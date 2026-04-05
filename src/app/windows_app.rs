@@ -16,7 +16,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     LoadCursorW, MSG, PostQuitMessage, RegisterClassExW, SM_CXSCREEN, SM_CYSCREEN, SW_SHOW,
     SetLayeredWindowAttributes, SetTimer, ShowWindow, TranslateMessage, WM_CHAR, WM_DESTROY,
     WM_ERASEBKGND, WM_KEYDOWN, WM_NCHITTEST, WM_PAINT, WM_SIZE, WM_TIMER, WNDCLASSEXW,
-    WS_EX_APPWINDOW, WS_EX_LAYERED, WS_POPUP, WS_VISIBLE,
+    WS_EX_APPWINDOW, WS_EX_LAYERED, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP, WS_THICKFRAME,
+    WS_VISIBLE,
 };
 use windows::core::{PCWSTR, w};
 
@@ -137,7 +138,7 @@ fn create_window() -> eyre::Result<HWND> {
             WS_EX_APPWINDOW | WS_EX_LAYERED,
             WINDOW_CLASS_NAME,
             PCWSTR(title.as_ptr()),
-            WS_POPUP | WS_VISIBLE,
+            WS_POPUP | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_VISIBLE,
             x,
             y,
             INITIAL_WINDOW_WIDTH,
@@ -243,6 +244,11 @@ extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam:
             Err(error) => fail_and_close(hwnd, error),
         },
         WM_NCHITTEST => {
+            let default_hit = unsafe { DefWindowProcW(hwnd, message, wparam, lparam) };
+            if default_hit.0 != isize::try_from(HTCLIENT).expect("HTCLIENT fits in isize") {
+                return default_hit;
+            }
+
             let y = extract_signed_coordinate(lparam.0 >> 16);
             let mut window_rect = RECT::default();
             let got_rect = unsafe { GetWindowRect(hwnd, &mut window_rect) }.is_ok();
