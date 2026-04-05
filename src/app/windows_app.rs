@@ -5,8 +5,10 @@ use teamy_windows::module::get_current_module;
 use tracing::info;
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, SIZE, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, CLEARTYPE_QUALITY, CreateFontIndirectW, DeleteObject, EndPaint, GetDC,
-    GetTextExtentPoint32W, HFONT, InvalidateRect, LOGFONTW, PAINTSTRUCT, ReleaseDC, SelectObject,
+    BeginPaint, BitBlt, CLEARTYPE_QUALITY, CreateCompatibleBitmap, CreateCompatibleDC,
+    CreateFontIndirectW, DeleteDC, DeleteObject, EndPaint, GetDC, GetTextExtentPoint32W,
+    HBITMAP, HDC, HGDIOBJ, HFONT, InvalidateRect, LOGFONTW, PAINTSTRUCT, ReleaseDC, SRCCOPY,
+    SelectObject,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
@@ -42,9 +44,36 @@ struct AppState {
 
 struct FontHandle(HFONT);
 
+struct MemoryDc(HDC);
+
+struct BitmapHandle(HBITMAP);
+
+struct SelectObjectGuard {
+    hdc: HDC,
+    object: HGDIOBJ,
+}
+
 impl Drop for FontHandle {
     fn drop(&mut self) {
         let _ = unsafe { DeleteObject(self.0.into()) };
+    }
+}
+
+impl Drop for MemoryDc {
+    fn drop(&mut self) {
+        let _ = unsafe { DeleteDC(self.0) };
+    }
+}
+
+impl Drop for BitmapHandle {
+    fn drop(&mut self) {
+        let _ = unsafe { DeleteObject(self.0.into()) };
+    }
+}
+
+impl Drop for SelectObjectGuard {
+    fn drop(&mut self) {
+        let _ = unsafe { SelectObject(self.hdc, self.object) };
     }
 }
 
@@ -167,11 +196,13 @@ extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam:
             Err(error) => fail_and_close(hwnd, error),
         },
         WM_TIMER if wparam.0 == POLL_TIMER_ID => match with_app_state(|state| state.terminal.pump()) {
-            Ok(should_close) => {
-                unsafe {
-                    let _ = InvalidateRect(Some(hwnd), None, false);
+            Ok(result) => {
+                if result.needs_repaint {
+                    unsafe {
+                        let _ = InvalidateRect(Some(hwnd), None, false);
+                    }
                 }
-                if should_close {
+                if result.should_close {
                     unsafe {
                         let _ = DestroyWindow(hwnd);
                     }
@@ -242,22 +273,66 @@ fn paint_window(hwnd: HWND) -> eyre::Result<()> {
     }
 
     let result = with_app_state(|state| {
-        let previous_font = unsafe { SelectObject(hdc, state.font.0.into()) };
         let layout = client_layout(hwnd, state.cell_width, state.cell_height)?;
+        let buffer_dc = create_memory_dc(hdc)?;
+        let buffer_bitmap = create_compatible_bitmap(hdc, layout.client_width, layout.client_height)?;
+        let previous_bitmap = unsafe { SelectObject(buffer_dc.0, buffer_bitmap.0.into()) };
+        let _bitmap_guard = SelectObjectGuard {
+            hdc: buffer_dc.0,
+            object: previous_bitmap,
+        };
+
+        let previous_font = unsafe { SelectObject(buffer_dc.0, state.font.0.into()) };
+        let _font_guard = SelectObjectGuard {
+            hdc: buffer_dc.0,
+            object: previous_font,
+        };
+
         let overlay = format!(
             "Teamy Studio  |  drag top strip to move  |  {}x{}",
             state.terminal.cols(),
             state.terminal.rows()
         );
-        let paint_result = state.terminal.paint(hdc, layout, &overlay);
-        let _ = unsafe { SelectObject(hdc, previous_font) };
-        paint_result
+        state.terminal.paint(buffer_dc.0, layout, &overlay)?;
+
+        unsafe {
+            BitBlt(
+                hdc,
+                0,
+                0,
+                layout.client_width.max(1),
+                layout.client_height.max(1),
+                Some(buffer_dc.0),
+                0,
+                0,
+                SRCCOPY,
+            )
+        }
+        .wrap_err("failed to copy buffered frame to window")?;
+
+        Ok(())
     });
 
     unsafe {
         let _ = EndPaint(hwnd, &paint);
     }
     result
+}
+
+fn create_memory_dc(hdc: HDC) -> eyre::Result<MemoryDc> {
+    let memory_dc = unsafe { CreateCompatibleDC(Some(hdc)) };
+    if memory_dc.0.is_null() {
+        eyre::bail!("failed to create memory device context")
+    }
+    Ok(MemoryDc(memory_dc))
+}
+
+fn create_compatible_bitmap(hdc: HDC, width: i32, height: i32) -> eyre::Result<BitmapHandle> {
+    let bitmap = unsafe { CreateCompatibleBitmap(hdc, width.max(1), height.max(1)) };
+    if bitmap.0.is_null() {
+        eyre::bail!("failed to create offscreen bitmap")
+    }
+    Ok(BitmapHandle(bitmap))
 }
 
 fn create_terminal_font() -> eyre::Result<(FontHandle, i32, i32)> {

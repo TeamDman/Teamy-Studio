@@ -29,6 +29,11 @@ const MAX_SCROLLBACK: usize = 20_000;
 
 type PtyWriter = Box<dyn Write + Send>;
 
+pub struct PumpResult {
+    pub should_close: bool,
+    pub needs_repaint: bool,
+}
+
 pub struct TerminalSession {
     terminal: Terminal<'static, 'static>,
     render_state: RenderState<'static>,
@@ -41,6 +46,7 @@ pub struct TerminalSession {
     cols: u16,
     rows: u16,
     needs_repaint: bool,
+    full_repaint_pending: bool,
     closed: bool,
 }
 
@@ -155,6 +161,7 @@ impl TerminalSession {
             cols: DEFAULT_COLS,
             rows: DEFAULT_ROWS,
             needs_repaint: true,
+            full_repaint_pending: true,
             closed: false,
         })
     }
@@ -194,10 +201,11 @@ impl TerminalSession {
         self.cols = cols;
         self.rows = rows;
         self.needs_repaint = true;
+        self.full_repaint_pending = true;
         Ok(())
     }
 
-    pub fn pump(&mut self) -> eyre::Result<bool> {
+    pub fn pump(&mut self) -> eyre::Result<PumpResult> {
         let mut changed = false;
 
         while let Ok(message) = self.reader.try_recv() {
@@ -220,7 +228,10 @@ impl TerminalSession {
         }
 
         self.needs_repaint |= changed;
-        Ok(self.closed)
+        Ok(PumpResult {
+            should_close: self.closed,
+            needs_repaint: self.needs_repaint,
+        })
     }
 
     pub fn handle_char(&mut self, code_unit: u32) -> eyre::Result<bool> {
@@ -285,9 +296,6 @@ impl TerminalSession {
     }
 
     pub fn paint(&mut self, hdc: HDC, layout: TerminalLayout, overlay_text: &str) -> eyre::Result<()> {
-        paint_terminal_background(hdc, layout.client_width, layout.client_height)?;
-        paint_drag_strip(hdc, layout.client_width, overlay_text)?;
-
         let snapshot = self
             .render_state
             .update(&self.terminal)
@@ -297,21 +305,43 @@ impl TerminalSession {
         let mut cells = CellIterator::new().wrap_err("failed to create cell iterator")?;
         let rect = layout.terminal_rect();
 
-        let background_brush = unsafe { CreateSolidBrush(rgb_to_colorref(colors.background)) };
-        if background_brush.0.is_null() {
-            eyre::bail!("failed to create terminal background brush");
+        if self.full_repaint_pending {
+            paint_terminal_background(hdc, layout.client_width, layout.client_height)?;
         }
-        let _ = unsafe { FillRect(hdc, &rect, background_brush) };
-        let _ = unsafe { DeleteObject(background_brush.into()) };
+        paint_drag_strip(hdc, layout.client_width, overlay_text)?;
+
+        if self.full_repaint_pending {
+            paint_rect_background(hdc, rect, colors.background)
+                .wrap_err("failed to paint terminal background")?;
+        }
 
         let mut row_index = 0_i32;
         let mut row_iter = rows.update(&snapshot).wrap_err("failed to update row iterator")?;
         while let Some(row) = row_iter.next() {
+            let row_is_dirty = row.dirty().wrap_err("failed to read row dirty flag")?;
+            let should_paint_row = self.full_repaint_pending || row_is_dirty;
             let y = rect.top + (row_index * layout.cell_height);
+            let row_rect = RECT {
+                left: rect.left,
+                top: y,
+                right: rect.right,
+                bottom: y + layout.cell_height,
+            };
+
+            if should_paint_row {
+                paint_rect_background(hdc, row_rect, colors.background)
+                    .wrap_err("failed to paint row background")?;
+            }
+
             let mut column_index = 0_i32;
             let mut cell_iter = cells.update(row).wrap_err("failed to update cell iterator")?;
 
             while let Some(cell) = cell_iter.next() {
+                if !should_paint_row {
+                    column_index += 1;
+                    continue;
+                }
+
                 let x = rect.left + (column_index * layout.cell_width);
                 let cell_rect = RECT {
                     left: x,
@@ -346,8 +376,10 @@ impl TerminalSession {
                 column_index += 1;
             }
 
-            row.set_dirty(false)
-                .wrap_err("failed to clear row dirty flag after paint")?;
+            if should_paint_row {
+                row.set_dirty(false)
+                    .wrap_err("failed to clear row dirty flag after paint")?;
+            }
             row_index += 1;
         }
 
@@ -362,6 +394,7 @@ impl TerminalSession {
         }
 
         self.needs_repaint = false;
+        self.full_repaint_pending = false;
         Ok(())
     }
 
@@ -417,6 +450,17 @@ pub fn keyboard_mods() -> key::Mods {
 
 fn rgb_to_colorref(color: RgbColor) -> COLORREF {
     COLORREF(u32::from(color.r) | (u32::from(color.g) << 8) | (u32::from(color.b) << 16))
+}
+
+fn paint_rect_background(hdc: HDC, rect: RECT, color: RgbColor) -> eyre::Result<()> {
+    let brush = unsafe { CreateSolidBrush(rgb_to_colorref(color)) };
+    if brush.0.is_null() {
+        eyre::bail!("failed to create background brush");
+    }
+
+    let _ = unsafe { FillRect(hdc, &rect, brush) };
+    let _ = unsafe { DeleteObject(brush.into()) };
+    Ok(())
 }
 
 fn paint_terminal_background(hdc: HDC, client_width: i32, client_height: i32) -> eyre::Result<()> {
