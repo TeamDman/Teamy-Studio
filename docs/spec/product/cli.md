@@ -5,28 +5,34 @@ This specification covers the current user-facing command line behavior exposed 
 ## Command Surface
 
 cli[command.surface.core]
-Invoking `teamy-studio.exe` with no explicit command must launch the main application window.
+Invoking `teamy-studio.exe` with no explicit command must launch the main application terminal window.
 
 cli[command.surface.window]
 The CLI must expose a `window` command group.
 
 cli[command.surface.window-show]
-The `window` command group must expose a `show` subcommand that launches the main application window.
-
-cli[window.startup.monitor-selection]
-The launched window must open on the monitor that currently contains the cursor.
-
-cli[window.startup.size]
-The launched window must start at 50% of the width and 50% of the height of the selected monitor.
+The `window` command group must expose a `show` subcommand that launches the main application terminal window.
 
 cli[window.startup.centered]
-The launched window must be centered within the selected monitor.
+The launched terminal window must open centered on screen.
 
-cli[window.appearance.red]
-The launched window must render as red at 50% opacity.
+cli[window.startup.size]
+The launched terminal window must start at a fixed size suitable for an 80x24-style shell surface.
+
+cli[window.appearance.translucent]
+The launched terminal window must use layered-window alpha so the shell surface remains translucent.
+
+cli[window.appearance.shell]
+The launched window must host a shell backed by a PTY and render terminal content through `libghostty-vt`.
+
+cli[window.appearance.chrome]
+The launched terminal window must render a visible accent strip above the terminal grid.
 
 cli[window.interaction.drag]
-The launched window must be draggable by clicking and dragging on the red surface.
+The launched terminal window must be draggable by clicking and dragging on the top accent strip.
+
+cli[window.interaction.input]
+The launched terminal window must forward keyboard input into the PTY-backed shell session.
 
 ## Parser Model
 

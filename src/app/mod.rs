@@ -1,5 +1,7 @@
 #[cfg(windows)]
 mod windows_app;
+#[cfg(windows)]
+mod windows_terminal;
 
 /// Run the Teamy Studio application shell.
 ///
