@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex, mpsc};
 use eyre::Context;
 use libghostty_vt::key;
 use libghostty_vt::render::{CellIterator, RenderState, RowIterator};
+use libghostty_vt::style::RgbColor;
 use libghostty_vt::{Terminal, TerminalOptions};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use tracing::{debug, info};
@@ -69,6 +70,14 @@ impl SuppressedChar {
 
 pub struct PumpResult {
     pub should_close: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct TerminalDisplayGlyph {
+    pub column: i32,
+    pub row: i32,
+    pub character: char,
+    pub color: [f32; 4],
 }
 
 #[derive(Clone, Copy)]
@@ -681,6 +690,52 @@ impl TerminalSession {
         Ok(lines.join("\n"))
     }
 
+    pub fn visible_glyphs(&mut self) -> eyre::Result<Vec<TerminalDisplayGlyph>> {
+        let snapshot = self
+            .render_state
+            .update(&self.terminal)
+            .wrap_err("failed to update terminal render state")?;
+        let colors = snapshot
+            .colors()
+            .wrap_err("failed to fetch terminal colors")?;
+        let mut rows = RowIterator::new().wrap_err("failed to create row iterator")?;
+        let mut cells = CellIterator::new().wrap_err("failed to create cell iterator")?;
+        let mut glyphs = Vec::new();
+
+        let mut row_index = 0_i32;
+        let mut row_iter = rows
+            .update(&snapshot)
+            .wrap_err("failed to update row iterator")?;
+        while let Some(row) = row_iter.next() {
+            let mut column_index = 0_i32;
+            let mut cell_iter = cells
+                .update(row)
+                .wrap_err("failed to update cell iterator")?;
+            while let Some(cell) = cell_iter.next() {
+                let graphemes = cell.graphemes().wrap_err("failed to read cell text")?;
+                if !graphemes.is_empty() {
+                    let foreground = cell
+                        .fg_color()
+                        .wrap_err("failed to read cell foreground")?
+                        .unwrap_or(colors.foreground);
+                    let color = rgb_to_rgba(foreground);
+                    for character in graphemes {
+                        glyphs.push(TerminalDisplayGlyph {
+                            column: column_index,
+                            row: row_index,
+                            character,
+                            color,
+                        });
+                    }
+                }
+                column_index += 1;
+            }
+            row_index += 1;
+        }
+
+        Ok(glyphs)
+    }
+
     #[must_use]
     pub fn take_input_trace(&mut self) -> Vec<Vec<u8>> {
         std::mem::take(&mut self.input_trace)
@@ -786,6 +841,15 @@ impl TerminalSession {
 
         Cow::Owned(output)
     }
+}
+
+fn rgb_to_rgba(color: RgbColor) -> [f32; 4] {
+    [
+        f32::from(color.r) / 255.0,
+        f32::from(color.g) / 255.0,
+        f32::from(color.b) / 255.0,
+        1.0,
+    ]
 }
 
 fn map_virtual_key(vkey: u32, lparam: isize) -> Option<(key::Key, char)> {

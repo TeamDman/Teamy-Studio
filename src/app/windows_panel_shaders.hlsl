@@ -4,6 +4,7 @@ struct VsInput {
     float2 uv : TEXCOORD;
     float effect : EFFECT;
     float glyph : GLYPH;
+    float4 glyphData : GLYPHDATA;
 };
 
 struct PsInput {
@@ -12,14 +13,10 @@ struct PsInput {
     float2 uv : TEXCOORD;
     float effect : EFFECT;
     float glyph : GLYPH;
+    float4 glyphData : GLYPHDATA;
 };
 
-Buffer<uint> GlyphRows : register(t0);
-
-static const int FONT_ATLAS_COLUMNS = 16;
-static const int FONT_ATLAS_CELL_WIDTH = 32;
-static const int FONT_ATLAS_CELL_HEIGHT = 64;
-static const int FONT_ATLAS_WIDTH = FONT_ATLAS_COLUMNS * FONT_ATLAS_CELL_WIDTH;
+Buffer<float4> CurveData : register(t0);
 
 PsInput VSMain(VsInput input) {
     PsInput output;
@@ -28,6 +25,7 @@ PsInput VSMain(VsInput input) {
     output.uv = input.uv;
     output.effect = input.effect;
     output.glyph = input.glyph;
+    output.glyphData = input.glyphData;
     return output;
 }
 
@@ -75,33 +73,91 @@ float icon_play(float2 uv) {
     return triangle_mask(p, float2(0.30, 0.22), float2(0.74, 0.50), float2(0.30, 0.78), 0.015);
 }
 
-float atlas_alpha(int x, int y) {
-    x = clamp(x, 0, FONT_ATLAS_WIDTH - 1);
-    y = max(y, 0);
-    uint value = GlyphRows[(y * FONT_ATLAS_WIDTH) + x];
-    return ((float)value) / 255.0;
+uint CalcRootCode(float y1, float y2, float y3) {
+    uint i1 = asuint(y1) >> 31U;
+    uint i2 = asuint(y2) >> 30U;
+    uint i3 = asuint(y3) >> 29U;
+
+    uint shift = (i2 & 2U) | (i1 & ~2U);
+    shift = (i3 & 4U) | (shift & ~4U);
+    return ((0x2E74U >> shift) & 0x0101U);
 }
 
-float text_mask(float glyph, float2 uv) {
-    int glyph_index = clamp((int)glyph, 0, 127);
-    int atlas_column = glyph_index % FONT_ATLAS_COLUMNS;
-    int atlas_row = glyph_index / FONT_ATLAS_COLUMNS;
-    float sample_x = (atlas_column * FONT_ATLAS_CELL_WIDTH) + (saturate(uv.x) * (FONT_ATLAS_CELL_WIDTH - 1));
-    float sample_y = (atlas_row * FONT_ATLAS_CELL_HEIGHT) + (saturate(uv.y) * (FONT_ATLAS_CELL_HEIGHT - 1));
-    int x0 = (int)floor(sample_x);
-    int y0 = (int)floor(sample_y);
-    int x1 = min(x0 + 1, FONT_ATLAS_WIDTH - 1);
-    int y1 = min(y0 + 1, (FONT_ATLAS_CELL_HEIGHT * 8) - 1);
-    float tx = frac(sample_x);
-    float ty = frac(sample_y);
+float2 SolveHorizPoly(float4 p12, float2 p3) {
+    float2 a = p12.xy - p12.zw * 2.0 + p3;
+    float2 b = p12.xy - p12.zw;
+    float ra = 1.0 / a.y;
+    float rb = 0.5 / b.y;
+    float d = sqrt(max(b.y * b.y - a.y * p12.y, 0.0));
+    float t1 = (b.y - d) * ra;
+    float t2 = (b.y + d) * ra;
+    if (abs(a.y) < 1.0 / 65536.0) t1 = t2 = p12.y * rb;
+    return float2((a.x * t1 - b.x * 2.0) * t1 + p12.x, (a.x * t2 - b.x * 2.0) * t2 + p12.x);
+}
 
-    float a00 = atlas_alpha(x0, y0);
-    float a10 = atlas_alpha(x1, y0);
-    float a01 = atlas_alpha(x0, y1);
-    float a11 = atlas_alpha(x1, y1);
-    float top = lerp(a00, a10, tx);
-    float bottom = lerp(a01, a11, tx);
-    return lerp(top, bottom, ty);
+float2 SolveVertPoly(float4 p12, float2 p3) {
+    float2 a = p12.xy - p12.zw * 2.0 + p3;
+    float2 b = p12.xy - p12.zw;
+    float ra = 1.0 / a.x;
+    float rb = 0.5 / b.x;
+    float d = sqrt(max(b.x * b.x - a.x * p12.x, 0.0));
+    float t1 = (b.x - d) * ra;
+    float t2 = (b.x + d) * ra;
+    if (abs(a.x) < 1.0 / 65536.0) t1 = t2 = p12.x * rb;
+    return float2((a.y * t1 - b.y * 2.0) * t1 + p12.y, (a.y * t2 - b.y * 2.0) * t2 + p12.y);
+}
+
+float CalcCoverage(float xcov, float ycov, float xwgt, float ywgt) {
+    return saturate(max(abs(xcov * xwgt + ycov * ywgt) / max(xwgt + ywgt, 1.0 / 65536.0), min(abs(xcov), abs(ycov))));
+}
+
+float slug_coverage(float2 renderCoord, float4 glyphData) {
+    int curveStart = (int)glyphData.x;
+    int curveCount = (int)glyphData.y;
+    if (curveCount <= 0) {
+        return 0.0;
+    }
+
+    float2 pixelsPerEm = 1.0 / fwidth(renderCoord);
+    float xcov = 0.0;
+    float ycov = 0.0;
+    float xwgt = 0.0;
+    float ywgt = 0.0;
+
+    [loop]
+    for (int curveIndex = 0; curveIndex < curveCount; curveIndex++) {
+        int baseIndex = curveStart + (curveIndex * 2);
+        float4 p12 = CurveData[baseIndex] - float4(renderCoord, renderCoord);
+        float2 p3 = CurveData[baseIndex + 1].xy - renderCoord;
+
+        uint hcode = CalcRootCode(p12.y, p12.w, p3.y);
+        if (hcode != 0U) {
+            float2 hr = SolveHorizPoly(p12, p3) * pixelsPerEm.x;
+            if ((hcode & 1U) != 0U) {
+                xcov += saturate(hr.x + 0.5);
+                xwgt = max(xwgt, saturate(1.0 - abs(hr.x) * 2.0));
+            }
+            if (hcode > 1U) {
+                xcov -= saturate(hr.y + 0.5);
+                xwgt = max(xwgt, saturate(1.0 - abs(hr.y) * 2.0));
+            }
+        }
+
+        uint vcode = CalcRootCode(p12.x, p12.z, p3.x);
+        if (vcode != 0U) {
+            float2 vr = SolveVertPoly(p12, p3) * pixelsPerEm.y;
+            if ((vcode & 1U) != 0U) {
+                ycov -= saturate(vr.x + 0.5);
+                ywgt = max(ywgt, saturate(1.0 - abs(vr.x) * 2.0));
+            }
+            if (vcode > 1U) {
+                ycov += saturate(vr.y + 0.5);
+                ywgt = max(ywgt, saturate(1.0 - abs(vr.y) * 2.0));
+            }
+        }
+    }
+
+    return CalcCoverage(xcov, ycov, xwgt, ywgt);
 }
 
 float border_mask(float2 uv) {
@@ -155,7 +211,7 @@ float4 apply_button(float2 uv, float4 color, float effect) {
 
 float4 PSMain(PsInput input) : SV_TARGET {
     if (input.effect > 7.5) {
-        float coverage = text_mask(input.glyph, input.uv);
+        float coverage = slug_coverage(input.uv, input.glyphData);
         return float4(input.color.rgb, input.color.a * coverage);
     }
 

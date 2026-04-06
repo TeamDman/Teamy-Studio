@@ -1,7 +1,10 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use eyre::Context;
-use windows::Win32::Foundation::{COLORREF, E_FAIL, HANDLE, HWND, RECT, SIZE, TRUE};
+use fontdb::{Database, Family, Query, Source};
+use ttf_parser::{Face, GlyphId, OutlineBuilder};
+use windows::Win32::Foundation::{E_FAIL, HANDLE, HWND, RECT, TRUE};
 use windows::Win32::Graphics::Direct3D::Fxc::{
     D3DCOMPILE_DEBUG, D3DCOMPILE_SKIP_OPTIMIZATION, D3DCompileFromFile,
 };
@@ -11,12 +14,6 @@ use windows::Win32::Graphics::Direct3D::{
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
-use windows::Win32::Graphics::Gdi::{
-    BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CLEARTYPE_QUALITY, CreateCompatibleDC,
-    CreateDIBSection, CreateFontIndirectW, DIB_RGB_COLORS, DeleteDC, DeleteObject,
-    GetTextExtentPoint32W, HFONT, LOGFONTW, SelectObject, SetBkMode, SetTextColor,
-    TRANSPARENT, TextOutW,
-};
 use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObjectEx};
 use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
 use windows::core::{Error, HSTRING, Interface, Owned, PCSTR, s};
@@ -27,15 +24,9 @@ const FRAME_COUNT: usize = 2;
 const MAX_PANEL_COUNT: usize = 32;
 const MAX_GLYPH_COUNT: usize = 8_192;
 const MAX_VERTEX_COUNT: usize = (MAX_PANEL_COUNT + MAX_GLYPH_COUNT) * 6;
-const FONT_GLYPH_COUNT: usize = 128;
-const FONT_ATLAS_COLUMNS: usize = 16;
-const FONT_ATLAS_ROWS: usize = FONT_GLYPH_COUNT / FONT_ATLAS_COLUMNS;
-const FONT_ATLAS_CELL_WIDTH: usize = 32;
-const FONT_ATLAS_CELL_HEIGHT: usize = 64;
-const FONT_ATLAS_WIDTH: usize = FONT_ATLAS_COLUMNS * FONT_ATLAS_CELL_WIDTH;
-const FONT_ATLAS_HEIGHT: usize = FONT_ATLAS_ROWS * FONT_ATLAS_CELL_HEIGHT;
+const FALLBACK_GLYPH: char = '?';
+const MAX_CURVE_FLOAT4_COUNT: usize = 65_536;
 const TERMINAL_FONT_FAMILY: &str = "CaskaydiaCove Nerd Font Mono";
-const TERMINAL_FONT_HEIGHT: i32 = -42;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -45,6 +36,29 @@ struct Vertex {
     uv: [f32; 2],
     effect: f32,
     glyph: f32,
+    glyph_data: [f32; 4],
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SlugGlyph {
+    curve_start: u32,
+    curve_count: u32,
+}
+
+#[derive(Debug)]
+struct LoadedTerminalFont {
+    font_bytes: Vec<u8>,
+    face_index: u32,
+    ascender: f32,
+    descender: f32,
+    cell_advance: f32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct QuadraticCurve {
+    p0: [f32; 2],
+    p1: [f32; 2],
+    p2: [f32; 2],
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -71,7 +85,7 @@ pub struct PanelRect {
 pub struct GlyphQuad {
     pub rect: RECT,
     pub color: [f32; 4],
-    pub glyph_index: u32,
+    pub character: char,
 }
 
 #[derive(Debug)]
@@ -101,7 +115,10 @@ pub struct D3d12PanelRenderer {
     vertex_buffer: ID3D12Resource,
     vertex_buffer_view: D3D12_VERTEX_BUFFER_VIEW,
     srv_heap: ID3D12DescriptorHeap,
-    _font_buffer: ID3D12Resource,
+    curve_buffer: ID3D12Resource,
+    font: LoadedTerminalFont,
+    glyph_cache: HashMap<char, SlugGlyph>,
+    cached_chars: Vec<char>,
     viewport: D3D12_VIEWPORT,
     scissor_rect: RECT,
     width: u32,
@@ -122,7 +139,8 @@ impl D3d12PanelRenderer {
         let (rtv_heap, rtv_descriptor_size, render_targets) =
             create_render_targets(&device, &swap_chain)?;
         let command_allocators = create_command_allocators(&device)?;
-        let (srv_heap, font_buffer) = create_font_buffer_and_srv(&device)?;
+        let (srv_heap, curve_buffer) = create_curve_buffer_and_srv(&device)?;
+        let font = load_terminal_font()?;
         let root_signature = create_root_signature(&device)?;
         let pipeline_state = create_pipeline_state(&device, &root_signature)?;
         let command_list: ID3D12GraphicsCommandList = unsafe {
@@ -174,7 +192,10 @@ impl D3d12PanelRenderer {
             vertex_buffer,
             vertex_buffer_view,
             srv_heap,
-            _font_buffer: font_buffer,
+            curve_buffer,
+            font,
+            glyph_cache: HashMap::new(),
+            cached_chars: Vec::new(),
             viewport,
             scissor_rect,
             width,
@@ -191,6 +212,15 @@ impl D3d12PanelRenderer {
         }
 
         self.wait_for_gpu()?;
+        for command_allocator in &self.command_allocators {
+            unsafe {
+                command_allocator.Reset()?;
+            }
+        }
+        unsafe {
+            self.command_list.Reset(&self.command_allocators[0], None)?;
+            self.command_list.Close()?;
+        }
         self.render_targets.fill(None);
         unsafe {
             self.swap_chain.ResizeBuffers(
@@ -207,6 +237,7 @@ impl D3d12PanelRenderer {
         self.rtv_heap = rtv_heap;
         self.rtv_descriptor_size = rtv_descriptor_size;
         self.render_targets = render_targets.map(Some);
+        self.frame_fence_values = [0; FRAME_COUNT];
         self.width = width;
         self.height = height;
         self.viewport.Width = width as f32;
@@ -225,6 +256,7 @@ impl D3d12PanelRenderer {
         let frame_index = unsafe { self.swap_chain.GetCurrentBackBufferIndex() as usize };
         self.wait_for_frame(frame_index)?;
 
+        self.update_slug_curves(scene)?;
         let vertex_count = self.update_scene_vertices(scene)?;
         let current_target = self.render_targets[frame_index]
             .as_ref()
@@ -301,14 +333,25 @@ impl D3d12PanelRenderer {
             );
         }
         for glyph in &scene.glyphs {
-            append_rect(
+            let slug_glyph = self
+                .glyph_cache
+                .get(&glyph.character)
+                .or_else(|| self.glyph_cache.get(&FALLBACK_GLYPH))
+                .copied()
+                .unwrap_or(SlugGlyph {
+                    curve_start: 0,
+                    curve_count: 0,
+                });
+            append_text_rect(
                 &mut vertices,
                 self.width as f32,
                 self.height as f32,
                 glyph.rect,
                 glyph.color,
-                PanelEffect::Text as u32,
-                glyph.glyph_index,
+                self.font.ascender,
+                self.font.descender,
+                self.font.cell_advance,
+                slug_glyph,
             );
         }
 
@@ -320,6 +363,34 @@ impl D3d12PanelRenderer {
         }
 
         Ok(vertices.len())
+    }
+
+    fn update_slug_curves(&mut self, scene: &RenderScene) -> eyre::Result<()> {
+        let scene_chars = collect_scene_chars(scene);
+        if scene_chars == self.cached_chars {
+            return Ok(());
+        }
+
+        let (curve_data, glyph_cache) = build_slug_curve_buffer(&self.font, &scene_chars)?;
+        unsafe {
+            let mut mapped = std::ptr::null_mut();
+            self.curve_buffer.Map(0, None, Some(&mut mapped))?;
+            std::ptr::write_bytes(
+                mapped,
+                0,
+                MAX_CURVE_FLOAT4_COUNT * std::mem::size_of::<[f32; 4]>(),
+            );
+            std::ptr::copy_nonoverlapping(
+                curve_data.as_ptr(),
+                mapped as *mut [f32; 4],
+                curve_data.len(),
+            );
+            self.curve_buffer.Unmap(0, None);
+        }
+
+        self.glyph_cache = glyph_cache;
+        self.cached_chars = scene_chars;
+        Ok(())
     }
 
     fn wait_for_frame_latency(&self) -> eyre::Result<()> {
@@ -478,16 +549,17 @@ pub fn push_text_block(
         }
 
         if character != ' ' && scene.glyphs.len() < MAX_GLYPH_COUNT {
-            scene.glyphs.push(GlyphQuad {
-                rect: RECT {
+            push_glyph(
+                scene,
+                RECT {
                     left: cursor_x,
                     top: cursor_y,
                     right: cursor_x + glyph_width,
                     bottom: cursor_y + glyph_height,
                 },
+                character,
                 color,
-                glyph_index: glyph_index_for_char(character),
-            });
+            );
         }
 
         cursor_x += glyph_width;
@@ -512,132 +584,168 @@ pub fn push_centered_text(scene: &mut RenderScene, rect: RECT, text: &str, color
     push_text_block(scene, text_rect, text, glyph_width, glyph_height, color);
 }
 
-fn glyph_index_for_char(character: char) -> u32 {
-    if character.is_ascii() {
-        u32::from(character as u8)
-    } else {
-        u32::from(b'?')
+pub fn push_glyph(scene: &mut RenderScene, rect: RECT, character: char, color: [f32; 4]) {
+    if scene.glyphs.len() >= MAX_GLYPH_COUNT || character == ' ' {
+        return;
+    }
+    scene.glyphs.push(GlyphQuad {
+        rect,
+        color,
+        character,
+    });
+}
+
+fn collect_scene_chars(scene: &RenderScene) -> Vec<char> {
+    let mut chars = Vec::with_capacity(scene.glyphs.len() + 1);
+    chars.push(FALLBACK_GLYPH);
+    for glyph in &scene.glyphs {
+        if !chars.contains(&glyph.character) {
+            chars.push(glyph.character);
+        }
+    }
+    chars
+}
+
+fn load_terminal_font() -> eyre::Result<LoadedTerminalFont> {
+    let mut database = Database::new();
+    database.load_system_fonts();
+    let query = Query {
+        families: &[Family::Name(TERMINAL_FONT_FAMILY)],
+        ..Query::default()
+    };
+    let font_id = database
+        .query(&query)
+        .ok_or_else(|| eyre::eyre!("failed to locate installed terminal font"))?;
+    let face_info = database
+        .face(font_id)
+        .ok_or_else(|| eyre::eyre!("fontdb returned an invalid font handle"))?;
+
+    let font_bytes = match &face_info.source {
+        Source::File(path) => std::fs::read(path)
+            .wrap_err_with(|| format!("failed to read font file {}", path.display()))?,
+        Source::Binary(data) => data.as_ref().as_ref().to_vec(),
+        Source::SharedFile(path, _) => std::fs::read(path)
+            .wrap_err_with(|| format!("failed to read shared font file {}", path.display()))?,
+    };
+
+    let face = Face::parse(&font_bytes, face_info.index)
+        .wrap_err("failed to parse installed terminal font")?;
+    let fallback_id = face
+        .glyph_index(FALLBACK_GLYPH)
+        .or_else(|| face.glyph_index('W'))
+        .ok_or_else(|| eyre::eyre!("terminal font did not contain expected fallback glyphs"))?;
+    let cell_advance = face
+        .glyph_hor_advance(fallback_id)
+        .map_or(1024.0, f32::from);
+    let ascender = f32::from(face.ascender());
+    let descender = f32::from(face.descender());
+
+    Ok(LoadedTerminalFont {
+        font_bytes,
+        face_index: face_info.index,
+        ascender,
+        descender,
+        cell_advance,
+    })
+}
+
+fn build_slug_curve_buffer(
+    font: &LoadedTerminalFont,
+    chars: &[char],
+) -> eyre::Result<(Vec<[f32; 4]>, HashMap<char, SlugGlyph>)> {
+    let face = Face::parse(&font.font_bytes, font.face_index)
+        .wrap_err("failed to parse terminal font for slug curve build")?;
+    let fallback_id = face
+        .glyph_index(FALLBACK_GLYPH)
+        .ok_or_else(|| eyre::eyre!("terminal font did not contain fallback glyph"))?;
+    let mut curve_data = Vec::new();
+    let mut glyph_cache = HashMap::new();
+
+    for character in chars {
+        let glyph_id = face.glyph_index(*character).unwrap_or(fallback_id);
+        let curves = extract_glyph_curves(&face, glyph_id);
+        let curve_start = curve_data.len() as u32;
+        for curve in &curves {
+            curve_data.push([curve.p0[0], curve.p0[1], curve.p1[0], curve.p1[1]]);
+            curve_data.push([curve.p2[0], curve.p2[1], 0.0, 0.0]);
+        }
+        glyph_cache.insert(
+            *character,
+            SlugGlyph {
+                curve_start,
+                curve_count: curves.len() as u32,
+            },
+        );
+    }
+
+    if curve_data.len() > MAX_CURVE_FLOAT4_COUNT {
+        eyre::bail!("slug curve buffer capacity exceeded")
+    }
+
+    Ok((curve_data, glyph_cache))
+}
+
+fn extract_glyph_curves(face: &Face<'_>, glyph_id: GlyphId) -> Vec<QuadraticCurve> {
+    let mut builder = QuadraticCurveBuilder::default();
+    let _ = face.outline_glyph(glyph_id, &mut builder);
+    builder.curves
+}
+
+#[derive(Default)]
+struct QuadraticCurveBuilder {
+    curves: Vec<QuadraticCurve>,
+    start: Option<[f32; 2]>,
+    current: Option<[f32; 2]>,
+}
+
+impl QuadraticCurveBuilder {
+    fn push_line(&mut self, to: [f32; 2]) {
+        if let Some(from) = self.current {
+            let midpoint = [(from[0] + to[0]) * 0.5, (from[1] + to[1]) * 0.5];
+            self.curves.push(QuadraticCurve {
+                p0: from,
+                p1: midpoint,
+                p2: to,
+            });
+            self.current = Some(to);
+        }
     }
 }
 
-fn build_font_rows() -> Vec<u32> {
-    let mut bitmap_info = BITMAPINFO::default();
-    bitmap_info.bmiHeader = BITMAPINFOHEADER {
-        biSize: u32::try_from(std::mem::size_of::<BITMAPINFOHEADER>()).unwrap_or_default(),
-        biWidth: i32::try_from(FONT_ATLAS_WIDTH).unwrap_or_default(),
-        biHeight: -i32::try_from(FONT_ATLAS_HEIGHT).unwrap_or_default(),
-        biPlanes: 1,
-        biBitCount: 32,
-        biCompression: BI_RGB.0,
-        ..Default::default()
-    };
-
-    let memory_dc = unsafe { CreateCompatibleDC(None) };
-    if memory_dc.0.is_null() {
-        return vec![0_u32; FONT_ATLAS_WIDTH * FONT_ATLAS_HEIGHT];
+impl OutlineBuilder for QuadraticCurveBuilder {
+    fn move_to(&mut self, x: f32, y: f32) {
+        let point = [x, y];
+        self.start = Some(point);
+        self.current = Some(point);
     }
 
-    let mut bits = std::ptr::null_mut();
-    let bitmap = unsafe {
-        CreateDIBSection(
-            Some(memory_dc),
-            &bitmap_info,
-            DIB_RGB_COLORS,
-            &mut bits,
-            None,
-            0,
-        )
-    };
-    let Ok(bitmap) = bitmap else {
-        unsafe {
-            let _ = DeleteDC(memory_dc);
-        }
-        return vec![0_u32; FONT_ATLAS_WIDTH * FONT_ATLAS_HEIGHT];
-    };
-    if bitmap.0.is_null() || bits.is_null() {
-        unsafe {
-            let _ = DeleteDC(memory_dc);
-        }
-        return vec![0_u32; FONT_ATLAS_WIDTH * FONT_ATLAS_HEIGHT];
+    fn line_to(&mut self, x: f32, y: f32) {
+        self.push_line([x, y]);
     }
 
-    let font = unsafe { CreateFontIndirectW(&terminal_font_definition()) };
-    if font.0.is_null() {
-        unsafe {
-            let _ = DeleteObject(bitmap.into());
-            let _ = DeleteDC(memory_dc);
-        }
-        return vec![0_u32; FONT_ATLAS_WIDTH * FONT_ATLAS_HEIGHT];
-    }
-
-    let previous_bitmap = unsafe { SelectObject(memory_dc, bitmap.into()) };
-    let previous_font = unsafe { SelectObject(memory_dc, HFONT(font.0).into()) };
-    let _ = unsafe { SetBkMode(memory_dc, TRANSPARENT) };
-    let _ = unsafe { SetTextColor(memory_dc, COLORREF(0x00FF_FFFF)) };
-
-    let atlas_pixels = unsafe {
-        std::slice::from_raw_parts_mut(bits.cast::<u8>(), FONT_ATLAS_WIDTH * FONT_ATLAS_HEIGHT * 4)
-    };
-    atlas_pixels.fill(0);
-
-    for code in 0_u8..u8::try_from(FONT_GLYPH_COUNT).unwrap_or(u8::MAX) {
-        let glyph = char::from(code);
-        let glyph_utf16 = [u16::from(code)];
-        let column = usize::from(code) % FONT_ATLAS_COLUMNS;
-        let row = usize::from(code) / FONT_ATLAS_COLUMNS;
-        let origin_x = i32::try_from(column * FONT_ATLAS_CELL_WIDTH).unwrap_or_default();
-        let origin_y = i32::try_from(row * FONT_ATLAS_CELL_HEIGHT).unwrap_or_default();
-
-        let mut size = SIZE::default();
-        let _ = unsafe { GetTextExtentPoint32W(memory_dc, &glyph_utf16, &mut size) };
-        let x = origin_x
-            + ((i32::try_from(FONT_ATLAS_CELL_WIDTH).unwrap_or_default() - size.cx).max(0) / 2);
-        let y = origin_y
-            + ((i32::try_from(FONT_ATLAS_CELL_HEIGHT).unwrap_or_default() - size.cy).max(0) / 2);
-        let _ = unsafe { TextOutW(memory_dc, x, y, &glyph_utf16) };
-
-        if !glyph.is_ascii_graphic() && glyph != ' ' {
-            continue;
+    fn quad_to(&mut self, x1: f32, y1: f32, x: f32, y: f32) {
+        if let Some(from) = self.current {
+            self.curves.push(QuadraticCurve {
+                p0: from,
+                p1: [x1, y1],
+                p2: [x, y],
+            });
+            self.current = Some([x, y]);
         }
     }
 
-    let mut rows = vec![0_u32; FONT_ATLAS_WIDTH * FONT_ATLAS_HEIGHT];
-    for y in 0..FONT_ATLAS_HEIGHT {
-        for x in 0..FONT_ATLAS_WIDTH {
-            let base = ((y * FONT_ATLAS_WIDTH) + x) * 4;
-            let blue = u32::from(atlas_pixels[base]);
-            let green = u32::from(atlas_pixels[base + 1]);
-            let red = u32::from(atlas_pixels[base + 2]);
-            let alpha = red.max(green).max(blue);
-            rows[(y * FONT_ATLAS_WIDTH) + x] = alpha;
+    fn curve_to(&mut self, x1: f32, y1: f32, x2: f32, y2: f32, x: f32, y: f32) {
+        let _ = (x1, y1, x2, y2);
+        self.push_line([x, y]);
+    }
+
+    fn close(&mut self) {
+        if let (Some(current), Some(start)) = (self.current, self.start) {
+            if current != start {
+                self.push_line(start);
+            }
         }
     }
-
-    unsafe {
-        let _ = SelectObject(memory_dc, previous_font);
-        let _ = SelectObject(memory_dc, previous_bitmap);
-        let _ = DeleteObject(font.into());
-        let _ = DeleteObject(bitmap.into());
-        let _ = DeleteDC(memory_dc);
-    }
-
-    rows
-}
-
-fn terminal_font_definition() -> LOGFONTW {
-    let mut font = LOGFONTW {
-        lfHeight: TERMINAL_FONT_HEIGHT,
-        lfQuality: CLEARTYPE_QUALITY,
-        ..Default::default()
-    };
-    for (slot, value) in font
-        .lfFaceName
-        .iter_mut()
-        .zip(TERMINAL_FONT_FAMILY.encode_utf16())
-    {
-        *slot = value;
-    }
-    font
 }
 
 fn create_device() -> eyre::Result<(IDXGIFactory4, ID3D12Device)> {
@@ -882,6 +990,12 @@ fn create_pipeline_state(
             AlignedByteOffset: 40,
             ..Default::default()
         },
+        D3D12_INPUT_ELEMENT_DESC {
+            SemanticName: s!("GLYPHDATA"),
+            Format: DXGI_FORMAT_R32G32B32A32_FLOAT,
+            AlignedByteOffset: 44,
+            ..Default::default()
+        },
     ];
 
     let blend_target = D3D12_RENDER_TARGET_BLEND_DESC {
@@ -1045,13 +1159,13 @@ fn create_vertex_buffer(
     ))
 }
 
-fn create_font_buffer_and_srv(
+fn create_curve_buffer_and_srv(
     device: &ID3D12Device,
 ) -> eyre::Result<(ID3D12DescriptorHeap, ID3D12Resource)> {
-    let font_rows = build_font_rows();
-    let byte_len = (font_rows.len() * std::mem::size_of::<u32>()) as u64;
+    let curve_data = vec![[0.0_f32; 4]; MAX_CURVE_FLOAT4_COUNT];
+    let byte_len = (curve_data.len() * std::mem::size_of::<[f32; 4]>()) as u64;
 
-    let mut font_buffer = None;
+    let mut curve_buffer = None;
     unsafe {
         device.CreateCommittedResource(
             &D3D12_HEAP_PROPERTIES {
@@ -1074,16 +1188,20 @@ fn create_font_buffer_and_srv(
             },
             D3D12_RESOURCE_STATE_GENERIC_READ,
             None,
-            &mut font_buffer,
+            &mut curve_buffer,
         )?
     };
-    let font_buffer: ID3D12Resource = font_buffer.expect("font buffer should be initialized");
+    let curve_buffer: ID3D12Resource = curve_buffer.expect("curve buffer should be initialized");
 
     unsafe {
         let mut mapped = std::ptr::null_mut();
-        font_buffer.Map(0, None, Some(&mut mapped))?;
-        std::ptr::copy_nonoverlapping(font_rows.as_ptr(), mapped as *mut u32, font_rows.len());
-        font_buffer.Unmap(0, None);
+        curve_buffer.Map(0, None, Some(&mut mapped))?;
+        std::ptr::copy_nonoverlapping(
+            curve_data.as_ptr(),
+            mapped as *mut [f32; 4],
+            curve_data.len(),
+        );
+        curve_buffer.Unmap(0, None);
     }
 
     let srv_heap: ID3D12DescriptorHeap = unsafe {
@@ -1096,13 +1214,13 @@ fn create_font_buffer_and_srv(
     };
 
     let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
-        Format: DXGI_FORMAT_R32_UINT,
+        Format: DXGI_FORMAT_R32G32B32A32_FLOAT,
         ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
         Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
         Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
             Buffer: D3D12_BUFFER_SRV {
                 FirstElement: 0,
-                NumElements: font_rows.len() as u32,
+                NumElements: curve_data.len() as u32,
                 StructureByteStride: 0,
                 Flags: D3D12_BUFFER_SRV_FLAG_NONE,
             },
@@ -1111,13 +1229,78 @@ fn create_font_buffer_and_srv(
 
     unsafe {
         device.CreateShaderResourceView(
-            &font_buffer,
+            &curve_buffer,
             Some(&desc),
             srv_heap.GetCPUDescriptorHandleForHeapStart(),
         );
     }
 
-    Ok((srv_heap, font_buffer))
+    Ok((srv_heap, curve_buffer))
+}
+
+fn append_text_rect(
+    vertices: &mut Vec<Vertex>,
+    width: f32,
+    height: f32,
+    rect: RECT,
+    color: [f32; 4],
+    ascender: f32,
+    descender: f32,
+    cell_advance: f32,
+    glyph: SlugGlyph,
+) {
+    if vertices.len() + 6 > MAX_VERTEX_COUNT {
+        return;
+    }
+
+    let left = rect.left as f32;
+    let top = rect.top as f32;
+    let right = rect.right as f32;
+    let bottom = rect.bottom as f32;
+    let effect = PanelEffect::Text as u32 as f32;
+    let glyph_data = [glyph.curve_start as f32, glyph.curve_count as f32, 0.0, 0.0];
+
+    let top_left = Vertex {
+        position: to_ndc(width, height, left, top),
+        color,
+        uv: [0.0, ascender],
+        effect,
+        glyph: 0.0,
+        glyph_data,
+    };
+    let top_right = Vertex {
+        position: to_ndc(width, height, right, top),
+        color,
+        uv: [cell_advance, ascender],
+        effect,
+        glyph: 0.0,
+        glyph_data,
+    };
+    let bottom_right = Vertex {
+        position: to_ndc(width, height, right, bottom),
+        color,
+        uv: [cell_advance, descender],
+        effect,
+        glyph: 0.0,
+        glyph_data,
+    };
+    let bottom_left = Vertex {
+        position: to_ndc(width, height, left, bottom),
+        color,
+        uv: [0.0, descender],
+        effect,
+        glyph: 0.0,
+        glyph_data,
+    };
+
+    vertices.extend_from_slice(&[
+        top_left,
+        top_right,
+        bottom_right,
+        top_left,
+        bottom_right,
+        bottom_left,
+    ]);
 }
 
 fn append_rect(
@@ -1146,6 +1329,7 @@ fn append_rect(
         uv: [0.0, 0.0],
         effect,
         glyph,
+        glyph_data: [0.0; 4],
     };
     let top_right = Vertex {
         position: to_ndc(width, height, right, top),
@@ -1153,6 +1337,7 @@ fn append_rect(
         uv: [1.0, 0.0],
         effect,
         glyph,
+        glyph_data: [0.0; 4],
     };
     let bottom_right = Vertex {
         position: to_ndc(width, height, right, bottom),
@@ -1160,6 +1345,7 @@ fn append_rect(
         uv: [1.0, 1.0],
         effect,
         glyph,
+        glyph_data: [0.0; 4],
     };
     let bottom_left = Vertex {
         position: to_ndc(width, height, left, bottom),
@@ -1167,6 +1353,7 @@ fn append_rect(
         uv: [0.0, 1.0],
         effect,
         glyph,
+        glyph_data: [0.0; 4],
     };
 
     vertices.extend_from_slice(&[
@@ -1204,7 +1391,10 @@ fn transition_barrier(
 
 #[cfg(test)]
 mod tests {
-    use super::{RenderScene, push_centered_text, push_text_block};
+    use super::{
+        FALLBACK_GLYPH, PanelEffect, RenderScene, append_rect, collect_scene_chars,
+        push_centered_text, push_glyph, push_text_block,
+    };
     use windows::Win32::Foundation::RECT;
 
     #[test]
@@ -1249,5 +1439,64 @@ mod tests {
         );
 
         assert_eq!(scene.glyphs.len(), 1);
+    }
+
+    #[test]
+    fn append_rect_preserves_text_effect_and_glyph_index_order() {
+        let mut vertices = Vec::new();
+        append_rect(
+            &mut vertices,
+            100.0,
+            50.0,
+            RECT {
+                left: 0,
+                top: 0,
+                right: 10,
+                bottom: 20,
+            },
+            [1.0, 1.0, 1.0, 1.0],
+            PanelEffect::Text as u32,
+            u32::from('A'),
+        );
+
+        assert_eq!(vertices.len(), 6);
+        assert_eq!(vertices[0].effect, PanelEffect::Text as u32 as f32);
+        assert_eq!(vertices[0].glyph, u32::from('A') as f32);
+    }
+
+    #[test]
+    fn collect_scene_atlas_chars_keeps_fallback_and_unicode_glyphs() {
+        let mut scene = RenderScene {
+            panels: Vec::new(),
+            glyphs: Vec::new(),
+        };
+        push_glyph(
+            &mut scene,
+            RECT {
+                left: 0,
+                top: 0,
+                right: 10,
+                bottom: 10,
+            },
+            '❯',
+            [1.0, 1.0, 1.0, 1.0],
+        );
+        push_glyph(
+            &mut scene,
+            RECT {
+                left: 10,
+                top: 0,
+                right: 20,
+                bottom: 10,
+            },
+            'A',
+            [1.0, 1.0, 1.0, 1.0],
+        );
+
+        let atlas_chars = collect_scene_chars(&scene);
+
+        assert_eq!(atlas_chars[0], FALLBACK_GLYPH);
+        assert!(atlas_chars.contains(&'❯'));
+        assert!(atlas_chars.contains(&'A'));
     }
 }

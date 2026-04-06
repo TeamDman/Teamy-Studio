@@ -34,9 +34,11 @@ open = "5"
 
 [target.'cfg(windows)'.dependencies]
 crossterm = "0.29"
+fontdb = "0.23"
 libghostty-vt = { git = "https://github.com/TeamDman/libghostty-rs.git", rev = "5e5351c9dc4b800202721ce15017c929958f685d" }
 portable-pty = "0.9"
 teamy-windows = "0.11.1"
+ttf-parser = "0.25"
 
 [target.'cfg(windows)'.dependencies.windows]
 version = "0.62.2"

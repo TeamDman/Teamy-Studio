@@ -10,14 +10,15 @@ use windows::Win32::Graphics::Gdi::{
     BeginPaint, CLEARTYPE_QUALITY, CreateFontIndirectW, DeleteObject, EndPaint, GetDC,
     GetTextExtentPoint32W, HFONT, LOGFONTW, PAINTSTRUCT, ReleaseDC, SelectObject,
 };
+use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_CONTROL};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect,
     GetSystemMetrics, GetWindowRect, HTCAPTION, HTCLIENT, IDC_ARROW, LoadCursorW, MSG, PM_REMOVE,
     PeekMessageW, PostQuitMessage, RegisterClassExW, SM_CXSCREEN, SM_CYSCREEN, SW_SHOW, SetTimer,
     ShowWindow, TranslateMessage, WM_CHAR, WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_KEYUP,
-    WM_LBUTTONUP, WM_NCHITTEST, WM_PAINT, WM_QUIT, WM_SIZE, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER,
-    WNDCLASSEXW, WS_EX_APPWINDOW, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP, WS_THICKFRAME,
-    WS_VISIBLE,
+    WM_LBUTTONUP, WM_MOUSEWHEEL, WM_NCHITTEST, WM_PAINT, WM_QUIT, WM_SIZE, WM_SYSKEYDOWN,
+    WM_SYSKEYUP, WM_TIMER, WNDCLASSEXW, WS_EX_APPWINDOW, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP,
+    WS_THICKFRAME, WS_VISIBLE,
 };
 use windows::core::{PCWSTR, w};
 
@@ -25,7 +26,7 @@ use crate::paths::AppHome;
 
 use super::WorkspaceWindowState;
 use super::windows_d3d12_renderer::{
-    D3d12PanelRenderer, build_panel_scene, push_centered_text, push_text_block,
+    D3d12PanelRenderer, build_panel_scene, push_centered_text, push_glyph, push_text_block,
 };
 use super::windows_terminal::{
     POLL_INTERVAL_MS, POLL_TIMER_ID, TerminalLayout, TerminalSession, keyboard_mods,
@@ -33,8 +34,11 @@ use super::windows_terminal::{
 
 const WINDOW_CLASS_NAME: PCWSTR = w!("TeamyStudioTerminalWindow");
 const WINDOW_TITLE: &str = "Teamy Studio Terminal";
-const FONT_HEIGHT: i32 = -20;
+const FONT_HEIGHT: i32 = -32;
 const FONT_FAMILY: &str = "CaskaydiaCove Nerd Font Mono";
+const MIN_FONT_HEIGHT: i32 = -12;
+const MAX_FONT_HEIGHT: i32 = -72;
+const FONT_ZOOM_STEP: i32 = 2;
 const INITIAL_WINDOW_WIDTH: i32 = 1040;
 const INITIAL_WINDOW_HEIGHT: i32 = 680;
 
@@ -46,6 +50,7 @@ struct AppState {
     app_home: AppHome,
     hwnd: Option<HWND>,
     workspace_window: Option<WorkspaceWindowState>,
+    font_height: i32,
     cell_width: i32,
     cell_height: i32,
     terminal: TerminalSession,
@@ -73,7 +78,8 @@ pub fn run(
     working_dir: Option<&Path>,
     workspace_window: Option<WorkspaceWindowState>,
 ) -> eyre::Result<()> {
-    let (cell_width, cell_height) = measure_terminal_cell_size()?;
+    let font_height = FONT_HEIGHT;
+    let (cell_width, cell_height) = measure_terminal_cell_size(font_height)?;
     let terminal = TerminalSession::new(app_home, working_dir)?;
 
     APP_STATE.with(|state| {
@@ -81,6 +87,7 @@ pub fn run(
             app_home: app_home.clone(),
             hwnd: None,
             workspace_window,
+            font_height,
             cell_width,
             cell_height,
             terminal,
@@ -305,6 +312,16 @@ extern "system" fn window_proc(
             }
             Err(error) => fail_and_close(hwnd, error),
         },
+        WM_MOUSEWHEEL => match handle_mouse_wheel(hwnd, wparam, lparam) {
+            Ok(handled) => {
+                if handled {
+                    LRESULT(0)
+                } else {
+                    unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
+                }
+            }
+            Err(error) => fail_and_close(hwnd, error),
+        },
         WM_NCHITTEST => {
             // cli[impl window.interaction.drag]
             let default_hit = unsafe { DefWindowProcW(hwnd, message, wparam, lparam) };
@@ -360,7 +377,7 @@ fn render_frame() -> eyre::Result<()> {
             .as_ref()
             .map_or(1, |workspace_window| workspace_window.cell_number);
         let output_text = build_output_panel_text(state);
-        let terminal_text = state.terminal.visible_text()?;
+        let terminal_glyphs = state.terminal.visible_glyphs()?;
 
         push_centered_text(
             &mut scene,
@@ -368,14 +385,18 @@ fn render_frame() -> eyre::Result<()> {
             &cell_number.to_string(),
             [0.95, 0.95, 0.98, 1.0],
         );
-        push_text_block(
-            &mut scene,
-            inset_rect(layout.terminal_rect(), 4),
-            &terminal_text,
-            state.cell_width,
-            state.cell_height,
-            [0.95, 0.95, 0.98, 1.0],
-        );
+        let terminal_rect = inset_rect(layout.terminal_rect(), 4);
+        for glyph in terminal_glyphs {
+            let left = terminal_rect.left + (glyph.column * state.cell_width);
+            let top = terminal_rect.top + (glyph.row * state.cell_height);
+            let rect = RECT {
+                left,
+                top,
+                right: left + state.cell_width,
+                bottom: top + state.cell_height,
+            };
+            push_glyph(&mut scene, rect, glyph.character, glyph.color);
+        }
         push_text_block(
             &mut scene,
             inset_rect(layout.result_panel_rect(), 14),
@@ -420,8 +441,8 @@ fn inset_rect(rect: RECT, amount: i32) -> RECT {
     }
 }
 
-fn measure_terminal_cell_size() -> eyre::Result<(i32, i32)> {
-    let font_definition = terminal_font_definition();
+fn measure_terminal_cell_size(font_height: i32) -> eyre::Result<(i32, i32)> {
+    let font_definition = terminal_font_definition(font_height);
     let font = unsafe { CreateFontIndirectW(&font_definition) };
     if font.0.is_null() {
         eyre::bail!("failed to create terminal font")
@@ -449,9 +470,9 @@ fn measure_terminal_cell_size() -> eyre::Result<(i32, i32)> {
     Ok((size.cx.max(8), size.cy.max(16)))
 }
 
-fn terminal_font_definition() -> LOGFONTW {
+fn terminal_font_definition(font_height: i32) -> LOGFONTW {
     let mut font = LOGFONTW {
-        lfHeight: FONT_HEIGHT,
+        lfHeight: font_height,
         lfQuality: CLEARTYPE_QUALITY,
         ..Default::default()
     };
@@ -459,6 +480,42 @@ fn terminal_font_definition() -> LOGFONTW {
         *slot = value;
     }
     font
+}
+
+fn handle_mouse_wheel(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) -> eyre::Result<bool> {
+    let ctrl_down = unsafe { (GetKeyState(i32::from(VK_CONTROL.0)) & (0x8000_u16 as i16)) != 0 };
+    if !ctrl_down {
+        return Ok(false);
+    }
+
+    with_app_state(|state| {
+        let layout = client_layout(hwnd, state.cell_width, state.cell_height)?;
+        let point = screen_to_client_point(hwnd, lparam)?;
+        if !point_in_rect(point, layout.terminal_rect()) {
+            return Ok(false);
+        }
+
+        let wheel_delta = ((wparam.0 >> 16) & 0xFFFF) as i16;
+        if wheel_delta == 0 {
+            return Ok(true);
+        }
+
+        let zoom_direction = if wheel_delta > 0 { -1 } else { 1 };
+        let next_font_height = (state.font_height + (zoom_direction * FONT_ZOOM_STEP))
+            .clamp(MAX_FONT_HEIGHT, MIN_FONT_HEIGHT);
+        if next_font_height == state.font_height {
+            return Ok(true);
+        }
+
+        let (cell_width, cell_height) = measure_terminal_cell_size(next_font_height)?;
+        state.font_height = next_font_height;
+        state.cell_width = cell_width;
+        state.cell_height = cell_height;
+
+        let layout = client_layout(hwnd, state.cell_width, state.cell_height)?;
+        state.terminal.resize(layout)?;
+        Ok(true)
+    })
 }
 
 fn client_layout(hwnd: HWND, cell_width: i32, cell_height: i32) -> eyre::Result<TerminalLayout> {
