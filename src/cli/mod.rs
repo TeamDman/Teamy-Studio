@@ -1,10 +1,12 @@
 pub mod facet_shape;
 pub mod global_args;
 pub mod self_test;
+pub mod shell;
 pub mod window;
 
 use crate::cli::global_args::GlobalArgs;
 use crate::cli::self_test::SelfTestArgs;
+use crate::cli::shell::ShellArgs;
 use crate::cli::window::WindowArgs;
 use arbitrary::Arbitrary;
 use eyre::Context;
@@ -12,7 +14,14 @@ use facet::Facet;
 use figue::FigueBuiltins;
 use figue::{self as args};
 
-/// Teamy Studio launches a desktop window by default and exposes a small window command surface.
+/// Teamy Studio launches a desktop window by default and exposes shell, self-test, and window commands.
+/// tool[impl cli.help.describes-behavior]
+/// tool[impl cli.help.describes-shell]
+/// tool[impl cli.help.describes-self-test]
+/// tool[impl cli.help.describes-environment]
+/// tool[impl cli.help.describes-argv]
+/// cli[impl parser.args-consistent]
+/// cli[impl parser.roundtrip]
 ///
 /// Environment variables:
 /// - `TEAMY_STUDIO_HOME_DIR` overrides the resolved application home directory.
@@ -46,14 +55,15 @@ impl Cli {
     ///
     /// This function will return an error if the tokio runtime cannot be built or if the command fails.
     pub fn invoke(self) -> eyre::Result<()> {
+        let app_home = crate::paths::APP_HOME.clone();
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .wrap_err("Failed to build tokio runtime")?;
         runtime.block_on(async move {
             match self.command {
-                Some(command) => command.invoke().await,
-                None => crate::app::run(),
+                Some(command) => command.invoke(&app_home).await,
+                None => crate::app::run(&app_home),
             }
         })?;
         Ok(())
@@ -61,23 +71,33 @@ impl Cli {
 }
 
 /// Teamy Studio commands.
+/// tool[impl cli.surface.shell]
+/// tool[impl cli.surface.self-test]
+/// tool[impl cli.surface.window]
 #[derive(Facet, Arbitrary, Debug, PartialEq)]
 #[repr(u8)]
 pub enum Command {
+    /// cli[impl command.surface.shell]
+    /// Launch or configure the default shell.
+    Shell(ShellArgs),
+    /// cli[impl command.surface.self-test]
     /// Run reproducible self-tests.
     SelfTest(SelfTestArgs),
+    /// cli[impl command.surface.window]
     /// Launch window-related behaviors.
     Window(WindowArgs),
 }
 
 impl Command {
+    /// cli[impl command.surface.core]
     /// # Errors
     ///
     /// This function will return an error if the subcommand fails.
-    pub async fn invoke(self) -> eyre::Result<()> {
+    pub async fn invoke(self, app_home: &crate::paths::AppHome) -> eyre::Result<()> {
         match self {
-            Command::SelfTest(args) => args.invoke().await,
-            Command::Window(args) => args.invoke().await,
+            Command::Shell(args) => args.invoke(app_home).await,
+            Command::SelfTest(args) => args.invoke(app_home).await,
+            Command::Window(args) => args.invoke(app_home).await,
         }
     }
 }

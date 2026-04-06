@@ -6,21 +6,21 @@ use tracing::{debug, info};
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, SIZE, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, BitBlt, CLEARTYPE_QUALITY, CreateCompatibleBitmap, CreateCompatibleDC,
-    CreateFontIndirectW, DeleteDC, DeleteObject, EndPaint, GetDC, GetTextExtentPoint32W,
-    HBITMAP, HDC, HGDIOBJ, HFONT, InvalidateRect, LOGFONTW, PAINTSTRUCT, ReleaseDC, SRCCOPY,
-    SelectObject,
+    CreateFontIndirectW, DeleteDC, DeleteObject, EndPaint, GetDC, GetTextExtentPoint32W, HBITMAP,
+    HDC, HFONT, HGDIOBJ, InvalidateRect, LOGFONTW, PAINTSTRUCT, ReleaseDC, SRCCOPY, SelectObject,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
-    GetClientRect, GetSystemMetrics, GetWindowRect, HTCAPTION, HTCLIENT, IDC_ARROW, LWA_ALPHA,
-    LoadCursorW, MSG, PostQuitMessage, RegisterClassExW, SM_CXSCREEN, SM_CYSCREEN, SW_SHOW,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect, GetMessageW,
+    GetSystemMetrics, GetWindowRect, HTCAPTION, HTCLIENT, IDC_ARROW, LWA_ALPHA, LoadCursorW, MSG,
+    PostQuitMessage, RegisterClassExW, SM_CXSCREEN, SM_CYSCREEN, SW_SHOW,
     SetLayeredWindowAttributes, SetTimer, ShowWindow, TranslateMessage, WM_CHAR, WM_DESTROY,
     WM_ERASEBKGND, WM_KEYDOWN, WM_KEYUP, WM_NCHITTEST, WM_PAINT, WM_SIZE, WM_SYSKEYDOWN,
-    WM_SYSKEYUP, WM_TIMER, WNDCLASSEXW,
-    WS_EX_APPWINDOW, WS_EX_LAYERED, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP, WS_THICKFRAME,
-    WS_VISIBLE,
+    WM_SYSKEYUP, WM_TIMER, WNDCLASSEXW, WS_EX_APPWINDOW, WS_EX_LAYERED, WS_MAXIMIZEBOX,
+    WS_MINIMIZEBOX, WS_POPUP, WS_THICKFRAME, WS_VISIBLE,
 };
 use windows::core::{PCWSTR, w};
+
+use crate::paths::AppHome;
 
 use super::windows_terminal::{
     DRAG_STRIP_HEIGHT, POLL_INTERVAL_MS, POLL_TIMER_ID, TerminalLayout, TerminalSession,
@@ -80,13 +80,16 @@ impl Drop for SelectObjectGuard {
 }
 
 /// Launch the Teamy Studio terminal window and block until it closes.
+/// cli[impl window.startup.centered]
+/// cli[impl window.startup.size]
+/// cli[impl window.appearance.translucent]
 ///
 /// # Errors
 ///
 /// This function will return an error if the window class, font, terminal session, or message loop fails.
-pub fn run() -> eyre::Result<()> {
+pub fn run(app_home: &AppHome) -> eyre::Result<()> {
     let (font, cell_width, cell_height) = create_terminal_font()?;
-    let terminal = TerminalSession::new()?;
+    let terminal = TerminalSession::new(app_home)?;
 
     APP_STATE.with(|state| {
         *state.borrow_mut() = Some(AppState {
@@ -183,7 +186,12 @@ fn message_loop() -> eyre::Result<()> {
     Ok(())
 }
 
-extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+extern "system" fn window_proc(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
     match message {
         WM_SIZE => match with_app_state(|state| {
             let layout = client_layout(hwnd, state.cell_width, state.cell_height)?;
@@ -197,50 +205,64 @@ extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam:
             }
             Err(error) => fail_and_close(hwnd, error),
         },
-        WM_TIMER if wparam.0 == POLL_TIMER_ID => match with_app_state(|state| state.terminal.pump()) {
-            Ok(result) => {
-                if result.needs_repaint {
-                    unsafe {
-                        let _ = InvalidateRect(Some(hwnd), None, false);
+        WM_TIMER if wparam.0 == POLL_TIMER_ID => {
+            match with_app_state(|state| state.terminal.pump()) {
+                Ok(result) => {
+                    if result.needs_repaint {
+                        unsafe {
+                            let _ = InvalidateRect(Some(hwnd), None, false);
+                        }
                     }
-                }
-                if result.should_close {
-                    unsafe {
-                        let _ = DestroyWindow(hwnd);
+                    if result.should_close {
+                        unsafe {
+                            let _ = DestroyWindow(hwnd);
+                        }
                     }
+                    LRESULT(0)
                 }
-                LRESULT(0)
+                Err(error) => fail_and_close(hwnd, error),
             }
-            Err(error) => fail_and_close(hwnd, error),
-        },
-        WM_CHAR => match with_app_state(|state| state.terminal.handle_char(wparam.0 as u32, lparam.0)) {
-            Ok(consumed) => {
-                debug!(
-                    message = "WM_CHAR",
-                    code_unit = wparam.0 as u32,
-                    lparam = lparam.0,
-                    consumed,
-                    "processed keyboard char message"
-                );
-                if consumed {
-                    unsafe {
-                        let _ = InvalidateRect(Some(hwnd), None, false);
+        }
+        WM_CHAR => {
+            // cli[impl window.interaction.input]
+            match with_app_state(|state| state.terminal.handle_char(wparam.0 as u32, lparam.0)) {
+                Ok(consumed) => {
+                    debug!(
+                        message = "WM_CHAR",
+                        code_unit = wparam.0 as u32,
+                        lparam = lparam.0,
+                        consumed,
+                        "processed keyboard char message"
+                    );
+                    if consumed {
+                        unsafe {
+                            let _ = InvalidateRect(Some(hwnd), None, false);
+                        }
+                        return LRESULT(0);
                     }
-                    return LRESULT(0);
+                    unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
                 }
-                unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
+                Err(error) => fail_and_close(hwnd, error),
             }
-            Err(error) => fail_and_close(hwnd, error),
-        },
+        }
         WM_KEYDOWN | WM_SYSKEYDOWN => match with_app_state(|state| {
+            // cli[impl window.interaction.input]
             let was_down = ((lparam.0 >> 30) & 1) != 0;
-            state
-                .terminal
-                .handle_key_event(wparam.0 as u32, lparam.0, was_down, false, keyboard_mods(wparam.0 as u32, lparam.0, false))
+            state.terminal.handle_key_event(
+                wparam.0 as u32,
+                lparam.0,
+                was_down,
+                false,
+                keyboard_mods(wparam.0 as u32, lparam.0, false),
+            )
         }) {
             Ok(consumed) => {
                 debug!(
-                    message = if message == WM_SYSKEYDOWN { "WM_SYSKEYDOWN" } else { "WM_KEYDOWN" },
+                    message = if message == WM_SYSKEYDOWN {
+                        "WM_SYSKEYDOWN"
+                    } else {
+                        "WM_KEYDOWN"
+                    },
                     vkey = wparam.0 as u32,
                     lparam = lparam.0,
                     was_down = ((lparam.0 >> 30) & 1) != 0,
@@ -258,13 +280,22 @@ extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam:
             Err(error) => fail_and_close(hwnd, error),
         },
         WM_KEYUP | WM_SYSKEYUP => match with_app_state(|state| {
-            state
-                .terminal
-                .handle_key_event(wparam.0 as u32, lparam.0, false, true, keyboard_mods(wparam.0 as u32, lparam.0, true))
+            // cli[impl window.interaction.input]
+            state.terminal.handle_key_event(
+                wparam.0 as u32,
+                lparam.0,
+                false,
+                true,
+                keyboard_mods(wparam.0 as u32, lparam.0, true),
+            )
         }) {
             Ok(consumed) => {
                 debug!(
-                    message = if message == WM_SYSKEYUP { "WM_SYSKEYUP" } else { "WM_KEYUP" },
+                    message = if message == WM_SYSKEYUP {
+                        "WM_SYSKEYUP"
+                    } else {
+                        "WM_KEYUP"
+                    },
                     vkey = wparam.0 as u32,
                     lparam = lparam.0,
                     consumed,
@@ -285,6 +316,7 @@ extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam:
             Err(error) => fail_and_close(hwnd, error),
         },
         WM_NCHITTEST => {
+            // cli[impl window.interaction.drag]
             let default_hit = unsafe { DefWindowProcW(hwnd, message, wparam, lparam) };
             if default_hit.0 != isize::try_from(HTCLIENT).expect("HTCLIENT fits in isize") {
                 return default_hit;
@@ -313,6 +345,7 @@ extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam:
 }
 
 fn paint_window(hwnd: HWND) -> eyre::Result<()> {
+    // cli[impl window.appearance.chrome]
     let mut paint = PAINTSTRUCT::default();
     let hdc = unsafe { BeginPaint(hwnd, &mut paint) };
     if hdc.0.is_null() {
@@ -322,7 +355,8 @@ fn paint_window(hwnd: HWND) -> eyre::Result<()> {
     let result = with_app_state(|state| {
         let layout = client_layout(hwnd, state.cell_width, state.cell_height)?;
         let buffer_dc = create_memory_dc(hdc)?;
-        let buffer_bitmap = create_compatible_bitmap(hdc, layout.client_width, layout.client_height)?;
+        let buffer_bitmap =
+            create_compatible_bitmap(hdc, layout.client_width, layout.client_height)?;
         let previous_bitmap = unsafe { SelectObject(buffer_dc.0, buffer_bitmap.0.into()) };
         let _bitmap_guard = SelectObjectGuard {
             hdc: buffer_dc.0,
@@ -416,7 +450,11 @@ fn terminal_font_definition() -> LOGFONTW {
         lfQuality: CLEARTYPE_QUALITY,
         ..Default::default()
     };
-    for (slot, value) in font.lfFaceName.iter_mut().zip("Cascadia Mono".encode_utf16()) {
+    for (slot, value) in font
+        .lfFaceName
+        .iter_mut()
+        .zip("Cascadia Mono".encode_utf16())
+    {
         *slot = value;
     }
     font

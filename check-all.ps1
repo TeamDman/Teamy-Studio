@@ -14,6 +14,8 @@ function Invoke-Step {
 }
 
 function Get-NonTracyTestFeatureArgs {
+	# tool[impl tests.exclude-tracy-feature]
+	# tool[impl tests.avoid-tracy-firewall-prompt]
 	$metadata = cargo metadata --no-deps --format-version 1 | ConvertFrom-Json
 	$pkg = if ($metadata.packages.Count -eq 1) {
 		$metadata.packages[0]

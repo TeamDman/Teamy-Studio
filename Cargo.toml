@@ -4,7 +4,9 @@ version = "0.1.0"
 edition = "2024"
 authors = ["TeamDman"]
 default-run = "teamy-studio"
+# repo[impl description.meaningful]
 description = "Teamy Studio desktop shell with a low-latency Win32 startup path"
+# repo[impl license.present]
 license = "MPL-2.0"
 readme = "README.md"
 repository = "https://github.com/TeamDman/Teamy-Studio"

@@ -14,6 +14,12 @@ use tracing_subscriber::prelude::*;
 use tracing_subscriber::util::SubscriberInitExt;
 
 /// Initialize logging based on the provided configuration.
+/// tool[impl logging.stderr-output]
+/// tool[impl logging.file-path-option]
+/// tool[impl logging.file-structured-ndjson]
+/// tool[impl logging.filter.from-env]
+/// tool[impl logging.filter.defaults]
+/// tool[impl logging.filter.debug-conflicts-with-log-filter]
 ///
 /// # Errors
 ///

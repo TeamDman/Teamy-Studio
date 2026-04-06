@@ -24,6 +24,7 @@ impl CacheHome {
     /// Resolve the `CacheHome` according to:
     /// * If [`super::APP_CACHE_ENV_VAR`] env var is set, use that directory
     /// * Otherwise use the platform `ProjectDirs::cache_dir()`
+    /// cli[impl path.cache.env-overrides-platform]
     ///
     /// # Errors
     ///

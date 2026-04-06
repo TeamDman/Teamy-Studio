@@ -7,9 +7,8 @@ fn main() -> eyre::Result<()> {
 
     use eyre::Context;
     use windows::Win32::System::Console::{
-        CONSOLE_MODE,
-        ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT, ENABLE_QUICK_EDIT_MODE, ENABLE_WINDOW_INPUT,
-        GetConsoleMode, GetStdHandle, STD_INPUT_HANDLE, SetConsoleMode,
+        CONSOLE_MODE, ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT, ENABLE_QUICK_EDIT_MODE,
+        ENABLE_WINDOW_INPUT, GetConsoleMode, GetStdHandle, STD_INPUT_HANDLE, SetConsoleMode,
     };
 
     let event_limit = std::env::var("TEAMY_KEY_PROBE_EVENT_LIMIT")
@@ -17,11 +16,10 @@ fn main() -> eyre::Result<()> {
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(16);
 
-    let input = unsafe { GetStdHandle(STD_INPUT_HANDLE) }
-        .wrap_err("failed to get console input handle")?;
+    let input =
+        unsafe { GetStdHandle(STD_INPUT_HANDLE) }.wrap_err("failed to get console input handle")?;
     let mut original_mode = CONSOLE_MODE(0);
-    unsafe { GetConsoleMode(input, &mut original_mode) }
-        .wrap_err("failed to read console mode")?;
+    unsafe { GetConsoleMode(input, &mut original_mode) }.wrap_err("failed to read console mode")?;
 
     let raw_mode = (original_mode | ENABLE_WINDOW_INPUT)
         & !(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_QUICK_EDIT_MODE);
@@ -69,7 +67,9 @@ impl Drop for ConsoleModeGuard {
     fn drop(&mut self) {
         print!("\x1b[?9001l");
         let _ = std::io::stdout().flush();
-        let _ = unsafe { windows::Win32::System::Console::SetConsoleMode(self.input, self.original_mode) };
+        let _ = unsafe {
+            windows::Win32::System::Console::SetConsoleMode(self.input, self.original_mode)
+        };
     }
 }
 
@@ -105,14 +105,20 @@ fn should_skip_event(event: &windows::Win32::System::Console::KEY_EVENT_RECORD) 
 }
 
 #[cfg(windows)]
-fn format_key_event(index: usize, event: &windows::Win32::System::Console::KEY_EVENT_RECORD) -> String {
+fn format_key_event(
+    index: usize,
+    event: &windows::Win32::System::Console::KEY_EVENT_RECORD,
+) -> String {
     use windows::Win32::System::Console::{
-        LEFT_ALT_PRESSED, LEFT_CTRL_PRESSED, RIGHT_ALT_PRESSED, RIGHT_CTRL_PRESSED,
-        SHIFT_PRESSED,
+        LEFT_ALT_PRESSED, LEFT_CTRL_PRESSED, RIGHT_ALT_PRESSED, RIGHT_CTRL_PRESSED, SHIFT_PRESSED,
     };
 
     let control_state = event.dwControlKeyState;
-    let direction = if event.bKeyDown.as_bool() { "DOWN" } else { "UP" };
+    let direction = if event.bKeyDown.as_bool() {
+        "DOWN"
+    } else {
+        "UP"
+    };
     let unicode = unsafe { event.uChar.UnicodeChar };
 
     format!(

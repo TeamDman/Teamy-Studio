@@ -14,11 +14,13 @@ use windows::Win32::Foundation::{COLORREF, RECT};
 use windows::Win32::Graphics::Gdi::{
     CreateSolidBrush, DeleteObject, FillRect, HDC, SetBkMode, SetTextColor, TRANSPARENT, TextOutW,
 };
-use windows::Win32::UI::Input::KeyboardAndMouse::GetKeyState;
 use windows::Win32::System::Console::{
     CAPSLOCK_ON, LEFT_ALT_PRESSED, LEFT_CTRL_PRESSED, NUMLOCK_ON, RIGHT_ALT_PRESSED,
     RIGHT_CTRL_PRESSED, SHIFT_PRESSED,
 };
+use windows::Win32::UI::Input::KeyboardAndMouse::GetKeyState;
+
+use crate::paths::AppHome;
 
 pub const DRAG_STRIP_HEIGHT: i32 = 38;
 pub const WINDOW_PADDING: i32 = 12;
@@ -133,8 +135,12 @@ impl TerminalLayout {
 }
 
 impl TerminalSession {
-    pub fn new() -> eyre::Result<Self> {
-        Self::new_with_command(default_shell_command())
+    /// cli[impl window.appearance.shell]
+    /// cli[impl window.appearance.shell-configured-default]
+    pub fn new(app_home: &AppHome) -> eyre::Result<Self> {
+        Self::new_with_command(crate::shell_default::load_effective_command_builder(
+            app_home,
+        )?)
     }
 
     pub fn new_with_command(shell: CommandBuilder) -> eyre::Result<Self> {
@@ -149,11 +155,10 @@ impl TerminalSession {
             .openpty(initial_size)
             .map_err(|error| eyre::eyre!("failed to open pseudoterminal: {error}"))?;
 
-        let writer: Arc<Mutex<PtyWriter>> = Arc::new(Mutex::new(
-            pair.master
-                .take_writer()
-                .map_err(|error| eyre::eyre!("failed to open PTY writer: {error}"))?,
-        ));
+        let writer: Arc<Mutex<PtyWriter>> =
+            Arc::new(Mutex::new(pair.master.take_writer().map_err(|error| {
+                eyre::eyre!("failed to open PTY writer: {error}")
+            })?));
         let writer_for_effect = Arc::clone(&writer);
 
         let mut terminal = Terminal::new(TerminalOptions {
@@ -171,7 +176,13 @@ impl TerminalSession {
             })
             .wrap_err("failed to register PTY write effect")?;
 
-        info!(program = shell.get_argv().first().map_or_else(|| "<unknown>".to_owned(), |arg| arg.to_string_lossy().into_owned()), "starting Teamy Studio PTY child");
+        info!(
+            program = shell.get_argv().first().map_or_else(
+                || "<unknown>".to_owned(),
+                |arg| arg.to_string_lossy().into_owned()
+            ),
+            "starting Teamy Studio PTY child"
+        );
         let child = pair
             .slave
             .spawn_command(shell)
@@ -282,7 +293,12 @@ impl TerminalSession {
             }
         }
 
-        if self.child.try_wait().wrap_err("failed to query shell status")?.is_some() {
+        if self
+            .child
+            .try_wait()
+            .wrap_err("failed to query shell status")?
+            .is_some()
+        {
             self.closed = true;
         }
 
@@ -313,7 +329,10 @@ impl TerminalSession {
                 .is_some_and(|suppressed| suppressed.matches(code_unit))
         {
             self.suppressed_chars.pop_front();
-            debug!(code_unit, "suppressed legacy WM_CHAR after handled key event");
+            debug!(
+                code_unit,
+                "suppressed legacy WM_CHAR after handled key event"
+            );
             return Ok(true);
         }
 
@@ -448,7 +467,9 @@ impl TerminalSession {
 
             self.write_input(&legacy_special_key_bytes(mapped_key, mods).unwrap_or_default())?;
             self.needs_repaint = true;
-            return Ok(!legacy_special_key_bytes(mapped_key, mods).unwrap_or_default().is_empty());
+            return Ok(!legacy_special_key_bytes(mapped_key, mods)
+                .unwrap_or_default()
+                .is_empty());
         }
 
         let action = if is_release {
@@ -519,10 +540,14 @@ impl TerminalSession {
         let mut cells = CellIterator::new().wrap_err("failed to create cell iterator")?;
         let mut lines = Vec::new();
 
-        let mut row_iter = rows.update(&snapshot).wrap_err("failed to update row iterator")?;
+        let mut row_iter = rows
+            .update(&snapshot)
+            .wrap_err("failed to update row iterator")?;
         while let Some(row) = row_iter.next() {
             let mut line = String::new();
-            let mut cell_iter = cells.update(row).wrap_err("failed to update cell iterator")?;
+            let mut cell_iter = cells
+                .update(row)
+                .wrap_err("failed to update cell iterator")?;
             while let Some(cell) = cell_iter.next() {
                 let graphemes = cell.graphemes().wrap_err("failed to read cell text")?;
                 if graphemes.is_empty() {
@@ -539,12 +564,19 @@ impl TerminalSession {
         Ok(lines.join("\n"))
     }
 
-    pub fn paint(&mut self, hdc: HDC, layout: TerminalLayout, overlay_text: &str) -> eyre::Result<()> {
+    pub fn paint(
+        &mut self,
+        hdc: HDC,
+        layout: TerminalLayout,
+        overlay_text: &str,
+    ) -> eyre::Result<()> {
         let snapshot = self
             .render_state
             .update(&self.terminal)
             .wrap_err("failed to update terminal render state")?;
-        let colors = snapshot.colors().wrap_err("failed to fetch terminal colors")?;
+        let colors = snapshot
+            .colors()
+            .wrap_err("failed to fetch terminal colors")?;
         let mut rows = RowIterator::new().wrap_err("failed to create row iterator")?;
         let mut cells = CellIterator::new().wrap_err("failed to create cell iterator")?;
         let rect = layout.terminal_rect();
@@ -560,7 +592,9 @@ impl TerminalSession {
         }
 
         let mut row_index = 0_i32;
-        let mut row_iter = rows.update(&snapshot).wrap_err("failed to update row iterator")?;
+        let mut row_iter = rows
+            .update(&snapshot)
+            .wrap_err("failed to update row iterator")?;
         while let Some(row) = row_iter.next() {
             let row_is_dirty = row.dirty().wrap_err("failed to read row dirty flag")?;
             let should_paint_row = self.full_repaint_pending || row_is_dirty;
@@ -578,7 +612,9 @@ impl TerminalSession {
             }
 
             let mut column_index = 0_i32;
-            let mut cell_iter = cells.update(row).wrap_err("failed to update cell iterator")?;
+            let mut cell_iter = cells
+                .update(row)
+                .wrap_err("failed to update cell iterator")?;
 
             while let Some(cell) = cell_iter.next() {
                 if !should_paint_row {
@@ -632,8 +668,17 @@ impl TerminalSession {
             .wrap_err("failed to clear render dirty state")?;
 
         if snapshot.cursor_visible().unwrap_or(false) {
-            if let Some(cursor) = snapshot.cursor_viewport().wrap_err("failed to fetch cursor")? {
-                paint_cursor(hdc, layout, rect, cursor, colors.cursor.unwrap_or(colors.foreground))?;
+            if let Some(cursor) = snapshot
+                .cursor_viewport()
+                .wrap_err("failed to fetch cursor")?
+            {
+                paint_cursor(
+                    hdc,
+                    layout,
+                    rect,
+                    cursor,
+                    colors.cursor.unwrap_or(colors.foreground),
+                )?;
             }
         }
 
@@ -652,7 +697,9 @@ impl TerminalSession {
             .writer
             .lock()
             .map_err(|_| eyre::eyre!("PTY writer mutex was poisoned"))?;
-        writer.write_all(data).wrap_err("failed to write input to PTY")?;
+        writer
+            .write_all(data)
+            .wrap_err("failed to write input to PTY")?;
         writer.flush().wrap_err("failed to flush PTY input")?;
         self.input_trace.push(data.to_vec());
         Ok(())
@@ -730,7 +777,8 @@ impl TerminalSession {
             if WIN32_INPUT_MODE_ENABLE.starts_with(&combined[index..])
                 || WIN32_INPUT_MODE_DISABLE.starts_with(&combined[index..])
             {
-                self.win32_input_mode_buffer.extend_from_slice(&combined[index..]);
+                self.win32_input_mode_buffer
+                    .extend_from_slice(&combined[index..]);
                 break;
             }
 
@@ -743,21 +791,6 @@ impl TerminalSession {
         }
 
         Cow::Owned(output)
-    }
-}
-
-fn default_shell_command() -> CommandBuilder {
-    #[cfg(windows)]
-    {
-        let shell = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_owned());
-        let mut command = CommandBuilder::new(shell);
-        command.arg("/D");
-        command
-    }
-
-    #[cfg(not(windows))]
-    {
-        CommandBuilder::new(std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_owned()))
     }
 }
 
@@ -814,21 +847,30 @@ fn map_virtual_key(vkey: u32, lparam: isize) -> Option<(key::Key, char)> {
         0xDC => Some((key::Key::Backslash, '\\')),
         0xDD => Some((key::Key::BracketRight, ']')),
         0xDE => Some((key::Key::Quote, '\'')),
-        0x10 => Some((if scancode == 0x36 {
-            key::Key::ShiftRight
-        } else {
-            key::Key::ShiftLeft
-        }, '\0')),
-        0x11 => Some((if extended {
-            key::Key::ControlRight
-        } else {
-            key::Key::ControlLeft
-        }, '\0')),
-        0x12 => Some((if extended {
-            key::Key::AltRight
-        } else {
-            key::Key::AltLeft
-        }, '\0')),
+        0x10 => Some((
+            if scancode == 0x36 {
+                key::Key::ShiftRight
+            } else {
+                key::Key::ShiftLeft
+            },
+            '\0',
+        )),
+        0x11 => Some((
+            if extended {
+                key::Key::ControlRight
+            } else {
+                key::Key::ControlLeft
+            },
+            '\0',
+        )),
+        0x12 => Some((
+            if extended {
+                key::Key::AltRight
+            } else {
+                key::Key::AltLeft
+            },
+            '\0',
+        )),
         0x08 => Some((key::Key::Backspace, '\0')),
         0x09 => Some((key::Key::Tab, '\0')),
         0x0D => Some((key::Key::Enter, '\0')),
@@ -854,11 +896,16 @@ fn should_route_key_through_char_input(
 ) -> bool {
     unshifted_codepoint != '\0'
         || (include_control_keys
-            && matches!(mapped_key, key::Key::Backspace | key::Key::Tab | key::Key::Enter))
+            && matches!(
+                mapped_key,
+                key::Key::Backspace | key::Key::Tab | key::Key::Enter
+            ))
 }
 
 fn repeat_count(lparam: isize) -> u16 {
-    u16::try_from((lparam as u64 & 0xFFFF) as u32).unwrap_or(1).max(1)
+    u16::try_from((lparam as u64 & 0xFFFF) as u32)
+        .unwrap_or(1)
+        .max(1)
 }
 
 pub fn keyboard_mods(vkey: u32, lparam: isize, is_release: bool) -> key::Mods {
@@ -977,7 +1024,11 @@ fn legacy_char_suppression(mapped_key: key::Key, unicode_char: char) -> Option<c
     }
 }
 
-fn legacy_key_event_character(mapped_key: key::Key, unshifted_codepoint: char, mods: key::Mods) -> Option<char> {
+fn legacy_key_event_character(
+    mapped_key: key::Key,
+    unshifted_codepoint: char,
+    mods: key::Mods,
+) -> Option<char> {
     match mapped_key {
         key::Key::Backspace => Some('\u{8}'),
         key::Key::Tab => Some('\t'),
@@ -1017,7 +1068,10 @@ fn legacy_key_event_character(mapped_key: key::Key, unshifted_codepoint: char, m
                 unshifted_codepoint
             })
         }
-        _ => Some(apply_shift_to_punctuation(unshifted_codepoint, mods.contains(key::Mods::SHIFT))),
+        _ => Some(apply_shift_to_punctuation(
+            unshifted_codepoint,
+            mods.contains(key::Mods::SHIFT),
+        )),
     }
 }
 

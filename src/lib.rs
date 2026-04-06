@@ -5,10 +5,13 @@ pub mod app;
 pub mod cli;
 pub mod logging_init;
 pub mod paths;
+pub mod shell_default;
 
 use crate::cli::Cli;
 
 /// Version string combining package version and git revision.
+/// tool[impl cli.version.includes-semver]
+/// tool[impl cli.version.includes-git-revision]
 const VERSION: &str = concat!(
     env!("CARGO_PKG_VERSION"),
     " (rev ",
@@ -17,6 +20,7 @@ const VERSION: &str = concat!(
 );
 
 /// Entrypoint for the program.
+/// tool[impl cli.help.position-independent]
 ///
 /// # Errors
 ///

@@ -1,15 +1,16 @@
+use eyre::Context;
+use libghostty_vt::key;
 use std::io::{self, Write};
 use std::thread;
 use std::time::{Duration, Instant};
-use eyre::Context;
-use libghostty_vt::key;
 use windows::Win32::System::Console::{
-    CONSOLE_MODE,
-    ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT, ENABLE_QUICK_EDIT_MODE, ENABLE_WINDOW_INPUT,
-    GetConsoleMode, GetStdHandle, INPUT_RECORD, KEY_EVENT, KEY_EVENT_RECORD,
-    LEFT_ALT_PRESSED, LEFT_CTRL_PRESSED, RIGHT_ALT_PRESSED, RIGHT_CTRL_PRESSED,
-    ReadConsoleInputW, SHIFT_PRESSED, STD_INPUT_HANDLE, SetConsoleMode,
+    CONSOLE_MODE, ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT, ENABLE_QUICK_EDIT_MODE,
+    ENABLE_WINDOW_INPUT, GetConsoleMode, GetStdHandle, INPUT_RECORD, KEY_EVENT, KEY_EVENT_RECORD,
+    LEFT_ALT_PRESSED, LEFT_CTRL_PRESSED, RIGHT_ALT_PRESSED, RIGHT_CTRL_PRESSED, ReadConsoleInputW,
+    SHIFT_PRESSED, STD_INPUT_HANDLE, SetConsoleMode,
 };
+
+use crate::paths::AppHome;
 
 use super::windows_terminal::{TerminalLayout, TerminalSession};
 
@@ -19,21 +20,22 @@ const CROSSTERM_KEY_PROBE_READY: &str = "CROSSTERM_KEY_PROBE_READY";
 const RATATUI_KEY_DEBUG_TITLE: &str = "Key Events (Hit Esc 3 times to exit)";
 const WINDOWS_KEY_PROBE_READY: &str = "WINDOWS_KEY_PROBE_READY";
 const WIN32_INPUT_MODE_UNSUPPORTED: &str = "WIN32_INPUT_MODE_UNSUPPORTED";
-const DEFAULT_RATATUI_KEY_DEBUG_PATH: &str = "g:\\Programming\\Repos\\ratatui-key-debug\\target\\debug\\ratatui_key_debug.exe";
+const DEFAULT_RATATUI_KEY_DEBUG_PATH: &str =
+    "g:\\Programming\\Repos\\ratatui-key-debug\\target\\debug\\ratatui_key_debug.exe";
 const WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 const PROBE_DETECTION_TIMEOUT: Duration = Duration::from_millis(250);
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
 
-pub fn run(inside: bool) -> eyre::Result<()> {
+pub fn run(app_home: &AppHome, inside: bool) -> eyre::Result<()> {
     if inside {
         run_inside()
     } else {
-        run_outside()
+        run_outside(app_home)
     }
 }
 
-fn run_outside() -> eyre::Result<()> {
-    let mut terminal = TerminalSession::new()?;
+fn run_outside(app_home: &AppHome) -> eyre::Result<()> {
+    let mut terminal = TerminalSession::new(app_home)?;
     terminal.resize(TerminalLayout {
         client_width: 1600,
         client_height: 900,
@@ -45,19 +47,39 @@ fn run_outside() -> eyre::Result<()> {
         return run_default_cmd_enter_reproduction(&mut terminal);
     }
 
-    if std::env::var("TEAMY_KEYBOARD_SELF_TEST_CASE").as_deref() == Ok("default-cmd-ratatui-key-debug") {
+    if std::env::var("TEAMY_KEYBOARD_SELF_TEST_CASE").as_deref()
+        == Ok("default-cmd-ratatui-key-debug")
+    {
         return run_default_cmd_ratatui_key_debug_reproduction(&mut terminal);
     }
 
-    if wait_for_screen(&mut terminal, CROSSTERM_KEY_PROBE_READY, PROBE_DETECTION_TIMEOUT).is_ok() {
+    if wait_for_screen(
+        &mut terminal,
+        CROSSTERM_KEY_PROBE_READY,
+        PROBE_DETECTION_TIMEOUT,
+    )
+    .is_ok()
+    {
         return run_crossterm_key_probe_reproduction(&mut terminal);
     }
 
-    if wait_for_screen(&mut terminal, RATATUI_KEY_DEBUG_TITLE, PROBE_DETECTION_TIMEOUT).is_ok() {
+    if wait_for_screen(
+        &mut terminal,
+        RATATUI_KEY_DEBUG_TITLE,
+        PROBE_DETECTION_TIMEOUT,
+    )
+    .is_ok()
+    {
         return run_ratatui_key_debug_reproduction(&mut terminal);
     }
 
-    if wait_for_screen(&mut terminal, WINDOWS_KEY_PROBE_READY, PROBE_DETECTION_TIMEOUT).is_ok() {
+    if wait_for_screen(
+        &mut terminal,
+        WINDOWS_KEY_PROBE_READY,
+        PROBE_DETECTION_TIMEOUT,
+    )
+    .is_ok()
+    {
         return run_windows_key_probe_reproduction(&mut terminal);
     }
 
@@ -95,7 +117,16 @@ fn run_outside() -> eyre::Result<()> {
         format_chunks(&backspace_keyup),
         format_chunks(&ctrl_keyup),
     );
-    assert_trace(&a_keydown, &a_char, &a_keyup, &ctrl_keydown, &backspace_keydown, &backspace_keyup, &ctrl_keyup, &transcript)?;
+    assert_trace(
+        &a_keydown,
+        &a_char,
+        &a_keyup,
+        &ctrl_keydown,
+        &backspace_keydown,
+        &backspace_keyup,
+        &ctrl_keyup,
+        &transcript,
+    )?;
 
     println!("{transcript}");
     Ok(())
@@ -116,7 +147,9 @@ fn run_default_cmd_enter_reproduction(terminal: &mut TerminalSession) -> eyre::R
     Ok(())
 }
 
-fn run_default_cmd_ratatui_key_debug_reproduction(terminal: &mut TerminalSession) -> eyre::Result<()> {
+fn run_default_cmd_ratatui_key_debug_reproduction(
+    terminal: &mut TerminalSession,
+) -> eyre::Result<()> {
     let ratatui_path = std::env::var("TEAMY_KEYBOARD_SELF_TEST_RATATUI_PATH")
         .unwrap_or_else(|_| DEFAULT_RATATUI_KEY_DEBUG_PATH.to_owned());
 
@@ -141,7 +174,8 @@ fn run_default_cmd_ratatui_key_debug_reproduction(terminal: &mut TerminalSession
         thread::sleep(POLL_INTERVAL);
     }
 
-    let after_ratatui_exit = wait_for_quiet_screen(terminal, Duration::from_millis(200), WAIT_TIMEOUT)?;
+    let after_ratatui_exit =
+        wait_for_quiet_screen(terminal, Duration::from_millis(200), WAIT_TIMEOUT)?;
     type_text(terminal, "exit")?;
     press_enter(terminal)?;
     let final_screen = wait_for_child_exit(terminal, WAIT_TIMEOUT)?;
@@ -161,7 +195,8 @@ fn run_default_cmd_ratatui_key_debug_reproduction(terminal: &mut TerminalSession
 }
 
 fn run_ratatui_key_debug_reproduction(terminal: &mut TerminalSession) -> eyre::Result<()> {
-    let (initial_flags, after_a_release, after_ctrl_backspace_press) = exercise_ratatui_key_debug(terminal)?;
+    let (initial_flags, after_a_release, after_ctrl_backspace_press) =
+        exercise_ratatui_key_debug(terminal)?;
 
     let ctrl_mods = key::Mods::CTRL | key::Mods::CTRL_SIDE;
 
@@ -176,10 +211,7 @@ fn run_ratatui_key_debug_reproduction(terminal: &mut TerminalSession) -> eyre::R
     let final_screen = wait_for_child_exit(terminal, WAIT_TIMEOUT)?;
     let transcript = format!(
         "kitty_flags: {:?}\n\n=== after_a_release ===\n{}\n\n=== after_ctrl_backspace_press ===\n{}\n\n=== final_screen ===\n{}",
-        initial_flags,
-        after_a_release,
-        after_ctrl_backspace_press,
-        final_screen,
+        initial_flags, after_a_release, after_ctrl_backspace_press, final_screen,
     );
 
     println!("{transcript}");
@@ -189,7 +221,8 @@ fn run_ratatui_key_debug_reproduction(terminal: &mut TerminalSession) -> eyre::R
 fn exercise_ratatui_key_debug(
     terminal: &mut TerminalSession,
 ) -> eyre::Result<(key::KittyKeyFlags, String, String)> {
-    let initial_flags = wait_for_kitty_flags(terminal, Duration::from_millis(250)).unwrap_or_else(|_| key::KittyKeyFlags::empty());
+    let initial_flags = wait_for_kitty_flags(terminal, Duration::from_millis(250))
+        .unwrap_or_else(|_| key::KittyKeyFlags::empty());
 
     let before = collect_screen(terminal)?;
     if !before.contains(RATATUI_KEY_DEBUG_TITLE) {
@@ -200,11 +233,17 @@ fn exercise_ratatui_key_debug(
     let _ = terminal.handle_char(u32::from('a'), char_lparam(0x1E))?;
     let after_a_press = wait_for_screen_line(terminal, "Char('a')", WAIT_TIMEOUT)?;
     let a_press_lines = matching_lines(&after_a_press, "Char('a')");
-    if a_press_lines.iter().any(|line| line.contains("kind: Release")) {
+    if a_press_lines
+        .iter()
+        .any(|line| line.contains("kind: Release"))
+    {
         eyre::bail!("plain A press already produced a release before WM_KEYUP\n\n{after_a_press}");
     }
     if a_press_lines.len() != 1 {
-        eyre::bail!("plain A press produced {} matching lines before WM_KEYUP\n\n{after_a_press}", a_press_lines.len());
+        eyre::bail!(
+            "plain A press produced {} matching lines before WM_KEYUP\n\n{after_a_press}",
+            a_press_lines.len()
+        );
     }
 
     send_keyup(terminal, 0x41, 0x1E, key::Mods::empty())?;
@@ -222,8 +261,13 @@ fn exercise_ratatui_key_debug(
     if backspace_press_lines.is_empty() {
         eyre::bail!("Ctrl+Backspace did not produce Backspace\n\n{after_ctrl_backspace_press}");
     }
-    if backspace_press_lines.iter().any(|line| line.contains("kind: Release")) {
-        eyre::bail!("Ctrl+Backspace press already produced a release before WM_KEYUP\n\n{after_ctrl_backspace_press}");
+    if backspace_press_lines
+        .iter()
+        .any(|line| line.contains("kind: Release"))
+    {
+        eyre::bail!(
+            "Ctrl+Backspace press already produced a release before WM_KEYUP\n\n{after_ctrl_backspace_press}"
+        );
     }
     if backspace_press_lines.len() != 1 {
         eyre::bail!(
@@ -251,7 +295,8 @@ fn run_crossterm_key_probe_reproduction(terminal: &mut TerminalSession) -> eyre:
     send_keydown(terminal, 0x11, 0x1D, ctrl_mods)?;
     send_keydown(terminal, 0x08, 0x0E, ctrl_mods)?;
     let backspace_char_consumed = terminal.handle_char(0x7F, char_lparam(0x0E))?;
-    let after_ctrl_backspace_press = wait_for_quiet_screen(terminal, Duration::from_millis(150), WAIT_TIMEOUT)?;
+    let after_ctrl_backspace_press =
+        wait_for_quiet_screen(terminal, Duration::from_millis(150), WAIT_TIMEOUT)?;
     assert_key_event_count(
         &after_ctrl_backspace_press,
         "code: Backspace",
@@ -274,9 +319,7 @@ fn run_crossterm_key_probe_reproduction(terminal: &mut TerminalSession) -> eyre:
     let final_screen = wait_for_child_exit(terminal, WAIT_TIMEOUT)?;
     let transcript = format!(
         "=== after_a_release ===\n{}\n\n=== after_ctrl_backspace_press ===\n{}\n\n=== final_screen ===\n{}",
-        after_a_release,
-        after_ctrl_backspace_press,
-        final_screen,
+        after_a_release, after_ctrl_backspace_press, final_screen,
     );
 
     println!("{transcript}");
@@ -296,9 +339,7 @@ fn run_windows_key_probe_reproduction(terminal: &mut TerminalSession) -> eyre::R
     if wait_for_screen(terminal, "EVENT E01", WAIT_TIMEOUT).is_err() {
         let trace = format_chunks(&terminal.take_input_trace());
         let screen = collect_screen(terminal)?;
-        println!(
-            "{WIN32_INPUT_MODE_UNSUPPORTED}\ntrace: {trace}\n\n{screen}"
-        );
+        println!("{WIN32_INPUT_MODE_UNSUPPORTED}\ntrace: {trace}\n\n{screen}");
         return Ok(());
     }
     let after_a_press = wait_for_quiet_screen(terminal, Duration::from_millis(150), WAIT_TIMEOUT)?;
@@ -329,11 +370,15 @@ fn run_windows_key_probe_reproduction(terminal: &mut TerminalSession) -> eyre::R
     send_keydown(terminal, 0x08, 0x0E, ctrl_mods)?;
     let _ = terminal.handle_char(0x7F, char_lparam(0x0E))?;
     let _ = wait_for_screen(terminal, "VK=08 SC=0E", WAIT_TIMEOUT)?;
-    let after_ctrl_backspace_press = wait_for_quiet_screen(terminal, Duration::from_millis(150), WAIT_TIMEOUT)?;
+    let after_ctrl_backspace_press =
+        wait_for_quiet_screen(terminal, Duration::from_millis(150), WAIT_TIMEOUT)?;
     assert_probe_event_state_with_press_variants(
         &after_ctrl_backspace_press,
         "VK=08 SC=0E",
-        &["DOWN VK=08 SC=0E CH=0008 CTRL=1", "DOWN VK=08 SC=0E CH=007F CTRL=1"],
+        &[
+            "DOWN VK=08 SC=0E CH=0008 CTRL=1",
+            "DOWN VK=08 SC=0E CH=007F CTRL=1",
+        ],
         "UP VK=08 SC=0E",
         1,
         false,
@@ -342,16 +387,14 @@ fn run_windows_key_probe_reproduction(terminal: &mut TerminalSession) -> eyre::R
 
     send_keyup(terminal, 0x08, 0x0E, ctrl_mods)?;
     send_keyup(terminal, 0x11, 0x1D, ctrl_mods)?;
-    let after_ctrl_backspace_release = wait_for_count(
-        terminal,
-        "VK=08 SC=0E",
-        2,
-        WAIT_TIMEOUT,
-    )?;
+    let after_ctrl_backspace_release = wait_for_count(terminal, "VK=08 SC=0E", 2, WAIT_TIMEOUT)?;
     assert_probe_event_state_with_press_variants(
         &after_ctrl_backspace_release,
         "VK=08 SC=0E",
-        &["DOWN VK=08 SC=0E CH=0008 CTRL=1", "DOWN VK=08 SC=0E CH=007F CTRL=1"],
+        &[
+            "DOWN VK=08 SC=0E CH=0008 CTRL=1",
+            "DOWN VK=08 SC=0E CH=007F CTRL=1",
+        ],
         "UP VK=08 SC=0E",
         2,
         true,
@@ -360,43 +403,46 @@ fn run_windows_key_probe_reproduction(terminal: &mut TerminalSession) -> eyre::R
 
     let transcript = format!(
         "=== after_a_press ===\n{}\n\n=== after_a_release ===\n{}\n\n=== after_ctrl_backspace_press ===\n{}\n\n=== after_ctrl_backspace_release ===\n{}",
-        after_a_press,
-        after_a_release,
-        after_ctrl_backspace_press,
-        after_ctrl_backspace_release,
+        after_a_press, after_a_release, after_ctrl_backspace_press, after_ctrl_backspace_release,
     );
     println!("{transcript}");
     Ok(())
 }
 
 fn run_inside() -> eyre::Result<()> {
-    let input = unsafe { GetStdHandle(STD_INPUT_HANDLE) }
-        .wrap_err("failed to get console input handle")?;
+    let input =
+        unsafe { GetStdHandle(STD_INPUT_HANDLE) }.wrap_err("failed to get console input handle")?;
     let mut original_mode = CONSOLE_MODE(0);
-    unsafe { GetConsoleMode(input, &mut original_mode) }
-        .wrap_err("failed to read console mode")?;
+    unsafe { GetConsoleMode(input, &mut original_mode) }.wrap_err("failed to read console mode")?;
 
     let raw_mode = (original_mode | ENABLE_WINDOW_INPUT)
         & !(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_QUICK_EDIT_MODE);
-    unsafe { SetConsoleMode(input, raw_mode) }.wrap_err("failed to enable keyboard self-test console mode")?;
+    unsafe { SetConsoleMode(input, raw_mode) }
+        .wrap_err("failed to enable keyboard self-test console mode")?;
     let _mode_guard = ConsoleModeGuard {
         input,
         original_mode,
     };
 
     println!("{SELF_TEST_READY}");
-    io::stdout().flush().wrap_err("failed to flush self-test ready banner")?;
+    io::stdout()
+        .flush()
+        .wrap_err("failed to flush self-test ready banner")?;
 
     let mut index = 0_usize;
     loop {
         let event = read_next_key_event(input)?;
         index += 1;
         println!("{}", format_key_event(index, &event));
-        io::stdout().flush().wrap_err("failed to flush self-test key event")?;
+        io::stdout()
+            .flush()
+            .wrap_err("failed to flush self-test key event")?;
 
         if event.bKeyDown.as_bool() && event.wVirtualKeyCode == 0x7B {
             println!("{SELF_TEST_DONE}");
-            io::stdout().flush().wrap_err("failed to flush self-test completion banner")?;
+            io::stdout()
+                .flush()
+                .wrap_err("failed to flush self-test completion banner")?;
             break;
         }
     }
@@ -415,7 +461,9 @@ impl Drop for ConsoleModeGuard {
     }
 }
 
-fn read_next_key_event(input: windows::Win32::Foundation::HANDLE) -> eyre::Result<KEY_EVENT_RECORD> {
+fn read_next_key_event(
+    input: windows::Win32::Foundation::HANDLE,
+) -> eyre::Result<KEY_EVENT_RECORD> {
     loop {
         let mut records = [INPUT_RECORD::default()];
         let mut records_read = 0;
@@ -437,7 +485,11 @@ fn read_next_key_event(input: windows::Win32::Foundation::HANDLE) -> eyre::Resul
 
 fn format_key_event(index: usize, event: &KEY_EVENT_RECORD) -> String {
     let control_state = event.dwControlKeyState;
-    let direction = if event.bKeyDown.as_bool() { "DOWN" } else { "UP" };
+    let direction = if event.bKeyDown.as_bool() {
+        "DOWN"
+    } else {
+        "UP"
+    };
     let unicode = unsafe { event.uChar.UnicodeChar };
 
     format!(
@@ -506,10 +558,18 @@ fn send_text_character(terminal: &mut TerminalSession, character: char) -> eyre:
 fn text_character_key(character: char) -> Option<(u32, u8, key::Mods)> {
     let shift = key::Mods::SHIFT | key::Mods::SHIFT_SIDE;
     let alpha = match character {
-        'a'..='z' => Some((character.to_ascii_uppercase() as u32, letter_scancode(character), key::Mods::empty())),
+        'a'..='z' => Some((
+            character.to_ascii_uppercase() as u32,
+            letter_scancode(character),
+            key::Mods::empty(),
+        )),
         'A'..='Z' => {
             let lower = character.to_ascii_lowercase();
-            Some((lower.to_ascii_uppercase() as u32, letter_scancode(lower), shift))
+            Some((
+                lower.to_ascii_uppercase() as u32,
+                letter_scancode(lower),
+                shift,
+            ))
         }
         '0' => Some((0x30, 0x0B, key::Mods::empty())),
         '1' => Some((0x31, 0x02, key::Mods::empty())),
@@ -736,7 +796,10 @@ fn wait_for_quiet_screen(
     }
 }
 
-fn wait_for_win32_input_mode(terminal: &mut TerminalSession, timeout: Duration) -> eyre::Result<()> {
+fn wait_for_win32_input_mode(
+    terminal: &mut TerminalSession,
+    timeout: Duration,
+) -> eyre::Result<()> {
     let started = Instant::now();
     loop {
         let _ = terminal.pump()?;
@@ -762,7 +825,9 @@ fn assert_probe_event_state(
 ) -> eyre::Result<()> {
     let count = screen.matches(event_prefix).count();
     if count != expected_count {
-        eyre::bail!("{label} expected {expected_count} matching events but saw {count}\n\n{screen}");
+        eyre::bail!(
+            "{label} expected {expected_count} matching events but saw {count}\n\n{screen}"
+        );
     }
 
     if !screen.contains(expected_press) {
@@ -791,10 +856,15 @@ fn assert_probe_event_state_with_press_variants(
 ) -> eyre::Result<()> {
     let count = screen.matches(event_prefix).count();
     if count != expected_count {
-        eyre::bail!("{label} expected {expected_count} matching events but saw {count}\n\n{screen}");
+        eyre::bail!(
+            "{label} expected {expected_count} matching events but saw {count}\n\n{screen}"
+        );
     }
 
-    if !expected_press_variants.iter().any(|expected_press| screen.contains(expected_press)) {
+    if !expected_press_variants
+        .iter()
+        .any(|expected_press| screen.contains(expected_press))
+    {
         eyre::bail!("{label} did not contain any expected press event variant\n\n{screen}");
     }
 
@@ -817,7 +887,9 @@ fn assert_key_event_count(
 ) -> eyre::Result<()> {
     let count = screen.matches(needle).count();
     if count != expected_count {
-        eyre::bail!("{label} expected {expected_count} matching key events but saw {count}\n\n{screen}");
+        eyre::bail!(
+            "{label} expected {expected_count} matching key events but saw {count}\n\n{screen}"
+        );
     }
 
     Ok(())
@@ -827,7 +899,7 @@ fn matching_lines(screen: &str, needle: &str) -> Vec<String> {
     screen
         .lines()
         .filter(|line| line.contains(needle))
-    .map(std::borrow::ToOwned::to_owned)
+        .map(std::borrow::ToOwned::to_owned)
         .collect()
 }
 

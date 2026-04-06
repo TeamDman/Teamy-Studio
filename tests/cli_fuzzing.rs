@@ -1,4 +1,6 @@
 //! CLI fuzzing tests using figue's arbitrary helper assertions.
+//! cli[verify parser.args-consistent]
+//! cli[verify parser.roundtrip]
 
 use teamy_studio::cli::Cli;
 

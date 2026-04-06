@@ -25,7 +25,10 @@ specs (
         impls (
             {
                 name rust
-                include (src/**/*.rs)
+                include (src/**/*.rs build.rs)
+                include_plain (
+                    check-all.ps1
+                )
                 test_include (tests/**/*.rs)
             }
         )

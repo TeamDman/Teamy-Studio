@@ -1,4 +1,7 @@
 #![cfg(windows)]
+//! cli[verify command.surface.self-test]
+//! cli[verify command.surface.self-test-keyboard-input]
+//! cli[verify window.interaction.input]
 
 use std::process::Command;
 
@@ -6,8 +9,8 @@ fn run_keyboard_self_test(probe_path: &str) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_teamy-studio"))
         .env("COMSPEC", probe_path)
         .env("TEAMY_KEY_PROBE_EVENT_LIMIT", "8")
-    .env_remove("TEAMY_KEYBOARD_SELF_TEST_CASE")
-    .env_remove("TEAMY_KEYBOARD_SELF_TEST_RATATUI_PATH")
+        .env_remove("TEAMY_KEYBOARD_SELF_TEST_CASE")
+        .env_remove("TEAMY_KEYBOARD_SELF_TEST_RATATUI_PATH")
         .args(["self-test", "keyboard-input"])
         .output()
         .expect("keyboard self-test should launch")
@@ -17,8 +20,8 @@ fn run_crossterm_keyboard_self_test() -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_teamy-studio"))
         .env("COMSPEC", env!("CARGO_BIN_EXE_crossterm_key_probe"))
         .env("TEAMY_KEY_PROBE_EVENT_LIMIT", "6")
-    .env_remove("TEAMY_KEYBOARD_SELF_TEST_CASE")
-    .env_remove("TEAMY_KEYBOARD_SELF_TEST_RATATUI_PATH")
+        .env_remove("TEAMY_KEYBOARD_SELF_TEST_CASE")
+        .env_remove("TEAMY_KEYBOARD_SELF_TEST_RATATUI_PATH")
         .args(["self-test", "keyboard-input"])
         .output()
         .expect("crossterm keyboard self-test should launch")
@@ -37,7 +40,10 @@ fn run_default_cmd_keyboard_self_test() -> std::process::Output {
 fn run_default_cmd_ratatui_keyboard_self_test() -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_teamy-studio"))
         .env("COMSPEC", "cmd.exe")
-        .env("TEAMY_KEYBOARD_SELF_TEST_CASE", "default-cmd-ratatui-key-debug")
+        .env(
+            "TEAMY_KEYBOARD_SELF_TEST_CASE",
+            "default-cmd-ratatui-key-debug",
+        )
         .env(
             "TEAMY_KEYBOARD_SELF_TEST_RATATUI_PATH",
             "g:\\Programming\\Repos\\ratatui-key-debug\\target\\debug\\ratatui_key_debug.exe",

@@ -22,6 +22,7 @@ fn add_exe_resources() {
 /// ```rust
 /// let git_rev = option_env!("GIT_REVISION").unwrap_or("unknown");
 /// ```
+/// tool[impl cli.version.includes-git-revision]
 fn add_git_revision() {
     // Try to get a short git revision; on failure, set to "unknown".
     let rev = Command::new("git")
