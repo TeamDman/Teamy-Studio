@@ -29,9 +29,13 @@ impl ShellArgs {
     /// # Errors
     ///
     /// This function will return an error if the shell action fails.
-    pub async fn invoke(self, app_home: &crate::paths::AppHome) -> Result<()> {
+    pub async fn invoke(
+        self,
+        app_home: &crate::paths::AppHome,
+        cache_home: &crate::paths::CacheHome,
+    ) -> Result<()> {
         match self.command {
-            Some(ShellCommand::Default(args)) => args.invoke(app_home).await,
+            Some(ShellCommand::Default(args)) => args.invoke(app_home, cache_home).await,
             None => crate::app::run_inline_shell(app_home),
         }
     }

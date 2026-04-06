@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::io::{Read, Write};
+use std::path::Path;
 use std::sync::{Arc, Mutex, mpsc};
 
 use eyre::Context;
@@ -22,19 +23,27 @@ use windows::Win32::UI::Input::KeyboardAndMouse::GetKeyState;
 
 use crate::paths::AppHome;
 
-pub const DRAG_STRIP_HEIGHT: i32 = 38;
-pub const WINDOW_PADDING: i32 = 12;
-pub const TOP_PADDING: i32 = WINDOW_PADDING + DRAG_STRIP_HEIGHT;
+pub const DRAG_STRIP_HEIGHT: i32 = 76;
+pub const WINDOW_PADDING: i32 = 18;
+pub const PANEL_WINDOW_ALPHA: u8 = 204;
 pub const POLL_TIMER_ID: usize = 1;
 pub const POLL_INTERVAL_MS: u32 = 16;
-pub const WINDOW_ALPHA: u8 = 208;
-pub const WINDOW_BACKGROUND: COLORREF = COLORREF(0x0068_1F4A);
-pub const WINDOW_ACCENT: COLORREF = COLORREF(0x008F_4D78);
 pub const WINDOW_TEXT: COLORREF = COLORREF(0x00F5_EBFF);
+pub const WINDOW_DEBUG_BACKGROUND: COLORREF = COLORREF(0x00A0_6000);
 
 const DEFAULT_COLS: u16 = 80;
 const DEFAULT_ROWS: u16 = 24;
 const MAX_SCROLLBACK: usize = 20_000;
+const CELL_PANEL_GAP: i32 = 14;
+const SIDECAR_WIDTH: i32 = 86;
+const RESULT_PANEL_HEIGHT: i32 = 152;
+const MIN_CODE_PANEL_HEIGHT: i32 = 180;
+const PLUS_BUTTON_SIZE: i32 = 42;
+const CODE_PANEL_PADDING: i32 = 14;
+const CODE_PANEL_FOOTER_HEIGHT: i32 = 28;
+const PANEL_BORDER_THICKNESS: i32 = 2;
+const SIDECAR_BUTTON_SIZE: i32 = 34;
+const SIDECAR_BUTTON_GAP: i32 = 12;
 const WIN32_INPUT_MODE_ENABLE: &[u8] = b"\x1b[?9001h";
 const WIN32_INPUT_MODE_DISABLE: &[u8] = b"\x1b[?9001l";
 
@@ -99,6 +108,12 @@ pub struct TerminalSession {
     win32_input_mode_buffer: Vec<u8>,
     pending_win32_char_key: Option<PendingWin32CharKey>,
     closed: bool,
+    shell_label: String,
+}
+
+pub struct CellChrome {
+    pub cell_number: usize,
+    pub result_text: String,
 }
 
 #[derive(Clone, Copy)]
@@ -111,12 +126,122 @@ pub struct TerminalLayout {
 
 impl TerminalLayout {
     #[must_use]
-    pub fn terminal_rect(self) -> RECT {
+    pub fn frame_rect(self) -> RECT {
         RECT {
             left: WINDOW_PADDING,
-            top: TOP_PADDING,
+            top: WINDOW_PADDING,
             right: (self.client_width - WINDOW_PADDING).max(WINDOW_PADDING),
-            bottom: (self.client_height - WINDOW_PADDING).max(TOP_PADDING),
+            bottom: (self.client_height - WINDOW_PADDING).max(WINDOW_PADDING),
+        }
+    }
+
+    #[must_use]
+    pub fn sidecar_rect(self) -> RECT {
+        let frame = self.frame_rect();
+        let code = self.code_panel_rect();
+        RECT {
+            left: frame.left,
+            top: frame.top,
+            right: (frame.left + SIDECAR_WIDTH).min(frame.right),
+            bottom: code.bottom,
+        }
+    }
+
+    #[must_use]
+    pub fn drag_handle_rect(self) -> RECT {
+        let sidecar = self.sidecar_rect();
+        RECT {
+            left: sidecar.left,
+            top: sidecar.top,
+            right: sidecar.right,
+            bottom: (sidecar.top + DRAG_STRIP_HEIGHT).min(sidecar.bottom),
+        }
+    }
+
+    #[must_use]
+    pub fn code_panel_rect(self) -> RECT {
+        let frame = self.frame_rect();
+        let code_left = (frame.left + SIDECAR_WIDTH + CELL_PANEL_GAP).min(frame.right);
+        let code_right = frame.right;
+        let plus = self.plus_button_rect();
+        let result_bottom = plus.top - CELL_PANEL_GAP;
+        let desired_result_top = result_bottom - RESULT_PANEL_HEIGHT;
+        let minimum_code_bottom = frame.top + MIN_CODE_PANEL_HEIGHT;
+        let code_bottom = (desired_result_top - CELL_PANEL_GAP)
+            .max(minimum_code_bottom)
+            .min(result_bottom - CELL_PANEL_GAP);
+
+        RECT {
+            left: code_left,
+            top: frame.top,
+            right: code_right,
+            bottom: code_bottom.max(frame.top + 1),
+        }
+    }
+
+    #[must_use]
+    pub fn result_panel_rect(self) -> RECT {
+        let code = self.code_panel_rect();
+        let plus = self.plus_button_rect();
+        RECT {
+            left: code.left,
+            top: code.bottom + CELL_PANEL_GAP,
+            right: code.right,
+            bottom: plus.top - CELL_PANEL_GAP,
+        }
+    }
+
+    #[must_use]
+    pub fn plus_button_rect(self) -> RECT {
+        let frame = self.frame_rect();
+        let code_left = (frame.left + SIDECAR_WIDTH + CELL_PANEL_GAP).min(frame.right);
+        let code_right = frame.right;
+        let center_x = code_left + ((code_right - code_left).max(PLUS_BUTTON_SIZE) / 2);
+        let left = (center_x - (PLUS_BUTTON_SIZE / 2)).max(code_left);
+        RECT {
+            left,
+            top: frame.bottom - PLUS_BUTTON_SIZE,
+            right: (left + PLUS_BUTTON_SIZE).min(code_right),
+            bottom: frame.bottom,
+        }
+    }
+
+    #[must_use]
+    pub fn sidecar_button_rect(self, index: usize) -> RECT {
+        let sidecar = self.sidecar_rect();
+        let top = self.drag_handle_rect().bottom
+            + 22
+            + (i32::try_from(index).unwrap_or_default()
+                * (SIDECAR_BUTTON_SIZE + SIDECAR_BUTTON_GAP));
+        let left = sidecar.left + ((sidecar.right - sidecar.left - SIDECAR_BUTTON_SIZE).max(0) / 2);
+        RECT {
+            left,
+            top,
+            right: left + SIDECAR_BUTTON_SIZE,
+            bottom: top + SIDECAR_BUTTON_SIZE,
+        }
+    }
+
+    #[must_use]
+    pub fn shell_label_rect(self) -> RECT {
+        let code = self.code_panel_rect();
+        RECT {
+            left: code.left + CODE_PANEL_PADDING,
+            top: code.bottom - CODE_PANEL_FOOTER_HEIGHT,
+            right: code.right - CODE_PANEL_PADDING,
+            bottom: code.bottom - 4,
+        }
+    }
+
+    #[must_use]
+    pub fn terminal_rect(self) -> RECT {
+        let code = self.code_panel_rect();
+        let footer = self.shell_label_rect();
+        RECT {
+            left: code.left + CODE_PANEL_PADDING,
+            top: code.top + CODE_PANEL_PADDING,
+            right: (code.right - CODE_PANEL_PADDING).max(code.left + CODE_PANEL_PADDING),
+            bottom: (footer.top - 8).max(code.top + CODE_PANEL_PADDING),
         }
     }
 
@@ -137,10 +262,12 @@ impl TerminalLayout {
 impl TerminalSession {
     /// cli[impl window.appearance.shell]
     /// cli[impl window.appearance.shell-configured-default]
-    pub fn new(app_home: &AppHome) -> eyre::Result<Self> {
-        Self::new_with_command(crate::shell_default::load_effective_command_builder(
-            app_home,
-        )?)
+    pub fn new(app_home: &AppHome, working_dir: Option<&Path>) -> eyre::Result<Self> {
+        let mut command = crate::shell_default::load_effective_command_builder(app_home)?;
+        if let Some(working_dir) = working_dir {
+            command.cwd(working_dir);
+        }
+        Self::new_with_command(command)
     }
 
     pub fn new_with_command(shell: CommandBuilder) -> eyre::Result<Self> {
@@ -183,6 +310,13 @@ impl TerminalSession {
             ),
             "starting Teamy Studio PTY child"
         );
+        let shell_label = shell
+            .get_argv()
+            .first()
+            .and_then(|arg| std::path::Path::new(arg).file_stem())
+            .map(|stem| stem.to_string_lossy().into_owned())
+            .filter(|label| !label.is_empty())
+            .unwrap_or_else(|| "shell".to_owned());
         let child = pair
             .slave
             .spawn_command(shell)
@@ -231,6 +365,7 @@ impl TerminalSession {
             win32_input_mode_buffer: Vec::new(),
             pending_win32_char_key: None,
             closed: false,
+            shell_label,
         })
     }
 
@@ -261,8 +396,14 @@ impl TerminalSession {
             .resize(PtySize {
                 cols,
                 rows,
-                pixel_width: u16::try_from(layout.client_width.max(0)).unwrap_or(u16::MAX),
-                pixel_height: u16::try_from(layout.client_height.max(0)).unwrap_or(u16::MAX),
+                pixel_width: u16::try_from(
+                    (layout.terminal_rect().right - layout.terminal_rect().left).max(0),
+                )
+                .unwrap_or(u16::MAX),
+                pixel_height: u16::try_from(
+                    (layout.terminal_rect().bottom - layout.terminal_rect().top).max(0),
+                )
+                .unwrap_or(u16::MAX),
             })
             .map_err(|error| eyre::eyre!("failed to resize PTY: {error}"))?;
 
@@ -568,7 +709,7 @@ impl TerminalSession {
         &mut self,
         hdc: HDC,
         layout: TerminalLayout,
-        overlay_text: &str,
+        chrome: &CellChrome,
     ) -> eyre::Result<()> {
         let snapshot = self
             .render_state
@@ -581,23 +722,24 @@ impl TerminalSession {
         let mut cells = CellIterator::new().wrap_err("failed to create cell iterator")?;
         let rect = layout.terminal_rect();
 
-        if self.full_repaint_pending {
-            paint_terminal_background(hdc, layout.client_width, layout.client_height)?;
-        }
-        paint_drag_strip(hdc, layout.client_width, overlay_text)?;
-
-        if self.full_repaint_pending {
-            paint_rect_background(hdc, rect, colors.background)
-                .wrap_err("failed to paint terminal background")?;
-        }
+        // The backing bitmap is recreated for every WM_PAINT, so the full frame
+        // must be repainted each time rather than relying on dirty-row deltas.
+        paint_terminal_background(hdc, layout.client_width, layout.client_height)?;
+        paint_cell_chrome(
+            hdc,
+            layout,
+            chrome.cell_number,
+            &chrome.result_text,
+            &self.shell_label,
+        )?;
+        paint_rect_background(hdc, rect, colors.background)
+            .wrap_err("failed to paint terminal background")?;
 
         let mut row_index = 0_i32;
         let mut row_iter = rows
             .update(&snapshot)
             .wrap_err("failed to update row iterator")?;
         while let Some(row) = row_iter.next() {
-            let row_is_dirty = row.dirty().wrap_err("failed to read row dirty flag")?;
-            let should_paint_row = self.full_repaint_pending || row_is_dirty;
             let y = rect.top + (row_index * layout.cell_height);
             let row_rect = RECT {
                 left: rect.left,
@@ -606,10 +748,8 @@ impl TerminalSession {
                 bottom: y + layout.cell_height,
             };
 
-            if should_paint_row {
-                paint_rect_background(hdc, row_rect, colors.background)
-                    .wrap_err("failed to paint row background")?;
-            }
+            paint_rect_background(hdc, row_rect, colors.background)
+                .wrap_err("failed to paint row background")?;
 
             let mut column_index = 0_i32;
             let mut cell_iter = cells
@@ -617,11 +757,6 @@ impl TerminalSession {
                 .wrap_err("failed to update cell iterator")?;
 
             while let Some(cell) = cell_iter.next() {
-                if !should_paint_row {
-                    column_index += 1;
-                    continue;
-                }
-
                 let x = rect.left + (column_index * layout.cell_width);
                 let cell_rect = RECT {
                     left: x,
@@ -656,10 +791,8 @@ impl TerminalSession {
                 column_index += 1;
             }
 
-            if should_paint_row {
-                row.set_dirty(false)
-                    .wrap_err("failed to clear row dirty flag after paint")?;
-            }
+            row.set_dirty(false)
+                .wrap_err("failed to clear row dirty flag after paint")?;
             row_index += 1;
         }
 
@@ -1147,6 +1280,85 @@ fn rgb_to_colorref(color: RgbColor) -> COLORREF {
     COLORREF(u32::from(color.r) | (u32::from(color.g) << 8) | (u32::from(color.b) << 16))
 }
 
+fn paint_cell_chrome(
+    hdc: HDC,
+    layout: TerminalLayout,
+    cell_number: usize,
+    result_text: &str,
+    shell_label: &str,
+) -> eyre::Result<()> {
+    let sidecar_fill = RgbColor {
+        r: 150,
+        g: 28,
+        b: 28,
+    };
+    let panel_fill = RgbColor { r: 0, g: 0, b: 0 };
+    let result_fill = RgbColor {
+        r: 214,
+        g: 118,
+        b: 22,
+    };
+    let drag_fill = RgbColor {
+        r: 108,
+        g: 43,
+        b: 153,
+    };
+    let border = RgbColor {
+        r: 240,
+        g: 240,
+        b: 240,
+    };
+    let plus_fill = RgbColor {
+        r: 214,
+        g: 118,
+        b: 22,
+    };
+
+    paint_panel(hdc, layout.sidecar_rect(), border, sidecar_fill)?;
+    paint_panel(hdc, layout.code_panel_rect(), border, panel_fill)?;
+    paint_panel(hdc, layout.result_panel_rect(), border, result_fill)?;
+    paint_panel(hdc, layout.plus_button_rect(), border, plus_fill)?;
+    paint_panel(hdc, layout.drag_handle_rect(), border, drag_fill)?;
+
+    draw_centered_text(
+        hdc,
+        layout.drag_handle_rect(),
+        &format!("{cell_number}"),
+        WINDOW_TEXT,
+    );
+
+    let play = layout.sidecar_button_rect(0);
+    let stop = layout.sidecar_button_rect(1);
+    paint_panel(hdc, play, border, panel_fill)?;
+    paint_panel(hdc, stop, border, panel_fill)?;
+    draw_text(hdc, play.left + 11, play.top + 8, ">", WINDOW_TEXT);
+    draw_text(hdc, stop.left + 7, stop.top + 8, "[]", WINDOW_TEXT);
+
+    let footer = layout.shell_label_rect();
+    draw_text(
+        hdc,
+        footer
+            .right
+            .saturating_sub((i32::try_from(shell_label.len()).unwrap_or_default() * 8) + 4),
+        footer.top,
+        shell_label,
+        WINDOW_TEXT,
+    );
+
+    let result_rect = layout.result_panel_rect();
+    draw_multiline_text(
+        hdc,
+        result_rect.left + 12,
+        result_rect.top + 12,
+        result_text,
+        WINDOW_TEXT,
+    );
+
+    let plus = layout.plus_button_rect();
+    draw_text(hdc, plus.left + 15, plus.top + 8, "+", WINDOW_TEXT);
+    Ok(())
+}
+
 fn paint_rect_background(hdc: HDC, rect: RECT, color: RgbColor) -> eyre::Result<()> {
     let brush = unsafe { CreateSolidBrush(rgb_to_colorref(color)) };
     if brush.0.is_null() {
@@ -1159,7 +1371,7 @@ fn paint_rect_background(hdc: HDC, rect: RECT, color: RgbColor) -> eyre::Result<
 }
 
 fn paint_terminal_background(hdc: HDC, client_width: i32, client_height: i32) -> eyre::Result<()> {
-    let brush = unsafe { CreateSolidBrush(WINDOW_BACKGROUND) };
+    let brush = unsafe { CreateSolidBrush(WINDOW_DEBUG_BACKGROUND) };
     if brush.0.is_null() {
         eyre::bail!("failed to create window background brush");
     }
@@ -1175,26 +1387,45 @@ fn paint_terminal_background(hdc: HDC, client_width: i32, client_height: i32) ->
     Ok(())
 }
 
-fn paint_drag_strip(hdc: HDC, client_width: i32, text: &str) -> eyre::Result<()> {
-    let brush = unsafe { CreateSolidBrush(WINDOW_ACCENT) };
-    if brush.0.is_null() {
-        eyre::bail!("failed to create drag strip brush");
-    }
+fn paint_panel(hdc: HDC, rect: RECT, border: RgbColor, fill: RgbColor) -> eyre::Result<()> {
+    paint_rect_background(hdc, rect, border)?;
+    let inner = inset_rect(rect, PANEL_BORDER_THICKNESS);
+    paint_rect_background(hdc, inner, fill)
+}
 
-    let rect = RECT {
-        left: 0,
-        top: 0,
-        right: client_width,
-        bottom: DRAG_STRIP_HEIGHT,
-    };
-    let _ = unsafe { FillRect(hdc, &rect, brush) };
-    let _ = unsafe { DeleteObject(brush.into()) };
-
+fn draw_text(hdc: HDC, x: i32, y: i32, text: &str, color: COLORREF) {
     let utf16 = text.encode_utf16().collect::<Vec<u16>>();
     let _ = unsafe { SetBkMode(hdc, TRANSPARENT) };
-    let _ = unsafe { SetTextColor(hdc, WINDOW_TEXT) };
-    let _ = unsafe { TextOutW(hdc, WINDOW_PADDING, 9, &utf16) };
-    Ok(())
+    let _ = unsafe { SetTextColor(hdc, color) };
+    let _ = unsafe { TextOutW(hdc, x, y, &utf16) };
+}
+
+fn draw_centered_text(hdc: HDC, rect: RECT, text: &str, color: COLORREF) {
+    let estimated_width = i32::try_from(text.chars().count()).unwrap_or_default() * 12;
+    let x = rect.left + (((rect.right - rect.left) - estimated_width).max(0) / 2);
+    let y = rect.top + (((rect.bottom - rect.top) - 20).max(0) / 2);
+    draw_text(hdc, x, y, text, color);
+}
+
+fn draw_multiline_text(hdc: HDC, x: i32, y: i32, text: &str, color: COLORREF) {
+    for (index, line) in text.lines().enumerate() {
+        draw_text(
+            hdc,
+            x,
+            y + (i32::try_from(index).unwrap_or_default() * 22),
+            line,
+            color,
+        );
+    }
+}
+
+fn inset_rect(rect: RECT, amount: i32) -> RECT {
+    RECT {
+        left: rect.left + amount,
+        top: rect.top + amount,
+        right: (rect.right - amount).max(rect.left + amount),
+        bottom: (rect.bottom - amount).max(rect.top + amount),
+    }
 }
 
 fn paint_cursor(
@@ -1234,4 +1465,51 @@ fn legacy_special_key_bytes(mapped_key: key::Key, mods: key::Mods) -> Option<Vec
         .set_utf8::<String>(None);
     encoder.encode_to_vec(&key_event, &mut response).ok()?;
     Some(response)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MIN_CODE_PANEL_HEIGHT, TerminalLayout};
+
+    #[test]
+    fn cell_layout_regions_do_not_overlap_and_leave_terminal_room() {
+        let layout = TerminalLayout {
+            client_width: 1040,
+            client_height: 680,
+            cell_width: 8,
+            cell_height: 16,
+        };
+
+        let sidecar = layout.sidecar_rect();
+        let code = layout.code_panel_rect();
+        let result = layout.result_panel_rect();
+        let plus = layout.plus_button_rect();
+        let terminal = layout.terminal_rect();
+
+        assert!(sidecar.right <= code.left);
+        assert!(code.bottom < result.top);
+        assert!(result.bottom < plus.top);
+        assert!(terminal.left >= code.left);
+        assert!(terminal.right <= code.right);
+        assert!(terminal.bottom <= code.bottom);
+        assert!((code.bottom - code.top) >= MIN_CODE_PANEL_HEIGHT);
+    }
+
+    #[test]
+    fn drag_handle_stays_within_sidecar() {
+        let layout = TerminalLayout {
+            client_width: 1040,
+            client_height: 680,
+            cell_width: 8,
+            cell_height: 16,
+        };
+
+        let drag = layout.drag_handle_rect();
+        let sidecar = layout.sidecar_rect();
+
+        assert!(drag.left >= sidecar.left);
+        assert!(drag.right <= sidecar.right);
+        assert!(drag.top >= sidecar.top);
+        assert!(drag.bottom <= sidecar.bottom);
+    }
 }

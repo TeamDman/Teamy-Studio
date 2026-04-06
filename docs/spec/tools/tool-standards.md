@@ -11,7 +11,10 @@ tool[cli.version.includes-git-revision]
 The CLI must report the current git revision alongside the semantic version.
 
 tool[cli.help.describes-behavior]
-The CLI help output must describe that Teamy Studio launches the main application window by default and offers explicit window commands.
+The CLI help output must describe that Teamy Studio launches a workspace run by default and offers explicit window commands.
+
+tool[cli.help.describes-workspace]
+The CLI help output must describe the workspace command group and its list, show, create, and run subcommands.
 
 tool[cli.help.describes-shell]
 The CLI help output must describe the shell command group and its default-shell management subcommands.
@@ -26,7 +29,10 @@ tool[cli.help.describes-environment]
 The CLI help output must describe environment variables that affect program behavior.
 
 tool[cli.surface.window]
-The CLI must expose a `window show` command that launches the same window as the no-argument startup path.
+The CLI must expose a `window show` command that launches the main application terminal window.
+
+tool[cli.surface.workspace]
+The CLI must expose a `workspace` command surface that supports list, show, create, and run subcommands.
 
 tool[cli.surface.shell]
 The CLI must expose a `shell` command surface that supports inline launch and default-shell management subcommands.

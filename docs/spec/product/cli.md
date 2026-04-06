@@ -5,7 +5,22 @@ This specification covers the current user-facing command line behavior exposed 
 ## Command Surface
 
 cli[command.surface.core]
-Invoking `teamy-studio.exe` with no explicit command must launch the main application terminal window.
+Invoking `teamy-studio.exe` with no explicit command must behave like `teamy-studio.exe workspace run` with no explicit workspace target.
+
+cli[command.surface.workspace]
+The CLI must expose a `workspace` command group.
+
+cli[command.surface.workspace-list]
+The `workspace` command group must expose a `list` subcommand.
+
+cli[command.surface.workspace-show]
+The `workspace` command group must expose a `show` subcommand.
+
+cli[command.surface.workspace-create]
+The `workspace` command group must expose a `create` subcommand with an optional workspace name argument.
+
+cli[command.surface.workspace-run]
+The `workspace` command group must expose a `run` subcommand with an optional workspace id-or-name target.
 
 cli[command.surface.shell]
 The CLI must expose a `shell` command group.
@@ -36,6 +51,26 @@ The CLI must expose a `window` command group.
 
 cli[command.surface.window-show]
 The `window` command group must expose a `show` subcommand that launches the main application terminal window.
+
+## Workspaces
+
+cli[workspace.list.prints-id-name-cell-count]
+The `workspace list` command must print each workspace with its id, name, and cell count.
+
+cli[workspace.show.bails-when-missing]
+The `workspace show` command must fail when the requested workspace id or exact name does not exist.
+
+cli[workspace.show.prints-id-name-cell-count]
+The `workspace show` command must print the workspace id, name, and cell count for the resolved workspace.
+
+cli[workspace.create.name-optional]
+The `workspace create` command must accept an optional workspace display name.
+
+cli[workspace.run.no-target-creates-workspace]
+The `workspace run` command must create a new workspace when no workspace target is provided.
+
+cli[workspace.run.target-by-id-or-name]
+The `workspace run` command must resolve an existing workspace by exact id or exact name when a target is provided.
 
 ## Shell Defaults
 
@@ -74,6 +109,9 @@ The launched window must host a shell backed by a PTY and render terminal conten
 cli[window.appearance.shell-configured-default]
 The launched window must start the effective default shell command rather than a hard-coded shell executable.
 
+cli[window.appearance.shell-starts-in-workspace-cell-dir]
+When a workspace is launched, the PTY-backed shell must start in that workspace's selected cell directory.
+
 cli[window.appearance.chrome]
 The launched terminal window must render a visible accent strip above the terminal grid.
 
@@ -98,3 +136,18 @@ If `TEAMY_STUDIO_HOME_DIR` is set to a non-empty value, it must take precedence 
 
 cli[path.cache.env-overrides-platform]
 If `TEAMY_STUDIO_CACHE_DIR` is set to a non-empty value, it must take precedence over the platform-derived cache directory.
+
+cli[path.cache.workspace-root-under-workspaces-dir]
+Notebook workspace state under the cache home must live beneath a `workspaces/{workspace-guid}` directory.
+
+cli[path.cache.workspace-name-file]
+The notebook workspace cache layout must store the workspace display name in `workspace_name.txt` at the workspace root.
+
+cli[path.cache.workspace-cell-order-file]
+The notebook workspace cache layout must store cell ordering in `workspace_cell_order.txt` at the workspace root.
+
+cli[path.cache.cell-artifact-layout]
+Each notebook cell cache layout must place cell artifacts beneath `cells/{cell-guid}` and expose `code.ps1`, `inputs.txt`, and `output.xml` paths in that directory.
+
+cli[path.cache.cell-transcript-numbering]
+Per-run notebook cell transcripts must use `run{n}.transcript` naming with a positive run number.

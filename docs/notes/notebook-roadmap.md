@@ -39,6 +39,12 @@ This layout is intentionally simple, inspectable, and compatible with PowerShell
 - each incremental step should keep the app runnable and demonstrably better than the previous step
 - transcript and output artifacts should remain easy to inspect directly on disk
 
+## Current Progress
+
+- Phase 0 is complete enough to build on: default-shell selection is persisted, visible through the CLI, and resolved for the PTY-backed Windows launch path.
+- Phase 1 has started: workspace and cell cache-path helpers now exist with tests for identifier validation and artifact naming.
+- The remaining Phase 1 work is wiring those helpers into real workspace creation and cell lifecycle flows.
+
 ## Phase 0: Stabilize Shell Selection
 
 Goal: make the configured default shell reliable for both inline and windowed launch paths.
@@ -139,8 +145,8 @@ This phase should not start until the simpler replayable cell artifact model is 
 
 The next implementation slice should stay small:
 
-1. finish reliable default-shell launch behavior for the PTY window path
-2. add workspace and cell cache-path helpers with unit tests
+1. wire the new workspace and cell path helpers into real workspace creation and initial cell creation flows
+2. start each launched terminal in its cell directory under the cache workspace tree
 3. introduce a single-cell layout model that can be tested without spawning multiple windows
 
-That sequence gives us a stable launch base, a durable storage model, and the first visible notebook-shaped UI step.
+That sequence turns the existing launch base and storage model into the first real notebook workspace lifecycle, then moves on to the first visible notebook-shaped UI step.

@@ -1,9 +1,11 @@
 use std::cell::RefCell;
+use std::path::Path;
+use std::thread;
 
 use eyre::Context;
 use teamy_windows::module::get_current_module;
-use tracing::{debug, info};
-use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, SIZE, WPARAM};
+use tracing::{debug, error, info};
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, BitBlt, CLEARTYPE_QUALITY, CreateCompatibleBitmap, CreateCompatibleDC,
     CreateFontIndirectW, DeleteDC, DeleteObject, EndPaint, GetDC, GetTextExtentPoint32W, HBITMAP,
@@ -14,17 +16,18 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetSystemMetrics, GetWindowRect, HTCAPTION, HTCLIENT, IDC_ARROW, LWA_ALPHA, LoadCursorW, MSG,
     PostQuitMessage, RegisterClassExW, SM_CXSCREEN, SM_CYSCREEN, SW_SHOW,
     SetLayeredWindowAttributes, SetTimer, ShowWindow, TranslateMessage, WM_CHAR, WM_DESTROY,
-    WM_ERASEBKGND, WM_KEYDOWN, WM_KEYUP, WM_NCHITTEST, WM_PAINT, WM_SIZE, WM_SYSKEYDOWN,
-    WM_SYSKEYUP, WM_TIMER, WNDCLASSEXW, WS_EX_APPWINDOW, WS_EX_LAYERED, WS_MAXIMIZEBOX,
-    WS_MINIMIZEBOX, WS_POPUP, WS_THICKFRAME, WS_VISIBLE,
+    WM_ERASEBKGND, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONUP, WM_NCHITTEST, WM_PAINT, WM_SIZE,
+    WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WNDCLASSEXW, WS_EX_APPWINDOW, WS_EX_LAYERED,
+    WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP, WS_THICKFRAME, WS_VISIBLE,
 };
 use windows::core::{PCWSTR, w};
 
 use crate::paths::AppHome;
 
+use super::WorkspaceWindowState;
 use super::windows_terminal::{
-    DRAG_STRIP_HEIGHT, POLL_INTERVAL_MS, POLL_TIMER_ID, TerminalLayout, TerminalSession,
-    WINDOW_ALPHA, keyboard_mods,
+    CellChrome, PANEL_WINDOW_ALPHA, POLL_INTERVAL_MS, POLL_TIMER_ID, TerminalLayout,
+    TerminalSession, keyboard_mods,
 };
 
 const WINDOW_CLASS_NAME: PCWSTR = w!("TeamyStudioTerminalWindow");
@@ -38,6 +41,8 @@ thread_local! {
 }
 
 struct AppState {
+    app_home: AppHome,
+    workspace_window: Option<WorkspaceWindowState>,
     font: FontHandle,
     cell_width: i32,
     cell_height: i32,
@@ -87,12 +92,18 @@ impl Drop for SelectObjectGuard {
 /// # Errors
 ///
 /// This function will return an error if the window class, font, terminal session, or message loop fails.
-pub fn run(app_home: &AppHome) -> eyre::Result<()> {
+pub fn run(
+    app_home: &AppHome,
+    working_dir: Option<&Path>,
+    workspace_window: Option<WorkspaceWindowState>,
+) -> eyre::Result<()> {
     let (font, cell_width, cell_height) = create_terminal_font()?;
-    let terminal = TerminalSession::new(app_home)?;
+    let terminal = TerminalSession::new(app_home, working_dir)?;
 
     APP_STATE.with(|state| {
         *state.borrow_mut() = Some(AppState {
+            app_home: app_home.clone(),
+            workspace_window,
             font,
             cell_width,
             cell_height,
@@ -128,7 +139,9 @@ fn create_window() -> eyre::Result<HWND> {
     };
     let atom = unsafe { RegisterClassExW(&class) };
     if atom == 0 {
-        eyre::bail!("failed to register terminal window class")
+        debug!(
+            "terminal window class already registered or registration deferred to create-window path"
+        );
     }
 
     let screen_width = unsafe { GetSystemMetrics(SM_CXSCREEN) };
@@ -155,7 +168,7 @@ fn create_window() -> eyre::Result<HWND> {
     }
     .wrap_err("failed to create terminal window")?;
 
-    unsafe { SetLayeredWindowAttributes(hwnd, COLORREF(0), WINDOW_ALPHA, LWA_ALPHA) }
+    unsafe { SetLayeredWindowAttributes(hwnd, Default::default(), PANEL_WINDOW_ALPHA, LWA_ALPHA) }
         .wrap_err("failed to enable layered window alpha")?;
 
     let timer = unsafe { SetTimer(Some(hwnd), POLL_TIMER_ID, POLL_INTERVAL_MS, None) };
@@ -315,6 +328,19 @@ extern "system" fn window_proc(
             Ok(()) => LRESULT(0),
             Err(error) => fail_and_close(hwnd, error),
         },
+        WM_LBUTTONUP => match handle_left_button_up(hwnd, lparam) {
+            Ok(handled) => {
+                if handled {
+                    unsafe {
+                        let _ = InvalidateRect(Some(hwnd), None, false);
+                    }
+                    LRESULT(0)
+                } else {
+                    unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
+                }
+            }
+            Err(error) => fail_and_close(hwnd, error),
+        },
         WM_NCHITTEST => {
             // cli[impl window.interaction.drag]
             let default_hit = unsafe { DefWindowProcW(hwnd, message, wparam, lparam) };
@@ -322,11 +348,12 @@ extern "system" fn window_proc(
                 return default_hit;
             }
 
-            let y = extract_signed_coordinate(lparam.0 >> 16);
-            let mut window_rect = RECT::default();
-            let got_rect = unsafe { GetWindowRect(hwnd, &mut window_rect) }.is_ok();
-            if got_rect && y - window_rect.top < DRAG_STRIP_HEIGHT {
-                return LRESULT(isize::try_from(HTCAPTION).expect("HTCAPTION fits in isize"));
+            match hit_test_drag_handle(hwnd, lparam) {
+                Ok(true) => {
+                    return LRESULT(isize::try_from(HTCAPTION).expect("HTCAPTION fits in isize"));
+                }
+                Ok(false) => {}
+                Err(error) => return fail_and_close(hwnd, error),
             }
             LRESULT(isize::try_from(HTCLIENT).expect("HTCLIENT fits in isize"))
         }
@@ -369,12 +396,8 @@ fn paint_window(hwnd: HWND) -> eyre::Result<()> {
             object: previous_font,
         };
 
-        let overlay = format!(
-            "Teamy Studio  |  drag top strip to move  |  {}x{}",
-            state.terminal.cols(),
-            state.terminal.rows()
-        );
-        state.terminal.paint(buffer_dc.0, layout, &overlay)?;
+        let chrome = cell_chrome(state);
+        state.terminal.paint(buffer_dc.0, layout, &chrome)?;
 
         unsafe {
             BitBlt(
@@ -473,6 +496,33 @@ fn client_layout(hwnd: HWND, cell_width: i32, cell_height: i32) -> eyre::Result<
     })
 }
 
+fn cell_chrome(state: &AppState) -> CellChrome {
+    let result_text = if let Some(workspace_window) = &state.workspace_window {
+        format!(
+            "workspace {}\ncell {} of {}\n{} cols x {} rows",
+            workspace_window.workspace.name,
+            workspace_window.cell_number,
+            workspace_window.workspace.cell_count,
+            state.terminal.cols(),
+            state.terminal.rows()
+        )
+    } else {
+        format!(
+            "standalone shell\n{} cols x {} rows",
+            state.terminal.cols(),
+            state.terminal.rows()
+        )
+    };
+
+    CellChrome {
+        cell_number: state
+            .workspace_window
+            .as_ref()
+            .map_or(1, |workspace_window| workspace_window.cell_number),
+        result_text,
+    }
+}
+
 fn with_app_state<T>(f: impl FnOnce(&mut AppState) -> eyre::Result<T>) -> eyre::Result<T> {
     APP_STATE.with(|state| {
         let mut borrowed = state.borrow_mut();
@@ -481,6 +531,74 @@ fn with_app_state<T>(f: impl FnOnce(&mut AppState) -> eyre::Result<T>) -> eyre::
             .ok_or_else(|| eyre::eyre!("application state was not initialized"))?;
         f(app_state)
     })
+}
+
+fn handle_left_button_up(hwnd: HWND, lparam: LPARAM) -> eyre::Result<bool> {
+    with_app_state(|state| {
+        let Some(workspace_window) = state.workspace_window.clone() else {
+            return Ok(false);
+        };
+
+        let layout = client_layout(hwnd, state.cell_width, state.cell_height)?;
+        let point = POINT {
+            x: extract_signed_coordinate(lparam.0),
+            y: extract_signed_coordinate(lparam.0 >> 16),
+        };
+        if !point_in_rect(point, layout.plus_button_rect()) {
+            return Ok(false);
+        }
+
+        let app_home = state.app_home.clone();
+        let cache_home = workspace_window.cache_home.clone();
+        let workspace_id = workspace_window.workspace.id.clone();
+
+        thread::Builder::new()
+            .name(format!(
+                "teamy-studio-cell-{}",
+                workspace_window.cell_number + 1
+            ))
+            .spawn(move || {
+                let launch_result =
+                    crate::workspace::append_workspace_cell(&cache_home, &workspace_id).and_then(
+                        |launch| super::run_workspace_launch(&app_home, &cache_home, launch),
+                    );
+                if let Err(error) = launch_result {
+                    error!(?error, "failed to open additional Teamy Studio cell window");
+                }
+            })
+            .wrap_err("failed to spawn Teamy Studio cell window thread")?;
+
+        Ok(true)
+    })
+}
+
+fn hit_test_drag_handle(hwnd: HWND, lparam: LPARAM) -> eyre::Result<bool> {
+    with_app_state(|state| {
+        let layout = client_layout(hwnd, state.cell_width, state.cell_height)?;
+        let point = screen_to_client_point(hwnd, lparam)?;
+        Ok(point_in_rect(point, layout.drag_handle_rect()))
+    })
+}
+
+fn screen_to_client_point(hwnd: HWND, lparam: LPARAM) -> eyre::Result<POINT> {
+    let mut window_rect = RECT::default();
+    if unsafe { GetWindowRect(hwnd, &mut window_rect) }.is_err() {
+        eyre::bail!("failed to query window rect")
+    }
+
+    let point = POINT {
+        x: extract_signed_coordinate(lparam.0),
+        y: extract_signed_coordinate(lparam.0 >> 16),
+    };
+
+    Ok(POINT {
+        x: point.x - window_rect.left,
+        y: point.y - window_rect.top,
+    })
+}
+
+fn point_in_rect(point: POINT, rect: RECT) -> bool {
+    point.x >= rect.left && point.x < rect.right && point.y >= rect.top && point.y < rect.bottom
 }
 
 fn fail_and_close(hwnd: HWND, error: eyre::Error) -> LRESULT {

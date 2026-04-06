@@ -27,9 +27,13 @@ impl SelfTestArgs {
     /// # Errors
     ///
     /// This function will return an error if the subcommand fails.
-    pub async fn invoke(self, app_home: &crate::paths::AppHome) -> eyre::Result<()> {
+    pub async fn invoke(
+        self,
+        app_home: &crate::paths::AppHome,
+        cache_home: &crate::paths::CacheHome,
+    ) -> eyre::Result<()> {
         match self.command {
-            SelfTestCommand::KeyboardInput(args) => args.invoke(app_home).await,
+            SelfTestCommand::KeyboardInput(args) => args.invoke(app_home, cache_home).await,
         }
     }
 }

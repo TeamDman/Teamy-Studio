@@ -67,6 +67,7 @@ fn test_version_includes_semver_and_git_revision() {
 }
 
 // tool[verify cli.help.describes-behavior]
+// tool[verify cli.help.describes-workspace]
 // tool[verify cli.help.describes-shell]
 // tool[verify cli.help.describes-self-test]
 // tool[verify cli.help.describes-argv]
@@ -74,6 +75,7 @@ fn test_version_includes_semver_and_git_revision() {
 // tool[verify cli.global.debug]
 // tool[verify cli.global.log-filter]
 // tool[verify cli.global.log-file]
+// tool[verify cli.surface.workspace]
 // tool[verify cli.surface.window]
 // tool[verify cli.surface.shell]
 // tool[verify cli.surface.self-test]
@@ -83,6 +85,10 @@ fn test_root_help_describes_commands_args_and_environment() {
     let text = output_text(&output);
 
     assert!(output.status.success(), "help command failed:\n{text}");
+    assert!(
+        text.contains("workspace"),
+        "missing workspace command in help:\n{text}"
+    );
     assert!(
         text.contains("window"),
         "missing window command in help:\n{text}"
@@ -115,6 +121,36 @@ fn test_root_help_describes_commands_args_and_environment() {
     assert!(
         text.contains("RUST_LOG"),
         "missing RUST_LOG in help:\n{text}"
+    );
+}
+
+// tool[verify cli.help.position-independent]
+// cli[verify command.surface.workspace]
+// cli[verify command.surface.workspace-list]
+// cli[verify command.surface.workspace-show]
+// cli[verify command.surface.workspace-create]
+// cli[verify command.surface.workspace-run]
+#[test]
+fn test_nested_workspace_help_is_available() {
+    let output = run_teamy_studio(&["workspace", "--help"], &[]);
+    let text = output_text(&output);
+
+    assert!(output.status.success(), "workspace help failed:\n{text}");
+    assert!(
+        text.contains("list"),
+        "missing list subcommand in help:\n{text}"
+    );
+    assert!(
+        text.contains("show"),
+        "missing show subcommand in help:\n{text}"
+    );
+    assert!(
+        text.contains("create"),
+        "missing create subcommand in help:\n{text}"
+    );
+    assert!(
+        text.contains("run"),
+        "missing run subcommand in help:\n{text}"
     );
 }
 
@@ -240,5 +276,104 @@ fn test_shell_runs_configured_default_inline() {
     assert!(
         run_output.status.success(),
         "inline shell failed:\n{run_text}"
+    );
+}
+
+// cli[verify command.surface.workspace-create]
+// cli[verify command.surface.workspace-list]
+// cli[verify command.surface.workspace-show]
+// cli[verify workspace.create.name-optional]
+// cli[verify workspace.list.prints-id-name-cell-count]
+// cli[verify workspace.show.prints-id-name-cell-count]
+// cli[verify path.cache.env-overrides-platform]
+#[test]
+fn test_workspace_create_list_and_show_roundtrip() {
+    let cache_home = TempDirGuard::new("teamy-studio-cli-workspaces");
+    let cache_home_str = cache_home.path().to_string_lossy().into_owned();
+
+    let create_output = run_teamy_studio(
+        &["workspace", "create", "alpha"],
+        &[("TEAMY_STUDIO_CACHE_DIR", &cache_home_str)],
+    );
+    let create_text = output_text(&create_output);
+    assert!(
+        create_output.status.success(),
+        "workspace create failed:\n{create_text}"
+    );
+    assert!(
+        create_text.contains("id: workspace-"),
+        "missing workspace id:\n{create_text}"
+    );
+    assert!(
+        create_text.contains("name: alpha"),
+        "missing workspace name:\n{create_text}"
+    );
+    assert!(
+        create_text.contains("cells: 1"),
+        "missing cell count:\n{create_text}"
+    );
+
+    let id_line = create_text
+        .lines()
+        .find(|line| line.starts_with("id: "))
+        .expect("workspace create output should include an id line");
+    let workspace_id = id_line.trim_start_matches("id: ").trim().to_owned();
+
+    let list_output = run_teamy_studio(
+        &["workspace", "list"],
+        &[("TEAMY_STUDIO_CACHE_DIR", &cache_home_str)],
+    );
+    let list_text = output_text(&list_output);
+    assert!(
+        list_output.status.success(),
+        "workspace list failed:\n{list_text}"
+    );
+    assert!(
+        list_text.contains(&format!("{workspace_id}\talpha\t1")),
+        "unexpected workspace list output:\n{list_text}"
+    );
+
+    let show_output = run_teamy_studio(
+        &["workspace", "show", &workspace_id],
+        &[("TEAMY_STUDIO_CACHE_DIR", &cache_home_str)],
+    );
+    let show_text = output_text(&show_output);
+    assert!(
+        show_output.status.success(),
+        "workspace show failed:\n{show_text}"
+    );
+    assert!(
+        show_text.contains(&format!("id: {workspace_id}")),
+        "missing shown id:\n{show_text}"
+    );
+    assert!(
+        show_text.contains("name: alpha"),
+        "missing shown name:\n{show_text}"
+    );
+    assert!(
+        show_text.contains("cells: 1"),
+        "missing shown cells:\n{show_text}"
+    );
+}
+
+// cli[verify workspace.show.bails-when-missing]
+#[test]
+fn test_workspace_show_fails_when_target_is_missing() {
+    let cache_home = TempDirGuard::new("teamy-studio-cli-workspace-missing");
+    let cache_home_str = cache_home.path().to_string_lossy().into_owned();
+
+    let output = run_teamy_studio(
+        &["workspace", "show", "missing-workspace"],
+        &[("TEAMY_STUDIO_CACHE_DIR", &cache_home_str)],
+    );
+    let text = output_text(&output);
+
+    assert!(
+        !output.status.success(),
+        "workspace show unexpectedly succeeded:\n{text}"
+    );
+    assert!(
+        text.contains("workspace `missing-workspace` not found"),
+        "unexpected missing-workspace error:\n{text}"
     );
 }

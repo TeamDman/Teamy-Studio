@@ -30,10 +30,14 @@ impl ShellDefaultArgs {
     /// # Errors
     ///
     /// This function will return an error if the subcommand fails.
-    pub async fn invoke(self, app_home: &crate::paths::AppHome) -> Result<()> {
+    pub async fn invoke(
+        self,
+        app_home: &crate::paths::AppHome,
+        cache_home: &crate::paths::CacheHome,
+    ) -> Result<()> {
         match self.command {
-            ShellDefaultCommand::Set(args) => args.invoke(app_home).await?,
-            ShellDefaultCommand::Show(args) => args.invoke(app_home).await?,
+            ShellDefaultCommand::Set(args) => args.invoke(app_home, cache_home).await?,
+            ShellDefaultCommand::Show(args) => args.invoke(app_home, cache_home).await?,
         }
 
         Ok(())

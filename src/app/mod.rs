@@ -5,7 +5,18 @@ mod windows_terminal;
 #[cfg(windows)]
 mod windows_terminal_self_test;
 
-use crate::paths::AppHome;
+use std::path::Path;
+
+use crate::paths::{AppHome, CacheHome, CellId};
+use crate::workspace::{WorkspaceLaunch, WorkspaceSummary};
+
+#[derive(Clone, Debug)]
+pub struct WorkspaceWindowState {
+    pub cache_home: CacheHome,
+    pub workspace: WorkspaceSummary,
+    pub cell_id: CellId,
+    pub cell_number: usize,
+}
 
 /// Run the Teamy Studio application shell.
 /// cli[impl command.surface.core]
@@ -14,16 +25,66 @@ use crate::paths::AppHome;
 ///
 /// This function will return an error if the platform-specific window cannot be launched.
 pub fn run(app_home: &AppHome) -> eyre::Result<()> {
+    run_in_dir(app_home, None, None)
+}
+
+/// Run the Teamy Studio application shell with an explicit starting directory.
+/// cli[impl window.appearance.shell-starts-in-workspace-cell-dir]
+///
+/// # Errors
+///
+/// This function will return an error if the platform-specific window cannot be launched.
+pub fn run_in_dir(
+    app_home: &AppHome,
+    working_dir: Option<&Path>,
+    workspace_window: Option<WorkspaceWindowState>,
+) -> eyre::Result<()> {
     #[cfg(windows)]
     {
-        windows_app::run(app_home)
+        windows_app::run(app_home, working_dir, workspace_window)
     }
 
     #[cfg(not(windows))]
     {
         let _ = app_home;
+        let _ = working_dir;
+        let _ = workspace_window;
         eyre::bail!("Teamy Studio currently only supports Windows")
     }
+}
+
+/// Run a notebook workspace, creating a new one when no target is provided.
+/// cli[impl command.surface.core]
+/// cli[impl workspace.run.no-target-creates-workspace]
+/// cli[impl workspace.run.target-by-id-or-name]
+///
+/// # Errors
+///
+/// This function will return an error if the workspace cannot be resolved or the window cannot be launched.
+pub fn run_workspace(
+    app_home: &AppHome,
+    cache_home: &CacheHome,
+    target: Option<&str>,
+) -> eyre::Result<()> {
+    let launch = crate::workspace::open_workspace(cache_home, target)?;
+    run_workspace_launch(app_home, cache_home, launch)
+}
+
+pub fn run_workspace_launch(
+    app_home: &AppHome,
+    cache_home: &CacheHome,
+    launch: WorkspaceLaunch,
+) -> eyre::Result<()> {
+    run_in_dir(
+        app_home,
+        Some(&launch.first_cell_dir),
+        Some(WorkspaceWindowState {
+            cache_home: cache_home.clone(),
+            workspace: launch.workspace,
+            cell_id: launch.first_cell_id,
+            cell_number: launch.cell_number,
+        }),
+    )
 }
 
 /// Run the configured default shell inline in the current console.

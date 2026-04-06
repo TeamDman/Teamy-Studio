@@ -35,7 +35,7 @@ pub fn run(app_home: &AppHome, inside: bool) -> eyre::Result<()> {
 }
 
 fn run_outside(app_home: &AppHome) -> eyre::Result<()> {
-    let mut terminal = TerminalSession::new(app_home)?;
+    let mut terminal = TerminalSession::new(app_home, None)?;
     terminal.resize(TerminalLayout {
         client_width: 1600,
         client_height: 900,
