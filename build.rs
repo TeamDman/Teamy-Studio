@@ -1,8 +1,12 @@
+use std::env;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn main() {
     add_exe_resources();
     add_git_revision();
+    stage_openconsole_binaries();
 }
 
 /// Embeds Windows resources (like application icon) into the executable.
@@ -29,4 +33,68 @@ fn add_git_revision() {
         .map_or_else(|| "unknown".to_string(), |s| s.trim().to_string());
 
     println!("cargo:rustc-env=GIT_REVISION={rev}",);
+}
+
+fn stage_openconsole_binaries() {
+    println!("cargo:rerun-if-env-changed=TEAMY_OPENCONSOLE_BUILD_DIR");
+
+    let Some(source_dir) = openconsole_build_dir() else {
+        return;
+    };
+
+    let Some(output_dir) = cargo_profile_dir() else {
+        println!(
+            "cargo:warning=skipping OpenConsole staging because Cargo output directory could not be determined"
+        );
+        return;
+    };
+
+    for file_name in ["conpty.dll", "OpenConsole.exe"] {
+        let source = source_dir.join(file_name);
+        if !source.exists() {
+            continue;
+        }
+
+        println!("cargo:rerun-if-changed={}", source.display());
+
+        let destination = output_dir.join(file_name);
+        if let Err(error) = fs::copy(&source, &destination) {
+            println!(
+                "cargo:warning=failed to stage {} from {} to {}: {}",
+                file_name,
+                source.display(),
+                destination.display(),
+                error,
+            );
+        }
+    }
+}
+
+fn openconsole_build_dir() -> Option<PathBuf> {
+    let env_dir = env::var_os("TEAMY_OPENCONSOLE_BUILD_DIR")
+        .map(PathBuf::from)
+        .filter(|path| path.join("conpty.dll").exists() && path.join("OpenConsole.exe").exists());
+    if env_dir.is_some() {
+        return env_dir;
+    }
+
+    let manifest_dir = env::var_os("CARGO_MANIFEST_DIR").map(PathBuf::from)?;
+    let sibling_dir = manifest_dir
+        .parent()
+        .map(Path::to_path_buf)?
+        .join("microsoft-terminal")
+        .join("bin")
+        .join("x64")
+        .join("Release");
+
+    if sibling_dir.join("conpty.dll").exists() && sibling_dir.join("OpenConsole.exe").exists() {
+        Some(sibling_dir)
+    } else {
+        None
+    }
+}
+
+fn cargo_profile_dir() -> Option<PathBuf> {
+    let out_dir = env::var_os("OUT_DIR").map(PathBuf::from)?;
+    out_dir.parent()?.parent()?.parent().map(Path::to_path_buf)
 }

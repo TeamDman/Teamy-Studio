@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex, mpsc};
 
@@ -11,6 +13,11 @@ use tracing::{debug, info};
 use windows::Win32::Foundation::{COLORREF, RECT};
 use windows::Win32::Graphics::Gdi::{
     CreateSolidBrush, DeleteObject, FillRect, HDC, SetBkMode, SetTextColor, TRANSPARENT, TextOutW,
+};
+use windows::Win32::UI::Input::KeyboardAndMouse::GetKeyState;
+use windows::Win32::System::Console::{
+    CAPSLOCK_ON, LEFT_ALT_PRESSED, LEFT_CTRL_PRESSED, NUMLOCK_ON, RIGHT_ALT_PRESSED,
+    RIGHT_CTRL_PRESSED, SHIFT_PRESSED,
 };
 
 pub const DRAG_STRIP_HEIGHT: i32 = 38;
@@ -26,12 +33,49 @@ pub const WINDOW_TEXT: COLORREF = COLORREF(0x00F5_EBFF);
 const DEFAULT_COLS: u16 = 80;
 const DEFAULT_ROWS: u16 = 24;
 const MAX_SCROLLBACK: usize = 20_000;
+const WIN32_INPUT_MODE_ENABLE: &[u8] = b"\x1b[?9001h";
+const WIN32_INPUT_MODE_DISABLE: &[u8] = b"\x1b[?9001l";
 
 type PtyWriter = Box<dyn Write + Send>;
+
+#[derive(Clone, Copy, Debug)]
+struct SuppressedChar {
+    primary: u32,
+    alternate: Option<u32>,
+}
+
+impl SuppressedChar {
+    fn single(primary: u32) -> Self {
+        Self {
+            primary,
+            alternate: None,
+        }
+    }
+
+    fn with_alternate(primary: u32, alternate: u32) -> Self {
+        Self {
+            primary,
+            alternate: Some(alternate),
+        }
+    }
+
+    fn matches(self, code_unit: u32) -> bool {
+        self.primary == code_unit || self.alternate == Some(code_unit)
+    }
+}
 
 pub struct PumpResult {
     pub should_close: bool,
     pub needs_repaint: bool,
+}
+
+#[derive(Clone, Copy)]
+struct PendingWin32CharKey {
+    vkey: u32,
+    lparam: isize,
+    mapped_key: key::Key,
+    unshifted_codepoint: char,
+    mods: key::Mods,
 }
 
 pub struct TerminalSession {
@@ -47,6 +91,11 @@ pub struct TerminalSession {
     rows: u16,
     needs_repaint: bool,
     full_repaint_pending: bool,
+    input_trace: Vec<Vec<u8>>,
+    suppressed_chars: VecDeque<SuppressedChar>,
+    win32_input_mode: bool,
+    win32_input_mode_buffer: Vec<u8>,
+    pending_win32_char_key: Option<PendingWin32CharKey>,
     closed: bool,
 }
 
@@ -85,6 +134,10 @@ impl TerminalLayout {
 
 impl TerminalSession {
     pub fn new() -> eyre::Result<Self> {
+        Self::new_with_command(default_shell_command())
+    }
+
+    pub fn new_with_command(shell: CommandBuilder) -> eyre::Result<Self> {
         let pty_system = native_pty_system();
         let initial_size = PtySize {
             cols: DEFAULT_COLS,
@@ -118,8 +171,7 @@ impl TerminalSession {
             })
             .wrap_err("failed to register PTY write effect")?;
 
-        info!("starting Teamy Studio shell");
-        let shell = default_shell_command();
+        info!(program = shell.get_argv().first().map_or_else(|| "<unknown>".to_owned(), |arg| arg.to_string_lossy().into_owned()), "starting Teamy Studio PTY child");
         let child = pair
             .slave
             .spawn_command(shell)
@@ -162,6 +214,11 @@ impl TerminalSession {
             rows: DEFAULT_ROWS,
             needs_repaint: true,
             full_repaint_pending: true,
+            input_trace: Vec::new(),
+            suppressed_chars: VecDeque::new(),
+            win32_input_mode: false,
+            win32_input_mode_buffer: Vec::new(),
+            pending_win32_char_key: None,
             closed: false,
         })
     }
@@ -211,7 +268,9 @@ impl TerminalSession {
         while let Ok(message) = self.reader.try_recv() {
             match message {
                 Ok(bytes) => {
-                    self.terminal.vt_write(&bytes);
+                    let bytes = normalize_cursor_visibility_mode_sequence(&bytes);
+                    let bytes = self.strip_win32_input_mode_sequence(bytes.as_ref());
+                    self.terminal.vt_write(bytes.as_ref());
                     changed = true;
                 }
                 Err(error) => {
@@ -234,10 +293,43 @@ impl TerminalSession {
         })
     }
 
-    pub fn handle_char(&mut self, code_unit: u32) -> eyre::Result<bool> {
+    pub fn handle_char(&mut self, code_unit: u32, lparam: isize) -> eyre::Result<bool> {
+        debug!(
+            code_unit,
+            lparam,
+            win32_input_mode = self.win32_input_mode,
+            suppressed_front = ?self.suppressed_chars.front().copied(),
+            "handling character input"
+        );
+        if self.should_route_text_through_key_events()? {
+            return Ok(false);
+        }
+
+        if !self.win32_input_mode
+            && self
+                .suppressed_chars
+                .front()
+                .copied()
+                .is_some_and(|suppressed| suppressed.matches(code_unit))
+        {
+            self.suppressed_chars.pop_front();
+            debug!(code_unit, "suppressed legacy WM_CHAR after handled key event");
+            return Ok(true);
+        }
+
         let Some(character) = char::from_u32(code_unit) else {
             return Ok(false);
         };
+
+        if self.win32_input_mode {
+            let Some(pending_key) = self.pending_win32_char_key else {
+                return Ok(false);
+            };
+
+            self.write_win32_input_mode_char_event(pending_key, character, lparam)?;
+            self.needs_repaint = true;
+            return Ok(true);
+        }
 
         if character == '\r' || character == '\t' || character == '\u{8}' {
             return Ok(false);
@@ -257,28 +349,127 @@ impl TerminalSession {
         Ok(true)
     }
 
-    pub fn handle_keydown(
+    pub fn handle_key_event(
         &mut self,
         vkey: u32,
+        lparam: isize,
         was_down: bool,
+        is_release: bool,
         mods: key::Mods,
     ) -> eyre::Result<bool> {
-        let Some(mapped_key) = map_virtual_key(vkey) else {
+        let Some((mapped_key, unshifted_codepoint)) = map_virtual_key(vkey, lparam) else {
             return Ok(false);
         };
 
-        let action = if was_down {
+        debug!(
+            vkey,
+            lparam,
+            ?mapped_key,
+            unshifted_codepoint = u32::from(unshifted_codepoint),
+            ?mods,
+            was_down,
+            is_release,
+            win32_input_mode = self.win32_input_mode,
+            "handling key event"
+        );
+
+        if is_release && !self.win32_input_mode && !self.should_report_key_releases()? {
+            return Ok(false);
+        }
+
+        let kitty_flags = self.current_kitty_keyboard_flags()?;
+        if self.win32_input_mode {
+            if is_release {
+                self.write_win32_input_mode_key_event(
+                    vkey,
+                    lparam,
+                    mapped_key,
+                    unshifted_codepoint,
+                    mods,
+                    '\0',
+                    1,
+                    false,
+                )?;
+                if self.pending_win32_char_key.map(|pending| pending.vkey) == Some(vkey) {
+                    self.pending_win32_char_key = None;
+                }
+                self.needs_repaint = true;
+                return Ok(true);
+            }
+
+            if should_route_key_through_char_input(mapped_key, unshifted_codepoint, true) {
+                self.pending_win32_char_key = Some(PendingWin32CharKey {
+                    vkey,
+                    lparam,
+                    mapped_key,
+                    unshifted_codepoint,
+                    mods,
+                });
+                return Ok(false);
+            }
+
+            self.write_win32_input_mode_key_event(
+                vkey,
+                lparam,
+                mapped_key,
+                unshifted_codepoint,
+                mods,
+                legacy_key_event_character(mapped_key, unshifted_codepoint, mods).unwrap_or('\0'),
+                repeat_count(lparam),
+                true,
+            )?;
+            self.needs_repaint = true;
+            return Ok(true);
+        }
+
+        if kitty_flags.is_empty() {
+            if mapped_key == key::Key::Backspace {
+                if is_release {
+                    debug!(vkey, "ignored legacy Backspace key release");
+                    return Ok(false);
+                }
+
+                self.suppressed_chars
+                    .push_back(SuppressedChar::with_alternate(u32::from('\u{8}'), 0x7F));
+                debug!(
+                    vkey,
+                    ?mods,
+                    suppressed_len = self.suppressed_chars.len(),
+                    "writing legacy Backspace byte and suppressing matching WM_CHAR"
+                );
+                self.write_input(&[0x7F])?;
+                self.needs_repaint = true;
+                return Ok(true);
+            }
+
+            if should_route_key_through_char_input(mapped_key, unshifted_codepoint, false) {
+                return Ok(false);
+            }
+
+            self.write_input(&legacy_special_key_bytes(mapped_key, mods).unwrap_or_default())?;
+            self.needs_repaint = true;
+            return Ok(!legacy_special_key_bytes(mapped_key, mods).unwrap_or_default().is_empty());
+        }
+
+        let action = if is_release {
+            key::Action::Release
+        } else if was_down {
             key::Action::Repeat
         } else {
             key::Action::Press
         };
         let mut response = Vec::with_capacity(16);
+        let mut consumed_mods = key::Mods::empty();
+        if unshifted_codepoint != '\0' && mods.contains(key::Mods::SHIFT) {
+            consumed_mods |= key::Mods::SHIFT;
+        }
+
         self.key_event
             .set_action(action)
             .set_key(mapped_key)
             .set_mods(mods)
-            .set_consumed_mods(key::Mods::empty())
-            .set_unshifted_codepoint('\0')
+            .set_consumed_mods(consumed_mods)
+            .set_unshifted_codepoint(unshifted_codepoint)
             .set_utf8::<String>(None);
 
         self.key_encoder
@@ -293,6 +484,59 @@ impl TerminalSession {
         self.write_input(&response)?;
         self.needs_repaint = true;
         Ok(true)
+    }
+
+    fn should_report_key_releases(&self) -> eyre::Result<bool> {
+        let flags = self.current_kitty_keyboard_flags()?;
+        Ok(flags.contains(key::KittyKeyFlags::REPORT_EVENTS))
+    }
+
+    fn should_route_text_through_key_events(&self) -> eyre::Result<bool> {
+        let flags = self.current_kitty_keyboard_flags()?;
+        Ok(flags.intersects(
+            key::KittyKeyFlags::REPORT_ALL
+                | key::KittyKeyFlags::REPORT_ASSOCIATED
+                | key::KittyKeyFlags::REPORT_EVENTS,
+        ))
+    }
+
+    pub fn current_kitty_keyboard_flags(&self) -> eyre::Result<key::KittyKeyFlags> {
+        self.terminal
+            .kitty_keyboard_flags()
+            .wrap_err("failed to query kitty keyboard flags")
+    }
+
+    pub fn win32_input_mode_enabled(&self) -> bool {
+        self.win32_input_mode
+    }
+
+    pub fn visible_text(&mut self) -> eyre::Result<String> {
+        let snapshot = self
+            .render_state
+            .update(&self.terminal)
+            .wrap_err("failed to update terminal render state")?;
+        let mut rows = RowIterator::new().wrap_err("failed to create row iterator")?;
+        let mut cells = CellIterator::new().wrap_err("failed to create cell iterator")?;
+        let mut lines = Vec::new();
+
+        let mut row_iter = rows.update(&snapshot).wrap_err("failed to update row iterator")?;
+        while let Some(row) = row_iter.next() {
+            let mut line = String::new();
+            let mut cell_iter = cells.update(row).wrap_err("failed to update cell iterator")?;
+            while let Some(cell) = cell_iter.next() {
+                let graphemes = cell.graphemes().wrap_err("failed to read cell text")?;
+                if graphemes.is_empty() {
+                    line.push(' ');
+                } else {
+                    for grapheme in graphemes {
+                        line.push(grapheme);
+                    }
+                }
+            }
+            lines.push(line.trim_end_matches(' ').to_owned());
+        }
+
+        Ok(lines.join("\n"))
     }
 
     pub fn paint(&mut self, hdc: HDC, layout: TerminalLayout, overlay_text: &str) -> eyre::Result<()> {
@@ -398,6 +642,11 @@ impl TerminalSession {
         Ok(())
     }
 
+    #[must_use]
+    pub fn take_input_trace(&mut self) -> Vec<Vec<u8>> {
+        std::mem::take(&mut self.input_trace)
+    }
+
     fn write_input(&mut self, data: &[u8]) -> eyre::Result<()> {
         let mut writer = self
             .writer
@@ -405,7 +654,95 @@ impl TerminalSession {
             .map_err(|_| eyre::eyre!("PTY writer mutex was poisoned"))?;
         writer.write_all(data).wrap_err("failed to write input to PTY")?;
         writer.flush().wrap_err("failed to flush PTY input")?;
+        self.input_trace.push(data.to_vec());
         Ok(())
+    }
+
+    fn write_win32_input_mode_key_event(
+        &mut self,
+        vkey: u32,
+        lparam: isize,
+        mapped_key: key::Key,
+        _unshifted_codepoint: char,
+        mods: key::Mods,
+        unicode_char: char,
+        repeat_count: u16,
+        key_down: bool,
+    ) -> eyre::Result<()> {
+        let scancode = ((lparam >> 16) & 0xFF) as u32;
+        let sequence = format!(
+            "\x1b[{vkey};{scancode};{};{};{};{}_",
+            u32::from(unicode_char),
+            u8::from(key_down),
+            control_key_state(mods),
+            repeat_count.max(1),
+        );
+
+        if let Some(character) = legacy_char_suppression(mapped_key, unicode_char) {
+            if key_down && !self.win32_input_mode {
+                self.suppressed_chars
+                    .push_back(SuppressedChar::single(character as u32));
+            }
+        }
+
+        self.write_input(sequence.as_bytes())
+    }
+
+    fn write_win32_input_mode_char_event(
+        &mut self,
+        pending_key: PendingWin32CharKey,
+        character: char,
+        lparam: isize,
+    ) -> eyre::Result<()> {
+        self.write_win32_input_mode_key_event(
+            pending_key.vkey,
+            pending_key.lparam,
+            pending_key.mapped_key,
+            pending_key.unshifted_codepoint,
+            pending_key.mods,
+            character,
+            repeat_count(lparam),
+            true,
+        )
+    }
+
+    fn strip_win32_input_mode_sequence<'a>(&mut self, data: &'a [u8]) -> Cow<'a, [u8]> {
+        let mut combined = std::mem::take(&mut self.win32_input_mode_buffer);
+        combined.extend_from_slice(data);
+        let mut output = Vec::with_capacity(combined.len());
+        let mut index = 0;
+
+        while index < combined.len() {
+            if combined[index..].starts_with(WIN32_INPUT_MODE_ENABLE) {
+                self.win32_input_mode = true;
+                self.pending_win32_char_key = None;
+                index += WIN32_INPUT_MODE_ENABLE.len();
+                continue;
+            }
+
+            if combined[index..].starts_with(WIN32_INPUT_MODE_DISABLE) {
+                self.win32_input_mode = false;
+                self.pending_win32_char_key = None;
+                index += WIN32_INPUT_MODE_DISABLE.len();
+                continue;
+            }
+
+            if WIN32_INPUT_MODE_ENABLE.starts_with(&combined[index..])
+                || WIN32_INPUT_MODE_DISABLE.starts_with(&combined[index..])
+            {
+                self.win32_input_mode_buffer.extend_from_slice(&combined[index..]);
+                break;
+            }
+
+            output.push(combined[index]);
+            index += 1;
+        }
+
+        if output.len() == data.len() && self.win32_input_mode_buffer.is_empty() {
+            return Cow::Borrowed(data);
+        }
+
+        Cow::Owned(output)
     }
 }
 
@@ -424,28 +761,332 @@ fn default_shell_command() -> CommandBuilder {
     }
 }
 
-fn map_virtual_key(vkey: u32) -> Option<key::Key> {
+fn map_virtual_key(vkey: u32, lparam: isize) -> Option<(key::Key, char)> {
+    let extended = ((lparam >> 24) & 1) != 0;
+    let scancode = ((lparam >> 16) & 0xFF) as u8;
+
     match vkey {
-        0x08 => Some(key::Key::Backspace),
-        0x09 => Some(key::Key::Tab),
-        0x0D => Some(key::Key::Enter),
-        0x1B => Some(key::Key::Escape),
-        0x21 => Some(key::Key::PageUp),
-        0x22 => Some(key::Key::PageDown),
-        0x23 => Some(key::Key::End),
-        0x24 => Some(key::Key::Home),
-        0x25 => Some(key::Key::ArrowLeft),
-        0x26 => Some(key::Key::ArrowUp),
-        0x27 => Some(key::Key::ArrowRight),
-        0x28 => Some(key::Key::ArrowDown),
-        0x2D => Some(key::Key::Insert),
-        0x2E => Some(key::Key::Delete),
+        0x20 => Some((key::Key::Space, ' ')),
+        0x30 => Some((key::Key::Digit0, '0')),
+        0x31 => Some((key::Key::Digit1, '1')),
+        0x32 => Some((key::Key::Digit2, '2')),
+        0x33 => Some((key::Key::Digit3, '3')),
+        0x34 => Some((key::Key::Digit4, '4')),
+        0x35 => Some((key::Key::Digit5, '5')),
+        0x36 => Some((key::Key::Digit6, '6')),
+        0x37 => Some((key::Key::Digit7, '7')),
+        0x38 => Some((key::Key::Digit8, '8')),
+        0x39 => Some((key::Key::Digit9, '9')),
+        0x41 => Some((key::Key::A, 'a')),
+        0x42 => Some((key::Key::B, 'b')),
+        0x43 => Some((key::Key::C, 'c')),
+        0x44 => Some((key::Key::D, 'd')),
+        0x45 => Some((key::Key::E, 'e')),
+        0x46 => Some((key::Key::F, 'f')),
+        0x47 => Some((key::Key::G, 'g')),
+        0x48 => Some((key::Key::H, 'h')),
+        0x49 => Some((key::Key::I, 'i')),
+        0x4A => Some((key::Key::J, 'j')),
+        0x4B => Some((key::Key::K, 'k')),
+        0x4C => Some((key::Key::L, 'l')),
+        0x4D => Some((key::Key::M, 'm')),
+        0x4E => Some((key::Key::N, 'n')),
+        0x4F => Some((key::Key::O, 'o')),
+        0x50 => Some((key::Key::P, 'p')),
+        0x51 => Some((key::Key::Q, 'q')),
+        0x52 => Some((key::Key::R, 'r')),
+        0x53 => Some((key::Key::S, 's')),
+        0x54 => Some((key::Key::T, 't')),
+        0x55 => Some((key::Key::U, 'u')),
+        0x56 => Some((key::Key::V, 'v')),
+        0x57 => Some((key::Key::W, 'w')),
+        0x58 => Some((key::Key::X, 'x')),
+        0x59 => Some((key::Key::Y, 'y')),
+        0x5A => Some((key::Key::Z, 'z')),
+        0xBA => Some((key::Key::Semicolon, ';')),
+        0xBB => Some((key::Key::Equal, '=')),
+        0xBC => Some((key::Key::Comma, ',')),
+        0xBD => Some((key::Key::Minus, '-')),
+        0xBE => Some((key::Key::Period, '.')),
+        0xBF => Some((key::Key::Slash, '/')),
+        0xC0 => Some((key::Key::Backquote, '`')),
+        0xDB => Some((key::Key::BracketLeft, '[')),
+        0xDC => Some((key::Key::Backslash, '\\')),
+        0xDD => Some((key::Key::BracketRight, ']')),
+        0xDE => Some((key::Key::Quote, '\'')),
+        0x10 => Some((if scancode == 0x36 {
+            key::Key::ShiftRight
+        } else {
+            key::Key::ShiftLeft
+        }, '\0')),
+        0x11 => Some((if extended {
+            key::Key::ControlRight
+        } else {
+            key::Key::ControlLeft
+        }, '\0')),
+        0x12 => Some((if extended {
+            key::Key::AltRight
+        } else {
+            key::Key::AltLeft
+        }, '\0')),
+        0x08 => Some((key::Key::Backspace, '\0')),
+        0x09 => Some((key::Key::Tab, '\0')),
+        0x0D => Some((key::Key::Enter, '\0')),
+        0x1B => Some((key::Key::Escape, '\0')),
+        0x21 => Some((key::Key::PageUp, '\0')),
+        0x22 => Some((key::Key::PageDown, '\0')),
+        0x23 => Some((key::Key::End, '\0')),
+        0x24 => Some((key::Key::Home, '\0')),
+        0x25 => Some((key::Key::ArrowLeft, '\0')),
+        0x26 => Some((key::Key::ArrowUp, '\0')),
+        0x27 => Some((key::Key::ArrowRight, '\0')),
+        0x28 => Some((key::Key::ArrowDown, '\0')),
+        0x2D => Some((key::Key::Insert, '\0')),
+        0x2E => Some((key::Key::Delete, '\0')),
         _ => None,
     }
 }
 
-pub fn keyboard_mods() -> key::Mods {
-    key::Mods::empty()
+fn should_route_key_through_char_input(
+    mapped_key: key::Key,
+    unshifted_codepoint: char,
+    include_control_keys: bool,
+) -> bool {
+    unshifted_codepoint != '\0'
+        || (include_control_keys
+            && matches!(mapped_key, key::Key::Backspace | key::Key::Tab | key::Key::Enter))
+}
+
+fn repeat_count(lparam: isize) -> u16 {
+    u16::try_from((lparam as u64 & 0xFFFF) as u32).unwrap_or(1).max(1)
+}
+
+pub fn keyboard_mods(vkey: u32, lparam: isize, is_release: bool) -> key::Mods {
+    let mut mods = key::Mods::empty();
+
+    if key_is_pressed(0x10) {
+        mods |= key::Mods::SHIFT;
+    }
+    if key_is_pressed(0x11) {
+        mods |= key::Mods::CTRL;
+    }
+    if key_is_pressed(0x12) {
+        mods |= key::Mods::ALT;
+    }
+    if key_is_pressed(0x5B) || key_is_pressed(0x5C) {
+        mods |= key::Mods::SUPER;
+    }
+    if key_is_toggled(0x14) {
+        mods |= key::Mods::CAPS_LOCK;
+    }
+    if key_is_toggled(0x90) {
+        mods |= key::Mods::NUM_LOCK;
+    }
+
+    if key_is_pressed(0xA1) {
+        mods |= key::Mods::SHIFT | key::Mods::SHIFT_SIDE;
+    }
+    if key_is_pressed(0xA3) {
+        mods |= key::Mods::CTRL | key::Mods::CTRL_SIDE;
+    }
+    if key_is_pressed(0xA5) {
+        mods |= key::Mods::ALT | key::Mods::ALT_SIDE;
+    }
+    if key_is_pressed(0x5C) {
+        mods |= key::Mods::SUPER | key::Mods::SUPER_SIDE;
+    }
+
+    if is_release {
+        let extended = ((lparam >> 24) & 1) != 0;
+        let scancode = ((lparam >> 16) & 0xFF) as u8;
+        match vkey {
+            0x10 => {
+                mods |= key::Mods::SHIFT;
+                if scancode == 0x36 {
+                    mods |= key::Mods::SHIFT_SIDE;
+                }
+            }
+            0x11 => {
+                mods |= key::Mods::CTRL;
+                if extended {
+                    mods |= key::Mods::CTRL_SIDE;
+                }
+            }
+            0x12 => {
+                mods |= key::Mods::ALT;
+                if extended {
+                    mods |= key::Mods::ALT_SIDE;
+                }
+            }
+            0x5B => {
+                mods |= key::Mods::SUPER;
+            }
+            0x5C => {
+                mods |= key::Mods::SUPER | key::Mods::SUPER_SIDE;
+            }
+            _ => {}
+        }
+    }
+
+    mods
+}
+
+fn key_is_pressed(vkey: i32) -> bool {
+    ((unsafe { GetKeyState(vkey) } as u16) & 0x8000) != 0
+}
+
+fn key_is_toggled(vkey: i32) -> bool {
+    ((unsafe { GetKeyState(vkey) } as u16) & 0x0001) != 0
+}
+
+fn control_key_state(mods: key::Mods) -> u32 {
+    let mut state = 0;
+
+    if mods.contains(key::Mods::SHIFT) {
+        state |= SHIFT_PRESSED;
+    }
+    if mods.contains(key::Mods::CTRL) {
+        state |= if mods.contains(key::Mods::CTRL_SIDE) {
+            RIGHT_CTRL_PRESSED
+        } else {
+            LEFT_CTRL_PRESSED | RIGHT_CTRL_PRESSED
+        };
+    }
+    if mods.contains(key::Mods::ALT) {
+        state |= if mods.contains(key::Mods::ALT_SIDE) {
+            RIGHT_ALT_PRESSED
+        } else {
+            LEFT_ALT_PRESSED | RIGHT_ALT_PRESSED
+        };
+    }
+    if mods.contains(key::Mods::CAPS_LOCK) {
+        state |= CAPSLOCK_ON;
+    }
+    if mods.contains(key::Mods::NUM_LOCK) {
+        state |= NUMLOCK_ON;
+    }
+
+    state
+}
+
+fn legacy_char_suppression(mapped_key: key::Key, unicode_char: char) -> Option<char> {
+    match mapped_key {
+        key::Key::Backspace | key::Key::Tab | key::Key::Enter => Some(unicode_char),
+        _ if unicode_char != '\0' => Some(unicode_char),
+        _ => None,
+    }
+}
+
+fn legacy_key_event_character(mapped_key: key::Key, unshifted_codepoint: char, mods: key::Mods) -> Option<char> {
+    match mapped_key {
+        key::Key::Backspace => Some('\u{8}'),
+        key::Key::Tab => Some('\t'),
+        key::Key::Enter => Some('\r'),
+        key::Key::Space => Some(' '),
+        _ if unshifted_codepoint == '\0' => None,
+        key::Key::A
+        | key::Key::B
+        | key::Key::C
+        | key::Key::D
+        | key::Key::E
+        | key::Key::F
+        | key::Key::G
+        | key::Key::H
+        | key::Key::I
+        | key::Key::J
+        | key::Key::K
+        | key::Key::L
+        | key::Key::M
+        | key::Key::N
+        | key::Key::O
+        | key::Key::P
+        | key::Key::Q
+        | key::Key::R
+        | key::Key::S
+        | key::Key::T
+        | key::Key::U
+        | key::Key::V
+        | key::Key::W
+        | key::Key::X
+        | key::Key::Y
+        | key::Key::Z => {
+            let shifted = mods.contains(key::Mods::SHIFT) ^ mods.contains(key::Mods::CAPS_LOCK);
+            Some(if shifted {
+                unshifted_codepoint.to_ascii_uppercase()
+            } else {
+                unshifted_codepoint
+            })
+        }
+        _ => Some(apply_shift_to_punctuation(unshifted_codepoint, mods.contains(key::Mods::SHIFT))),
+    }
+}
+
+fn apply_shift_to_punctuation(character: char, shifted: bool) -> char {
+    if !shifted {
+        return character;
+    }
+
+    match character {
+        '1' => '!',
+        '2' => '@',
+        '3' => '#',
+        '4' => '$',
+        '5' => '%',
+        '6' => '^',
+        '7' => '&',
+        '8' => '*',
+        '9' => '(',
+        '0' => ')',
+        ';' => ':',
+        '=' => '+',
+        ',' => '<',
+        '-' => '_',
+        '.' => '>',
+        '/' => '?',
+        '`' => '~',
+        '[' => '{',
+        '\\' => '|',
+        ']' => '}',
+        '\'' => '"',
+        _ => character,
+    }
+}
+
+fn normalize_cursor_visibility_mode_sequence(data: &[u8]) -> Cow<'_, [u8]> {
+    let mut rewritten: Option<Vec<u8>> = None;
+    let mut index = 0;
+
+    while index + 5 <= data.len() {
+        let matches_cursor_mode = data[index] == 0x1B
+            && data[index + 1] == b'['
+            && data[index + 2] == b'2'
+            && data[index + 3] == b'5'
+            && matches!(data[index + 4], b'h' | b'l');
+
+        if matches_cursor_mode {
+            let output = rewritten.get_or_insert_with(|| {
+                let mut output = Vec::with_capacity(data.len() + 4);
+                output.extend_from_slice(&data[..index]);
+                output
+            });
+            output.extend_from_slice(b"\x1B[?25");
+            output.push(data[index + 4]);
+            index += 5;
+            continue;
+        }
+
+        if let Some(output) = rewritten.as_mut() {
+            output.push(data[index]);
+        }
+        index += 1;
+    }
+
+    if let Some(mut output) = rewritten {
+        output.extend_from_slice(&data[index..]);
+        Cow::Owned(output)
+    } else {
+        Cow::Borrowed(data)
+    }
 }
 
 fn rgb_to_colorref(color: RgbColor) -> COLORREF {
@@ -524,4 +1165,19 @@ fn paint_cursor(
     let _ = unsafe { FillRect(hdc, &cursor_rect, brush) };
     let _ = unsafe { DeleteObject(brush.into()) };
     Ok(())
+}
+
+fn legacy_special_key_bytes(mapped_key: key::Key, mods: key::Mods) -> Option<Vec<u8>> {
+    let mut key_event = key::Event::new().ok()?;
+    let mut encoder = key::Encoder::new().ok()?;
+    let mut response = Vec::with_capacity(16);
+    key_event
+        .set_action(key::Action::Press)
+        .set_key(mapped_key)
+        .set_mods(mods)
+        .set_consumed_mods(key::Mods::empty())
+        .set_unshifted_codepoint('\0')
+        .set_utf8::<String>(None);
+    encoder.encode_to_vec(&key_event, &mut response).ok()?;
+    Some(response)
 }

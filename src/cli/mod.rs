@@ -1,8 +1,10 @@
 pub mod facet_shape;
 pub mod global_args;
+pub mod self_test;
 pub mod window;
 
 use crate::cli::global_args::GlobalArgs;
+use crate::cli::self_test::SelfTestArgs;
 use crate::cli::window::WindowArgs;
 use arbitrary::Arbitrary;
 use eyre::Context;
@@ -62,6 +64,8 @@ impl Cli {
 #[derive(Facet, Arbitrary, Debug, PartialEq)]
 #[repr(u8)]
 pub enum Command {
+    /// Run reproducible self-tests.
+    SelfTest(SelfTestArgs),
     /// Launch window-related behaviors.
     Window(WindowArgs),
 }
@@ -72,6 +76,7 @@ impl Command {
     /// This function will return an error if the subcommand fails.
     pub async fn invoke(self) -> eyre::Result<()> {
         match self {
+            Command::SelfTest(args) => args.invoke().await,
             Command::Window(args) => args.invoke().await,
         }
     }

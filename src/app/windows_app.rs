@@ -2,7 +2,7 @@ use std::cell::RefCell;
 
 use eyre::Context;
 use teamy_windows::module::get_current_module;
-use tracing::info;
+use tracing::{debug, info};
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, SIZE, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, BitBlt, CLEARTYPE_QUALITY, CreateCompatibleBitmap, CreateCompatibleDC,
@@ -15,7 +15,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetClientRect, GetSystemMetrics, GetWindowRect, HTCAPTION, HTCLIENT, IDC_ARROW, LWA_ALPHA,
     LoadCursorW, MSG, PostQuitMessage, RegisterClassExW, SM_CXSCREEN, SM_CYSCREEN, SW_SHOW,
     SetLayeredWindowAttributes, SetTimer, ShowWindow, TranslateMessage, WM_CHAR, WM_DESTROY,
-    WM_ERASEBKGND, WM_KEYDOWN, WM_NCHITTEST, WM_PAINT, WM_SIZE, WM_TIMER, WNDCLASSEXW,
+    WM_ERASEBKGND, WM_KEYDOWN, WM_KEYUP, WM_NCHITTEST, WM_PAINT, WM_SIZE, WM_SYSKEYDOWN,
+    WM_SYSKEYUP, WM_TIMER, WNDCLASSEXW,
     WS_EX_APPWINDOW, WS_EX_LAYERED, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP, WS_THICKFRAME,
     WS_VISIBLE,
 };
@@ -212,8 +213,15 @@ extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam:
             }
             Err(error) => fail_and_close(hwnd, error),
         },
-        WM_CHAR => match with_app_state(|state| state.terminal.handle_char(wparam.0 as u32)) {
+        WM_CHAR => match with_app_state(|state| state.terminal.handle_char(wparam.0 as u32, lparam.0)) {
             Ok(consumed) => {
+                debug!(
+                    message = "WM_CHAR",
+                    code_unit = wparam.0 as u32,
+                    lparam = lparam.0,
+                    consumed,
+                    "processed keyboard char message"
+                );
                 if consumed {
                     unsafe {
                         let _ = InvalidateRect(Some(hwnd), None, false);
@@ -224,11 +232,44 @@ extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam:
             }
             Err(error) => fail_and_close(hwnd, error),
         },
-        WM_KEYDOWN => match with_app_state(|state| {
+        WM_KEYDOWN | WM_SYSKEYDOWN => match with_app_state(|state| {
             let was_down = ((lparam.0 >> 30) & 1) != 0;
-            state.terminal.handle_keydown(wparam.0 as u32, was_down, keyboard_mods())
+            state
+                .terminal
+                .handle_key_event(wparam.0 as u32, lparam.0, was_down, false, keyboard_mods(wparam.0 as u32, lparam.0, false))
         }) {
             Ok(consumed) => {
+                debug!(
+                    message = if message == WM_SYSKEYDOWN { "WM_SYSKEYDOWN" } else { "WM_KEYDOWN" },
+                    vkey = wparam.0 as u32,
+                    lparam = lparam.0,
+                    was_down = ((lparam.0 >> 30) & 1) != 0,
+                    consumed,
+                    "processed keyboard down message"
+                );
+                if consumed {
+                    unsafe {
+                        let _ = InvalidateRect(Some(hwnd), None, false);
+                    }
+                    return LRESULT(0);
+                }
+                unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
+            }
+            Err(error) => fail_and_close(hwnd, error),
+        },
+        WM_KEYUP | WM_SYSKEYUP => match with_app_state(|state| {
+            state
+                .terminal
+                .handle_key_event(wparam.0 as u32, lparam.0, false, true, keyboard_mods(wparam.0 as u32, lparam.0, true))
+        }) {
+            Ok(consumed) => {
+                debug!(
+                    message = if message == WM_SYSKEYUP { "WM_SYSKEYUP" } else { "WM_KEYUP" },
+                    vkey = wparam.0 as u32,
+                    lparam = lparam.0,
+                    consumed,
+                    "processed keyboard up message"
+                );
                 if consumed {
                     unsafe {
                         let _ = InvalidateRect(Some(hwnd), None, false);
