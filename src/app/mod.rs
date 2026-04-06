@@ -157,3 +157,20 @@ pub fn write_slug_snapshot_png(
         output_path,
     )
 }
+
+#[cfg(windows)]
+pub fn write_slug_snapshot_sheet_png(
+    font_size_px: u32,
+    cell_size_px: u32,
+    columns: u32,
+    output_path: &Path,
+    index_output_path: &Path,
+) -> eyre::Result<()> {
+    windows_d3d12_renderer::write_slug_snapshot_sheet_png(
+        font_size_px,
+        cell_size_px,
+        columns,
+        output_path,
+        index_output_path,
+    )
+}

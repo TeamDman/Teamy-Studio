@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -29,6 +29,7 @@ const MAX_VERTEX_COUNT: usize = (MAX_PANEL_COUNT + MAX_GLYPH_COUNT) * 6;
 const FALLBACK_GLYPH: char = '?';
 const MAX_CURVE_FLOAT4_COUNT: usize = 65_536;
 const TERMINAL_FONT_FAMILY: &str = "CaskaydiaCove Nerd Font Mono";
+const SNAPSHOT_GLYPH_PADDING_PX: f32 = 1.25;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -730,61 +731,20 @@ pub fn write_slug_snapshot_png(
     let font = load_terminal_font()?;
     let face = Face::parse(&font.font_bytes, font.face_index)
         .wrap_err("failed to parse terminal font for snapshot")?;
-    let glyph_id = face
-        .glyph_index(character)
-        .or_else(|| face.glyph_index(FALLBACK_GLYPH))
-        .ok_or_else(|| eyre::eyre!("failed to resolve snapshot glyph in font"))?;
-    let curves = extract_glyph_curves(&face, glyph_id);
-    let glyph = SlugGlyph {
-        curve_start: 0,
-        curve_count: u32::try_from(curves.len()).unwrap_or(u32::MAX),
-        x_min: face
-            .glyph_bounding_box(glyph_id)
-            .map_or(0.0, |rect| f32::from(rect.x_min)),
-        y_min: face
-            .glyph_bounding_box(glyph_id)
-            .map_or(font.descender, |rect| f32::from(rect.y_min)),
-        x_max: face
-            .glyph_bounding_box(glyph_id)
-            .map_or(font.cell_advance, |rect| f32::from(rect.x_max)),
-        y_max: face
-            .glyph_bounding_box(glyph_id)
-            .map_or(font.ascender, |rect| f32::from(rect.y_max)),
-        advance: face
-            .glyph_hor_advance(glyph_id)
-            .map_or(font.cell_advance, f32::from),
-    };
-
-    let font_height_units = (font.ascender - font.descender).max(1.0);
-    let scale = font_size_px as f32 / font_height_units;
-    let glyph_width_px = ((glyph.x_max - glyph.x_min).max(1.0) * scale).max(1.0);
-    let glyph_height_px = ((glyph.y_max - glyph.y_min).max(1.0) * scale).max(1.0);
-    let offset_x = ((image_width as f32 - glyph_width_px) * 0.5).max(0.0);
-    let offset_y = ((image_height as f32 - font_size_px as f32) * 0.5).max(0.0);
+    let (curves, glyph) = load_snapshot_glyph(&font, &face, character)?;
     let mut image = ImageBuffer::<Rgba<u8>, Vec<u8>>::new(image_width, image_height);
-
-    for pixel in image.pixels_mut() {
-        *pixel = Rgba([0, 0, 0, 255]);
-    }
-
-    for y in 0..image_height {
-        for x in 0..image_width {
-            let sample_x = x as f32 + 0.5;
-            let sample_y = y as f32 + 0.5;
-            let render_coord = [
-                glyph.x_min + ((sample_x - offset_x) / scale),
-                glyph.y_max
-                    - ((sample_y - (offset_y + ((font_size_px as f32 - glyph_height_px) * 0.5)))
-                        / scale),
-            ];
-            let coverage = cpu_slug_coverage(render_coord, scale, &curves, glyph);
-            if coverage <= 0.0 {
-                continue;
-            }
-            let value = (coverage * 255.0).clamp(0.0, 255.0) as u8;
-            image.put_pixel(x, y, Rgba([255, 255, 255, value]));
-        }
-    }
+    clear_snapshot_background(&mut image);
+    render_snapshot_glyph_into_image(
+        &mut image,
+        0,
+        0,
+        image_width,
+        image_height,
+        font_size_px,
+        &font,
+        &curves,
+        glyph,
+    );
 
     if let Some(parent) = output_path.parent() {
         std::fs::create_dir_all(parent).wrap_err_with(|| {
@@ -795,6 +755,208 @@ pub fn write_slug_snapshot_png(
         .save(output_path)
         .wrap_err_with(|| format!("failed to write snapshot png {}", output_path.display()))?;
     Ok(())
+}
+
+pub fn write_slug_snapshot_sheet_png(
+    font_size_px: u32,
+    cell_size_px: u32,
+    columns: u32,
+    output_path: &Path,
+    index_output_path: &Path,
+) -> eyre::Result<()> {
+    let font = load_terminal_font()?;
+    let face = Face::parse(&font.font_bytes, font.face_index)
+        .wrap_err("failed to parse terminal font for snapshot sheet")?;
+    let characters = collect_font_unicode_chars(&face);
+    let columns = columns.max(1);
+    let cell_size_px = cell_size_px.max(24);
+    let rows = u32::try_from(characters.len().div_ceil(columns as usize))
+        .unwrap_or(1)
+        .max(1);
+    let image_width = columns * cell_size_px;
+    let image_height = rows * cell_size_px;
+    let mut image = ImageBuffer::<Rgba<u8>, Vec<u8>>::new(image_width, image_height);
+    clear_snapshot_background(&mut image);
+    draw_snapshot_grid(&mut image, cell_size_px);
+    let mut index_text = String::new();
+
+    for (index, character) in characters.iter().copied().enumerate() {
+        let cell_index = u32::try_from(index).unwrap_or_default();
+        let cell_x = (cell_index % columns) * cell_size_px;
+        let cell_y = (cell_index / columns) * cell_size_px;
+        let (curves, glyph) = load_snapshot_glyph(&font, &face, character)?;
+        render_snapshot_glyph_into_image(
+            &mut image,
+            cell_x,
+            cell_y,
+            cell_size_px,
+            cell_size_px,
+            font_size_px,
+            &font,
+            &curves,
+            glyph,
+        );
+        use std::fmt::Write as _;
+        let _ = writeln!(
+            index_text,
+            "row={} col={} codepoint=U+{:04X} char={:?}",
+            cell_index / columns,
+            cell_index % columns,
+            u32::from(character),
+            character
+        );
+    }
+
+    if let Some(parent) = output_path.parent() {
+        std::fs::create_dir_all(parent)
+            .wrap_err_with(|| format!("failed to create sheet directory {}", parent.display()))?;
+    }
+    if let Some(parent) = index_output_path.parent() {
+        std::fs::create_dir_all(parent).wrap_err_with(|| {
+            format!(
+                "failed to create sheet index directory {}",
+                parent.display()
+            )
+        })?;
+    }
+
+    image
+        .save(output_path)
+        .wrap_err_with(|| format!("failed to write snapshot sheet {}", output_path.display()))?;
+    std::fs::write(index_output_path, index_text).wrap_err_with(|| {
+        format!(
+            "failed to write snapshot sheet index {}",
+            index_output_path.display()
+        )
+    })?;
+    Ok(())
+}
+
+fn load_snapshot_glyph(
+    font: &LoadedTerminalFont,
+    face: &Face<'_>,
+    character: char,
+) -> eyre::Result<(Vec<QuadraticCurve>, SlugGlyph)> {
+    let glyph_id = face
+        .glyph_index(character)
+        .or_else(|| face.glyph_index(FALLBACK_GLYPH))
+        .ok_or_else(|| eyre::eyre!("failed to resolve snapshot glyph in font"))?;
+    let curves = extract_glyph_curves(face, glyph_id);
+    let glyph = build_slug_glyph_from_face(font, face, glyph_id, 0, curves.len());
+    Ok((curves, glyph))
+}
+
+fn build_slug_glyph_from_face(
+    font: &LoadedTerminalFont,
+    face: &Face<'_>,
+    glyph_id: GlyphId,
+    curve_start: u32,
+    curve_count: usize,
+) -> SlugGlyph {
+    let advance = face
+        .glyph_hor_advance(glyph_id)
+        .map_or(font.cell_advance, f32::from);
+    let bbox = face.glyph_bounding_box(glyph_id);
+    SlugGlyph {
+        curve_start,
+        curve_count: u32::try_from(curve_count).unwrap_or(u32::MAX),
+        x_min: bbox.map_or(0.0, |rect| f32::from(rect.x_min)),
+        y_min: bbox.map_or(font.descender, |rect| f32::from(rect.y_min)),
+        x_max: bbox.map_or(advance, |rect| f32::from(rect.x_max)),
+        y_max: bbox.map_or(font.ascender, |rect| f32::from(rect.y_max)),
+        advance,
+    }
+}
+
+fn collect_font_unicode_chars(face: &Face<'_>) -> Vec<char> {
+    let mut chars = BTreeSet::new();
+    if let Some(cmap) = face.tables().cmap {
+        for subtable in cmap.subtables {
+            if !subtable.is_unicode() {
+                continue;
+            }
+            subtable.codepoints(|codepoint| {
+                if let Some(character) = char::from_u32(codepoint) {
+                    if face.glyph_index(character).is_some() {
+                        chars.insert(character);
+                    }
+                }
+            });
+        }
+    }
+    chars.into_iter().collect()
+}
+
+fn clear_snapshot_background(image: &mut ImageBuffer<Rgba<u8>, Vec<u8>>) {
+    for pixel in image.pixels_mut() {
+        *pixel = Rgba([0, 0, 0, 255]);
+    }
+}
+
+fn draw_snapshot_grid(image: &mut ImageBuffer<Rgba<u8>, Vec<u8>>, cell_size_px: u32) {
+    let grid = Rgba([20, 20, 20, 255]);
+    for y in (0..image.height()).step_by(cell_size_px as usize) {
+        for x in 0..image.width() {
+            image.put_pixel(x, y, grid);
+        }
+    }
+    for x in (0..image.width()).step_by(cell_size_px as usize) {
+        for y in 0..image.height() {
+            image.put_pixel(x, y, grid);
+        }
+    }
+}
+
+fn render_snapshot_glyph_into_image(
+    image: &mut ImageBuffer<Rgba<u8>, Vec<u8>>,
+    origin_x: u32,
+    origin_y: u32,
+    image_width: u32,
+    image_height: u32,
+    font_size_px: u32,
+    font: &LoadedTerminalFont,
+    curves: &[QuadraticCurve],
+    glyph: SlugGlyph,
+) {
+    let font_height_units = (font.ascender - font.descender).max(1.0);
+    let scale = font_size_px as f32 / font_height_units;
+    let uv_pad_x = SNAPSHOT_GLYPH_PADDING_PX / scale;
+    let uv_pad_y = SNAPSHOT_GLYPH_PADDING_PX / scale;
+    let glyph_width_px =
+        (((glyph.x_max - glyph.x_min) + (uv_pad_x * 2.0)).max(1.0) * scale).max(1.0);
+    let glyph_height_px =
+        (((glyph.y_max - glyph.y_min) + (uv_pad_y * 2.0)).max(1.0) * scale).max(1.0);
+    let offset_x = origin_x as f32 + ((image_width as f32 - glyph_width_px) * 0.5).max(0.0);
+    let offset_y = origin_y as f32 + ((image_height as f32 - glyph_height_px) * 0.5).max(0.0);
+    let render_x_min = glyph.x_min - uv_pad_x;
+    let render_y_max = glyph.y_max + uv_pad_y;
+    let start_x = offset_x.floor().max(origin_x as f32) as u32;
+    let end_x = (offset_x + glyph_width_px)
+        .ceil()
+        .min((origin_x + image_width) as f32)
+        .max(start_x as f32) as u32;
+    let start_y = offset_y.floor().max(origin_y as f32) as u32;
+    let end_y = (offset_y + glyph_height_px)
+        .ceil()
+        .min((origin_y + image_height) as f32)
+        .max(start_y as f32) as u32;
+
+    for y in start_y..end_y {
+        for x in start_x..end_x {
+            let sample_x = x as f32 + 0.5;
+            let sample_y = y as f32 + 0.5;
+            let render_coord = [
+                render_x_min + ((sample_x - offset_x) / scale),
+                render_y_max - ((sample_y - offset_y) / scale),
+            ];
+            let coverage = cpu_slug_coverage(render_coord, scale, curves, glyph);
+            if coverage <= 0.0 {
+                continue;
+            }
+            let value = (coverage * 255.0).clamp(0.0, 255.0) as u8;
+            image.put_pixel(x, y, Rgba([255, 255, 255, value]));
+        }
+    }
 }
 
 fn cpu_slug_coverage(
@@ -1568,16 +1730,20 @@ fn append_text_rect(
     let screen_height = (rect.bottom - rect.top) as f32;
     let advance = glyph.advance.max(1.0);
     let font_height = (font.ascender - font.descender).max(1.0);
-    let glyph_left = left + (glyph.x_min / advance) * screen_width;
-    let glyph_right = left + (glyph.x_max / advance) * screen_width;
-    let glyph_top = top + ((font.ascender - glyph.y_max) / font_height) * screen_height;
-    let glyph_bottom = top + ((font.ascender - glyph.y_min) / font_height) * screen_height;
+    let pad_x = SNAPSHOT_GLYPH_PADDING_PX;
+    let pad_y = SNAPSHOT_GLYPH_PADDING_PX;
+    let uv_pad_x = (advance / screen_width.max(1.0)) * pad_x;
+    let uv_pad_y = (font_height / screen_height.max(1.0)) * pad_y;
+    let glyph_left = left + (glyph.x_min / advance) * screen_width - pad_x;
+    let glyph_right = left + (glyph.x_max / advance) * screen_width + pad_x;
+    let glyph_top = top + ((font.ascender - glyph.y_max) / font_height) * screen_height - pad_y;
+    let glyph_bottom = top + ((font.ascender - glyph.y_min) / font_height) * screen_height + pad_y;
     let effect = PanelEffect::Text as u32 as f32;
 
     let top_left = Vertex {
         position: to_ndc(width, height, glyph_left, glyph_top),
         color,
-        uv: [glyph.x_min, glyph.y_max],
+        uv: [glyph.x_min - uv_pad_x, glyph.y_max + uv_pad_y],
         effect,
         glyph: 0.0,
         glyph_data,
@@ -1585,7 +1751,7 @@ fn append_text_rect(
     let top_right = Vertex {
         position: to_ndc(width, height, glyph_right, glyph_top),
         color,
-        uv: [glyph.x_max, glyph.y_max],
+        uv: [glyph.x_max + uv_pad_x, glyph.y_max + uv_pad_y],
         effect,
         glyph: 0.0,
         glyph_data,
@@ -1593,7 +1759,7 @@ fn append_text_rect(
     let bottom_right = Vertex {
         position: to_ndc(width, height, glyph_right, glyph_bottom),
         color,
-        uv: [glyph.x_max, glyph.y_min],
+        uv: [glyph.x_max + uv_pad_x, glyph.y_min - uv_pad_y],
         effect,
         glyph: 0.0,
         glyph_data,
@@ -1601,7 +1767,7 @@ fn append_text_rect(
     let bottom_left = Vertex {
         position: to_ndc(width, height, glyph_left, glyph_bottom),
         color,
-        uv: [glyph.x_min, glyph.y_min],
+        uv: [glyph.x_min - uv_pad_x, glyph.y_min - uv_pad_y],
         effect,
         glyph: 0.0,
         glyph_data,
@@ -1707,8 +1873,8 @@ fn transition_barrier(
 mod tests {
     use super::{
         FALLBACK_GLYPH, PanelEffect, RenderScene, append_rect, collect_scene_chars,
-        cpu_slug_coverage, extract_glyph_curves, load_terminal_font, push_centered_text,
-        push_glyph, push_text_block,
+        extract_glyph_curves, load_terminal_font, push_centered_text, push_glyph, push_text_block,
+        render_snapshot_glyph_into_image,
     };
     use image::RgbaImage;
     use ttf_parser::{Face, OutlineBuilder};
@@ -1893,6 +2059,27 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn unicode_snapshot_sheet_writes_debug_artifacts() -> eyre::Result<()> {
+        let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let output_dir = manifest_dir
+            .join("target")
+            .join("test-artifacts")
+            .join("slug");
+
+        super::write_slug_snapshot_sheet_png(
+            48,
+            64,
+            24,
+            &output_dir.join("unicode-sheet.png"),
+            &output_dir.join("unicode-sheet-index.txt"),
+        )?;
+
+        assert!(output_dir.join("unicode-sheet.png").exists());
+        assert!(output_dir.join("unicode-sheet-index.txt").exists());
+        Ok(())
+    }
+
     fn render_test_glyph(
         font: &super::LoadedTerminalFont,
         curves: &[super::QuadraticCurve],
@@ -1901,27 +2088,19 @@ mod tests {
         image_width: u32,
         image_height: u32,
     ) -> RgbaImage {
-        let font_height_units = (font.ascender - font.descender).max(1.0);
-        let scale = font_size_px as f32 / font_height_units;
-        let glyph_width_px = ((glyph.x_max - glyph.x_min).max(1.0) * scale).max(1.0);
-        let glyph_height_px = ((glyph.y_max - glyph.y_min).max(1.0) * scale).max(1.0);
-        let offset_x = ((image_width as f32 - glyph_width_px) * 0.5).max(0.0);
-        let offset_y = ((image_height as f32 - glyph_height_px) * 0.5).max(0.0);
         let mut image = RgbaImage::new(image_width, image_height);
-
-        for y in 0..image_height {
-            for x in 0..image_width {
-                let sample_x = x as f32 + 0.5;
-                let sample_y = y as f32 + 0.5;
-                let render_coord = [
-                    glyph.x_min + ((sample_x - offset_x) / scale),
-                    glyph.y_max - ((sample_y - offset_y) / scale),
-                ];
-                let coverage = cpu_slug_coverage(render_coord, scale, curves, glyph);
-                let value = (coverage * 255.0).clamp(0.0, 255.0) as u8;
-                image.put_pixel(x, y, image::Rgba([255, 255, 255, value]));
-            }
-        }
+        super::clear_snapshot_background(&mut image);
+        render_snapshot_glyph_into_image(
+            &mut image,
+            0,
+            0,
+            image_width,
+            image_height,
+            font_size_px,
+            font,
+            curves,
+            glyph,
+        );
 
         image
     }
