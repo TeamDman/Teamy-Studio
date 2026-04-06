@@ -34,7 +34,8 @@ use super::windows_terminal::{
 
 const WINDOW_CLASS_NAME: PCWSTR = w!("TeamyStudioTerminalWindow");
 const WINDOW_TITLE: &str = "Teamy Studio Terminal";
-const FONT_HEIGHT: i32 = -32;
+const TERMINAL_FONT_HEIGHT: i32 = -32;
+const OUTPUT_FONT_HEIGHT: i32 = -32;
 const FONT_FAMILY: &str = "CaskaydiaCove Nerd Font Mono";
 const MIN_FONT_HEIGHT: i32 = -12;
 const MAX_FONT_HEIGHT: i32 = -72;
@@ -50,9 +51,12 @@ struct AppState {
     app_home: AppHome,
     hwnd: Option<HWND>,
     workspace_window: Option<WorkspaceWindowState>,
-    font_height: i32,
-    cell_width: i32,
-    cell_height: i32,
+    terminal_font_height: i32,
+    terminal_cell_width: i32,
+    terminal_cell_height: i32,
+    output_font_height: i32,
+    output_cell_width: i32,
+    output_cell_height: i32,
     terminal: TerminalSession,
     renderer: Option<D3d12PanelRenderer>,
 }
@@ -78,8 +82,11 @@ pub fn run(
     working_dir: Option<&Path>,
     workspace_window: Option<WorkspaceWindowState>,
 ) -> eyre::Result<()> {
-    let font_height = FONT_HEIGHT;
-    let (cell_width, cell_height) = measure_terminal_cell_size(font_height)?;
+    let terminal_font_height = TERMINAL_FONT_HEIGHT;
+    let (terminal_cell_width, terminal_cell_height) =
+        measure_terminal_cell_size(terminal_font_height)?;
+    let output_font_height = OUTPUT_FONT_HEIGHT;
+    let (output_cell_width, output_cell_height) = measure_terminal_cell_size(output_font_height)?;
     let terminal = TerminalSession::new(app_home, working_dir)?;
 
     APP_STATE.with(|state| {
@@ -87,9 +94,12 @@ pub fn run(
             app_home: app_home.clone(),
             hwnd: None,
             workspace_window,
-            font_height,
-            cell_width,
-            cell_height,
+            terminal_font_height,
+            terminal_cell_width,
+            terminal_cell_height,
+            output_font_height,
+            output_cell_width,
+            output_cell_height,
             terminal,
             renderer: None,
         });
@@ -107,7 +117,7 @@ pub fn run(
     }
 
     with_app_state(|state| {
-        let layout = client_layout(hwnd, state.cell_width, state.cell_height)?;
+        let layout = client_layout(hwnd, state.terminal_cell_width, state.terminal_cell_height)?;
         state.terminal.resize(layout)
     })?;
 
@@ -196,7 +206,8 @@ extern "system" fn window_proc(
 ) -> LRESULT {
     match message {
         WM_SIZE => match with_app_state(|state| {
-            let layout = client_layout(hwnd, state.cell_width, state.cell_height)?;
+            let layout =
+                client_layout(hwnd, state.terminal_cell_width, state.terminal_cell_height)?;
             state.terminal.resize(layout)?;
             if let Some(renderer) = state.renderer.as_mut() {
                 renderer.resize(layout.client_width as u32, layout.client_height as u32)?;
@@ -370,7 +381,7 @@ fn render_frame() -> eyre::Result<()> {
         let Some(hwnd) = state.hwnd else {
             return Ok(());
         };
-        let layout = client_layout(hwnd, state.cell_width, state.cell_height)?;
+        let layout = client_layout(hwnd, state.terminal_cell_width, state.terminal_cell_height)?;
         let mut scene = build_panel_scene(layout);
         let cell_number = state
             .workspace_window
@@ -387,13 +398,13 @@ fn render_frame() -> eyre::Result<()> {
         );
         let terminal_rect = inset_rect(layout.terminal_rect(), 4);
         for glyph in terminal_glyphs {
-            let left = terminal_rect.left + (glyph.column * state.cell_width);
-            let top = terminal_rect.top + (glyph.row * state.cell_height);
+            let left = terminal_rect.left + (glyph.column * state.terminal_cell_width);
+            let top = terminal_rect.top + (glyph.row * state.terminal_cell_height);
             let rect = RECT {
                 left,
                 top,
-                right: left + state.cell_width,
-                bottom: top + state.cell_height,
+                right: left + state.terminal_cell_width,
+                bottom: top + state.terminal_cell_height,
             };
             push_glyph(&mut scene, rect, glyph.character, glyph.color);
         }
@@ -401,8 +412,8 @@ fn render_frame() -> eyre::Result<()> {
             &mut scene,
             inset_rect(layout.result_panel_rect(), 14),
             &output_text,
-            state.cell_width,
-            state.cell_height,
+            state.output_cell_width,
+            state.output_cell_height,
             [0.96, 0.95, 0.90, 1.0],
         );
 
@@ -483,15 +494,19 @@ fn terminal_font_definition(font_height: i32) -> LOGFONTW {
 }
 
 fn handle_mouse_wheel(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) -> eyre::Result<bool> {
+    // cli[impl window.interaction.zoom.terminal]
+    // cli[impl window.interaction.zoom.output]
     let ctrl_down = unsafe { (GetKeyState(i32::from(VK_CONTROL.0)) & (0x8000_u16 as i16)) != 0 };
     if !ctrl_down {
         return Ok(false);
     }
 
     with_app_state(|state| {
-        let layout = client_layout(hwnd, state.cell_width, state.cell_height)?;
+        let layout = client_layout(hwnd, state.terminal_cell_width, state.terminal_cell_height)?;
         let point = screen_to_client_point(hwnd, lparam)?;
-        if !point_in_rect(point, layout.terminal_rect()) {
+        let in_terminal = point_in_rect(point, layout.terminal_rect());
+        let in_output = point_in_rect(point, layout.result_panel_rect());
+        if !in_terminal && !in_output {
             return Ok(false);
         }
 
@@ -501,19 +516,34 @@ fn handle_mouse_wheel(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) -> eyre::Resul
         }
 
         let zoom_direction = if wheel_delta > 0 { -1 } else { 1 };
-        let next_font_height = (state.font_height + (zoom_direction * FONT_ZOOM_STEP))
+        if in_terminal {
+            let next_font_height = (state.terminal_font_height + (zoom_direction * FONT_ZOOM_STEP))
+                .clamp(MAX_FONT_HEIGHT, MIN_FONT_HEIGHT);
+            if next_font_height == state.terminal_font_height {
+                return Ok(true);
+            }
+
+            let (cell_width, cell_height) = measure_terminal_cell_size(next_font_height)?;
+            state.terminal_font_height = next_font_height;
+            state.terminal_cell_width = cell_width;
+            state.terminal_cell_height = cell_height;
+
+            let layout =
+                client_layout(hwnd, state.terminal_cell_width, state.terminal_cell_height)?;
+            state.terminal.resize(layout)?;
+            return Ok(true);
+        }
+
+        let next_font_height = (state.output_font_height + (zoom_direction * FONT_ZOOM_STEP))
             .clamp(MAX_FONT_HEIGHT, MIN_FONT_HEIGHT);
-        if next_font_height == state.font_height {
+        if next_font_height == state.output_font_height {
             return Ok(true);
         }
 
         let (cell_width, cell_height) = measure_terminal_cell_size(next_font_height)?;
-        state.font_height = next_font_height;
-        state.cell_width = cell_width;
-        state.cell_height = cell_height;
-
-        let layout = client_layout(hwnd, state.cell_width, state.cell_height)?;
-        state.terminal.resize(layout)?;
+        state.output_font_height = next_font_height;
+        state.output_cell_width = cell_width;
+        state.output_cell_height = cell_height;
         Ok(true)
     })
 }
@@ -547,7 +577,7 @@ fn handle_left_button_up(hwnd: HWND, lparam: LPARAM) -> eyre::Result<bool> {
             return Ok(false);
         };
 
-        let layout = client_layout(hwnd, state.cell_width, state.cell_height)?;
+        let layout = client_layout(hwnd, state.terminal_cell_width, state.terminal_cell_height)?;
         let point = POINT {
             x: extract_signed_coordinate(lparam.0),
             y: extract_signed_coordinate(lparam.0 >> 16),
@@ -582,7 +612,7 @@ fn handle_left_button_up(hwnd: HWND, lparam: LPARAM) -> eyre::Result<bool> {
 
 fn hit_test_drag_handle(hwnd: HWND, lparam: LPARAM) -> eyre::Result<bool> {
     with_app_state(|state| {
-        let layout = client_layout(hwnd, state.cell_width, state.cell_height)?;
+        let layout = client_layout(hwnd, state.terminal_cell_width, state.terminal_cell_height)?;
         let point = screen_to_client_point(hwnd, lparam)?;
         Ok(point_in_rect(point, layout.drag_handle_rect()))
     })

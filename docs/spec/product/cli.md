@@ -127,6 +127,12 @@ The launched terminal window must forward keyboard input into the PTY-backed she
 cli[window.interaction.input.numpad-numlock-text]
 When NumLock is enabled, numpad digit and operator keys must be forwarded as their text characters rather than being dropped.
 
+cli[window.interaction.zoom.terminal]
+Holding Ctrl while scrolling over the terminal area must adjust the terminal text scale and recompute the terminal column and row count to fit the resized cell grid.
+
+cli[window.interaction.zoom.output]
+Holding Ctrl while scrolling over the output panel must adjust only the output panel text scale and must not change the terminal grid size.
+
 ## Parser Model
 
 cli[parser.args-consistent]

@@ -38,7 +38,7 @@ function Get-NonTracyTestFeatureArgs {
 }
 
 Invoke-Step -Label "format check" -Action {
-	rustup run nightly -- cargo fmt --all
+	cargo fmt --all
 }
 
 Invoke-Step -Label "clippy lint check" -Action {

@@ -1,8 +1,10 @@
 use std::collections::HashMap;
+use std::path::Path;
 use std::path::PathBuf;
 
 use eyre::Context;
 use fontdb::{Database, Family, Query, Source};
+use image::{ImageBuffer, Rgba};
 use ttf_parser::{Face, GlyphId, OutlineBuilder};
 use windows::Win32::Foundation::{E_FAIL, HANDLE, HWND, RECT, TRUE};
 use windows::Win32::Graphics::Direct3D::Fxc::{
@@ -689,6 +691,269 @@ fn extract_glyph_curves(face: &Face<'_>, glyph_id: GlyphId) -> Vec<QuadraticCurv
     let mut builder = QuadraticCurveBuilder::default();
     let _ = face.outline_glyph(glyph_id, &mut builder);
     builder.curves
+}
+
+pub fn write_slug_snapshot_png(
+    character: char,
+    font_size_px: u32,
+    image_width: u32,
+    image_height: u32,
+    output_path: &Path,
+) -> eyre::Result<()> {
+    let font = load_terminal_font()?;
+    let face = Face::parse(&font.font_bytes, font.face_index)
+        .wrap_err("failed to parse terminal font for snapshot")?;
+    let glyph_id = face
+        .glyph_index(character)
+        .or_else(|| face.glyph_index(FALLBACK_GLYPH))
+        .ok_or_else(|| eyre::eyre!("failed to resolve snapshot glyph in font"))?;
+    let curves = extract_glyph_curves(&face, glyph_id);
+    let glyph = SlugGlyph {
+        curve_start: 0,
+        curve_count: u32::try_from(curves.len()).unwrap_or(u32::MAX),
+    };
+
+    let font_height_units = (font.ascender - font.descender).max(1.0);
+    let scale = font_size_px as f32 / font_height_units;
+    let glyph_width_px = (font.cell_advance * scale).max(1.0);
+    let offset_x = ((image_width as f32 - glyph_width_px) * 0.5).max(0.0);
+    let offset_y = ((image_height as f32 - font_size_px as f32) * 0.5).max(0.0);
+    let mut image = ImageBuffer::<Rgba<u8>, Vec<u8>>::new(image_width, image_height);
+
+    for pixel in image.pixels_mut() {
+        *pixel = Rgba([0, 0, 0, 255]);
+    }
+
+    for y in 0..image_height {
+        for x in 0..image_width {
+            let sample_x = x as f32 + 0.5;
+            let sample_y = y as f32 + 0.5;
+            let render_coord = [
+                (sample_x - offset_x) / scale,
+                font.ascender - ((sample_y - offset_y) / scale),
+            ];
+            let coverage = cpu_slug_coverage(render_coord, scale, &curves, glyph);
+            if coverage <= 0.0 {
+                continue;
+            }
+            let value = (coverage * 255.0).clamp(0.0, 255.0) as u8;
+            image.put_pixel(x, y, Rgba([255, 255, 255, value]));
+        }
+    }
+
+    if let Some(parent) = output_path.parent() {
+        std::fs::create_dir_all(parent).wrap_err_with(|| {
+            format!("failed to create snapshot directory {}", parent.display())
+        })?;
+    }
+    image
+        .save(output_path)
+        .wrap_err_with(|| format!("failed to write snapshot png {}", output_path.display()))?;
+    Ok(())
+}
+
+fn cpu_slug_coverage(
+    render_coord: [f32; 2],
+    pixels_per_em: f32,
+    curves: &[QuadraticCurve],
+    glyph: SlugGlyph,
+) -> f32 {
+    if glyph.curve_count == 0 {
+        return 0.0;
+    }
+
+    let mut xcov: f32 = 0.0;
+    let mut ycov: f32 = 0.0;
+    let mut xwgt: f32 = 0.0;
+    let mut ywgt: f32 = 0.0;
+    let start = usize::try_from(glyph.curve_start).unwrap_or_default();
+    let end = start + usize::try_from(glyph.curve_count).unwrap_or_default();
+
+    for curve in curves.iter().skip(start).take(end.saturating_sub(start)) {
+        if is_linear_curve(curve) {
+            apply_linear_curve_coverage(
+                curve,
+                render_coord,
+                pixels_per_em,
+                &mut xcov,
+                &mut ycov,
+                &mut xwgt,
+                &mut ywgt,
+            );
+            continue;
+        }
+
+        let p12 = [
+            curve.p0[0] - render_coord[0],
+            curve.p0[1] - render_coord[1],
+            curve.p1[0] - render_coord[0],
+            curve.p1[1] - render_coord[1],
+        ];
+        let p3 = [curve.p2[0] - render_coord[0], curve.p2[1] - render_coord[1]];
+
+        let hcode = calc_root_code(p12[1], p12[3], p3[1]);
+        if hcode != 0 {
+            let hr = solve_horiz_poly(p12, p3);
+            if (hcode & 1) != 0 {
+                let sample = saturate((hr[0] * pixels_per_em) + 0.5);
+                xcov += sample;
+                xwgt = xwgt.max(saturate(1.0 - (hr[0] * pixels_per_em).abs() * 2.0));
+            }
+            if hcode > 1 {
+                let sample = saturate((hr[1] * pixels_per_em) + 0.5);
+                xcov -= sample;
+                xwgt = xwgt.max(saturate(1.0 - (hr[1] * pixels_per_em).abs() * 2.0));
+            }
+        }
+
+        let vcode = calc_root_code(p12[0], p12[2], p3[0]);
+        if vcode != 0 {
+            let vr = solve_vert_poly(p12, p3);
+            if (vcode & 1) != 0 {
+                let sample = saturate((vr[0] * pixels_per_em) + 0.5);
+                ycov -= sample;
+                ywgt = ywgt.max(saturate(1.0 - (vr[0] * pixels_per_em).abs() * 2.0));
+            }
+            if vcode > 1 {
+                let sample = saturate((vr[1] * pixels_per_em) + 0.5);
+                ycov += sample;
+                ywgt = ywgt.max(saturate(1.0 - (vr[1] * pixels_per_em).abs() * 2.0));
+            }
+        }
+    }
+
+    calc_coverage(xcov, ycov, xwgt, ywgt)
+}
+
+fn is_linear_curve(curve: &QuadraticCurve) -> bool {
+    let epsilon = 1.0 / 1024.0;
+    let ax = curve.p0[0] - (curve.p1[0] * 2.0) + curve.p2[0];
+    let ay = curve.p0[1] - (curve.p1[1] * 2.0) + curve.p2[1];
+    ax.abs() <= epsilon && ay.abs() <= epsilon
+}
+
+fn apply_linear_curve_coverage(
+    curve: &QuadraticCurve,
+    render_coord: [f32; 2],
+    pixels_per_em: f32,
+    xcov: &mut f32,
+    ycov: &mut f32,
+    xwgt: &mut f32,
+    ywgt: &mut f32,
+) {
+    let p0 = [curve.p0[0] - render_coord[0], curve.p0[1] - render_coord[1]];
+    let p1 = [curve.p2[0] - render_coord[0], curve.p2[1] - render_coord[1]];
+
+    if let Some(intersection_x) = horizontal_line_intersection(p0, p1) {
+        let root = (intersection_x * pixels_per_em) + 0.5;
+        let sample = saturate(root);
+        if p1[1] > p0[1] {
+            *xcov += sample;
+        } else {
+            *xcov -= sample;
+        }
+        *xwgt = (*xwgt).max(saturate(1.0 - (intersection_x * pixels_per_em).abs() * 2.0));
+    }
+
+    if let Some(intersection_y) = vertical_line_intersection(p0, p1) {
+        let root = (intersection_y * pixels_per_em) + 0.5;
+        let sample = saturate(root);
+        if p1[0] > p0[0] {
+            *ycov += sample;
+        } else {
+            *ycov -= sample;
+        }
+        *ywgt = (*ywgt).max(saturate(1.0 - (intersection_y * pixels_per_em).abs() * 2.0));
+    }
+}
+
+fn horizontal_line_intersection(p0: [f32; 2], p1: [f32; 2]) -> Option<f32> {
+    if !crosses_zero_half_open(p0[1], p1[1]) {
+        return None;
+    }
+    let dy = p1[1] - p0[1];
+    if dy.abs() <= f32::EPSILON {
+        return None;
+    }
+    let t = -p0[1] / dy;
+    Some(p0[0] + (p1[0] - p0[0]) * t)
+}
+
+fn vertical_line_intersection(p0: [f32; 2], p1: [f32; 2]) -> Option<f32> {
+    if !crosses_zero_half_open(p0[0], p1[0]) {
+        return None;
+    }
+    let dx = p1[0] - p0[0];
+    if dx.abs() <= f32::EPSILON {
+        return None;
+    }
+    let t = -p0[0] / dx;
+    Some(p0[1] + (p1[1] - p0[1]) * t)
+}
+
+fn crosses_zero_half_open(a: f32, b: f32) -> bool {
+    (a <= 0.0 && b > 0.0) || (b <= 0.0 && a > 0.0)
+}
+
+fn calc_root_code(y1: f32, y2: f32, y3: f32) -> u32 {
+    let i1 = y1.to_bits() >> 31;
+    let i2 = y2.to_bits() >> 30;
+    let i3 = y3.to_bits() >> 29;
+    let mut shift = (i2 & 2) | (i1 & !2);
+    shift = (i3 & 4) | (shift & !4);
+    (0x2E74_u32 >> shift) & 0x0101
+}
+
+fn solve_horiz_poly(p12: [f32; 4], p3: [f32; 2]) -> [f32; 2] {
+    let a = [
+        p12[0] - (p12[2] * 2.0) + p3[0],
+        p12[1] - (p12[3] * 2.0) + p3[1],
+    ];
+    let b = [p12[0] - p12[2], p12[1] - p12[3]];
+    let ra = 1.0 / a[1];
+    let rb = 0.5 / b[1];
+    let d = (b[1] * b[1] - a[1] * p12[1]).max(0.0).sqrt();
+    let mut t1 = (b[1] - d) * ra;
+    let mut t2 = (b[1] + d) * ra;
+    if a[1].abs() < 1.0 / 65536.0 {
+        t1 = p12[1] * rb;
+        t2 = t1;
+    }
+    [
+        ((a[0] * t1) - (b[0] * 2.0)) * t1 + p12[0],
+        ((a[0] * t2) - (b[0] * 2.0)) * t2 + p12[0],
+    ]
+}
+
+fn solve_vert_poly(p12: [f32; 4], p3: [f32; 2]) -> [f32; 2] {
+    let a = [
+        p12[0] - (p12[2] * 2.0) + p3[0],
+        p12[1] - (p12[3] * 2.0) + p3[1],
+    ];
+    let b = [p12[0] - p12[2], p12[1] - p12[3]];
+    let ra = 1.0 / a[0];
+    let rb = 0.5 / b[0];
+    let d = (b[0] * b[0] - a[0] * p12[0]).max(0.0).sqrt();
+    let mut t1 = (b[0] - d) * ra;
+    let mut t2 = (b[0] + d) * ra;
+    if a[0].abs() < 1.0 / 65536.0 {
+        t1 = p12[0] * rb;
+        t2 = t1;
+    }
+    [
+        ((a[1] * t1) - (b[1] * 2.0)) * t1 + p12[1],
+        ((a[1] * t2) - (b[1] * 2.0)) * t2 + p12[1],
+    ]
+}
+
+fn calc_coverage(xcov: f32, ycov: f32, xwgt: f32, ywgt: f32) -> f32 {
+    ((xcov * xwgt + ycov * ywgt).abs() / (xwgt + ywgt).max(1.0 / 65536.0))
+        .max(xcov.abs().min(ycov.abs()))
+        .clamp(0.0, 1.0)
+}
+
+fn saturate(value: f32) -> f32 {
+    value.clamp(0.0, 1.0)
 }
 
 #[derive(Default)]
@@ -1393,8 +1658,11 @@ fn transition_barrier(
 mod tests {
     use super::{
         FALLBACK_GLYPH, PanelEffect, RenderScene, append_rect, collect_scene_chars,
-        push_centered_text, push_glyph, push_text_block,
+        cpu_slug_coverage, extract_glyph_curves, load_terminal_font, push_centered_text,
+        push_glyph, push_text_block,
     };
+    use image::RgbaImage;
+    use ttf_parser::{Face, OutlineBuilder};
     use windows::Win32::Foundation::RECT;
 
     #[test]
@@ -1498,5 +1766,141 @@ mod tests {
         assert_eq!(atlas_chars[0], FALLBACK_GLYPH);
         assert!(atlas_chars.contains(&'❯'));
         assert!(atlas_chars.contains(&'A'));
+    }
+
+    #[test]
+    fn slash_snapshot_has_single_alpha_span_per_scanline() -> eyre::Result<()> {
+        let font = load_terminal_font()?;
+        let face = Face::parse(&font.font_bytes, font.face_index)?;
+        let glyph_id = face.glyph_index('/').expect("slash glyph should exist");
+        let curves = extract_glyph_curves(&face, glyph_id);
+        let glyph = super::SlugGlyph {
+            curve_start: 0,
+            curve_count: curves.len() as u32,
+        };
+        let image = render_test_glyph(&font, &curves, glyph, 256, 512, 512);
+
+        let multi_span_rows = count_rows_with_multiple_spans(&image);
+        assert_eq!(
+            multi_span_rows, 0,
+            "slash should be convex per occupied scanline"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn g_and_six_outlines_use_quadratic_segments_in_this_font() -> eyre::Result<()> {
+        let font = load_terminal_font()?;
+        let face = Face::parse(&font.font_bytes, font.face_index)?;
+
+        for character in ['g', '6'] {
+            let glyph_id = face
+                .glyph_index(character)
+                .expect("diagnostic glyph should exist in terminal font");
+            let mut builder = SegmentCountingOutlineBuilder::default();
+            let _ = face.outline_glyph(glyph_id, &mut builder);
+
+            assert_eq!(
+                builder.cubic_segments, 0,
+                "{character} unexpectedly uses cubic outlines in the installed terminal font"
+            );
+            assert!(
+                builder.quadratic_segments > 0 || builder.line_segments > 0,
+                "{character} should produce outline segments"
+            );
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn g_and_six_snapshots_write_debug_artifacts() -> eyre::Result<()> {
+        let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let output_dir = manifest_dir.join("target").join("test-artifacts").join("slug");
+
+        super::write_slug_snapshot_png('g', 256, 512, 512, &output_dir.join("g-256.png"))?;
+        super::write_slug_snapshot_png('6', 256, 512, 512, &output_dir.join("6-256.png"))?;
+
+        assert!(output_dir.join("g-256.png").exists());
+        assert!(output_dir.join("6-256.png").exists());
+        Ok(())
+    }
+
+    fn render_test_glyph(
+        font: &super::LoadedTerminalFont,
+        curves: &[super::QuadraticCurve],
+        glyph: super::SlugGlyph,
+        font_size_px: u32,
+        image_width: u32,
+        image_height: u32,
+    ) -> RgbaImage {
+        let font_height_units = (font.ascender - font.descender).max(1.0);
+        let scale = font_size_px as f32 / font_height_units;
+        let glyph_width_px = (font.cell_advance * scale).max(1.0);
+        let offset_x = ((image_width as f32 - glyph_width_px) * 0.5).max(0.0);
+        let offset_y = ((image_height as f32 - font_size_px as f32) * 0.5).max(0.0);
+        let mut image = RgbaImage::new(image_width, image_height);
+
+        for y in 0..image_height {
+            for x in 0..image_width {
+                let sample_x = x as f32 + 0.5;
+                let sample_y = y as f32 + 0.5;
+                let render_coord = [
+                    (sample_x - offset_x) / scale,
+                    font.ascender - ((sample_y - offset_y) / scale),
+                ];
+                let coverage = cpu_slug_coverage(render_coord, scale, curves, glyph);
+                let value = (coverage * 255.0).clamp(0.0, 255.0) as u8;
+                image.put_pixel(x, y, image::Rgba([255, 255, 255, value]));
+            }
+        }
+
+        image
+    }
+
+    fn count_rows_with_multiple_spans(image: &RgbaImage) -> usize {
+        let mut count = 0;
+        for y in 0..image.height() {
+            let mut spans = 0;
+            let mut in_span = false;
+            for x in 0..image.width() {
+                let filled = image.get_pixel(x, y)[3] > 0;
+                if filled && !in_span {
+                    spans += 1;
+                    in_span = true;
+                } else if !filled {
+                    in_span = false;
+                }
+            }
+            if spans > 1 {
+                count += 1;
+            }
+        }
+        count
+    }
+
+    #[derive(Default)]
+    struct SegmentCountingOutlineBuilder {
+        line_segments: usize,
+        quadratic_segments: usize,
+        cubic_segments: usize,
+    }
+
+    impl OutlineBuilder for SegmentCountingOutlineBuilder {
+        fn move_to(&mut self, _x: f32, _y: f32) {}
+
+        fn line_to(&mut self, _x: f32, _y: f32) {
+            self.line_segments += 1;
+        }
+
+        fn quad_to(&mut self, _x1: f32, _y1: f32, _x: f32, _y: f32) {
+            self.quadratic_segments += 1;
+        }
+
+        fn curve_to(&mut self, _x1: f32, _y1: f32, _x2: f32, _y2: f32, _x: f32, _y: f32) {
+            self.cubic_segments += 1;
+        }
+
+        fn close(&mut self) {}
     }
 }

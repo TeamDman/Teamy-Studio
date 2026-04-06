@@ -111,6 +111,43 @@ float CalcCoverage(float xcov, float ycov, float xwgt, float ywgt) {
     return saturate(max(abs(xcov * xwgt + ycov * ywgt) / max(xwgt + ywgt, 1.0 / 65536.0), min(abs(xcov), abs(ycov))));
 }
 
+bool IsLinearCurve(float4 p12, float2 p3) {
+    float2 a = p12.xy - p12.zw * 2.0 + p3;
+    return all(abs(a) <= float2(1.0 / 1024.0, 1.0 / 1024.0));
+}
+
+bool CrossesZeroHalfOpen(float a, float b) {
+    return ((a <= 0.0) && (b > 0.0)) || ((b <= 0.0) && (a > 0.0));
+}
+
+void ApplyLinearCurveCoverage(
+    float2 p0,
+    float2 p1,
+    float2 pixelsPerEm,
+    inout float xcov,
+    inout float ycov,
+    inout float xwgt,
+    inout float ywgt
+) {
+    float dy = p1.y - p0.y;
+    if (CrossesZeroHalfOpen(p0.y, p1.y) && abs(dy) > (1.0 / 65536.0)) {
+        float t = -p0.y / dy;
+        float xr = (p0.x + (p1.x - p0.x) * t) * pixelsPerEm.x;
+        float sample = saturate(xr + 0.5);
+        xcov += (p1.y > p0.y) ? sample : -sample;
+        xwgt = max(xwgt, saturate(1.0 - abs(xr) * 2.0));
+    }
+
+    float dx = p1.x - p0.x;
+    if (CrossesZeroHalfOpen(p0.x, p1.x) && abs(dx) > (1.0 / 65536.0)) {
+        float t = -p0.x / dx;
+        float yr = (p0.y + (p1.y - p0.y) * t) * pixelsPerEm.y;
+        float sample = saturate(yr + 0.5);
+        ycov += (p1.x > p0.x) ? sample : -sample;
+        ywgt = max(ywgt, saturate(1.0 - abs(yr) * 2.0));
+    }
+}
+
 float slug_coverage(float2 renderCoord, float4 glyphData) {
     int curveStart = (int)glyphData.x;
     int curveCount = (int)glyphData.y;
@@ -129,6 +166,11 @@ float slug_coverage(float2 renderCoord, float4 glyphData) {
         int baseIndex = curveStart + (curveIndex * 2);
         float4 p12 = CurveData[baseIndex] - float4(renderCoord, renderCoord);
         float2 p3 = CurveData[baseIndex + 1].xy - renderCoord;
+
+        if (IsLinearCurve(p12, p3)) {
+            ApplyLinearCurveCoverage(p12.xy, p3, pixelsPerEm, xcov, ycov, xwgt, ywgt);
+            continue;
+        }
 
         uint hcode = CalcRootCode(p12.y, p12.w, p3.y);
         if (hcode != 0U) {

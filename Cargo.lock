@@ -2111,6 +2111,7 @@ dependencies = [
  "eyre",
  "facet",
  "fontdb",
+ "image",
  "libghostty-vt",
  "open",
  "portable-pty",

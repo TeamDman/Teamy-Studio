@@ -140,3 +140,20 @@ pub fn run_keyboard_input_self_test(app_home: &AppHome, inside: bool) -> eyre::R
         eyre::bail!("Teamy Studio keyboard self-test currently only supports Windows")
     }
 }
+
+#[cfg(windows)]
+pub fn write_slug_snapshot_png(
+    character: char,
+    font_size_px: u32,
+    image_width: u32,
+    image_height: u32,
+    output_path: &Path,
+) -> eyre::Result<()> {
+    windows_d3d12_renderer::write_slug_snapshot_png(
+        character,
+        font_size_px,
+        image_width,
+        image_height,
+        output_path,
+    )
+}
