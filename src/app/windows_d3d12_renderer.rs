@@ -45,6 +45,11 @@ struct Vertex {
 struct SlugGlyph {
     curve_start: u32,
     curve_count: u32,
+    x_min: f32,
+    y_min: f32,
+    x_max: f32,
+    y_max: f32,
+    advance: f32,
 }
 
 #[derive(Debug)]
@@ -54,6 +59,20 @@ struct LoadedTerminalFont {
     ascender: f32,
     descender: f32,
     cell_advance: f32,
+}
+
+impl SlugGlyph {
+    fn empty(font: &LoadedTerminalFont) -> Self {
+        Self {
+            curve_start: 0,
+            curve_count: 0,
+            x_min: 0.0,
+            y_min: font.descender,
+            x_max: font.cell_advance,
+            y_max: font.ascender,
+            advance: font.cell_advance,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -340,20 +359,15 @@ impl D3d12PanelRenderer {
                 .get(&glyph.character)
                 .or_else(|| self.glyph_cache.get(&FALLBACK_GLYPH))
                 .copied()
-                .unwrap_or(SlugGlyph {
-                    curve_start: 0,
-                    curve_count: 0,
-                });
+                .unwrap_or_else(|| SlugGlyph::empty(&self.font));
             append_text_rect(
                 &mut vertices,
                 self.width as f32,
                 self.height as f32,
                 glyph.rect,
                 glyph.color,
-                self.font.ascender,
-                self.font.descender,
-                self.font.cell_advance,
                 slug_glyph,
+                &self.font,
             );
         }
 
@@ -671,11 +685,24 @@ fn build_slug_curve_buffer(
             curve_data.push([curve.p0[0], curve.p0[1], curve.p1[0], curve.p1[1]]);
             curve_data.push([curve.p2[0], curve.p2[1], 0.0, 0.0]);
         }
+        let advance = face
+            .glyph_hor_advance(glyph_id)
+            .map_or(font.cell_advance, f32::from);
+        let bbox = face.glyph_bounding_box(glyph_id);
+        let x_min = bbox.map_or(0.0, |rect| f32::from(rect.x_min));
+        let y_min = bbox.map_or(font.descender, |rect| f32::from(rect.y_min));
+        let x_max = bbox.map_or(advance, |rect| f32::from(rect.x_max));
+        let y_max = bbox.map_or(font.ascender, |rect| f32::from(rect.y_max));
         glyph_cache.insert(
             *character,
             SlugGlyph {
                 curve_start,
                 curve_count: curves.len() as u32,
+                x_min,
+                y_min,
+                x_max,
+                y_max,
+                advance,
             },
         );
     }
@@ -711,11 +738,27 @@ pub fn write_slug_snapshot_png(
     let glyph = SlugGlyph {
         curve_start: 0,
         curve_count: u32::try_from(curves.len()).unwrap_or(u32::MAX),
+        x_min: face
+            .glyph_bounding_box(glyph_id)
+            .map_or(0.0, |rect| f32::from(rect.x_min)),
+        y_min: face
+            .glyph_bounding_box(glyph_id)
+            .map_or(font.descender, |rect| f32::from(rect.y_min)),
+        x_max: face
+            .glyph_bounding_box(glyph_id)
+            .map_or(font.cell_advance, |rect| f32::from(rect.x_max)),
+        y_max: face
+            .glyph_bounding_box(glyph_id)
+            .map_or(font.ascender, |rect| f32::from(rect.y_max)),
+        advance: face
+            .glyph_hor_advance(glyph_id)
+            .map_or(font.cell_advance, f32::from),
     };
 
     let font_height_units = (font.ascender - font.descender).max(1.0);
     let scale = font_size_px as f32 / font_height_units;
-    let glyph_width_px = (font.cell_advance * scale).max(1.0);
+    let glyph_width_px = ((glyph.x_max - glyph.x_min).max(1.0) * scale).max(1.0);
+    let glyph_height_px = ((glyph.y_max - glyph.y_min).max(1.0) * scale).max(1.0);
     let offset_x = ((image_width as f32 - glyph_width_px) * 0.5).max(0.0);
     let offset_y = ((image_height as f32 - font_size_px as f32) * 0.5).max(0.0);
     let mut image = ImageBuffer::<Rgba<u8>, Vec<u8>>::new(image_width, image_height);
@@ -729,8 +772,10 @@ pub fn write_slug_snapshot_png(
             let sample_x = x as f32 + 0.5;
             let sample_y = y as f32 + 0.5;
             let render_coord = [
-                (sample_x - offset_x) / scale,
-                font.ascender - ((sample_y - offset_y) / scale),
+                glyph.x_min + ((sample_x - offset_x) / scale),
+                glyph.y_max
+                    - ((sample_y - (offset_y + ((font_size_px as f32 - glyph_height_px) * 0.5)))
+                        / scale),
             ];
             let coverage = cpu_slug_coverage(render_coord, scale, &curves, glyph);
             if coverage <= 0.0 {
@@ -1509,10 +1554,8 @@ fn append_text_rect(
     height: f32,
     rect: RECT,
     color: [f32; 4],
-    ascender: f32,
-    descender: f32,
-    cell_advance: f32,
     glyph: SlugGlyph,
+    font: &LoadedTerminalFont,
 ) {
     if vertices.len() + 6 > MAX_VERTEX_COUNT {
         return;
@@ -1520,39 +1563,45 @@ fn append_text_rect(
 
     let left = rect.left as f32;
     let top = rect.top as f32;
-    let right = rect.right as f32;
-    let bottom = rect.bottom as f32;
-    let effect = PanelEffect::Text as u32 as f32;
     let glyph_data = [glyph.curve_start as f32, glyph.curve_count as f32, 0.0, 0.0];
+    let screen_width = (rect.right - rect.left) as f32;
+    let screen_height = (rect.bottom - rect.top) as f32;
+    let advance = glyph.advance.max(1.0);
+    let font_height = (font.ascender - font.descender).max(1.0);
+    let glyph_left = left + (glyph.x_min / advance) * screen_width;
+    let glyph_right = left + (glyph.x_max / advance) * screen_width;
+    let glyph_top = top + ((font.ascender - glyph.y_max) / font_height) * screen_height;
+    let glyph_bottom = top + ((font.ascender - glyph.y_min) / font_height) * screen_height;
+    let effect = PanelEffect::Text as u32 as f32;
 
     let top_left = Vertex {
-        position: to_ndc(width, height, left, top),
+        position: to_ndc(width, height, glyph_left, glyph_top),
         color,
-        uv: [0.0, ascender],
+        uv: [glyph.x_min, glyph.y_max],
         effect,
         glyph: 0.0,
         glyph_data,
     };
     let top_right = Vertex {
-        position: to_ndc(width, height, right, top),
+        position: to_ndc(width, height, glyph_right, glyph_top),
         color,
-        uv: [cell_advance, ascender],
+        uv: [glyph.x_max, glyph.y_max],
         effect,
         glyph: 0.0,
         glyph_data,
     };
     let bottom_right = Vertex {
-        position: to_ndc(width, height, right, bottom),
+        position: to_ndc(width, height, glyph_right, glyph_bottom),
         color,
-        uv: [cell_advance, descender],
+        uv: [glyph.x_max, glyph.y_min],
         effect,
         glyph: 0.0,
         glyph_data,
     };
     let bottom_left = Vertex {
-        position: to_ndc(width, height, left, bottom),
+        position: to_ndc(width, height, glyph_left, glyph_bottom),
         color,
-        uv: [0.0, descender],
+        uv: [glyph.x_min, glyph.y_min],
         effect,
         glyph: 0.0,
         glyph_data,
@@ -1777,6 +1826,21 @@ mod tests {
         let glyph = super::SlugGlyph {
             curve_start: 0,
             curve_count: curves.len() as u32,
+            x_min: face
+                .glyph_bounding_box(glyph_id)
+                .map_or(0.0, |rect| f32::from(rect.x_min)),
+            y_min: face
+                .glyph_bounding_box(glyph_id)
+                .map_or(font.descender, |rect| f32::from(rect.y_min)),
+            x_max: face
+                .glyph_bounding_box(glyph_id)
+                .map_or(font.cell_advance, |rect| f32::from(rect.x_max)),
+            y_max: face
+                .glyph_bounding_box(glyph_id)
+                .map_or(font.ascender, |rect| f32::from(rect.y_max)),
+            advance: face
+                .glyph_hor_advance(glyph_id)
+                .map_or(font.cell_advance, f32::from),
         };
         let image = render_test_glyph(&font, &curves, glyph, 256, 512, 512);
 
@@ -1816,7 +1880,10 @@ mod tests {
     #[test]
     fn g_and_six_snapshots_write_debug_artifacts() -> eyre::Result<()> {
         let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let output_dir = manifest_dir.join("target").join("test-artifacts").join("slug");
+        let output_dir = manifest_dir
+            .join("target")
+            .join("test-artifacts")
+            .join("slug");
 
         super::write_slug_snapshot_png('g', 256, 512, 512, &output_dir.join("g-256.png"))?;
         super::write_slug_snapshot_png('6', 256, 512, 512, &output_dir.join("6-256.png"))?;
@@ -1836,9 +1903,10 @@ mod tests {
     ) -> RgbaImage {
         let font_height_units = (font.ascender - font.descender).max(1.0);
         let scale = font_size_px as f32 / font_height_units;
-        let glyph_width_px = (font.cell_advance * scale).max(1.0);
+        let glyph_width_px = ((glyph.x_max - glyph.x_min).max(1.0) * scale).max(1.0);
+        let glyph_height_px = ((glyph.y_max - glyph.y_min).max(1.0) * scale).max(1.0);
         let offset_x = ((image_width as f32 - glyph_width_px) * 0.5).max(0.0);
-        let offset_y = ((image_height as f32 - font_size_px as f32) * 0.5).max(0.0);
+        let offset_y = ((image_height as f32 - glyph_height_px) * 0.5).max(0.0);
         let mut image = RgbaImage::new(image_width, image_height);
 
         for y in 0..image_height {
@@ -1846,8 +1914,8 @@ mod tests {
                 let sample_x = x as f32 + 0.5;
                 let sample_y = y as f32 + 0.5;
                 let render_coord = [
-                    (sample_x - offset_x) / scale,
-                    font.ascender - ((sample_y - offset_y) / scale),
+                    glyph.x_min + ((sample_x - offset_x) / scale),
+                    glyph.y_max - ((sample_y - offset_y) / scale),
                 ];
                 let coverage = cpu_slug_coverage(render_coord, scale, curves, glyph);
                 let value = (coverage * 255.0).clamp(0.0, 255.0) as u8;
