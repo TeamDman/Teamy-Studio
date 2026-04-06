@@ -40,7 +40,9 @@ struct Vertex {
     effect: f32,
     glyph: f32,
     glyph_data: [f32; 4],
-    dilate_data: [f32; 4],
+    normal: [f32; 2],
+    jacobian: [f32; 4],
+    viewport_data: [f32; 2],
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1183,6 +1185,48 @@ impl QuadraticCurveBuilder {
             self.current = Some(to);
         }
     }
+
+    fn append_quadratic(&mut self, from: [f32; 2], control: [f32; 2], to: [f32; 2]) {
+        self.curves.push(QuadraticCurve {
+            p0: from,
+            p1: control,
+            p2: to,
+        });
+    }
+
+    fn append_cubic_as_quadratics(
+        &mut self,
+        p0: [f32; 2],
+        p1: [f32; 2],
+        p2: [f32; 2],
+        p3: [f32; 2],
+        depth: u32,
+    ) {
+        let q1_from_p1 = [((3.0 * p1[0]) - p0[0]) * 0.5, ((3.0 * p1[1]) - p0[1]) * 0.5];
+        let q1_from_p2 = [((3.0 * p2[0]) - p3[0]) * 0.5, ((3.0 * p2[1]) - p3[1]) * 0.5];
+        let error = (q1_from_p1[0] - q1_from_p2[0])
+            .abs()
+            .max((q1_from_p1[1] - q1_from_p2[1]).abs());
+
+        if error <= 0.25 || depth >= 8 {
+            let control = [
+                (q1_from_p1[0] + q1_from_p2[0]) * 0.5,
+                (q1_from_p1[1] + q1_from_p2[1]) * 0.5,
+            ];
+            self.append_quadratic(p0, control, p3);
+            return;
+        }
+
+        let p01 = [(p0[0] + p1[0]) * 0.5, (p0[1] + p1[1]) * 0.5];
+        let p12 = [(p1[0] + p2[0]) * 0.5, (p1[1] + p2[1]) * 0.5];
+        let p23 = [(p2[0] + p3[0]) * 0.5, (p2[1] + p3[1]) * 0.5];
+        let p012 = [(p01[0] + p12[0]) * 0.5, (p01[1] + p12[1]) * 0.5];
+        let p123 = [(p12[0] + p23[0]) * 0.5, (p12[1] + p23[1]) * 0.5];
+        let midpoint = [(p012[0] + p123[0]) * 0.5, (p012[1] + p123[1]) * 0.5];
+
+        self.append_cubic_as_quadratics(p0, p01, p012, midpoint, depth + 1);
+        self.append_cubic_as_quadratics(midpoint, p123, p23, p3, depth + 1);
+    }
 }
 
 impl OutlineBuilder for QuadraticCurveBuilder {
@@ -1198,18 +1242,16 @@ impl OutlineBuilder for QuadraticCurveBuilder {
 
     fn quad_to(&mut self, x1: f32, y1: f32, x: f32, y: f32) {
         if let Some(from) = self.current {
-            self.curves.push(QuadraticCurve {
-                p0: from,
-                p1: [x1, y1],
-                p2: [x, y],
-            });
+            self.append_quadratic(from, [x1, y1], [x, y]);
             self.current = Some([x, y]);
         }
     }
 
     fn curve_to(&mut self, x1: f32, y1: f32, x2: f32, y2: f32, x: f32, y: f32) {
-        let _ = (x1, y1, x2, y2);
-        self.push_line([x, y]);
+        if let Some(from) = self.current {
+            self.append_cubic_as_quadratics(from, [x1, y1], [x2, y2], [x, y], 0);
+            self.current = Some([x, y]);
+        }
     }
 
     fn close(&mut self) {
@@ -1470,9 +1512,21 @@ fn create_pipeline_state(
             ..Default::default()
         },
         D3D12_INPUT_ELEMENT_DESC {
-            SemanticName: s!("DILATE"),
-            Format: DXGI_FORMAT_R32G32B32A32_FLOAT,
+            SemanticName: s!("NORMAL"),
+            Format: DXGI_FORMAT_R32G32_FLOAT,
             AlignedByteOffset: 60,
+            ..Default::default()
+        },
+        D3D12_INPUT_ELEMENT_DESC {
+            SemanticName: s!("JACOBIAN"),
+            Format: DXGI_FORMAT_R32G32B32A32_FLOAT,
+            AlignedByteOffset: 68,
+            ..Default::default()
+        },
+        D3D12_INPUT_ELEMENT_DESC {
+            SemanticName: s!("VIEWPORT"),
+            Format: DXGI_FORMAT_R32G32_FLOAT,
+            AlignedByteOffset: 84,
             ..Default::default()
         },
     ];
@@ -1741,12 +1795,13 @@ fn append_text_rect(
     let glyph_right = left + (glyph.x_max / advance) * screen_width;
     let glyph_top = top + ((font.ascender - glyph.y_max) / font_height) * screen_height;
     let glyph_bottom = top + ((font.ascender - glyph.y_min) / font_height) * screen_height;
-    let dilate_data = [
-        (2.0 / width.max(1.0)) * SLUG_GLYPH_DILATION_PX,
-        (2.0 / height.max(1.0)) * SLUG_GLYPH_DILATION_PX,
-        (advance / screen_width.max(1.0)) * SLUG_GLYPH_DILATION_PX,
-        (font_height / screen_height.max(1.0)) * SLUG_GLYPH_DILATION_PX,
+    let jacobian = [
+        (width.max(1.0) * advance) / (2.0 * screen_width.max(1.0)),
+        0.0,
+        0.0,
+        (height.max(1.0) * font_height) / (2.0 * screen_height.max(1.0)),
     ];
+    let viewport_data = [width.max(1.0), height.max(1.0)];
     let effect = PanelEffect::Text as u32 as f32;
 
     let top_left = Vertex {
@@ -1756,34 +1811,42 @@ fn append_text_rect(
         effect,
         glyph: 0.0,
         glyph_data,
-        dilate_data,
+        normal: [-1.0, 1.0],
+        jacobian,
+        viewport_data,
     };
     let top_right = Vertex {
         position: to_ndc(width, height, glyph_right, glyph_top),
         color,
         uv: [glyph.x_max, glyph.y_max],
         effect,
-        glyph: 1.0,
+        glyph: 0.0,
         glyph_data,
-        dilate_data,
+        normal: [1.0, 1.0],
+        jacobian,
+        viewport_data,
     };
     let bottom_right = Vertex {
         position: to_ndc(width, height, glyph_right, glyph_bottom),
         color,
         uv: [glyph.x_max, glyph.y_min],
         effect,
-        glyph: 2.0,
+        glyph: 0.0,
         glyph_data,
-        dilate_data,
+        normal: [1.0, -1.0],
+        jacobian,
+        viewport_data,
     };
     let bottom_left = Vertex {
         position: to_ndc(width, height, glyph_left, glyph_bottom),
         color,
         uv: [glyph.x_min, glyph.y_min],
         effect,
-        glyph: 3.0,
+        glyph: 0.0,
         glyph_data,
-        dilate_data,
+        normal: [-1.0, -1.0],
+        jacobian,
+        viewport_data,
     };
 
     vertices.extend_from_slice(&[
@@ -1823,7 +1886,9 @@ fn append_rect(
         effect,
         glyph,
         glyph_data: [0.0; 4],
-        dilate_data: [0.0; 4],
+        normal: [0.0; 2],
+        jacobian: [0.0; 4],
+        viewport_data: [0.0; 2],
     };
     let top_right = Vertex {
         position: to_ndc(width, height, right, top),
@@ -1832,7 +1897,9 @@ fn append_rect(
         effect,
         glyph,
         glyph_data: [0.0; 4],
-        dilate_data: [0.0; 4],
+        normal: [0.0; 2],
+        jacobian: [0.0; 4],
+        viewport_data: [0.0; 2],
     };
     let bottom_right = Vertex {
         position: to_ndc(width, height, right, bottom),
@@ -1841,7 +1908,9 @@ fn append_rect(
         effect,
         glyph,
         glyph_data: [0.0; 4],
-        dilate_data: [0.0; 4],
+        normal: [0.0; 2],
+        jacobian: [0.0; 4],
+        viewport_data: [0.0; 2],
     };
     let bottom_left = Vertex {
         position: to_ndc(width, height, left, bottom),
@@ -1850,7 +1919,9 @@ fn append_rect(
         effect,
         glyph,
         glyph_data: [0.0; 4],
-        dilate_data: [0.0; 4],
+        normal: [0.0; 2],
+        jacobian: [0.0; 4],
+        viewport_data: [0.0; 2],
     };
 
     vertices.extend_from_slice(&[
@@ -1893,6 +1964,7 @@ mod tests {
         extract_glyph_curves, load_terminal_font, push_centered_text, push_glyph, push_text_block,
         render_snapshot_glyph_into_image,
     };
+    use eyre::WrapErr;
     use image::RgbaImage;
     use ttf_parser::{Face, OutlineBuilder};
     use windows::Win32::Foundation::RECT;
@@ -2040,7 +2112,7 @@ mod tests {
         let font = load_terminal_font()?;
         let face = Face::parse(&font.font_bytes, font.face_index)?;
 
-        for character in ['r', 'g', '6'] {
+        for character in ['b', 'r', 'g', '6'] {
             let glyph_id = face
                 .glyph_index(character)
                 .expect("diagnostic glyph should exist in terminal font");
@@ -2061,20 +2133,65 @@ mod tests {
     }
 
     #[test]
-    fn g_and_six_snapshots_write_debug_artifacts() -> eyre::Result<()> {
+    fn glyph_snapshots_write_debug_artifacts() -> eyre::Result<()> {
         let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let output_dir = manifest_dir
             .join("target")
             .join("test-artifacts")
             .join("slug");
 
+        super::write_slug_snapshot_png('b', 256, 512, 512, &output_dir.join("b-256.png"))?;
         super::write_slug_snapshot_png('r', 256, 512, 512, &output_dir.join("r-256.png"))?;
         super::write_slug_snapshot_png('g', 256, 512, 512, &output_dir.join("g-256.png"))?;
         super::write_slug_snapshot_png('6', 256, 512, 512, &output_dir.join("6-256.png"))?;
 
+        assert!(output_dir.join("b-256.png").exists());
         assert!(output_dir.join("r-256.png").exists());
         assert!(output_dir.join("g-256.png").exists());
         assert!(output_dir.join("6-256.png").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn fontdue_reference_snapshots_write_debug_artifacts() -> eyre::Result<()> {
+        let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let output_dir = manifest_dir
+            .join("target")
+            .join("test-artifacts")
+            .join("slug");
+
+        write_fontdue_reference_png('b', 256, 512, 512, &output_dir.join("b-fontdue-256.png"))?;
+        write_fontdue_reference_png('r', 256, 512, 512, &output_dir.join("r-fontdue-256.png"))?;
+
+        assert!(output_dir.join("b-fontdue-256.png").exists());
+        assert!(output_dir.join("r-fontdue-256.png").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn fontdue_comparison_diffs_write_debug_artifacts() -> eyre::Result<()> {
+        let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let output_dir = manifest_dir
+            .join("target")
+            .join("test-artifacts")
+            .join("slug");
+        let font = load_terminal_font()?;
+        let face = Face::parse(&font.font_bytes, font.face_index)?;
+
+        for character in ['b', 'r'] {
+            let glyph_id = face
+                .glyph_index(character)
+                .expect("comparison glyph should exist in terminal font");
+            let curves = extract_glyph_curves(&face, glyph_id);
+            let glyph = super::build_slug_glyph_from_face(&font, &face, glyph_id, 0, curves.len());
+            let slug = render_test_glyph(&font, &curves, glyph, 256, 512, 512);
+            let fontdue = render_fontdue_reference_glyph(character, 256, 512, 512)?;
+            let diff = render_alpha_diff(&slug, &fontdue);
+            diff.save(output_dir.join(format!("{character}-slug-fontdue-diff.png")))?;
+        }
+
+        assert!(output_dir.join("b-slug-fontdue-diff.png").exists());
+        assert!(output_dir.join("r-slug-fontdue-diff.png").exists());
         Ok(())
     }
 
@@ -2121,6 +2238,85 @@ mod tests {
             glyph,
         );
 
+        image
+    }
+
+    fn write_fontdue_reference_png(
+        character: char,
+        font_size_px: u32,
+        image_width: u32,
+        image_height: u32,
+        output_path: &std::path::Path,
+    ) -> eyre::Result<()> {
+        let image =
+            render_fontdue_reference_glyph(character, font_size_px, image_width, image_height)?;
+
+        if let Some(parent) = output_path.parent() {
+            std::fs::create_dir_all(parent).wrap_err_with(|| {
+                format!(
+                    "failed to create fontdue snapshot directory {}",
+                    parent.display()
+                )
+            })?;
+        }
+        image.save(output_path).wrap_err_with(|| {
+            format!(
+                "failed to write fontdue snapshot png {}",
+                output_path.display()
+            )
+        })?;
+        Ok(())
+    }
+
+    fn render_fontdue_reference_glyph(
+        character: char,
+        font_size_px: u32,
+        image_width: u32,
+        image_height: u32,
+    ) -> eyre::Result<RgbaImage> {
+        use fontdue::{Font as FontdueFont, FontSettings as FontdueSettings};
+        use image::Rgba;
+
+        let font = load_terminal_font()?;
+        let fontdue_font =
+            FontdueFont::from_bytes(font.font_bytes.clone(), FontdueSettings::default())
+                .map_err(|message| eyre::eyre!(message))?;
+        let (metrics, bitmap) = fontdue_font.rasterize(character, font_size_px as f32);
+        let mut image = RgbaImage::new(image_width, image_height);
+        super::clear_snapshot_background(&mut image);
+
+        let offset_x = ((image_width as i32 - metrics.width as i32) / 2).max(0) as u32;
+        let offset_y = ((image_height as i32 - metrics.height as i32) / 2).max(0) as u32;
+
+        for y in 0..metrics.height {
+            for x in 0..metrics.width {
+                let alpha = bitmap[y * metrics.width + x];
+                if alpha == 0 {
+                    continue;
+                }
+                let dst_x = offset_x + x as u32;
+                let dst_y = offset_y + y as u32;
+                if dst_x < image_width && dst_y < image_height {
+                    image.put_pixel(dst_x, dst_y, Rgba([255, 255, 255, alpha]));
+                }
+            }
+        }
+
+        Ok(image)
+    }
+
+    fn render_alpha_diff(lhs: &RgbaImage, rhs: &RgbaImage) -> RgbaImage {
+        let width = lhs.width().min(rhs.width());
+        let height = lhs.height().min(rhs.height());
+        let mut image = RgbaImage::new(width, height);
+        for y in 0..height {
+            for x in 0..width {
+                let left = lhs.get_pixel(x, y)[3] as i16;
+                let right = rhs.get_pixel(x, y)[3] as i16;
+                let delta = (left - right).unsigned_abs() as u8;
+                image.put_pixel(x, y, image::Rgba([delta, delta, delta, 255]));
+            }
+        }
         image
     }
 

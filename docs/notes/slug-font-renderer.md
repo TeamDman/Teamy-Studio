@@ -8,6 +8,7 @@ Goal: capture the current Teamy Studio text renderer design, its known fidelity 
 - The D3D12 text path now loads the installed `CaskaydiaCove Nerd Font Mono` through `fontdb`.
 - Glyph outlines are parsed with `ttf-parser` and converted into quadratic curve records.
 - The GPU text path evaluates analytic coverage from those curves in `src/app/windows_panel_shaders.hlsl`.
+- The text vertex path now carries per-vertex normals, an inverse-Jacobian mapping, and viewport data so glyph quads can be dilated in a more Slug-like way in the vertex shader.
 - Terminal text and notebook/output text still share the same renderer backend, but their interactive scale factors are now tracked independently in the window state.
 
 ## What This Is And Is Not
@@ -19,35 +20,36 @@ What it is:
 What it is not yet:
 - a full Slug implementation
 - a band-accelerated renderer
-- a faithful port of Slug's vertex dilation and Jacobian-aware raster contract
+- a faithful port of Slug's full banded data model and matrix-driven shader contract
 
 ## Known Limitations
 
 - We are not using band-acceleration tables yet.
 - We currently walk all curves for the glyph during coverage evaluation instead of using Slug's band partitioning.
-- The current shader path uses a simplified coverage formulation rather than the full Slug pipeline.
-- Glyph placement still leans on cell metrics more than glyph-specific bounds and side bearings.
-- Cubic outlines are not handled correctly yet: `QuadraticCurveBuilder::curve_to(...)` currently degrades cubic segments into straight lines.
+- The current shader path still uses a simplified all-curves coverage formulation rather than the full Slug band pipeline.
+- Flat stems and flat caps on glyphs like `b` still show softer / denser edge pixels than the VS Code terminal reference, so the remaining fidelity gap is not explained by quad padding alone.
+- Cubic outlines are now recursively approximated as quadratic segments, but this path still needs validation against fonts that rely heavily on cubic CFF outlines.
 
 ## First-Principles Artifacting Analysis
 
 Observed symptom:
 - Diagonal and complex strokes show visible artifacting that becomes easier to see when zooming in.
+- Flat vertical and horizontal edges on glyphs like `b` also show nonuniform antialiasing compared with reference terminal renderers.
 
 Likely causes ranked by expected visual impact:
 
-1. Cubic outlines are currently wrong.
-- If a glyph contains cubic segments and the builder collapses them into line segments, the resulting curve field is not an approximation of the original outline. It is a geometry error.
-- That can directly produce broken diagonals, kinks, missing curvature, and uneven coverage.
+1. Cubic outline conversion still needs validation.
+- Cubic segments are now subdivided into quadratic approximations instead of being collapsed to lines.
+- This removes a known geometry error, but it still needs targeted verification against fonts that actually exercise the cubic path.
 
-2. The renderer does not yet implement Slug's full dilation and Jacobian contract.
-- Slug's published pipeline is not just curve evaluation in the pixel shader.
-- The quality story depends on how glyph bounds, dilation, and local transform scale are carried into the coverage stage.
-- Our simplified mapping from cell-space UVs to font-space coordinates is plausible, but it is not yet proven correct for every stroke orientation and zoom level.
+2. The renderer still does not implement Slug's full banded pipeline.
+- A more Slug-like per-vertex dilation / inverse-Jacobian path is now in place.
+- However, band selection, sorted curve subsets, and the exact reference shader contract are still missing.
+- Remaining flat-edge softness suggests the next correctness gap is deeper than quad expansion alone.
 
-3. Glyph layout still uses coarse cell metrics.
-- The current placement path is good enough to get text on screen, but it does not yet fully respect glyph-specific bounds.
-- That can bias sampling windows and make edge behavior look worse, especially for narrow punctuation and diagonals such as `/`.
+3. Sample-window alignment may still not match reference rasterizers.
+- Glyph-specific bounds are now used for quad mapping, but there may still be baseline or sample-window mismatches relative to production terminal renderers.
+- That can show up most clearly on stems and flat edges where the expected result is visually unforgiving.
 
 4. Missing band tables are a performance problem first.
 - The lack of band acceleration should mainly affect cost, not baseline correctness.
@@ -58,15 +60,25 @@ Likely causes ranked by expected visual impact:
 The codebase now exposes an offscreen glyph snapshot entrypoint:
 - `teamy_studio::app::write_slug_snapshot_png(...)`
 
+Additional debug references now exist:
+- the ignored integration snapshot harness emits `/`, `b`, `r`, and the Unicode sheet
+- renderer unit tests can also emit `fontdue` reference rasters for selected glyphs so we can compare our shader path against an independent CPU rasterizer
+
 Purpose:
 - render a single glyph such as `/` to a PNG without opening a window
 - make debugging repeatable and comparable across renderer changes
 
 Current harness:
-- `cargo test snapshot_single_glyph_slash_png -- --ignored`
+- `cargo test --test slug_snapshot -- --ignored --nocapture`
 
 Artifact output:
 - `target/test-artifacts/slug/slash-256.png`
+- `target/test-artifacts/slug/b-256.png`
+- `target/test-artifacts/slug/r-256.png`
+- `target/test-artifacts/slug/unicode-sheet.png`
+- `target/test-artifacts/slug/unicode-sheet-index.txt`
+- `target/test-artifacts/slug/b-fontdue-256.png`
+- `target/test-artifacts/slug/r-fontdue-256.png`
 
 Why this matters:
 - the artifacting problem should be debugged on a single large glyph first
@@ -74,7 +86,7 @@ Why this matters:
 
 ## Recommended Next Work
 
-1. Fix cubic outline handling in `QuadraticCurveBuilder::curve_to(...)`.
-2. Add a second snapshot case for a Powerline glyph and a box-drawing glyph.
-3. Move glyph placement from cell-only assumptions toward glyph bounds and side bearings.
-4. Add band-acceleration tables after geometry correctness is established.
+1. Use the new `fontdue` reference rasters to compare stem edges and isolate whether the remaining mismatch is geometry placement or coverage accumulation.
+2. Implement the remaining Slug band-selection / sorted-curve machinery instead of walking every curve for every pixel.
+3. Add reduced regression cases for flat-edge glyphs like `b` once we can express the expected behavior robustly.
+4. Validate the new cubic-to-quadratic path against a font that actually uses cubic outlines.

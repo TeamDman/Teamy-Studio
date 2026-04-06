@@ -5,7 +5,9 @@ struct VsInput {
     float effect : EFFECT;
     float glyph : GLYPH;
     float4 glyphData : GLYPHDATA;
-    float4 dilateData : DILATE;
+    float2 normal : NORMAL;
+    float4 jacobian : JACOBIAN;
+    float2 viewportData : VIEWPORT;
 };
 
 struct PsInput {
@@ -19,11 +21,14 @@ struct PsInput {
 
 Buffer<float4> CurveData : register(t0);
 
-float2 TextCornerNormal(float corner) {
-    if (corner < 0.5) return float2(-0.70710678, 0.70710678);
-    if (corner < 1.5) return float2(0.70710678, 0.70710678);
-    if (corner < 2.5) return float2(0.70710678, -0.70710678);
-    return float2(-0.70710678, -0.70710678);
+float2 SlugDilateNdc(float2 position, float2 texcoord, float2 normal, float4 jacobian, float2 viewport, out float2 sampleCoord) {
+    float2 n = normalize(normal);
+    float u = n.x * viewport.x;
+    float v = n.y * viewport.y;
+    float uv = max(u * u + v * v, 1.0 / 16777216.0);
+    float2 d = n * rsqrt(uv);
+    sampleCoord = texcoord + float2(dot(d, jacobian.xy), dot(d, jacobian.zw));
+    return position + d;
 }
 
 PsInput VSMain(VsInput input) {
@@ -31,10 +36,8 @@ PsInput VSMain(VsInput input) {
     float2 position = input.position.xy;
     float2 uv = input.uv;
 
-    if (input.effect > 7.5) {
-        float2 normal = TextCornerNormal(input.glyph);
-        position += float2(normal.x * input.dilateData.x, normal.y * input.dilateData.y);
-        uv += float2(normal.x * input.dilateData.z, normal.y * input.dilateData.w);
+    if (input.effect > 7.5 && any(input.normal != 0.0.xx)) {
+        position = SlugDilateNdc(position, uv, input.normal, input.jacobian, input.viewportData, uv);
     }
 
     output.position = float4(position, input.position.z, 1.0);

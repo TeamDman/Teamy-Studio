@@ -58,6 +58,9 @@ features = [
 	"Win32_UI_WindowsAndMessaging",
 ]
 
+[target.'cfg(windows)'.dev-dependencies]
+fontdue = "0.9.3"
+
 [features]
 default = []
 tracy = ["dep:tracing-tracy"]
