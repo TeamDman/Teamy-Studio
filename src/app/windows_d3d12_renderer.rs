@@ -28,8 +28,10 @@ const MAX_GLYPH_COUNT: usize = 8_192;
 const MAX_VERTEX_COUNT: usize = (MAX_PANEL_COUNT + MAX_GLYPH_COUNT) * 6;
 const FALLBACK_GLYPH: char = '?';
 const MAX_CURVE_FLOAT4_COUNT: usize = 65_536;
+const MAX_BAND_UINT_COUNT: usize = 262_144;
 const TERMINAL_FONT_FAMILY: &str = "CaskaydiaCove Nerd Font Mono";
 const SLUG_GLYPH_DILATION_PX: f32 = 0.5;
+const SLUG_BAND_SIZE_FONT_UNITS: f32 = 64.0;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -40,6 +42,7 @@ struct Vertex {
     effect: f32,
     glyph: f32,
     glyph_data: [f32; 4],
+    banding: [f32; 4],
     normal: [f32; 2],
     jacobian: [f32; 4],
     viewport_data: [f32; 2],
@@ -49,6 +52,10 @@ struct Vertex {
 struct SlugGlyph {
     curve_start: u32,
     curve_count: u32,
+    band_start: u32,
+    band_count_x: u32,
+    band_count_y: u32,
+    band_transform: [f32; 4],
     x_min: f32,
     y_min: f32,
     x_max: f32,
@@ -70,6 +77,10 @@ impl SlugGlyph {
         Self {
             curve_start: 0,
             curve_count: 0,
+            band_start: 0,
+            band_count_x: 1,
+            band_count_y: 1,
+            band_transform: [0.0; 4],
             x_min: 0.0,
             y_min: font.descender,
             x_max: font.cell_advance,
@@ -84,6 +95,14 @@ struct QuadraticCurve {
     p0: [f32; 2],
     p1: [f32; 2],
     p2: [f32; 2],
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CurveExtents {
+    min_x: f32,
+    max_x: f32,
+    min_y: f32,
+    max_y: f32,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -141,6 +160,7 @@ pub struct D3d12PanelRenderer {
     vertex_buffer_view: D3D12_VERTEX_BUFFER_VIEW,
     srv_heap: ID3D12DescriptorHeap,
     curve_buffer: ID3D12Resource,
+    band_buffer: ID3D12Resource,
     font: LoadedTerminalFont,
     glyph_cache: HashMap<char, SlugGlyph>,
     cached_chars: Vec<char>,
@@ -164,7 +184,7 @@ impl D3d12PanelRenderer {
         let (rtv_heap, rtv_descriptor_size, render_targets) =
             create_render_targets(&device, &swap_chain)?;
         let command_allocators = create_command_allocators(&device)?;
-        let (srv_heap, curve_buffer) = create_curve_buffer_and_srv(&device)?;
+        let (srv_heap, curve_buffer, band_buffer) = create_slug_buffers_and_srv(&device)?;
         let font = load_terminal_font()?;
         let root_signature = create_root_signature(&device)?;
         let pipeline_state = create_pipeline_state(&device, &root_signature)?;
@@ -218,6 +238,7 @@ impl D3d12PanelRenderer {
             vertex_buffer_view,
             srv_heap,
             curve_buffer,
+            band_buffer,
             font,
             glyph_cache: HashMap::new(),
             cached_chars: Vec::new(),
@@ -391,7 +412,8 @@ impl D3d12PanelRenderer {
             return Ok(());
         }
 
-        let (curve_data, glyph_cache) = build_slug_curve_buffer(&self.font, &scene_chars)?;
+        let (curve_data, band_data, glyph_cache) =
+            build_slug_curve_buffer(&self.font, &scene_chars)?;
         unsafe {
             let mut mapped = std::ptr::null_mut();
             self.curve_buffer.Map(0, None, Some(&mut mapped))?;
@@ -406,6 +428,20 @@ impl D3d12PanelRenderer {
                 curve_data.len(),
             );
             self.curve_buffer.Unmap(0, None);
+
+            let mut band_mapped = std::ptr::null_mut();
+            self.band_buffer.Map(0, None, Some(&mut band_mapped))?;
+            std::ptr::write_bytes(
+                band_mapped,
+                0,
+                MAX_BAND_UINT_COUNT * std::mem::size_of::<u32>(),
+            );
+            std::ptr::copy_nonoverlapping(
+                band_data.as_ptr(),
+                band_mapped as *mut u32,
+                band_data.len(),
+            );
+            self.band_buffer.Unmap(0, None);
         }
 
         self.glyph_cache = glyph_cache;
@@ -672,13 +708,14 @@ fn load_terminal_font() -> eyre::Result<LoadedTerminalFont> {
 fn build_slug_curve_buffer(
     font: &LoadedTerminalFont,
     chars: &[char],
-) -> eyre::Result<(Vec<[f32; 4]>, HashMap<char, SlugGlyph>)> {
+) -> eyre::Result<(Vec<[f32; 4]>, Vec<u32>, HashMap<char, SlugGlyph>)> {
     let face = Face::parse(&font.font_bytes, font.face_index)
         .wrap_err("failed to parse terminal font for slug curve build")?;
     let fallback_id = face
         .glyph_index(FALLBACK_GLYPH)
         .ok_or_else(|| eyre::eyre!("terminal font did not contain fallback glyph"))?;
     let mut curve_data = Vec::new();
+    let mut band_data = Vec::new();
     let mut glyph_cache = HashMap::new();
 
     for character in chars {
@@ -689,24 +726,18 @@ fn build_slug_curve_buffer(
             curve_data.push([curve.p0[0], curve.p0[1], curve.p1[0], curve.p1[1]]);
             curve_data.push([curve.p2[0], curve.p2[1], 0.0, 0.0]);
         }
-        let advance = face
-            .glyph_hor_advance(glyph_id)
-            .map_or(font.cell_advance, f32::from);
-        let bbox = face.glyph_bounding_box(glyph_id);
-        let x_min = bbox.map_or(0.0, |rect| f32::from(rect.x_min));
-        let y_min = bbox.map_or(font.descender, |rect| f32::from(rect.y_min));
-        let x_max = bbox.map_or(advance, |rect| f32::from(rect.x_max));
-        let y_max = bbox.map_or(font.ascender, |rect| f32::from(rect.y_max));
+        let band_start = band_data.len() as u32;
+        let glyph = build_slug_glyph_from_face(font, &face, glyph_id, curve_start, curves.len());
+        let (band_count_x, band_count_y, band_transform) =
+            append_slug_band_data(&curves, glyph, &mut band_data);
         glyph_cache.insert(
             *character,
             SlugGlyph {
-                curve_start,
-                curve_count: curves.len() as u32,
-                x_min,
-                y_min,
-                x_max,
-                y_max,
-                advance,
+                band_start,
+                band_count_x,
+                band_count_y,
+                band_transform,
+                ..glyph
             },
         );
     }
@@ -715,7 +746,11 @@ fn build_slug_curve_buffer(
         eyre::bail!("slug curve buffer capacity exceeded")
     }
 
-    Ok((curve_data, glyph_cache))
+    if band_data.len() > MAX_BAND_UINT_COUNT {
+        eyre::bail!("slug band buffer capacity exceeded")
+    }
+
+    Ok((curve_data, band_data, glyph_cache))
 }
 
 fn extract_glyph_curves(face: &Face<'_>, glyph_id: GlyphId) -> Vec<QuadraticCurve> {
@@ -734,7 +769,7 @@ pub fn write_slug_snapshot_png(
     let font = load_terminal_font()?;
     let face = Face::parse(&font.font_bytes, font.face_index)
         .wrap_err("failed to parse terminal font for snapshot")?;
-    let (curves, glyph) = load_snapshot_glyph(&font, &face, character)?;
+    let (curves, band_data, glyph) = load_snapshot_glyph(&font, &face, character)?;
     let mut image = ImageBuffer::<Rgba<u8>, Vec<u8>>::new(image_width, image_height);
     clear_snapshot_background(&mut image);
     render_snapshot_glyph_into_image(
@@ -746,6 +781,7 @@ pub fn write_slug_snapshot_png(
         font_size_px,
         &font,
         &curves,
+        &band_data,
         glyph,
     );
 
@@ -787,7 +823,7 @@ pub fn write_slug_snapshot_sheet_png(
         let cell_index = u32::try_from(index).unwrap_or_default();
         let cell_x = (cell_index % columns) * cell_size_px;
         let cell_y = (cell_index / columns) * cell_size_px;
-        let (curves, glyph) = load_snapshot_glyph(&font, &face, character)?;
+        let (curves, band_data, glyph) = load_snapshot_glyph(&font, &face, character)?;
         render_snapshot_glyph_into_image(
             &mut image,
             cell_x,
@@ -797,6 +833,7 @@ pub fn write_slug_snapshot_sheet_png(
             font_size_px,
             &font,
             &curves,
+            &band_data,
             glyph,
         );
         use std::fmt::Write as _;
@@ -839,14 +876,27 @@ fn load_snapshot_glyph(
     font: &LoadedTerminalFont,
     face: &Face<'_>,
     character: char,
-) -> eyre::Result<(Vec<QuadraticCurve>, SlugGlyph)> {
+) -> eyre::Result<(Vec<QuadraticCurve>, Vec<u32>, SlugGlyph)> {
     let glyph_id = face
         .glyph_index(character)
         .or_else(|| face.glyph_index(FALLBACK_GLYPH))
         .ok_or_else(|| eyre::eyre!("failed to resolve snapshot glyph in font"))?;
     let curves = extract_glyph_curves(face, glyph_id);
     let glyph = build_slug_glyph_from_face(font, face, glyph_id, 0, curves.len());
-    Ok((curves, glyph))
+    let mut band_data = Vec::new();
+    let (band_count_x, band_count_y, band_transform) =
+        append_slug_band_data(&curves, glyph, &mut band_data);
+    Ok((
+        curves,
+        band_data,
+        SlugGlyph {
+            band_start: 0,
+            band_count_x,
+            band_count_y,
+            band_transform,
+            ..glyph
+        },
+    ))
 }
 
 fn build_slug_glyph_from_face(
@@ -863,12 +913,136 @@ fn build_slug_glyph_from_face(
     SlugGlyph {
         curve_start,
         curve_count: u32::try_from(curve_count).unwrap_or(u32::MAX),
+        band_start: 0,
+        band_count_x: 1,
+        band_count_y: 1,
+        band_transform: [0.0; 4],
         x_min: bbox.map_or(0.0, |rect| f32::from(rect.x_min)),
         y_min: bbox.map_or(font.descender, |rect| f32::from(rect.y_min)),
         x_max: bbox.map_or(advance, |rect| f32::from(rect.x_max)),
         y_max: bbox.map_or(font.ascender, |rect| f32::from(rect.y_max)),
         advance,
     }
+}
+
+fn append_slug_band_data(
+    curves: &[QuadraticCurve],
+    glyph: SlugGlyph,
+    band_data: &mut Vec<u32>,
+) -> (u32, u32, [f32; 4]) {
+    let band_count_x = compute_band_count(glyph.x_max - glyph.x_min);
+    let band_count_y = compute_band_count(glyph.y_max - glyph.y_min);
+    let band_transform = [
+        compute_band_scale(glyph.x_min, glyph.x_max, band_count_x),
+        compute_band_scale(glyph.y_min, glyph.y_max, band_count_y),
+        compute_band_offset(glyph.x_min, glyph.x_max, band_count_x),
+        compute_band_offset(glyph.y_min, glyph.y_max, band_count_y),
+    ];
+    let curve_extents: Vec<_> = curves.iter().copied().map(curve_extents).collect();
+    let mut horizontal_bands = vec![Vec::<usize>::new(); band_count_y as usize];
+    let mut vertical_bands = vec![Vec::<usize>::new(); band_count_x as usize];
+
+    for (curve_index, extents) in curve_extents.iter().enumerate() {
+        let horizontal_start = band_index(
+            extents.min_y,
+            band_transform[1],
+            band_transform[3],
+            band_count_y,
+        );
+        let horizontal_end = band_index(
+            extents.max_y,
+            band_transform[1],
+            band_transform[3],
+            band_count_y,
+        );
+        for band in horizontal_start..=horizontal_end {
+            horizontal_bands[band as usize].push(curve_index);
+        }
+
+        let vertical_start = band_index(
+            extents.min_x,
+            band_transform[0],
+            band_transform[2],
+            band_count_x,
+        );
+        let vertical_end = band_index(
+            extents.max_x,
+            band_transform[0],
+            band_transform[2],
+            band_count_x,
+        );
+        for band in vertical_start..=vertical_end {
+            vertical_bands[band as usize].push(curve_index);
+        }
+    }
+
+    for band in &mut horizontal_bands {
+        band.sort_by(|lhs, rhs| {
+            curve_extents[*rhs]
+                .max_x
+                .total_cmp(&curve_extents[*lhs].max_x)
+        });
+    }
+    for band in &mut vertical_bands {
+        band.sort_by(|lhs, rhs| {
+            curve_extents[*rhs]
+                .max_y
+                .total_cmp(&curve_extents[*lhs].max_y)
+        });
+    }
+
+    let table_start = band_data.len();
+    let table_len = ((band_count_x + band_count_y) as usize) * 2;
+    band_data.resize(table_start + table_len, 0);
+
+    for (band_index, band) in horizontal_bands.iter().enumerate() {
+        let entry_index = table_start + (band_index * 2);
+        band_data[entry_index] = band.len() as u32;
+        band_data[entry_index + 1] = band_data.len() as u32;
+        for curve_index in band {
+            band_data.push(*curve_index as u32);
+        }
+    }
+
+    let vertical_table_start = table_start + (band_count_y as usize * 2);
+    for (band_index, band) in vertical_bands.iter().enumerate() {
+        let entry_index = vertical_table_start + (band_index * 2);
+        band_data[entry_index] = band.len() as u32;
+        band_data[entry_index + 1] = band_data.len() as u32;
+        for curve_index in band {
+            band_data.push(*curve_index as u32);
+        }
+    }
+
+    (band_count_x, band_count_y, band_transform)
+}
+
+fn curve_extents(curve: QuadraticCurve) -> CurveExtents {
+    CurveExtents {
+        min_x: curve.p0[0].min(curve.p1[0]).min(curve.p2[0]),
+        max_x: curve.p0[0].max(curve.p1[0]).max(curve.p2[0]),
+        min_y: curve.p0[1].min(curve.p1[1]).min(curve.p2[1]),
+        max_y: curve.p0[1].max(curve.p1[1]).max(curve.p2[1]),
+    }
+}
+
+fn compute_band_count(span: f32) -> u32 {
+    ((span.max(1.0) / SLUG_BAND_SIZE_FONT_UNITS).ceil() as u32).clamp(1, 255)
+}
+
+fn compute_band_scale(min_value: f32, max_value: f32, band_count: u32) -> f32 {
+    let _ = min_value;
+    band_count.max(1) as f32 / (max_value - min_value).max(1.0)
+}
+
+fn compute_band_offset(min_value: f32, max_value: f32, band_count: u32) -> f32 {
+    -(min_value * compute_band_scale(min_value, max_value, band_count))
+}
+
+fn band_index(value: f32, scale: f32, offset: f32, band_count: u32) -> u32 {
+    ((value * scale) + offset)
+        .trunc()
+        .clamp(0.0, band_count.saturating_sub(1) as f32) as u32
 }
 
 fn collect_font_unicode_chars(face: &Face<'_>) -> Vec<char> {
@@ -919,6 +1093,7 @@ fn render_snapshot_glyph_into_image(
     font_size_px: u32,
     font: &LoadedTerminalFont,
     curves: &[QuadraticCurve],
+    band_data: &[u32],
     glyph: SlugGlyph,
 ) {
     let font_height_units = (font.ascender - font.descender).max(1.0);
@@ -952,7 +1127,7 @@ fn render_snapshot_glyph_into_image(
                 render_x_min + ((sample_x - offset_x) / scale),
                 render_y_max - ((sample_y - offset_y) / scale),
             ];
-            let coverage = cpu_slug_coverage(render_coord, scale, curves, glyph);
+            let coverage = cpu_slug_coverage(render_coord, scale, curves, band_data, glyph);
             if coverage <= 0.0 {
                 continue;
             }
@@ -963,6 +1138,90 @@ fn render_snapshot_glyph_into_image(
 }
 
 fn cpu_slug_coverage(
+    render_coord: [f32; 2],
+    pixels_per_em: f32,
+    curves: &[QuadraticCurve],
+    band_data: &[u32],
+    glyph: SlugGlyph,
+) -> f32 {
+    if glyph.curve_count == 0 {
+        return 0.0;
+    }
+
+    let mut xcov: f32 = 0.0;
+    let mut ycov: f32 = 0.0;
+    let mut xwgt: f32 = 0.0;
+    let mut ywgt: f32 = 0.0;
+    let horizontal_band = band_index(
+        render_coord[1],
+        glyph.band_transform[1],
+        glyph.band_transform[3],
+        glyph.band_count_y,
+    ) as usize;
+    let horizontal_entry = glyph.band_start as usize + (horizontal_band * 2);
+    let horizontal_count = band_data.get(horizontal_entry).copied().unwrap_or_default() as usize;
+    let horizontal_start = band_data
+        .get(horizontal_entry + 1)
+        .copied()
+        .unwrap_or_default() as usize;
+    for offset in 0..horizontal_count {
+        let curve_index = band_data
+            .get(horizontal_start + offset)
+            .copied()
+            .unwrap_or_default() as usize;
+        let Some(curve) = curves.get(curve_index) else {
+            continue;
+        };
+        if (curve_extents(*curve).max_x - render_coord[0]) * pixels_per_em < -0.5 {
+            break;
+        }
+        accumulate_horizontal_curve_coverage(
+            curve,
+            render_coord,
+            pixels_per_em,
+            &mut xcov,
+            &mut xwgt,
+        );
+    }
+
+    let vertical_band = band_index(
+        render_coord[0],
+        glyph.band_transform[0],
+        glyph.band_transform[2],
+        glyph.band_count_x,
+    ) as usize;
+    let vertical_entry =
+        glyph.band_start as usize + (glyph.band_count_y as usize * 2) + (vertical_band * 2);
+    let vertical_count = band_data.get(vertical_entry).copied().unwrap_or_default() as usize;
+    let vertical_start = band_data
+        .get(vertical_entry + 1)
+        .copied()
+        .unwrap_or_default() as usize;
+    for offset in 0..vertical_count {
+        let curve_index = band_data
+            .get(vertical_start + offset)
+            .copied()
+            .unwrap_or_default() as usize;
+        let Some(curve) = curves.get(curve_index) else {
+            continue;
+        };
+        if (curve_extents(*curve).max_y - render_coord[1]) * pixels_per_em < -0.5 {
+            break;
+        }
+        accumulate_vertical_curve_coverage(
+            curve,
+            render_coord,
+            pixels_per_em,
+            &mut ycov,
+            &mut ywgt,
+        );
+    }
+
+    calc_coverage(xcov, ycov, xwgt, ywgt)
+}
+
+#[cfg(test)]
+fn cpu_slug_coverage_all_curves(
     render_coord: [f32; 2],
     pixels_per_em: f32,
     curves: &[QuadraticCurve],
@@ -980,56 +1239,20 @@ fn cpu_slug_coverage(
     let end = start + usize::try_from(glyph.curve_count).unwrap_or_default();
 
     for curve in curves.iter().skip(start).take(end.saturating_sub(start)) {
-        if is_linear_curve(curve) {
-            apply_linear_curve_coverage(
-                curve,
-                render_coord,
-                pixels_per_em,
-                &mut xcov,
-                &mut ycov,
-                &mut xwgt,
-                &mut ywgt,
-            );
-            continue;
-        }
-
-        let p12 = [
-            curve.p0[0] - render_coord[0],
-            curve.p0[1] - render_coord[1],
-            curve.p1[0] - render_coord[0],
-            curve.p1[1] - render_coord[1],
-        ];
-        let p3 = [curve.p2[0] - render_coord[0], curve.p2[1] - render_coord[1]];
-
-        let hcode = calc_root_code(p12[1], p12[3], p3[1]);
-        if hcode != 0 {
-            let hr = solve_horiz_poly(p12, p3);
-            if (hcode & 1) != 0 {
-                let sample = saturate((hr[0] * pixels_per_em) + 0.5);
-                xcov += sample;
-                xwgt = xwgt.max(saturate(1.0 - (hr[0] * pixels_per_em).abs() * 2.0));
-            }
-            if hcode > 1 {
-                let sample = saturate((hr[1] * pixels_per_em) + 0.5);
-                xcov -= sample;
-                xwgt = xwgt.max(saturate(1.0 - (hr[1] * pixels_per_em).abs() * 2.0));
-            }
-        }
-
-        let vcode = calc_root_code(p12[0], p12[2], p3[0]);
-        if vcode != 0 {
-            let vr = solve_vert_poly(p12, p3);
-            if (vcode & 1) != 0 {
-                let sample = saturate((vr[0] * pixels_per_em) + 0.5);
-                ycov -= sample;
-                ywgt = ywgt.max(saturate(1.0 - (vr[0] * pixels_per_em).abs() * 2.0));
-            }
-            if vcode > 1 {
-                let sample = saturate((vr[1] * pixels_per_em) + 0.5);
-                ycov += sample;
-                ywgt = ywgt.max(saturate(1.0 - (vr[1] * pixels_per_em).abs() * 2.0));
-            }
-        }
+        accumulate_horizontal_curve_coverage(
+            curve,
+            render_coord,
+            pixels_per_em,
+            &mut xcov,
+            &mut xwgt,
+        );
+        accumulate_vertical_curve_coverage(
+            curve,
+            render_coord,
+            pixels_per_em,
+            &mut ycov,
+            &mut ywgt,
+        );
     }
 
     calc_coverage(xcov, ycov, xwgt, ywgt)
@@ -1042,14 +1265,86 @@ fn is_linear_curve(curve: &QuadraticCurve) -> bool {
     ax.abs() <= epsilon && ay.abs() <= epsilon
 }
 
-fn apply_linear_curve_coverage(
+fn accumulate_horizontal_curve_coverage(
     curve: &QuadraticCurve,
     render_coord: [f32; 2],
     pixels_per_em: f32,
     xcov: &mut f32,
-    ycov: &mut f32,
     xwgt: &mut f32,
+) {
+    if is_linear_curve(curve) {
+        apply_linear_horizontal_coverage(curve, render_coord, pixels_per_em, xcov, xwgt);
+        return;
+    }
+
+    let p12 = [
+        curve.p0[0] - render_coord[0],
+        curve.p0[1] - render_coord[1],
+        curve.p1[0] - render_coord[0],
+        curve.p1[1] - render_coord[1],
+    ];
+    let p3 = [curve.p2[0] - render_coord[0], curve.p2[1] - render_coord[1]];
+    let hcode = calc_root_code(p12[1], p12[3], p3[1]);
+    if hcode == 0 {
+        return;
+    }
+
+    let hr = solve_horiz_poly(p12, p3);
+    if (hcode & 1) != 0 {
+        let sample = saturate((hr[0] * pixels_per_em) + 0.5);
+        *xcov += sample;
+        *xwgt = (*xwgt).max(saturate(1.0 - (hr[0] * pixels_per_em).abs() * 2.0));
+    }
+    if hcode > 1 {
+        let sample = saturate((hr[1] * pixels_per_em) + 0.5);
+        *xcov -= sample;
+        *xwgt = (*xwgt).max(saturate(1.0 - (hr[1] * pixels_per_em).abs() * 2.0));
+    }
+}
+
+fn accumulate_vertical_curve_coverage(
+    curve: &QuadraticCurve,
+    render_coord: [f32; 2],
+    pixels_per_em: f32,
+    ycov: &mut f32,
     ywgt: &mut f32,
+) {
+    if is_linear_curve(curve) {
+        apply_linear_vertical_coverage(curve, render_coord, pixels_per_em, ycov, ywgt);
+        return;
+    }
+
+    let p12 = [
+        curve.p0[0] - render_coord[0],
+        curve.p0[1] - render_coord[1],
+        curve.p1[0] - render_coord[0],
+        curve.p1[1] - render_coord[1],
+    ];
+    let p3 = [curve.p2[0] - render_coord[0], curve.p2[1] - render_coord[1]];
+    let vcode = calc_root_code(p12[0], p12[2], p3[0]);
+    if vcode == 0 {
+        return;
+    }
+
+    let vr = solve_vert_poly(p12, p3);
+    if (vcode & 1) != 0 {
+        let sample = saturate((vr[0] * pixels_per_em) + 0.5);
+        *ycov -= sample;
+        *ywgt = (*ywgt).max(saturate(1.0 - (vr[0] * pixels_per_em).abs() * 2.0));
+    }
+    if vcode > 1 {
+        let sample = saturate((vr[1] * pixels_per_em) + 0.5);
+        *ycov += sample;
+        *ywgt = (*ywgt).max(saturate(1.0 - (vr[1] * pixels_per_em).abs() * 2.0));
+    }
+}
+
+fn apply_linear_horizontal_coverage(
+    curve: &QuadraticCurve,
+    render_coord: [f32; 2],
+    pixels_per_em: f32,
+    xcov: &mut f32,
+    xwgt: &mut f32,
 ) {
     let p0 = [curve.p0[0] - render_coord[0], curve.p0[1] - render_coord[1]];
     let p1 = [curve.p2[0] - render_coord[0], curve.p2[1] - render_coord[1]];
@@ -1064,6 +1359,17 @@ fn apply_linear_curve_coverage(
         }
         *xwgt = (*xwgt).max(saturate(1.0 - (intersection_x * pixels_per_em).abs() * 2.0));
     }
+}
+
+fn apply_linear_vertical_coverage(
+    curve: &QuadraticCurve,
+    render_coord: [f32; 2],
+    pixels_per_em: f32,
+    ycov: &mut f32,
+    ywgt: &mut f32,
+) {
+    let p0 = [curve.p0[0] - render_coord[0], curve.p0[1] - render_coord[1]];
+    let p1 = [curve.p2[0] - render_coord[0], curve.p2[1] - render_coord[1]];
 
     if let Some(intersection_y) = vertical_line_intersection(p0, p1) {
         let root = (intersection_y * pixels_per_em) + 0.5;
@@ -1404,7 +1710,7 @@ fn create_render_targets(
 fn create_root_signature(device: &ID3D12Device) -> eyre::Result<ID3D12RootSignature> {
     let descriptor_ranges = [D3D12_DESCRIPTOR_RANGE {
         RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
-        NumDescriptors: 1,
+        NumDescriptors: 2,
         BaseShaderRegister: 0,
         RegisterSpace: 0,
         OffsetInDescriptorsFromTableStart: D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND,
@@ -1512,21 +1818,27 @@ fn create_pipeline_state(
             ..Default::default()
         },
         D3D12_INPUT_ELEMENT_DESC {
+            SemanticName: s!("BANDING"),
+            Format: DXGI_FORMAT_R32G32B32A32_FLOAT,
+            AlignedByteOffset: 60,
+            ..Default::default()
+        },
+        D3D12_INPUT_ELEMENT_DESC {
             SemanticName: s!("NORMAL"),
             Format: DXGI_FORMAT_R32G32_FLOAT,
-            AlignedByteOffset: 60,
+            AlignedByteOffset: 76,
             ..Default::default()
         },
         D3D12_INPUT_ELEMENT_DESC {
             SemanticName: s!("JACOBIAN"),
             Format: DXGI_FORMAT_R32G32B32A32_FLOAT,
-            AlignedByteOffset: 68,
+            AlignedByteOffset: 84,
             ..Default::default()
         },
         D3D12_INPUT_ELEMENT_DESC {
             SemanticName: s!("VIEWPORT"),
             Format: DXGI_FORMAT_R32G32_FLOAT,
-            AlignedByteOffset: 84,
+            AlignedByteOffset: 100,
             ..Default::default()
         },
     ];
@@ -1692,11 +2004,13 @@ fn create_vertex_buffer(
     ))
 }
 
-fn create_curve_buffer_and_srv(
+fn create_slug_buffers_and_srv(
     device: &ID3D12Device,
-) -> eyre::Result<(ID3D12DescriptorHeap, ID3D12Resource)> {
+) -> eyre::Result<(ID3D12DescriptorHeap, ID3D12Resource, ID3D12Resource)> {
     let curve_data = vec![[0.0_f32; 4]; MAX_CURVE_FLOAT4_COUNT];
     let byte_len = (curve_data.len() * std::mem::size_of::<[f32; 4]>()) as u64;
+    let band_data = vec![0_u32; MAX_BAND_UINT_COUNT];
+    let band_byte_len = (band_data.len() * std::mem::size_of::<u32>()) as u64;
 
     let mut curve_buffer = None;
     unsafe {
@@ -1726,6 +2040,34 @@ fn create_curve_buffer_and_srv(
     };
     let curve_buffer: ID3D12Resource = curve_buffer.expect("curve buffer should be initialized");
 
+    let mut band_buffer = None;
+    unsafe {
+        device.CreateCommittedResource(
+            &D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_UPLOAD,
+                ..Default::default()
+            },
+            D3D12_HEAP_FLAG_NONE,
+            &D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: band_byte_len,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                ..Default::default()
+            },
+            D3D12_RESOURCE_STATE_GENERIC_READ,
+            None,
+            &mut band_buffer,
+        )?
+    };
+    let band_buffer: ID3D12Resource = band_buffer.expect("band buffer should be initialized");
+
     unsafe {
         let mut mapped = std::ptr::null_mut();
         curve_buffer.Map(0, None, Some(&mut mapped))?;
@@ -1735,18 +2077,26 @@ fn create_curve_buffer_and_srv(
             curve_data.len(),
         );
         curve_buffer.Unmap(0, None);
+
+        let mut band_mapped = std::ptr::null_mut();
+        band_buffer.Map(0, None, Some(&mut band_mapped))?;
+        std::ptr::copy_nonoverlapping(band_data.as_ptr(), band_mapped as *mut u32, band_data.len());
+        band_buffer.Unmap(0, None);
     }
 
     let srv_heap: ID3D12DescriptorHeap = unsafe {
         device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
             Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-            NumDescriptors: 1,
+            NumDescriptors: 2,
             Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
             ..Default::default()
         })?
     };
+    let descriptor_size =
+        unsafe { device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) }
+            as usize;
 
-    let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+    let curve_desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
         Format: DXGI_FORMAT_R32G32B32A32_FLOAT,
         ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
         Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
@@ -1760,15 +2110,33 @@ fn create_curve_buffer_and_srv(
         },
     };
 
+    let band_desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+        Format: DXGI_FORMAT_R32_UINT,
+        ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+        Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+        Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+            Buffer: D3D12_BUFFER_SRV {
+                FirstElement: 0,
+                NumElements: band_data.len() as u32,
+                StructureByteStride: 0,
+                Flags: D3D12_BUFFER_SRV_FLAG_NONE,
+            },
+        },
+    };
+
     unsafe {
+        let heap_start = srv_heap.GetCPUDescriptorHandleForHeapStart();
+        device.CreateShaderResourceView(&curve_buffer, Some(&curve_desc), heap_start);
         device.CreateShaderResourceView(
-            &curve_buffer,
-            Some(&desc),
-            srv_heap.GetCPUDescriptorHandleForHeapStart(),
+            &band_buffer,
+            Some(&band_desc),
+            D3D12_CPU_DESCRIPTOR_HANDLE {
+                ptr: heap_start.ptr + descriptor_size,
+            },
         );
     }
 
-    Ok((srv_heap, curve_buffer))
+    Ok((srv_heap, curve_buffer, band_buffer))
 }
 
 fn append_text_rect(
@@ -1786,7 +2154,13 @@ fn append_text_rect(
 
     let left = rect.left as f32;
     let top = rect.top as f32;
-    let glyph_data = [glyph.curve_start as f32, glyph.curve_count as f32, 0.0, 0.0];
+    let glyph_data = [
+        glyph.curve_start as f32,
+        glyph.curve_count as f32,
+        glyph.band_count_x.saturating_sub(1) as f32,
+        glyph.band_count_y.saturating_sub(1) as f32,
+    ];
+    let banding = glyph.band_transform;
     let screen_width = (rect.right - rect.left) as f32;
     let screen_height = (rect.bottom - rect.top) as f32;
     let advance = glyph.advance.max(1.0);
@@ -1809,8 +2183,9 @@ fn append_text_rect(
         color,
         uv: [glyph.x_min, glyph.y_max],
         effect,
-        glyph: 0.0,
+        glyph: glyph.band_start as f32,
         glyph_data,
+        banding,
         normal: [-1.0, 1.0],
         jacobian,
         viewport_data,
@@ -1820,8 +2195,9 @@ fn append_text_rect(
         color,
         uv: [glyph.x_max, glyph.y_max],
         effect,
-        glyph: 0.0,
+        glyph: glyph.band_start as f32,
         glyph_data,
+        banding,
         normal: [1.0, 1.0],
         jacobian,
         viewport_data,
@@ -1831,8 +2207,9 @@ fn append_text_rect(
         color,
         uv: [glyph.x_max, glyph.y_min],
         effect,
-        glyph: 0.0,
+        glyph: glyph.band_start as f32,
         glyph_data,
+        banding,
         normal: [1.0, -1.0],
         jacobian,
         viewport_data,
@@ -1842,8 +2219,9 @@ fn append_text_rect(
         color,
         uv: [glyph.x_min, glyph.y_min],
         effect,
-        glyph: 0.0,
+        glyph: glyph.band_start as f32,
         glyph_data,
+        banding,
         normal: [-1.0, -1.0],
         jacobian,
         viewport_data,
@@ -1886,6 +2264,7 @@ fn append_rect(
         effect,
         glyph,
         glyph_data: [0.0; 4],
+        banding: [0.0; 4],
         normal: [0.0; 2],
         jacobian: [0.0; 4],
         viewport_data: [0.0; 2],
@@ -1897,6 +2276,7 @@ fn append_rect(
         effect,
         glyph,
         glyph_data: [0.0; 4],
+        banding: [0.0; 4],
         normal: [0.0; 2],
         jacobian: [0.0; 4],
         viewport_data: [0.0; 2],
@@ -1908,6 +2288,7 @@ fn append_rect(
         effect,
         glyph,
         glyph_data: [0.0; 4],
+        banding: [0.0; 4],
         normal: [0.0; 2],
         jacobian: [0.0; 4],
         viewport_data: [0.0; 2],
@@ -1919,6 +2300,7 @@ fn append_rect(
         effect,
         glyph,
         glyph_data: [0.0; 4],
+        banding: [0.0; 4],
         normal: [0.0; 2],
         jacobian: [0.0; 4],
         viewport_data: [0.0; 2],
@@ -1960,8 +2342,9 @@ fn transition_barrier(
 #[cfg(test)]
 mod tests {
     use super::{
-        FALLBACK_GLYPH, PanelEffect, RenderScene, append_rect, collect_scene_chars,
-        extract_glyph_curves, load_terminal_font, push_centered_text, push_glyph, push_text_block,
+        FALLBACK_GLYPH, PanelEffect, RenderScene, append_rect, append_slug_band_data,
+        collect_scene_chars, cpu_slug_coverage, cpu_slug_coverage_all_curves, extract_glyph_curves,
+        load_terminal_font, push_centered_text, push_glyph, push_text_block,
         render_snapshot_glyph_into_image,
     };
     use eyre::WrapErr;
@@ -2081,6 +2464,10 @@ mod tests {
         let glyph = super::SlugGlyph {
             curve_start: 0,
             curve_count: curves.len() as u32,
+            band_start: 0,
+            band_count_x: 1,
+            band_count_y: 1,
+            band_transform: [0.0; 4],
             x_min: face
                 .glyph_bounding_box(glyph_id)
                 .map_or(0.0, |rect| f32::from(rect.x_min)),
@@ -2097,7 +2484,23 @@ mod tests {
                 .glyph_hor_advance(glyph_id)
                 .map_or(font.cell_advance, f32::from),
         };
-        let image = render_test_glyph(&font, &curves, glyph, 256, 512, 512);
+        let mut band_data = Vec::new();
+        let (band_count_x, band_count_y, band_transform) =
+            append_slug_band_data(&curves, glyph, &mut band_data);
+        let image = render_test_glyph(
+            &font,
+            &curves,
+            &band_data,
+            super::SlugGlyph {
+                band_count_x,
+                band_count_y,
+                band_transform,
+                ..glyph
+            },
+            256,
+            512,
+            512,
+        );
 
         let multi_span_rows = count_rows_with_multiple_spans(&image);
         assert_eq!(
@@ -2184,7 +2587,23 @@ mod tests {
                 .expect("comparison glyph should exist in terminal font");
             let curves = extract_glyph_curves(&face, glyph_id);
             let glyph = super::build_slug_glyph_from_face(&font, &face, glyph_id, 0, curves.len());
-            let slug = render_test_glyph(&font, &curves, glyph, 256, 512, 512);
+            let mut band_data = Vec::new();
+            let (band_count_x, band_count_y, band_transform) =
+                append_slug_band_data(&curves, glyph, &mut band_data);
+            let slug = render_test_glyph(
+                &font,
+                &curves,
+                &band_data,
+                super::SlugGlyph {
+                    band_count_x,
+                    band_count_y,
+                    band_transform,
+                    ..glyph
+                },
+                256,
+                512,
+                512,
+            );
             let fontdue = render_fontdue_reference_glyph(character, 256, 512, 512)?;
             let diff = render_alpha_diff(&slug, &fontdue);
             diff.save(output_dir.join(format!("{character}-slug-fontdue-diff.png")))?;
@@ -2216,9 +2635,54 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn banded_cpu_coverage_matches_full_curve_walk() -> eyre::Result<()> {
+        let font = load_terminal_font()?;
+        let face = Face::parse(&font.font_bytes, font.face_index)?;
+
+        for character in ['b', 'r'] {
+            let glyph_id = face
+                .glyph_index(character)
+                .expect("comparison glyph should exist in terminal font");
+            let curves = extract_glyph_curves(&face, glyph_id);
+            let glyph = super::build_slug_glyph_from_face(&font, &face, glyph_id, 0, curves.len());
+            let mut band_data = Vec::new();
+            let (band_count_x, band_count_y, band_transform) =
+                append_slug_band_data(&curves, glyph, &mut band_data);
+            let glyph = super::SlugGlyph {
+                band_count_x,
+                band_count_y,
+                band_transform,
+                ..glyph
+            };
+
+            let step_x = ((glyph.x_max - glyph.x_min).max(1.0)) / 24.0;
+            let step_y = ((glyph.y_max - glyph.y_min).max(1.0)) / 24.0;
+            for y in 0..=24 {
+                for x in 0..=24 {
+                    let sample = [
+                        glyph.x_min + (step_x * x as f32),
+                        glyph.y_min + (step_y * y as f32),
+                    ];
+                    let banded = cpu_slug_coverage(sample, 16.0, &curves, &band_data, glyph);
+                    let full = cpu_slug_coverage_all_curves(sample, 16.0, &curves, glyph);
+                    assert!(
+                        (banded - full).abs() <= 0.0001,
+                        "{character} coverage mismatch at ({}, {}): banded={banded} full={full}",
+                        sample[0],
+                        sample[1]
+                    );
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     fn render_test_glyph(
         font: &super::LoadedTerminalFont,
         curves: &[super::QuadraticCurve],
+        band_data: &[u32],
         glyph: super::SlugGlyph,
         font_size_px: u32,
         image_width: u32,
@@ -2235,6 +2699,7 @@ mod tests {
             font_size_px,
             font,
             curves,
+            band_data,
             glyph,
         );
 

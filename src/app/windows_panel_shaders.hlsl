@@ -5,6 +5,7 @@ struct VsInput {
     float effect : EFFECT;
     float glyph : GLYPH;
     float4 glyphData : GLYPHDATA;
+    float4 banding : BANDING;
     float2 normal : NORMAL;
     float4 jacobian : JACOBIAN;
     float2 viewportData : VIEWPORT;
@@ -17,9 +18,11 @@ struct PsInput {
     float effect : EFFECT;
     float glyph : GLYPH;
     float4 glyphData : GLYPHDATA;
+    float4 banding : BANDING;
 };
 
 Buffer<float4> CurveData : register(t0);
+Buffer<uint> BandData : register(t1);
 
 float2 SlugDilateNdc(float2 position, float2 texcoord, float2 normal, float4 jacobian, float2 viewport, out float2 sampleCoord) {
     float2 n = normalize(normal);
@@ -46,6 +49,7 @@ PsInput VSMain(VsInput input) {
     output.effect = input.effect;
     output.glyph = input.glyph;
     output.glyphData = input.glyphData;
+    output.banding = input.banding;
     return output;
 }
 
@@ -168,27 +172,81 @@ void ApplyLinearCurveCoverage(
     }
 }
 
-float slug_coverage(float2 renderCoord, float4 glyphData) {
+void ApplyLinearHorizontalCoverage(
+    float2 p0,
+    float2 p1,
+    float pixelsPerEm,
+    inout float xcov,
+    inout float xwgt
+) {
+    float dy = p1.y - p0.y;
+    if (CrossesZeroHalfOpen(p0.y, p1.y) && abs(dy) > (1.0 / 65536.0)) {
+        float t = -p0.y / dy;
+        float xr = (p0.x + (p1.x - p0.x) * t) * pixelsPerEm;
+        float sample = saturate(xr + 0.5);
+        xcov += (p1.y > p0.y) ? sample : -sample;
+        xwgt = max(xwgt, saturate(1.0 - abs(xr) * 2.0));
+    }
+}
+
+void ApplyLinearVerticalCoverage(
+    float2 p0,
+    float2 p1,
+    float pixelsPerEm,
+    inout float ycov,
+    inout float ywgt
+) {
+    float dx = p1.x - p0.x;
+    if (CrossesZeroHalfOpen(p0.x, p1.x) && abs(dx) > (1.0 / 65536.0)) {
+        float t = -p0.x / dx;
+        float yr = (p0.y + (p1.y - p0.y) * t) * pixelsPerEm;
+        float sample = saturate(yr + 0.5);
+        ycov += (p1.x > p0.x) ? sample : -sample;
+        ywgt = max(ywgt, saturate(1.0 - abs(yr) * 2.0));
+    }
+}
+
+uint ClampBandIndex(float coord, float scale, float offset, uint bandMax) {
+    return (uint)clamp((int)(coord * scale + offset), 0, (int)bandMax);
+}
+
+uint2 LoadBandEntry(uint bandStart, uint bandIndex) {
+    uint entry = bandStart + (bandIndex * 2U);
+    return uint2(BandData[entry], BandData[entry + 1U]);
+}
+
+float slug_coverage(float2 renderCoord, float bandStartFloat, float4 glyphData, float4 banding) {
     int curveStart = (int)glyphData.x;
     int curveCount = (int)glyphData.y;
     if (curveCount <= 0) {
         return 0.0;
     }
 
+    uint bandStart = (uint)bandStartFloat;
+    uint bandMaxX = (uint)glyphData.z;
+    uint bandMaxY = (uint)glyphData.w;
     float2 pixelsPerEm = 1.0 / fwidth(renderCoord);
     float xcov = 0.0;
     float ycov = 0.0;
     float xwgt = 0.0;
     float ywgt = 0.0;
 
+    uint horizontalBand = ClampBandIndex(renderCoord.y, banding.y, banding.w, bandMaxY);
+    uint2 horizontalEntry = LoadBandEntry(bandStart, horizontalBand);
+
     [loop]
-    for (int curveIndex = 0; curveIndex < curveCount; curveIndex++) {
+    for (uint offset = 0U; offset < horizontalEntry.x; offset++) {
+        int curveIndex = (int)BandData[horizontalEntry.y + offset];
         int baseIndex = curveStart + (curveIndex * 2);
         float4 p12 = CurveData[baseIndex] - float4(renderCoord, renderCoord);
         float2 p3 = CurveData[baseIndex + 1].xy - renderCoord;
 
+        if (max(max(p12.x, p12.z), p3.x) * pixelsPerEm.x < -0.5) {
+            break;
+        }
+
         if (IsLinearCurve(p12, p3)) {
-            ApplyLinearCurveCoverage(p12.xy, p3, pixelsPerEm, xcov, ycov, xwgt, ywgt);
+            ApplyLinearHorizontalCoverage(p12.xy, p3, pixelsPerEm.x, xcov, xwgt);
             continue;
         }
 
@@ -203,6 +261,27 @@ float slug_coverage(float2 renderCoord, float4 glyphData) {
                 xcov -= saturate(hr.y + 0.5);
                 xwgt = max(xwgt, saturate(1.0 - abs(hr.y) * 2.0));
             }
+        }
+    }
+
+    uint verticalBandStart = bandStart + ((bandMaxY + 1U) * 2U);
+    uint verticalBand = ClampBandIndex(renderCoord.x, banding.x, banding.z, bandMaxX);
+    uint2 verticalEntry = LoadBandEntry(verticalBandStart, verticalBand);
+
+    [loop]
+    for (uint offset = 0U; offset < verticalEntry.x; offset++) {
+        int curveIndex = (int)BandData[verticalEntry.y + offset];
+        int baseIndex = curveStart + (curveIndex * 2);
+        float4 p12 = CurveData[baseIndex] - float4(renderCoord, renderCoord);
+        float2 p3 = CurveData[baseIndex + 1].xy - renderCoord;
+
+        if (max(max(p12.y, p12.w), p3.y) * pixelsPerEm.y < -0.5) {
+            break;
+        }
+
+        if (IsLinearCurve(p12, p3)) {
+            ApplyLinearVerticalCoverage(p12.xy, p3, pixelsPerEm.y, ycov, ywgt);
+            continue;
         }
 
         uint vcode = CalcRootCode(p12.x, p12.z, p3.x);
@@ -273,7 +352,7 @@ float4 apply_button(float2 uv, float4 color, float effect) {
 
 float4 PSMain(PsInput input) : SV_TARGET {
     if (input.effect > 7.5) {
-        float coverage = slug_coverage(input.uv, input.glyphData);
+        float coverage = slug_coverage(input.uv, input.glyph, input.glyphData, input.banding);
         return float4(input.color.rgb, input.color.a * coverage);
     }
 
