@@ -10,13 +10,16 @@ fn snapshot_glyph_diagnostics_pngs() -> eyre::Result<()> {
         .join("test-artifacts")
         .join("slug");
     let slash_path = output_dir.join("slash-256.png");
+    let r_path = output_dir.join("r-256.png");
     let sheet_path = output_dir.join("unicode-sheet.png");
     let index_path = output_dir.join("unicode-sheet-index.txt");
 
     teamy_studio::app::write_slug_snapshot_png('/', 256, 512, 512, &slash_path)?;
+    teamy_studio::app::write_slug_snapshot_png('r', 256, 512, 512, &r_path)?;
     teamy_studio::app::write_slug_snapshot_sheet_png(48, 64, 24, &sheet_path, &index_path)?;
 
     assert!(slash_path.exists());
+    assert!(r_path.exists());
     assert!(sheet_path.exists());
     assert!(index_path.exists());
 

@@ -5,6 +5,7 @@ struct VsInput {
     float effect : EFFECT;
     float glyph : GLYPH;
     float4 glyphData : GLYPHDATA;
+    float4 dilateData : DILATE;
 };
 
 struct PsInput {
@@ -18,11 +19,27 @@ struct PsInput {
 
 Buffer<float4> CurveData : register(t0);
 
+float2 TextCornerNormal(float corner) {
+    if (corner < 0.5) return float2(-0.70710678, 0.70710678);
+    if (corner < 1.5) return float2(0.70710678, 0.70710678);
+    if (corner < 2.5) return float2(0.70710678, -0.70710678);
+    return float2(-0.70710678, -0.70710678);
+}
+
 PsInput VSMain(VsInput input) {
     PsInput output;
-    output.position = float4(input.position, 1.0);
+    float2 position = input.position.xy;
+    float2 uv = input.uv;
+
+    if (input.effect > 7.5) {
+        float2 normal = TextCornerNormal(input.glyph);
+        position += float2(normal.x * input.dilateData.x, normal.y * input.dilateData.y);
+        uv += float2(normal.x * input.dilateData.z, normal.y * input.dilateData.w);
+    }
+
+    output.position = float4(position, input.position.z, 1.0);
     output.color = input.color;
-    output.uv = input.uv;
+    output.uv = uv;
     output.effect = input.effect;
     output.glyph = input.glyph;
     output.glyphData = input.glyphData;

@@ -29,7 +29,7 @@ const MAX_VERTEX_COUNT: usize = (MAX_PANEL_COUNT + MAX_GLYPH_COUNT) * 6;
 const FALLBACK_GLYPH: char = '?';
 const MAX_CURVE_FLOAT4_COUNT: usize = 65_536;
 const TERMINAL_FONT_FAMILY: &str = "CaskaydiaCove Nerd Font Mono";
-const SNAPSHOT_GLYPH_PADDING_PX: f32 = 1.25;
+const SLUG_GLYPH_DILATION_PX: f32 = 0.5;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -40,6 +40,7 @@ struct Vertex {
     effect: f32,
     glyph: f32,
     glyph_data: [f32; 4],
+    dilate_data: [f32; 4],
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -920,8 +921,8 @@ fn render_snapshot_glyph_into_image(
 ) {
     let font_height_units = (font.ascender - font.descender).max(1.0);
     let scale = font_size_px as f32 / font_height_units;
-    let uv_pad_x = SNAPSHOT_GLYPH_PADDING_PX / scale;
-    let uv_pad_y = SNAPSHOT_GLYPH_PADDING_PX / scale;
+    let uv_pad_x = SLUG_GLYPH_DILATION_PX / scale;
+    let uv_pad_y = SLUG_GLYPH_DILATION_PX / scale;
     let glyph_width_px =
         (((glyph.x_max - glyph.x_min) + (uv_pad_x * 2.0)).max(1.0) * scale).max(1.0);
     let glyph_height_px =
@@ -1468,6 +1469,12 @@ fn create_pipeline_state(
             AlignedByteOffset: 44,
             ..Default::default()
         },
+        D3D12_INPUT_ELEMENT_DESC {
+            SemanticName: s!("DILATE"),
+            Format: DXGI_FORMAT_R32G32B32A32_FLOAT,
+            AlignedByteOffset: 60,
+            ..Default::default()
+        },
     ];
 
     let blend_target = D3D12_RENDER_TARGET_BLEND_DESC {
@@ -1730,47 +1737,53 @@ fn append_text_rect(
     let screen_height = (rect.bottom - rect.top) as f32;
     let advance = glyph.advance.max(1.0);
     let font_height = (font.ascender - font.descender).max(1.0);
-    let pad_x = SNAPSHOT_GLYPH_PADDING_PX;
-    let pad_y = SNAPSHOT_GLYPH_PADDING_PX;
-    let uv_pad_x = (advance / screen_width.max(1.0)) * pad_x;
-    let uv_pad_y = (font_height / screen_height.max(1.0)) * pad_y;
-    let glyph_left = left + (glyph.x_min / advance) * screen_width - pad_x;
-    let glyph_right = left + (glyph.x_max / advance) * screen_width + pad_x;
-    let glyph_top = top + ((font.ascender - glyph.y_max) / font_height) * screen_height - pad_y;
-    let glyph_bottom = top + ((font.ascender - glyph.y_min) / font_height) * screen_height + pad_y;
+    let glyph_left = left + (glyph.x_min / advance) * screen_width;
+    let glyph_right = left + (glyph.x_max / advance) * screen_width;
+    let glyph_top = top + ((font.ascender - glyph.y_max) / font_height) * screen_height;
+    let glyph_bottom = top + ((font.ascender - glyph.y_min) / font_height) * screen_height;
+    let dilate_data = [
+        (2.0 / width.max(1.0)) * SLUG_GLYPH_DILATION_PX,
+        (2.0 / height.max(1.0)) * SLUG_GLYPH_DILATION_PX,
+        (advance / screen_width.max(1.0)) * SLUG_GLYPH_DILATION_PX,
+        (font_height / screen_height.max(1.0)) * SLUG_GLYPH_DILATION_PX,
+    ];
     let effect = PanelEffect::Text as u32 as f32;
 
     let top_left = Vertex {
         position: to_ndc(width, height, glyph_left, glyph_top),
         color,
-        uv: [glyph.x_min - uv_pad_x, glyph.y_max + uv_pad_y],
+        uv: [glyph.x_min, glyph.y_max],
         effect,
         glyph: 0.0,
         glyph_data,
+        dilate_data,
     };
     let top_right = Vertex {
         position: to_ndc(width, height, glyph_right, glyph_top),
         color,
-        uv: [glyph.x_max + uv_pad_x, glyph.y_max + uv_pad_y],
+        uv: [glyph.x_max, glyph.y_max],
         effect,
-        glyph: 0.0,
+        glyph: 1.0,
         glyph_data,
+        dilate_data,
     };
     let bottom_right = Vertex {
         position: to_ndc(width, height, glyph_right, glyph_bottom),
         color,
-        uv: [glyph.x_max + uv_pad_x, glyph.y_min - uv_pad_y],
+        uv: [glyph.x_max, glyph.y_min],
         effect,
-        glyph: 0.0,
+        glyph: 2.0,
         glyph_data,
+        dilate_data,
     };
     let bottom_left = Vertex {
         position: to_ndc(width, height, glyph_left, glyph_bottom),
         color,
-        uv: [glyph.x_min - uv_pad_x, glyph.y_min - uv_pad_y],
+        uv: [glyph.x_min, glyph.y_min],
         effect,
-        glyph: 0.0,
+        glyph: 3.0,
         glyph_data,
+        dilate_data,
     };
 
     vertices.extend_from_slice(&[
@@ -1810,6 +1823,7 @@ fn append_rect(
         effect,
         glyph,
         glyph_data: [0.0; 4],
+        dilate_data: [0.0; 4],
     };
     let top_right = Vertex {
         position: to_ndc(width, height, right, top),
@@ -1818,6 +1832,7 @@ fn append_rect(
         effect,
         glyph,
         glyph_data: [0.0; 4],
+        dilate_data: [0.0; 4],
     };
     let bottom_right = Vertex {
         position: to_ndc(width, height, right, bottom),
@@ -1826,6 +1841,7 @@ fn append_rect(
         effect,
         glyph,
         glyph_data: [0.0; 4],
+        dilate_data: [0.0; 4],
     };
     let bottom_left = Vertex {
         position: to_ndc(width, height, left, bottom),
@@ -1834,6 +1850,7 @@ fn append_rect(
         effect,
         glyph,
         glyph_data: [0.0; 4],
+        dilate_data: [0.0; 4],
     };
 
     vertices.extend_from_slice(&[
@@ -2023,7 +2040,7 @@ mod tests {
         let font = load_terminal_font()?;
         let face = Face::parse(&font.font_bytes, font.face_index)?;
 
-        for character in ['g', '6'] {
+        for character in ['r', 'g', '6'] {
             let glyph_id = face
                 .glyph_index(character)
                 .expect("diagnostic glyph should exist in terminal font");
@@ -2051,9 +2068,11 @@ mod tests {
             .join("test-artifacts")
             .join("slug");
 
+        super::write_slug_snapshot_png('r', 256, 512, 512, &output_dir.join("r-256.png"))?;
         super::write_slug_snapshot_png('g', 256, 512, 512, &output_dir.join("g-256.png"))?;
         super::write_slug_snapshot_png('6', 256, 512, 512, &output_dir.join("6-256.png"))?;
 
+        assert!(output_dir.join("r-256.png").exists());
         assert!(output_dir.join("g-256.png").exists());
         assert!(output_dir.join("6-256.png").exists());
         Ok(())
