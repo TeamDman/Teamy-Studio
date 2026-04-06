@@ -1,6 +1,8 @@
 #[cfg(windows)]
 mod windows_app;
 #[cfg(windows)]
+mod windows_background;
+#[cfg(windows)]
 mod windows_terminal;
 #[cfg(windows)]
 mod windows_terminal_self_test;

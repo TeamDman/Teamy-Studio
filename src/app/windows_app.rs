@@ -25,9 +25,9 @@ use windows::core::{PCWSTR, w};
 use crate::paths::AppHome;
 
 use super::WorkspaceWindowState;
+use super::windows_background::PANEL_WINDOW_ALPHA;
 use super::windows_terminal::{
-    CellChrome, PANEL_WINDOW_ALPHA, POLL_INTERVAL_MS, POLL_TIMER_ID, TerminalLayout,
-    TerminalSession, keyboard_mods,
+    CellChrome, POLL_INTERVAL_MS, POLL_TIMER_ID, TerminalLayout, TerminalSession, keyboard_mods,
 };
 
 const WINDOW_CLASS_NAME: PCWSTR = w!("TeamyStudioTerminalWindow");

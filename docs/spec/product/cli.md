@@ -121,6 +121,9 @@ The launched terminal window must be draggable by clicking and dragging on the t
 cli[window.interaction.input]
 The launched terminal window must forward keyboard input into the PTY-backed shell session.
 
+cli[window.interaction.input.numpad-numlock-text]
+When NumLock is enabled, numpad digit and operator keys must be forwarded as their text characters rather than being dropped.
+
 ## Parser Model
 
 cli[parser.args-consistent]

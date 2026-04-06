@@ -23,13 +23,13 @@ use windows::Win32::UI::Input::KeyboardAndMouse::GetKeyState;
 
 use crate::paths::AppHome;
 
+use super::windows_background::paint_background_layer;
+
 pub const DRAG_STRIP_HEIGHT: i32 = 76;
 pub const WINDOW_PADDING: i32 = 18;
-pub const PANEL_WINDOW_ALPHA: u8 = 204;
 pub const POLL_TIMER_ID: usize = 1;
 pub const POLL_INTERVAL_MS: u32 = 16;
 pub const WINDOW_TEXT: COLORREF = COLORREF(0x00F5_EBFF);
-pub const WINDOW_DEBUG_BACKGROUND: COLORREF = COLORREF(0x00A0_6000);
 
 const DEFAULT_COLS: u16 = 80;
 const DEFAULT_ROWS: u16 = 24;
@@ -969,6 +969,21 @@ fn map_virtual_key(vkey: u32, lparam: isize) -> Option<(key::Key, char)> {
         0x58 => Some((key::Key::X, 'x')),
         0x59 => Some((key::Key::Y, 'y')),
         0x5A => Some((key::Key::Z, 'z')),
+        0x60 => Some((key::Key::Digit0, '0')),
+        0x61 => Some((key::Key::Digit1, '1')),
+        0x62 => Some((key::Key::Digit2, '2')),
+        0x63 => Some((key::Key::Digit3, '3')),
+        0x64 => Some((key::Key::Digit4, '4')),
+        0x65 => Some((key::Key::Digit5, '5')),
+        0x66 => Some((key::Key::Digit6, '6')),
+        0x67 => Some((key::Key::Digit7, '7')),
+        0x68 => Some((key::Key::Digit8, '8')),
+        0x69 => Some((key::Key::Digit9, '9')),
+        0x6A => Some((key::Key::Digit8, '*')),
+        0x6B => Some((key::Key::Equal, '+')),
+        0x6D => Some((key::Key::Minus, '-')),
+        0x6E => Some((key::Key::Period, '.')),
+        0x6F => Some((key::Key::Slash, '/')),
         0xBA => Some((key::Key::Semicolon, ';')),
         0xBB => Some((key::Key::Equal, '=')),
         0xBC => Some((key::Key::Comma, ',')),
@@ -1371,20 +1386,7 @@ fn paint_rect_background(hdc: HDC, rect: RECT, color: RgbColor) -> eyre::Result<
 }
 
 fn paint_terminal_background(hdc: HDC, client_width: i32, client_height: i32) -> eyre::Result<()> {
-    let brush = unsafe { CreateSolidBrush(WINDOW_DEBUG_BACKGROUND) };
-    if brush.0.is_null() {
-        eyre::bail!("failed to create window background brush");
-    }
-
-    let rect = RECT {
-        left: 0,
-        top: 0,
-        right: client_width,
-        bottom: client_height,
-    };
-    let _ = unsafe { FillRect(hdc, &rect, brush) };
-    let _ = unsafe { DeleteObject(brush.into()) };
-    Ok(())
+    paint_background_layer(hdc, client_width, client_height)
 }
 
 fn paint_panel(hdc: HDC, rect: RECT, border: RgbColor, fill: RgbColor) -> eyre::Result<()> {
@@ -1469,7 +1471,7 @@ fn legacy_special_key_bytes(mapped_key: key::Key, mods: key::Mods) -> Option<Vec
 
 #[cfg(test)]
 mod tests {
-    use super::{MIN_CODE_PANEL_HEIGHT, TerminalLayout};
+    use super::{MIN_CODE_PANEL_HEIGHT, TerminalLayout, map_virtual_key};
 
     #[test]
     fn cell_layout_regions_do_not_overlap_and_leave_terminal_room() {
@@ -1511,5 +1513,46 @@ mod tests {
         assert!(drag.right <= sidecar.right);
         assert!(drag.top >= sidecar.top);
         assert!(drag.bottom <= sidecar.bottom);
+    }
+
+    #[test]
+    fn map_virtual_key_maps_numpad_digits_to_text() {
+        for (vkey, expected) in [
+            (0x60, '0'),
+            (0x61, '1'),
+            (0x62, '2'),
+            (0x63, '3'),
+            (0x64, '4'),
+            (0x65, '5'),
+            (0x66, '6'),
+            (0x67, '7'),
+            (0x68, '8'),
+            (0x69, '9'),
+        ] {
+            let (_, actual) = map_virtual_key(vkey, 0)
+                .unwrap_or_else(|| panic!("expected numpad vkey {vkey:#X} to map"));
+            assert_eq!(
+                actual, expected,
+                "unexpected char for numpad vkey {vkey:#X}"
+            );
+        }
+    }
+
+    #[test]
+    fn map_virtual_key_maps_numpad_operators_to_text() {
+        for (vkey, expected) in [
+            (0x6A, '*'),
+            (0x6B, '+'),
+            (0x6D, '-'),
+            (0x6E, '.'),
+            (0x6F, '/'),
+        ] {
+            let (_, actual) = map_virtual_key(vkey, 0)
+                .unwrap_or_else(|| panic!("expected numpad vkey {vkey:#X} to map"));
+            assert_eq!(
+                actual, expected,
+                "unexpected char for numpad vkey {vkey:#X}"
+            );
+        }
     }
 }
