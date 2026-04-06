@@ -8,7 +8,7 @@ Goal: capture the current Teamy Studio text renderer design, its known fidelity 
 - The D3D12 text path now loads the installed `CaskaydiaCove Nerd Font Mono` through `fontdb`.
 - Glyph outlines are parsed with `ttf-parser` and converted into quadratic curve records.
 - The GPU text path evaluates analytic coverage from those curves in `src/app/windows_panel_shaders.hlsl`.
-- The text vertex path now carries per-vertex normals, an inverse-Jacobian mapping, and viewport data so glyph quads can be dilated in a more Slug-like way in the vertex shader.
+- The text vertex path now uses object-space glyph quads, per-vertex normals, an inverse-Jacobian mapping, and a Slug-style matrix/viewport constant buffer so dilation happens in the same coordinate space as the original Slug shaders.
 - Glyphs now also carry precomputed band tables and band transforms so both the shader path and the CPU snapshot path consume horizontal and vertical curve subsets instead of walking every curve for every sample.
 - Terminal text and notebook/output text still share the same renderer backend, but their interactive scale factors are now tracked independently in the window state.
 
@@ -25,9 +25,10 @@ What it is not yet:
 ## Known Limitations
 
 - We now use per-glyph band tables to select curve subsets, but the storage format is still a simplified packed buffer rather than a faithful port of Slug's original band texture layout.
-- The current shader path now follows the horizontal-band and vertical-band split, but it still uses a reduced contract compared with the original Slug matrix/flag pipeline.
+- The current shader path now follows the horizontal-band and vertical-band split and uses a Slug-style matrix/viewport constant buffer, but it still uses a reduced contract compared with the original packed texture/flag pipeline.
 - Flat stems and flat caps on glyphs like `b` still show softer / denser edge pixels than the VS Code terminal reference, so the remaining fidelity gap is not explained by quad padding alone.
 - Cubic outlines are now recursively approximated as quadratic segments, but this path still needs validation against fonts that rely heavily on cubic CFF outlines.
+- The previous line-only curve special case has been removed so both CPU and GPU coverage paths now rely on the same quadratic math that the original Slug shader uses.
 
 ## First-Principles Artifacting Analysis
 
@@ -42,7 +43,7 @@ Likely causes ranked by expected visual impact:
 - This removes a known geometry error, but it still needs targeted verification against fonts that actually exercise the cubic path.
 
 2. The renderer still does not implement Slug's full reference contract.
-- A more Slug-like per-vertex dilation / inverse-Jacobian path is now in place.
+- A more Slug-like object-space dilation / inverse-Jacobian / matrix path is now in place.
 - Band selection and sorted curve subsets are now in place.
 - However, the exact reference texture layout, shader flags, and full matrix-driven contract are still missing.
 - Remaining flat-edge softness suggests the next correctness gap is deeper than quad expansion alone.

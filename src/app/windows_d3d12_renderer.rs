@@ -45,7 +45,14 @@ struct Vertex {
     banding: [f32; 4],
     normal: [f32; 2],
     jacobian: [f32; 4],
-    viewport_data: [f32; 2],
+    _padding: [f32; 2],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+struct ShaderParams {
+    slug_matrix: [[f32; 4]; 4],
+    slug_viewport: [f32; 4],
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -158,6 +165,7 @@ pub struct D3d12PanelRenderer {
     pipeline_state: ID3D12PipelineState,
     vertex_buffer: ID3D12Resource,
     vertex_buffer_view: D3D12_VERTEX_BUFFER_VIEW,
+    shader_param_buffer: ID3D12Resource,
     srv_heap: ID3D12DescriptorHeap,
     curve_buffer: ID3D12Resource,
     band_buffer: ID3D12Resource,
@@ -199,6 +207,7 @@ impl D3d12PanelRenderer {
         unsafe { command_list.Close()? };
 
         let (vertex_buffer, vertex_buffer_view) = create_vertex_buffer(&device)?;
+        let shader_param_buffer = create_shader_param_buffer(&device)?;
         let fence: ID3D12Fence = unsafe { device.CreateFence(0, D3D12_FENCE_FLAG_NONE) }?;
         let fence_event = unsafe { Owned::new(CreateEventW(None, false, false, None)?) };
 
@@ -236,6 +245,7 @@ impl D3d12PanelRenderer {
             pipeline_state,
             vertex_buffer,
             vertex_buffer_view,
+            shader_param_buffer,
             srv_heap,
             curve_buffer,
             band_buffer,
@@ -314,12 +324,18 @@ impl D3d12PanelRenderer {
             self.command_list
                 .Reset(command_allocator, &self.pipeline_state)?;
 
+            self.update_shader_params()?;
+
             self.command_list
                 .SetDescriptorHeaps(&[Some(self.srv_heap.clone())]);
             self.command_list
                 .SetGraphicsRootSignature(&self.root_signature);
-            self.command_list.SetGraphicsRootDescriptorTable(
+            self.command_list.SetGraphicsRootConstantBufferView(
                 0,
+                self.shader_param_buffer.GetGPUVirtualAddress(),
+            );
+            self.command_list.SetGraphicsRootDescriptorTable(
+                1,
                 self.srv_heap.GetGPUDescriptorHandleForHeapStart(),
             );
             self.command_list.RSSetViewports(&[self.viewport]);
@@ -370,8 +386,6 @@ impl D3d12PanelRenderer {
         for panel in &scene.panels {
             append_rect(
                 &mut vertices,
-                self.width as f32,
-                self.height as f32,
                 panel.rect,
                 panel.color,
                 panel.effect as u32,
@@ -387,8 +401,6 @@ impl D3d12PanelRenderer {
                 .unwrap_or_else(|| SlugGlyph::empty(&self.font));
             append_text_rect(
                 &mut vertices,
-                self.width as f32,
-                self.height as f32,
                 glyph.rect,
                 glyph.color,
                 slug_glyph,
@@ -446,6 +458,17 @@ impl D3d12PanelRenderer {
 
         self.glyph_cache = glyph_cache;
         self.cached_chars = scene_chars;
+        Ok(())
+    }
+
+    fn update_shader_params(&self) -> eyre::Result<()> {
+        let params = build_shader_params(self.width as f32, self.height as f32);
+        unsafe {
+            let mut mapped = std::ptr::null_mut();
+            self.shader_param_buffer.Map(0, None, Some(&mut mapped))?;
+            std::ptr::copy_nonoverlapping(&params, mapped as *mut ShaderParams, 1);
+            self.shader_param_buffer.Unmap(0, None);
+        }
         Ok(())
     }
 
@@ -1258,13 +1281,6 @@ fn cpu_slug_coverage_all_curves(
     calc_coverage(xcov, ycov, xwgt, ywgt)
 }
 
-fn is_linear_curve(curve: &QuadraticCurve) -> bool {
-    let epsilon = 1.0 / 1024.0;
-    let ax = curve.p0[0] - (curve.p1[0] * 2.0) + curve.p2[0];
-    let ay = curve.p0[1] - (curve.p1[1] * 2.0) + curve.p2[1];
-    ax.abs() <= epsilon && ay.abs() <= epsilon
-}
-
 fn accumulate_horizontal_curve_coverage(
     curve: &QuadraticCurve,
     render_coord: [f32; 2],
@@ -1272,11 +1288,6 @@ fn accumulate_horizontal_curve_coverage(
     xcov: &mut f32,
     xwgt: &mut f32,
 ) {
-    if is_linear_curve(curve) {
-        apply_linear_horizontal_coverage(curve, render_coord, pixels_per_em, xcov, xwgt);
-        return;
-    }
-
     let p12 = [
         curve.p0[0] - render_coord[0],
         curve.p0[1] - render_coord[1],
@@ -1309,11 +1320,6 @@ fn accumulate_vertical_curve_coverage(
     ycov: &mut f32,
     ywgt: &mut f32,
 ) {
-    if is_linear_curve(curve) {
-        apply_linear_vertical_coverage(curve, render_coord, pixels_per_em, ycov, ywgt);
-        return;
-    }
-
     let p12 = [
         curve.p0[0] - render_coord[0],
         curve.p0[1] - render_coord[1],
@@ -1337,78 +1343,6 @@ fn accumulate_vertical_curve_coverage(
         *ycov += sample;
         *ywgt = (*ywgt).max(saturate(1.0 - (vr[1] * pixels_per_em).abs() * 2.0));
     }
-}
-
-fn apply_linear_horizontal_coverage(
-    curve: &QuadraticCurve,
-    render_coord: [f32; 2],
-    pixels_per_em: f32,
-    xcov: &mut f32,
-    xwgt: &mut f32,
-) {
-    let p0 = [curve.p0[0] - render_coord[0], curve.p0[1] - render_coord[1]];
-    let p1 = [curve.p2[0] - render_coord[0], curve.p2[1] - render_coord[1]];
-
-    if let Some(intersection_x) = horizontal_line_intersection(p0, p1) {
-        let root = (intersection_x * pixels_per_em) + 0.5;
-        let sample = saturate(root);
-        if p1[1] > p0[1] {
-            *xcov += sample;
-        } else {
-            *xcov -= sample;
-        }
-        *xwgt = (*xwgt).max(saturate(1.0 - (intersection_x * pixels_per_em).abs() * 2.0));
-    }
-}
-
-fn apply_linear_vertical_coverage(
-    curve: &QuadraticCurve,
-    render_coord: [f32; 2],
-    pixels_per_em: f32,
-    ycov: &mut f32,
-    ywgt: &mut f32,
-) {
-    let p0 = [curve.p0[0] - render_coord[0], curve.p0[1] - render_coord[1]];
-    let p1 = [curve.p2[0] - render_coord[0], curve.p2[1] - render_coord[1]];
-
-    if let Some(intersection_y) = vertical_line_intersection(p0, p1) {
-        let root = (intersection_y * pixels_per_em) + 0.5;
-        let sample = saturate(root);
-        if p1[0] > p0[0] {
-            *ycov += sample;
-        } else {
-            *ycov -= sample;
-        }
-        *ywgt = (*ywgt).max(saturate(1.0 - (intersection_y * pixels_per_em).abs() * 2.0));
-    }
-}
-
-fn horizontal_line_intersection(p0: [f32; 2], p1: [f32; 2]) -> Option<f32> {
-    if !crosses_zero_half_open(p0[1], p1[1]) {
-        return None;
-    }
-    let dy = p1[1] - p0[1];
-    if dy.abs() <= f32::EPSILON {
-        return None;
-    }
-    let t = -p0[1] / dy;
-    Some(p0[0] + (p1[0] - p0[0]) * t)
-}
-
-fn vertical_line_intersection(p0: [f32; 2], p1: [f32; 2]) -> Option<f32> {
-    if !crosses_zero_half_open(p0[0], p1[0]) {
-        return None;
-    }
-    let dx = p1[0] - p0[0];
-    if dx.abs() <= f32::EPSILON {
-        return None;
-    }
-    let t = -p0[0] / dx;
-    Some(p0[1] + (p1[1] - p0[1]) * t)
-}
-
-fn crosses_zero_half_open(a: f32, b: f32) -> bool {
-    (a <= 0.0 && b > 0.0) || (b <= 0.0 && a > 0.0)
 }
 
 fn calc_root_code(y1: f32, y2: f32, y3: f32) -> u32 {
@@ -1715,16 +1649,28 @@ fn create_root_signature(device: &ID3D12Device) -> eyre::Result<ID3D12RootSignat
         RegisterSpace: 0,
         OffsetInDescriptorsFromTableStart: D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND,
     }];
-    let root_parameters = [D3D12_ROOT_PARAMETER {
-        ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
-        Anonymous: D3D12_ROOT_PARAMETER_0 {
-            DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE {
-                NumDescriptorRanges: descriptor_ranges.len() as u32,
-                pDescriptorRanges: descriptor_ranges.as_ptr(),
+    let root_parameters = [
+        D3D12_ROOT_PARAMETER {
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_CBV,
+            Anonymous: D3D12_ROOT_PARAMETER_0 {
+                Descriptor: D3D12_ROOT_DESCRIPTOR {
+                    ShaderRegister: 0,
+                    RegisterSpace: 0,
+                },
             },
+            ShaderVisibility: D3D12_SHADER_VISIBILITY_VERTEX,
         },
-        ShaderVisibility: D3D12_SHADER_VISIBILITY_PIXEL,
-    }];
+        D3D12_ROOT_PARAMETER {
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+            Anonymous: D3D12_ROOT_PARAMETER_0 {
+                DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE {
+                    NumDescriptorRanges: descriptor_ranges.len() as u32,
+                    pDescriptorRanges: descriptor_ranges.as_ptr(),
+                },
+            },
+            ShaderVisibility: D3D12_SHADER_VISIBILITY_PIXEL,
+        },
+    ];
     let description = D3D12_ROOT_SIGNATURE_DESC {
         NumParameters: root_parameters.len() as u32,
         pParameters: root_parameters.as_ptr(),
@@ -1961,6 +1907,20 @@ fn shader_path() -> PathBuf {
         .join("windows_panel_shaders.hlsl")
 }
 
+fn build_shader_params(width: f32, height: f32) -> ShaderParams {
+    let safe_width = width.max(1.0);
+    let safe_height = height.max(1.0);
+    ShaderParams {
+        slug_matrix: [
+            [2.0 / safe_width, 0.0, 0.0, -1.0],
+            [0.0, -2.0 / safe_height, 0.0, 1.0],
+            [0.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ],
+        slug_viewport: [safe_width, safe_height, 0.0, 0.0],
+    }
+}
+
 fn create_vertex_buffer(
     device: &ID3D12Device,
 ) -> eyre::Result<(ID3D12Resource, D3D12_VERTEX_BUFFER_VIEW)> {
@@ -2002,6 +1962,37 @@ fn create_vertex_buffer(
             StrideInBytes: std::mem::size_of::<Vertex>() as u32,
         },
     ))
+}
+
+fn create_shader_param_buffer(device: &ID3D12Device) -> eyre::Result<ID3D12Resource> {
+    let buffer_size = 256_u64;
+    let mut shader_param_buffer = None;
+    unsafe {
+        device.CreateCommittedResource(
+            &D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_UPLOAD,
+                ..Default::default()
+            },
+            D3D12_HEAP_FLAG_NONE,
+            &D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: buffer_size,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                ..Default::default()
+            },
+            D3D12_RESOURCE_STATE_GENERIC_READ,
+            None,
+            &mut shader_param_buffer,
+        )?
+    };
+    Ok(shader_param_buffer.expect("shader parameter buffer should be initialized"))
 }
 
 fn create_slug_buffers_and_srv(
@@ -2141,8 +2132,6 @@ fn create_slug_buffers_and_srv(
 
 fn append_text_rect(
     vertices: &mut Vec<Vertex>,
-    width: f32,
-    height: f32,
     rect: RECT,
     color: [f32; 4],
     glyph: SlugGlyph,
@@ -2170,16 +2159,15 @@ fn append_text_rect(
     let glyph_top = top + ((font.ascender - glyph.y_max) / font_height) * screen_height;
     let glyph_bottom = top + ((font.ascender - glyph.y_min) / font_height) * screen_height;
     let jacobian = [
-        (width.max(1.0) * advance) / (2.0 * screen_width.max(1.0)),
+        advance / screen_width.max(1.0),
         0.0,
         0.0,
-        (height.max(1.0) * font_height) / (2.0 * screen_height.max(1.0)),
+        -font_height / screen_height.max(1.0),
     ];
-    let viewport_data = [width.max(1.0), height.max(1.0)];
     let effect = PanelEffect::Text as u32 as f32;
 
     let top_left = Vertex {
-        position: to_ndc(width, height, glyph_left, glyph_top),
+        position: [glyph_left, glyph_top, 0.0],
         color,
         uv: [glyph.x_min, glyph.y_max],
         effect,
@@ -2188,10 +2176,10 @@ fn append_text_rect(
         banding,
         normal: [-1.0, 1.0],
         jacobian,
-        viewport_data,
+        _padding: [0.0; 2],
     };
     let top_right = Vertex {
-        position: to_ndc(width, height, glyph_right, glyph_top),
+        position: [glyph_right, glyph_top, 0.0],
         color,
         uv: [glyph.x_max, glyph.y_max],
         effect,
@@ -2200,10 +2188,10 @@ fn append_text_rect(
         banding,
         normal: [1.0, 1.0],
         jacobian,
-        viewport_data,
+        _padding: [0.0; 2],
     };
     let bottom_right = Vertex {
-        position: to_ndc(width, height, glyph_right, glyph_bottom),
+        position: [glyph_right, glyph_bottom, 0.0],
         color,
         uv: [glyph.x_max, glyph.y_min],
         effect,
@@ -2212,10 +2200,10 @@ fn append_text_rect(
         banding,
         normal: [1.0, -1.0],
         jacobian,
-        viewport_data,
+        _padding: [0.0; 2],
     };
     let bottom_left = Vertex {
-        position: to_ndc(width, height, glyph_left, glyph_bottom),
+        position: [glyph_left, glyph_bottom, 0.0],
         color,
         uv: [glyph.x_min, glyph.y_min],
         effect,
@@ -2224,7 +2212,7 @@ fn append_text_rect(
         banding,
         normal: [-1.0, -1.0],
         jacobian,
-        viewport_data,
+        _padding: [0.0; 2],
     };
 
     vertices.extend_from_slice(&[
@@ -2239,8 +2227,6 @@ fn append_text_rect(
 
 fn append_rect(
     vertices: &mut Vec<Vertex>,
-    width: f32,
-    height: f32,
     rect: RECT,
     color: [f32; 4],
     effect: u32,
@@ -2258,7 +2244,7 @@ fn append_rect(
     let glyph = glyph_index as f32;
 
     let top_left = Vertex {
-        position: to_ndc(width, height, left, top),
+        position: [left, top, 0.0],
         color,
         uv: [0.0, 0.0],
         effect,
@@ -2267,10 +2253,10 @@ fn append_rect(
         banding: [0.0; 4],
         normal: [0.0; 2],
         jacobian: [0.0; 4],
-        viewport_data: [0.0; 2],
+        _padding: [0.0; 2],
     };
     let top_right = Vertex {
-        position: to_ndc(width, height, right, top),
+        position: [right, top, 0.0],
         color,
         uv: [1.0, 0.0],
         effect,
@@ -2279,10 +2265,10 @@ fn append_rect(
         banding: [0.0; 4],
         normal: [0.0; 2],
         jacobian: [0.0; 4],
-        viewport_data: [0.0; 2],
+        _padding: [0.0; 2],
     };
     let bottom_right = Vertex {
-        position: to_ndc(width, height, right, bottom),
+        position: [right, bottom, 0.0],
         color,
         uv: [1.0, 1.0],
         effect,
@@ -2291,10 +2277,10 @@ fn append_rect(
         banding: [0.0; 4],
         normal: [0.0; 2],
         jacobian: [0.0; 4],
-        viewport_data: [0.0; 2],
+        _padding: [0.0; 2],
     };
     let bottom_left = Vertex {
-        position: to_ndc(width, height, left, bottom),
+        position: [left, bottom, 0.0],
         color,
         uv: [0.0, 1.0],
         effect,
@@ -2303,7 +2289,7 @@ fn append_rect(
         banding: [0.0; 4],
         normal: [0.0; 2],
         jacobian: [0.0; 4],
-        viewport_data: [0.0; 2],
+        _padding: [0.0; 2],
     };
 
     vertices.extend_from_slice(&[
@@ -2314,10 +2300,6 @@ fn append_rect(
         bottom_right,
         bottom_left,
     ]);
-}
-
-fn to_ndc(width: f32, height: f32, x: f32, y: f32) -> [f32; 3] {
-    [(x / width) * 2.0 - 1.0, 1.0 - (y / height) * 2.0, 0.0]
 }
 
 fn transition_barrier(

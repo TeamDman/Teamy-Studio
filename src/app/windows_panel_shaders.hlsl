@@ -8,7 +8,7 @@ struct VsInput {
     float4 banding : BANDING;
     float2 normal : NORMAL;
     float4 jacobian : JACOBIAN;
-    float2 viewportData : VIEWPORT;
+    float2 padding : VIEWPORT;
 };
 
 struct PsInput {
@@ -24,12 +24,26 @@ struct PsInput {
 Buffer<float4> CurveData : register(t0);
 Buffer<uint> BandData : register(t1);
 
-float2 SlugDilateNdc(float2 position, float2 texcoord, float2 normal, float4 jacobian, float2 viewport, out float2 sampleCoord) {
+cbuffer ParamStruct : register(b0)
+{
+    float4 slug_matrix[4];
+    float4 slug_viewport;
+};
+
+float2 SlugDilate(float2 position, float2 texcoord, float2 normal, float4 jacobian, out float2 sampleCoord) {
     float2 n = normalize(normal);
-    float u = n.x * viewport.x;
-    float v = n.y * viewport.y;
+    float s = dot(slug_matrix[3].xy, position) + slug_matrix[3].w;
+    float t = dot(slug_matrix[3].xy, n);
+
+    float u = (s * dot(slug_matrix[0].xy, n) - t * (dot(slug_matrix[0].xy, position) + slug_matrix[0].w)) * slug_viewport.x;
+    float v = (s * dot(slug_matrix[1].xy, n) - t * (dot(slug_matrix[1].xy, position) + slug_matrix[1].w)) * slug_viewport.y;
+
+    float s2 = s * s;
+    float st = s * t;
     float uv = max(u * u + v * v, 1.0 / 16777216.0);
-    float2 d = n * rsqrt(uv);
+    float denom = uv - st * st;
+    float2 d = n * (s2 * (st + sqrt(uv)) / max(abs(denom), 1.0 / 16777216.0));
+
     sampleCoord = texcoord + float2(dot(d, jacobian.xy), dot(d, jacobian.zw));
     return position + d;
 }
@@ -40,10 +54,13 @@ PsInput VSMain(VsInput input) {
     float2 uv = input.uv;
 
     if (input.effect > 7.5 && any(input.normal != 0.0.xx)) {
-        position = SlugDilateNdc(position, uv, input.normal, input.jacobian, input.viewportData, uv);
+        position = SlugDilate(position, uv, input.normal, input.jacobian, uv);
     }
 
-    output.position = float4(position, input.position.z, 1.0);
+    output.position.x = position.x * slug_matrix[0].x + position.y * slug_matrix[0].y + slug_matrix[0].w;
+    output.position.y = position.x * slug_matrix[1].x + position.y * slug_matrix[1].y + slug_matrix[1].w;
+    output.position.z = position.x * slug_matrix[2].x + position.y * slug_matrix[2].y + slug_matrix[2].w;
+    output.position.w = position.x * slug_matrix[3].x + position.y * slug_matrix[3].y + slug_matrix[3].w;
     output.color = input.color;
     output.uv = uv;
     output.effect = input.effect;
@@ -135,77 +152,6 @@ float CalcCoverage(float xcov, float ycov, float xwgt, float ywgt) {
     return saturate(max(abs(xcov * xwgt + ycov * ywgt) / max(xwgt + ywgt, 1.0 / 65536.0), min(abs(xcov), abs(ycov))));
 }
 
-bool IsLinearCurve(float4 p12, float2 p3) {
-    float2 a = p12.xy - p12.zw * 2.0 + p3;
-    return all(abs(a) <= float2(1.0 / 1024.0, 1.0 / 1024.0));
-}
-
-bool CrossesZeroHalfOpen(float a, float b) {
-    return ((a <= 0.0) && (b > 0.0)) || ((b <= 0.0) && (a > 0.0));
-}
-
-void ApplyLinearCurveCoverage(
-    float2 p0,
-    float2 p1,
-    float2 pixelsPerEm,
-    inout float xcov,
-    inout float ycov,
-    inout float xwgt,
-    inout float ywgt
-) {
-    float dy = p1.y - p0.y;
-    if (CrossesZeroHalfOpen(p0.y, p1.y) && abs(dy) > (1.0 / 65536.0)) {
-        float t = -p0.y / dy;
-        float xr = (p0.x + (p1.x - p0.x) * t) * pixelsPerEm.x;
-        float sample = saturate(xr + 0.5);
-        xcov += (p1.y > p0.y) ? sample : -sample;
-        xwgt = max(xwgt, saturate(1.0 - abs(xr) * 2.0));
-    }
-
-    float dx = p1.x - p0.x;
-    if (CrossesZeroHalfOpen(p0.x, p1.x) && abs(dx) > (1.0 / 65536.0)) {
-        float t = -p0.x / dx;
-        float yr = (p0.y + (p1.y - p0.y) * t) * pixelsPerEm.y;
-        float sample = saturate(yr + 0.5);
-        ycov += (p1.x > p0.x) ? sample : -sample;
-        ywgt = max(ywgt, saturate(1.0 - abs(yr) * 2.0));
-    }
-}
-
-void ApplyLinearHorizontalCoverage(
-    float2 p0,
-    float2 p1,
-    float pixelsPerEm,
-    inout float xcov,
-    inout float xwgt
-) {
-    float dy = p1.y - p0.y;
-    if (CrossesZeroHalfOpen(p0.y, p1.y) && abs(dy) > (1.0 / 65536.0)) {
-        float t = -p0.y / dy;
-        float xr = (p0.x + (p1.x - p0.x) * t) * pixelsPerEm;
-        float sample = saturate(xr + 0.5);
-        xcov += (p1.y > p0.y) ? sample : -sample;
-        xwgt = max(xwgt, saturate(1.0 - abs(xr) * 2.0));
-    }
-}
-
-void ApplyLinearVerticalCoverage(
-    float2 p0,
-    float2 p1,
-    float pixelsPerEm,
-    inout float ycov,
-    inout float ywgt
-) {
-    float dx = p1.x - p0.x;
-    if (CrossesZeroHalfOpen(p0.x, p1.x) && abs(dx) > (1.0 / 65536.0)) {
-        float t = -p0.x / dx;
-        float yr = (p0.y + (p1.y - p0.y) * t) * pixelsPerEm;
-        float sample = saturate(yr + 0.5);
-        ycov += (p1.x > p0.x) ? sample : -sample;
-        ywgt = max(ywgt, saturate(1.0 - abs(yr) * 2.0));
-    }
-}
-
 uint ClampBandIndex(float coord, float scale, float offset, uint bandMax) {
     return (uint)clamp((int)(coord * scale + offset), 0, (int)bandMax);
 }
@@ -245,11 +191,6 @@ float slug_coverage(float2 renderCoord, float bandStartFloat, float4 glyphData, 
             break;
         }
 
-        if (IsLinearCurve(p12, p3)) {
-            ApplyLinearHorizontalCoverage(p12.xy, p3, pixelsPerEm.x, xcov, xwgt);
-            continue;
-        }
-
         uint hcode = CalcRootCode(p12.y, p12.w, p3.y);
         if (hcode != 0U) {
             float2 hr = SolveHorizPoly(p12, p3) * pixelsPerEm.x;
@@ -277,11 +218,6 @@ float slug_coverage(float2 renderCoord, float bandStartFloat, float4 glyphData, 
 
         if (max(max(p12.y, p12.w), p3.y) * pixelsPerEm.y < -0.5) {
             break;
-        }
-
-        if (IsLinearCurve(p12, p3)) {
-            ApplyLinearVerticalCoverage(p12.xy, p3, pixelsPerEm.y, ycov, ywgt);
-            continue;
         }
 
         uint vcode = CalcRootCode(p12.x, p12.z, p3.x);
