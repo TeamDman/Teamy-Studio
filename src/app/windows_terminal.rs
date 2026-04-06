@@ -6,15 +6,11 @@ use std::sync::{Arc, Mutex, mpsc};
 
 use eyre::Context;
 use libghostty_vt::key;
-use libghostty_vt::render::{CellIterator, CursorViewport, RenderState, RowIterator};
-use libghostty_vt::style::RgbColor;
+use libghostty_vt::render::{CellIterator, RenderState, RowIterator};
 use libghostty_vt::{Terminal, TerminalOptions};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use tracing::{debug, info};
-use windows::Win32::Foundation::{COLORREF, RECT};
-use windows::Win32::Graphics::Gdi::{
-    CreateSolidBrush, DeleteObject, FillRect, HDC, SetBkMode, SetTextColor, TRANSPARENT, TextOutW,
-};
+use windows::Win32::Foundation::RECT;
 use windows::Win32::System::Console::{
     CAPSLOCK_ON, LEFT_ALT_PRESSED, LEFT_CTRL_PRESSED, NUMLOCK_ON, RIGHT_ALT_PRESSED,
     RIGHT_CTRL_PRESSED, SHIFT_PRESSED,
@@ -23,13 +19,10 @@ use windows::Win32::UI::Input::KeyboardAndMouse::GetKeyState;
 
 use crate::paths::AppHome;
 
-use super::windows_background::paint_background_layer;
-
 pub const DRAG_STRIP_HEIGHT: i32 = 76;
 pub const WINDOW_PADDING: i32 = 18;
 pub const POLL_TIMER_ID: usize = 1;
 pub const POLL_INTERVAL_MS: u32 = 16;
-pub const WINDOW_TEXT: COLORREF = COLORREF(0x00F5_EBFF);
 
 const DEFAULT_COLS: u16 = 80;
 const DEFAULT_ROWS: u16 = 24;
@@ -41,7 +34,6 @@ const MIN_CODE_PANEL_HEIGHT: i32 = 180;
 const PLUS_BUTTON_SIZE: i32 = 42;
 const CODE_PANEL_PADDING: i32 = 14;
 const CODE_PANEL_FOOTER_HEIGHT: i32 = 28;
-const PANEL_BORDER_THICKNESS: i32 = 2;
 const SIDECAR_BUTTON_SIZE: i32 = 34;
 const SIDECAR_BUTTON_GAP: i32 = 12;
 const WIN32_INPUT_MODE_ENABLE: &[u8] = b"\x1b[?9001h";
@@ -77,7 +69,6 @@ impl SuppressedChar {
 
 pub struct PumpResult {
     pub should_close: bool,
-    pub needs_repaint: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -108,12 +99,6 @@ pub struct TerminalSession {
     win32_input_mode_buffer: Vec<u8>,
     pending_win32_char_key: Option<PendingWin32CharKey>,
     closed: bool,
-    shell_label: String,
-}
-
-pub struct CellChrome {
-    pub cell_number: usize,
-    pub result_text: String,
 }
 
 #[derive(Clone, Copy)]
@@ -310,13 +295,6 @@ impl TerminalSession {
             ),
             "starting Teamy Studio PTY child"
         );
-        let shell_label = shell
-            .get_argv()
-            .first()
-            .and_then(|arg| std::path::Path::new(arg).file_stem())
-            .map(|stem| stem.to_string_lossy().into_owned())
-            .filter(|label| !label.is_empty())
-            .unwrap_or_else(|| "shell".to_owned());
         let child = pair
             .slave
             .spawn_command(shell)
@@ -365,7 +343,6 @@ impl TerminalSession {
             win32_input_mode_buffer: Vec::new(),
             pending_win32_char_key: None,
             closed: false,
-            shell_label,
         })
     }
 
@@ -446,7 +423,6 @@ impl TerminalSession {
         self.needs_repaint |= changed;
         Ok(PumpResult {
             should_close: self.closed,
-            needs_repaint: self.needs_repaint,
         })
     }
 
@@ -703,121 +679,6 @@ impl TerminalSession {
         }
 
         Ok(lines.join("\n"))
-    }
-
-    pub fn paint(
-        &mut self,
-        hdc: HDC,
-        layout: TerminalLayout,
-        chrome: &CellChrome,
-    ) -> eyre::Result<()> {
-        let snapshot = self
-            .render_state
-            .update(&self.terminal)
-            .wrap_err("failed to update terminal render state")?;
-        let colors = snapshot
-            .colors()
-            .wrap_err("failed to fetch terminal colors")?;
-        let mut rows = RowIterator::new().wrap_err("failed to create row iterator")?;
-        let mut cells = CellIterator::new().wrap_err("failed to create cell iterator")?;
-        let rect = layout.terminal_rect();
-
-        // The backing bitmap is recreated for every WM_PAINT, so the full frame
-        // must be repainted each time rather than relying on dirty-row deltas.
-        paint_terminal_background(hdc, layout.client_width, layout.client_height)?;
-        paint_cell_chrome(
-            hdc,
-            layout,
-            chrome.cell_number,
-            &chrome.result_text,
-            &self.shell_label,
-        )?;
-        paint_rect_background(hdc, rect, colors.background)
-            .wrap_err("failed to paint terminal background")?;
-
-        let mut row_index = 0_i32;
-        let mut row_iter = rows
-            .update(&snapshot)
-            .wrap_err("failed to update row iterator")?;
-        while let Some(row) = row_iter.next() {
-            let y = rect.top + (row_index * layout.cell_height);
-            let row_rect = RECT {
-                left: rect.left,
-                top: y,
-                right: rect.right,
-                bottom: y + layout.cell_height,
-            };
-
-            paint_rect_background(hdc, row_rect, colors.background)
-                .wrap_err("failed to paint row background")?;
-
-            let mut column_index = 0_i32;
-            let mut cell_iter = cells
-                .update(row)
-                .wrap_err("failed to update cell iterator")?;
-
-            while let Some(cell) = cell_iter.next() {
-                let x = rect.left + (column_index * layout.cell_width);
-                let cell_rect = RECT {
-                    left: x,
-                    top: y,
-                    right: x + layout.cell_width,
-                    bottom: y + layout.cell_height,
-                };
-
-                let background = cell.bg_color().wrap_err("failed to read cell background")?;
-                if let Some(background) = background.filter(|color| *color != colors.background) {
-                    let brush = unsafe { CreateSolidBrush(rgb_to_colorref(background)) };
-                    if brush.0.is_null() {
-                        eyre::bail!("failed to create cell background brush");
-                    }
-                    let _ = unsafe { FillRect(hdc, &cell_rect, brush) };
-                    let _ = unsafe { DeleteObject(brush.into()) };
-                }
-
-                let graphemes = cell.graphemes().wrap_err("failed to read cell text")?;
-                if !graphemes.is_empty() {
-                    let foreground = cell
-                        .fg_color()
-                        .wrap_err("failed to read cell foreground")?
-                        .unwrap_or(colors.foreground);
-                    let text: String = graphemes.into_iter().collect();
-                    let utf16 = text.encode_utf16().collect::<Vec<u16>>();
-                    let _ = unsafe { SetBkMode(hdc, TRANSPARENT) };
-                    let _ = unsafe { SetTextColor(hdc, rgb_to_colorref(foreground)) };
-                    let _ = unsafe { TextOutW(hdc, x, y, &utf16) };
-                }
-
-                column_index += 1;
-            }
-
-            row.set_dirty(false)
-                .wrap_err("failed to clear row dirty flag after paint")?;
-            row_index += 1;
-        }
-
-        snapshot
-            .set_dirty(libghostty_vt::render::Dirty::Clean)
-            .wrap_err("failed to clear render dirty state")?;
-
-        if snapshot.cursor_visible().unwrap_or(false) {
-            if let Some(cursor) = snapshot
-                .cursor_viewport()
-                .wrap_err("failed to fetch cursor")?
-            {
-                paint_cursor(
-                    hdc,
-                    layout,
-                    rect,
-                    cursor,
-                    colors.cursor.unwrap_or(colors.foreground),
-                )?;
-            }
-        }
-
-        self.needs_repaint = false;
-        self.full_repaint_pending = false;
-        Ok(())
     }
 
     #[must_use]
@@ -1289,169 +1150,6 @@ fn normalize_cursor_visibility_mode_sequence(data: &[u8]) -> Cow<'_, [u8]> {
     } else {
         Cow::Borrowed(data)
     }
-}
-
-fn rgb_to_colorref(color: RgbColor) -> COLORREF {
-    COLORREF(u32::from(color.r) | (u32::from(color.g) << 8) | (u32::from(color.b) << 16))
-}
-
-fn paint_cell_chrome(
-    hdc: HDC,
-    layout: TerminalLayout,
-    cell_number: usize,
-    result_text: &str,
-    shell_label: &str,
-) -> eyre::Result<()> {
-    let sidecar_fill = RgbColor {
-        r: 150,
-        g: 28,
-        b: 28,
-    };
-    let panel_fill = RgbColor { r: 0, g: 0, b: 0 };
-    let result_fill = RgbColor {
-        r: 214,
-        g: 118,
-        b: 22,
-    };
-    let drag_fill = RgbColor {
-        r: 108,
-        g: 43,
-        b: 153,
-    };
-    let border = RgbColor {
-        r: 240,
-        g: 240,
-        b: 240,
-    };
-    let plus_fill = RgbColor {
-        r: 214,
-        g: 118,
-        b: 22,
-    };
-
-    paint_panel(hdc, layout.sidecar_rect(), border, sidecar_fill)?;
-    paint_panel(hdc, layout.code_panel_rect(), border, panel_fill)?;
-    paint_panel(hdc, layout.result_panel_rect(), border, result_fill)?;
-    paint_panel(hdc, layout.plus_button_rect(), border, plus_fill)?;
-    paint_panel(hdc, layout.drag_handle_rect(), border, drag_fill)?;
-
-    draw_centered_text(
-        hdc,
-        layout.drag_handle_rect(),
-        &format!("{cell_number}"),
-        WINDOW_TEXT,
-    );
-
-    let play = layout.sidecar_button_rect(0);
-    let stop = layout.sidecar_button_rect(1);
-    paint_panel(hdc, play, border, panel_fill)?;
-    paint_panel(hdc, stop, border, panel_fill)?;
-    draw_text(hdc, play.left + 11, play.top + 8, ">", WINDOW_TEXT);
-    draw_text(hdc, stop.left + 7, stop.top + 8, "[]", WINDOW_TEXT);
-
-    let footer = layout.shell_label_rect();
-    draw_text(
-        hdc,
-        footer
-            .right
-            .saturating_sub((i32::try_from(shell_label.len()).unwrap_or_default() * 8) + 4),
-        footer.top,
-        shell_label,
-        WINDOW_TEXT,
-    );
-
-    let result_rect = layout.result_panel_rect();
-    draw_multiline_text(
-        hdc,
-        result_rect.left + 12,
-        result_rect.top + 12,
-        result_text,
-        WINDOW_TEXT,
-    );
-
-    let plus = layout.plus_button_rect();
-    draw_text(hdc, plus.left + 15, plus.top + 8, "+", WINDOW_TEXT);
-    Ok(())
-}
-
-fn paint_rect_background(hdc: HDC, rect: RECT, color: RgbColor) -> eyre::Result<()> {
-    let brush = unsafe { CreateSolidBrush(rgb_to_colorref(color)) };
-    if brush.0.is_null() {
-        eyre::bail!("failed to create background brush");
-    }
-
-    let _ = unsafe { FillRect(hdc, &rect, brush) };
-    let _ = unsafe { DeleteObject(brush.into()) };
-    Ok(())
-}
-
-fn paint_terminal_background(hdc: HDC, client_width: i32, client_height: i32) -> eyre::Result<()> {
-    paint_background_layer(hdc, client_width, client_height)
-}
-
-fn paint_panel(hdc: HDC, rect: RECT, border: RgbColor, fill: RgbColor) -> eyre::Result<()> {
-    paint_rect_background(hdc, rect, border)?;
-    let inner = inset_rect(rect, PANEL_BORDER_THICKNESS);
-    paint_rect_background(hdc, inner, fill)
-}
-
-fn draw_text(hdc: HDC, x: i32, y: i32, text: &str, color: COLORREF) {
-    let utf16 = text.encode_utf16().collect::<Vec<u16>>();
-    let _ = unsafe { SetBkMode(hdc, TRANSPARENT) };
-    let _ = unsafe { SetTextColor(hdc, color) };
-    let _ = unsafe { TextOutW(hdc, x, y, &utf16) };
-}
-
-fn draw_centered_text(hdc: HDC, rect: RECT, text: &str, color: COLORREF) {
-    let estimated_width = i32::try_from(text.chars().count()).unwrap_or_default() * 12;
-    let x = rect.left + (((rect.right - rect.left) - estimated_width).max(0) / 2);
-    let y = rect.top + (((rect.bottom - rect.top) - 20).max(0) / 2);
-    draw_text(hdc, x, y, text, color);
-}
-
-fn draw_multiline_text(hdc: HDC, x: i32, y: i32, text: &str, color: COLORREF) {
-    for (index, line) in text.lines().enumerate() {
-        draw_text(
-            hdc,
-            x,
-            y + (i32::try_from(index).unwrap_or_default() * 22),
-            line,
-            color,
-        );
-    }
-}
-
-fn inset_rect(rect: RECT, amount: i32) -> RECT {
-    RECT {
-        left: rect.left + amount,
-        top: rect.top + amount,
-        right: (rect.right - amount).max(rect.left + amount),
-        bottom: (rect.bottom - amount).max(rect.top + amount),
-    }
-}
-
-fn paint_cursor(
-    hdc: HDC,
-    layout: TerminalLayout,
-    rect: RECT,
-    cursor: CursorViewport,
-    color: RgbColor,
-) -> eyre::Result<()> {
-    let left = rect.left + (i32::from(cursor.x) * layout.cell_width);
-    let top = rect.top + (i32::from(cursor.y) * layout.cell_height);
-    let cursor_rect = RECT {
-        left,
-        top: top + layout.cell_height.saturating_sub(3),
-        right: left + layout.cell_width,
-        bottom: top + layout.cell_height,
-    };
-    let brush = unsafe { CreateSolidBrush(rgb_to_colorref(color)) };
-    if brush.0.is_null() {
-        eyre::bail!("failed to create cursor brush");
-    }
-    let _ = unsafe { FillRect(hdc, &cursor_rect, brush) };
-    let _ = unsafe { DeleteObject(brush.into()) };
-    Ok(())
 }
 
 fn legacy_special_key_bytes(mapped_key: key::Key, mods: key::Mods) -> Option<Vec<u8>> {

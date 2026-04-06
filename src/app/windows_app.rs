@@ -7,32 +7,34 @@ use teamy_windows::module::get_current_module;
 use tracing::{debug, error, info};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, BitBlt, CLEARTYPE_QUALITY, CreateCompatibleBitmap, CreateCompatibleDC,
-    CreateFontIndirectW, DeleteDC, DeleteObject, EndPaint, GetDC, GetTextExtentPoint32W, HBITMAP,
-    HDC, HFONT, HGDIOBJ, InvalidateRect, LOGFONTW, PAINTSTRUCT, ReleaseDC, SRCCOPY, SelectObject,
+    BeginPaint, CLEARTYPE_QUALITY, CreateFontIndirectW, DeleteObject, EndPaint, GetDC,
+    GetTextExtentPoint32W, HFONT, LOGFONTW, PAINTSTRUCT, ReleaseDC, SelectObject,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect, GetMessageW,
-    GetSystemMetrics, GetWindowRect, HTCAPTION, HTCLIENT, IDC_ARROW, LWA_ALPHA, LoadCursorW, MSG,
-    PostQuitMessage, RegisterClassExW, SM_CXSCREEN, SM_CYSCREEN, SW_SHOW,
-    SetLayeredWindowAttributes, SetTimer, ShowWindow, TranslateMessage, WM_CHAR, WM_DESTROY,
-    WM_ERASEBKGND, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONUP, WM_NCHITTEST, WM_PAINT, WM_SIZE,
-    WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WNDCLASSEXW, WS_EX_APPWINDOW, WS_EX_LAYERED,
-    WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP, WS_THICKFRAME, WS_VISIBLE,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect,
+    GetSystemMetrics, GetWindowRect, HTCAPTION, HTCLIENT, IDC_ARROW, LoadCursorW, MSG, PM_REMOVE,
+    PeekMessageW, PostQuitMessage, RegisterClassExW, SM_CXSCREEN, SM_CYSCREEN, SW_SHOW, SetTimer,
+    ShowWindow, TranslateMessage, WM_CHAR, WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_KEYUP,
+    WM_LBUTTONUP, WM_NCHITTEST, WM_PAINT, WM_QUIT, WM_SIZE, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER,
+    WNDCLASSEXW, WS_EX_APPWINDOW, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP, WS_THICKFRAME,
+    WS_VISIBLE,
 };
 use windows::core::{PCWSTR, w};
 
 use crate::paths::AppHome;
 
 use super::WorkspaceWindowState;
-use super::windows_background::PANEL_WINDOW_ALPHA;
+use super::windows_d3d12_renderer::{
+    D3d12PanelRenderer, build_panel_scene, push_centered_text, push_text_block,
+};
 use super::windows_terminal::{
-    CellChrome, POLL_INTERVAL_MS, POLL_TIMER_ID, TerminalLayout, TerminalSession, keyboard_mods,
+    POLL_INTERVAL_MS, POLL_TIMER_ID, TerminalLayout, TerminalSession, keyboard_mods,
 };
 
 const WINDOW_CLASS_NAME: PCWSTR = w!("TeamyStudioTerminalWindow");
 const WINDOW_TITLE: &str = "Teamy Studio Terminal";
 const FONT_HEIGHT: i32 = -20;
+const FONT_FAMILY: &str = "CaskaydiaCove Nerd Font Mono";
 const INITIAL_WINDOW_WIDTH: i32 = 1040;
 const INITIAL_WINDOW_HEIGHT: i32 = 680;
 
@@ -42,45 +44,19 @@ thread_local! {
 
 struct AppState {
     app_home: AppHome,
+    hwnd: Option<HWND>,
     workspace_window: Option<WorkspaceWindowState>,
-    font: FontHandle,
     cell_width: i32,
     cell_height: i32,
     terminal: TerminalSession,
+    renderer: Option<D3d12PanelRenderer>,
 }
 
 struct FontHandle(HFONT);
 
-struct MemoryDc(HDC);
-
-struct BitmapHandle(HBITMAP);
-
-struct SelectObjectGuard {
-    hdc: HDC,
-    object: HGDIOBJ,
-}
-
 impl Drop for FontHandle {
     fn drop(&mut self) {
         let _ = unsafe { DeleteObject(self.0.into()) };
-    }
-}
-
-impl Drop for MemoryDc {
-    fn drop(&mut self) {
-        let _ = unsafe { DeleteDC(self.0) };
-    }
-}
-
-impl Drop for BitmapHandle {
-    fn drop(&mut self) {
-        let _ = unsafe { DeleteObject(self.0.into()) };
-    }
-}
-
-impl Drop for SelectObjectGuard {
-    fn drop(&mut self) {
-        let _ = unsafe { SelectObject(self.hdc, self.object) };
     }
 }
 
@@ -97,21 +73,28 @@ pub fn run(
     working_dir: Option<&Path>,
     workspace_window: Option<WorkspaceWindowState>,
 ) -> eyre::Result<()> {
-    let (font, cell_width, cell_height) = create_terminal_font()?;
+    let (cell_width, cell_height) = measure_terminal_cell_size()?;
     let terminal = TerminalSession::new(app_home, working_dir)?;
 
     APP_STATE.with(|state| {
         *state.borrow_mut() = Some(AppState {
             app_home: app_home.clone(),
+            hwnd: None,
             workspace_window,
-            font,
             cell_width,
             cell_height,
             terminal,
+            renderer: None,
         });
     });
 
     let hwnd = create_window()?;
+    let renderer = D3d12PanelRenderer::new(hwnd)?;
+    with_app_state(|state| {
+        state.hwnd = Some(hwnd);
+        state.renderer = Some(renderer);
+        Ok(())
+    })?;
     unsafe {
         let _ = ShowWindow(hwnd, SW_SHOW);
     }
@@ -152,7 +135,7 @@ fn create_window() -> eyre::Result<HWND> {
 
     let hwnd = unsafe {
         CreateWindowExW(
-            WS_EX_APPWINDOW | WS_EX_LAYERED,
+            WS_EX_APPWINDOW,
             WINDOW_CLASS_NAME,
             PCWSTR(title.as_ptr()),
             WS_POPUP | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_VISIBLE,
@@ -168,9 +151,6 @@ fn create_window() -> eyre::Result<HWND> {
     }
     .wrap_err("failed to create terminal window")?;
 
-    unsafe { SetLayeredWindowAttributes(hwnd, Default::default(), PANEL_WINDOW_ALPHA, LWA_ALPHA) }
-        .wrap_err("failed to enable layered window alpha")?;
-
     let timer = unsafe { SetTimer(Some(hwnd), POLL_TIMER_ID, POLL_INTERVAL_MS, None) };
     if timer == 0 {
         eyre::bail!("failed to start terminal poll timer")
@@ -180,23 +160,25 @@ fn create_window() -> eyre::Result<HWND> {
 }
 
 fn message_loop() -> eyre::Result<()> {
-    let mut message = MSG::default();
     loop {
-        let result = unsafe { GetMessageW(&mut message, None, 0, 0) };
-        let value = result.0;
-        if value == -1 {
-            eyre::bail!("message loop failed")
-        }
-        if value == 0 {
-            break;
+        let mut message = MSG::default();
+        let mut handled_message = false;
+        while unsafe { PeekMessageW(&mut message, None, 0, 0, PM_REMOVE) }.into() {
+            handled_message = true;
+            if message.message == WM_QUIT {
+                return Ok(());
+            }
+
+            unsafe {
+                let _ = TranslateMessage(&message);
+                DispatchMessageW(&message);
+            }
         }
 
-        unsafe {
-            let _ = TranslateMessage(&message);
-            DispatchMessageW(&message);
+        if !handled_message {
+            render_frame()?;
         }
     }
-    Ok(())
 }
 
 extern "system" fn window_proc(
@@ -208,24 +190,18 @@ extern "system" fn window_proc(
     match message {
         WM_SIZE => match with_app_state(|state| {
             let layout = client_layout(hwnd, state.cell_width, state.cell_height)?;
-            state.terminal.resize(layout)
-        }) {
-            Ok(()) => {
-                unsafe {
-                    let _ = InvalidateRect(Some(hwnd), None, false);
-                }
-                LRESULT(0)
+            state.terminal.resize(layout)?;
+            if let Some(renderer) = state.renderer.as_mut() {
+                renderer.resize(layout.client_width as u32, layout.client_height as u32)?;
             }
+            Ok(())
+        }) {
+            Ok(()) => LRESULT(0),
             Err(error) => fail_and_close(hwnd, error),
         },
         WM_TIMER if wparam.0 == POLL_TIMER_ID => {
             match with_app_state(|state| state.terminal.pump()) {
                 Ok(result) => {
-                    if result.needs_repaint {
-                        unsafe {
-                            let _ = InvalidateRect(Some(hwnd), None, false);
-                        }
-                    }
                     if result.should_close {
                         unsafe {
                             let _ = DestroyWindow(hwnd);
@@ -248,9 +224,6 @@ extern "system" fn window_proc(
                         "processed keyboard char message"
                     );
                     if consumed {
-                        unsafe {
-                            let _ = InvalidateRect(Some(hwnd), None, false);
-                        }
                         return LRESULT(0);
                     }
                     unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
@@ -283,9 +256,6 @@ extern "system" fn window_proc(
                     "processed keyboard down message"
                 );
                 if consumed {
-                    unsafe {
-                        let _ = InvalidateRect(Some(hwnd), None, false);
-                    }
                     return LRESULT(0);
                 }
                 unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
@@ -315,25 +285,19 @@ extern "system" fn window_proc(
                     "processed keyboard up message"
                 );
                 if consumed {
-                    unsafe {
-                        let _ = InvalidateRect(Some(hwnd), None, false);
-                    }
                     return LRESULT(0);
                 }
                 unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
             }
             Err(error) => fail_and_close(hwnd, error),
         },
-        WM_PAINT => match paint_window(hwnd) {
+        WM_PAINT => match acknowledge_paint(hwnd) {
             Ok(()) => LRESULT(0),
             Err(error) => fail_and_close(hwnd, error),
         },
         WM_LBUTTONUP => match handle_left_button_up(hwnd, lparam) {
             Ok(handled) => {
                 if handled {
-                    unsafe {
-                        let _ = InvalidateRect(Some(hwnd), None, false);
-                    }
                     LRESULT(0)
                 } else {
                     unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
@@ -371,87 +335,105 @@ extern "system" fn window_proc(
     }
 }
 
-fn paint_window(hwnd: HWND) -> eyre::Result<()> {
-    // cli[impl window.appearance.chrome]
+fn acknowledge_paint(hwnd: HWND) -> eyre::Result<()> {
     let mut paint = PAINTSTRUCT::default();
     let hdc = unsafe { BeginPaint(hwnd, &mut paint) };
     if hdc.0.is_null() {
         eyre::bail!("failed to begin painting")
     }
 
-    let result = with_app_state(|state| {
-        let layout = client_layout(hwnd, state.cell_width, state.cell_height)?;
-        let buffer_dc = create_memory_dc(hdc)?;
-        let buffer_bitmap =
-            create_compatible_bitmap(hdc, layout.client_width, layout.client_height)?;
-        let previous_bitmap = unsafe { SelectObject(buffer_dc.0, buffer_bitmap.0.into()) };
-        let _bitmap_guard = SelectObjectGuard {
-            hdc: buffer_dc.0,
-            object: previous_bitmap,
-        };
-
-        let previous_font = unsafe { SelectObject(buffer_dc.0, state.font.0.into()) };
-        let _font_guard = SelectObjectGuard {
-            hdc: buffer_dc.0,
-            object: previous_font,
-        };
-
-        let chrome = cell_chrome(state);
-        state.terminal.paint(buffer_dc.0, layout, &chrome)?;
-
-        unsafe {
-            BitBlt(
-                hdc,
-                0,
-                0,
-                layout.client_width.max(1),
-                layout.client_height.max(1),
-                Some(buffer_dc.0),
-                0,
-                0,
-                SRCCOPY,
-            )
-        }
-        .wrap_err("failed to copy buffered frame to window")?;
-
-        Ok(())
-    });
-
     unsafe {
         let _ = EndPaint(hwnd, &paint);
     }
-    result
+    Ok(())
 }
 
-fn create_memory_dc(hdc: HDC) -> eyre::Result<MemoryDc> {
-    let memory_dc = unsafe { CreateCompatibleDC(Some(hdc)) };
-    if memory_dc.0.is_null() {
-        eyre::bail!("failed to create memory device context")
+fn render_frame() -> eyre::Result<()> {
+    with_app_state(|state| {
+        let Some(hwnd) = state.hwnd else {
+            return Ok(());
+        };
+        let layout = client_layout(hwnd, state.cell_width, state.cell_height)?;
+        let mut scene = build_panel_scene(layout);
+        let cell_number = state
+            .workspace_window
+            .as_ref()
+            .map_or(1, |workspace_window| workspace_window.cell_number);
+        let output_text = build_output_panel_text(state);
+        let terminal_text = state.terminal.visible_text()?;
+
+        push_centered_text(
+            &mut scene,
+            layout.drag_handle_rect(),
+            &cell_number.to_string(),
+            [0.95, 0.95, 0.98, 1.0],
+        );
+        push_text_block(
+            &mut scene,
+            inset_rect(layout.terminal_rect(), 4),
+            &terminal_text,
+            state.cell_width,
+            state.cell_height,
+            [0.95, 0.95, 0.98, 1.0],
+        );
+        push_text_block(
+            &mut scene,
+            inset_rect(layout.result_panel_rect(), 14),
+            &output_text,
+            state.cell_width,
+            state.cell_height,
+            [0.96, 0.95, 0.90, 1.0],
+        );
+
+        let Some(renderer) = state.renderer.as_mut() else {
+            return Ok(());
+        };
+        renderer.render(&scene)
+    })
+}
+
+fn build_output_panel_text(state: &AppState) -> String {
+    if let Some(workspace_window) = &state.workspace_window {
+        format!(
+            "workspace {}\ncell {} of {}\n{} cols x {} rows",
+            workspace_window.workspace.name,
+            workspace_window.cell_number,
+            workspace_window.workspace.cell_count,
+            state.terminal.cols(),
+            state.terminal.rows()
+        )
+    } else {
+        format!(
+            "standalone shell\n{} cols x {} rows",
+            state.terminal.cols(),
+            state.terminal.rows()
+        )
     }
-    Ok(MemoryDc(memory_dc))
 }
 
-fn create_compatible_bitmap(hdc: HDC, width: i32, height: i32) -> eyre::Result<BitmapHandle> {
-    let bitmap = unsafe { CreateCompatibleBitmap(hdc, width.max(1), height.max(1)) };
-    if bitmap.0.is_null() {
-        eyre::bail!("failed to create offscreen bitmap")
+fn inset_rect(rect: RECT, amount: i32) -> RECT {
+    RECT {
+        left: rect.left + amount,
+        top: rect.top + amount,
+        right: (rect.right - amount).max(rect.left + amount),
+        bottom: (rect.bottom - amount).max(rect.top + amount),
     }
-    Ok(BitmapHandle(bitmap))
 }
 
-fn create_terminal_font() -> eyre::Result<(FontHandle, i32, i32)> {
+fn measure_terminal_cell_size() -> eyre::Result<(i32, i32)> {
     let font_definition = terminal_font_definition();
     let font = unsafe { CreateFontIndirectW(&font_definition) };
     if font.0.is_null() {
         eyre::bail!("failed to create terminal font")
     }
+    let font = FontHandle(font);
 
     let hdc = unsafe { GetDC(None) };
     if hdc.0.is_null() {
         eyre::bail!("failed to acquire screen DC for font metrics")
     }
 
-    let previous_font = unsafe { SelectObject(hdc, font.into()) };
+    let previous_font = unsafe { SelectObject(hdc, font.0.into()) };
     let glyph = ['W' as u16];
     let mut size = SIZE::default();
     let measured = unsafe { GetTextExtentPoint32W(hdc, &glyph, &mut size) }.as_bool();
@@ -464,7 +446,7 @@ fn create_terminal_font() -> eyre::Result<(FontHandle, i32, i32)> {
         eyre::bail!("failed to measure terminal font")
     }
 
-    Ok((FontHandle(font), size.cx.max(8), size.cy.max(16)))
+    Ok((size.cx.max(8), size.cy.max(16)))
 }
 
 fn terminal_font_definition() -> LOGFONTW {
@@ -473,11 +455,7 @@ fn terminal_font_definition() -> LOGFONTW {
         lfQuality: CLEARTYPE_QUALITY,
         ..Default::default()
     };
-    for (slot, value) in font
-        .lfFaceName
-        .iter_mut()
-        .zip("Cascadia Mono".encode_utf16())
-    {
+    for (slot, value) in font.lfFaceName.iter_mut().zip(FONT_FAMILY.encode_utf16()) {
         *slot = value;
     }
     font
@@ -494,33 +472,6 @@ fn client_layout(hwnd: HWND, cell_width: i32, cell_height: i32) -> eyre::Result<
         cell_width,
         cell_height,
     })
-}
-
-fn cell_chrome(state: &AppState) -> CellChrome {
-    let result_text = if let Some(workspace_window) = &state.workspace_window {
-        format!(
-            "workspace {}\ncell {} of {}\n{} cols x {} rows",
-            workspace_window.workspace.name,
-            workspace_window.cell_number,
-            workspace_window.workspace.cell_count,
-            state.terminal.cols(),
-            state.terminal.rows()
-        )
-    } else {
-        format!(
-            "standalone shell\n{} cols x {} rows",
-            state.terminal.cols(),
-            state.terminal.rows()
-        )
-    };
-
-    CellChrome {
-        cell_number: state
-            .workspace_window
-            .as_ref()
-            .map_or(1, |workspace_window| workspace_window.cell_number),
-        result_text,
-    }
 }
 
 fn with_app_state<T>(f: impl FnOnce(&mut AppState) -> eyre::Result<T>) -> eyre::Result<T> {

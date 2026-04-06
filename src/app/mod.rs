@@ -1,7 +1,7 @@
 #[cfg(windows)]
 mod windows_app;
 #[cfg(windows)]
-mod windows_background;
+mod windows_d3d12_renderer;
 #[cfg(windows)]
 mod windows_terminal;
 #[cfg(windows)]

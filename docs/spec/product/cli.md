@@ -72,6 +72,9 @@ The `workspace run` command must create a new workspace when no workspace target
 cli[workspace.run.target-by-id-or-name]
 The `workspace run` command must resolve an existing workspace by exact id or exact name when a target is provided.
 
+cli[workspace.plus-button.appends-cell]
+Clicking the plus button in a workspace cell window must append a new cell to that workspace and open the new cell in its own window.
+
 ## Shell Defaults
 
 cli[shell.default.persisted-in-app-home]
