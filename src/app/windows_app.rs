@@ -30,10 +30,12 @@ use crate::paths::AppHome;
 
 use super::WorkspaceWindowState;
 use super::windows_d3d12_renderer::{
-    D3d12PanelRenderer, build_panel_scene, push_centered_text, push_glyph, push_text_block,
+    D3d12PanelRenderer, PanelEffect, RenderScene, build_panel_scene, push_centered_text,
+    push_glyph, push_overlay_panel, push_panel, push_text_block,
 };
 use super::windows_terminal::{
-    POLL_INTERVAL_MS, POLL_TIMER_ID, TerminalLayout, TerminalSession, keyboard_mods,
+    POLL_INTERVAL_MS, POLL_TIMER_ID, TerminalDisplayCursorStyle, TerminalDisplayState,
+    TerminalLayout, TerminalSession, keyboard_mods,
 };
 
 const WINDOW_CLASS_NAME: PCWSTR = w!("TeamyStudioTerminalWindow");
@@ -437,6 +439,13 @@ fn render_current_frame(
         if let Some(renderer) = state.renderer.as_mut() {
             renderer.resize(width, height)?;
         }
+
+        if state.terminal.pump()?.should_close {
+            unsafe {
+                let _ = DestroyWindow(hwnd);
+            }
+            return Ok(());
+        }
     }
 
     let layout = client_layout(hwnd, state.terminal_cell_width, state.terminal_cell_height)?;
@@ -446,7 +455,7 @@ fn render_current_frame(
         .as_ref()
         .map_or(1, |workspace_window| workspace_window.cell_number);
     let output_text = build_output_panel_text(state);
-    let terminal_glyphs = state.terminal.visible_glyphs()?;
+    let terminal_display = state.terminal.visible_display_state()?;
 
     push_centered_text(
         &mut scene,
@@ -455,17 +464,13 @@ fn render_current_frame(
         [0.95, 0.95, 0.98, 1.0],
     );
     let terminal_rect = inset_rect(layout.terminal_rect(), 4);
-    for glyph in terminal_glyphs {
-        let left = terminal_rect.left + (glyph.column * state.terminal_cell_width);
-        let top = terminal_rect.top + (glyph.row * state.terminal_cell_height);
-        let rect = RECT {
-            left,
-            top,
-            right: left + state.terminal_cell_width,
-            bottom: top + state.terminal_cell_height,
-        };
-        push_glyph(&mut scene, rect, glyph.character, glyph.color);
-    }
+    push_terminal_display(
+        &mut scene,
+        terminal_rect,
+        state.terminal_cell_width,
+        state.terminal_cell_height,
+        terminal_display,
+    );
     push_text_block(
         &mut scene,
         inset_rect(layout.result_panel_rect(), 14),
@@ -479,6 +484,125 @@ fn render_current_frame(
         return Ok(());
     };
     renderer.render(&scene)
+}
+
+fn push_terminal_display(
+    scene: &mut RenderScene,
+    terminal_rect: RECT,
+    cell_width: i32,
+    cell_height: i32,
+    display: TerminalDisplayState,
+) {
+    for background in display.backgrounds {
+        push_panel(
+            scene,
+            terminal_cell_rect(
+                terminal_rect,
+                background.column,
+                background.row,
+                cell_width,
+                cell_height,
+            ),
+            background.color,
+            PanelEffect::TerminalFill,
+        );
+    }
+
+    for glyph in display.glyphs {
+        push_glyph(
+            scene,
+            terminal_cell_rect(
+                terminal_rect,
+                glyph.column,
+                glyph.row,
+                cell_width,
+                cell_height,
+            ),
+            glyph.character,
+            glyph.color,
+        );
+    }
+
+    if let Some(cursor) = display.cursor {
+        let cell_rect = terminal_cell_rect(
+            terminal_rect,
+            cursor.column,
+            cursor.row,
+            cell_width,
+            cell_height,
+        );
+        for rect in terminal_cursor_overlay_rects(cell_rect, cursor.style) {
+            push_overlay_panel(scene, rect, cursor.color, PanelEffect::TerminalCursor);
+        }
+    }
+}
+
+fn terminal_cell_rect(
+    terminal_rect: RECT,
+    column: i32,
+    row: i32,
+    cell_width: i32,
+    cell_height: i32,
+) -> RECT {
+    let left = terminal_rect.left + (column * cell_width);
+    let top = terminal_rect.top + (row * cell_height);
+    RECT {
+        left,
+        top,
+        right: left + cell_width,
+        bottom: top + cell_height,
+    }
+}
+
+fn terminal_cursor_overlay_rects(
+    cell_rect: RECT,
+    style: TerminalDisplayCursorStyle,
+) -> Vec<RECT> {
+    let width = (cell_rect.right - cell_rect.left).max(1);
+    let height = (cell_rect.bottom - cell_rect.top).max(1);
+    let thickness = (width.min(height) / 6).clamp(2, 4);
+
+    match style {
+        TerminalDisplayCursorStyle::Bar => vec![RECT {
+            left: cell_rect.left,
+            top: cell_rect.top,
+            right: (cell_rect.left + thickness).min(cell_rect.right),
+            bottom: cell_rect.bottom,
+        }],
+        TerminalDisplayCursorStyle::Block => vec![cell_rect],
+        TerminalDisplayCursorStyle::Underline => vec![RECT {
+            left: cell_rect.left,
+            top: (cell_rect.bottom - thickness).max(cell_rect.top),
+            right: cell_rect.right,
+            bottom: cell_rect.bottom,
+        }],
+        TerminalDisplayCursorStyle::BlockHollow => vec![
+            RECT {
+                left: cell_rect.left,
+                top: cell_rect.top,
+                right: cell_rect.right,
+                bottom: (cell_rect.top + thickness).min(cell_rect.bottom),
+            },
+            RECT {
+                left: cell_rect.left,
+                top: (cell_rect.bottom - thickness).max(cell_rect.top),
+                right: cell_rect.right,
+                bottom: cell_rect.bottom,
+            },
+            RECT {
+                left: cell_rect.left,
+                top: cell_rect.top,
+                right: (cell_rect.left + thickness).min(cell_rect.right),
+                bottom: cell_rect.bottom,
+            },
+            RECT {
+                left: (cell_rect.right - thickness).max(cell_rect.left),
+                top: cell_rect.top,
+                right: cell_rect.right,
+                bottom: cell_rect.bottom,
+            },
+        ],
+    }
 }
 
 fn build_output_panel_text(state: &AppState) -> String {
@@ -806,6 +930,25 @@ mod tests {
         let hit = classify_resize_border_hit(client_rect, point, 8, 8);
 
         assert_eq!(hit, None);
+    }
+
+    #[test]
+    fn hollow_cursor_builds_four_border_rects() {
+        let rects = terminal_cursor_overlay_rects(
+            RECT {
+                left: 10,
+                top: 20,
+                right: 18,
+                bottom: 36,
+            },
+            TerminalDisplayCursorStyle::BlockHollow,
+        );
+
+        assert_eq!(rects.len(), 4);
+        assert_eq!(rects[0].top, 20);
+        assert_eq!(rects[1].bottom, 36);
+        assert_eq!(rects[2].left, 10);
+        assert_eq!(rects[3].right, 18);
     }
 }
 

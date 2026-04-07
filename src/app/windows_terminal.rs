@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex, mpsc};
 
 use eyre::Context;
 use libghostty_vt::key;
-use libghostty_vt::render::{CellIterator, RenderState, RowIterator};
+use libghostty_vt::render::{CellIterator, CursorVisualStyle, RenderState, RowIterator};
 use libghostty_vt::style::RgbColor;
 use libghostty_vt::{Terminal, TerminalOptions};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
@@ -70,12 +70,42 @@ pub struct PumpResult {
     pub should_close: bool,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct TerminalDisplayGlyph {
     pub column: i32,
     pub row: i32,
     pub character: char,
     pub color: [f32; 4],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TerminalDisplayBackground {
+    pub column: i32,
+    pub row: i32,
+    pub color: [f32; 4],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TerminalDisplayCursorStyle {
+    Bar,
+    Block,
+    Underline,
+    BlockHollow,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TerminalDisplayCursor {
+    pub column: i32,
+    pub row: i32,
+    pub color: [f32; 4],
+    pub style: TerminalDisplayCursorStyle,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TerminalDisplayState {
+    pub backgrounds: Vec<TerminalDisplayBackground>,
+    pub glyphs: Vec<TerminalDisplayGlyph>,
+    pub cursor: Option<TerminalDisplayCursor>,
 }
 
 #[derive(Clone, Copy)]
@@ -676,7 +706,7 @@ impl TerminalSession {
         Ok(lines.join("\n"))
     }
 
-    pub fn visible_glyphs(&mut self) -> eyre::Result<Vec<TerminalDisplayGlyph>> {
+    pub fn visible_display_state(&mut self) -> eyre::Result<TerminalDisplayState> {
         let snapshot = self
             .render_state
             .update(&self.terminal)
@@ -686,7 +716,12 @@ impl TerminalSession {
             .wrap_err("failed to fetch terminal colors")?;
         let mut rows = RowIterator::new().wrap_err("failed to create row iterator")?;
         let mut cells = CellIterator::new().wrap_err("failed to create cell iterator")?;
-        let mut glyphs = Vec::new();
+        let cursor = build_terminal_cursor(&snapshot, &colors)?;
+        let mut display = TerminalDisplayState {
+            backgrounds: Vec::new(),
+            glyphs: Vec::new(),
+            cursor,
+        };
 
         let mut row_index = 0_i32;
         let mut row_iter = rows
@@ -698,19 +733,32 @@ impl TerminalSession {
                 .update(row)
                 .wrap_err("failed to update cell iterator")?;
             while let Some(cell) = cell_iter.next() {
+                let style = cell.style().wrap_err("failed to read cell style")?;
                 let graphemes = cell.graphemes().wrap_err("failed to read cell text")?;
+                let foreground = cell
+                    .fg_color()
+                    .wrap_err("failed to read cell foreground")?;
+                let background = cell
+                    .bg_color()
+                    .wrap_err("failed to read cell background")?;
+                let (glyph_color, background_color) =
+                    resolve_terminal_cell_colors(&colors, foreground, background, style.inverse);
+
+                if let Some(color) = background_color {
+                    display.backgrounds.push(TerminalDisplayBackground {
+                        column: column_index,
+                        row: row_index,
+                        color,
+                    });
+                }
+
                 if !graphemes.is_empty() {
-                    let foreground = cell
-                        .fg_color()
-                        .wrap_err("failed to read cell foreground")?
-                        .unwrap_or(colors.foreground);
-                    let color = rgb_to_rgba(foreground);
                     for character in graphemes {
-                        glyphs.push(TerminalDisplayGlyph {
+                        display.glyphs.push(TerminalDisplayGlyph {
                             column: column_index,
                             row: row_index,
                             character,
-                            color,
+                            color: glyph_color,
                         });
                     }
                 }
@@ -719,7 +767,7 @@ impl TerminalSession {
             row_index += 1;
         }
 
-        Ok(glyphs)
+        Ok(display)
     }
 
     #[must_use]
@@ -836,6 +884,68 @@ fn rgb_to_rgba(color: RgbColor) -> [f32; 4] {
         f32::from(color.b) / 255.0,
         1.0,
     ]
+}
+
+fn resolve_terminal_cell_colors(
+    colors: &libghostty_vt::render::Colors,
+    foreground: Option<RgbColor>,
+    background: Option<RgbColor>,
+    inverse: bool,
+) -> ([f32; 4], Option<[f32; 4]>) {
+    let mut foreground = foreground.unwrap_or(colors.foreground);
+    let mut background = background.unwrap_or(colors.background);
+    let mut draw_background = background != colors.background;
+
+    if inverse {
+        std::mem::swap(&mut foreground, &mut background);
+        draw_background = true;
+    }
+
+    (
+        rgb_to_rgba(foreground),
+        draw_background.then(|| rgb_to_rgba(background)),
+    )
+}
+
+fn build_terminal_cursor(
+    snapshot: &libghostty_vt::render::Snapshot<'_, '_>,
+    colors: &libghostty_vt::render::Colors,
+) -> eyre::Result<Option<TerminalDisplayCursor>> {
+    if !snapshot.cursor_visible().wrap_err("failed to query cursor visibility")? {
+        return Ok(None);
+    }
+
+    let Some(viewport) = snapshot
+        .cursor_viewport()
+        .wrap_err("failed to query cursor viewport")?
+    else {
+        return Ok(None);
+    };
+    let style = snapshot
+        .cursor_visual_style()
+        .wrap_err("failed to query cursor visual style")?;
+    let cursor_color = snapshot
+        .cursor_color()
+        .wrap_err("failed to query cursor color")?
+        .or(colors.cursor)
+        .unwrap_or(colors.foreground);
+
+    Ok(Some(TerminalDisplayCursor {
+        column: i32::from(viewport.x),
+        row: i32::from(viewport.y),
+        color: rgb_to_rgba(cursor_color),
+        style: map_cursor_style(style),
+    }))
+}
+
+fn map_cursor_style(style: CursorVisualStyle) -> TerminalDisplayCursorStyle {
+    match style {
+        CursorVisualStyle::Bar => TerminalDisplayCursorStyle::Bar,
+        CursorVisualStyle::Block => TerminalDisplayCursorStyle::Block,
+        CursorVisualStyle::Underline => TerminalDisplayCursorStyle::Underline,
+        CursorVisualStyle::BlockHollow => TerminalDisplayCursorStyle::BlockHollow,
+        _ => TerminalDisplayCursorStyle::Block,
+    }
 }
 
 fn map_virtual_key(vkey: u32, lparam: isize) -> Option<(key::Key, char)> {
@@ -1219,7 +1329,12 @@ fn legacy_special_key_bytes(mapped_key: key::Key, mods: key::Mods) -> Option<Vec
 
 #[cfg(test)]
 mod tests {
-    use super::{MIN_CODE_PANEL_HEIGHT, TerminalLayout, map_virtual_key};
+    use super::{
+        MIN_CODE_PANEL_HEIGHT, TerminalDisplayCursorStyle, TerminalLayout, map_cursor_style,
+        map_virtual_key, resolve_terminal_cell_colors,
+    };
+    use libghostty_vt::render::Colors;
+    use libghostty_vt::style::RgbColor;
 
     #[test]
     fn cell_layout_regions_do_not_overlap_and_leave_terminal_room() {
@@ -1243,6 +1358,50 @@ mod tests {
         assert_eq!(terminal.right, code.right);
         assert_eq!(terminal.bottom, code.bottom);
         assert!((code.bottom - code.top) >= MIN_CODE_PANEL_HEIGHT);
+    }
+
+    #[test]
+    fn inverse_cells_swap_colors_and_force_background() {
+        let colors = Colors {
+            background: RgbColor { r: 10, g: 20, b: 30 },
+            foreground: RgbColor {
+                r: 240,
+                g: 241,
+                b: 242,
+            },
+            cursor: None,
+            palette: [RgbColor { r: 0, g: 0, b: 0 }; 256],
+        };
+
+        let (foreground, background) = resolve_terminal_cell_colors(
+            &colors,
+            Some(RgbColor { r: 1, g: 2, b: 3 }),
+            None,
+            true,
+        );
+
+        assert_eq!(foreground, [10.0 / 255.0, 20.0 / 255.0, 30.0 / 255.0, 1.0]);
+        assert_eq!(background, Some([1.0 / 255.0, 2.0 / 255.0, 3.0 / 255.0, 1.0]));
+    }
+
+    #[test]
+    fn cursor_style_mapping_matches_ghostty_values() {
+        assert_eq!(
+            map_cursor_style(libghostty_vt::render::CursorVisualStyle::Bar),
+            TerminalDisplayCursorStyle::Bar
+        );
+        assert_eq!(
+            map_cursor_style(libghostty_vt::render::CursorVisualStyle::Block),
+            TerminalDisplayCursorStyle::Block
+        );
+        assert_eq!(
+            map_cursor_style(libghostty_vt::render::CursorVisualStyle::Underline),
+            TerminalDisplayCursorStyle::Underline
+        );
+        assert_eq!(
+            map_cursor_style(libghostty_vt::render::CursorVisualStyle::BlockHollow),
+            TerminalDisplayCursorStyle::BlockHollow
+        );
     }
 
     #[test]

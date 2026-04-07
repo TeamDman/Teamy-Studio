@@ -61,7 +61,7 @@ PsInput VSMain(VsInput input) {
     float2 position = input.position.xy;
     float2 uv = input.uv;
 
-    if (input.effect > 7.5 && any(input.normal != 0.0.xx)) {
+    if (input.effect > 9.5 && any(input.normal != 0.0.xx)) {
         position = SlugDilate(position, uv, input.normal, input.jacobian, uv);
     }
 
@@ -373,9 +373,13 @@ float4 apply_button(float2 uv, float4 color, float effect) {
 }
 
 float4 PSMain(PsInput input) : SV_TARGET {
-    if (input.effect > 7.5) {
+    if (input.effect > 9.5) {
         float coverage = slug_coverage(input.uv, input.glyph, input.glyphData, input.banding);
         return float4(input.color.rgb, input.color.a * coverage);
+    }
+
+    if (input.effect > 7.5) {
+        return input.color;
     }
 
     float4 shaded = input.color;

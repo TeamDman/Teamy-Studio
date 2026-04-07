@@ -25,7 +25,7 @@ use windows::core::{Error, HSTRING, Interface, Owned, PCSTR, s};
 use super::windows_terminal::TerminalLayout;
 
 const FRAME_COUNT: usize = 2;
-const MAX_PANEL_COUNT: usize = 32;
+const MAX_PANEL_COUNT: usize = 8_192;
 const MAX_GLYPH_COUNT: usize = 8_192;
 const MAX_VERTEX_COUNT: usize = (MAX_PANEL_COUNT + MAX_GLYPH_COUNT) * 6;
 const FALLBACK_GLYPH: char = '?';
@@ -127,7 +127,9 @@ pub enum PanelEffect {
     PlayButton = 5,
     StopButton = 6,
     PlusButton = 7,
-    Text = 8,
+    TerminalFill = 8,
+    TerminalCursor = 9,
+    Text = 10,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -148,6 +150,7 @@ pub struct GlyphQuad {
 pub struct RenderScene {
     pub panels: Vec<PanelRect>,
     pub glyphs: Vec<GlyphQuad>,
+    pub overlay_panels: Vec<PanelRect>,
 }
 
 #[derive(Debug)]
@@ -514,6 +517,15 @@ impl D3d12PanelRenderer {
                 &self.font,
             );
         }
+        for panel in &scene.overlay_panels {
+            append_rect(
+                &mut vertices,
+                panel.rect,
+                panel.color,
+                panel.effect as u32,
+                0,
+            );
+        }
 
         unsafe {
             let mut mapped = std::ptr::null_mut();
@@ -698,7 +710,37 @@ pub fn build_panel_scene(layout: TerminalLayout) -> RenderScene {
     RenderScene {
         panels,
         glyphs: Vec::with_capacity(2_048),
+        overlay_panels: Vec::with_capacity(16),
     }
+}
+
+pub fn push_panel(scene: &mut RenderScene, rect: RECT, color: [f32; 4], effect: PanelEffect) {
+    if scene.panels.len() + scene.overlay_panels.len() >= MAX_PANEL_COUNT {
+        return;
+    }
+
+    scene.panels.push(PanelRect {
+        rect,
+        color,
+        effect,
+    });
+}
+
+pub fn push_overlay_panel(
+    scene: &mut RenderScene,
+    rect: RECT,
+    color: [f32; 4],
+    effect: PanelEffect,
+) {
+    if scene.panels.len() + scene.overlay_panels.len() >= MAX_PANEL_COUNT {
+        return;
+    }
+
+    scene.overlay_panels.push(PanelRect {
+        rect,
+        color,
+        effect,
+    });
 }
 
 pub fn push_text_block(
@@ -2617,8 +2659,9 @@ mod tests {
     use super::{
         FALLBACK_GLYPH, PanelEffect, RenderScene, append_rect, append_slug_band_data,
         build_panel_scene, collect_scene_chars, cpu_slug_coverage,
-        cpu_slug_coverage_all_curves, extract_glyph_curves, load_terminal_font,
-        push_centered_text, push_glyph, push_text_block, render_snapshot_glyph_into_image,
+        cpu_slug_coverage_all_curves, extract_glyph_curves, load_terminal_font, push_centered_text,
+        push_glyph, push_overlay_panel, push_panel, push_text_block,
+        render_snapshot_glyph_into_image,
     };
     use crate::app::windows_terminal::TerminalLayout;
     use eyre::WrapErr;
@@ -2631,6 +2674,7 @@ mod tests {
         let mut scene = RenderScene {
             panels: Vec::new(),
             glyphs: Vec::new(),
+            overlay_panels: Vec::new(),
         };
         push_text_block(
             &mut scene,
@@ -2654,6 +2698,7 @@ mod tests {
         let mut scene = RenderScene {
             panels: Vec::new(),
             glyphs: Vec::new(),
+            overlay_panels: Vec::new(),
         };
         push_centered_text(
             &mut scene,
@@ -2734,6 +2779,7 @@ mod tests {
         let mut scene = RenderScene {
             panels: Vec::new(),
             glyphs: Vec::new(),
+            overlay_panels: Vec::new(),
         };
         push_glyph(
             &mut scene,
@@ -2763,6 +2809,41 @@ mod tests {
         assert_eq!(atlas_chars[0], FALLBACK_GLYPH);
         assert!(atlas_chars.contains(&'❯'));
         assert!(atlas_chars.contains(&'A'));
+    }
+
+    #[test]
+    fn push_overlay_panel_tracks_overlays_separately() {
+        let mut scene = RenderScene {
+            panels: Vec::new(),
+            glyphs: Vec::new(),
+            overlay_panels: Vec::new(),
+        };
+
+        push_panel(
+            &mut scene,
+            RECT {
+                left: 0,
+                top: 0,
+                right: 10,
+                bottom: 10,
+            },
+            [1.0, 0.0, 0.0, 1.0],
+            PanelEffect::TerminalFill,
+        );
+        push_overlay_panel(
+            &mut scene,
+            RECT {
+                left: 1,
+                top: 1,
+                right: 9,
+                bottom: 9,
+            },
+            [0.0, 1.0, 0.0, 1.0],
+            PanelEffect::TerminalCursor,
+        );
+
+        assert_eq!(scene.panels.len(), 1);
+        assert_eq!(scene.overlay_panels.len(), 1);
     }
 
     #[test]

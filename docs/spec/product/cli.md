@@ -139,6 +139,12 @@ The code area must read as a single panel surface rather than an outer code pane
 cli[window.appearance.code-panel.terminal-alignment]
 The terminal area must align with the bottom-left of the code area instead of appearing as a separately inset framed region.
 
+cli[window.appearance.terminal.selection.inverse]
+Selected terminal cells must render with visible reverse-video style rather than only dimming the foreground glyphs.
+
+cli[window.appearance.terminal.cursor.visible]
+The terminal caret must be visibly rendered using the terminal's active cursor position and cursor style.
+
 cli[window.interaction.drag]
 The launched terminal window must be draggable by clicking and dragging on the top accent strip.
 
@@ -150,6 +156,9 @@ The launched terminal window must still resize from its edges and corners using 
 
 cli[window.interaction.resize.live]
 While the user is actively resizing the window, the presented UI must continue reacting during the full grab, including moments when the pointer pauses and the client size is temporarily unchanged, instead of freezing and snapping only after the drag ends.
+
+cli[window.interaction.resize.terminal-live-output]
+Interactive resize must not stall terminal output presentation while other app-rendered panels continue updating.
 
 cli[window.interaction.resize.low-latency]
 Interactive resize must prioritize minimal latency so panel layout and terminal presentation track the live window dimensions as closely as possible.
