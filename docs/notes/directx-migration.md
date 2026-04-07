@@ -19,6 +19,7 @@ Reference inspiration:
 - Preserve the product's frameless presentation: Teamy Studio owns the full visible surface, with no OS title bar, caption buttons, or preference-colored borders.
 - Preserve native resize affordances despite the frameless shell: edge and corner hit-testing must still produce the expected OS resize cursors and resize behaviors.
 - Treat interactive resize as a low-latency path: the presented UI should keep reacting during the drag itself rather than freezing and snapping when the drag completes.
+- Keep the move loop hot too: grabbing the purple drag strip should not freeze animation or terminal redraw just because the pointer is momentarily stationary.
 - Keep cursor affordances explicit for frameless interactions: the custom purple drag strip should advertise itself with a move-style hover cursor.
 - Keep shader border treatments pixel-stable: highlight thickness should be authored in absolute pixels so small and large panels read consistently.
 - Drive shader animation from elapsed time, not frame count, so the scene reads the same at 60 Hz and 144 Hz.
@@ -102,6 +103,6 @@ Tasks:
 - The resize crash was caused by leaked swap-chain back-buffer references in the resource-barrier helper, not by the resize architecture itself.
 - The post-resize transparent gap came from leaving a native non-client resize frame attached to a visually frameless popup window; the fix was to make the whole window client-owned with `WM_NCCALCSIZE` and explicit edge/corner `WM_NCHITTEST` handling.
 - The expected Teamy Studio shell is now explicit: no OS chrome, no OS-colored borders, but native edge resize cursors and behaviors must still work.
-- Live resize should be treated as an always-hot path. Deferring all resize work until after the drag ends causes visible freeze-frame behavior, so the host should resize and present during the drag itself.
+- Live resize and live move should be treated as always-hot paths. Deferring presentation until the pointer moves again causes visible freeze-frame behavior, so the host should keep presenting throughout the OS move/size loop.
 - Panel borders need to be specified in pixels rather than UV percentages; otherwise large panels get a heavy white falloff while smaller panels barely show it.
 - Background animation should be tied to elapsed time in the shader constants, not presentation cadence, so motion remains visually stable across refresh rates.

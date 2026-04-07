@@ -18,10 +18,11 @@ use windows::Win32::UI::WindowsAndMessaging::{
     HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT, IDC_ARROW, IDC_SIZEALL, LoadCursorW, MSG, PM_REMOVE,
     PeekMessageW, PostQuitMessage, RegisterClassExW, SM_CXPADDEDBORDER, SM_CXSCREEN,
     SM_CXSIZEFRAME, SM_CYSCREEN, SM_CYSIZEFRAME, SW_SHOW, SYSTEM_METRICS_INDEX, SetTimer,
-    ShowWindow, TranslateMessage, WM_CHAR, WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_KEYUP,
-    WM_LBUTTONUP, WM_MOUSEWHEEL, WM_NCCALCSIZE, WM_NCHITTEST, WM_PAINT, WM_QUIT, WM_SETCURSOR,
-    WM_SIZE, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WNDCLASSEXW, WS_EX_APPWINDOW, WS_MAXIMIZEBOX,
-    WS_MINIMIZEBOX, WS_POPUP, WS_THICKFRAME, WS_VISIBLE,
+    ShowWindow, TranslateMessage, WM_CHAR, WM_DESTROY, WM_ENTERSIZEMOVE, WM_ERASEBKGND,
+    WM_EXITSIZEMOVE, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONUP, WM_MOUSEWHEEL, WM_NCCALCSIZE,
+    WM_NCHITTEST, WM_PAINT, WM_QUIT, WM_SETCURSOR, WM_SIZE, WM_SYSKEYDOWN, WM_SYSKEYUP,
+    WM_TIMER, WNDCLASSEXW, WS_EX_APPWINDOW, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP,
+    WS_THICKFRAME, WS_VISIBLE,
 };
 use windows::core::{PCWSTR, w};
 
@@ -55,6 +56,7 @@ struct AppState {
     app_home: AppHome,
     hwnd: Option<HWND>,
     workspace_window: Option<WorkspaceWindowState>,
+    in_move_size_loop: bool,
     terminal_font_height: i32,
     terminal_cell_width: i32,
     terminal_cell_height: i32,
@@ -98,6 +100,7 @@ pub fn run(
             app_home: app_home.clone(),
             hwnd: None,
             workspace_window,
+            in_move_size_loop: false,
             terminal_font_height,
             terminal_cell_width,
             terminal_cell_height,
@@ -206,6 +209,20 @@ extern "system" fn window_proc(
 ) -> LRESULT {
     match message {
         WM_NCCALCSIZE => LRESULT(0),
+        WM_ENTERSIZEMOVE => match with_app_state(|state| {
+            state.in_move_size_loop = true;
+            Ok(())
+        }) {
+            Ok(()) => LRESULT(0),
+            Err(error) => fail_and_close(hwnd, error),
+        },
+        WM_EXITSIZEMOVE => match with_app_state(|state| {
+            state.in_move_size_loop = false;
+            render_current_frame(state, hwnd, None)
+        }) {
+            Ok(()) => LRESULT(0),
+            Err(error) => fail_and_close(hwnd, error),
+        },
         WM_SIZE => match with_app_state(|state| {
             let layout =
                 client_layout(hwnd, state.terminal_cell_width, state.terminal_cell_height)?;
@@ -220,31 +237,29 @@ extern "system" fn window_proc(
             Ok(()) => LRESULT(0),
             Err(error) => fail_and_close(hwnd, error),
         },
-        WM_TIMER if wparam.0 == POLL_TIMER_ID => {
-            match with_app_state(|state| state.terminal.pump()) {
-                Ok(result) => {
-                    if result.should_close {
-                        unsafe {
-                            let _ = DestroyWindow(hwnd);
-                        }
+        WM_TIMER if wparam.0 == POLL_TIMER_ID => match handle_poll_timer(hwnd) {
+            Ok(should_close) => {
+                if should_close {
+                    unsafe {
+                        let _ = DestroyWindow(hwnd);
                     }
-                    LRESULT(0)
                 }
-                Err(error) => fail_and_close(hwnd, error),
+                LRESULT(0)
             }
-        }
+            Err(error) => fail_and_close(hwnd, error),
+        },
         WM_CHAR => {
             // cli[impl window.interaction.input]
             match with_app_state(|state| state.terminal.handle_char(wparam.0 as u32, lparam.0)) {
-                Ok(consumed) => {
+                Ok(result) => {
                     debug!(
                         message = "WM_CHAR",
                         code_unit = wparam.0 as u32,
                         lparam = lparam.0,
-                        consumed,
+                        consumed = result,
                         "processed keyboard char message"
                     );
-                    if consumed {
+                    if result {
                         return LRESULT(0);
                     }
                     unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
@@ -395,6 +410,21 @@ fn render_frame() -> eyre::Result<()> {
             return Ok(());
         };
         render_current_frame(state, hwnd, None)
+    })
+}
+
+fn handle_poll_timer(hwnd: HWND) -> eyre::Result<bool> {
+    with_app_state(|state| {
+        let result = state.terminal.pump()?;
+        if result.should_close {
+            return Ok(true);
+        }
+
+        if state.in_move_size_loop {
+            render_current_frame(state, hwnd, None)?;
+        }
+
+        Ok(false)
     })
 }
 

@@ -142,11 +142,14 @@ The terminal area must align with the bottom-left of the code area instead of ap
 cli[window.interaction.drag]
 The launched terminal window must be draggable by clicking and dragging on the top accent strip.
 
+cli[window.interaction.drag.live]
+While the user is holding the top accent strip to reposition the window, the app must keep presenting frames even if the pointer pauses and the window bounds temporarily stop changing.
+
 cli[window.interaction.resize.native-edges]
 The launched terminal window must still resize from its edges and corners using native OS hit-testing semantics and native resize cursors even though OS-managed chrome is hidden.
 
 cli[window.interaction.resize.live]
-While the user is actively resizing the window, the presented UI must continue reacting to the changing client size instead of freezing and snapping only after the drag ends.
+While the user is actively resizing the window, the presented UI must continue reacting during the full grab, including moments when the pointer pauses and the client size is temporarily unchanged, instead of freezing and snapping only after the drag ends.
 
 cli[window.interaction.resize.low-latency]
 Interactive resize must prioritize minimal latency so panel layout and terminal presentation track the live window dimensions as closely as possible.
