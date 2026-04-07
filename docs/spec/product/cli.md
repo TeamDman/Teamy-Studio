@@ -121,6 +121,24 @@ When a workspace is launched, the PTY-backed shell must start in that workspace'
 cli[window.appearance.chrome]
 The launched terminal window must render a visible accent strip above the terminal grid.
 
+cli[window.appearance.drag-cursor]
+Hovering the pointer over the purple drag strip must show a move-style drag affordance instead of the default arrow cursor.
+
+cli[window.appearance.panel-borders.absolute-pixels]
+Panel edge highlights must use absolute pixel thickness rather than proportional UV scaling so the border treatment stays visually consistent across large and small panels.
+
+cli[window.appearance.backgrounds.animated-time-based]
+Shader-driven panel backgrounds must animate from elapsed time rather than frame count so the motion reads the same at different refresh rates.
+
+cli[window.appearance.backgrounds.blue-half-transparent]
+The blue background panel must render at 50% alpha beneath the opaque notebook panels.
+
+cli[window.appearance.code-panel.single-surface]
+The code area must read as a single panel surface rather than an outer code panel containing a second nested framed terminal panel.
+
+cli[window.appearance.code-panel.terminal-alignment]
+The terminal area must align with the bottom-left of the code area instead of appearing as a separately inset framed region.
+
 cli[window.interaction.drag]
 The launched terminal window must be draggable by clicking and dragging on the top accent strip.
 

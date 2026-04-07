@@ -13,14 +13,14 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_CONTROL};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect,
-    GetWindowRect,
+    GetCursorPos, GetWindowRect, SetCursor,
     GetSystemMetrics, HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTCAPTION, HTCLIENT, HTLEFT,
-    HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT, IDC_ARROW, LoadCursorW, MSG, PM_REMOVE,
+    HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT, IDC_ARROW, IDC_SIZEALL, LoadCursorW, MSG, PM_REMOVE,
     PeekMessageW, PostQuitMessage, RegisterClassExW, SM_CXPADDEDBORDER, SM_CXSCREEN,
     SM_CXSIZEFRAME, SM_CYSCREEN, SM_CYSIZEFRAME, SW_SHOW, SYSTEM_METRICS_INDEX, SetTimer,
     ShowWindow, TranslateMessage, WM_CHAR, WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_KEYUP,
-    WM_LBUTTONUP, WM_MOUSEWHEEL, WM_NCCALCSIZE, WM_NCHITTEST, WM_PAINT, WM_QUIT, WM_SIZE,
-    WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WNDCLASSEXW, WS_EX_APPWINDOW, WS_MAXIMIZEBOX,
+    WM_LBUTTONUP, WM_MOUSEWHEEL, WM_NCCALCSIZE, WM_NCHITTEST, WM_PAINT, WM_QUIT, WM_SETCURSOR,
+    WM_SIZE, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WNDCLASSEXW, WS_EX_APPWINDOW, WS_MAXIMIZEBOX,
     WS_MINIMIZEBOX, WS_POPUP, WS_THICKFRAME, WS_VISIBLE,
 };
 use windows::core::{PCWSTR, w};
@@ -336,6 +336,11 @@ extern "system" fn window_proc(
             }
             Err(error) => fail_and_close(hwnd, error),
         },
+        WM_SETCURSOR => match handle_set_cursor(hwnd, lparam) {
+            Ok(true) => LRESULT(1),
+            Ok(false) => unsafe { DefWindowProcW(hwnd, message, wparam, lparam) },
+            Err(error) => fail_and_close(hwnd, error),
+        },
         WM_NCHITTEST => {
             let point = match screen_to_client_point(hwnd, lparam) {
                 Ok(point) => point,
@@ -644,6 +649,18 @@ fn screen_to_client_point(hwnd: HWND, lparam: LPARAM) -> eyre::Result<POINT> {
         x: extract_signed_coordinate(lparam.0),
         y: extract_signed_coordinate(lparam.0 >> 16),
     };
+    screen_to_client_point_from_screen(hwnd, screen_point)
+}
+
+fn cursor_client_point(hwnd: HWND) -> eyre::Result<POINT> {
+    let mut screen_point = POINT::default();
+    if unsafe { GetCursorPos(&mut screen_point) }.is_err() {
+        eyre::bail!("failed to query cursor position")
+    }
+    screen_to_client_point_from_screen(hwnd, screen_point)
+}
+
+fn screen_to_client_point_from_screen(hwnd: HWND, screen_point: POINT) -> eyre::Result<POINT> {
     let mut window_rect = RECT::default();
     if unsafe { GetWindowRect(hwnd, &mut window_rect) }.is_err() {
         eyre::bail!("failed to query window rect")
@@ -653,6 +670,24 @@ fn screen_to_client_point(hwnd: HWND, lparam: LPARAM) -> eyre::Result<POINT> {
         x: screen_point.x - window_rect.left,
         y: screen_point.y - window_rect.top,
     })
+}
+
+fn handle_set_cursor(hwnd: HWND, lparam: LPARAM) -> eyre::Result<bool> {
+    let hit_test_code = (lparam.0 & 0xFFFF) as u32;
+    if hit_test_code != HTCAPTION && hit_test_code != HTCLIENT {
+        return Ok(false);
+    }
+
+    let point = cursor_client_point(hwnd)?;
+    if !hit_test_drag_handle_point(hwnd, point)? {
+        return Ok(false);
+    }
+
+    let move_cursor = unsafe { LoadCursorW(None, IDC_SIZEALL).unwrap_or_default() };
+    unsafe {
+        SetCursor(Some(move_cursor));
+    }
+    Ok(true)
 }
 
 fn hit_test_resize_border(hwnd: HWND, point: POINT) -> eyre::Result<Option<LRESULT>> {

@@ -33,8 +33,6 @@ const SIDECAR_WIDTH: i32 = 86;
 const RESULT_PANEL_HEIGHT: i32 = 152;
 const MIN_CODE_PANEL_HEIGHT: i32 = 180;
 const PLUS_BUTTON_SIZE: i32 = 42;
-const CODE_PANEL_PADDING: i32 = 14;
-const CODE_PANEL_FOOTER_HEIGHT: i32 = 28;
 const SIDECAR_BUTTON_SIZE: i32 = 34;
 const SIDECAR_BUTTON_GAP: i32 = 12;
 const WIN32_INPUT_MODE_ENABLE: &[u8] = b"\x1b[?9001h";
@@ -217,25 +215,13 @@ impl TerminalLayout {
     }
 
     #[must_use]
-    pub fn shell_label_rect(self) -> RECT {
-        let code = self.code_panel_rect();
-        RECT {
-            left: code.left + CODE_PANEL_PADDING,
-            top: code.bottom - CODE_PANEL_FOOTER_HEIGHT,
-            right: code.right - CODE_PANEL_PADDING,
-            bottom: code.bottom - 4,
-        }
-    }
-
-    #[must_use]
     pub fn terminal_rect(self) -> RECT {
         let code = self.code_panel_rect();
-        let footer = self.shell_label_rect();
         RECT {
-            left: code.left + CODE_PANEL_PADDING,
-            top: code.top + CODE_PANEL_PADDING,
-            right: (code.right - CODE_PANEL_PADDING).max(code.left + CODE_PANEL_PADDING),
-            bottom: (footer.top - 8).max(code.top + CODE_PANEL_PADDING),
+            left: code.left,
+            top: code.top,
+            right: code.right,
+            bottom: code.bottom,
         }
     }
 
@@ -1253,9 +1239,9 @@ mod tests {
         assert!(sidecar.right <= code.left);
         assert!(code.bottom < result.top);
         assert!(result.bottom < plus.top);
-        assert!(terminal.left >= code.left);
-        assert!(terminal.right <= code.right);
-        assert!(terminal.bottom <= code.bottom);
+        assert_eq!(terminal.left, code.left);
+        assert_eq!(terminal.right, code.right);
+        assert_eq!(terminal.bottom, code.bottom);
         assert!((code.bottom - code.top) >= MIN_CODE_PANEL_HEIGHT);
     }
 

@@ -1,6 +1,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 use std::path::PathBuf;
+use std::time::Instant;
 
 use eyre::Context;
 use fontdb::{Database, Family, Query, Source};
@@ -55,6 +56,7 @@ struct Vertex {
 struct ShaderParams {
     slug_matrix: [[f32; 4]; 4],
     slug_viewport: [f32; 4],
+    scene_time: [f32; 4],
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -180,6 +182,7 @@ pub struct D3d12PanelRenderer {
     scissor_rect: RECT,
     width: u32,
     height: u32,
+    animation_start: Instant,
 }
 
 impl D3d12PanelRenderer {
@@ -261,6 +264,7 @@ impl D3d12PanelRenderer {
             scissor_rect,
             width,
             height,
+            animation_start: Instant::now(),
         })
     }
 
@@ -565,7 +569,8 @@ impl D3d12PanelRenderer {
     }
 
     fn update_shader_params(&self) -> eyre::Result<()> {
-        let params = build_shader_params(self.width as f32, self.height as f32);
+        let elapsed_seconds = self.animation_start.elapsed().as_secs_f32();
+        let params = build_shader_params(self.width as f32, self.height as f32, elapsed_seconds);
         unsafe {
             let mut mapped = std::ptr::null_mut();
             self.shader_param_buffer.Map(0, None, Some(&mut mapped))?;
@@ -644,7 +649,7 @@ pub fn build_panel_scene(layout: TerminalLayout) -> RenderScene {
     let code = [0.05, 0.06, 0.08, 1.0];
     let result = [0.84, 0.44, 0.13, 1.0];
     let button = [0.12, 0.13, 0.17, 1.0];
-    let mut panels = Vec::with_capacity(9);
+    let mut panels = Vec::with_capacity(8);
     panels.push(PanelRect {
         rect: RECT {
             left: 0,
@@ -668,11 +673,6 @@ pub fn build_panel_scene(layout: TerminalLayout) -> RenderScene {
     panels.push(PanelRect {
         rect: layout.code_panel_rect(),
         color: code,
-        effect: PanelEffect::CodePanel,
-    });
-    panels.push(PanelRect {
-        rect: layout.terminal_rect(),
-        color: [0.02, 0.02, 0.03, 1.0],
         effect: PanelEffect::CodePanel,
     });
     panels.push(PanelRect {
@@ -1932,7 +1932,7 @@ fn create_root_signature(device: &ID3D12Device) -> eyre::Result<ID3D12RootSignat
                     RegisterSpace: 0,
                 },
             },
-            ShaderVisibility: D3D12_SHADER_VISIBILITY_VERTEX,
+            ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
         },
         D3D12_ROOT_PARAMETER {
             ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
@@ -2181,7 +2181,7 @@ fn shader_path() -> PathBuf {
         .join("windows_panel_shaders.hlsl")
 }
 
-fn build_shader_params(width: f32, height: f32) -> ShaderParams {
+fn build_shader_params(width: f32, height: f32, elapsed_seconds: f32) -> ShaderParams {
     let safe_width = width.max(1.0);
     let safe_height = height.max(1.0);
     ShaderParams {
@@ -2192,6 +2192,7 @@ fn build_shader_params(width: f32, height: f32) -> ShaderParams {
             [0.0, 0.0, 0.0, 1.0],
         ],
         slug_viewport: [safe_width, safe_height, 0.0, 0.0],
+        scene_time: [elapsed_seconds, 0.0, 0.0, 0.0],
     }
 }
 
@@ -2615,10 +2616,11 @@ fn issue_transition_barrier(
 mod tests {
     use super::{
         FALLBACK_GLYPH, PanelEffect, RenderScene, append_rect, append_slug_band_data,
-        collect_scene_chars, cpu_slug_coverage, cpu_slug_coverage_all_curves, extract_glyph_curves,
-        load_terminal_font, push_centered_text, push_glyph, push_text_block,
-        render_snapshot_glyph_into_image,
+        build_panel_scene, collect_scene_chars, cpu_slug_coverage,
+        cpu_slug_coverage_all_curves, extract_glyph_curves, load_terminal_font,
+        push_centered_text, push_glyph, push_text_block, render_snapshot_glyph_into_image,
     };
+    use crate::app::windows_terminal::TerminalLayout;
     use eyre::WrapErr;
     use image::RgbaImage;
     use ttf_parser::{Face, OutlineBuilder};
@@ -2687,6 +2689,44 @@ mod tests {
         assert_eq!(vertices.len(), 6);
         assert_eq!(vertices[0].effect, PanelEffect::Text as u32 as f32);
         assert_eq!(vertices[0].glyph, u32::from('A') as f32);
+    }
+
+    #[test]
+    fn build_panel_scene_uses_single_code_panel_surface() {
+        let layout = TerminalLayout {
+            client_width: 1040,
+            client_height: 680,
+            cell_width: 8,
+            cell_height: 16,
+        };
+
+        let scene = build_panel_scene(layout);
+        let code_panel_count = scene
+            .panels
+            .iter()
+            .filter(|panel| matches!(panel.effect, PanelEffect::CodePanel))
+            .count();
+
+        assert_eq!(code_panel_count, 1);
+    }
+
+    #[test]
+    fn build_panel_scene_keeps_blue_background_half_transparent() {
+        let layout = TerminalLayout {
+            client_width: 1040,
+            client_height: 680,
+            cell_width: 8,
+            cell_height: 16,
+        };
+
+        let scene = build_panel_scene(layout);
+        let blue_panel = scene
+            .panels
+            .iter()
+            .find(|panel| matches!(panel.effect, PanelEffect::BlueBackground))
+            .expect("blue background panel should exist");
+
+        assert_eq!(blue_panel.color[3], 0.5);
     }
 
     #[test]

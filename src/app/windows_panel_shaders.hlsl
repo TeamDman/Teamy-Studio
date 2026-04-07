@@ -28,7 +28,15 @@ cbuffer ParamStruct : register(b0)
 {
     float4 slug_matrix[4];
     float4 slug_viewport;
+    float4 scene_time;
 };
+
+static const float PANEL_BORDER_WIDTH_PX = 14.0;
+static const float PANEL_BORDER_HIGHLIGHT = 0.78;
+
+float PanelTime() {
+    return scene_time.x;
+}
 
 float2 SlugDilate(float2 position, float2 texcoord, float2 normal, float4 jacobian, out float2 sampleCoord) {
     float2 n = normalize(normal);
@@ -300,36 +308,52 @@ float slug_coverage(float2 renderCoord, float bandStartFloat, float4 glyphData, 
 }
 
 float border_mask(float2 uv) {
-    float edge = min(min(uv.x, 1.0 - uv.x), min(uv.y, 1.0 - uv.y));
-    return smoothstep(0.0, 0.03, edge);
+    float uv_per_pixel_x = max(abs(ddx(uv.x)) + abs(ddy(uv.x)), 1.0 / 65536.0);
+    float uv_per_pixel_y = max(abs(ddx(uv.y)) + abs(ddy(uv.y)), 1.0 / 65536.0);
+    float edge_px = min(
+        min(uv.x / uv_per_pixel_x, (1.0 - uv.x) / uv_per_pixel_x),
+        min(uv.y / uv_per_pixel_y, (1.0 - uv.y) / uv_per_pixel_y)
+    );
+    return smoothstep(0.0, PANEL_BORDER_WIDTH_PX, edge_px);
 }
 
 float4 apply_blue_background(float2 uv, float4 color) {
-    float waves = 0.5 + 0.5 * sin((uv.x * 11.0) + (uv.y * 17.0));
-    float horizon = smoothstep(0.15, 0.95, uv.y);
-    float glow = lerp(0.82, 1.18, waves * horizon);
-    return float4(color.rgb * glow, color.a);
+    float t = PanelTime();
+    float drift = sin((uv.x * 6.5) + (uv.y * 4.2) - (t * 0.45));
+    float ripple = sin((uv.x * 18.0) - (uv.y * 7.0) + (t * 0.8));
+    float horizon = smoothstep(0.08, 0.96, uv.y);
+    float glow = 0.9 + (0.12 * drift * horizon) + (0.05 * ripple);
+    return float4(color.rgb * glow, 0.5);
 }
 
 float4 apply_sidecar(float2 uv, float4 color) {
-    float bands = 0.92 + 0.08 * sin(uv.y * 38.0);
+    float t = PanelTime();
+    float bands = 0.9 + (0.06 * sin((uv.y * 34.0) - (t * 0.7)));
+    float embers = 0.96 + (0.05 * sin((uv.x * 5.0) + (uv.y * 11.0) + (t * 0.45)));
+    bands *= embers;
     return float4(color.rgb * bands, color.a);
 }
 
 float4 apply_drag(float2 uv, float4 color) {
+    float t = PanelTime();
     float stripe = smoothstep(0.48, 0.52, abs(uv.y - 0.5));
-    float sheen = 0.9 + (0.08 * sin(uv.x * 20.0));
+    float sweep = sin((uv.x * 15.0) - (t * 1.4));
+    float sheen = 0.92 + (0.06 * sweep) + (0.04 * sin((uv.y * 9.0) + (t * 0.8)));
     return float4(color.rgb * (sheen + (0.05 * stripe)), color.a);
 }
 
 float4 apply_code(float2 uv, float4 color) {
-    float scan = 0.93 + 0.04 * sin(uv.y * 120.0);
-    float vignette = 1.0 - (0.08 * distance(uv, float2(0.5, 0.5)));
-    return float4(color.rgb * scan * vignette, color.a);
+    float t = PanelTime();
+    float scan = 0.95 + (0.02 * sin((uv.y * 110.0) - (t * 2.2)));
+    float drift = 0.98 + (0.03 * sin((uv.x * 4.0) + (uv.y * 6.5) + (t * 0.35)));
+    return float4(color.rgb * scan * drift, color.a);
 }
 
 float4 apply_result(float2 uv, float4 color) {
-    float warmth = 0.88 + 0.12 * sin((uv.x + uv.y) * 20.0);
+    float t = PanelTime();
+    float warmth = 0.9 + (0.08 * sin(((uv.x + uv.y) * 16.0) - (t * 0.6)));
+    float wave = 0.97 + (0.04 * sin((uv.x * 12.0) + (t * 0.9)));
+    warmth *= wave;
     return float4(color.rgb * warmth, color.a);
 }
 
@@ -370,6 +394,7 @@ float4 PSMain(PsInput input) : SV_TARGET {
     }
 
     float mask = border_mask(input.uv);
-    float3 border = lerp(float3(0.95, 0.95, 0.98), shaded.rgb, mask);
+    float edge = (1.0 - mask) * PANEL_BORDER_HIGHLIGHT;
+    float3 border = lerp(shaded.rgb, float3(0.95, 0.95, 0.98), edge);
     return float4(border, shaded.a);
 }
