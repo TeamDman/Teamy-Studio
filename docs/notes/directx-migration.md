@@ -22,6 +22,7 @@ Reference inspiration:
 - Keep the move loop hot too: grabbing the purple drag strip should not freeze animation or terminal redraw just because the pointer is momentarily stationary.
 - Keep cursor affordances explicit for frameless interactions: the custom purple drag strip should advertise itself with a move-style hover cursor.
 - Preserve terminal affordances that the software renderer used to imply for free: selected text should read as reverse video and the caret should remain visible with the terminal-provided cursor style.
+- The first frame during a drag/resize hold matters too: waiting on a low-priority timer introduces a visible startup hitch, so the modal-loop render path should wake itself immediately.
 - Keep shader border treatments pixel-stable: highlight thickness should be authored in absolute pixels so small and large panels read consistently.
 - Drive shader animation from elapsed time, not frame count, so the scene reads the same at 60 Hz and 144 Hz.
 
@@ -105,6 +106,7 @@ Tasks:
 - The post-resize transparent gap came from leaving a native non-client resize frame attached to a visually frameless popup window; the fix was to make the whole window client-owned with `WM_NCCALCSIZE` and explicit edge/corner `WM_NCHITTEST` handling.
 - The expected Teamy Studio shell is now explicit: no OS chrome, no OS-colored borders, but native edge resize cursors and behaviors must still work.
 - Live resize and live move should be treated as always-hot paths. Deferring presentation until the pointer moves again causes visible freeze-frame behavior, so the host should keep presenting throughout the OS move/size loop.
+- The frameless drag strip cannot hand control to the native `HTCAPTION` loop immediately on mouse-down without reintroducing Windows' click-and-hold startup delay; the host should defer that handoff until pointer motion clears a minimal 1 px custom drag threshold.
 - Fast resize should not let terminal output fall behind while the rest of the app keeps animating; the same modal-loop path that keeps the frame alive must also keep PTY output pumping.
 - Panel borders need to be specified in pixels rather than UV percentages; otherwise large panels get a heavy white falloff while smaller panels barely show it.
 - Background animation should be tied to elapsed time in the shader constants, not presentation cadence, so motion remains visually stable across refresh rates.

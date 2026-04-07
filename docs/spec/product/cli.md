@@ -145,17 +145,23 @@ Selected terminal cells must render with visible reverse-video style rather than
 cli[window.appearance.terminal.cursor.visible]
 The terminal caret must be visibly rendered using the terminal's active cursor position and cursor style.
 
+cli[window.appearance.terminal.cursor.legible-block]
+Block-style terminal cursors must keep the glyph beneath them legible instead of fully obliterating the cell contents.
+
 cli[window.interaction.drag]
 The launched terminal window must be draggable by clicking and dragging on the top accent strip.
 
 cli[window.interaction.drag.live]
-While the user is holding the top accent strip to reposition the window, the app must keep presenting frames even if the pointer pauses and the window bounds temporarily stop changing.
+While the user is holding the top accent strip to reposition the window, the app must keep presenting frames immediately, without a noticeable startup pause, even if the pointer pauses and the window bounds temporarily stop changing.
+
+cli[window.interaction.drag.threshold]
+The frameless drag strip must hand off to the native window move loop after no more than 1 pixel of pointer motion so the cursor and window stay visually aligned when dragging begins.
 
 cli[window.interaction.resize.native-edges]
 The launched terminal window must still resize from its edges and corners using native OS hit-testing semantics and native resize cursors even though OS-managed chrome is hidden.
 
 cli[window.interaction.resize.live]
-While the user is actively resizing the window, the presented UI must continue reacting during the full grab, including moments when the pointer pauses and the client size is temporarily unchanged, instead of freezing and snapping only after the drag ends.
+While the user is actively resizing the window, the presented UI must continue reacting immediately during the full grab, including moments when the pointer pauses and the client size is temporarily unchanged, instead of freezing and snapping only after the drag ends.
 
 cli[window.interaction.resize.terminal-live-output]
 Interactive resize must not stall terminal output presentation while other app-rendered panels continue updating.

@@ -16,13 +16,14 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetCursorPos, GetWindowRect, SetCursor,
     GetSystemMetrics, HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTCAPTION, HTCLIENT, HTLEFT,
     HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT, IDC_ARROW, IDC_SIZEALL, LoadCursorW, MSG, PM_REMOVE,
-    PeekMessageW, PostQuitMessage, RegisterClassExW, SM_CXPADDEDBORDER, SM_CXSCREEN,
+    PeekMessageW, PostMessageW, PostQuitMessage, RegisterClassExW, SM_CXPADDEDBORDER, SM_CXSCREEN,
     SM_CXSIZEFRAME, SM_CYSCREEN, SM_CYSIZEFRAME, SW_SHOW, SYSTEM_METRICS_INDEX, SetTimer,
-    ShowWindow, TranslateMessage, WM_CHAR, WM_DESTROY, WM_ENTERSIZEMOVE, WM_ERASEBKGND,
-    WM_EXITSIZEMOVE, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONUP, WM_MOUSEWHEEL, WM_NCCALCSIZE,
-    WM_NCHITTEST, WM_PAINT, WM_QUIT, WM_SETCURSOR, WM_SIZE, WM_SYSKEYDOWN, WM_SYSKEYUP,
-    WM_TIMER, WNDCLASSEXW, WS_EX_APPWINDOW, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP,
-    WS_THICKFRAME, WS_VISIBLE,
+    ShowWindow, TranslateMessage, WM_CHAR, WM_DESTROY,
+    WM_ENTERSIZEMOVE, WM_ERASEBKGND, WM_EXITSIZEMOVE, WM_KEYDOWN, WM_KEYUP,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCALCSIZE,
+    WM_NCHITTEST, WM_NCLBUTTONDOWN, WM_PAINT, WM_QUIT, WM_SETCURSOR, WM_SIZE,
+    WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WNDCLASSEXW, WS_EX_APPWINDOW, WS_MAXIMIZEBOX,
+    WS_MINIMIZEBOX, WS_POPUP, WS_THICKFRAME, WS_VISIBLE,
 };
 use windows::core::{PCWSTR, w};
 
@@ -48,6 +49,7 @@ const MAX_FONT_HEIGHT: i32 = -72;
 const FONT_ZOOM_STEP: i32 = 2;
 const INITIAL_WINDOW_WIDTH: i32 = 1040;
 const INITIAL_WINDOW_HEIGHT: i32 = 680;
+const DRAG_START_THRESHOLD_PX: i32 = 1;
 const MIN_RESIZE_BORDER_THICKNESS: i32 = 1;
 
 thread_local! {
@@ -58,6 +60,7 @@ struct AppState {
     app_home: AppHome,
     hwnd: Option<HWND>,
     workspace_window: Option<WorkspaceWindowState>,
+    pending_window_drag: Option<PendingWindowDrag>,
     in_move_size_loop: bool,
     terminal_font_height: i32,
     terminal_cell_width: i32,
@@ -67,6 +70,24 @@ struct AppState {
     output_cell_height: i32,
     terminal: TerminalSession,
     renderer: Option<D3d12PanelRenderer>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct PendingWindowDrag {
+    origin: POINT,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PendingDragAction {
+    NotHandled,
+    Consumed,
+    StartSystemDrag,
+}
+
+impl PendingDragAction {
+    fn clears_pending_drag(self) -> bool {
+        matches!(self, Self::NotHandled | Self::StartSystemDrag)
+    }
 }
 
 struct FontHandle(HFONT);
@@ -102,6 +123,7 @@ pub fn run(
             app_home: app_home.clone(),
             hwnd: None,
             workspace_window,
+            pending_window_drag: None,
             in_move_size_loop: false,
             terminal_font_height,
             terminal_cell_width,
@@ -213,6 +235,7 @@ extern "system" fn window_proc(
         WM_NCCALCSIZE => LRESULT(0),
         WM_ENTERSIZEMOVE => match with_app_state(|state| {
             state.in_move_size_loop = true;
+            render_current_frame(state, hwnd, None)?;
             Ok(())
         }) {
             Ok(()) => LRESULT(0),
@@ -220,7 +243,8 @@ extern "system" fn window_proc(
         },
         WM_EXITSIZEMOVE => match with_app_state(|state| {
             state.in_move_size_loop = false;
-            render_current_frame(state, hwnd, None)
+            render_current_frame(state, hwnd, None)?;
+            Ok(())
         }) {
             Ok(()) => LRESULT(0),
             Err(error) => fail_and_close(hwnd, error),
@@ -329,6 +353,16 @@ extern "system" fn window_proc(
             }
             Err(error) => fail_and_close(hwnd, error),
         },
+        WM_LBUTTONDOWN => match handle_left_button_down(hwnd, lparam) {
+            Ok(true) => LRESULT(0),
+            Ok(false) => unsafe { DefWindowProcW(hwnd, message, wparam, lparam) },
+            Err(error) => fail_and_close(hwnd, error),
+        },
+        WM_MOUSEMOVE => match handle_mouse_move(hwnd, wparam, lparam) {
+            Ok(true) => LRESULT(0),
+            Ok(false) => unsafe { DefWindowProcW(hwnd, message, wparam, lparam) },
+            Err(error) => fail_and_close(hwnd, error),
+        },
         WM_PAINT => match acknowledge_paint(hwnd) {
             Ok(()) => LRESULT(0),
             Err(error) => fail_and_close(hwnd, error),
@@ -366,15 +400,6 @@ extern "system" fn window_proc(
             match hit_test_resize_border(hwnd, point) {
                 Ok(Some(hit)) => return hit,
                 Ok(None) => {}
-                Err(error) => return fail_and_close(hwnd, error),
-            }
-
-            // cli[impl window.interaction.drag]
-            match hit_test_drag_handle_point(hwnd, point) {
-                Ok(true) => {
-                    return LRESULT(isize::try_from(HTCAPTION).expect("HTCAPTION fits in isize"));
-                }
-                Ok(false) => {}
                 Err(error) => return fail_and_close(hwnd, error),
             }
             LRESULT(isize::try_from(HTCLIENT).expect("HTCLIENT fits in isize"))
@@ -422,7 +447,7 @@ fn handle_poll_timer(hwnd: HWND) -> eyre::Result<bool> {
             return Ok(true);
         }
 
-        if state.in_move_size_loop {
+        if should_render_from_poll_timer(state.in_move_size_loop) {
             render_current_frame(state, hwnd, None)?;
         }
 
@@ -439,13 +464,13 @@ fn render_current_frame(
         if let Some(renderer) = state.renderer.as_mut() {
             renderer.resize(width, height)?;
         }
+    }
 
-        if state.terminal.pump()?.should_close {
-            unsafe {
-                let _ = DestroyWindow(hwnd);
-            }
-            return Ok(());
+    if (resize.is_some() || state.in_move_size_loop) && state.terminal.pump()?.should_close {
+        unsafe {
+            let _ = DestroyWindow(hwnd);
         }
+        return Ok(());
     }
 
     let layout = client_layout(hwnd, state.terminal_cell_width, state.terminal_cell_height)?;
@@ -532,9 +557,26 @@ fn push_terminal_display(
             cell_height,
         );
         for rect in terminal_cursor_overlay_rects(cell_rect, cursor.style) {
-            push_overlay_panel(scene, rect, cursor.color, PanelEffect::TerminalCursor);
+            push_overlay_panel(
+                scene,
+                rect,
+                terminal_cursor_overlay_color(cursor.color, cursor.style),
+                PanelEffect::TerminalCursor,
+            );
         }
     }
+}
+
+fn terminal_cursor_overlay_color(
+    mut color: [f32; 4],
+    style: TerminalDisplayCursorStyle,
+) -> [f32; 4] {
+    color[3] = match style {
+        TerminalDisplayCursorStyle::Block => 0.42,
+        TerminalDisplayCursorStyle::BlockHollow => 0.95,
+        TerminalDisplayCursorStyle::Bar | TerminalDisplayCursorStyle::Underline => 0.9,
+    };
+    color
 }
 
 fn terminal_cell_rect(
@@ -754,6 +796,10 @@ fn with_app_state<T>(f: impl FnOnce(&mut AppState) -> eyre::Result<T>) -> eyre::
 
 fn handle_left_button_up(hwnd: HWND, lparam: LPARAM) -> eyre::Result<bool> {
     with_app_state(|state| {
+        if state.pending_window_drag.take().is_some() {
+            return Ok(true);
+        }
+
         let Some(workspace_window) = state.workspace_window.clone() else {
             return Ok(false);
         };
@@ -791,11 +837,103 @@ fn handle_left_button_up(hwnd: HWND, lparam: LPARAM) -> eyre::Result<bool> {
     })
 }
 
+fn handle_left_button_down(hwnd: HWND, lparam: LPARAM) -> eyre::Result<bool> {
+    let point = POINT {
+        x: extract_signed_coordinate(lparam.0),
+        y: extract_signed_coordinate(lparam.0 >> 16),
+    };
+    let in_drag_handle = hit_test_drag_handle_point(hwnd, point)?;
+
+    with_app_state(|state| {
+        state.pending_window_drag = None;
+        if !in_drag_handle {
+            return Ok(false);
+        }
+
+        state.pending_window_drag = Some(PendingWindowDrag { origin: point });
+        Ok(true)
+    })
+}
+
+fn handle_mouse_move(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) -> eyre::Result<bool> {
+    let point = POINT {
+        x: extract_signed_coordinate(lparam.0),
+        y: extract_signed_coordinate(lparam.0 >> 16),
+    };
+
+    let action = with_app_state(|state| {
+        let Some(pending_drag) = state.pending_window_drag else {
+            return Ok(PendingDragAction::NotHandled);
+        };
+
+        let action = update_pending_drag_action(
+            pending_drag,
+            point,
+            (wparam.0 & 0x0001) != 0,
+            DRAG_START_THRESHOLD_PX,
+            DRAG_START_THRESHOLD_PX,
+        );
+        if action.clears_pending_drag() {
+            state.pending_window_drag = None;
+        }
+        Ok(action)
+    })?;
+
+    match action {
+        PendingDragAction::NotHandled => Ok(false),
+        PendingDragAction::Consumed => Ok(true),
+        PendingDragAction::StartSystemDrag => {
+            begin_system_window_drag(hwnd, point)
+                .wrap_err("failed to hand deferred drag strip motion to the native move loop")?;
+            Ok(true)
+        }
+    }
+}
+
+fn update_pending_drag_action(
+    pending_drag: PendingWindowDrag,
+    point: POINT,
+    left_button_down: bool,
+    threshold_x: i32,
+    threshold_y: i32,
+) -> PendingDragAction {
+    if !left_button_down {
+        return PendingDragAction::NotHandled;
+    }
+
+    if !drag_threshold_exceeded(
+        pending_drag.origin,
+        point,
+        threshold_x,
+        threshold_y,
+    ) {
+        return PendingDragAction::Consumed;
+    }
+
+    PendingDragAction::StartSystemDrag
+}
+
 fn hit_test_drag_handle_point(hwnd: HWND, point: POINT) -> eyre::Result<bool> {
     with_app_state(|state| {
         let layout = client_layout(hwnd, state.terminal_cell_width, state.terminal_cell_height)?;
         Ok(point_in_rect(point, layout.drag_handle_rect()))
     })
+}
+
+fn begin_system_window_drag(hwnd: HWND, client_point: POINT) -> eyre::Result<()> {
+    let screen_point = client_to_screen_point(hwnd, client_point)?;
+    let (wparam, lparam) = system_drag_message(screen_point);
+    unsafe {
+        let _ = PostMessageW(Some(hwnd), WM_NCLBUTTONDOWN, wparam, lparam);
+    }
+    Ok(())
+}
+
+fn system_drag_message(screen_point: POINT) -> (WPARAM, LPARAM) {
+    (
+        WPARAM(usize::try_from(HTCAPTION).expect("HTCAPTION fits in usize")),
+        LPARAM(pack_point_lparam(screen_point)),
+    )
 }
 
 fn screen_to_client_point(hwnd: HWND, lparam: LPARAM) -> eyre::Result<POINT> {
@@ -826,7 +964,23 @@ fn screen_to_client_point_from_screen(hwnd: HWND, screen_point: POINT) -> eyre::
     })
 }
 
+fn client_to_screen_point(hwnd: HWND, client_point: POINT) -> eyre::Result<POINT> {
+    let mut window_rect = RECT::default();
+    if unsafe { GetWindowRect(hwnd, &mut window_rect) }.is_err() {
+        eyre::bail!("failed to query window rect")
+    }
+
+    Ok(POINT {
+        x: window_rect.left + client_point.x,
+        y: window_rect.top + client_point.y,
+    })
+}
+
 fn handle_set_cursor(hwnd: HWND, lparam: LPARAM) -> eyre::Result<bool> {
+    if !should_override_drag_cursor(with_app_state(|state| Ok(state.in_move_size_loop))?) {
+        return Ok(false);
+    }
+
     let hit_test_code = (lparam.0 & 0xFFFF) as u32;
     if hit_test_code != HTCAPTION && hit_test_code != HTCLIENT {
         return Ok(false);
@@ -877,6 +1031,21 @@ fn fail_and_close(hwnd: HWND, error: eyre::Error) -> LRESULT {
 
 fn extract_signed_coordinate(value: isize) -> i32 {
     (value as i16) as i32
+}
+
+fn pack_point_lparam(point: POINT) -> isize {
+    let x = (point.x as u16) as u32;
+    let y = (point.y as u16) as u32;
+    ((y << 16) | x) as isize
+}
+
+fn drag_threshold_exceeded(
+    origin: POINT,
+    current: POINT,
+    threshold_x: i32,
+    threshold_y: i32,
+) -> bool {
+    (current.x - origin.x).abs() >= threshold_x || (current.y - origin.y).abs() >= threshold_y
 }
 
 fn wide_null_terminated(value: &str) -> Vec<u16> {
@@ -950,6 +1119,118 @@ mod tests {
         assert_eq!(rects[2].left, 10);
         assert_eq!(rects[3].right, 18);
     }
+
+    #[test]
+    fn drag_cursor_override_is_disabled_during_native_move_size() {
+        assert!(should_override_drag_cursor(false));
+        assert!(!should_override_drag_cursor(true));
+    }
+
+    #[test]
+    fn drag_threshold_requires_real_motion() {
+        assert!(!drag_threshold_exceeded(
+            POINT { x: 10, y: 20 },
+            POINT { x: 10, y: 20 },
+            DRAG_START_THRESHOLD_PX,
+            DRAG_START_THRESHOLD_PX,
+        ));
+    }
+
+    #[test]
+    fn drag_threshold_starts_native_drag_after_one_pixel_of_motion() {
+        assert!(drag_threshold_exceeded(
+            POINT { x: 10, y: 20 },
+            POINT { x: 11, y: 20 },
+            DRAG_START_THRESHOLD_PX,
+            DRAG_START_THRESHOLD_PX,
+        ));
+        assert!(drag_threshold_exceeded(
+            POINT { x: 10, y: 20 },
+            POINT { x: 10, y: 21 },
+            DRAG_START_THRESHOLD_PX,
+            DRAG_START_THRESHOLD_PX,
+        ));
+    }
+
+    #[test]
+    fn pending_drag_is_consumed_before_threshold_is_crossed() {
+        let action = update_pending_drag_action(
+            PendingWindowDrag {
+                origin: POINT { x: 10, y: 20 },
+            },
+            POINT { x: 10, y: 20 },
+            true,
+            DRAG_START_THRESHOLD_PX,
+            DRAG_START_THRESHOLD_PX,
+        );
+
+        assert_eq!(action, PendingDragAction::Consumed);
+        assert!(!action.clears_pending_drag());
+    }
+
+    #[test]
+    fn pending_drag_requests_native_drag_after_threshold_is_crossed() {
+        let action = update_pending_drag_action(
+            PendingWindowDrag {
+                origin: POINT { x: 10, y: 20 },
+            },
+            POINT { x: 11, y: 20 },
+            true,
+            DRAG_START_THRESHOLD_PX,
+            DRAG_START_THRESHOLD_PX,
+        );
+
+        assert_eq!(action, PendingDragAction::StartSystemDrag);
+        assert!(action.clears_pending_drag());
+    }
+
+    #[test]
+    fn pending_drag_clears_when_button_is_released() {
+        let action = update_pending_drag_action(
+            PendingWindowDrag {
+                origin: POINT { x: 10, y: 20 },
+            },
+            POINT { x: 10, y: 20 },
+            false,
+            DRAG_START_THRESHOLD_PX,
+            DRAG_START_THRESHOLD_PX,
+        );
+
+        assert_eq!(action, PendingDragAction::NotHandled);
+        assert!(action.clears_pending_drag());
+    }
+
+    #[test]
+    fn system_drag_message_targets_caption_with_screen_coordinates() {
+        let (wparam, lparam) = system_drag_message(POINT { x: 300, y: 400 });
+
+        assert_eq!(wparam.0, usize::try_from(HTCAPTION).unwrap());
+        assert_eq!(lparam.0, pack_point_lparam(POINT { x: 300, y: 400 }));
+    }
+
+    #[test]
+    fn timer_render_path_stays_active_only_during_move_size() {
+        assert!(!should_render_from_poll_timer(false));
+        assert!(should_render_from_poll_timer(true));
+    }
+
+    #[test]
+    fn block_cursor_overlay_is_translucent() {
+        let color = terminal_cursor_overlay_color(
+            [0.8, 0.9, 1.0, 1.0],
+            TerminalDisplayCursorStyle::Block,
+        );
+
+        assert_eq!(color, [0.8, 0.9, 1.0, 0.42]);
+    }
+}
+
+fn should_override_drag_cursor(in_move_size_loop: bool) -> bool {
+    !in_move_size_loop
+}
+
+fn should_render_from_poll_timer(in_move_size_loop: bool) -> bool {
+    in_move_size_loop
 }
 
 fn classify_resize_border_hit(
