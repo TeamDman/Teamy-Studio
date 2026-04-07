@@ -13,12 +13,15 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_CONTROL};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect,
-    GetSystemMetrics, GetWindowRect, HTCAPTION, HTCLIENT, IDC_ARROW, LoadCursorW, MSG, PM_REMOVE,
-    PeekMessageW, PostQuitMessage, RegisterClassExW, SM_CXSCREEN, SM_CYSCREEN, SW_SHOW, SetTimer,
+    GetWindowRect,
+    GetSystemMetrics, HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTCAPTION, HTCLIENT, HTLEFT,
+    HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT, IDC_ARROW, LoadCursorW, MSG, PM_REMOVE,
+    PeekMessageW, PostQuitMessage, RegisterClassExW, SM_CXPADDEDBORDER, SM_CXSCREEN,
+    SM_CXSIZEFRAME, SM_CYSCREEN, SM_CYSIZEFRAME, SW_SHOW, SYSTEM_METRICS_INDEX, SetTimer,
     ShowWindow, TranslateMessage, WM_CHAR, WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_KEYUP,
-    WM_LBUTTONUP, WM_MOUSEWHEEL, WM_NCHITTEST, WM_PAINT, WM_QUIT, WM_SIZE, WM_SYSKEYDOWN,
-    WM_SYSKEYUP, WM_TIMER, WNDCLASSEXW, WS_EX_APPWINDOW, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP,
-    WS_THICKFRAME, WS_VISIBLE,
+    WM_LBUTTONUP, WM_MOUSEWHEEL, WM_NCCALCSIZE, WM_NCHITTEST, WM_PAINT, WM_QUIT, WM_SIZE,
+    WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WNDCLASSEXW, WS_EX_APPWINDOW, WS_MAXIMIZEBOX,
+    WS_MINIMIZEBOX, WS_POPUP, WS_THICKFRAME, WS_VISIBLE,
 };
 use windows::core::{PCWSTR, w};
 
@@ -42,6 +45,7 @@ const MAX_FONT_HEIGHT: i32 = -72;
 const FONT_ZOOM_STEP: i32 = 2;
 const INITIAL_WINDOW_WIDTH: i32 = 1040;
 const INITIAL_WINDOW_HEIGHT: i32 = 680;
+const MIN_RESIZE_BORDER_THICKNESS: i32 = 1;
 
 thread_local! {
     static APP_STATE: RefCell<Option<AppState>> = const { RefCell::new(None) };
@@ -179,9 +183,7 @@ fn create_window() -> eyre::Result<HWND> {
 fn message_loop() -> eyre::Result<()> {
     loop {
         let mut message = MSG::default();
-        let mut handled_message = false;
         while unsafe { PeekMessageW(&mut message, None, 0, 0, PM_REMOVE) }.into() {
-            handled_message = true;
             if message.message == WM_QUIT {
                 return Ok(());
             }
@@ -192,9 +194,7 @@ fn message_loop() -> eyre::Result<()> {
             }
         }
 
-        if !handled_message {
-            render_frame()?;
-        }
+        render_frame()?;
     }
 }
 
@@ -205,13 +205,16 @@ extern "system" fn window_proc(
     lparam: LPARAM,
 ) -> LRESULT {
     match message {
+        WM_NCCALCSIZE => LRESULT(0),
         WM_SIZE => match with_app_state(|state| {
             let layout =
                 client_layout(hwnd, state.terminal_cell_width, state.terminal_cell_height)?;
             state.terminal.resize(layout)?;
-            if let Some(renderer) = state.renderer.as_mut() {
-                renderer.resize(layout.client_width as u32, layout.client_height as u32)?;
-            }
+            render_current_frame(
+                state,
+                hwnd,
+                Some((layout.client_width as u32, layout.client_height as u32)),
+            )?;
             Ok(())
         }) {
             Ok(()) => LRESULT(0),
@@ -334,13 +337,18 @@ extern "system" fn window_proc(
             Err(error) => fail_and_close(hwnd, error),
         },
         WM_NCHITTEST => {
-            // cli[impl window.interaction.drag]
-            let default_hit = unsafe { DefWindowProcW(hwnd, message, wparam, lparam) };
-            if default_hit.0 != isize::try_from(HTCLIENT).expect("HTCLIENT fits in isize") {
-                return default_hit;
+            let point = match screen_to_client_point(hwnd, lparam) {
+                Ok(point) => point,
+                Err(error) => return fail_and_close(hwnd, error),
+            };
+            match hit_test_resize_border(hwnd, point) {
+                Ok(Some(hit)) => return hit,
+                Ok(None) => {}
+                Err(error) => return fail_and_close(hwnd, error),
             }
 
-            match hit_test_drag_handle(hwnd, lparam) {
+            // cli[impl window.interaction.drag]
+            match hit_test_drag_handle_point(hwnd, point) {
                 Ok(true) => {
                     return LRESULT(isize::try_from(HTCAPTION).expect("HTCAPTION fits in isize"));
                 }
@@ -381,47 +389,61 @@ fn render_frame() -> eyre::Result<()> {
         let Some(hwnd) = state.hwnd else {
             return Ok(());
         };
-        let layout = client_layout(hwnd, state.terminal_cell_width, state.terminal_cell_height)?;
-        let mut scene = build_panel_scene(layout);
-        let cell_number = state
-            .workspace_window
-            .as_ref()
-            .map_or(1, |workspace_window| workspace_window.cell_number);
-        let output_text = build_output_panel_text(state);
-        let terminal_glyphs = state.terminal.visible_glyphs()?;
-
-        push_centered_text(
-            &mut scene,
-            layout.drag_handle_rect(),
-            &cell_number.to_string(),
-            [0.95, 0.95, 0.98, 1.0],
-        );
-        let terminal_rect = inset_rect(layout.terminal_rect(), 4);
-        for glyph in terminal_glyphs {
-            let left = terminal_rect.left + (glyph.column * state.terminal_cell_width);
-            let top = terminal_rect.top + (glyph.row * state.terminal_cell_height);
-            let rect = RECT {
-                left,
-                top,
-                right: left + state.terminal_cell_width,
-                bottom: top + state.terminal_cell_height,
-            };
-            push_glyph(&mut scene, rect, glyph.character, glyph.color);
-        }
-        push_text_block(
-            &mut scene,
-            inset_rect(layout.result_panel_rect(), 14),
-            &output_text,
-            state.output_cell_width,
-            state.output_cell_height,
-            [0.96, 0.95, 0.90, 1.0],
-        );
-
-        let Some(renderer) = state.renderer.as_mut() else {
-            return Ok(());
-        };
-        renderer.render(&scene)
+        render_current_frame(state, hwnd, None)
     })
+}
+
+fn render_current_frame(
+    state: &mut AppState,
+    hwnd: HWND,
+    resize: Option<(u32, u32)>,
+) -> eyre::Result<()> {
+    if let Some((width, height)) = resize {
+        if let Some(renderer) = state.renderer.as_mut() {
+            renderer.resize(width, height)?;
+        }
+    }
+
+    let layout = client_layout(hwnd, state.terminal_cell_width, state.terminal_cell_height)?;
+    let mut scene = build_panel_scene(layout);
+    let cell_number = state
+        .workspace_window
+        .as_ref()
+        .map_or(1, |workspace_window| workspace_window.cell_number);
+    let output_text = build_output_panel_text(state);
+    let terminal_glyphs = state.terminal.visible_glyphs()?;
+
+    push_centered_text(
+        &mut scene,
+        layout.drag_handle_rect(),
+        &cell_number.to_string(),
+        [0.95, 0.95, 0.98, 1.0],
+    );
+    let terminal_rect = inset_rect(layout.terminal_rect(), 4);
+    for glyph in terminal_glyphs {
+        let left = terminal_rect.left + (glyph.column * state.terminal_cell_width);
+        let top = terminal_rect.top + (glyph.row * state.terminal_cell_height);
+        let rect = RECT {
+            left,
+            top,
+            right: left + state.terminal_cell_width,
+            bottom: top + state.terminal_cell_height,
+        };
+        push_glyph(&mut scene, rect, glyph.character, glyph.color);
+    }
+    push_text_block(
+        &mut scene,
+        inset_rect(layout.result_panel_rect(), 14),
+        &output_text,
+        state.output_cell_width,
+        state.output_cell_height,
+        [0.96, 0.95, 0.90, 1.0],
+    );
+
+    let Some(renderer) = state.renderer.as_mut() else {
+        return Ok(());
+    };
+    renderer.render(&scene)
 }
 
 fn build_output_panel_text(state: &AppState) -> String {
@@ -610,29 +632,46 @@ fn handle_left_button_up(hwnd: HWND, lparam: LPARAM) -> eyre::Result<bool> {
     })
 }
 
-fn hit_test_drag_handle(hwnd: HWND, lparam: LPARAM) -> eyre::Result<bool> {
+fn hit_test_drag_handle_point(hwnd: HWND, point: POINT) -> eyre::Result<bool> {
     with_app_state(|state| {
         let layout = client_layout(hwnd, state.terminal_cell_width, state.terminal_cell_height)?;
-        let point = screen_to_client_point(hwnd, lparam)?;
         Ok(point_in_rect(point, layout.drag_handle_rect()))
     })
 }
 
 fn screen_to_client_point(hwnd: HWND, lparam: LPARAM) -> eyre::Result<POINT> {
+    let screen_point = POINT {
+        x: extract_signed_coordinate(lparam.0),
+        y: extract_signed_coordinate(lparam.0 >> 16),
+    };
     let mut window_rect = RECT::default();
     if unsafe { GetWindowRect(hwnd, &mut window_rect) }.is_err() {
         eyre::bail!("failed to query window rect")
     }
 
-    let point = POINT {
-        x: extract_signed_coordinate(lparam.0),
-        y: extract_signed_coordinate(lparam.0 >> 16),
-    };
-
     Ok(POINT {
-        x: point.x - window_rect.left,
-        y: point.y - window_rect.top,
+        x: screen_point.x - window_rect.left,
+        y: screen_point.y - window_rect.top,
     })
+}
+
+fn hit_test_resize_border(hwnd: HWND, point: POINT) -> eyre::Result<Option<LRESULT>> {
+    let mut client_rect = RECT::default();
+    if unsafe { GetClientRect(hwnd, &mut client_rect) }.is_err() {
+        eyre::bail!("failed to query client rect for hit testing")
+    }
+
+    let resize_border_x = resize_border_thickness(SM_CXSIZEFRAME);
+    let resize_border_y = resize_border_thickness(SM_CYSIZEFRAME);
+    let hit = classify_resize_border_hit(client_rect, point, resize_border_x, resize_border_y);
+
+    Ok(hit.map(|code| LRESULT(isize::try_from(code).expect("hit-test code fits in isize"))))
+}
+
+fn resize_border_thickness(size_frame_metric: SYSTEM_METRICS_INDEX) -> i32 {
+    let padded_border = unsafe { GetSystemMetrics(SM_CXPADDEDBORDER) };
+    let size_frame = unsafe { GetSystemMetrics(size_frame_metric) };
+    (size_frame + padded_border).max(MIN_RESIZE_BORDER_THICKNESS)
 }
 
 fn point_in_rect(point: POINT, rect: RECT) -> bool {
@@ -653,4 +692,86 @@ fn extract_signed_coordinate(value: isize) -> i32 {
 
 fn wide_null_terminated(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resize_border_prefers_top_left_corner() {
+        let client_rect = RECT {
+            left: 0,
+            top: 0,
+            right: 400,
+            bottom: 300,
+        };
+        let point = POINT { x: 2, y: 3 };
+
+        let hit = classify_resize_border_hit(client_rect, point, 8, 8);
+
+        assert_eq!(hit, Some(HTTOPLEFT));
+    }
+
+    #[test]
+    fn resize_border_prefers_bottom_right_corner() {
+        let client_rect = RECT {
+            left: 0,
+            top: 0,
+            right: 400,
+            bottom: 300,
+        };
+        let point = POINT { x: 399, y: 299 };
+
+        let hit = classify_resize_border_hit(client_rect, point, 8, 8);
+
+        assert_eq!(hit, Some(HTBOTTOMRIGHT));
+    }
+
+    #[test]
+    fn resize_border_ignores_interior_points() {
+        let client_rect = RECT {
+            left: 0,
+            top: 0,
+            right: 400,
+            bottom: 300,
+        };
+        let point = POINT { x: 200, y: 120 };
+
+        let hit = classify_resize_border_hit(client_rect, point, 8, 8);
+
+        assert_eq!(hit, None);
+    }
+}
+
+fn classify_resize_border_hit(
+    client_rect: RECT,
+    point: POINT,
+    resize_border_x: i32,
+    resize_border_y: i32,
+) -> Option<u32> {
+    let left = point.x < client_rect.left + resize_border_x;
+    let right = point.x >= client_rect.right - resize_border_x;
+    let top = point.y < client_rect.top + resize_border_y;
+    let bottom = point.y >= client_rect.bottom - resize_border_y;
+
+    if top && left {
+        Some(HTTOPLEFT)
+    } else if top && right {
+        Some(HTTOPRIGHT)
+    } else if bottom && left {
+        Some(HTBOTTOMLEFT)
+    } else if bottom && right {
+        Some(HTBOTTOMRIGHT)
+    } else if left {
+        Some(HTLEFT)
+    } else if right {
+        Some(HTRIGHT)
+    } else if top {
+        Some(HTTOP)
+    } else if bottom {
+        Some(HTBOTTOM)
+    } else {
+        None
+    }
 }

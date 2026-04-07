@@ -106,6 +106,9 @@ The launched terminal window must start at a fixed size suitable for an 80x24-st
 cli[window.appearance.translucent]
 The launched terminal window must use layered-window alpha so the shell surface remains translucent.
 
+cli[window.appearance.os-chrome-none]
+The launched terminal window must not show OS-managed chrome or decorations such as the title bar, icon, caption buttons, or user-preference-colored window borders.
+
 cli[window.appearance.shell]
 The launched window must host a shell backed by a PTY and render terminal content through `libghostty-vt`.
 
@@ -120,6 +123,15 @@ The launched terminal window must render a visible accent strip above the termin
 
 cli[window.interaction.drag]
 The launched terminal window must be draggable by clicking and dragging on the top accent strip.
+
+cli[window.interaction.resize.native-edges]
+The launched terminal window must still resize from its edges and corners using native OS hit-testing semantics and native resize cursors even though OS-managed chrome is hidden.
+
+cli[window.interaction.resize.live]
+While the user is actively resizing the window, the presented UI must continue reacting to the changing client size instead of freezing and snapping only after the drag ends.
+
+cli[window.interaction.resize.low-latency]
+Interactive resize must prioritize minimal latency so panel layout and terminal presentation track the live window dimensions as closely as possible.
 
 cli[window.interaction.input]
 The launched terminal window must forward keyboard input into the PTY-backed shell session.

@@ -152,6 +152,58 @@ float CalcCoverage(float xcov, float ycov, float xwgt, float ywgt) {
     return saturate(max(abs(xcov * xwgt + ycov * ywgt) / max(xwgt + ywgt, 1.0 / 65536.0), min(abs(xcov), abs(ycov))));
 }
 
+bool IsDegenerateQuadratic(float4 p12, float2 p3) {
+    float2 a = p12.xy - p12.zw * 2.0 + p3;
+    return all(abs(a) <= float2(1.0 / 1024.0, 1.0 / 1024.0));
+}
+
+bool ShouldUseDegenerateLineFallback(float4 p12, float2 p3) {
+    if (!IsDegenerateQuadratic(p12, p3)) {
+        return false;
+    }
+
+    float2 delta = abs(p3 - p12.xy);
+    return all(delta > float2(1.0 / 65536.0, 1.0 / 65536.0));
+}
+
+bool CrossesZeroHalfOpen(float a, float b) {
+    return ((a <= 0.0) && (b > 0.0)) || ((b <= 0.0) && (a > 0.0));
+}
+
+void ApplyDegenerateHorizontalCoverage(
+    float2 p0,
+    float2 p1,
+    float pixelsPerEm,
+    inout float xcov,
+    inout float xwgt
+) {
+    float dy = p1.y - p0.y;
+    if (CrossesZeroHalfOpen(p0.y, p1.y) && abs(dy) > (1.0 / 65536.0)) {
+        float t = -p0.y / dy;
+        float xr = (p0.x + (p1.x - p0.x) * t) * pixelsPerEm;
+        float sample = saturate(xr + 0.5);
+        xcov += (p1.y > p0.y) ? sample : -sample;
+        xwgt = max(xwgt, saturate(1.0 - abs(xr) * 2.0));
+    }
+}
+
+void ApplyDegenerateVerticalCoverage(
+    float2 p0,
+    float2 p1,
+    float pixelsPerEm,
+    inout float ycov,
+    inout float ywgt
+) {
+    float dx = p1.x - p0.x;
+    if (CrossesZeroHalfOpen(p0.x, p1.x) && abs(dx) > (1.0 / 65536.0)) {
+        float t = -p0.x / dx;
+        float yr = (p0.y + (p1.y - p0.y) * t) * pixelsPerEm;
+        float sample = saturate(yr + 0.5);
+        ycov += (p1.x > p0.x) ? sample : -sample;
+        ywgt = max(ywgt, saturate(1.0 - abs(yr) * 2.0));
+    }
+}
+
 uint ClampBandIndex(float coord, float scale, float offset, uint bandMax) {
     return (uint)clamp((int)(coord * scale + offset), 0, (int)bandMax);
 }
@@ -191,6 +243,11 @@ float slug_coverage(float2 renderCoord, float bandStartFloat, float4 glyphData, 
             break;
         }
 
+        if (ShouldUseDegenerateLineFallback(p12, p3)) {
+            ApplyDegenerateHorizontalCoverage(p12.xy, p3, pixelsPerEm.x, xcov, xwgt);
+            continue;
+        }
+
         uint hcode = CalcRootCode(p12.y, p12.w, p3.y);
         if (hcode != 0U) {
             float2 hr = SolveHorizPoly(p12, p3) * pixelsPerEm.x;
@@ -218,6 +275,11 @@ float slug_coverage(float2 renderCoord, float bandStartFloat, float4 glyphData, 
 
         if (max(max(p12.y, p12.w), p3.y) * pixelsPerEm.y < -0.5) {
             break;
+        }
+
+        if (ShouldUseDegenerateLineFallback(p12, p3)) {
+            ApplyDegenerateVerticalCoverage(p12.xy, p3, pixelsPerEm.y, ycov, ywgt);
+            continue;
         }
 
         uint vcode = CalcRootCode(p12.x, p12.z, p3.x);

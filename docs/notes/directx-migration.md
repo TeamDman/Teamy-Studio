@@ -16,6 +16,9 @@ Reference inspiration:
 - Keep each slice runnable and testable on its own.
 - Prefer the sample's low-latency frame pacing model over a paint-on-demand WM_PAINT loop.
 - Accept higher setup complexity if it buys explicit presentation control and future in-app drag responsiveness.
+- Preserve the product's frameless presentation: Teamy Studio owns the full visible surface, with no OS title bar, caption buttons, or preference-colored borders.
+- Preserve native resize affordances despite the frameless shell: edge and corner hit-testing must still produce the expected OS resize cursors and resize behaviors.
+- Treat interactive resize as a low-latency path: the presented UI should keep reacting during the drag itself rather than freezing and snapping when the drag completes.
 
 ## Plan
 
@@ -42,6 +45,7 @@ Tasks:
 
 Status:
 - complete: the window host now targets a dedicated D3D12 panel renderer instead of the previous GDI backbuffer blit path
+- complete: the Win32 host now claims the full window as client area and supplies its own edge/corner hit-testing so the app stays frameless while retaining native resize cursors
 
 ### Phase 2: Move Notebook Chrome Into Shader Panels
 
@@ -54,6 +58,7 @@ Tasks:
 
 Status:
 - complete: the D3D12 panel renderer now owns those surfaces and shades them in HLSL
+- complete: OS-managed chrome is intentionally absent; the visible accent strip and notebook frame are entirely app-rendered surfaces
 
 ### Phase 3: Restrict Transparency to the Blue Background
 
@@ -87,3 +92,10 @@ Tasks:
 1. switch the D3D12 swap chain from the initial HWND presentation path to the composition-aware path needed for real per-pixel blue-only transparency
 2. move terminal glyph rendering into the same presented frame
 3. add time-driven cloud motion once the composition path is in place
+
+## Recent Window-Host Findings
+
+- The resize crash was caused by leaked swap-chain back-buffer references in the resource-barrier helper, not by the resize architecture itself.
+- The post-resize transparent gap came from leaving a native non-client resize frame attached to a visually frameless popup window; the fix was to make the whole window client-owned with `WM_NCCALCSIZE` and explicit edge/corner `WM_NCHITTEST` handling.
+- The expected Teamy Studio shell is now explicit: no OS chrome, no OS-colored borders, but native edge resize cursors and behaviors must still work.
+- Live resize should be treated as an always-hot path. Deferring all resize work until after the drag ends causes visible freeze-frame behavior, so the host should resize and present during the drag itself.

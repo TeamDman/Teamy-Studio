@@ -10,6 +10,7 @@ Goal: capture the current Teamy Studio text renderer design, its known fidelity 
 - The GPU text path evaluates analytic coverage from those curves in `src/app/windows_panel_shaders.hlsl`.
 - The text vertex path now uses object-space glyph quads, per-vertex normals, an inverse-Jacobian mapping, and a Slug-style matrix/viewport constant buffer so dilation happens in the same coordinate space as the original Slug shaders.
 - Glyphs now also carry precomputed band tables and band transforms so both the shader path and the CPU snapshot path consume horizontal and vertical curve subsets instead of walking every curve for every sample.
+- Snapshot scaling and live glyph quad placement now use the font's `units_per_em` instead of `ascender - descender`, which closed the long-standing size mismatch against `fontdue` on glyphs like `b`.
 - Terminal text and notebook/output text still share the same renderer backend, but their interactive scale factors are now tracked independently in the window state.
 
 ## What This Is And Is Not
@@ -64,6 +65,7 @@ The codebase now exposes an offscreen glyph snapshot entrypoint:
 Additional debug references now exist:
 - the ignored integration snapshot harness emits `/`, `b`, `r`, and the Unicode sheet
 - renderer unit tests can also emit `fontdue` reference rasters for selected glyphs so we can compare our shader path against an independent CPU rasterizer
+- the D3D12 device path now enables the debug layer, tries GPU-based validation in debug builds, and captures the DXGI info queue so `ResizeBuffers` failures surface actionable diagnostics
 
 Purpose:
 - render a single glyph such as `/` to a PNG without opening a window

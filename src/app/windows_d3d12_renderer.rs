@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use eyre::Context;
 use fontdb::{Database, Family, Query, Source};
 use image::{ImageBuffer, Rgba};
+use tracing::{info, warn};
 use ttf_parser::{Face, GlyphId, OutlineBuilder};
 use windows::Win32::Foundation::{E_FAIL, HANDLE, HWND, RECT, TRUE};
 use windows::Win32::Graphics::Direct3D::Fxc::{
@@ -32,6 +33,7 @@ const MAX_BAND_UINT_COUNT: usize = 262_144;
 const TERMINAL_FONT_FAMILY: &str = "CaskaydiaCove Nerd Font Mono";
 const SLUG_GLYPH_DILATION_PX: f32 = 0.5;
 const SLUG_BAND_SIZE_FONT_UNITS: f32 = 64.0;
+const TEAMY_D3D12_GPU_VALIDATION_ENV: &str = "TEAMY_D3D12_GPU_VALIDATION";
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -74,6 +76,7 @@ struct SlugGlyph {
 struct LoadedTerminalFont {
     font_bytes: Vec<u8>,
     face_index: u32,
+    units_per_em: f32,
     ascender: f32,
     descender: f32,
     cell_advance: f32,
@@ -148,6 +151,7 @@ pub struct RenderScene {
 #[derive(Debug)]
 pub struct D3d12PanelRenderer {
     _dxgi_factory: IDXGIFactory4,
+    dxgi_info_queue: Option<IDXGIInfoQueue>,
     _device: ID3D12Device,
     command_queue: ID3D12CommandQueue,
     swap_chain: IDXGISwapChain3,
@@ -180,7 +184,7 @@ pub struct D3d12PanelRenderer {
 
 impl D3d12PanelRenderer {
     pub fn new(hwnd: HWND) -> eyre::Result<Self> {
-        let (dxgi_factory, device) = create_device()?;
+        let (dxgi_factory, device, dxgi_info_queue) = create_device()?;
         let command_queue = create_command_queue(&device)?;
         let (width, height) = client_size(hwnd)?;
         let swap_chain = create_swap_chain(&dxgi_factory, &command_queue, hwnd, width, height)?;
@@ -228,6 +232,7 @@ impl D3d12PanelRenderer {
 
         Ok(Self {
             _dxgi_factory: dxgi_factory,
+            dxgi_info_queue,
             _device: device,
             command_queue,
             swap_chain,
@@ -268,25 +273,45 @@ impl D3d12PanelRenderer {
         }
 
         self.wait_for_gpu()?;
-        for command_allocator in &self.command_allocators {
-            unsafe {
-                command_allocator.Reset()?;
-            }
-        }
         unsafe {
             self.command_list.Reset(&self.command_allocators[0], None)?;
+            self.command_list.ClearState(None);
             self.command_list.Close()?;
         }
-        self.render_targets.fill(None);
-        unsafe {
+        let command_allocators = create_command_allocators(&self._device)?;
+        let command_list = create_closed_command_list(
+            &self._device,
+            &command_allocators[0],
+            &self.pipeline_state,
+        )?;
+        self.command_allocators = command_allocators;
+        self.command_list = command_list;
+        let old_render_targets =
+            std::mem::replace(&mut self.render_targets, std::array::from_fn(|_| None));
+        drop(old_render_targets);
+        let old_rtv_heap =
+            std::mem::replace(&mut self.rtv_heap, create_empty_rtv_heap(&self._device)?);
+        drop(old_rtv_heap);
+        self.rtv_descriptor_size = unsafe {
+            self._device
+                .GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV)
+        };
+        self.frame_latency_waitable_object = Owned::default();
+        if let Err(error) = unsafe {
             self.swap_chain.ResizeBuffers(
                 FRAME_COUNT as u32,
                 width,
                 height,
                 DXGI_FORMAT_B8G8R8A8_UNORM,
                 DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT,
-            )?
-        };
+            )
+        } {
+            self.log_dxgi_debug_messages("ResizeBuffers");
+            self.log_dxgi_live_objects("ResizeBuffers");
+            return Err(error).wrap_err("failed to resize swap chain buffers");
+        }
+        self.frame_latency_waitable_object =
+            unsafe { Owned::new(self.swap_chain.GetFrameLatencyWaitableObject()) };
 
         let (rtv_heap, rtv_descriptor_size, render_targets) =
             create_render_targets(&self._device, &self.swap_chain)?;
@@ -305,6 +330,82 @@ impl D3d12PanelRenderer {
             bottom: height as i32,
         };
         Ok(())
+    }
+
+    fn log_dxgi_debug_messages(&self, context: &str) {
+        let Some(queue) = &self.dxgi_info_queue else {
+            return;
+        };
+
+        let count = unsafe { queue.GetNumStoredMessages(DXGI_DEBUG_ALL) };
+        if count == 0 {
+            return;
+        }
+
+        warn!(context, count, "DXGI debug messages");
+        for index in 0..count {
+            let mut message_size = 0;
+            if unsafe { queue.GetMessage(DXGI_DEBUG_ALL, index, None, &mut message_size) }.is_err()
+            {
+                warn!(context, index, "failed to query DXGI debug message size");
+                continue;
+            }
+
+            let mut message_buffer = vec![0_u8; message_size];
+            let message_ptr = message_buffer.as_mut_ptr() as *mut DXGI_INFO_QUEUE_MESSAGE;
+            if unsafe {
+                queue.GetMessage(DXGI_DEBUG_ALL, index, Some(message_ptr), &mut message_size)
+            }
+            .is_err()
+            {
+                warn!(context, index, "failed to read DXGI debug message");
+                continue;
+            }
+
+            let (severity, description) = unsafe {
+                let description_slice = std::slice::from_raw_parts(
+                    (*message_ptr).pDescription as *const u8,
+                    (*message_ptr).DescriptionByteLength,
+                );
+                let severity = match (*message_ptr).Severity {
+                    DXGI_INFO_QUEUE_MESSAGE_SEVERITY_CORRUPTION => "CORRUPTION",
+                    DXGI_INFO_QUEUE_MESSAGE_SEVERITY_ERROR => "ERROR",
+                    DXGI_INFO_QUEUE_MESSAGE_SEVERITY_WARNING => "WARNING",
+                    DXGI_INFO_QUEUE_MESSAGE_SEVERITY_INFO => "INFO",
+                    DXGI_INFO_QUEUE_MESSAGE_SEVERITY_MESSAGE => "MESSAGE",
+                    _ => "UNKNOWN",
+                };
+                let description = String::from_utf8_lossy(description_slice)
+                    .trim_matches(char::from(0))
+                    .trim()
+                    .to_string();
+                (severity, description)
+            };
+
+            warn!(context, index, severity, %description, "DXGI debug message");
+        }
+        unsafe { queue.ClearStoredMessages(DXGI_DEBUG_ALL) };
+    }
+
+    fn log_dxgi_live_objects(&self, context: &str) {
+        let debug = unsafe { DXGIGetDebugInterface1::<IDXGIDebug1>(0) };
+        match debug {
+            Ok(debug) => {
+                if let Err(error) = unsafe {
+                    debug.ReportLiveObjects(
+                        DXGI_DEBUG_ALL,
+                        DXGI_DEBUG_RLO_FLAGS(
+                            DXGI_DEBUG_RLO_DETAIL.0 | DXGI_DEBUG_RLO_IGNORE_INTERNAL.0,
+                        ),
+                    )
+                } {
+                    warn!(context, ?error, "failed to report DXGI live objects");
+                }
+            }
+            Err(error) => {
+                warn!(context, ?error, "failed to acquire DXGI debug reporter");
+            }
+        }
     }
 
     pub fn render(&mut self, scene: &RenderScene) -> eyre::Result<()> {
@@ -341,11 +442,12 @@ impl D3d12PanelRenderer {
             self.command_list.RSSetViewports(&[self.viewport]);
             self.command_list.RSSetScissorRects(&[self.scissor_rect]);
 
-            self.command_list.ResourceBarrier(&[transition_barrier(
+            issue_transition_barrier(
+                &self.command_list,
                 current_target,
                 D3D12_RESOURCE_STATE_PRESENT,
                 D3D12_RESOURCE_STATE_RENDER_TARGET,
-            )]);
+            );
 
             let rtv_handle = D3D12_CPU_DESCRIPTOR_HANDLE {
                 ptr: self.rtv_heap.GetCPUDescriptorHandleForHeapStart().ptr
@@ -364,11 +466,12 @@ impl D3d12PanelRenderer {
             self.command_list
                 .DrawInstanced(vertex_count as u32, 1, 0, 0);
 
-            self.command_list.ResourceBarrier(&[transition_barrier(
+            issue_transition_barrier(
+                &self.command_list,
                 current_target,
                 D3D12_RESOURCE_STATE_RENDER_TARGET,
                 D3D12_RESOURCE_STATE_PRESENT,
-            )]);
+            );
             self.command_list.Close()?;
         }
 
@@ -716,12 +819,14 @@ fn load_terminal_font() -> eyre::Result<LoadedTerminalFont> {
     let cell_advance = face
         .glyph_hor_advance(fallback_id)
         .map_or(1024.0, f32::from);
+    let units_per_em = f32::from(face.units_per_em());
     let ascender = f32::from(face.ascender());
     let descender = f32::from(face.descender());
 
     Ok(LoadedTerminalFont {
         font_bytes,
         face_index: face_info.index,
+        units_per_em,
         ascender,
         descender,
         cell_advance,
@@ -1119,7 +1224,7 @@ fn render_snapshot_glyph_into_image(
     band_data: &[u32],
     glyph: SlugGlyph,
 ) {
-    let font_height_units = (font.ascender - font.descender).max(1.0);
+    let font_height_units = font.units_per_em.max(1.0);
     let scale = font_size_px as f32 / font_height_units;
     let uv_pad_x = SLUG_GLYPH_DILATION_PX / scale;
     let uv_pad_y = SLUG_GLYPH_DILATION_PX / scale;
@@ -1281,6 +1386,92 @@ fn cpu_slug_coverage_all_curves(
     calc_coverage(xcov, ycov, xwgt, ywgt)
 }
 
+fn is_degenerate_quadratic(curve: &QuadraticCurve) -> bool {
+    let epsilon = 1.0 / 1024.0;
+    let ax = curve.p0[0] - (curve.p1[0] * 2.0) + curve.p2[0];
+    let ay = curve.p0[1] - (curve.p1[1] * 2.0) + curve.p2[1];
+    ax.abs() <= epsilon && ay.abs() <= epsilon
+}
+
+fn should_use_degenerate_line_fallback(curve: &QuadraticCurve) -> bool {
+    if !is_degenerate_quadratic(curve) {
+        return false;
+    }
+
+    let axis_epsilon = 1.0 / 65536.0;
+    let dx = (curve.p2[0] - curve.p0[0]).abs();
+    let dy = (curve.p2[1] - curve.p0[1]).abs();
+    dx > axis_epsilon && dy > axis_epsilon
+}
+
+fn apply_degenerate_horizontal_coverage(
+    curve: &QuadraticCurve,
+    render_coord: [f32; 2],
+    pixels_per_em: f32,
+    xcov: &mut f32,
+    xwgt: &mut f32,
+) {
+    let p0 = [curve.p0[0] - render_coord[0], curve.p0[1] - render_coord[1]];
+    let p1 = [curve.p2[0] - render_coord[0], curve.p2[1] - render_coord[1]];
+    if let Some(intersection_x) = horizontal_line_intersection(p0, p1) {
+        let sample = saturate((intersection_x * pixels_per_em) + 0.5);
+        if p1[1] > p0[1] {
+            *xcov += sample;
+        } else {
+            *xcov -= sample;
+        }
+        *xwgt = (*xwgt).max(saturate(1.0 - (intersection_x * pixels_per_em).abs() * 2.0));
+    }
+}
+
+fn apply_degenerate_vertical_coverage(
+    curve: &QuadraticCurve,
+    render_coord: [f32; 2],
+    pixels_per_em: f32,
+    ycov: &mut f32,
+    ywgt: &mut f32,
+) {
+    let p0 = [curve.p0[0] - render_coord[0], curve.p0[1] - render_coord[1]];
+    let p1 = [curve.p2[0] - render_coord[0], curve.p2[1] - render_coord[1]];
+    if let Some(intersection_y) = vertical_line_intersection(p0, p1) {
+        let sample = saturate((intersection_y * pixels_per_em) + 0.5);
+        if p1[0] > p0[0] {
+            *ycov += sample;
+        } else {
+            *ycov -= sample;
+        }
+        *ywgt = (*ywgt).max(saturate(1.0 - (intersection_y * pixels_per_em).abs() * 2.0));
+    }
+}
+
+fn horizontal_line_intersection(p0: [f32; 2], p1: [f32; 2]) -> Option<f32> {
+    if !crosses_zero_half_open(p0[1], p1[1]) {
+        return None;
+    }
+    let dy = p1[1] - p0[1];
+    if dy.abs() <= f32::EPSILON {
+        return None;
+    }
+    let t = -p0[1] / dy;
+    Some(p0[0] + (p1[0] - p0[0]) * t)
+}
+
+fn vertical_line_intersection(p0: [f32; 2], p1: [f32; 2]) -> Option<f32> {
+    if !crosses_zero_half_open(p0[0], p1[0]) {
+        return None;
+    }
+    let dx = p1[0] - p0[0];
+    if dx.abs() <= f32::EPSILON {
+        return None;
+    }
+    let t = -p0[0] / dx;
+    Some(p0[1] + (p1[1] - p0[1]) * t)
+}
+
+fn crosses_zero_half_open(a: f32, b: f32) -> bool {
+    (a <= 0.0 && b > 0.0) || (b <= 0.0 && a > 0.0)
+}
+
 fn accumulate_horizontal_curve_coverage(
     curve: &QuadraticCurve,
     render_coord: [f32; 2],
@@ -1288,6 +1479,11 @@ fn accumulate_horizontal_curve_coverage(
     xcov: &mut f32,
     xwgt: &mut f32,
 ) {
+    if should_use_degenerate_line_fallback(curve) {
+        apply_degenerate_horizontal_coverage(curve, render_coord, pixels_per_em, xcov, xwgt);
+        return;
+    }
+
     let p12 = [
         curve.p0[0] - render_coord[0],
         curve.p0[1] - render_coord[1],
@@ -1320,6 +1516,11 @@ fn accumulate_vertical_curve_coverage(
     ycov: &mut f32,
     ywgt: &mut f32,
 ) {
+    if should_use_degenerate_line_fallback(curve) {
+        apply_degenerate_vertical_coverage(curve, render_coord, pixels_per_em, ycov, ywgt);
+        return;
+    }
+
     let p12 = [
         curve.p0[0] - render_coord[0],
         curve.p0[1] - render_coord[1],
@@ -1503,15 +1704,67 @@ impl OutlineBuilder for QuadraticCurveBuilder {
     }
 }
 
-fn create_device() -> eyre::Result<(IDXGIFactory4, ID3D12Device)> {
+fn create_device() -> eyre::Result<(IDXGIFactory4, ID3D12Device, Option<IDXGIInfoQueue>)> {
     let mut dxgi_flags = DXGI_CREATE_FACTORY_FLAGS(0);
+    let mut dxgi_info_queue = None;
     if cfg!(debug_assertions) {
         unsafe {
-            let mut debug = None;
-            if D3D12GetDebugInterface::<ID3D12Debug>(&mut debug).is_ok() {
-                if let Some(debug) = debug {
-                    debug.EnableDebugLayer();
+            let mut debug_enabled = false;
+            let mut debug1 = None;
+            if D3D12GetDebugInterface::<ID3D12Debug1>(&mut debug1).is_ok() {
+                if let Some(debug1) = debug1 {
+                    let gpu_validation_enabled = std::env::var_os(TEAMY_D3D12_GPU_VALIDATION_ENV)
+                        .is_some_and(|value| !value.is_empty() && value != "0");
+                    if gpu_validation_enabled {
+                        info!(
+                            env = TEAMY_D3D12_GPU_VALIDATION_ENV,
+                            "enabled D3D12 debug layer with GPU-based validation"
+                        );
+                        debug1.SetEnableGPUBasedValidation(true);
+                    } else {
+                        info!(
+                            env = TEAMY_D3D12_GPU_VALIDATION_ENV,
+                            "enabled D3D12 debug layer without GPU-based validation"
+                        );
+                    }
+                    debug1.EnableDebugLayer();
                     dxgi_flags |= DXGI_CREATE_FACTORY_DEBUG;
+                    debug_enabled = true;
+                }
+            } else {
+                let mut debug = None;
+                if D3D12GetDebugInterface::<ID3D12Debug>(&mut debug).is_ok() {
+                    if let Some(debug) = debug {
+                        info!("enabled D3D12 debug layer");
+                        debug.EnableDebugLayer();
+                        dxgi_flags |= DXGI_CREATE_FACTORY_DEBUG;
+                        debug_enabled = true;
+                    }
+                } else {
+                    warn!("D3D12 debug layer unavailable");
+                }
+            }
+
+            if debug_enabled {
+                match DXGIGetDebugInterface1::<IDXGIInfoQueue>(0) {
+                    Ok(queue) => {
+                        let _ = queue.SetBreakOnSeverity(
+                            DXGI_DEBUG_ALL,
+                            DXGI_INFO_QUEUE_MESSAGE_SEVERITY_CORRUPTION,
+                            true,
+                        );
+                        let _ = queue.SetBreakOnSeverity(
+                            DXGI_DEBUG_ALL,
+                            DXGI_INFO_QUEUE_MESSAGE_SEVERITY_ERROR,
+                            true,
+                        );
+                        queue.ClearStoredMessages(DXGI_DEBUG_ALL);
+                        info!("acquired DXGI info queue");
+                        dxgi_info_queue = Some(queue);
+                    }
+                    Err(error) => {
+                        warn!(?error, "failed to acquire DXGI info queue");
+                    }
                 }
             }
         }
@@ -1523,7 +1776,7 @@ fn create_device() -> eyre::Result<(IDXGIFactory4, ID3D12Device)> {
     let mut device = None;
     unsafe { D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_11_0, &mut device) }?;
     let device = device.expect("device should be initialized after D3D12CreateDevice succeeds");
-    Ok((dxgi_factory, device))
+    Ok((dxgi_factory, device, dxgi_info_queue))
 }
 
 fn get_hardware_adapter(factory: &IDXGIFactory4) -> eyre::Result<IDXGIAdapter1> {
@@ -1572,6 +1825,23 @@ fn create_command_allocators(
     Ok(allocators.map(Option::unwrap))
 }
 
+fn create_closed_command_list(
+    device: &ID3D12Device,
+    command_allocator: &ID3D12CommandAllocator,
+    pipeline_state: &ID3D12PipelineState,
+) -> eyre::Result<ID3D12GraphicsCommandList> {
+    let command_list: ID3D12GraphicsCommandList = unsafe {
+        device.CreateCommandList(
+            0,
+            D3D12_COMMAND_LIST_TYPE_DIRECT,
+            command_allocator,
+            pipeline_state,
+        )
+    }?;
+    unsafe { command_list.Close()? };
+    Ok(command_list)
+}
+
 fn create_swap_chain(
     factory: &IDXGIFactory4,
     command_queue: &ID3D12CommandQueue,
@@ -1613,13 +1883,7 @@ fn create_render_targets(
     device: &ID3D12Device,
     swap_chain: &IDXGISwapChain3,
 ) -> eyre::Result<(ID3D12DescriptorHeap, u32, [ID3D12Resource; FRAME_COUNT])> {
-    let rtv_heap: ID3D12DescriptorHeap = unsafe {
-        device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
-            Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
-            NumDescriptors: FRAME_COUNT as u32,
-            ..Default::default()
-        })?
-    };
+    let rtv_heap = create_empty_rtv_heap(device)?;
     let rtv_descriptor_size =
         unsafe { device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV) };
     let heap_start = unsafe { rtv_heap.GetCPUDescriptorHandleForHeapStart() };
@@ -1639,6 +1903,16 @@ fn create_render_targets(
         rtv_descriptor_size,
         render_targets.map(Option::unwrap),
     ))
+}
+
+fn create_empty_rtv_heap(device: &ID3D12Device) -> eyre::Result<ID3D12DescriptorHeap> {
+    Ok(unsafe {
+        device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+            Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
+            NumDescriptors: FRAME_COUNT as u32,
+            ..Default::default()
+        })?
+    })
 }
 
 fn create_root_signature(device: &ID3D12Device) -> eyre::Result<ID3D12RootSignature> {
@@ -2153,7 +2427,7 @@ fn append_text_rect(
     let screen_width = (rect.right - rect.left) as f32;
     let screen_height = (rect.bottom - rect.top) as f32;
     let advance = glyph.advance.max(1.0);
-    let font_height = (font.ascender - font.descender).max(1.0);
+    let font_height = font.units_per_em.max(1.0);
     let glyph_left = left + (glyph.x_min / advance) * screen_width;
     let glyph_right = left + (glyph.x_max / advance) * screen_width;
     let glyph_top = top + ((font.ascender - glyph.y_max) / font_height) * screen_height;
@@ -2321,6 +2595,22 @@ fn transition_barrier(
     }
 }
 
+fn issue_transition_barrier(
+    command_list: &ID3D12GraphicsCommandList,
+    resource: &ID3D12Resource,
+    before: D3D12_RESOURCE_STATES,
+    after: D3D12_RESOURCE_STATES,
+) {
+    let mut barriers = [transition_barrier(resource, before, after)];
+    unsafe {
+        command_list.ResourceBarrier(&barriers);
+
+        let transition = &mut barriers[0].Anonymous.Transition;
+        let resource = std::mem::ManuallyDrop::take(&mut transition.pResource);
+        drop(resource);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -2383,8 +2673,6 @@ mod tests {
         let mut vertices = Vec::new();
         append_rect(
             &mut vertices,
-            100.0,
-            50.0,
             RECT {
                 left: 0,
                 top: 0,
@@ -2489,6 +2777,60 @@ mod tests {
             multi_span_rows, 0,
             "slash should be convex per occupied scanline"
         );
+        assert_eq!(
+            count_connected_components(&image, 8),
+            1,
+            "slash should render as one connected component"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn b_snapshot_left_edge_stays_close_to_fontdue() -> eyre::Result<()> {
+        let font = load_terminal_font()?;
+        let face = Face::parse(&font.font_bytes, font.face_index)?;
+        let glyph_id = face.glyph_index('b').expect("b glyph should exist");
+        let curves = extract_glyph_curves(&face, glyph_id);
+        let glyph = super::build_slug_glyph_from_face(&font, &face, glyph_id, 0, curves.len());
+        let mut band_data = Vec::new();
+        let (band_count_x, band_count_y, band_transform) =
+            append_slug_band_data(&curves, glyph, &mut band_data);
+        let slug = render_test_glyph(
+            &font,
+            &curves,
+            &band_data,
+            super::SlugGlyph {
+                band_count_x,
+                band_count_y,
+                band_transform,
+                ..glyph
+            },
+            256,
+            512,
+            512,
+        );
+        let fontdue = render_fontdue_reference_glyph('b', 256, 512, 512)?;
+
+        let slug_rows = foreground_row_spans(&slug, 24);
+        let fontdue_rows = foreground_row_spans(&fontdue, 24);
+        let overlap = slug_rows.len().min(fontdue_rows.len());
+        assert!(
+            overlap >= 64,
+            "expected enough overlapping rows for b comparison"
+        );
+
+        let first_delta_sum: i32 = slug_rows
+            .iter()
+            .zip(fontdue_rows.iter())
+            .take(overlap)
+            .map(|(lhs, rhs)| (lhs.0 as i32 - rhs.0 as i32).abs())
+            .sum();
+        let average_first_delta = first_delta_sum as f32 / overlap as f32;
+
+        assert!(
+            average_first_delta <= 3.5,
+            "b left edge drifted too far from fontdue: average first-edge delta = {average_first_delta}"
+        );
         Ok(())
     }
 
@@ -2525,11 +2867,13 @@ mod tests {
             .join("test-artifacts")
             .join("slug");
 
+        super::write_slug_snapshot_png('/', 256, 512, 512, &output_dir.join("slash-256.png"))?;
         super::write_slug_snapshot_png('b', 256, 512, 512, &output_dir.join("b-256.png"))?;
         super::write_slug_snapshot_png('r', 256, 512, 512, &output_dir.join("r-256.png"))?;
         super::write_slug_snapshot_png('g', 256, 512, 512, &output_dir.join("g-256.png"))?;
         super::write_slug_snapshot_png('6', 256, 512, 512, &output_dir.join("6-256.png"))?;
 
+        assert!(output_dir.join("slash-256.png").exists());
         assert!(output_dir.join("b-256.png").exists());
         assert!(output_dir.join("r-256.png").exists());
         assert!(output_dir.join("g-256.png").exists());
@@ -2545,9 +2889,17 @@ mod tests {
             .join("test-artifacts")
             .join("slug");
 
+        write_fontdue_reference_png(
+            '/',
+            256,
+            512,
+            512,
+            &output_dir.join("slash-fontdue-256.png"),
+        )?;
         write_fontdue_reference_png('b', 256, 512, 512, &output_dir.join("b-fontdue-256.png"))?;
         write_fontdue_reference_png('r', 256, 512, 512, &output_dir.join("r-fontdue-256.png"))?;
 
+        assert!(output_dir.join("slash-fontdue-256.png").exists());
         assert!(output_dir.join("b-fontdue-256.png").exists());
         assert!(output_dir.join("r-fontdue-256.png").exists());
         Ok(())
@@ -2563,7 +2915,7 @@ mod tests {
         let font = load_terminal_font()?;
         let face = Face::parse(&font.font_bytes, font.face_index)?;
 
-        for character in ['b', 'r'] {
+        for character in ['/', 'b', 'r'] {
             let glyph_id = face
                 .glyph_index(character)
                 .expect("comparison glyph should exist in terminal font");
@@ -2588,9 +2940,13 @@ mod tests {
             );
             let fontdue = render_fontdue_reference_glyph(character, 256, 512, 512)?;
             let diff = render_alpha_diff(&slug, &fontdue);
-            diff.save(output_dir.join(format!("{character}-slug-fontdue-diff.png")))?;
+            diff.save(output_dir.join(format!(
+                "{}-slug-fontdue-diff.png",
+                debug_glyph_name(character)
+            )))?;
         }
 
+        assert!(output_dir.join("slash-slug-fontdue-diff.png").exists());
         assert!(output_dir.join("b-slug-fontdue-diff.png").exists());
         assert!(output_dir.join("r-slug-fontdue-diff.png").exists());
         Ok(())
@@ -2752,6 +3108,22 @@ mod tests {
         Ok(image)
     }
 
+    fn debug_glyph_name(character: char) -> &'static str {
+        match character {
+            '/' => "slash",
+            '\\' => "backslash",
+            _ => {
+                if character == 'b' {
+                    "b"
+                } else if character == 'r' {
+                    "r"
+                } else {
+                    "glyph"
+                }
+            }
+        }
+    }
+
     fn render_alpha_diff(lhs: &RgbaImage, rhs: &RgbaImage) -> RgbaImage {
         let width = lhs.width().min(rhs.width());
         let height = lhs.height().min(rhs.height());
@@ -2765,6 +3137,27 @@ mod tests {
             }
         }
         image
+    }
+
+    fn foreground_row_spans(image: &RgbaImage, rgb_threshold: u16) -> Vec<(u32, u32)> {
+        let mut spans = Vec::new();
+        for y in 0..image.height() {
+            let mut first = None;
+            let mut last = None;
+            for x in 0..image.width() {
+                let pixel = image.get_pixel(x, y);
+                let intensity = u16::from(pixel[0]) + u16::from(pixel[1]) + u16::from(pixel[2]);
+                if intensity <= rgb_threshold {
+                    continue;
+                }
+                first.get_or_insert(x);
+                last = Some(x);
+            }
+            if let (Some(first), Some(last)) = (first, last) {
+                spans.push((first, last));
+            }
+        }
+        spans
     }
 
     fn count_rows_with_multiple_spans(image: &RgbaImage) -> usize {
@@ -2786,6 +3179,48 @@ mod tests {
             }
         }
         count
+    }
+
+    fn count_connected_components(image: &RgbaImage, alpha_threshold: u8) -> usize {
+        let width = image.width() as usize;
+        let height = image.height() as usize;
+        let mut visited = vec![false; width * height];
+        let mut components = 0;
+
+        for y in 0..height {
+            for x in 0..width {
+                let index = y * width + x;
+                if visited[index] || image.get_pixel(x as u32, y as u32)[3] <= alpha_threshold {
+                    continue;
+                }
+
+                components += 1;
+                let mut stack = vec![(x, y)];
+                visited[index] = true;
+
+                while let Some((cx, cy)) = stack.pop() {
+                    let min_x = cx.saturating_sub(1);
+                    let max_x = (cx + 1).min(width - 1);
+                    let min_y = cy.saturating_sub(1);
+                    let max_y = (cy + 1).min(height - 1);
+                    for ny in min_y..=max_y {
+                        for nx in min_x..=max_x {
+                            let neighbor_index = ny * width + nx;
+                            if visited[neighbor_index] {
+                                continue;
+                            }
+                            if image.get_pixel(nx as u32, ny as u32)[3] <= alpha_threshold {
+                                continue;
+                            }
+                            visited[neighbor_index] = true;
+                            stack.push((nx, ny));
+                        }
+                    }
+                }
+            }
+        }
+
+        components
     }
 
     #[derive(Default)]
