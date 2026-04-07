@@ -49,7 +49,7 @@ const MAX_FONT_HEIGHT: i32 = -72;
 const FONT_ZOOM_STEP: i32 = 2;
 const INITIAL_WINDOW_WIDTH: i32 = 1040;
 const INITIAL_WINDOW_HEIGHT: i32 = 680;
-const DRAG_START_THRESHOLD_PX: i32 = 1;
+const DRAG_START_THRESHOLD_PX: i32 = 0;
 const MIN_RESIZE_BORDER_THICKNESS: i32 = 1;
 
 thread_local! {
@@ -1045,6 +1045,10 @@ fn drag_threshold_exceeded(
     threshold_x: i32,
     threshold_y: i32,
 ) -> bool {
+    if threshold_x <= 0 || threshold_y <= 0 {
+        return true;
+    }
+
     (current.x - origin.x).abs() >= threshold_x || (current.y - origin.y).abs() >= threshold_y
 }
 
@@ -1127,12 +1131,22 @@ mod tests {
     }
 
     #[test]
-    fn drag_threshold_requires_real_motion() {
+    fn zero_drag_threshold_has_no_deadzone() {
+        assert!(drag_threshold_exceeded(
+            POINT { x: 10, y: 20 },
+            POINT { x: 10, y: 20 },
+            0,
+            0,
+        ));
+    }
+
+    #[test]
+    fn positive_drag_threshold_requires_real_motion() {
         assert!(!drag_threshold_exceeded(
             POINT { x: 10, y: 20 },
             POINT { x: 10, y: 20 },
-            DRAG_START_THRESHOLD_PX,
-            DRAG_START_THRESHOLD_PX,
+            1,
+            1,
         ));
     }
 
@@ -1141,14 +1155,14 @@ mod tests {
         assert!(drag_threshold_exceeded(
             POINT { x: 10, y: 20 },
             POINT { x: 11, y: 20 },
-            DRAG_START_THRESHOLD_PX,
-            DRAG_START_THRESHOLD_PX,
+            1,
+            1,
         ));
         assert!(drag_threshold_exceeded(
             POINT { x: 10, y: 20 },
             POINT { x: 10, y: 21 },
-            DRAG_START_THRESHOLD_PX,
-            DRAG_START_THRESHOLD_PX,
+            1,
+            1,
         ));
     }
 
@@ -1160,12 +1174,28 @@ mod tests {
             },
             POINT { x: 10, y: 20 },
             true,
-            DRAG_START_THRESHOLD_PX,
-            DRAG_START_THRESHOLD_PX,
+            1,
+            1,
         );
 
         assert_eq!(action, PendingDragAction::Consumed);
         assert!(!action.clears_pending_drag());
+    }
+
+    #[test]
+    fn pending_drag_starts_immediately_when_threshold_is_zero() {
+        let action = update_pending_drag_action(
+            PendingWindowDrag {
+                origin: POINT { x: 10, y: 20 },
+            },
+            POINT { x: 10, y: 20 },
+            true,
+            0,
+            0,
+        );
+
+        assert_eq!(action, PendingDragAction::StartSystemDrag);
+        assert!(action.clears_pending_drag());
     }
 
     #[test]

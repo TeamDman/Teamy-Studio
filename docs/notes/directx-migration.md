@@ -106,7 +106,7 @@ Tasks:
 - The post-resize transparent gap came from leaving a native non-client resize frame attached to a visually frameless popup window; the fix was to make the whole window client-owned with `WM_NCCALCSIZE` and explicit edge/corner `WM_NCHITTEST` handling.
 - The expected Teamy Studio shell is now explicit: no OS chrome, no OS-colored borders, but native edge resize cursors and behaviors must still work.
 - Live resize and live move should be treated as always-hot paths. Deferring presentation until the pointer moves again causes visible freeze-frame behavior, so the host should keep presenting throughout the OS move/size loop.
-- The frameless drag strip cannot hand control to the native `HTCAPTION` loop immediately on mouse-down without reintroducing Windows' click-and-hold startup delay; the host should defer that handoff until pointer motion clears a minimal 1 px custom drag threshold.
+- The frameless drag strip cannot hand control to the native `HTCAPTION` loop immediately on mouse-down without reintroducing Windows' click-and-hold startup delay; the host should defer that handoff through a configurable custom drag threshold, including a zero-pixel mode when no deadzone is desired.
 - Fast resize should not let terminal output fall behind while the rest of the app keeps animating; the same modal-loop path that keeps the frame alive must also keep PTY output pumping.
 - Panel borders need to be specified in pixels rather than UV percentages; otherwise large panels get a heavy white falloff while smaller panels barely show it.
 - Background animation should be tied to elapsed time in the shader constants, not presentation cadence, so motion remains visually stable across refresh rates.

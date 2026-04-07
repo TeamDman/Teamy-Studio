@@ -155,7 +155,7 @@ cli[window.interaction.drag.live]
 While the user is holding the top accent strip to reposition the window, the app must keep presenting frames immediately, without a noticeable startup pause, even if the pointer pauses and the window bounds temporarily stop changing.
 
 cli[window.interaction.drag.threshold]
-The frameless drag strip must hand off to the native window move loop after no more than 1 pixel of pointer motion so the cursor and window stay visually aligned when dragging begins.
+The frameless drag strip must support a zero-pixel drag threshold so the native window move loop can begin with no deadzone when that behavior is configured.
 
 cli[window.interaction.resize.native-edges]
 The launched terminal window must still resize from its edges and corners using native OS hit-testing semantics and native resize cursors even though OS-managed chrome is hidden.
