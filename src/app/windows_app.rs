@@ -181,8 +181,9 @@ struct PendingWindowDrag {
     origin: ClientPoint,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 struct PendingTerminalSelection {
+    origin: ClientPoint,
     anchor: TerminalCellPoint,
     mode: TerminalSelectionMode,
 }
@@ -192,6 +193,13 @@ enum PendingDragAction {
     NotHandled,
     Consumed,
     StartSystemDrag,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PendingTerminalSelectionAction {
+    KeepPending,
+    ClearPending,
+    Update(TerminalSelection),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1081,14 +1089,12 @@ fn handle_left_button_up(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Result<boo
         if let Some(pending_selection) = state.pending_terminal_selection.take() {
             let layout =
                 client_layout(hwnd, state.terminal_cell_width, state.terminal_cell_height)?;
-            if let Some(cell) =
-                terminal_cell_from_client_point(layout, ClientPoint::from_lparam(lparam), true)
+            let point = ClientPoint::from_lparam(lparam);
+            let cell = terminal_cell_from_client_point(layout, point, true);
+            if let Some(selection) =
+                complete_pending_terminal_selection(pending_selection, point, cell)
             {
-                state.terminal_selection = Some(TerminalSelection::new(
-                    pending_selection.anchor,
-                    cell,
-                    pending_selection.mode,
-                ));
+                state.terminal_selection = Some(selection);
             }
             return Ok(true);
         }
@@ -1130,6 +1136,7 @@ fn handle_left_button_up(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Result<boo
 /// behavior[impl window.interaction.drag]
 /// behavior[impl window.interaction.selection.linear]
 /// behavior[impl window.interaction.selection.block-alt-drag]
+/// behavior[impl window.interaction.selection.click-dismiss]
 fn handle_left_button_down(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Result<bool> {
     let point = ClientPoint::from_lparam(lparam);
     let in_drag_handle = hit_test_drag_handle_point(hwnd, point)?;
@@ -1144,18 +1151,17 @@ fn handle_left_button_down(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Result<b
         if !in_drag_handle {
             let layout =
                 client_layout(hwnd, state.terminal_cell_width, state.terminal_cell_height)?;
+            state.terminal_selection = None;
             state.pending_terminal_selection = None;
             if let Some(cell) = terminal_cell_from_client_point(layout, point, false) {
-                let selection = TerminalSelection::new(cell, cell, selection_mode);
-                state.terminal_selection = Some(selection);
                 state.pending_terminal_selection = Some(PendingTerminalSelection {
+                    origin: point,
                     anchor: cell,
                     mode: selection_mode,
                 });
                 return Ok(true);
             }
 
-            state.terminal_selection = None;
             return Ok(false);
         }
 
@@ -1174,22 +1180,28 @@ fn handle_mouse_move(hwnd: WindowHandle, wparam: WPARAM, lparam: LPARAM) -> eyre
             return Ok(None);
         };
 
-        if (wparam.0 & 0x0001) == 0 {
-            state.pending_terminal_selection = None;
-            return Ok(Some(state.terminal_selection.is_some()));
-        }
-
-        let layout = client_layout(hwnd, state.terminal_cell_width, state.terminal_cell_height)?;
-        let Some(cell) = terminal_cell_from_client_point(layout, point, true) else {
-            return Ok(Some(true));
+        let action = if (wparam.0 & 0x0001) == 0 {
+            update_pending_terminal_selection_action(pending_selection, point, false, None)
+        } else if point == pending_selection.origin {
+            update_pending_terminal_selection_action(pending_selection, point, true, None)
+        } else {
+            let layout =
+                client_layout(hwnd, state.terminal_cell_width, state.terminal_cell_height)?;
+            let cell = terminal_cell_from_client_point(layout, point, true);
+            update_pending_terminal_selection_action(pending_selection, point, true, cell)
         };
 
-        state.terminal_selection = Some(TerminalSelection::new(
-            pending_selection.anchor,
-            cell,
-            pending_selection.mode,
-        ));
-        Ok(Some(true))
+        match action {
+            PendingTerminalSelectionAction::KeepPending => Ok(Some(true)),
+            PendingTerminalSelectionAction::ClearPending => {
+                state.pending_terminal_selection = None;
+                Ok(Some(state.terminal_selection.is_some()))
+            }
+            PendingTerminalSelectionAction::Update(selection) => {
+                state.terminal_selection = Some(selection);
+                Ok(Some(true))
+            }
+        }
     })?;
 
     if let Some(consumed) = selection_result {
@@ -1331,6 +1343,43 @@ fn update_pending_drag_action(
     }
 
     PendingDragAction::StartSystemDrag
+}
+
+fn update_pending_terminal_selection_action(
+    pending_selection: PendingTerminalSelection,
+    point: ClientPoint,
+    left_button_down: bool,
+    cell: Option<TerminalCellPoint>,
+) -> PendingTerminalSelectionAction {
+    if !left_button_down {
+        return PendingTerminalSelectionAction::ClearPending;
+    }
+
+    if point == pending_selection.origin {
+        return PendingTerminalSelectionAction::KeepPending;
+    }
+
+    let Some(cell) = cell else {
+        return PendingTerminalSelectionAction::KeepPending;
+    };
+
+    PendingTerminalSelectionAction::Update(TerminalSelection::new(
+        pending_selection.anchor,
+        cell,
+        pending_selection.mode,
+    ))
+}
+
+fn complete_pending_terminal_selection(
+    pending_selection: PendingTerminalSelection,
+    point: ClientPoint,
+    cell: Option<TerminalCellPoint>,
+) -> Option<TerminalSelection> {
+    if point == pending_selection.origin {
+        return None;
+    }
+
+    cell.map(|cell| TerminalSelection::new(pending_selection.anchor, cell, pending_selection.mode))
 }
 
 fn hit_test_drag_handle_point(hwnd: WindowHandle, point: ClientPoint) -> eyre::Result<bool> {
@@ -1520,6 +1569,86 @@ mod tests {
 
         assert_eq!(action, PendingDragAction::NotHandled);
         assert!(action.clears_pending_drag());
+    }
+
+    // behavior[verify window.interaction.selection.click-dismiss]
+    #[test]
+    fn pending_terminal_selection_does_not_materialize_without_pointer_movement() {
+        let action = update_pending_terminal_selection_action(
+            PendingTerminalSelection {
+                origin: ClientPoint::new(10, 20),
+                anchor: TerminalCellPoint::new(2, 3),
+                mode: TerminalSelectionMode::Linear,
+            },
+            ClientPoint::new(10, 20),
+            true,
+            Some(TerminalCellPoint::new(2, 3)),
+        );
+
+        assert_eq!(action, PendingTerminalSelectionAction::KeepPending);
+    }
+
+    // behavior[verify window.interaction.selection.linear]
+    #[test]
+    fn pending_terminal_selection_materializes_after_pointer_movement() {
+        let action = update_pending_terminal_selection_action(
+            PendingTerminalSelection {
+                origin: ClientPoint::new(10, 20),
+                anchor: TerminalCellPoint::new(2, 3),
+                mode: TerminalSelectionMode::Linear,
+            },
+            ClientPoint::new(11, 20),
+            true,
+            Some(TerminalCellPoint::new(4, 5)),
+        );
+
+        assert_eq!(
+            action,
+            PendingTerminalSelectionAction::Update(TerminalSelection::new(
+                TerminalCellPoint::new(2, 3),
+                TerminalCellPoint::new(4, 5),
+                TerminalSelectionMode::Linear,
+            ))
+        );
+    }
+
+    // behavior[verify window.interaction.selection.click-dismiss]
+    #[test]
+    fn pending_terminal_selection_completion_keeps_clicks_from_creating_single_cell_selection() {
+        let selection = complete_pending_terminal_selection(
+            PendingTerminalSelection {
+                origin: ClientPoint::new(10, 20),
+                anchor: TerminalCellPoint::new(2, 3),
+                mode: TerminalSelectionMode::Linear,
+            },
+            ClientPoint::new(10, 20),
+            Some(TerminalCellPoint::new(2, 3)),
+        );
+
+        assert_eq!(selection, None);
+    }
+
+    // behavior[verify window.interaction.selection.click-dismiss]
+    #[test]
+    fn pending_terminal_selection_completion_uses_release_point_after_drag() {
+        let selection = complete_pending_terminal_selection(
+            PendingTerminalSelection {
+                origin: ClientPoint::new(10, 20),
+                anchor: TerminalCellPoint::new(2, 3),
+                mode: TerminalSelectionMode::Block,
+            },
+            ClientPoint::new(18, 26),
+            Some(TerminalCellPoint::new(6, 7)),
+        );
+
+        assert_eq!(
+            selection,
+            Some(TerminalSelection::new(
+                TerminalCellPoint::new(2, 3),
+                TerminalCellPoint::new(6, 7),
+                TerminalSelectionMode::Block,
+            ))
+        );
     }
 
     // behavior[verify window.interaction.drag]

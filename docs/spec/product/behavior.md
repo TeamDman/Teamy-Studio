@@ -88,6 +88,9 @@ When NumLock is enabled, numpad digit and operator keys must be forwarded as the
 behavior[window.interaction.selection.linear]
 Dragging with the left mouse button across the terminal area must create a text selection that wraps along terminal rows.
 
+behavior[window.interaction.selection.click-dismiss]
+Clicking in the terminal area without dragging must clear any existing terminal selection and must not create a new selection until the pointer moves while the left mouse button remains held.
+
 behavior[window.interaction.selection.block-alt-drag]
 Holding Alt while dragging with the left mouse button across the terminal area must create a rectangular box selection instead of a row-wrapping selection.
 
