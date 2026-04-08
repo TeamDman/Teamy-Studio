@@ -58,3 +58,7 @@ Invoke-Step -Label "tests" -Action {
 Invoke-Step -Label "tracey validation" -Action {
 	tracey query validate --deny warnings
 }
+
+# Invoke-Step -Label "tracey status" -Action {
+# 	tracey query status --deny warnings
+# }
