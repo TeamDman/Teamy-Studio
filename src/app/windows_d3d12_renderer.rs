@@ -31,7 +31,9 @@ use std::time::Instant;
 use eyre::Context;
 use fontdb::{Database, Family, Query, Source};
 use image::{ImageBuffer, Rgba};
-use tracing::{info, warn};
+#[cfg(feature = "tracy")]
+use tracing::debug_span;
+use tracing::{info, info_span, instrument, warn};
 use ttf_parser::{Face, GlyphId, OutlineBuilder};
 use windows::Win32::Foundation::{E_FAIL, HANDLE, HWND, RECT, TRUE};
 use windows::Win32::Graphics::Direct3D::Fxc::{
@@ -216,23 +218,33 @@ pub struct D3d12PanelRenderer {
 }
 
 impl D3d12PanelRenderer {
+    #[instrument(level = "info", skip_all)]
     pub fn new(hwnd: HWND) -> eyre::Result<Self> {
-        let (dxgi_factory, device, dxgi_info_queue) = create_device()?;
-        let command_queue = create_command_queue(&device)?;
-        let (width, height) = client_size(hwnd)?;
-        let swap_chain = create_swap_chain(&dxgi_factory, &command_queue, hwnd, width, height)?;
+        let (dxgi_factory, device, dxgi_info_queue) =
+            info_span!("create_d3d12_device").in_scope(create_device)?;
+        let command_queue =
+            info_span!("create_d3d12_command_queue").in_scope(|| create_command_queue(&device))?;
+        let (width, height) =
+            info_span!("query_renderer_client_size").in_scope(|| client_size(hwnd))?;
+        let swap_chain = info_span!("create_swap_chain", width, height)
+            .in_scope(|| create_swap_chain(&dxgi_factory, &command_queue, hwnd, width, height))?;
         unsafe { dxgi_factory.MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER)? };
         unsafe { swap_chain.SetMaximumFrameLatency(1)? };
         let frame_latency_waitable_object =
             unsafe { Owned::new(swap_chain.GetFrameLatencyWaitableObject()) };
 
         let (rtv_heap, rtv_descriptor_size, render_targets) =
-            create_render_targets(&device, &swap_chain)?;
-        let command_allocators = create_command_allocators(&device)?;
-        let (srv_heap, curve_buffer, band_buffer) = create_slug_buffers_and_srv(&device)?;
-        let font = load_terminal_font()?;
-        let root_signature = create_root_signature(&device)?;
-        let pipeline_state = create_pipeline_state(&device, &root_signature)?;
+            info_span!("create_render_targets")
+                .in_scope(|| create_render_targets(&device, &swap_chain))?;
+        let command_allocators = info_span!("create_command_allocators")
+            .in_scope(|| create_command_allocators(&device))?;
+        let (srv_heap, curve_buffer, band_buffer) = info_span!("create_slug_buffers_and_srv")
+            .in_scope(|| create_slug_buffers_and_srv(&device))?;
+        let font = info_span!("load_terminal_font").in_scope(load_terminal_font)?;
+        let root_signature =
+            info_span!("create_root_signature").in_scope(|| create_root_signature(&device))?;
+        let pipeline_state = info_span!("create_pipeline_state")
+            .in_scope(|| create_pipeline_state(&device, &root_signature))?;
         let command_list: ID3D12GraphicsCommandList = unsafe {
             device.CreateCommandList(
                 0,
@@ -243,8 +255,10 @@ impl D3d12PanelRenderer {
         }?;
         unsafe { command_list.Close()? };
 
-        let (vertex_buffer, vertex_buffer_view) = create_vertex_buffer(&device)?;
-        let shader_param_buffer = create_shader_param_buffer(&device)?;
+        let (vertex_buffer, vertex_buffer_view) =
+            info_span!("create_vertex_buffer").in_scope(|| create_vertex_buffer(&device))?;
+        let shader_param_buffer = info_span!("create_shader_param_buffer")
+            .in_scope(|| create_shader_param_buffer(&device))?;
         let fence: ID3D12Fence = unsafe { device.CreateFence(0, D3D12_FENCE_FLAG_NONE) }?;
         let fence_event = unsafe { Owned::new(CreateEventW(None, false, false, None)?) };
 
@@ -298,6 +312,7 @@ impl D3d12PanelRenderer {
         })
     }
 
+    #[instrument(level = "info", skip_all, fields(width, height))]
     pub fn resize(&mut self, width: u32, height: u32) -> eyre::Result<()> {
         if width == 0 || height == 0 {
             return Ok(());
@@ -439,80 +454,108 @@ impl D3d12PanelRenderer {
         }
     }
 
+    #[cfg_attr(feature = "tracy", instrument(level = "debug", skip_all, fields(panel_count = scene.panels.len(), glyph_count = scene.glyphs.len(), overlay_count = scene.overlay_panels.len())))]
     pub fn render(&mut self, scene: &RenderScene) -> eyre::Result<()> {
-        self.wait_for_frame_latency()?;
+        {
+            #[cfg(feature = "tracy")]
+            let _span = debug_span!("wait_for_frame_sync").entered();
+            self.wait_for_frame_latency()?;
+        }
         let frame_index = unsafe { self.swap_chain.GetCurrentBackBufferIndex() as usize };
-        self.wait_for_frame(frame_index)?;
+        {
+            #[cfg(feature = "tracy")]
+            let _span = debug_span!("wait_for_frame_fence", frame_index).entered();
+            self.wait_for_frame(frame_index)?;
+        }
 
-        self.update_slug_curves(scene)?;
-        let vertex_count = self.update_scene_vertices(scene)?;
+        {
+            #[cfg(feature = "tracy")]
+            let _span = debug_span!("update_slug_curves").entered();
+            self.update_slug_curves(scene)?;
+        }
+        let vertex_count = {
+            #[cfg(feature = "tracy")]
+            let _span = debug_span!("update_scene_vertices").entered();
+            self.update_scene_vertices(scene)?
+        };
         let current_target = self.render_targets[frame_index]
             .as_ref()
             .ok_or_else(|| eyre::eyre!("render target was missing for current frame"))?;
         let command_allocator = &self.command_allocators[frame_index];
 
-        unsafe {
-            command_allocator.Reset()?;
-            self.command_list
-                .Reset(command_allocator, &self.pipeline_state)?;
+        {
+            #[cfg(feature = "tracy")]
+            let _span = debug_span!("record_render_commands", frame_index, vertex_count).entered();
+            unsafe {
+                command_allocator.Reset()?;
+                self.command_list
+                    .Reset(command_allocator, &self.pipeline_state)?;
 
-            self.update_shader_params()?;
+                self.update_shader_params()?;
 
-            self.command_list
-                .SetDescriptorHeaps(&[Some(self.srv_heap.clone())]);
-            self.command_list
-                .SetGraphicsRootSignature(&self.root_signature);
-            self.command_list.SetGraphicsRootConstantBufferView(
-                0,
-                self.shader_param_buffer.GetGPUVirtualAddress(),
-            );
-            self.command_list.SetGraphicsRootDescriptorTable(
-                1,
-                self.srv_heap.GetGPUDescriptorHandleForHeapStart(),
-            );
-            self.command_list.RSSetViewports(&[self.viewport]);
-            self.command_list.RSSetScissorRects(&[self.scissor_rect]);
+                self.command_list
+                    .SetDescriptorHeaps(&[Some(self.srv_heap.clone())]);
+                self.command_list
+                    .SetGraphicsRootSignature(&self.root_signature);
+                self.command_list.SetGraphicsRootConstantBufferView(
+                    0,
+                    self.shader_param_buffer.GetGPUVirtualAddress(),
+                );
+                self.command_list.SetGraphicsRootDescriptorTable(
+                    1,
+                    self.srv_heap.GetGPUDescriptorHandleForHeapStart(),
+                );
+                self.command_list.RSSetViewports(&[self.viewport]);
+                self.command_list.RSSetScissorRects(&[self.scissor_rect]);
 
-            issue_transition_barrier(
-                &self.command_list,
-                current_target,
-                D3D12_RESOURCE_STATE_PRESENT,
-                D3D12_RESOURCE_STATE_RENDER_TARGET,
-            );
+                issue_transition_barrier(
+                    &self.command_list,
+                    current_target,
+                    D3D12_RESOURCE_STATE_PRESENT,
+                    D3D12_RESOURCE_STATE_RENDER_TARGET,
+                );
 
-            let rtv_handle = D3D12_CPU_DESCRIPTOR_HANDLE {
-                ptr: self.rtv_heap.GetCPUDescriptorHandleForHeapStart().ptr
-                    + frame_index * self.rtv_descriptor_size as usize,
-            };
-            self.command_list
-                .OMSetRenderTargets(1, Some(&rtv_handle), false, None);
+                let rtv_handle = D3D12_CPU_DESCRIPTOR_HANDLE {
+                    ptr: self.rtv_heap.GetCPUDescriptorHandleForHeapStart().ptr
+                        + frame_index * self.rtv_descriptor_size as usize,
+                };
+                self.command_list
+                    .OMSetRenderTargets(1, Some(&rtv_handle), false, None);
 
-            let clear_color = [0.0_f32, 0.0_f32, 0.0_f32, 0.0_f32];
-            self.command_list
-                .ClearRenderTargetView(rtv_handle, &clear_color, None);
-            self.command_list
-                .IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-            self.command_list
-                .IASetVertexBuffers(0, Some(&[self.vertex_buffer_view]));
-            self.command_list
-                .DrawInstanced(vertex_count as u32, 1, 0, 0);
+                let clear_color = [0.0_f32, 0.0_f32, 0.0_f32, 0.0_f32];
+                self.command_list
+                    .ClearRenderTargetView(rtv_handle, &clear_color, None);
+                self.command_list
+                    .IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                self.command_list
+                    .IASetVertexBuffers(0, Some(&[self.vertex_buffer_view]));
+                self.command_list
+                    .DrawInstanced(vertex_count as u32, 1, 0, 0);
 
-            issue_transition_barrier(
-                &self.command_list,
-                current_target,
-                D3D12_RESOURCE_STATE_RENDER_TARGET,
-                D3D12_RESOURCE_STATE_PRESENT,
-            );
-            self.command_list.Close()?;
+                issue_transition_barrier(
+                    &self.command_list,
+                    current_target,
+                    D3D12_RESOURCE_STATE_RENDER_TARGET,
+                    D3D12_RESOURCE_STATE_PRESENT,
+                );
+                self.command_list.Close()?;
+            }
         }
 
         let command_lists = [Some(self.command_list.cast::<ID3D12CommandList>()?)];
-        unsafe {
-            self.command_queue.ExecuteCommandLists(&command_lists);
-            self.swap_chain.Present(0, DXGI_PRESENT(0)).ok()?;
+        {
+            #[cfg(feature = "tracy")]
+            let _span = debug_span!("submit_and_present_frame", frame_index).entered();
+            unsafe {
+                self.command_queue.ExecuteCommandLists(&command_lists);
+                self.swap_chain.Present(0, DXGI_PRESENT(0)).ok()?;
+            }
         }
 
-        self.signal_frame(frame_index)
+        self.signal_frame(frame_index)?;
+        #[cfg(feature = "tracy")]
+        info!(message = "finished frame", tracy.frame_mark = true,);
+        Ok(())
     }
 
     fn update_scene_vertices(&self, scene: &RenderScene) -> eyre::Result<usize> {

@@ -5,13 +5,22 @@ use std::fs::File;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::Mutex;
+#[cfg(feature = "tracy")]
+use tracing::Metadata;
 use tracing::debug;
 use tracing::level_filters::LevelFilter;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::Registry;
+#[cfg(feature = "tracy")]
+use tracing_subscriber::filter::FilterFn;
 use tracing_subscriber::fmt::writer::BoxMakeWriter;
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::util::SubscriberInitExt;
+
+#[cfg(feature = "tracy")]
+fn exclude_tracy_frame_mark(meta: &Metadata<'_>) -> bool {
+    meta.fields().field("tracy.frame_mark").is_none()
+}
 
 /// Initialize logging based on the provided configuration.
 /// tool[impl logging.stderr-output]
@@ -48,6 +57,8 @@ pub fn init_logging(global_args: &GlobalArgs) -> eyre::Result<()> {
         .with_writer(std::io::stderr)
         .pretty()
         .without_time();
+    #[cfg(feature = "tracy")]
+    let stderr_layer = stderr_layer.with_filter(FilterFn::new(exclude_tracy_frame_mark));
     let subscriber = subscriber.with(stderr_layer);
 
     let json_log_path = match global_args.log_file.as_ref() {
@@ -78,6 +89,8 @@ pub fn init_logging(global_args: &GlobalArgs) -> eyre::Result<()> {
             .with_target(false)
             .with_line_number(true)
             .with_writer(json_writer);
+        #[cfg(feature = "tracy")]
+        let json_layer = json_layer.with_filter(FilterFn::new(exclude_tracy_frame_mark));
         Some(json_layer)
     } else {
         None

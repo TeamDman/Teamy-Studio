@@ -2,12 +2,14 @@ use std::cell::RefCell;
 use std::marker::PhantomData;
 use std::path::Path;
 use std::thread;
+#[cfg(feature = "tracy")]
+use tracing::debug_span;
 use tracing::trace;
 
 use eyre::Context;
 use teamy_windows::clipboard::{read_clipboard, write_clipboard};
 use teamy_windows::module::get_current_module;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, info_span, instrument};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, CLEARTYPE_QUALITY, CreateFontIndirectW, DeleteObject, EndPaint, GetDC,
@@ -19,11 +21,12 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetSystemMetrics, GetWindowRect, HTCAPTION, HTCLIENT, IDC_ARROW, IDC_SIZEALL, LoadCursorW, MSG,
     PM_REMOVE, PeekMessageW, PostMessageW, PostQuitMessage, RegisterClassExW, SM_CXPADDEDBORDER,
     SM_CXSCREEN, SM_CXSIZEFRAME, SM_CYSCREEN, SM_CYSIZEFRAME, SW_SHOW, SYSTEM_METRICS_INDEX,
-    SetCursor, SetTimer, ShowWindow, TranslateMessage, WM_CHAR, WM_DESTROY, WM_ENTERSIZEMOVE,
-    WM_ERASEBKGND, WM_EXITSIZEMOVE, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP,
-    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCALCSIZE, WM_NCHITTEST, WM_NCLBUTTONDOWN, WM_PAINT, WM_QUIT,
-    WM_RBUTTONUP, WM_SETCURSOR, WM_SIZE, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WNDCLASSEXW,
-    WS_EX_APPWINDOW, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP, WS_THICKFRAME, WS_VISIBLE,
+    SetCursor, SetTimer, ShowWindow, TranslateMessage, WM_CHAR, WM_CLOSE, WM_DESTROY,
+    WM_ENTERSIZEMOVE, WM_ERASEBKGND, WM_EXITSIZEMOVE, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN,
+    WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCALCSIZE, WM_NCHITTEST, WM_NCLBUTTONDOWN,
+    WM_PAINT, WM_QUIT, WM_RBUTTONUP, WM_SETCURSOR, WM_SIZE, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER,
+    WNDCLASSEXW, WS_EX_APPWINDOW, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP, WS_THICKFRAME,
+    WS_VISIBLE,
 };
 use windows::core::{PCWSTR, w};
 
@@ -83,6 +86,7 @@ struct AppState {
     terminal_scrollbar_hovered_part: Option<TerminalScrollbarPart>,
     terminal_scrollbar_drag: Option<TerminalScrollbarDrag>,
     in_move_size_loop: bool,
+    terminal_poll_pending: bool,
     terminal_font_height: i32,
     terminal_cell_width: i32,
     terminal_cell_height: i32,
@@ -145,6 +149,12 @@ impl WindowHandle {
         self.window_thread.assert_window_thread();
         // Safety: `self.hwnd` is a live top-level window owned by this process on `self.window_thread`.
         let _ = unsafe { DestroyWindow(self.hwnd) };
+    }
+
+    fn post_close(self) {
+        self.window_thread.assert_window_thread();
+        // Safety: posting WM_CLOSE to this live top-level window defers destruction until the message loop handles it.
+        let _ = unsafe { PostMessageW(Some(self.hwnd), WM_CLOSE, WPARAM(0), LPARAM(0)) };
     }
 
     fn client_rect(self) -> eyre::Result<ClientRect> {
@@ -372,6 +382,7 @@ fn dispatch_message(message: &MSG) {
 /// # Errors
 ///
 /// This function will return an error if the window class, font, terminal session, or message loop fails.
+#[instrument(level = "info", skip_all, fields(has_working_dir = working_dir.is_some(), has_workspace_window = workspace_window.is_some()))]
 pub fn run(
     app_home: &AppHome,
     working_dir: Option<&Path>,
@@ -379,11 +390,21 @@ pub fn run(
 ) -> eyre::Result<()> {
     let window_thread = WindowThread::current();
     let terminal_font_height = TERMINAL_FONT_HEIGHT;
-    let (terminal_cell_width, terminal_cell_height) =
-        measure_terminal_cell_size(terminal_font_height)?;
+    let (terminal_cell_width, terminal_cell_height) = info_span!(
+        "measure_terminal_cell_size",
+        kind = "terminal",
+        font_height = terminal_font_height,
+    )
+    .in_scope(|| measure_terminal_cell_size(terminal_font_height))?;
     let output_font_height = OUTPUT_FONT_HEIGHT;
-    let (output_cell_width, output_cell_height) = measure_terminal_cell_size(output_font_height)?;
-    let terminal = TerminalSession::new(app_home, working_dir)?;
+    let (output_cell_width, output_cell_height) = info_span!(
+        "measure_terminal_cell_size",
+        kind = "output",
+        font_height = output_font_height,
+    )
+    .in_scope(|| measure_terminal_cell_size(output_font_height))?;
+    let terminal = info_span!("create_terminal_session")
+        .in_scope(|| TerminalSession::new(app_home, working_dir))?;
 
     APP_STATE.with(|state| {
         *state.borrow_mut() = Some(AppState {
@@ -397,6 +418,7 @@ pub fn run(
             terminal_scrollbar_hovered_part: None,
             terminal_scrollbar_drag: None,
             in_move_size_loop: false,
+            terminal_poll_pending: false,
             terminal_font_height,
             terminal_cell_width,
             terminal_cell_height,
@@ -408,18 +430,22 @@ pub fn run(
         });
     });
 
-    let hwnd = create_window(window_thread)?;
-    let renderer = D3d12PanelRenderer::new(hwnd.raw())?;
+    let hwnd = info_span!("create_terminal_window").in_scope(|| create_window(window_thread))?;
+    let renderer =
+        info_span!("create_d3d12_renderer").in_scope(|| D3d12PanelRenderer::new(hwnd.raw()))?;
     with_app_state(|state| {
         state.hwnd = Some(hwnd);
         state.renderer = Some(renderer);
         Ok(())
     })?;
-    hwnd.show();
+    info_span!("show_window_and_resize_terminal").in_scope(|| -> eyre::Result<()> {
+        hwnd.show();
 
-    with_app_state(|state| {
-        let layout = client_layout(hwnd, state.terminal_cell_width, state.terminal_cell_height)?;
-        state.terminal.resize(layout)
+        with_app_state(|state| {
+            let layout =
+                client_layout(hwnd, state.terminal_cell_width, state.terminal_cell_height)?;
+            state.terminal.resize(layout)
+        })
     })?;
 
     info!("Teamy Studio terminal window shown");
@@ -427,6 +453,7 @@ pub fn run(
 }
 
 /// os[impl window.appearance.os-chrome-none]
+#[instrument(level = "info", skip_all)]
 fn create_window(window_thread: WindowThread) -> eyre::Result<WindowHandle> {
     let instance = get_current_module().wrap_err("failed to get module handle")?;
 
@@ -769,12 +796,10 @@ fn render_frame() -> eyre::Result<()> {
 /// behavior[impl window.interaction.resize.live]
 /// behavior[impl window.interaction.resize.terminal-live-output]
 /// behavior[impl window.interaction.resize.low-latency]
+#[cfg_attr(feature = "tracy", instrument(level = "debug", skip_all))]
 fn handle_poll_timer(hwnd: WindowHandle) -> eyre::Result<bool> {
     with_app_state(|state| {
-        let result = state.terminal.pump()?;
-        if result.should_close {
-            return Ok(true);
-        }
+        state.terminal_poll_pending = true;
 
         let selection_scrolled = auto_scroll_pending_terminal_selection(state, hwnd)?;
 
@@ -786,62 +811,96 @@ fn handle_poll_timer(hwnd: WindowHandle) -> eyre::Result<bool> {
     })
 }
 
+#[cfg_attr(feature = "tracy", instrument(level = "debug", skip_all, fields(resize = resize.is_some())))]
 fn render_current_frame(
     state: &mut AppState,
     hwnd: WindowHandle,
     resize: Option<(u32, u32)>,
 ) -> eyre::Result<()> {
+    let poll_pending = state.terminal_poll_pending;
+    let should_pump_terminal = poll_pending || resize.is_some() || state.in_move_size_loop;
+    if should_pump_terminal {
+        state.terminal_poll_pending = false;
+        #[cfg(feature = "tracy")]
+        let _span = debug_span!(
+            "pump_terminal_for_frame",
+            from_poll_timer = poll_pending,
+            resize = resize.is_some(),
+            in_move_size_loop = state.in_move_size_loop,
+        )
+        .entered();
+        if state.terminal.pump()?.should_close {
+            hwnd.post_close();
+            return Ok(());
+        }
+    }
+
     if let Some((width, height)) = resize
         && let Some(renderer) = state.renderer.as_mut()
     {
         renderer.resize(width, height)?;
     }
 
-    if (resize.is_some() || state.in_move_size_loop) && state.terminal.pump()?.should_close {
-        hwnd.destroy();
-        return Ok(());
-    }
-
-    let layout = client_layout(hwnd, state.terminal_cell_width, state.terminal_cell_height)?;
-    let mut scene = build_panel_scene(layout);
+    let layout = {
+        #[cfg(feature = "tracy")]
+        let _span = debug_span!("compute_client_layout").entered();
+        client_layout(hwnd, state.terminal_cell_width, state.terminal_cell_height)?
+    };
+    let mut scene = {
+        #[cfg(feature = "tracy")]
+        let _span = debug_span!("build_panel_scene").entered();
+        build_panel_scene(layout)
+    };
     let cell_number = state
         .workspace_window
         .as_ref()
         .map_or(1, |workspace_window| workspace_window.cell_number);
-    let output_text = build_output_panel_text(state);
-    let terminal_display = state
-        .terminal
-        .visible_display_state_with_selection(state.terminal_selection)?;
+    let output_text = {
+        #[cfg(feature = "tracy")]
+        let _span = debug_span!("build_output_panel_text").entered();
+        build_output_panel_text(state)
+    };
+    let terminal_display = {
+        #[cfg(feature = "tracy")]
+        let _span = debug_span!("build_terminal_display_state").entered();
+        state
+            .terminal
+            .visible_display_state_with_selection(state.terminal_selection)?
+    };
 
-    push_centered_text(
-        &mut scene,
-        layout.drag_handle_rect().to_win32_rect(),
-        &cell_number.to_string(),
-        [0.95, 0.95, 0.98, 1.0],
-    );
-    let terminal_rect = layout.terminal_viewport_rect().inset(4);
-    let scrollbar_rect = layout.terminal_scrollbar_rect().inset(4);
-    push_terminal_display(
-        &mut scene,
-        terminal_rect,
-        state.terminal_cell_width,
-        state.terminal_cell_height,
-        &terminal_display,
-    );
-    push_terminal_scrollbar(
-        &mut scene,
-        scrollbar_rect,
-        terminal_display.scrollbar,
-        terminal_scrollbar_visual_state(state),
-    );
-    push_text_block(
-        &mut scene,
-        layout.result_panel_rect().inset(14).to_win32_rect(),
-        &output_text,
-        state.output_cell_width,
-        state.output_cell_height,
-        [0.96, 0.95, 0.90, 1.0],
-    );
+    let () = {
+        #[cfg(feature = "tracy")]
+        let _span = debug_span!("populate_render_scene").entered();
+        push_centered_text(
+            &mut scene,
+            layout.drag_handle_rect().to_win32_rect(),
+            &cell_number.to_string(),
+            [0.95, 0.95, 0.98, 1.0],
+        );
+        let terminal_rect = layout.terminal_viewport_rect().inset(4);
+        let scrollbar_rect = layout.terminal_scrollbar_rect().inset(4);
+        push_terminal_display(
+            &mut scene,
+            terminal_rect,
+            state.terminal_cell_width,
+            state.terminal_cell_height,
+            &terminal_display,
+        );
+        push_terminal_scrollbar(
+            &mut scene,
+            scrollbar_rect,
+            terminal_display.scrollbar,
+            terminal_scrollbar_visual_state(state),
+        );
+        push_text_block(
+            &mut scene,
+            layout.result_panel_rect().inset(14).to_win32_rect(),
+            &output_text,
+            state.output_cell_width,
+            state.output_cell_height,
+            [0.96, 0.95, 0.90, 1.0],
+        );
+    };
 
     let Some(renderer) = state.renderer.as_mut() else {
         return Ok(());

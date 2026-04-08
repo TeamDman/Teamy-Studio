@@ -169,7 +169,7 @@ Start-Sleep -Seconds 1
 try {
 	Write-Host "Running: cargo run --release --features tracy -- $($QueryArgs -join ' ')"
 	$commandStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
-	cargo run --release --features tracy -- @QueryArgs --log-filter debug
+	cargo run --release --features tracy -- @QueryArgs --log-filter trace
 	$commandStopwatch.Stop()
 	$commandElapsed = $commandStopwatch.Elapsed
 	Write-Host "Traced command time: $(Format-Elapsed $commandElapsed)"
