@@ -372,18 +372,37 @@ float4 apply_button(float2 uv, float4 color, float effect) {
     return shaded;
 }
 
+float4 apply_terminal_scrollbar_track(float2 uv, float4 color) {
+    float t = PanelTime();
+    float groove = 0.88 + (0.05 * sin((uv.y * 15.0) + (t * 0.75)));
+    float inset = 0.92 - (0.12 * abs((uv.x - 0.5) * 2.0));
+    return float4(color.rgb * groove * inset, color.a);
+}
+
+float4 apply_terminal_scrollbar_thumb(float2 uv, float4 color) {
+    float t = PanelTime();
+    float sheen = 0.95 + (0.08 * sin((uv.y * 9.0) - (t * 1.1)));
+    float ridge = 1.0 - (0.14 * abs((uv.x - 0.5) * 2.0));
+    float cap = 0.96 + (0.05 * sin((uv.x * 12.0) + (t * 0.6)));
+    return float4(color.rgb * sheen * ridge * cap, color.a);
+}
+
 float4 PSMain(PsInput input) : SV_TARGET {
-    if (input.effect > 9.5) {
+    if (input.effect > 11.5) {
         float coverage = slug_coverage(input.uv, input.glyph, input.glyphData, input.banding);
         return float4(input.color.rgb, input.color.a * coverage);
     }
 
-    if (input.effect > 7.5) {
+    if (input.effect > 7.5 && input.effect < 9.5) {
         return input.color;
     }
 
     float4 shaded = input.color;
-    if (input.effect < 0.5) {
+    if (input.effect > 10.5) {
+        shaded = apply_terminal_scrollbar_thumb(input.uv, input.color);
+    } else if (input.effect > 9.5) {
+        shaded = apply_terminal_scrollbar_track(input.uv, input.color);
+    } else if (input.effect < 0.5) {
         shaded = apply_blue_background(input.uv, input.color);
     } else if (input.effect < 1.5) {
         shaded = apply_sidecar(input.uv, input.color);

@@ -154,7 +154,9 @@ pub enum PanelEffect {
     PlusButton = 7,
     TerminalFill = 8,
     TerminalCursor = 9,
-    Text = 10,
+    TerminalScrollbarTrack = 10,
+    TerminalScrollbarThumb = 11,
+    Text = 12,
 }
 
 #[derive(Clone, Copy, Debug)]

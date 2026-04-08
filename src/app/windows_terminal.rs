@@ -10,6 +10,7 @@ use libghostty_vt::key;
 use libghostty_vt::render::{CellIterator, CursorVisualStyle, RenderState, RowIterator};
 use libghostty_vt::screen::RowSemanticPrompt;
 use libghostty_vt::style::RgbColor;
+use libghostty_vt::terminal::{Point, PointCoordinate, ScrollViewport};
 use libghostty_vt::{Terminal, TerminalOptions};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use tracing::{debug, info};
@@ -38,6 +39,8 @@ const MIN_CODE_PANEL_HEIGHT: i32 = 180;
 const PLUS_BUTTON_SIZE: i32 = 42;
 const SIDECAR_BUTTON_SIZE: i32 = 34;
 const SIDECAR_BUTTON_GAP: i32 = 12;
+const TERMINAL_SCROLLBAR_WIDTH: i32 = 12;
+const TERMINAL_SCROLLBAR_GAP: i32 = 8;
 const WIN32_INPUT_MODE_ENABLE: &[u8] = b"\x1b[?9001h";
 const WIN32_INPUT_MODE_DISABLE: &[u8] = b"\x1b[?9001l";
 const CTRL_D_EOF: u8 = 0x04;
@@ -104,11 +107,33 @@ pub struct TerminalDisplayCursor {
     pub style: TerminalDisplayCursorStyle,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TerminalDisplayScrollbar {
+    pub total: u64,
+    pub offset: u64,
+    pub visible: u64,
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct TerminalDisplayState {
     pub backgrounds: Vec<TerminalDisplayBackground>,
     pub glyphs: Vec<TerminalDisplayGlyph>,
     pub cursor: Option<TerminalDisplayCursor>,
+    pub scrollbar: Option<TerminalDisplayScrollbar>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TerminalViewportMetrics {
+    pub total: u64,
+    pub offset: u64,
+    pub visible: u64,
+    pub scrollback: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TerminalTextRow {
+    row: i32,
+    cells: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -333,13 +358,35 @@ impl TerminalLayout {
     #[must_use]
     /// behavior[impl window.appearance.code-panel.terminal-alignment]
     pub fn terminal_rect(self) -> ClientRect {
+        self.terminal_viewport_rect()
+    }
+
+    #[must_use]
+    pub fn terminal_viewport_rect(self) -> ClientRect {
         let code = self.code_panel_rect();
-        ClientRect::new(code.left(), code.top(), code.right(), code.bottom())
+        let scrollbar = self.terminal_scrollbar_rect();
+        ClientRect::new(
+            code.left(),
+            code.top(),
+            (scrollbar.left() - TERMINAL_SCROLLBAR_GAP).max(code.left() + 1),
+            code.bottom(),
+        )
+    }
+
+    #[must_use]
+    pub fn terminal_scrollbar_rect(self) -> ClientRect {
+        let code = self.code_panel_rect();
+        ClientRect::new(
+            (code.right() - TERMINAL_SCROLLBAR_WIDTH).max(code.left() + 1),
+            code.top(),
+            code.right(),
+            code.bottom(),
+        )
     }
 
     #[must_use]
     pub fn grid_size(self) -> (u16, u16) {
-        let rect = self.terminal_rect();
+        let rect = self.terminal_viewport_rect();
         let width = rect.width().max(self.cell_width.max(1));
         let height = rect.height().max(self.cell_height.max(1));
         let cols = (width / self.cell_width.max(1)).max(1);
@@ -483,9 +530,9 @@ impl TerminalSession {
             .resize(PtySize {
                 cols,
                 rows,
-                pixel_width: u16::try_from(layout.terminal_rect().width().max(0))
+                pixel_width: u16::try_from(layout.terminal_viewport_rect().width().max(0))
                     .unwrap_or(u16::MAX),
-                pixel_height: u16::try_from(layout.terminal_rect().height().max(0))
+                pixel_height: u16::try_from(layout.terminal_viewport_rect().height().max(0))
                     .unwrap_or(u16::MAX),
             })
             .map_err(|error| eyre::eyre!("failed to resize PTY: {error}"))?;
@@ -851,7 +898,7 @@ impl TerminalSession {
     }
 
     pub fn selected_text(&mut self, selection: TerminalSelection) -> eyre::Result<String> {
-        let rows = self.visible_cell_text_rows()?;
+        let rows = self.selected_cell_text_rows(selection)?;
         Ok(extract_selected_text(&rows, selection))
     }
 
@@ -859,15 +906,55 @@ impl TerminalSession {
         let rows = self.visible_cell_text_rows()?;
         Ok(rows
             .into_iter()
-            .map(|row| row.concat().trim_end_matches(' ').to_owned())
+            .map(|row| row.cells.concat().trim_end_matches(' ').to_owned())
             .collect::<Vec<_>>()
             .join("\n"))
+    }
+
+    pub fn viewport_metrics(&self) -> eyre::Result<TerminalViewportMetrics> {
+        let scrollbar = self
+            .terminal
+            .scrollbar()
+            .wrap_err("failed to query terminal scrollbar state")?;
+        let scrollback_rows = self
+            .terminal
+            .scrollback_rows()
+            .wrap_err("failed to query terminal scrollback row count")?;
+
+        Ok(TerminalViewportMetrics {
+            total: scrollbar.total,
+            offset: scrollbar.offset,
+            visible: scrollbar.len,
+            scrollback: u64::try_from(scrollback_rows).unwrap_or(u64::MAX),
+        })
+    }
+
+    pub fn viewport_to_screen_cell(
+        &self,
+        cell: TerminalCellPoint,
+    ) -> eyre::Result<TerminalCellPoint> {
+        let metrics = self.viewport_metrics()?;
+        Ok(TerminalCellPoint::new(
+            cell.column(),
+            i32::try_from(metrics.offset).unwrap_or(i32::MAX) + cell.row(),
+        ))
+    }
+
+    pub fn scroll_viewport_by(&mut self, delta: isize) {
+        if delta == 0 {
+            return;
+        }
+
+        self.terminal.scroll_viewport(ScrollViewport::Delta(delta));
+        self.repaint.needs_repaint = true;
+        self.repaint.full_repaint_pending = true;
     }
 
     pub fn visible_display_state_with_selection(
         &mut self,
         selection: Option<TerminalSelection>,
     ) -> eyre::Result<TerminalDisplayState> {
+        let viewport = self.viewport_metrics()?;
         let snapshot = self
             .render_state
             .update(&self.terminal)
@@ -882,6 +969,11 @@ impl TerminalSession {
             backgrounds: Vec::new(),
             glyphs: Vec::new(),
             cursor,
+            scrollbar: Some(TerminalDisplayScrollbar {
+                total: viewport.total,
+                offset: viewport.offset,
+                visible: viewport.visible,
+            }),
         };
 
         let mut row_index = 0_i32;
@@ -898,8 +990,13 @@ impl TerminalSession {
                 let graphemes = cell.graphemes().wrap_err("failed to read cell text")?;
                 let foreground = cell.fg_color().wrap_err("failed to read cell foreground")?;
                 let background = cell.bg_color().wrap_err("failed to read cell background")?;
-                let cell_position = TerminalCellPoint::new(column_index, row_index);
-                let selected = selection.is_some_and(|selection| selection.contains(cell_position));
+                let viewport_cell = TerminalCellPoint::new(column_index, row_index);
+                let selection_cell = TerminalCellPoint::new(
+                    column_index,
+                    i32::try_from(viewport.offset).unwrap_or(i32::MAX) + row_index,
+                );
+                let selected =
+                    selection.is_some_and(|selection| selection.contains(selection_cell));
                 let (glyph_color, background_color) = resolve_terminal_cell_colors(
                     &colors,
                     foreground,
@@ -909,7 +1006,7 @@ impl TerminalSession {
 
                 if let Some(color) = background_color {
                     display.backgrounds.push(TerminalDisplayBackground {
-                        cell: cell_position,
+                        cell: viewport_cell,
                         color,
                     });
                 }
@@ -917,7 +1014,7 @@ impl TerminalSession {
                 if !graphemes.is_empty() {
                     for character in graphemes {
                         display.glyphs.push(TerminalDisplayGlyph {
-                            cell: cell_position,
+                            cell: viewport_cell,
                             character,
                             color: glyph_color,
                         });
@@ -1128,7 +1225,8 @@ impl TerminalSession {
         }
     }
 
-    fn visible_cell_text_rows(&mut self) -> eyre::Result<Vec<Vec<String>>> {
+    fn visible_cell_text_rows(&mut self) -> eyre::Result<Vec<TerminalTextRow>> {
+        let viewport = self.viewport_metrics()?;
         let snapshot = self
             .render_state
             .update(&self.terminal)
@@ -1140,6 +1238,7 @@ impl TerminalSession {
         let mut row_iter = rows
             .update(&snapshot)
             .wrap_err("failed to update row iterator")?;
+        let mut row_index = 0_i32;
         while let Some(row) = row_iter.next() {
             let mut row_cells = Vec::new();
             let mut cell_iter = cells
@@ -1153,10 +1252,57 @@ impl TerminalSession {
                     row_cells.push(graphemes.iter().collect());
                 }
             }
-            text_rows.push(row_cells);
+            text_rows.push(TerminalTextRow {
+                row: i32::try_from(viewport.offset).unwrap_or(i32::MAX) + row_index,
+                cells: row_cells,
+            });
+            row_index += 1;
         }
 
         Ok(text_rows)
+    }
+
+    fn selected_cell_text_rows(
+        &self,
+        selection: TerminalSelection,
+    ) -> eyre::Result<Vec<TerminalTextRow>> {
+        let total_rows = self
+            .terminal
+            .total_rows()
+            .wrap_err("failed to query terminal total row count")?;
+        if total_rows == 0 {
+            return Ok(Vec::new());
+        }
+
+        let (start_row, end_row) = selection_row_bounds(selection);
+        let max_row = i32::try_from(total_rows.saturating_sub(1)).unwrap_or(i32::MAX);
+        let clamped_start = start_row.clamp(0, max_row);
+        let clamped_end = end_row.clamp(0, max_row);
+        let mut rows = Vec::new();
+
+        for row in clamped_start..=clamped_end {
+            rows.push(TerminalTextRow {
+                row,
+                cells: self.screen_row_cells(u32::try_from(row).unwrap_or_default())?,
+            });
+        }
+
+        Ok(rows)
+    }
+
+    fn screen_row_cells(&self, row: u32) -> eyre::Result<Vec<String>> {
+        let mut cells = Vec::with_capacity(usize::from(self.cols));
+        for column in 0..self.cols {
+            let grid_ref = self
+                .terminal
+                .grid_ref(Point::Screen(PointCoordinate { x: column, y: row }))
+                .wrap_err_with(|| {
+                    format!("failed to resolve terminal screen point at column {column}, row {row}")
+                })?;
+            cells.push(read_grid_ref_text(&grid_ref)?);
+        }
+
+        Ok(cells)
     }
 }
 
@@ -1310,16 +1456,27 @@ fn linear_selection_contains(
         && (cell.row(), cell.column()) <= (end.row(), end.column())
 }
 
-fn extract_selected_text(rows: &[Vec<String>], selection: TerminalSelection) -> String {
+fn selection_row_bounds(selection: TerminalSelection) -> (i32, i32) {
+    match selection.mode() {
+        TerminalSelectionMode::Linear => {
+            let (start, end) = ordered_linear_bounds(selection.anchor, selection.focus);
+            (start.row(), end.row())
+        }
+        TerminalSelectionMode::Block => {
+            let (_, top, _, bottom) = ordered_block_bounds(selection.anchor, selection.focus);
+            (top, bottom)
+        }
+    }
+}
+
+fn extract_selected_text(rows: &[TerminalTextRow], selection: TerminalSelection) -> String {
     let mut selected_rows = Vec::new();
 
-    for (row_index, row) in rows.iter().enumerate() {
+    for row in rows {
         let mut selected = String::new();
-        for (column_index, cell_text) in row.iter().enumerate() {
-            let cell = TerminalCellPoint::new(
-                i32::try_from(column_index).unwrap_or(i32::MAX),
-                i32::try_from(row_index).unwrap_or(i32::MAX),
-            );
+        for (column_index, cell_text) in row.cells.iter().enumerate() {
+            let cell =
+                TerminalCellPoint::new(i32::try_from(column_index).unwrap_or(i32::MAX), row.row);
             if selection.contains(cell) {
                 selected.push_str(cell_text);
             }
@@ -1336,6 +1493,26 @@ fn extract_selected_text(rows: &[Vec<String>], selection: TerminalSelection) -> 
     }
 
     selected_rows.join("\n")
+}
+
+fn read_grid_ref_text(grid_ref: &libghostty_vt::screen::GridRef<'_>) -> eyre::Result<String> {
+    let mut small = ['\0'; 8];
+    match grid_ref.graphemes(&mut small) {
+        Ok(0) => Ok(" ".to_owned()),
+        Ok(length) => Ok(small[..length].iter().collect()),
+        Err(libghostty_vt::Error::OutOfSpace { required }) => {
+            let mut buffer = vec!['\0'; required];
+            let length = grid_ref
+                .graphemes(&mut buffer)
+                .wrap_err("failed to read terminal grapheme cluster into resized buffer")?;
+            if length == 0 {
+                Ok(" ".to_owned())
+            } else {
+                Ok(buffer[..length].iter().collect())
+            }
+        }
+        Err(error) => Err(error).wrap_err("failed to read terminal cell grapheme cluster"),
+    }
 }
 
 fn rgb_to_rgba(color: RgbColor) -> [f32; 4] {
@@ -1830,7 +2007,7 @@ mod tests {
     use super::{
         MIN_CODE_PANEL_HEIGHT, PendingWin32CharKey, PromptInputState, SemanticPromptTracking,
         TerminalDisplayCursorStyle, TerminalLayout, TerminalSelection, TerminalSelectionMode,
-        extract_selected_text, map_cursor_style, map_virtual_key, osc_terminator,
+        TerminalTextRow, extract_selected_text, map_cursor_style, map_virtual_key, osc_terminator,
         partial_osc_133_prefix_len, resolve_terminal_cell_colors, should_close_from_echoed_ctrl_d,
         should_mark_prompt_input_written_for_key, should_translate_ctrl_d_key,
         should_translate_ctrl_d_to_exit, strip_echoed_ctrl_d,
@@ -1854,14 +2031,17 @@ mod tests {
         let code = layout.code_panel_rect();
         let result = layout.result_panel_rect();
         let plus = layout.plus_button_rect();
-        let terminal = layout.terminal_rect();
+        let terminal = layout.terminal_viewport_rect();
+        let scrollbar = layout.terminal_scrollbar_rect();
 
         assert!(sidecar.right() <= code.left());
         assert!(code.bottom() < result.top());
         assert!(result.bottom() < plus.top());
         assert_eq!(terminal.left(), code.left());
-        assert_eq!(terminal.right(), code.right());
         assert_eq!(terminal.bottom(), code.bottom());
+        assert!(terminal.right() < scrollbar.left());
+        assert_eq!(scrollbar.right(), code.right());
+        assert_eq!(scrollbar.bottom(), code.bottom());
         assert!(code.height() >= MIN_CODE_PANEL_HEIGHT);
     }
 
@@ -2176,18 +2356,24 @@ mod tests {
     #[test]
     fn extract_selected_text_wraps_linear_selection_by_row() {
         let rows = vec![
-            vec![
-                "a".to_owned(),
-                "b".to_owned(),
-                "c".to_owned(),
-                "d".to_owned(),
-            ],
-            vec![
-                "e".to_owned(),
-                "f".to_owned(),
-                "g".to_owned(),
-                "h".to_owned(),
-            ],
+            TerminalTextRow {
+                row: 0,
+                cells: vec![
+                    "a".to_owned(),
+                    "b".to_owned(),
+                    "c".to_owned(),
+                    "d".to_owned(),
+                ],
+            },
+            TerminalTextRow {
+                row: 1,
+                cells: vec![
+                    "e".to_owned(),
+                    "f".to_owned(),
+                    "g".to_owned(),
+                    "h".to_owned(),
+                ],
+            },
         ];
         let selection = TerminalSelection::new(
             TerminalCellPoint::new(2, 0),
@@ -2202,24 +2388,33 @@ mod tests {
     #[test]
     fn extract_selected_text_preserves_block_rows() {
         let rows = vec![
-            vec![
-                "a".to_owned(),
-                "b".to_owned(),
-                "c".to_owned(),
-                "d".to_owned(),
-            ],
-            vec![
-                "e".to_owned(),
-                "f".to_owned(),
-                "g".to_owned(),
-                "h".to_owned(),
-            ],
-            vec![
-                "i".to_owned(),
-                "j".to_owned(),
-                "k".to_owned(),
-                "l".to_owned(),
-            ],
+            TerminalTextRow {
+                row: 0,
+                cells: vec![
+                    "a".to_owned(),
+                    "b".to_owned(),
+                    "c".to_owned(),
+                    "d".to_owned(),
+                ],
+            },
+            TerminalTextRow {
+                row: 1,
+                cells: vec![
+                    "e".to_owned(),
+                    "f".to_owned(),
+                    "g".to_owned(),
+                    "h".to_owned(),
+                ],
+            },
+            TerminalTextRow {
+                row: 2,
+                cells: vec![
+                    "i".to_owned(),
+                    "j".to_owned(),
+                    "k".to_owned(),
+                    "l".to_owned(),
+                ],
+            },
         ];
         let selection = TerminalSelection::new(
             TerminalCellPoint::new(1, 0),
@@ -2228,5 +2423,42 @@ mod tests {
         );
 
         assert_eq!(extract_selected_text(&rows, selection), "bc\nfg\njk");
+    }
+
+    // behavior[verify window.interaction.clipboard.selection-preserves-scrolled-history]
+    #[test]
+    fn extract_selected_text_uses_absolute_row_coordinates() {
+        let rows = vec![
+            TerminalTextRow {
+                row: 12,
+                cells: vec!["a".to_owned(), "b".to_owned(), "c".to_owned()],
+            },
+            TerminalTextRow {
+                row: 13,
+                cells: vec!["d".to_owned(), "e".to_owned(), "f".to_owned()],
+            },
+        ];
+        let selection = TerminalSelection::new(
+            TerminalCellPoint::new(1, 12),
+            TerminalCellPoint::new(1, 13),
+            TerminalSelectionMode::Linear,
+        );
+
+        assert_eq!(extract_selected_text(&rows, selection), "bc\nde");
+    }
+
+    #[test]
+    fn selection_checks_can_use_absolute_rows_without_moving_render_cells() {
+        let render_cell = TerminalCellPoint::new(4, 2);
+        let selection_cell = TerminalCellPoint::new(4, 18);
+        let selection = TerminalSelection::new(
+            TerminalCellPoint::new(4, 18),
+            TerminalCellPoint::new(4, 18),
+            TerminalSelectionMode::Block,
+        );
+
+        assert_eq!(render_cell.row(), 2);
+        assert!(selection.contains(selection_cell));
+        assert!(!selection.contains(render_cell));
     }
 }

@@ -56,6 +56,9 @@ The terminal caret must be visibly rendered using the terminal's active cursor p
 behavior[window.appearance.terminal.cursor.legible-block]
 Block-style terminal cursors must keep the glyph beneath them legible instead of fully obliterating the cell contents.
 
+behavior[window.appearance.terminal.scrollbar.shader]
+The terminal area must render a visible scrollbar track and thumb using the panel shader pipeline rather than native window chrome.
+
 ## Window Interaction
 
 behavior[window.interaction.drag]
@@ -94,8 +97,14 @@ Clicking in the terminal area without dragging must clear any existing terminal 
 behavior[window.interaction.selection.block-alt-drag]
 Holding Alt while dragging with the left mouse button across the terminal area must create a rectangular box selection instead of a row-wrapping selection.
 
+behavior[window.interaction.selection.drag-auto-scroll]
+When a terminal text selection drag moves beyond the top or bottom edge of the visible terminal viewport, the viewport must keep scrolling in that direction without requiring mouse-wheel input or a mouse release, and the scrollback velocity must increase with the pointer's distance beyond the viewport.
+
 behavior[window.interaction.clipboard.right-click-copy-selection]
 When a terminal selection is present, right clicking in the terminal area must copy the selected text to the clipboard and clear the selection.
+
+behavior[window.interaction.clipboard.selection-preserves-scrolled-history]
+When a terminal selection spans content that required scrolling the viewport during the drag, copying the selection must include the full selected history range rather than only the portion still visible in the viewport.
 
 behavior[window.interaction.clipboard.right-click-paste]
 When no terminal selection is present, right clicking in the terminal area must paste the current clipboard text into the PTY-backed shell session.
@@ -108,3 +117,6 @@ Holding Ctrl while scrolling over the terminal area must adjust the terminal tex
 
 behavior[window.interaction.zoom.output]
 Holding Ctrl while scrolling over the output panel must adjust only the output panel text scale and must not change the terminal grid size.
+
+behavior[window.interaction.scrollback.mouse-wheel]
+Scrolling the mouse wheel over the terminal area without holding Ctrl must move through terminal scrollback history instead of being ignored.

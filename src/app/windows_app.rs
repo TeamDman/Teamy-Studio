@@ -13,7 +13,7 @@ use windows::Win32::Graphics::Gdi::{
     BeginPaint, CLEARTYPE_QUALITY, CreateFontIndirectW, DeleteObject, EndPaint, GetDC,
     GetTextExtentPoint32W, HFONT, LOGFONTW, PAINTSTRUCT, ReleaseDC, SelectObject,
 };
-use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_CONTROL, VK_MENU};
+use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_CONTROL, VK_LBUTTON, VK_MENU};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect, GetCursorPos,
     GetSystemMetrics, GetWindowRect, HTCAPTION, HTCLIENT, IDC_ARROW, IDC_SIZEALL, LoadCursorW, MSG,
@@ -58,6 +58,9 @@ const INITIAL_WINDOW_WIDTH: i32 = 1040;
 const INITIAL_WINDOW_HEIGHT: i32 = 680;
 const DRAG_START_THRESHOLD_PX: i32 = 0;
 const MIN_RESIZE_BORDER_THICKNESS: i32 = 1;
+const MOUSE_WHEEL_DELTA: i16 = 120;
+const TERMINAL_WHEEL_SCROLL_LINES: isize = 3;
+const SELECTION_AUTO_SCROLL_MAX_LINES: isize = 12;
 
 thread_local! {
     static APP_STATE: RefCell<Option<AppState>> = const { RefCell::new(None) };
@@ -70,6 +73,7 @@ struct AppState {
     pending_window_drag: Option<PendingWindowDrag>,
     terminal_selection: Option<TerminalSelection>,
     pending_terminal_selection: Option<PendingTerminalSelection>,
+    terminal_selection_drag_point: Option<ClientPoint>,
     in_move_size_loop: bool,
     terminal_font_height: i32,
     terminal_cell_width: i32,
@@ -339,6 +343,7 @@ pub fn run(
             pending_window_drag: None,
             terminal_selection: None,
             pending_terminal_selection: None,
+            terminal_selection_drag_point: None,
             in_move_size_loop: false,
             terminal_font_height,
             terminal_cell_width,
@@ -719,7 +724,9 @@ fn handle_poll_timer(hwnd: WindowHandle) -> eyre::Result<bool> {
             return Ok(true);
         }
 
-        if should_render_from_poll_timer(state.in_move_size_loop) {
+        let selection_scrolled = auto_scroll_pending_terminal_selection(state, hwnd)?;
+
+        if should_render_from_poll_timer(state.in_move_size_loop) || selection_scrolled {
             render_current_frame(state, hwnd, None)?;
         }
 
@@ -760,14 +767,16 @@ fn render_current_frame(
         &cell_number.to_string(),
         [0.95, 0.95, 0.98, 1.0],
     );
-    let terminal_rect = layout.terminal_rect().inset(4);
+    let terminal_rect = layout.terminal_viewport_rect().inset(4);
+    let scrollbar_rect = layout.terminal_scrollbar_rect().inset(4);
     push_terminal_display(
         &mut scene,
         terminal_rect,
         state.terminal_cell_width,
         state.terminal_cell_height,
-        terminal_display,
+        &terminal_display,
     );
+    push_terminal_scrollbar(&mut scene, scrollbar_rect, terminal_display.scrollbar);
     push_text_block(
         &mut scene,
         layout.result_panel_rect().inset(14).to_win32_rect(),
@@ -789,9 +798,9 @@ fn push_terminal_display(
     terminal_rect: ClientRect,
     cell_width: i32,
     cell_height: i32,
-    display: TerminalDisplayState,
+    display: &TerminalDisplayState,
 ) {
-    for background in display.backgrounds {
+    for background in &display.backgrounds {
         push_panel(
             scene,
             terminal_cell_rect(terminal_rect, background.cell, cell_width, cell_height)
@@ -801,7 +810,7 @@ fn push_terminal_display(
         );
     }
 
-    for glyph in display.glyphs {
+    for glyph in &display.glyphs {
         push_glyph(
             scene,
             terminal_cell_rect(terminal_rect, glyph.cell, cell_width, cell_height).to_win32_rect(),
@@ -821,6 +830,56 @@ fn push_terminal_display(
             );
         }
     }
+}
+
+/// behavior[impl window.appearance.terminal.scrollbar.shader]
+fn push_terminal_scrollbar(
+    scene: &mut RenderScene,
+    scrollbar_rect: ClientRect,
+    scrollbar: Option<super::windows_terminal::TerminalDisplayScrollbar>,
+) {
+    if scrollbar_rect.width() <= 0 || scrollbar_rect.height() <= 0 {
+        return;
+    }
+
+    push_panel(
+        scene,
+        scrollbar_rect.to_win32_rect(),
+        [0.12, 0.15, 0.20, 0.78],
+        PanelEffect::TerminalScrollbarTrack,
+    );
+
+    let Some(scrollbar) = scrollbar else {
+        return;
+    };
+    if scrollbar.total == 0 {
+        return;
+    }
+
+    let track_height = u64::try_from(scrollbar_rect.height().max(1)).unwrap_or(1);
+    let min_thumb_height = scrollbar_rect.width().max(18);
+    let proportional_thumb = (track_height.saturating_mul(scrollbar.visible) / scrollbar.total)
+        .max(u64::try_from(min_thumb_height).unwrap_or(1));
+    let thumb_height = i32::try_from(proportional_thumb.min(track_height))
+        .unwrap_or(i32::MAX)
+        .clamp(min_thumb_height, scrollbar_rect.height().max(1));
+    let travel = u64::try_from((scrollbar_rect.height() - thumb_height).max(0)).unwrap_or_default();
+    let thumb_top = scrollbar_rect.top()
+        + i32::try_from(travel.saturating_mul(scrollbar.offset) / scrollbar.total)
+            .unwrap_or_default();
+    let thumb_rect = ClientRect::new(
+        scrollbar_rect.left(),
+        thumb_top,
+        scrollbar_rect.right(),
+        (thumb_top + thumb_height).min(scrollbar_rect.bottom()),
+    );
+
+    push_panel(
+        scene,
+        thumb_rect.to_win32_rect(),
+        [0.74, 0.80, 0.90, 0.92],
+        PanelEffect::TerminalScrollbarThumb,
+    );
 }
 
 fn terminal_cursor_overlay_color(
@@ -845,7 +904,7 @@ fn terminal_cell_rect(
 }
 
 fn terminal_render_rect(layout: TerminalLayout) -> ClientRect {
-    layout.terminal_rect().inset(4)
+    layout.terminal_viewport_rect().inset(4)
 }
 
 fn terminal_cell_from_client_point(
@@ -996,7 +1055,28 @@ fn handle_mouse_wheel(hwnd: WindowHandle, wparam: WPARAM, lparam: LPARAM) -> eyr
     // behavior[impl window.interaction.zoom.output]
     let ctrl_down = control_key_is_down();
     if !ctrl_down {
-        return Ok(false);
+        return with_app_state(|state| {
+            let layout =
+                client_layout(hwnd, state.terminal_cell_width, state.terminal_cell_height)?;
+            let point = screen_to_client_point(hwnd, lparam)?;
+            if !layout.code_panel_rect().contains(point) {
+                return Ok(false);
+            }
+
+            let wheel_delta = high_word_i16(wparam.0);
+            if wheel_delta == 0 {
+                return Ok(true);
+            }
+
+            let steps = if wheel_delta.abs() < MOUSE_WHEEL_DELTA {
+                isize::from(wheel_delta.signum())
+            } else {
+                isize::from(wheel_delta / MOUSE_WHEEL_DELTA)
+            };
+            let line_delta = -steps * TERMINAL_WHEEL_SCROLL_LINES;
+            state.terminal.scroll_viewport_by(line_delta);
+            Ok(true)
+        });
     }
 
     with_app_state(|state| {
@@ -1087,10 +1167,13 @@ fn handle_left_button_up(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Result<boo
         }
 
         if let Some(pending_selection) = state.pending_terminal_selection.take() {
+            state.terminal_selection_drag_point = None;
             let layout =
                 client_layout(hwnd, state.terminal_cell_width, state.terminal_cell_height)?;
             let point = ClientPoint::from_lparam(lparam);
-            let cell = terminal_cell_from_client_point(layout, point, true);
+            let cell = terminal_cell_from_client_point(layout, point, true)
+                .map(|cell| state.terminal.viewport_to_screen_cell(cell))
+                .transpose()?;
             if let Some(selection) =
                 complete_pending_terminal_selection(pending_selection, point, cell)
             {
@@ -1148,17 +1231,20 @@ fn handle_left_button_down(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Result<b
 
     with_app_state(|state| {
         state.pending_window_drag = None;
+        state.terminal_selection_drag_point = None;
         if !in_drag_handle {
             let layout =
                 client_layout(hwnd, state.terminal_cell_width, state.terminal_cell_height)?;
             state.terminal_selection = None;
             state.pending_terminal_selection = None;
             if let Some(cell) = terminal_cell_from_client_point(layout, point, false) {
+                let anchor = state.terminal.viewport_to_screen_cell(cell)?;
                 state.pending_terminal_selection = Some(PendingTerminalSelection {
                     origin: point,
-                    anchor: cell,
+                    anchor,
                     mode: selection_mode,
                 });
+                state.terminal_selection_drag_point = Some(point);
                 return Ok(true);
             }
 
@@ -1167,6 +1253,7 @@ fn handle_left_button_down(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Result<b
 
         state.terminal_selection = None;
         state.pending_terminal_selection = None;
+        state.terminal_selection_drag_point = None;
         state.pending_window_drag = Some(PendingWindowDrag { origin: point });
         Ok(true)
     })
@@ -1180,6 +1267,8 @@ fn handle_mouse_move(hwnd: WindowHandle, wparam: WPARAM, lparam: LPARAM) -> eyre
             return Ok(None);
         };
 
+        state.terminal_selection_drag_point = Some(point);
+
         let action = if (wparam.0 & 0x0001) == 0 {
             update_pending_terminal_selection_action(pending_selection, point, false, None)
         } else if point == pending_selection.origin {
@@ -1187,7 +1276,9 @@ fn handle_mouse_move(hwnd: WindowHandle, wparam: WPARAM, lparam: LPARAM) -> eyre
         } else {
             let layout =
                 client_layout(hwnd, state.terminal_cell_width, state.terminal_cell_height)?;
-            let cell = terminal_cell_from_client_point(layout, point, true);
+            let cell = terminal_cell_from_client_point(layout, point, true)
+                .map(|cell| state.terminal.viewport_to_screen_cell(cell))
+                .transpose()?;
             update_pending_terminal_selection_action(pending_selection, point, true, cell)
         };
 
@@ -1195,6 +1286,7 @@ fn handle_mouse_move(hwnd: WindowHandle, wparam: WPARAM, lparam: LPARAM) -> eyre
             PendingTerminalSelectionAction::KeepPending => Ok(Some(true)),
             PendingTerminalSelectionAction::ClearPending => {
                 state.pending_terminal_selection = None;
+                state.terminal_selection_drag_point = None;
                 Ok(Some(state.terminal_selection.is_some()))
             }
             PendingTerminalSelectionAction::Update(selection) => {
@@ -1250,6 +1342,7 @@ fn handle_right_button_up(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Result<bo
         }
 
         state.pending_terminal_selection = None;
+        state.terminal_selection_drag_point = None;
 
         if let Some(selection) = state.terminal_selection.take() {
             return Ok(RightClickTerminalPreparation::CopySelection(
@@ -1475,6 +1568,78 @@ fn fail_and_close(hwnd: WindowHandle, error: &eyre::Error) -> LRESULT {
     LRESULT(0)
 }
 
+fn auto_scroll_pending_terminal_selection(
+    state: &mut AppState,
+    hwnd: WindowHandle,
+) -> eyre::Result<bool> {
+    let Some(pending_selection) = state.pending_terminal_selection else {
+        state.terminal_selection_drag_point = None;
+        return Ok(false);
+    };
+    if !left_mouse_button_is_down() {
+        state.pending_terminal_selection = None;
+        state.terminal_selection_drag_point = None;
+        return Ok(false);
+    }
+
+    let Some(point) = state.terminal_selection_drag_point else {
+        return Ok(false);
+    };
+
+    let layout = client_layout(hwnd, state.terminal_cell_width, state.terminal_cell_height)?;
+    let scroll_delta =
+        terminal_selection_autoscroll_delta(layout, point, state.terminal_cell_height)?;
+    if scroll_delta == 0 {
+        return Ok(false);
+    }
+
+    state.terminal.scroll_viewport_by(scroll_delta);
+    let cell = terminal_cell_from_client_point(layout, point, true)
+        .map(|cell| state.terminal.viewport_to_screen_cell(cell))
+        .transpose()?;
+    if let PendingTerminalSelectionAction::Update(selection) =
+        update_pending_terminal_selection_action(pending_selection, point, true, cell)
+    {
+        state.terminal_selection = Some(selection);
+    }
+
+    Ok(true)
+}
+
+/// behavior[impl window.interaction.selection.drag-auto-scroll]
+fn terminal_selection_autoscroll_delta(
+    layout: TerminalLayout,
+    point: ClientPoint,
+    cell_height: i32,
+) -> eyre::Result<isize> {
+    let point = point.to_win32_point()?;
+    let rect = terminal_render_rect(layout);
+    if point.y < rect.top() {
+        let overshoot = rect.top() - point.y;
+        return Ok(-scroll_lines_for_overshoot(overshoot, cell_height));
+    }
+    if point.y >= rect.bottom() {
+        let overshoot = point.y - rect.bottom() + 1;
+        return Ok(scroll_lines_for_overshoot(overshoot, cell_height));
+    }
+
+    Ok(0)
+}
+
+fn scroll_lines_for_overshoot(overshoot: i32, cell_height: i32) -> isize {
+    let base = overshoot.max(1);
+    let lines = 1 + (base / cell_height.max(1));
+    isize::try_from(lines)
+        .unwrap_or(SELECTION_AUTO_SCROLL_MAX_LINES)
+        .clamp(1, SELECTION_AUTO_SCROLL_MAX_LINES)
+}
+
+fn left_mouse_button_is_down() -> bool {
+    // Safety: querying the async key state for the left mouse button does not require extra invariants.
+    let state = unsafe { GetKeyState(i32::from(VK_LBUTTON.0)) };
+    (state.cast_unsigned() & 0x8000) != 0
+}
+
 fn wide_null_terminated(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(std::iter::once(0)).collect()
 }
@@ -1649,6 +1814,14 @@ mod tests {
                 TerminalSelectionMode::Block,
             ))
         );
+    }
+
+    // behavior[verify window.interaction.selection.drag-auto-scroll]
+    #[test]
+    fn selection_autoscroll_velocity_scales_with_overshoot() {
+        assert_eq!(scroll_lines_for_overshoot(1, 16), 1);
+        assert_eq!(scroll_lines_for_overshoot(16, 16), 2);
+        assert!(scroll_lines_for_overshoot(160, 16) > scroll_lines_for_overshoot(16, 16));
     }
 
     // behavior[verify window.interaction.drag]
