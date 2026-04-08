@@ -1,4 +1,5 @@
 use std::cell::RefCell;
+use std::marker::PhantomData;
 use std::path::Path;
 use std::thread;
 use tracing::trace;
@@ -57,7 +58,7 @@ thread_local! {
 
 struct AppState {
     app_home: AppHome,
-    hwnd: Option<HWND>,
+    hwnd: Option<WindowHandle>,
     workspace_window: Option<WorkspaceWindowState>,
     pending_window_drag: Option<PendingWindowDrag>,
     in_move_size_loop: bool,
@@ -69,6 +70,100 @@ struct AppState {
     output_cell_height: i32,
     terminal: TerminalSession,
     renderer: Option<D3d12PanelRenderer>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct WindowThread {
+    _thread_affinity: PhantomData<*mut ()>,
+}
+
+impl WindowThread {
+    fn current() -> Self {
+        Self {
+            _thread_affinity: PhantomData,
+        }
+    }
+
+    fn assert_window_thread(self) {
+        let _ = self._thread_affinity;
+    }
+
+    fn post_quit_message(self) {
+        self.assert_window_thread();
+        // Safety: this token is only created and used on the UI thread that owns the message queue.
+        unsafe { PostQuitMessage(0) };
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct WindowHandle {
+    hwnd: HWND,
+    window_thread: WindowThread,
+}
+
+impl WindowHandle {
+    fn new(window_thread: WindowThread, hwnd: HWND) -> Self {
+        Self {
+            hwnd,
+            window_thread,
+        }
+    }
+
+    fn raw(self) -> HWND {
+        self.hwnd
+    }
+
+    fn show(self) {
+        self.window_thread.assert_window_thread();
+        // Safety: `self.hwnd` is a live top-level window owned by this process on `self.window_thread`.
+        let _ = unsafe { ShowWindow(self.hwnd, SW_SHOW) };
+    }
+
+    fn destroy(self) {
+        self.window_thread.assert_window_thread();
+        // Safety: `self.hwnd` is a live top-level window owned by this process on `self.window_thread`.
+        let _ = unsafe { DestroyWindow(self.hwnd) };
+    }
+
+    fn client_rect(self) -> eyre::Result<RECT> {
+        self.window_thread.assert_window_thread();
+        let mut rect = RECT::default();
+        // Safety: `rect` is a valid out-pointer for GetClientRect and `self.hwnd` names the window being queried.
+        if unsafe { GetClientRect(self.hwnd, &raw mut rect) }.is_err() {
+            eyre::bail!("failed to query client rect")
+        }
+        Ok(rect)
+    }
+
+    fn window_rect(self) -> eyre::Result<RECT> {
+        self.window_thread.assert_window_thread();
+        let mut rect = RECT::default();
+        // Safety: `rect` is a valid out-pointer for GetWindowRect and `self.hwnd` names the window being queried.
+        if unsafe { GetWindowRect(self.hwnd, &raw mut rect) }.is_err() {
+            eyre::bail!("failed to query window rect")
+        }
+        Ok(rect)
+    }
+
+    fn set_poll_timer(self) -> eyre::Result<()> {
+        self.window_thread.assert_window_thread();
+        // Safety: installing a thread-owned timer on a live HWND is valid.
+        let timer = unsafe { SetTimer(Some(self.hwnd), POLL_TIMER_ID, POLL_INTERVAL_MS, None) };
+        if timer == 0 {
+            eyre::bail!("failed to start terminal poll timer")
+        }
+        Ok(())
+    }
+
+    fn post_system_drag(self, wparam: WPARAM, lparam: LPARAM) {
+        self.window_thread.assert_window_thread();
+        // Safety: WM_NCLBUTTONDOWN with HTCAPTION delegates drag handling to the native move loop.
+        let _ = unsafe { PostMessageW(Some(self.hwnd), WM_NCLBUTTONDOWN, wparam, lparam) };
+    }
+
+    fn post_quit_message(self) {
+        self.window_thread.post_quit_message();
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -98,9 +193,9 @@ impl Drop for FontHandle {
     }
 }
 
-fn def_window_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+fn def_window_proc(hwnd: WindowHandle, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     // Safety: forwarding an unhandled window message to DefWindowProcW is the required Win32 default behavior.
-    unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
+    unsafe { DefWindowProcW(hwnd.raw(), message, wparam, lparam) }
 }
 
 fn wparam_to_u32(wparam: WPARAM) -> eyre::Result<u32> {
@@ -135,24 +230,6 @@ fn pack_point_lparam(point: POINT) -> isize {
     isize::try_from((u32::from(y) << 16) | u32::from(x)).expect("packed LPARAM must fit in isize")
 }
 
-fn query_client_rect(hwnd: HWND) -> eyre::Result<RECT> {
-    let mut rect = RECT::default();
-    // Safety: `rect` is a valid out-pointer for GetClientRect.
-    if unsafe { GetClientRect(hwnd, &raw mut rect) }.is_err() {
-        eyre::bail!("failed to query client rect")
-    }
-    Ok(rect)
-}
-
-fn query_window_rect(hwnd: HWND) -> eyre::Result<RECT> {
-    let mut rect = RECT::default();
-    // Safety: `rect` is a valid out-pointer for GetWindowRect.
-    if unsafe { GetWindowRect(hwnd, &raw mut rect) }.is_err() {
-        eyre::bail!("failed to query window rect")
-    }
-    Ok(rect)
-}
-
 fn query_cursor_pos() -> eyre::Result<POINT> {
     let mut point = POINT::default();
     // Safety: `point` is a valid out-pointer for GetCursorPos.
@@ -183,34 +260,14 @@ fn load_cursor(cursor: PCWSTR) -> windows::Win32::UI::WindowsAndMessaging::HCURS
     unsafe { LoadCursorW(None, cursor).unwrap_or_default() }
 }
 
-fn show_window_now(hwnd: HWND) {
-    // Safety: `hwnd` is a live top-level window owned by this process.
-    let _ = unsafe { ShowWindow(hwnd, SW_SHOW) };
-}
-
-fn destroy_window_now(hwnd: HWND) {
-    // Safety: `hwnd` is a live top-level window owned by this process.
-    let _ = unsafe { DestroyWindow(hwnd) };
-}
-
-fn post_quit_message() {
-    // Safety: posting a quit message is valid from this window thread.
-    unsafe { PostQuitMessage(0) };
-}
-
-fn post_system_drag(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) {
-    // Safety: WM_NCLBUTTONDOWN with HTCAPTION delegates drag handling to the native move loop.
-    let _ = unsafe { PostMessageW(Some(hwnd), WM_NCLBUTTONDOWN, wparam, lparam) };
-}
-
-fn begin_paint(hwnd: HWND, paint: &mut PAINTSTRUCT) -> windows::Win32::Graphics::Gdi::HDC {
+fn begin_paint(hwnd: WindowHandle, paint: &mut PAINTSTRUCT) -> windows::Win32::Graphics::Gdi::HDC {
     // Safety: `paint` is a valid out-pointer for BeginPaint.
-    unsafe { BeginPaint(hwnd, &raw mut *paint) }
+    unsafe { BeginPaint(hwnd.raw(), &raw mut *paint) }
 }
 
-fn end_paint(hwnd: HWND, paint: &PAINTSTRUCT) {
+fn end_paint(hwnd: WindowHandle, paint: &PAINTSTRUCT) {
     // Safety: `paint` was initialized by BeginPaint for the same window.
-    let _ = unsafe { EndPaint(hwnd, &raw const *paint) };
+    let _ = unsafe { EndPaint(hwnd.raw(), &raw const *paint) };
 }
 
 fn peek_message(message: &mut MSG) -> bool {
@@ -241,6 +298,7 @@ pub fn run(
     working_dir: Option<&Path>,
     workspace_window: Option<WorkspaceWindowState>,
 ) -> eyre::Result<()> {
+    let window_thread = WindowThread::current();
     let terminal_font_height = TERMINAL_FONT_HEIGHT;
     let (terminal_cell_width, terminal_cell_height) =
         measure_terminal_cell_size(terminal_font_height)?;
@@ -266,14 +324,14 @@ pub fn run(
         });
     });
 
-    let hwnd = create_window()?;
-    let renderer = D3d12PanelRenderer::new(hwnd)?;
+    let hwnd = create_window(window_thread)?;
+    let renderer = D3d12PanelRenderer::new(hwnd.raw())?;
     with_app_state(|state| {
         state.hwnd = Some(hwnd);
         state.renderer = Some(renderer);
         Ok(())
     })?;
-    show_window_now(hwnd);
+    hwnd.show();
 
     with_app_state(|state| {
         let layout = client_layout(hwnd, state.terminal_cell_width, state.terminal_cell_height)?;
@@ -284,7 +342,7 @@ pub fn run(
     message_loop()
 }
 
-fn create_window() -> eyre::Result<HWND> {
+fn create_window(window_thread: WindowThread) -> eyre::Result<WindowHandle> {
     let instance = get_current_module().wrap_err("failed to get module handle")?;
 
     let class = WNDCLASSEXW {
@@ -328,13 +386,9 @@ fn create_window() -> eyre::Result<HWND> {
     }
     .wrap_err("failed to create terminal window")?;
 
-    // Safety: installing a thread-owned timer on a live HWND is valid.
-    let timer = unsafe { SetTimer(Some(hwnd), POLL_TIMER_ID, POLL_INTERVAL_MS, None) };
-    if timer == 0 {
-        eyre::bail!("failed to start terminal poll timer")
-    }
-
-    Ok(hwnd)
+    let window = WindowHandle::new(window_thread, hwnd);
+    window.set_poll_timer()?;
+    Ok(window)
 }
 
 fn message_loop() -> eyre::Result<()> {
@@ -359,6 +413,7 @@ extern "system" fn window_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    let hwnd = WindowHandle::new(WindowThread::current(), hwnd);
     match message {
         WM_NCCALCSIZE => LRESULT(0),
         WM_ENTERSIZEMOVE => handle_enter_size_move(hwnd),
@@ -391,12 +446,12 @@ extern "system" fn window_proc(
         },
         WM_NCHITTEST => handle_non_client_hit_test(hwnd, lparam),
         WM_ERASEBKGND => LRESULT(1),
-        WM_DESTROY => handle_destroy_message(),
+        WM_DESTROY => handle_destroy_message(hwnd),
         _ => def_window_proc(hwnd, message, wparam, lparam),
     }
 }
 
-fn handle_enter_size_move(hwnd: HWND) -> LRESULT {
+fn handle_enter_size_move(hwnd: WindowHandle) -> LRESULT {
     match with_app_state(|state| {
         state.in_move_size_loop = true;
         render_current_frame(state, hwnd, None)?;
@@ -407,7 +462,7 @@ fn handle_enter_size_move(hwnd: HWND) -> LRESULT {
     }
 }
 
-fn handle_exit_size_move(hwnd: HWND) -> LRESULT {
+fn handle_exit_size_move(hwnd: WindowHandle) -> LRESULT {
     match with_app_state(|state| {
         state.in_move_size_loop = false;
         render_current_frame(state, hwnd, None)?;
@@ -418,7 +473,7 @@ fn handle_exit_size_move(hwnd: HWND) -> LRESULT {
     }
 }
 
-fn handle_size(hwnd: HWND) -> LRESULT {
+fn handle_size(hwnd: WindowHandle) -> LRESULT {
     match with_app_state(|state| {
         let layout = client_layout(hwnd, state.terminal_cell_width, state.terminal_cell_height)?;
         state.terminal.resize(layout)?;
@@ -437,11 +492,11 @@ fn handle_size(hwnd: HWND) -> LRESULT {
     }
 }
 
-fn handle_timer(hwnd: HWND) -> LRESULT {
+fn handle_timer(hwnd: WindowHandle) -> LRESULT {
     match handle_poll_timer(hwnd) {
         Ok(should_close) => {
             if should_close {
-                destroy_window_now(hwnd);
+                hwnd.destroy();
             }
             LRESULT(0)
         }
@@ -449,7 +504,12 @@ fn handle_timer(hwnd: HWND) -> LRESULT {
     }
 }
 
-fn handle_char_message(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+fn handle_char_message(
+    hwnd: WindowHandle,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
     let code_unit = match wparam_to_u32(wparam) {
         Ok(code_unit) => code_unit,
         Err(error) => return fail_and_close(hwnd, &error),
@@ -474,7 +534,12 @@ fn handle_char_message(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM)
     }
 }
 
-fn handle_key_down_message(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+fn handle_key_down_message(
+    hwnd: WindowHandle,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
     let virtual_key = match wparam_to_u32(wparam) {
         Ok(virtual_key) => virtual_key,
         Err(error) => return fail_and_close(hwnd, &error),
@@ -513,7 +578,12 @@ fn handle_key_down_message(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
     }
 }
 
-fn handle_key_up_message(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+fn handle_key_up_message(
+    hwnd: WindowHandle,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
     let virtual_key = match wparam_to_u32(wparam) {
         Ok(virtual_key) => virtual_key,
         Err(error) => return fail_and_close(hwnd, &error),
@@ -551,11 +621,11 @@ fn handle_key_up_message(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARA
 }
 
 fn handle_bool_message(
-    hwnd: HWND,
+    hwnd: WindowHandle,
     message: u32,
     wparam: WPARAM,
     lparam: LPARAM,
-    handler: impl FnOnce(HWND) -> eyre::Result<bool>,
+    handler: impl FnOnce(WindowHandle) -> eyre::Result<bool>,
 ) -> LRESULT {
     match handler(hwnd) {
         Ok(true) => LRESULT(0),
@@ -564,7 +634,7 @@ fn handle_bool_message(
     }
 }
 
-fn handle_non_client_hit_test(hwnd: HWND, lparam: LPARAM) -> LRESULT {
+fn handle_non_client_hit_test(hwnd: WindowHandle, lparam: LPARAM) -> LRESULT {
     let point = match screen_to_client_point(hwnd, lparam) {
         Ok(point) => point,
         Err(error) => return fail_and_close(hwnd, &error),
@@ -576,15 +646,15 @@ fn handle_non_client_hit_test(hwnd: HWND, lparam: LPARAM) -> LRESULT {
     }
 }
 
-fn handle_destroy_message() -> LRESULT {
+fn handle_destroy_message(hwnd: WindowHandle) -> LRESULT {
     APP_STATE.with(|state| {
         let _ = state.borrow_mut().take();
     });
-    post_quit_message();
+    hwnd.post_quit_message();
     LRESULT(0)
 }
 
-fn acknowledge_paint(hwnd: HWND) -> eyre::Result<()> {
+fn acknowledge_paint(hwnd: WindowHandle) -> eyre::Result<()> {
     let mut paint = PAINTSTRUCT::default();
     let hdc = begin_paint(hwnd, &mut paint);
     if hdc.0.is_null() {
@@ -604,7 +674,7 @@ fn render_frame() -> eyre::Result<()> {
     })
 }
 
-fn handle_poll_timer(hwnd: HWND) -> eyre::Result<bool> {
+fn handle_poll_timer(hwnd: WindowHandle) -> eyre::Result<bool> {
     with_app_state(|state| {
         let result = state.terminal.pump()?;
         if result.should_close {
@@ -621,7 +691,7 @@ fn handle_poll_timer(hwnd: HWND) -> eyre::Result<bool> {
 
 fn render_current_frame(
     state: &mut AppState,
-    hwnd: HWND,
+    hwnd: WindowHandle,
     resize: Option<(u32, u32)>,
 ) -> eyre::Result<()> {
     if let Some((width, height)) = resize
@@ -631,7 +701,7 @@ fn render_current_frame(
     }
 
     if (resize.is_some() || state.in_move_size_loop) && state.terminal.pump()?.should_close {
-        destroy_window_now(hwnd);
+        hwnd.destroy();
         return Ok(());
     }
 
@@ -879,7 +949,7 @@ fn terminal_font_definition(font_height: i32) -> LOGFONTW {
     font
 }
 
-fn handle_mouse_wheel(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) -> eyre::Result<bool> {
+fn handle_mouse_wheel(hwnd: WindowHandle, wparam: WPARAM, lparam: LPARAM) -> eyre::Result<bool> {
     // cli[impl window.interaction.zoom.terminal]
     // cli[impl window.interaction.zoom.output]
     let ctrl_down = control_key_is_down();
@@ -944,8 +1014,12 @@ fn handle_mouse_wheel(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) -> eyre::Resul
     })
 }
 
-fn client_layout(hwnd: HWND, cell_width: i32, cell_height: i32) -> eyre::Result<TerminalLayout> {
-    let rect = query_client_rect(hwnd)?;
+fn client_layout(
+    hwnd: WindowHandle,
+    cell_width: i32,
+    cell_height: i32,
+) -> eyre::Result<TerminalLayout> {
+    let rect = hwnd.client_rect()?;
     Ok(TerminalLayout {
         client_width: rect.right - rect.left,
         client_height: rect.bottom - rect.top,
@@ -964,7 +1038,7 @@ fn with_app_state<T>(f: impl FnOnce(&mut AppState) -> eyre::Result<T>) -> eyre::
     })
 }
 
-fn handle_left_button_up(hwnd: HWND, lparam: LPARAM) -> eyre::Result<bool> {
+fn handle_left_button_up(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Result<bool> {
     with_app_state(|state| {
         if state.pending_window_drag.take().is_some() {
             return Ok(true);
@@ -1007,7 +1081,7 @@ fn handle_left_button_up(hwnd: HWND, lparam: LPARAM) -> eyre::Result<bool> {
     })
 }
 
-fn handle_left_button_down(hwnd: HWND, lparam: LPARAM) -> eyre::Result<bool> {
+fn handle_left_button_down(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Result<bool> {
     let point = POINT {
         x: extract_signed_coordinate(lparam.0),
         y: extract_signed_coordinate(lparam.0 >> 16),
@@ -1025,7 +1099,7 @@ fn handle_left_button_down(hwnd: HWND, lparam: LPARAM) -> eyre::Result<bool> {
     })
 }
 
-fn handle_mouse_move(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) -> eyre::Result<bool> {
+fn handle_mouse_move(hwnd: WindowHandle, wparam: WPARAM, lparam: LPARAM) -> eyre::Result<bool> {
     let point = POINT {
         x: extract_signed_coordinate(lparam.0),
         y: extract_signed_coordinate(lparam.0 >> 16),
@@ -1078,17 +1152,17 @@ fn update_pending_drag_action(
     PendingDragAction::StartSystemDrag
 }
 
-fn hit_test_drag_handle_point(hwnd: HWND, point: POINT) -> eyre::Result<bool> {
+fn hit_test_drag_handle_point(hwnd: WindowHandle, point: POINT) -> eyre::Result<bool> {
     with_app_state(|state| {
         let layout = client_layout(hwnd, state.terminal_cell_width, state.terminal_cell_height)?;
         Ok(point_in_rect(point, layout.drag_handle_rect()))
     })
 }
 
-fn begin_system_window_drag(hwnd: HWND, client_point: POINT) -> eyre::Result<()> {
+fn begin_system_window_drag(hwnd: WindowHandle, client_point: POINT) -> eyre::Result<()> {
     let screen_point = client_to_screen_point(hwnd, client_point)?;
     let (wparam, lparam) = system_drag_message(screen_point);
-    post_system_drag(hwnd, wparam, lparam);
+    hwnd.post_system_drag(wparam, lparam);
     Ok(())
 }
 
@@ -1099,7 +1173,7 @@ fn system_drag_message(screen_point: POINT) -> (WPARAM, LPARAM) {
     )
 }
 
-fn screen_to_client_point(hwnd: HWND, lparam: LPARAM) -> eyre::Result<POINT> {
+fn screen_to_client_point(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Result<POINT> {
     let screen_point = POINT {
         x: signed_word_i32(lparam.0),
         y: signed_word_i32(lparam.0 >> 16),
@@ -1107,13 +1181,16 @@ fn screen_to_client_point(hwnd: HWND, lparam: LPARAM) -> eyre::Result<POINT> {
     screen_to_client_point_from_screen(hwnd, screen_point)
 }
 
-fn cursor_client_point(hwnd: HWND) -> eyre::Result<POINT> {
+fn cursor_client_point(hwnd: WindowHandle) -> eyre::Result<POINT> {
     let screen_point = query_cursor_pos()?;
     screen_to_client_point_from_screen(hwnd, screen_point)
 }
 
-fn screen_to_client_point_from_screen(hwnd: HWND, screen_point: POINT) -> eyre::Result<POINT> {
-    let window_rect = query_window_rect(hwnd)?;
+fn screen_to_client_point_from_screen(
+    hwnd: WindowHandle,
+    screen_point: POINT,
+) -> eyre::Result<POINT> {
+    let window_rect = hwnd.window_rect()?;
 
     Ok(POINT {
         x: screen_point.x - window_rect.left,
@@ -1121,8 +1198,8 @@ fn screen_to_client_point_from_screen(hwnd: HWND, screen_point: POINT) -> eyre::
     })
 }
 
-fn client_to_screen_point(hwnd: HWND, client_point: POINT) -> eyre::Result<POINT> {
-    let window_rect = query_window_rect(hwnd)?;
+fn client_to_screen_point(hwnd: WindowHandle, client_point: POINT) -> eyre::Result<POINT> {
+    let window_rect = hwnd.window_rect()?;
 
     Ok(POINT {
         x: window_rect.left + client_point.x,
@@ -1130,7 +1207,7 @@ fn client_to_screen_point(hwnd: HWND, client_point: POINT) -> eyre::Result<POINT
     })
 }
 
-fn handle_set_cursor(hwnd: HWND, lparam: LPARAM) -> eyre::Result<bool> {
+fn handle_set_cursor(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Result<bool> {
     if !should_override_drag_cursor(with_app_state(|state| Ok(state.in_move_size_loop))?) {
         return Ok(false);
     }
@@ -1151,9 +1228,10 @@ fn handle_set_cursor(hwnd: HWND, lparam: LPARAM) -> eyre::Result<bool> {
     Ok(true)
 }
 
-fn hit_test_resize_border(hwnd: HWND, point: POINT) -> eyre::Result<Option<LRESULT>> {
-    let client_rect =
-        query_client_rect(hwnd).wrap_err("failed to query client rect for hit testing")?;
+fn hit_test_resize_border(hwnd: WindowHandle, point: POINT) -> eyre::Result<Option<LRESULT>> {
+    let client_rect = hwnd
+        .client_rect()
+        .wrap_err("failed to query client rect for hit testing")?;
 
     let resize_border_x = resize_border_thickness(SM_CXSIZEFRAME);
     let resize_border_y = resize_border_thickness(SM_CYSIZEFRAME);
@@ -1172,9 +1250,9 @@ fn point_in_rect(point: POINT, rect: RECT) -> bool {
     point.x >= rect.left && point.x < rect.right && point.y >= rect.top && point.y < rect.bottom
 }
 
-fn fail_and_close(hwnd: HWND, error: &eyre::Error) -> LRESULT {
+fn fail_and_close(hwnd: WindowHandle, error: &eyre::Error) -> LRESULT {
     tracing::error!(?error, "terminal window failed");
-    destroy_window_now(hwnd);
+    hwnd.destroy();
     LRESULT(0)
 }
 
