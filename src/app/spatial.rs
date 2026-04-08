@@ -366,6 +366,7 @@ mod tests {
         assert!(!rect.contains(ClientPoint::new(29, 40)));
     }
 
+    // os[verify window.interaction.resize.native-edges]
     #[test]
     fn resize_border_prefers_top_left_corner() {
         let hit = classify_resize_border_hit(
@@ -378,6 +379,7 @@ mod tests {
         assert_eq!(hit, Some(HTTOPLEFT));
     }
 
+    // os[verify window.interaction.resize.native-edges]
     #[test]
     fn resize_border_ignores_interior_points() {
         let hit = classify_resize_border_hit(
@@ -390,6 +392,7 @@ mod tests {
         assert_eq!(hit, None);
     }
 
+    // os[verify window.interaction.drag.threshold]
     #[test]
     fn zero_drag_threshold_has_no_deadzone() {
         assert!(drag_threshold_exceeded(

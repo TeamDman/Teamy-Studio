@@ -1406,6 +1406,7 @@ mod tests {
     use libghostty_vt::render::Colors;
     use libghostty_vt::style::RgbColor;
 
+    // behavior[verify window.appearance.code-panel.terminal-alignment]
     #[test]
     fn cell_layout_regions_do_not_overlap_and_leave_terminal_room() {
         let layout = TerminalLayout {
@@ -1430,6 +1431,7 @@ mod tests {
         assert!(code.height() >= MIN_CODE_PANEL_HEIGHT);
     }
 
+    // behavior[verify window.appearance.terminal.selection.inverse]
     #[test]
     fn inverse_cells_swap_colors_and_force_background() {
         let colors = Colors {
@@ -1477,6 +1479,7 @@ mod tests {
         );
     }
 
+    // behavior[verify window.appearance.chrome]
     #[test]
     fn drag_handle_stays_within_sidecar() {
         let layout = TerminalLayout {
@@ -1495,6 +1498,7 @@ mod tests {
         assert!(drag.bottom() <= sidecar.bottom());
     }
 
+    // behavior[verify window.interaction.input.numpad-numlock-text]
     #[test]
     fn map_virtual_key_maps_numpad_digits_to_text() {
         for (vkey, expected) in [
@@ -1518,6 +1522,7 @@ mod tests {
         }
     }
 
+    // behavior[verify window.interaction.input.numpad-numlock-text]
     #[test]
     fn map_virtual_key_maps_numpad_operators_to_text() {
         for (vkey, expected) in [

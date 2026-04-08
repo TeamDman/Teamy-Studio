@@ -2685,9 +2685,10 @@ fn issue_transition_barrier(
 mod tests {
     use super::{
         FALLBACK_GLYPH, PanelEffect, RenderScene, append_rect, append_slug_band_data,
-        build_panel_scene, collect_scene_chars, cpu_slug_coverage, cpu_slug_coverage_all_curves,
-        extract_glyph_curves, load_terminal_font, push_centered_text, push_glyph,
-        push_overlay_panel, push_panel, push_text_block, render_snapshot_glyph_into_image,
+        build_panel_scene, build_shader_params, collect_scene_chars, cpu_slug_coverage,
+        cpu_slug_coverage_all_curves, extract_glyph_curves, load_terminal_font, push_centered_text,
+        push_glyph, push_overlay_panel, push_panel, push_text_block,
+        render_snapshot_glyph_into_image,
     };
     use crate::app::windows_terminal::TerminalLayout;
     use eyre::WrapErr;
@@ -2762,6 +2763,8 @@ mod tests {
         assert_eq!(vertices[0].glyph, u32::from('A') as f32);
     }
 
+    // behavior[verify window.appearance.code-panel.single-surface]
+    // os[verify os.windows.rendering.direct3d12]
     #[test]
     fn build_panel_scene_uses_single_code_panel_surface() {
         let layout = TerminalLayout {
@@ -2781,6 +2784,8 @@ mod tests {
         assert_eq!(code_panel_count, 1);
     }
 
+    // behavior[verify window.appearance.backgrounds.blue-half-transparent]
+    // os[verify os.windows.rendering.direct3d12]
     #[test]
     fn build_panel_scene_keeps_blue_background_half_transparent() {
         let layout = TerminalLayout {
@@ -2798,6 +2803,34 @@ mod tests {
             .expect("blue background panel should exist");
 
         assert_eq!(blue_panel.color[3], 0.5);
+    }
+
+    // behavior[verify window.appearance.chrome]
+    #[test]
+    fn build_panel_scene_includes_drag_handle_panel() {
+        let layout = TerminalLayout {
+            client_width: 1040,
+            client_height: 680,
+            cell_width: 8,
+            cell_height: 16,
+        };
+
+        let scene = build_panel_scene(layout);
+        let drag_panel_count = scene
+            .panels
+            .iter()
+            .filter(|panel| matches!(panel.effect, PanelEffect::DragHandle))
+            .count();
+
+        assert_eq!(drag_panel_count, 1);
+    }
+
+    // behavior[verify window.appearance.backgrounds.animated-time-based]
+    #[test]
+    fn build_shader_params_stores_elapsed_seconds_in_scene_time() {
+        let params = build_shader_params(1040.0, 680.0, 12.5);
+
+        assert_eq!(params.scene_time, [12.5, 0.0, 0.0, 0.0]);
     }
 
     #[test]

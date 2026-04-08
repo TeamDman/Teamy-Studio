@@ -1223,6 +1223,7 @@ mod tests {
         assert_eq!(rects[3].right(), 18);
     }
 
+    // behavior[verify window.appearance.drag-cursor]
     #[test]
     fn drag_cursor_override_is_disabled_during_native_move_size() {
         assert!(should_override_drag_cursor(false));
@@ -1245,6 +1246,7 @@ mod tests {
         assert!(!action.clears_pending_drag());
     }
 
+    // os[verify window.interaction.drag.threshold]
     #[test]
     fn pending_drag_starts_immediately_when_threshold_is_zero() {
         let action = update_pending_drag_action(
@@ -1261,6 +1263,8 @@ mod tests {
         assert!(action.clears_pending_drag());
     }
 
+    // behavior[verify window.interaction.drag]
+    // os[verify window.interaction.drag.threshold]
     #[test]
     fn pending_drag_requests_native_drag_after_threshold_is_crossed() {
         let action = update_pending_drag_action(
@@ -1293,6 +1297,7 @@ mod tests {
         assert!(action.clears_pending_drag());
     }
 
+    // behavior[verify window.interaction.drag]
     #[test]
     fn system_drag_message_targets_caption_with_screen_coordinates() {
         let (wparam, lparam) = system_drag_message(ScreenPoint::new(300, 400)).unwrap();
@@ -1301,12 +1306,17 @@ mod tests {
         assert_eq!(lparam.0, ScreenPoint::new(300, 400).pack_lparam().unwrap());
     }
 
+    // behavior[verify window.interaction.drag.live]
+    // behavior[verify window.interaction.resize.live]
+    // behavior[verify window.interaction.resize.terminal-live-output]
+    // behavior[verify window.interaction.resize.low-latency]
     #[test]
     fn timer_render_path_stays_active_only_during_move_size() {
         assert!(!should_render_from_poll_timer(false));
         assert!(should_render_from_poll_timer(true));
     }
 
+    // behavior[verify window.appearance.terminal.cursor.legible-block]
     #[test]
     fn block_cursor_overlay_is_translucent() {
         let color =
