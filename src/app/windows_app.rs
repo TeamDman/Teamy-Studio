@@ -1,17 +1,3 @@
-#![expect(
-    clippy::borrow_as_ptr,
-    clippy::cast_lossless,
-    clippy::cast_possible_truncation,
-    clippy::cast_possible_wrap,
-    clippy::cast_sign_loss,
-    clippy::collapsible_if,
-    clippy::multiple_unsafe_ops_per_block,
-    clippy::needless_pass_by_value,
-    clippy::semicolon_outside_block,
-    clippy::too_many_lines,
-    clippy::undocumented_unsafe_blocks
-)]
-
 use std::cell::RefCell;
 use std::path::Path;
 use std::thread;
@@ -107,8 +93,139 @@ struct FontHandle(HFONT);
 
 impl Drop for FontHandle {
     fn drop(&mut self) {
+        // Safety: this `HFONT` is owned by `FontHandle` and may be deleted during drop.
         let _ = unsafe { DeleteObject(self.0.into()) };
     }
+}
+
+fn def_window_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    // Safety: forwarding an unhandled window message to DefWindowProcW is the required Win32 default behavior.
+    unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
+}
+
+fn wparam_to_u32(wparam: WPARAM) -> eyre::Result<u32> {
+    u32::try_from(wparam.0).wrap_err("WPARAM did not fit in u32")
+}
+
+fn low_word_u16(value: isize) -> u16 {
+    u16::try_from(value & 0xFFFF).expect("masking to 16 bits must fit in u16")
+}
+
+fn signed_word_i32(value: isize) -> i32 {
+    i32::from(i16::from_le_bytes(low_word_u16(value).to_le_bytes()))
+}
+
+fn high_word_i16(value: usize) -> i16 {
+    let high_word =
+        u16::try_from((value >> 16) & 0xFFFF).expect("masking to 16 bits must fit in u16");
+    i16::from_le_bytes(high_word.to_le_bytes())
+}
+
+fn pack_point_lparam(point: POINT) -> isize {
+    let x = u16::from_le_bytes(
+        i16::try_from(point.x)
+            .expect("screen x coordinate must fit in signed 16-bit LPARAM packing")
+            .to_le_bytes(),
+    );
+    let y = u16::from_le_bytes(
+        i16::try_from(point.y)
+            .expect("screen y coordinate must fit in signed 16-bit LPARAM packing")
+            .to_le_bytes(),
+    );
+    isize::try_from((u32::from(y) << 16) | u32::from(x)).expect("packed LPARAM must fit in isize")
+}
+
+fn query_client_rect(hwnd: HWND) -> eyre::Result<RECT> {
+    let mut rect = RECT::default();
+    // Safety: `rect` is a valid out-pointer for GetClientRect.
+    if unsafe { GetClientRect(hwnd, &raw mut rect) }.is_err() {
+        eyre::bail!("failed to query client rect")
+    }
+    Ok(rect)
+}
+
+fn query_window_rect(hwnd: HWND) -> eyre::Result<RECT> {
+    let mut rect = RECT::default();
+    // Safety: `rect` is a valid out-pointer for GetWindowRect.
+    if unsafe { GetWindowRect(hwnd, &raw mut rect) }.is_err() {
+        eyre::bail!("failed to query window rect")
+    }
+    Ok(rect)
+}
+
+fn query_cursor_pos() -> eyre::Result<POINT> {
+    let mut point = POINT::default();
+    // Safety: `point` is a valid out-pointer for GetCursorPos.
+    if unsafe { GetCursorPos(&raw mut point) }.is_err() {
+        eyre::bail!("failed to query cursor position")
+    }
+    Ok(point)
+}
+
+fn system_metric(metric: SYSTEM_METRICS_INDEX) -> i32 {
+    // Safety: GetSystemMetrics is safe for any documented metric constant.
+    unsafe { GetSystemMetrics(metric) }
+}
+
+fn control_key_is_down() -> bool {
+    // Safety: querying key state for VK_CONTROL does not require additional invariants.
+    let state = unsafe { GetKeyState(i32::from(VK_CONTROL.0)) };
+    (state.cast_unsigned() & 0x8000) != 0
+}
+
+fn register_window_class(class: &WNDCLASSEXW) -> u16 {
+    // Safety: `class` points to a fully initialized WNDCLASSEXW for registration.
+    unsafe { RegisterClassExW(&raw const *class) }
+}
+
+fn load_cursor(cursor: PCWSTR) -> windows::Win32::UI::WindowsAndMessaging::HCURSOR {
+    // Safety: loading a shared system cursor by identifier is valid.
+    unsafe { LoadCursorW(None, cursor).unwrap_or_default() }
+}
+
+fn show_window_now(hwnd: HWND) {
+    // Safety: `hwnd` is a live top-level window owned by this process.
+    let _ = unsafe { ShowWindow(hwnd, SW_SHOW) };
+}
+
+fn destroy_window_now(hwnd: HWND) {
+    // Safety: `hwnd` is a live top-level window owned by this process.
+    let _ = unsafe { DestroyWindow(hwnd) };
+}
+
+fn post_quit_message() {
+    // Safety: posting a quit message is valid from this window thread.
+    unsafe { PostQuitMessage(0) };
+}
+
+fn post_system_drag(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) {
+    // Safety: WM_NCLBUTTONDOWN with HTCAPTION delegates drag handling to the native move loop.
+    let _ = unsafe { PostMessageW(Some(hwnd), WM_NCLBUTTONDOWN, wparam, lparam) };
+}
+
+fn begin_paint(hwnd: HWND, paint: &mut PAINTSTRUCT) -> windows::Win32::Graphics::Gdi::HDC {
+    // Safety: `paint` is a valid out-pointer for BeginPaint.
+    unsafe { BeginPaint(hwnd, &raw mut *paint) }
+}
+
+fn end_paint(hwnd: HWND, paint: &PAINTSTRUCT) {
+    // Safety: `paint` was initialized by BeginPaint for the same window.
+    let _ = unsafe { EndPaint(hwnd, &raw const *paint) };
+}
+
+fn peek_message(message: &mut MSG) -> bool {
+    // Safety: `message` is a valid out-pointer for PeekMessageW.
+    unsafe { PeekMessageW(&raw mut *message, None, 0, 0, PM_REMOVE) }.into()
+}
+
+fn translate_message(message: &MSG) {
+    // Safety: `message` was produced by PeekMessageW in this thread.
+    let _ = unsafe { TranslateMessage(&raw const *message) };
+}
+
+fn dispatch_message(message: &MSG) {
+    // Safety: `message` was produced by PeekMessageW in this thread.
+    unsafe { DispatchMessageW(&raw const *message) };
 }
 
 /// Launch the Teamy Studio terminal window and block until it closes.
@@ -156,9 +273,7 @@ pub fn run(
         state.renderer = Some(renderer);
         Ok(())
     })?;
-    unsafe {
-        let _ = ShowWindow(hwnd, SW_SHOW);
-    }
+    show_window_now(hwnd);
 
     with_app_state(|state| {
         let layout = client_layout(hwnd, state.terminal_cell_width, state.terminal_cell_height)?;
@@ -178,22 +293,23 @@ fn create_window() -> eyre::Result<HWND> {
         hInstance: instance.into(),
         lpszClassName: WINDOW_CLASS_NAME,
         lpfnWndProc: Some(window_proc),
-        hCursor: unsafe { LoadCursorW(None, IDC_ARROW).unwrap_or_default() },
+        hCursor: load_cursor(IDC_ARROW),
         ..Default::default()
     };
-    let atom = unsafe { RegisterClassExW(&class) };
+    let atom = register_window_class(&class);
     if atom == 0 {
         debug!(
             "terminal window class already registered or registration deferred to create-window path"
         );
     }
 
-    let screen_width = unsafe { GetSystemMetrics(SM_CXSCREEN) };
-    let screen_height = unsafe { GetSystemMetrics(SM_CYSCREEN) };
+    let screen_width = system_metric(SM_CXSCREEN);
+    let screen_height = system_metric(SM_CYSCREEN);
     let x = (screen_width - INITIAL_WINDOW_WIDTH) / 2;
     let y = (screen_height - INITIAL_WINDOW_HEIGHT) / 2;
     let title = wide_null_terminated(WINDOW_TITLE);
 
+    // Safety: all pointers and handles passed to CreateWindowExW are valid for the duration of the call.
     let hwnd = unsafe {
         CreateWindowExW(
             WS_EX_APPWINDOW,
@@ -212,6 +328,7 @@ fn create_window() -> eyre::Result<HWND> {
     }
     .wrap_err("failed to create terminal window")?;
 
+    // Safety: installing a thread-owned timer on a live HWND is valid.
     let timer = unsafe { SetTimer(Some(hwnd), POLL_TIMER_ID, POLL_INTERVAL_MS, None) };
     if timer == 0 {
         eyre::bail!("failed to start terminal poll timer")
@@ -223,15 +340,13 @@ fn create_window() -> eyre::Result<HWND> {
 fn message_loop() -> eyre::Result<()> {
     loop {
         let mut message = MSG::default();
-        while unsafe { PeekMessageW(&mut message, None, 0, 0, PM_REMOVE) }.into() {
+        while peek_message(&mut message) {
             if message.message == WM_QUIT {
                 return Ok(());
             }
 
-            unsafe {
-                let _ = TranslateMessage(&message);
-                DispatchMessageW(&message);
-            }
+            translate_message(&message);
+            dispatch_message(&message);
         }
 
         render_frame()?;
@@ -246,201 +361,237 @@ extern "system" fn window_proc(
 ) -> LRESULT {
     match message {
         WM_NCCALCSIZE => LRESULT(0),
-        WM_ENTERSIZEMOVE => match with_app_state(|state| {
-            state.in_move_size_loop = true;
-            render_current_frame(state, hwnd, None)?;
-            Ok(())
-        }) {
-            Ok(()) => LRESULT(0),
-            Err(error) => fail_and_close(hwnd, error),
-        },
-        WM_EXITSIZEMOVE => match with_app_state(|state| {
-            state.in_move_size_loop = false;
-            render_current_frame(state, hwnd, None)?;
-            Ok(())
-        }) {
-            Ok(()) => LRESULT(0),
-            Err(error) => fail_and_close(hwnd, error),
-        },
-        WM_SIZE => match with_app_state(|state| {
-            let layout =
-                client_layout(hwnd, state.terminal_cell_width, state.terminal_cell_height)?;
-            state.terminal.resize(layout)?;
-            render_current_frame(
-                state,
-                hwnd,
-                Some((layout.client_width as u32, layout.client_height as u32)),
-            )?;
-            Ok(())
-        }) {
-            Ok(()) => LRESULT(0),
-            Err(error) => fail_and_close(hwnd, error),
-        },
-        WM_TIMER if wparam.0 == POLL_TIMER_ID => match handle_poll_timer(hwnd) {
-            Ok(should_close) => {
-                if should_close {
-                    unsafe {
-                        let _ = DestroyWindow(hwnd);
-                    }
-                }
-                LRESULT(0)
-            }
-            Err(error) => fail_and_close(hwnd, error),
-        },
-        WM_CHAR => {
-            // cli[impl window.interaction.input]
-            match with_app_state(|state| state.terminal.handle_char(wparam.0 as u32, lparam.0)) {
-                Ok(result) => {
-                    trace!(
-                        message = "WM_CHAR",
-                        code_unit = wparam.0 as u32,
-                        lparam = lparam.0,
-                        consumed = result,
-                        "processed keyboard char message"
-                    );
-                    if result {
-                        return LRESULT(0);
-                    }
-                    unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
-                }
-                Err(error) => fail_and_close(hwnd, error),
-            }
-        }
-        WM_KEYDOWN | WM_SYSKEYDOWN => match with_app_state(|state| {
-            // cli[impl window.interaction.input]
-            let was_down = ((lparam.0 >> 30) & 1) != 0;
-            state.terminal.handle_key_event(
-                wparam.0 as u32,
-                lparam.0,
-                was_down,
-                false,
-                keyboard_mods(wparam.0 as u32, lparam.0, false),
-            )
-        }) {
-            Ok(consumed) => {
-                trace!(
-                    message = if message == WM_SYSKEYDOWN {
-                        "WM_SYSKEYDOWN"
-                    } else {
-                        "WM_KEYDOWN"
-                    },
-                    vkey = wparam.0 as u32,
-                    lparam = lparam.0,
-                    was_down = ((lparam.0 >> 30) & 1) != 0,
-                    consumed,
-                    "processed keyboard down message"
-                );
-                if consumed {
-                    return LRESULT(0);
-                }
-                unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
-            }
-            Err(error) => fail_and_close(hwnd, error),
-        },
-        WM_KEYUP | WM_SYSKEYUP => match with_app_state(|state| {
-            // cli[impl window.interaction.input]
-            state.terminal.handle_key_event(
-                wparam.0 as u32,
-                lparam.0,
-                false,
-                true,
-                keyboard_mods(wparam.0 as u32, lparam.0, true),
-            )
-        }) {
-            Ok(consumed) => {
-                trace!(
-                    message = if message == WM_SYSKEYUP {
-                        "WM_SYSKEYUP"
-                    } else {
-                        "WM_KEYUP"
-                    },
-                    vkey = wparam.0 as u32,
-                    lparam = lparam.0,
-                    consumed,
-                    "processed keyboard up message"
-                );
-                if consumed {
-                    return LRESULT(0);
-                }
-                unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
-            }
-            Err(error) => fail_and_close(hwnd, error),
-        },
-        WM_LBUTTONDOWN => match handle_left_button_down(hwnd, lparam) {
-            Ok(true) => LRESULT(0),
-            Ok(false) => unsafe { DefWindowProcW(hwnd, message, wparam, lparam) },
-            Err(error) => fail_and_close(hwnd, error),
-        },
-        WM_MOUSEMOVE => match handle_mouse_move(hwnd, wparam, lparam) {
-            Ok(true) => LRESULT(0),
-            Ok(false) => unsafe { DefWindowProcW(hwnd, message, wparam, lparam) },
-            Err(error) => fail_and_close(hwnd, error),
-        },
+        WM_ENTERSIZEMOVE => handle_enter_size_move(hwnd),
+        WM_EXITSIZEMOVE => handle_exit_size_move(hwnd),
+        WM_SIZE => handle_size(hwnd),
+        WM_TIMER if wparam.0 == POLL_TIMER_ID => handle_timer(hwnd),
+        WM_CHAR => handle_char_message(hwnd, message, wparam, lparam),
+        WM_KEYDOWN | WM_SYSKEYDOWN => handle_key_down_message(hwnd, message, wparam, lparam),
+        WM_KEYUP | WM_SYSKEYUP => handle_key_up_message(hwnd, message, wparam, lparam),
+        WM_LBUTTONDOWN => handle_bool_message(hwnd, message, wparam, lparam, |hwnd| {
+            handle_left_button_down(hwnd, lparam)
+        }),
+        WM_MOUSEMOVE => handle_bool_message(hwnd, message, wparam, lparam, |hwnd| {
+            handle_mouse_move(hwnd, wparam, lparam)
+        }),
         WM_PAINT => match acknowledge_paint(hwnd) {
             Ok(()) => LRESULT(0),
-            Err(error) => fail_and_close(hwnd, error),
+            Err(error) => fail_and_close(hwnd, &error),
         },
-        WM_LBUTTONUP => match handle_left_button_up(hwnd, lparam) {
-            Ok(handled) => {
-                if handled {
-                    LRESULT(0)
-                } else {
-                    unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
-                }
-            }
-            Err(error) => fail_and_close(hwnd, error),
-        },
-        WM_MOUSEWHEEL => match handle_mouse_wheel(hwnd, wparam, lparam) {
-            Ok(handled) => {
-                if handled {
-                    LRESULT(0)
-                } else {
-                    unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
-                }
-            }
-            Err(error) => fail_and_close(hwnd, error),
-        },
+        WM_LBUTTONUP => handle_bool_message(hwnd, message, wparam, lparam, |hwnd| {
+            handle_left_button_up(hwnd, lparam)
+        }),
+        WM_MOUSEWHEEL => handle_bool_message(hwnd, message, wparam, lparam, |hwnd| {
+            handle_mouse_wheel(hwnd, wparam, lparam)
+        }),
         WM_SETCURSOR => match handle_set_cursor(hwnd, lparam) {
             Ok(true) => LRESULT(1),
-            Ok(false) => unsafe { DefWindowProcW(hwnd, message, wparam, lparam) },
-            Err(error) => fail_and_close(hwnd, error),
+            Ok(false) => def_window_proc(hwnd, message, wparam, lparam),
+            Err(error) => fail_and_close(hwnd, &error),
         },
-        WM_NCHITTEST => {
-            let point = match screen_to_client_point(hwnd, lparam) {
-                Ok(point) => point,
-                Err(error) => return fail_and_close(hwnd, error),
-            };
-            match hit_test_resize_border(hwnd, point) {
-                Ok(Some(hit)) => return hit,
-                Ok(None) => {}
-                Err(error) => return fail_and_close(hwnd, error),
-            }
-            LRESULT(isize::try_from(HTCLIENT).expect("HTCLIENT fits in isize"))
-        }
+        WM_NCHITTEST => handle_non_client_hit_test(hwnd, lparam),
         WM_ERASEBKGND => LRESULT(1),
-        WM_DESTROY => {
-            APP_STATE.with(|state| {
-                let _ = state.borrow_mut().take();
-            });
-            unsafe {
-                PostQuitMessage(0);
+        WM_DESTROY => handle_destroy_message(),
+        _ => def_window_proc(hwnd, message, wparam, lparam),
+    }
+}
+
+fn handle_enter_size_move(hwnd: HWND) -> LRESULT {
+    match with_app_state(|state| {
+        state.in_move_size_loop = true;
+        render_current_frame(state, hwnd, None)?;
+        Ok(())
+    }) {
+        Ok(()) => LRESULT(0),
+        Err(error) => fail_and_close(hwnd, &error),
+    }
+}
+
+fn handle_exit_size_move(hwnd: HWND) -> LRESULT {
+    match with_app_state(|state| {
+        state.in_move_size_loop = false;
+        render_current_frame(state, hwnd, None)?;
+        Ok(())
+    }) {
+        Ok(()) => LRESULT(0),
+        Err(error) => fail_and_close(hwnd, &error),
+    }
+}
+
+fn handle_size(hwnd: HWND) -> LRESULT {
+    match with_app_state(|state| {
+        let layout = client_layout(hwnd, state.terminal_cell_width, state.terminal_cell_height)?;
+        state.terminal.resize(layout)?;
+        render_current_frame(
+            state,
+            hwnd,
+            Some((
+                layout.client_width.cast_unsigned(),
+                layout.client_height.cast_unsigned(),
+            )),
+        )?;
+        Ok(())
+    }) {
+        Ok(()) => LRESULT(0),
+        Err(error) => fail_and_close(hwnd, &error),
+    }
+}
+
+fn handle_timer(hwnd: HWND) -> LRESULT {
+    match handle_poll_timer(hwnd) {
+        Ok(should_close) => {
+            if should_close {
+                destroy_window_now(hwnd);
             }
             LRESULT(0)
         }
-        _ => unsafe { DefWindowProcW(hwnd, message, wparam, lparam) },
+        Err(error) => fail_and_close(hwnd, &error),
     }
+}
+
+fn handle_char_message(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    let code_unit = match wparam_to_u32(wparam) {
+        Ok(code_unit) => code_unit,
+        Err(error) => return fail_and_close(hwnd, &error),
+    };
+
+    match with_app_state(|state| state.terminal.handle_char(code_unit, lparam.0)) {
+        Ok(consumed) => {
+            trace!(
+                message = "WM_CHAR",
+                code_unit,
+                lparam = lparam.0,
+                consumed,
+                "processed keyboard char message"
+            );
+            if consumed {
+                LRESULT(0)
+            } else {
+                def_window_proc(hwnd, message, wparam, lparam)
+            }
+        }
+        Err(error) => fail_and_close(hwnd, &error),
+    }
+}
+
+fn handle_key_down_message(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    let virtual_key = match wparam_to_u32(wparam) {
+        Ok(virtual_key) => virtual_key,
+        Err(error) => return fail_and_close(hwnd, &error),
+    };
+    let was_down = ((lparam.0 >> 30) & 1) != 0;
+
+    match with_app_state(|state| {
+        state.terminal.handle_key_event(
+            virtual_key,
+            lparam.0,
+            was_down,
+            false,
+            keyboard_mods(virtual_key, lparam.0, false),
+        )
+    }) {
+        Ok(consumed) => {
+            trace!(
+                message = if message == WM_SYSKEYDOWN {
+                    "WM_SYSKEYDOWN"
+                } else {
+                    "WM_KEYDOWN"
+                },
+                vkey = virtual_key,
+                lparam = lparam.0,
+                was_down,
+                consumed,
+                "processed keyboard down message"
+            );
+            if consumed {
+                LRESULT(0)
+            } else {
+                def_window_proc(hwnd, message, wparam, lparam)
+            }
+        }
+        Err(error) => fail_and_close(hwnd, &error),
+    }
+}
+
+fn handle_key_up_message(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    let virtual_key = match wparam_to_u32(wparam) {
+        Ok(virtual_key) => virtual_key,
+        Err(error) => return fail_and_close(hwnd, &error),
+    };
+
+    match with_app_state(|state| {
+        state.terminal.handle_key_event(
+            virtual_key,
+            lparam.0,
+            false,
+            true,
+            keyboard_mods(virtual_key, lparam.0, true),
+        )
+    }) {
+        Ok(consumed) => {
+            trace!(
+                message = if message == WM_SYSKEYUP {
+                    "WM_SYSKEYUP"
+                } else {
+                    "WM_KEYUP"
+                },
+                vkey = virtual_key,
+                lparam = lparam.0,
+                consumed,
+                "processed keyboard up message"
+            );
+            if consumed {
+                LRESULT(0)
+            } else {
+                def_window_proc(hwnd, message, wparam, lparam)
+            }
+        }
+        Err(error) => fail_and_close(hwnd, &error),
+    }
+}
+
+fn handle_bool_message(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    handler: impl FnOnce(HWND) -> eyre::Result<bool>,
+) -> LRESULT {
+    match handler(hwnd) {
+        Ok(true) => LRESULT(0),
+        Ok(false) => def_window_proc(hwnd, message, wparam, lparam),
+        Err(error) => fail_and_close(hwnd, &error),
+    }
+}
+
+fn handle_non_client_hit_test(hwnd: HWND, lparam: LPARAM) -> LRESULT {
+    let point = match screen_to_client_point(hwnd, lparam) {
+        Ok(point) => point,
+        Err(error) => return fail_and_close(hwnd, &error),
+    };
+    match hit_test_resize_border(hwnd, point) {
+        Ok(Some(hit)) => hit,
+        Ok(None) => LRESULT(isize::try_from(HTCLIENT).expect("HTCLIENT fits in isize")),
+        Err(error) => fail_and_close(hwnd, &error),
+    }
+}
+
+fn handle_destroy_message() -> LRESULT {
+    APP_STATE.with(|state| {
+        let _ = state.borrow_mut().take();
+    });
+    post_quit_message();
+    LRESULT(0)
 }
 
 fn acknowledge_paint(hwnd: HWND) -> eyre::Result<()> {
     let mut paint = PAINTSTRUCT::default();
-    let hdc = unsafe { BeginPaint(hwnd, &mut paint) };
+    let hdc = begin_paint(hwnd, &mut paint);
     if hdc.0.is_null() {
         eyre::bail!("failed to begin painting")
     }
 
-    unsafe {
-        let _ = EndPaint(hwnd, &paint);
-    }
+    end_paint(hwnd, &paint);
     Ok(())
 }
 
@@ -473,16 +624,14 @@ fn render_current_frame(
     hwnd: HWND,
     resize: Option<(u32, u32)>,
 ) -> eyre::Result<()> {
-    if let Some((width, height)) = resize {
-        if let Some(renderer) = state.renderer.as_mut() {
-            renderer.resize(width, height)?;
-        }
+    if let Some((width, height)) = resize
+        && let Some(renderer) = state.renderer.as_mut()
+    {
+        renderer.resize(width, height)?;
     }
 
     if (resize.is_some() || state.in_move_size_loop) && state.terminal.pump()?.should_close {
-        unsafe {
-            let _ = DestroyWindow(hwnd);
-        }
+        destroy_window_now(hwnd);
         return Ok(());
     }
 
@@ -687,25 +836,29 @@ fn inset_rect(rect: RECT, amount: i32) -> RECT {
 
 fn measure_terminal_cell_size(font_height: i32) -> eyre::Result<(i32, i32)> {
     let font_definition = terminal_font_definition(font_height);
-    let font = unsafe { CreateFontIndirectW(&font_definition) };
+    // Safety: `font_definition` is fully initialized and valid for CreateFontIndirectW.
+    let font = unsafe { CreateFontIndirectW(&raw const font_definition) };
     if font.0.is_null() {
         eyre::bail!("failed to create terminal font")
     }
     let font = FontHandle(font);
 
+    // Safety: querying the screen DC with a null HWND is valid.
     let hdc = unsafe { GetDC(None) };
     if hdc.0.is_null() {
         eyre::bail!("failed to acquire screen DC for font metrics")
     }
 
+    // Safety: selecting the created font into the device context is valid.
     let previous_font = unsafe { SelectObject(hdc, font.0.into()) };
     let glyph = ['W' as u16];
     let mut size = SIZE::default();
-    let measured = unsafe { GetTextExtentPoint32W(hdc, &glyph, &mut size) }.as_bool();
+    // Safety: `glyph` and `size` remain valid for the duration of the measurement call.
+    let measured = unsafe { GetTextExtentPoint32W(hdc, &glyph, &raw mut size) }.as_bool();
+    // Safety: restoring the previous selected object is valid for this device context.
     let _ = unsafe { SelectObject(hdc, previous_font) };
-    unsafe {
-        ReleaseDC(None, hdc);
-    }
+    // Safety: releasing the screen DC after GetDC(None) is required.
+    unsafe { ReleaseDC(None, hdc) };
 
     if !measured {
         eyre::bail!("failed to measure terminal font")
@@ -729,7 +882,7 @@ fn terminal_font_definition(font_height: i32) -> LOGFONTW {
 fn handle_mouse_wheel(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) -> eyre::Result<bool> {
     // cli[impl window.interaction.zoom.terminal]
     // cli[impl window.interaction.zoom.output]
-    let ctrl_down = unsafe { (GetKeyState(i32::from(VK_CONTROL.0)) & (0x8000_u16 as i16)) != 0 };
+    let ctrl_down = control_key_is_down();
     if !ctrl_down {
         return Ok(false);
     }
@@ -743,7 +896,7 @@ fn handle_mouse_wheel(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) -> eyre::Resul
             return Ok(false);
         }
 
-        let wheel_delta = ((wparam.0 >> 16) & 0xFFFF) as i16;
+        let wheel_delta = high_word_i16(wparam.0);
         if wheel_delta == 0 {
             return Ok(true);
         }
@@ -792,10 +945,7 @@ fn handle_mouse_wheel(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) -> eyre::Resul
 }
 
 fn client_layout(hwnd: HWND, cell_width: i32, cell_height: i32) -> eyre::Result<TerminalLayout> {
-    let mut rect = RECT::default();
-    if unsafe { GetClientRect(hwnd, &mut rect) }.is_err() {
-        eyre::bail!("failed to query client rect")
-    }
+    let rect = query_client_rect(hwnd)?;
     Ok(TerminalLayout {
         client_width: rect.right - rect.left,
         client_height: rect.bottom - rect.top,
@@ -938,9 +1088,7 @@ fn hit_test_drag_handle_point(hwnd: HWND, point: POINT) -> eyre::Result<bool> {
 fn begin_system_window_drag(hwnd: HWND, client_point: POINT) -> eyre::Result<()> {
     let screen_point = client_to_screen_point(hwnd, client_point)?;
     let (wparam, lparam) = system_drag_message(screen_point);
-    unsafe {
-        let _ = PostMessageW(Some(hwnd), WM_NCLBUTTONDOWN, wparam, lparam);
-    }
+    post_system_drag(hwnd, wparam, lparam);
     Ok(())
 }
 
@@ -953,25 +1101,19 @@ fn system_drag_message(screen_point: POINT) -> (WPARAM, LPARAM) {
 
 fn screen_to_client_point(hwnd: HWND, lparam: LPARAM) -> eyre::Result<POINT> {
     let screen_point = POINT {
-        x: extract_signed_coordinate(lparam.0),
-        y: extract_signed_coordinate(lparam.0 >> 16),
+        x: signed_word_i32(lparam.0),
+        y: signed_word_i32(lparam.0 >> 16),
     };
     screen_to_client_point_from_screen(hwnd, screen_point)
 }
 
 fn cursor_client_point(hwnd: HWND) -> eyre::Result<POINT> {
-    let mut screen_point = POINT::default();
-    if unsafe { GetCursorPos(&mut screen_point) }.is_err() {
-        eyre::bail!("failed to query cursor position")
-    }
+    let screen_point = query_cursor_pos()?;
     screen_to_client_point_from_screen(hwnd, screen_point)
 }
 
 fn screen_to_client_point_from_screen(hwnd: HWND, screen_point: POINT) -> eyre::Result<POINT> {
-    let mut window_rect = RECT::default();
-    if unsafe { GetWindowRect(hwnd, &mut window_rect) }.is_err() {
-        eyre::bail!("failed to query window rect")
-    }
+    let window_rect = query_window_rect(hwnd)?;
 
     Ok(POINT {
         x: screen_point.x - window_rect.left,
@@ -980,10 +1122,7 @@ fn screen_to_client_point_from_screen(hwnd: HWND, screen_point: POINT) -> eyre::
 }
 
 fn client_to_screen_point(hwnd: HWND, client_point: POINT) -> eyre::Result<POINT> {
-    let mut window_rect = RECT::default();
-    if unsafe { GetWindowRect(hwnd, &mut window_rect) }.is_err() {
-        eyre::bail!("failed to query window rect")
-    }
+    let window_rect = query_window_rect(hwnd)?;
 
     Ok(POINT {
         x: window_rect.left + client_point.x,
@@ -996,7 +1135,7 @@ fn handle_set_cursor(hwnd: HWND, lparam: LPARAM) -> eyre::Result<bool> {
         return Ok(false);
     }
 
-    let hit_test_code = (lparam.0 & 0xFFFF) as u32;
+    let hit_test_code = u32::from(low_word_u16(lparam.0));
     if hit_test_code != HTCAPTION && hit_test_code != HTCLIENT {
         return Ok(false);
     }
@@ -1006,18 +1145,15 @@ fn handle_set_cursor(hwnd: HWND, lparam: LPARAM) -> eyre::Result<bool> {
         return Ok(false);
     }
 
-    let move_cursor = unsafe { LoadCursorW(None, IDC_SIZEALL).unwrap_or_default() };
-    unsafe {
-        SetCursor(Some(move_cursor));
-    }
+    let move_cursor = load_cursor(IDC_SIZEALL);
+    // Safety: setting the cursor for the current WM_SETCURSOR handling path is valid.
+    unsafe { SetCursor(Some(move_cursor)) };
     Ok(true)
 }
 
 fn hit_test_resize_border(hwnd: HWND, point: POINT) -> eyre::Result<Option<LRESULT>> {
-    let mut client_rect = RECT::default();
-    if unsafe { GetClientRect(hwnd, &mut client_rect) }.is_err() {
-        eyre::bail!("failed to query client rect for hit testing")
-    }
+    let client_rect =
+        query_client_rect(hwnd).wrap_err("failed to query client rect for hit testing")?;
 
     let resize_border_x = resize_border_thickness(SM_CXSIZEFRAME);
     let resize_border_y = resize_border_thickness(SM_CYSIZEFRAME);
@@ -1027,8 +1163,8 @@ fn hit_test_resize_border(hwnd: HWND, point: POINT) -> eyre::Result<Option<LRESU
 }
 
 fn resize_border_thickness(size_frame_metric: SYSTEM_METRICS_INDEX) -> i32 {
-    let padded_border = unsafe { GetSystemMetrics(SM_CXPADDEDBORDER) };
-    let size_frame = unsafe { GetSystemMetrics(size_frame_metric) };
+    let padded_border = system_metric(SM_CXPADDEDBORDER);
+    let size_frame = system_metric(size_frame_metric);
     (size_frame + padded_border).max(MIN_RESIZE_BORDER_THICKNESS)
 }
 
@@ -1036,22 +1172,14 @@ fn point_in_rect(point: POINT, rect: RECT) -> bool {
     point.x >= rect.left && point.x < rect.right && point.y >= rect.top && point.y < rect.bottom
 }
 
-fn fail_and_close(hwnd: HWND, error: eyre::Error) -> LRESULT {
+fn fail_and_close(hwnd: HWND, error: &eyre::Error) -> LRESULT {
     tracing::error!(?error, "terminal window failed");
-    unsafe {
-        let _ = DestroyWindow(hwnd);
-    }
+    destroy_window_now(hwnd);
     LRESULT(0)
 }
 
 fn extract_signed_coordinate(value: isize) -> i32 {
-    (value as i16) as i32
-}
-
-fn pack_point_lparam(point: POINT) -> isize {
-    let x = (point.x as u16) as u32;
-    let y = (point.y as u16) as u32;
-    ((y << 16) | x) as isize
+    signed_word_i32(value)
 }
 
 fn drag_threshold_exceeded(
