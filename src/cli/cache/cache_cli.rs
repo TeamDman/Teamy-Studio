@@ -30,11 +30,11 @@ impl CacheArgs {
     /// # Errors
     ///
     /// This function will return an error if the subcommand fails.
-    pub async fn invoke(self) -> Result<()> {
+    pub fn invoke(self) -> Result<()> {
         match self.command {
-            CacheCommand::Clean(args) => args.invoke().await?,
-            CacheCommand::Open(args) => args.invoke().await?,
-            CacheCommand::Show(args) => args.invoke().await?,
+            CacheCommand::Clean(_) => CacheCleanArgs::invoke()?,
+            CacheCommand::Open(_) => CacheOpenArgs::invoke()?,
+            CacheCommand::Show(_) => CacheShowArgs::invoke()?,
         }
 
         Ok(())

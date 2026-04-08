@@ -10,8 +10,7 @@ impl CacheCleanArgs {
     /// # Errors
     ///
     /// This function does not return any errors.
-    #[expect(clippy::unused_async)]
-    pub async fn invoke(self) -> Result<()> {
+    pub fn invoke() -> Result<()> {
         Ok(())
     }
 }

@@ -88,11 +88,8 @@ fn openconsole_build_dir() -> Option<PathBuf> {
         .join("x64")
         .join("Release");
 
-    if sibling_dir.join("conpty.dll").exists() && sibling_dir.join("OpenConsole.exe").exists() {
-        Some(sibling_dir)
-    } else {
-        None
-    }
+    (sibling_dir.join("conpty.dll").exists() && sibling_dir.join("OpenConsole.exe").exists())
+        .then_some(sibling_dir)
 }
 
 fn cargo_profile_dir() -> Option<PathBuf> {

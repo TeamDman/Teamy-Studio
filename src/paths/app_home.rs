@@ -42,6 +42,7 @@ impl AppHome {
     /// Resolve the `AppHome` according to the same rules used previously:
     /// * If [`super::APP_HOME_ENV_VAR`] env var is set, use that directory
     /// * Otherwise use the platform `ProjectDirs::config_dir()`
+    ///
     /// cli[impl path.app-home.env-overrides-platform]
     ///
     /// # Errors

@@ -1,9 +1,21 @@
-use tracing::trace;
+#![expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::collapsible_if,
+    clippy::map_err_ignore,
+    clippy::match_same_arms,
+    clippy::struct_excessive_bools,
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    clippy::undocumented_unsafe_blocks
+)]
+
 use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::{Arc, Mutex, mpsc};
+use tracing::trace;
 
 use eyre::Context;
 use libghostty_vt::key;
@@ -736,12 +748,8 @@ impl TerminalSession {
             while let Some(cell) = cell_iter.next() {
                 let style = cell.style().wrap_err("failed to read cell style")?;
                 let graphemes = cell.graphemes().wrap_err("failed to read cell text")?;
-                let foreground = cell
-                    .fg_color()
-                    .wrap_err("failed to read cell foreground")?;
-                let background = cell
-                    .bg_color()
-                    .wrap_err("failed to read cell background")?;
+                let foreground = cell.fg_color().wrap_err("failed to read cell foreground")?;
+                let background = cell.bg_color().wrap_err("failed to read cell background")?;
                 let (glyph_color, background_color) =
                     resolve_terminal_cell_colors(&colors, foreground, background, style.inverse);
 
@@ -912,7 +920,10 @@ fn build_terminal_cursor(
     snapshot: &libghostty_vt::render::Snapshot<'_, '_>,
     colors: &libghostty_vt::render::Colors,
 ) -> eyre::Result<Option<TerminalDisplayCursor>> {
-    if !snapshot.cursor_visible().wrap_err("failed to query cursor visibility")? {
+    if !snapshot
+        .cursor_visible()
+        .wrap_err("failed to query cursor visibility")?
+    {
         return Ok(None);
     }
 
@@ -1364,7 +1375,11 @@ mod tests {
     #[test]
     fn inverse_cells_swap_colors_and_force_background() {
         let colors = Colors {
-            background: RgbColor { r: 10, g: 20, b: 30 },
+            background: RgbColor {
+                r: 10,
+                g: 20,
+                b: 30,
+            },
             foreground: RgbColor {
                 r: 240,
                 g: 241,
@@ -1374,15 +1389,14 @@ mod tests {
             palette: [RgbColor { r: 0, g: 0, b: 0 }; 256],
         };
 
-        let (foreground, background) = resolve_terminal_cell_colors(
-            &colors,
-            Some(RgbColor { r: 1, g: 2, b: 3 }),
-            None,
-            true,
-        );
+        let (foreground, background) =
+            resolve_terminal_cell_colors(&colors, Some(RgbColor { r: 1, g: 2, b: 3 }), None, true);
 
         assert_eq!(foreground, [10.0 / 255.0, 20.0 / 255.0, 30.0 / 255.0, 1.0]);
-        assert_eq!(background, Some([1.0 / 255.0, 2.0 / 255.0, 3.0 / 255.0, 1.0]));
+        assert_eq!(
+            background,
+            Some([1.0 / 255.0, 2.0 / 255.0, 3.0 / 255.0, 1.0])
+        );
     }
 
     #[test]

@@ -16,13 +16,17 @@ fn main() -> eyre::Result<()> {
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(16);
 
+    // Safety: querying the standard input handle does not require additional invariants.
     let input =
         unsafe { GetStdHandle(STD_INPUT_HANDLE) }.wrap_err("failed to get console input handle")?;
     let mut original_mode = CONSOLE_MODE(0);
-    unsafe { GetConsoleMode(input, &mut original_mode) }.wrap_err("failed to read console mode")?;
+    // Safety: `original_mode` is a valid out-pointer for `GetConsoleMode`.
+    unsafe { GetConsoleMode(input, &raw mut original_mode) }
+        .wrap_err("failed to read console mode")?;
 
     let raw_mode = (original_mode | ENABLE_WINDOW_INPUT)
         & !(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_QUICK_EDIT_MODE);
+    // Safety: `input` is a valid console input handle and `raw_mode` is derived from the current mode bits.
     unsafe { SetConsoleMode(input, raw_mode) }
         .wrap_err("failed to enable windows_key_probe console mode")?;
     let _mode_guard = ConsoleModeGuard {
@@ -67,6 +71,7 @@ impl Drop for ConsoleModeGuard {
     fn drop(&mut self) {
         print!("\x1b[?9001l");
         let _ = std::io::stdout().flush();
+        // Safety: this restores the previously read console mode on the same input handle.
         let _ = unsafe {
             windows::Win32::System::Console::SetConsoleMode(self.input, self.original_mode)
         };
@@ -83,7 +88,8 @@ fn read_next_key_event(
     loop {
         let mut records = [INPUT_RECORD::default()];
         let mut records_read = 0;
-        unsafe { ReadConsoleInputW(input, &mut records, &mut records_read) }
+        // Safety: both output buffers live for the duration of the call and point to valid writable memory.
+        unsafe { ReadConsoleInputW(input, &mut records, &raw mut records_read) }
             .wrap_err("failed to read console input")?;
 
         if records_read == 0 {
@@ -95,13 +101,14 @@ fn read_next_key_event(
             continue;
         }
 
+        // Safety: `EventType == KEY_EVENT`, so reading the `KeyEvent` union field is valid.
         return Ok(unsafe { record.Event.KeyEvent });
     }
 }
 
 #[cfg(windows)]
 fn should_skip_event(event: &windows::Win32::System::Console::KEY_EVENT_RECORD) -> bool {
-    matches!(event.wVirtualKeyCode, 0x10 | 0x11 | 0x12)
+    matches!(event.wVirtualKeyCode, 0x10..=0x12)
 }
 
 #[cfg(windows)]
@@ -119,6 +126,7 @@ fn format_key_event(
     } else {
         "UP"
     };
+    // Safety: reading the Unicode union field is valid for console key events.
     let unicode = unsafe { event.uChar.UnicodeChar };
 
     format!(

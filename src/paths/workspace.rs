@@ -17,6 +17,11 @@ const CELL_OUTPUT_FILENAME: &str = "output.xml";
 pub struct WorkspaceId(String);
 
 impl WorkspaceId {
+    /// Create a validated workspace identifier.
+    ///
+    /// # Errors
+    ///
+    /// This function will return an error if the provided id is empty or contains invalid path characters.
     pub fn new(value: impl Into<String>) -> Result<Self> {
         let value = value.into();
         validate_path_atom(&value, "workspace id")?;
@@ -33,6 +38,11 @@ impl WorkspaceId {
 pub struct CellId(String);
 
 impl CellId {
+    /// Create a validated cell identifier.
+    ///
+    /// # Errors
+    ///
+    /// This function will return an error if the provided id is empty or contains invalid path characters.
     pub fn new(value: impl Into<String>) -> Result<Self> {
         let value = value.into();
         validate_path_atom(&value, "cell id")?;
@@ -118,7 +128,7 @@ pub fn cell_transcript_path(
     cell_id: &CellId,
     run_number: NonZeroUsize,
 ) -> PathBuf {
-    cell_root(cache_home, workspace_id, cell_id).join(format!("run{}.transcript", run_number))
+    cell_root(cache_home, workspace_id, cell_id).join(format!("run{run_number}.transcript"))
 }
 
 fn validate_path_atom(value: &str, label: &str) -> Result<()> {

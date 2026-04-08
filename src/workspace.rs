@@ -28,6 +28,10 @@ pub struct WorkspaceLaunch {
 }
 
 /// cli[impl workspace.list.prints-id-name-cell-count]
+///
+/// # Errors
+///
+/// This function will return an error if the workspaces directory cannot be read.
 pub fn list_workspaces(cache_home: &CacheHome) -> Result<Vec<WorkspaceSummary>> {
     let root = workspaces_root(cache_home);
     if !root.exists() {
@@ -56,12 +60,20 @@ pub fn list_workspaces(cache_home: &CacheHome) -> Result<Vec<WorkspaceSummary>> 
 
 /// cli[impl workspace.show.bails-when-missing]
 /// cli[impl workspace.show.prints-id-name-cell-count]
+///
+/// # Errors
+///
+/// This function will return an error if the workspace cannot be resolved.
 pub fn show_workspace(cache_home: &CacheHome, target: &str) -> Result<WorkspaceSummary> {
     resolve_workspace(cache_home, target)?
         .ok_or_else(|| eyre::eyre!("workspace `{target}` not found"))
 }
 
 /// cli[impl workspace.create.name-optional]
+///
+/// # Errors
+///
+/// This function will return an error if the workspace cannot be created on disk.
 pub fn create_workspace(cache_home: &CacheHome, name: Option<&str>) -> Result<WorkspaceLaunch> {
     fs::create_dir_all(workspaces_root(cache_home)).wrap_err("failed to create workspaces root")?;
 
@@ -69,7 +81,7 @@ pub fn create_workspace(cache_home: &CacheHome, name: Option<&str>) -> Result<Wo
     let workspace_name = normalize_workspace_name(name, workspace_id.as_str())?;
     ensure_workspace_name_available(cache_home, &workspace_name)?;
 
-    let first_cell_id = CellId::new("cell-1").expect("static cell id must be valid");
+    let first_cell_id = CellId::new("cell-1")?;
     let root = workspace_root(cache_home, &workspace_id);
     fs::create_dir_all(&root)
         .wrap_err_with(|| format!("failed to create workspace directory {}", root.display()))?;
@@ -98,6 +110,10 @@ pub fn create_workspace(cache_home: &CacheHome, name: Option<&str>) -> Result<Wo
 
 /// cli[impl workspace.run.no-target-creates-workspace]
 /// cli[impl workspace.run.target-by-id-or-name]
+///
+/// # Errors
+///
+/// This function will return an error if the target workspace cannot be opened or created.
 pub fn open_workspace(cache_home: &CacheHome, target: Option<&str>) -> Result<WorkspaceLaunch> {
     match target {
         Some(target) => {
@@ -117,13 +133,17 @@ pub fn open_workspace(cache_home: &CacheHome, target: Option<&str>) -> Result<Wo
 }
 
 /// cli[impl workspace.plus-button.appends-cell]
+///
+/// # Errors
+///
+/// This function will return an error if the next cell cannot be created or persisted.
 pub fn append_workspace_cell(
     cache_home: &CacheHome,
     workspace_id: &WorkspaceId,
 ) -> Result<WorkspaceLaunch> {
     let mut order = read_cell_order(cache_home, workspace_id)?;
     if order.is_empty() {
-        let first = CellId::new("cell-1").expect("static cell id must be valid");
+        let first = CellId::new("cell-1")?;
         scaffold_cell(cache_home, workspace_id, &first)?;
         order.push(first);
     }
@@ -144,10 +164,10 @@ pub fn append_workspace_cell(
 }
 
 fn resolve_workspace(cache_home: &CacheHome, target: &str) -> Result<Option<WorkspaceSummary>> {
-    if let Ok(workspace_id) = WorkspaceId::new(target.to_owned()) {
-        if workspace_root(cache_home, &workspace_id).is_dir() {
-            return Ok(Some(load_workspace_summary(cache_home, &workspace_id)?));
-        }
+    if let Ok(workspace_id) = WorkspaceId::new(target.to_owned())
+        && workspace_root(cache_home, &workspace_id).is_dir()
+    {
+        return Ok(Some(load_workspace_summary(cache_home, &workspace_id)?));
     }
 
     let mut matches = list_workspaces(cache_home)?
@@ -207,8 +227,10 @@ fn count_cells(cache_home: &CacheHome, workspace_id: &WorkspaceId) -> Result<usi
 
 fn ensure_first_cell(cache_home: &CacheHome, workspace_id: &WorkspaceId) -> Result<CellId> {
     let order_path = workspace_cell_order_path(cache_home, workspace_id);
-    let first_cell_id = read_first_cell_id(&order_path)?
-        .unwrap_or_else(|| CellId::new("cell-1").expect("static cell id must be valid"));
+    let first_cell_id = match read_first_cell_id(&order_path)? {
+        Some(cell_id) => cell_id,
+        None => CellId::new("cell-1")?,
+    };
 
     if !order_path.exists() {
         write_text_file(&order_path, &format!("{}\n", first_cell_id.as_str()))?;
@@ -244,7 +266,7 @@ fn read_first_cell_id(path: &Path) -> Result<Option<CellId>> {
         }
     };
 
-    for line in contents.lines().filter(|line| !line.trim().is_empty()) {
+    if let Some(line) = contents.lines().find(|line| !line.trim().is_empty()) {
         return Ok(Some(CellId::new(line.to_owned())?));
     }
     Ok(None)

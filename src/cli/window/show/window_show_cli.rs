@@ -10,9 +10,7 @@ impl WindowShowArgs {
     /// # Errors
     ///
     /// This function will return an error if the application window cannot be created.
-    #[expect(clippy::unused_async)]
-    pub async fn invoke(
-        self,
+    pub fn invoke(
         app_home: &crate::paths::AppHome,
         cache_home: &crate::paths::CacheHome,
     ) -> eyre::Result<()> {

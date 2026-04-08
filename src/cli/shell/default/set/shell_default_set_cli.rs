@@ -23,8 +23,7 @@ impl ShellDefaultSetArgs {
     /// # Errors
     ///
     /// This function will return an error if the default shell cannot be saved.
-    #[expect(clippy::unused_async)]
-    pub async fn invoke(
+    pub fn invoke(
         self,
         app_home: &crate::paths::AppHome,
         cache_home: &crate::paths::CacheHome,

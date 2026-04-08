@@ -72,6 +72,11 @@ pub fn run_workspace(
     run_workspace_launch(app_home, cache_home, launch)
 }
 
+/// Run a resolved workspace launch in the application window.
+///
+/// # Errors
+///
+/// This function will return an error if the application window cannot be launched.
 pub fn run_workspace_launch(
     app_home: &AppHome,
     cache_home: &CacheHome,
@@ -101,8 +106,8 @@ pub fn run_inline_shell(app_home: &AppHome) -> eyre::Result<()> {
         use eyre::Context;
         use tracing::info;
 
-        let argv = crate::shell_default::load_effective_argv(app_home)?;
-        let (program, args) = argv
+        let command_argv = crate::shell_default::load_effective_argv(app_home)?;
+        let (program, args) = command_argv
             .split_first()
             .ok_or_else(|| eyre::eyre!("default shell command cannot be empty"))?;
 
@@ -142,6 +147,11 @@ pub fn run_keyboard_input_self_test(app_home: &AppHome, inside: bool) -> eyre::R
 }
 
 #[cfg(windows)]
+/// Write a PNG snapshot for a single slug glyph.
+///
+/// # Errors
+///
+/// This function will return an error if the glyph snapshot cannot be rendered or written.
 pub fn write_slug_snapshot_png(
     character: char,
     font_size_px: u32,
@@ -159,6 +169,11 @@ pub fn write_slug_snapshot_png(
 }
 
 #[cfg(windows)]
+/// Write a PNG sheet containing multiple slug glyph snapshots plus an index file.
+///
+/// # Errors
+///
+/// This function will return an error if the snapshot sheet or index cannot be produced.
 pub fn write_slug_snapshot_sheet_png(
     font_size_px: u32,
     cell_size_px: u32,

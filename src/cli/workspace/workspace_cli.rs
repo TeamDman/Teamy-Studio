@@ -39,16 +39,16 @@ impl WorkspaceArgs {
     /// # Errors
     ///
     /// This function will return an error if the workspace action fails.
-    pub async fn invoke(
+    pub fn invoke(
         self,
         app_home: &crate::paths::AppHome,
         cache_home: &crate::paths::CacheHome,
     ) -> eyre::Result<()> {
         match self.command {
-            WorkspaceCommand::List(args) => args.invoke(app_home, cache_home).await,
-            WorkspaceCommand::Show(args) => args.invoke(app_home, cache_home).await,
-            WorkspaceCommand::Create(args) => args.invoke(app_home, cache_home).await,
-            WorkspaceCommand::Run(args) => args.invoke(app_home, cache_home).await,
+            WorkspaceCommand::List(_) => WorkspaceListArgs::invoke(app_home, cache_home),
+            WorkspaceCommand::Show(args) => args.invoke(app_home, cache_home),
+            WorkspaceCommand::Create(args) => args.invoke(app_home, cache_home),
+            WorkspaceCommand::Run(args) => args.invoke(app_home, cache_home),
         }
     }
 }

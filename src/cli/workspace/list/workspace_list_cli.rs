@@ -11,9 +11,7 @@ impl WorkspaceListArgs {
     /// # Errors
     ///
     /// This function will return an error if the workspaces cannot be listed.
-    #[expect(clippy::unused_async)]
-    pub async fn invoke(
-        self,
+    pub fn invoke(
         app_home: &crate::paths::AppHome,
         cache_home: &crate::paths::CacheHome,
     ) -> eyre::Result<()> {

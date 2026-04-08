@@ -10,8 +10,7 @@ impl HomeShowArgs {
     /// # Errors
     ///
     /// This function does not return any errors.
-    #[expect(clippy::unused_async)]
-    pub async fn invoke(self) -> Result<()> {
+    pub fn invoke() -> Result<()> {
         println!("{}", crate::paths::APP_HOME.display());
         Ok(())
     }

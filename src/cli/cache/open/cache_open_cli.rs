@@ -12,8 +12,7 @@ impl CacheOpenArgs {
     ///
     /// This function will return an error if the cache directory cannot be created
     /// or the file manager cannot be launched.
-    #[expect(clippy::unused_async)]
-    pub async fn invoke(self) -> Result<()> {
+    pub fn invoke() -> Result<()> {
         std::fs::create_dir_all(crate::paths::CACHE_DIR.0.as_path())?;
         open::that_detached(crate::paths::CACHE_DIR.0.as_path()).wrap_err_with(|| {
             format!(

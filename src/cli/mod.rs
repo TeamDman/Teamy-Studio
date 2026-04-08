@@ -11,7 +11,6 @@ use crate::cli::shell::ShellArgs;
 use crate::cli::window::WindowArgs;
 use crate::cli::workspace::WorkspaceArgs;
 use arbitrary::Arbitrary;
-use eyre::Context;
 use facet::Facet;
 use figue::FigueBuiltins;
 use figue::{self as args};
@@ -56,21 +55,14 @@ impl PartialEq for Cli {
 impl Cli {
     /// # Errors
     ///
-    /// This function will return an error if the tokio runtime cannot be built or if the command fails.
+    /// This function will return an error if the command fails.
     pub fn invoke(self) -> eyre::Result<()> {
         let app_home = crate::paths::APP_HOME.clone();
         let cache_home = crate::paths::CACHE_DIR.clone();
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .wrap_err("Failed to build tokio runtime")?;
-        runtime.block_on(async move {
-            match self.command {
-                Some(command) => command.invoke(&app_home, &cache_home).await,
-                None => crate::app::run_workspace(&app_home, &cache_home, None),
-            }
-        })?;
-        Ok(())
+        match self.command {
+            Some(command) => command.invoke(&app_home, &cache_home),
+            None => crate::app::run_workspace(&app_home, &cache_home, None),
+        }
     }
 }
 
@@ -101,16 +93,16 @@ impl Command {
     /// # Errors
     ///
     /// This function will return an error if the subcommand fails.
-    pub async fn invoke(
+    pub fn invoke(
         self,
         app_home: &crate::paths::AppHome,
         cache_home: &crate::paths::CacheHome,
     ) -> eyre::Result<()> {
         match self {
-            Command::Workspace(args) => args.invoke(app_home, cache_home).await,
-            Command::Shell(args) => args.invoke(app_home, cache_home).await,
-            Command::SelfTest(args) => args.invoke(app_home, cache_home).await,
-            Command::Window(args) => args.invoke(app_home, cache_home).await,
+            Command::Workspace(args) => args.invoke(app_home, cache_home),
+            Command::Shell(args) => args.invoke(app_home, cache_home),
+            Command::SelfTest(args) => args.invoke(app_home, cache_home),
+            Command::Window(args) => args.invoke(app_home, cache_home),
         }
     }
 }

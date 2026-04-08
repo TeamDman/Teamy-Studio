@@ -1,3 +1,27 @@
+#![expect(
+    clippy::borrow_as_ptr,
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_precision_loss,
+    clippy::cast_ptr_alignment,
+    clippy::cast_sign_loss,
+    clippy::collapsible_if,
+    clippy::float_cmp,
+    clippy::items_after_statements,
+    clippy::multiple_unsafe_ops_per_block,
+    clippy::ptr_as_ptr,
+    clippy::semicolon_if_nothing_returned,
+    clippy::semicolon_outside_block,
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    clippy::type_complexity,
+    clippy::undocumented_unsafe_blocks,
+    clippy::unnecessary_cast,
+    clippy::unused_self,
+    clippy::vec_init_then_push,
+    clippy::wildcard_imports
+)]
+
 use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 use std::path::PathBuf;
@@ -157,7 +181,7 @@ pub struct RenderScene {
 pub struct D3d12PanelRenderer {
     _dxgi_factory: IDXGIFactory4,
     dxgi_info_queue: Option<IDXGIInfoQueue>,
-    _device: ID3D12Device,
+    device: ID3D12Device,
     command_queue: ID3D12CommandQueue,
     swap_chain: IDXGISwapChain3,
     render_targets: [Option<ID3D12Resource>; FRAME_COUNT],
@@ -239,7 +263,7 @@ impl D3d12PanelRenderer {
         Ok(Self {
             _dxgi_factory: dxgi_factory,
             dxgi_info_queue,
-            _device: device,
+            device,
             command_queue,
             swap_chain,
             render_targets: render_targets.map(Some),
@@ -285,22 +309,19 @@ impl D3d12PanelRenderer {
             self.command_list.ClearState(None);
             self.command_list.Close()?;
         }
-        let command_allocators = create_command_allocators(&self._device)?;
-        let command_list = create_closed_command_list(
-            &self._device,
-            &command_allocators[0],
-            &self.pipeline_state,
-        )?;
+        let command_allocators = create_command_allocators(&self.device)?;
+        let command_list =
+            create_closed_command_list(&self.device, &command_allocators[0], &self.pipeline_state)?;
         self.command_allocators = command_allocators;
         self.command_list = command_list;
         let old_render_targets =
             std::mem::replace(&mut self.render_targets, std::array::from_fn(|_| None));
         drop(old_render_targets);
         let old_rtv_heap =
-            std::mem::replace(&mut self.rtv_heap, create_empty_rtv_heap(&self._device)?);
+            std::mem::replace(&mut self.rtv_heap, create_empty_rtv_heap(&self.device)?);
         drop(old_rtv_heap);
         self.rtv_descriptor_size = unsafe {
-            self._device
+            self.device
                 .GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV)
         };
         self.frame_latency_waitable_object = Owned::default();
@@ -321,7 +342,7 @@ impl D3d12PanelRenderer {
             unsafe { Owned::new(self.swap_chain.GetFrameLatencyWaitableObject()) };
 
         let (rtv_heap, rtv_descriptor_size, render_targets) =
-            create_render_targets(&self._device, &self.swap_chain)?;
+            create_render_targets(&self.device, &self.swap_chain)?;
         self.rtv_heap = rtv_heap;
         self.rtv_descriptor_size = rtv_descriptor_size;
         self.render_targets = render_targets.map(Some);
@@ -1703,12 +1724,12 @@ impl QuadraticCurveBuilder {
         let p01 = [(p0[0] + p1[0]) * 0.5, (p0[1] + p1[1]) * 0.5];
         let p12 = [(p1[0] + p2[0]) * 0.5, (p1[1] + p2[1]) * 0.5];
         let p23 = [(p2[0] + p3[0]) * 0.5, (p2[1] + p3[1]) * 0.5];
-        let p012 = [(p01[0] + p12[0]) * 0.5, (p01[1] + p12[1]) * 0.5];
-        let p123 = [(p12[0] + p23[0]) * 0.5, (p12[1] + p23[1]) * 0.5];
-        let midpoint = [(p012[0] + p123[0]) * 0.5, (p012[1] + p123[1]) * 0.5];
+        let p01_12 = [(p01[0] + p12[0]) * 0.5, (p01[1] + p12[1]) * 0.5];
+        let p12_23 = [(p12[0] + p23[0]) * 0.5, (p12[1] + p23[1]) * 0.5];
+        let midpoint = [(p01_12[0] + p12_23[0]) * 0.5, (p01_12[1] + p12_23[1]) * 0.5];
 
-        self.append_cubic_as_quadratics(p0, p01, p012, midpoint, depth + 1);
-        self.append_cubic_as_quadratics(midpoint, p123, p23, p3, depth + 1);
+        self.append_cubic_as_quadratics(p0, p01, p01_12, midpoint, depth + 1);
+        self.append_cubic_as_quadratics(midpoint, p12_23, p23, p3, depth + 1);
     }
 }
 
@@ -2658,10 +2679,9 @@ fn issue_transition_barrier(
 mod tests {
     use super::{
         FALLBACK_GLYPH, PanelEffect, RenderScene, append_rect, append_slug_band_data,
-        build_panel_scene, collect_scene_chars, cpu_slug_coverage,
-        cpu_slug_coverage_all_curves, extract_glyph_curves, load_terminal_font, push_centered_text,
-        push_glyph, push_overlay_panel, push_panel, push_text_block,
-        render_snapshot_glyph_into_image,
+        build_panel_scene, collect_scene_chars, cpu_slug_coverage, cpu_slug_coverage_all_curves,
+        extract_glyph_curves, load_terminal_font, push_centered_text, push_glyph,
+        push_overlay_panel, push_panel, push_text_block, render_snapshot_glyph_into_image,
     };
     use crate::app::windows_terminal::TerminalLayout;
     use eyre::WrapErr;

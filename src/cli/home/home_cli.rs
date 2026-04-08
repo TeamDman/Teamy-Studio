@@ -27,10 +27,10 @@ impl HomeArgs {
     /// # Errors
     ///
     /// This function will return an error if the subcommand fails.
-    pub async fn invoke(self) -> Result<()> {
+    pub fn invoke(self) -> Result<()> {
         match self.command {
-            HomeCommand::Open(args) => args.invoke().await?,
-            HomeCommand::Show(args) => args.invoke().await?,
+            HomeCommand::Open(_) => HomeOpenArgs::invoke()?,
+            HomeCommand::Show(_) => HomeShowArgs::invoke()?,
         }
 
         Ok(())

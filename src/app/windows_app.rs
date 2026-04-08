@@ -1,7 +1,21 @@
-use tracing::trace;
+#![expect(
+    clippy::borrow_as_ptr,
+    clippy::cast_lossless,
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    clippy::collapsible_if,
+    clippy::multiple_unsafe_ops_per_block,
+    clippy::needless_pass_by_value,
+    clippy::semicolon_outside_block,
+    clippy::too_many_lines,
+    clippy::undocumented_unsafe_blocks
+)]
+
 use std::cell::RefCell;
 use std::path::Path;
 use std::thread;
+use tracing::trace;
 
 use eyre::Context;
 use teamy_windows::module::get_current_module;
@@ -13,18 +27,16 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_CONTROL};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect,
-    GetCursorPos, GetWindowRect, SetCursor,
-    GetSystemMetrics, HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTCAPTION, HTCLIENT, HTLEFT,
-    HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT, IDC_ARROW, IDC_SIZEALL, LoadCursorW, MSG, PM_REMOVE,
-    PeekMessageW, PostMessageW, PostQuitMessage, RegisterClassExW, SM_CXPADDEDBORDER, SM_CXSCREEN,
-    SM_CXSIZEFRAME, SM_CYSCREEN, SM_CYSIZEFRAME, SW_SHOW, SYSTEM_METRICS_INDEX, SetTimer,
-    ShowWindow, TranslateMessage, WM_CHAR, WM_DESTROY,
-    WM_ENTERSIZEMOVE, WM_ERASEBKGND, WM_EXITSIZEMOVE, WM_KEYDOWN, WM_KEYUP,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCALCSIZE,
-    WM_NCHITTEST, WM_NCLBUTTONDOWN, WM_PAINT, WM_QUIT, WM_SETCURSOR, WM_SIZE,
-    WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WNDCLASSEXW, WS_EX_APPWINDOW, WS_MAXIMIZEBOX,
-    WS_MINIMIZEBOX, WS_POPUP, WS_THICKFRAME, WS_VISIBLE,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect, GetCursorPos,
+    GetSystemMetrics, GetWindowRect, HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTCAPTION, HTCLIENT,
+    HTLEFT, HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT, IDC_ARROW, IDC_SIZEALL, LoadCursorW, MSG,
+    PM_REMOVE, PeekMessageW, PostMessageW, PostQuitMessage, RegisterClassExW, SM_CXPADDEDBORDER,
+    SM_CXSCREEN, SM_CXSIZEFRAME, SM_CYSCREEN, SM_CYSIZEFRAME, SW_SHOW, SYSTEM_METRICS_INDEX,
+    SetCursor, SetTimer, ShowWindow, TranslateMessage, WM_CHAR, WM_DESTROY, WM_ENTERSIZEMOVE,
+    WM_ERASEBKGND, WM_EXITSIZEMOVE, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCALCSIZE, WM_NCHITTEST, WM_NCLBUTTONDOWN, WM_PAINT, WM_QUIT,
+    WM_SETCURSOR, WM_SIZE, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WNDCLASSEXW, WS_EX_APPWINDOW,
+    WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP, WS_THICKFRAME, WS_VISIBLE,
 };
 use windows::core::{PCWSTR, w};
 
@@ -597,10 +609,7 @@ fn terminal_cell_rect(
     }
 }
 
-fn terminal_cursor_overlay_rects(
-    cell_rect: RECT,
-    style: TerminalDisplayCursorStyle,
-) -> Vec<RECT> {
+fn terminal_cursor_overlay_rects(cell_rect: RECT, style: TerminalDisplayCursorStyle) -> Vec<RECT> {
     let width = (cell_rect.right - cell_rect.left).max(1);
     let height = (cell_rect.bottom - cell_rect.top).max(1);
     let thickness = (width.min(height) / 6).clamp(2, 4);
@@ -912,12 +921,7 @@ fn update_pending_drag_action(
         return PendingDragAction::NotHandled;
     }
 
-    if !drag_threshold_exceeded(
-        pending_drag.origin,
-        point,
-        threshold_x,
-        threshold_y,
-    ) {
+    if !drag_threshold_exceeded(pending_drag.origin, point, threshold_x, threshold_y) {
         return PendingDragAction::Consumed;
     }
 
@@ -1257,10 +1261,8 @@ mod tests {
 
     #[test]
     fn block_cursor_overlay_is_translucent() {
-        let color = terminal_cursor_overlay_color(
-            [0.8, 0.9, 1.0, 1.0],
-            TerminalDisplayCursorStyle::Block,
-        );
+        let color =
+            terminal_cursor_overlay_color([0.8, 0.9, 1.0, 1.0], TerminalDisplayCursorStyle::Block);
 
         assert_eq!(color, [0.8, 0.9, 1.0, 0.42]);
     }

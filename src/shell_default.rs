@@ -23,11 +23,19 @@ pub fn default_shell_path(app_home: &AppHome) -> PathBuf {
 
 /// cli[impl shell.default.fallback.builtin]
 /// cli[impl shell.default.fallback.windows-comspec]
+///
+/// # Errors
+///
+/// This function will return an error if the configured shell cannot be read.
 pub fn load_effective_argv(app_home: &AppHome) -> eyre::Result<Vec<String>> {
     Ok(load_configured_argv(app_home)?.unwrap_or_else(builtin_default_argv))
 }
 
 /// cli[impl shell.default.persisted-in-app-home]
+///
+/// # Errors
+///
+/// This function will return an error if the configured shell file cannot be read.
 pub fn load_configured_argv(app_home: &AppHome) -> eyre::Result<Option<Vec<String>>> {
     let path = default_shell_path(app_home);
     match fs::read_to_string(&path) {
@@ -50,6 +58,10 @@ pub fn load_configured_argv(app_home: &AppHome) -> eyre::Result<Option<Vec<Strin
 }
 
 /// cli[impl shell.default.persisted-in-app-home]
+///
+/// # Errors
+///
+/// This function will return an error if the shell arguments are invalid or the configuration file cannot be written.
 pub fn save_configured_argv(
     app_home: &AppHome,
     program: String,
@@ -68,25 +80,35 @@ pub fn save_configured_argv(
         );
     }
 
-    let mut argv = Vec::with_capacity(args.len() + 1);
-    argv.push(program);
-    argv.extend(args);
+    let mut command_argv = Vec::with_capacity(args.len() + 1);
+    command_argv.push(program);
+    command_argv.extend(args);
 
     app_home.ensure_dir()?;
     let path = default_shell_path(app_home);
-    fs::write(&path, serialize_shell_file(&argv))
+    fs::write(&path, serialize_shell_file(&command_argv))
         .wrap_err_with(|| format!("failed to write default shell config to {}", path.display()))?;
     Ok(())
 }
 
 #[cfg(windows)]
+/// Build a Windows PTY command for the configured default shell.
+///
+/// # Errors
+///
+/// This function will return an error if the effective shell argv cannot be resolved.
 pub fn load_effective_command_builder(app_home: &AppHome) -> eyre::Result<CommandBuilder> {
     command_builder_from_argv(&load_effective_argv(app_home)?)
 }
 
 #[cfg(windows)]
-pub fn command_builder_from_argv(argv: &[String]) -> eyre::Result<CommandBuilder> {
-    let (program, args) = argv
+/// Build a Windows PTY command from a pre-resolved argv list.
+///
+/// # Errors
+///
+/// This function will return an error if the argv list is empty.
+pub fn command_builder_from_argv(command_argv: &[String]) -> eyre::Result<CommandBuilder> {
+    let (program, args) = command_argv
         .split_first()
         .ok_or_else(|| eyre::eyre!("default shell command cannot be empty"))?;
     let resolved_program = resolve_windows_program(program);

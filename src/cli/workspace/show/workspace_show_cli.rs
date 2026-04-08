@@ -17,8 +17,7 @@ impl WorkspaceShowArgs {
     /// # Errors
     ///
     /// This function will return an error if the workspace cannot be found or read.
-    #[expect(clippy::unused_async)]
-    pub async fn invoke(
+    pub fn invoke(
         self,
         app_home: &crate::paths::AppHome,
         cache_home: &crate::paths::CacheHome,

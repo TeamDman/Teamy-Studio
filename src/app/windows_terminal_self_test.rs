@@ -117,16 +117,16 @@ fn run_outside(app_home: &AppHome) -> eyre::Result<()> {
         format_chunks(&backspace_keyup),
         format_chunks(&ctrl_keyup),
     );
-    assert_trace(
-        &a_keydown,
-        &a_char,
-        &a_keyup,
-        &ctrl_keydown,
-        &backspace_keydown,
-        &backspace_keyup,
-        &ctrl_keyup,
-        &transcript,
-    )?;
+    assert_trace(&TraceSnapshot {
+        a_keydown: &a_keydown,
+        a_char: &a_char,
+        a_keyup: &a_keyup,
+        ctrl_keydown: &ctrl_keydown,
+        backspace_keydown: &backspace_keydown,
+        backspace_keyup: &backspace_keyup,
+        ctrl_keyup: &ctrl_keyup,
+        transcript: &transcript,
+    })?;
 
     println!("{transcript}");
     Ok(())
@@ -181,13 +181,7 @@ fn run_default_cmd_ratatui_key_debug_reproduction(
     let final_screen = wait_for_child_exit(terminal, WAIT_TIMEOUT)?;
 
     let transcript = format!(
-        "launched: {}\nkitty_flags: {:?}\n\n=== after_a_release ===\n{}\n\n=== after_ctrl_backspace_press ===\n{}\n\n=== after_ratatui_exit ===\n{}\n\n=== final_screen ===\n{}",
-        ratatui_path,
-        initial_flags,
-        after_a_release,
-        after_ctrl_backspace_press,
-        after_ratatui_exit,
-        final_screen,
+        "launched: {ratatui_path}\nkitty_flags: {initial_flags:?}\n\n=== after_a_release ===\n{after_a_release}\n\n=== after_ctrl_backspace_press ===\n{after_ctrl_backspace_press}\n\n=== after_ratatui_exit ===\n{after_ratatui_exit}\n\n=== final_screen ===\n{final_screen}"
     );
 
     println!("{transcript}");
@@ -210,8 +204,7 @@ fn run_ratatui_key_debug_reproduction(terminal: &mut TerminalSession) -> eyre::R
 
     let final_screen = wait_for_child_exit(terminal, WAIT_TIMEOUT)?;
     let transcript = format!(
-        "kitty_flags: {:?}\n\n=== after_a_release ===\n{}\n\n=== after_ctrl_backspace_press ===\n{}\n\n=== final_screen ===\n{}",
-        initial_flags, after_a_release, after_ctrl_backspace_press, final_screen,
+        "kitty_flags: {initial_flags:?}\n\n=== after_a_release ===\n{after_a_release}\n\n=== after_ctrl_backspace_press ===\n{after_ctrl_backspace_press}\n\n=== final_screen ===\n{final_screen}"
     );
 
     println!("{transcript}");
@@ -318,8 +311,7 @@ fn run_crossterm_key_probe_reproduction(terminal: &mut TerminalSession) -> eyre:
 
     let final_screen = wait_for_child_exit(terminal, WAIT_TIMEOUT)?;
     let transcript = format!(
-        "=== after_a_release ===\n{}\n\n=== after_ctrl_backspace_press ===\n{}\n\n=== final_screen ===\n{}",
-        after_a_release, after_ctrl_backspace_press, final_screen,
+        "=== after_a_release ===\n{after_a_release}\n\n=== after_ctrl_backspace_press ===\n{after_ctrl_backspace_press}\n\n=== final_screen ===\n{final_screen}"
     );
 
     println!("{transcript}");
@@ -402,21 +394,24 @@ fn run_windows_key_probe_reproduction(terminal: &mut TerminalSession) -> eyre::R
     )?;
 
     let transcript = format!(
-        "=== after_a_press ===\n{}\n\n=== after_a_release ===\n{}\n\n=== after_ctrl_backspace_press ===\n{}\n\n=== after_ctrl_backspace_release ===\n{}",
-        after_a_press, after_a_release, after_ctrl_backspace_press, after_ctrl_backspace_release,
+        "=== after_a_press ===\n{after_a_press}\n\n=== after_a_release ===\n{after_a_release}\n\n=== after_ctrl_backspace_press ===\n{after_ctrl_backspace_press}\n\n=== after_ctrl_backspace_release ===\n{after_ctrl_backspace_release}"
     );
     println!("{transcript}");
     Ok(())
 }
 
 fn run_inside() -> eyre::Result<()> {
+    // Safety: querying the standard input handle does not require additional invariants.
     let input =
         unsafe { GetStdHandle(STD_INPUT_HANDLE) }.wrap_err("failed to get console input handle")?;
     let mut original_mode = CONSOLE_MODE(0);
-    unsafe { GetConsoleMode(input, &mut original_mode) }.wrap_err("failed to read console mode")?;
+    // Safety: `original_mode` is a valid out-pointer for `GetConsoleMode`.
+    unsafe { GetConsoleMode(input, &raw mut original_mode) }
+        .wrap_err("failed to read console mode")?;
 
     let raw_mode = (original_mode | ENABLE_WINDOW_INPUT)
         & !(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_QUICK_EDIT_MODE);
+    // Safety: `input` is a valid console handle and `raw_mode` is derived from the current mode bits.
     unsafe { SetConsoleMode(input, raw_mode) }
         .wrap_err("failed to enable keyboard self-test console mode")?;
     let _mode_guard = ConsoleModeGuard {
@@ -455,8 +450,20 @@ struct ConsoleModeGuard {
     original_mode: CONSOLE_MODE,
 }
 
+struct TraceSnapshot<'a> {
+    a_keydown: &'a [Vec<u8>],
+    a_char: &'a [Vec<u8>],
+    a_keyup: &'a [Vec<u8>],
+    ctrl_keydown: &'a [Vec<u8>],
+    backspace_keydown: &'a [Vec<u8>],
+    backspace_keyup: &'a [Vec<u8>],
+    ctrl_keyup: &'a [Vec<u8>],
+    transcript: &'a str,
+}
+
 impl Drop for ConsoleModeGuard {
     fn drop(&mut self) {
+        // Safety: this restores the saved console mode on the same input handle.
         let _ = unsafe { SetConsoleMode(self.input, self.original_mode) };
     }
 }
@@ -467,7 +474,8 @@ fn read_next_key_event(
     loop {
         let mut records = [INPUT_RECORD::default()];
         let mut records_read = 0;
-        unsafe { ReadConsoleInputW(input, &mut records, &mut records_read) }
+        // Safety: both output buffers are valid and writable for the duration of the call.
+        unsafe { ReadConsoleInputW(input, &mut records, &raw mut records_read) }
             .wrap_err("failed to read console input")?;
 
         if records_read == 0 {
@@ -479,6 +487,7 @@ fn read_next_key_event(
             continue;
         }
 
+        // Safety: `EventType == KEY_EVENT`, so accessing the `KeyEvent` union field is valid.
         return Ok(unsafe { record.Event.KeyEvent });
     }
 }
@@ -490,6 +499,7 @@ fn format_key_event(index: usize, event: &KEY_EVENT_RECORD) -> String {
     } else {
         "UP"
     };
+    // Safety: reading the Unicode union field is valid for console key events.
     let unicode = unsafe { event.uChar.UnicodeChar };
 
     format!(
@@ -557,7 +567,7 @@ fn send_text_character(terminal: &mut TerminalSession, character: char) -> eyre:
 
 fn text_character_key(character: char) -> Option<(u32, u8, key::Mods)> {
     let shift = key::Mods::SHIFT | key::Mods::SHIFT_SIDE;
-    let alpha = match character {
+    match character {
         'a'..='z' => Some((
             character.to_ascii_uppercase() as u32,
             letter_scancode(character),
@@ -589,9 +599,7 @@ fn text_character_key(character: char) -> Option<(u32, u8, key::Mods)> {
         '.' => Some((0xBE, 0x34, key::Mods::empty())),
         '/' => Some((0xBF, 0x35, key::Mods::empty())),
         _ => None,
-    };
-
-    alpha
+    }
 }
 
 fn letter_scancode(character: char) -> u8 {
@@ -664,42 +672,54 @@ fn format_chunks(chunks: &[Vec<u8>]) -> String {
         .join(" | ")
 }
 
-fn assert_trace(
-    a_keydown: &[Vec<u8>],
-    a_char: &[Vec<u8>],
-    a_keyup: &[Vec<u8>],
-    ctrl_keydown: &[Vec<u8>],
-    backspace_keydown: &[Vec<u8>],
-    backspace_keyup: &[Vec<u8>],
-    ctrl_keyup: &[Vec<u8>],
-    transcript: &str,
-) -> eyre::Result<()> {
-    if !a_keydown.is_empty() {
-        eyre::bail!("plain A keydown unexpectedly wrote PTY input\n\n{transcript}");
+fn assert_trace(snapshot: &TraceSnapshot<'_>) -> eyre::Result<()> {
+    if !snapshot.a_keydown.is_empty() {
+        eyre::bail!(
+            "plain A keydown unexpectedly wrote PTY input\n\n{}",
+            snapshot.transcript
+        );
     }
 
-    if a_char != [b"a".to_vec()] {
-        eyre::bail!("plain A text routing changed unexpectedly\n\n{transcript}");
+    if snapshot.a_char != [b"a".to_vec()] {
+        eyre::bail!(
+            "plain A text routing changed unexpectedly\n\n{}",
+            snapshot.transcript
+        );
     }
 
-    if !a_keyup.is_empty() {
-        eyre::bail!("plain A keyup unexpectedly wrote PTY input\n\n{transcript}");
+    if !snapshot.a_keyup.is_empty() {
+        eyre::bail!(
+            "plain A keyup unexpectedly wrote PTY input\n\n{}",
+            snapshot.transcript
+        );
     }
 
-    if !ctrl_keydown.is_empty() {
-        eyre::bail!("Ctrl keydown unexpectedly wrote PTY input\n\n{transcript}");
+    if !snapshot.ctrl_keydown.is_empty() {
+        eyre::bail!(
+            "Ctrl keydown unexpectedly wrote PTY input\n\n{}",
+            snapshot.transcript
+        );
     }
 
-    if backspace_keydown != [vec![0x7F]] {
-        eyre::bail!("Ctrl+Backspace keydown should produce DEL (0x7F)\n\n{transcript}");
+    if snapshot.backspace_keydown != [vec![0x7F]] {
+        eyre::bail!(
+            "Ctrl+Backspace keydown should produce DEL (0x7F)\n\n{}",
+            snapshot.transcript
+        );
     }
 
-    if !backspace_keyup.is_empty() {
-        eyre::bail!("Ctrl+Backspace keyup unexpectedly wrote PTY input\n\n{transcript}");
+    if !snapshot.backspace_keyup.is_empty() {
+        eyre::bail!(
+            "Ctrl+Backspace keyup unexpectedly wrote PTY input\n\n{}",
+            snapshot.transcript
+        );
     }
 
-    if !ctrl_keyup.is_empty() {
-        eyre::bail!("Ctrl keyup unexpectedly wrote PTY input\n\n{transcript}");
+    if !snapshot.ctrl_keyup.is_empty() {
+        eyre::bail!(
+            "Ctrl keyup unexpectedly wrote PTY input\n\n{}",
+            snapshot.transcript
+        );
     }
 
     Ok(())
