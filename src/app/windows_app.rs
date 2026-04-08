@@ -15,8 +15,7 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_CONTROL};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect, GetCursorPos,
-    GetSystemMetrics, GetWindowRect, HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTCAPTION, HTCLIENT,
-    HTLEFT, HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT, IDC_ARROW, IDC_SIZEALL, LoadCursorW, MSG,
+    GetSystemMetrics, GetWindowRect, HTCAPTION, HTCLIENT, IDC_ARROW, IDC_SIZEALL, LoadCursorW, MSG,
     PM_REMOVE, PeekMessageW, PostMessageW, PostQuitMessage, RegisterClassExW, SM_CXPADDEDBORDER,
     SM_CXSCREEN, SM_CXSIZEFRAME, SM_CYSCREEN, SM_CYSIZEFRAME, SW_SHOW, SYSTEM_METRICS_INDEX,
     SetCursor, SetTimer, ShowWindow, TranslateMessage, WM_CHAR, WM_DESTROY, WM_ENTERSIZEMOVE,
@@ -30,6 +29,10 @@ use windows::core::{PCWSTR, w};
 use crate::paths::AppHome;
 
 use super::WorkspaceWindowState;
+use super::spatial::{
+    ClientPoint, ClientRect, ScreenPoint, ScreenRect, ScreenToClientTransform, TerminalCellPoint,
+    classify_resize_border_hit, drag_threshold_exceeded,
+};
 use super::windows_d3d12_renderer::{
     D3d12PanelRenderer, PanelEffect, RenderScene, build_panel_scene, push_centered_text,
     push_glyph, push_overlay_panel, push_panel, push_text_block,
@@ -125,24 +128,24 @@ impl WindowHandle {
         let _ = unsafe { DestroyWindow(self.hwnd) };
     }
 
-    fn client_rect(self) -> eyre::Result<RECT> {
+    fn client_rect(self) -> eyre::Result<ClientRect> {
         self.window_thread.assert_window_thread();
         let mut rect = RECT::default();
         // Safety: `rect` is a valid out-pointer for GetClientRect and `self.hwnd` names the window being queried.
         if unsafe { GetClientRect(self.hwnd, &raw mut rect) }.is_err() {
             eyre::bail!("failed to query client rect")
         }
-        Ok(rect)
+        Ok(ClientRect::from_win32_rect(rect))
     }
 
-    fn window_rect(self) -> eyre::Result<RECT> {
+    fn window_rect(self) -> eyre::Result<ScreenRect> {
         self.window_thread.assert_window_thread();
         let mut rect = RECT::default();
         // Safety: `rect` is a valid out-pointer for GetWindowRect and `self.hwnd` names the window being queried.
         if unsafe { GetWindowRect(self.hwnd, &raw mut rect) }.is_err() {
             eyre::bail!("failed to query window rect")
         }
-        Ok(rect)
+        Ok(ScreenRect::from_win32_rect(rect))
     }
 
     fn set_poll_timer(self) -> eyre::Result<()> {
@@ -168,7 +171,7 @@ impl WindowHandle {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct PendingWindowDrag {
-    origin: POINT,
+    origin: ClientPoint,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -206,37 +209,18 @@ fn low_word_u16(value: isize) -> u16 {
     u16::try_from(value & 0xFFFF).expect("masking to 16 bits must fit in u16")
 }
 
-fn signed_word_i32(value: isize) -> i32 {
-    i32::from(i16::from_le_bytes(low_word_u16(value).to_le_bytes()))
-}
-
 fn high_word_i16(value: usize) -> i16 {
     let high_word =
         u16::try_from((value >> 16) & 0xFFFF).expect("masking to 16 bits must fit in u16");
     i16::from_le_bytes(high_word.to_le_bytes())
 }
-
-fn pack_point_lparam(point: POINT) -> isize {
-    let x = u16::from_le_bytes(
-        i16::try_from(point.x)
-            .expect("screen x coordinate must fit in signed 16-bit LPARAM packing")
-            .to_le_bytes(),
-    );
-    let y = u16::from_le_bytes(
-        i16::try_from(point.y)
-            .expect("screen y coordinate must fit in signed 16-bit LPARAM packing")
-            .to_le_bytes(),
-    );
-    isize::try_from((u32::from(y) << 16) | u32::from(x)).expect("packed LPARAM must fit in isize")
-}
-
-fn query_cursor_pos() -> eyre::Result<POINT> {
+fn query_cursor_pos() -> eyre::Result<ScreenPoint> {
     let mut point = POINT::default();
     // Safety: `point` is a valid out-pointer for GetCursorPos.
     if unsafe { GetCursorPos(&raw mut point) }.is_err() {
         eyre::bail!("failed to query cursor position")
     }
-    Ok(point)
+    Ok(ScreenPoint::from_win32_point(point))
 }
 
 fn system_metric(metric: SYSTEM_METRICS_INDEX) -> i32 {
@@ -716,11 +700,11 @@ fn render_current_frame(
 
     push_centered_text(
         &mut scene,
-        layout.drag_handle_rect(),
+        layout.drag_handle_rect().to_win32_rect(),
         &cell_number.to_string(),
         [0.95, 0.95, 0.98, 1.0],
     );
-    let terminal_rect = inset_rect(layout.terminal_rect(), 4);
+    let terminal_rect = layout.terminal_rect().inset(4);
     push_terminal_display(
         &mut scene,
         terminal_rect,
@@ -730,7 +714,7 @@ fn render_current_frame(
     );
     push_text_block(
         &mut scene,
-        inset_rect(layout.result_panel_rect(), 14),
+        layout.result_panel_rect().inset(14).to_win32_rect(),
         &output_text,
         state.output_cell_width,
         state.output_cell_height,
@@ -745,7 +729,7 @@ fn render_current_frame(
 
 fn push_terminal_display(
     scene: &mut RenderScene,
-    terminal_rect: RECT,
+    terminal_rect: ClientRect,
     cell_width: i32,
     cell_height: i32,
     display: TerminalDisplayState,
@@ -753,13 +737,8 @@ fn push_terminal_display(
     for background in display.backgrounds {
         push_panel(
             scene,
-            terminal_cell_rect(
-                terminal_rect,
-                background.column,
-                background.row,
-                cell_width,
-                cell_height,
-            ),
+            terminal_cell_rect(terminal_rect, background.cell, cell_width, cell_height)
+                .to_win32_rect(),
             background.color,
             PanelEffect::TerminalFill,
         );
@@ -768,30 +747,18 @@ fn push_terminal_display(
     for glyph in display.glyphs {
         push_glyph(
             scene,
-            terminal_cell_rect(
-                terminal_rect,
-                glyph.column,
-                glyph.row,
-                cell_width,
-                cell_height,
-            ),
+            terminal_cell_rect(terminal_rect, glyph.cell, cell_width, cell_height).to_win32_rect(),
             glyph.character,
             glyph.color,
         );
     }
 
     if let Some(cursor) = display.cursor {
-        let cell_rect = terminal_cell_rect(
-            terminal_rect,
-            cursor.column,
-            cursor.row,
-            cell_width,
-            cell_height,
-        );
+        let cell_rect = terminal_cell_rect(terminal_rect, cursor.cell, cell_width, cell_height);
         for rect in terminal_cursor_overlay_rects(cell_rect, cursor.style) {
             push_overlay_panel(
                 scene,
-                rect,
+                rect.to_win32_rect(),
                 terminal_cursor_overlay_color(cursor.color, cursor.style),
                 PanelEffect::TerminalCursor,
             );
@@ -812,66 +779,61 @@ fn terminal_cursor_overlay_color(
 }
 
 fn terminal_cell_rect(
-    terminal_rect: RECT,
-    column: i32,
-    row: i32,
+    terminal_rect: ClientRect,
+    cell: TerminalCellPoint,
     cell_width: i32,
     cell_height: i32,
-) -> RECT {
-    let left = terminal_rect.left + (column * cell_width);
-    let top = terminal_rect.top + (row * cell_height);
-    RECT {
-        left,
-        top,
-        right: left + cell_width,
-        bottom: top + cell_height,
-    }
+) -> ClientRect {
+    cell.to_client_rect(terminal_rect, cell_width, cell_height)
 }
 
-fn terminal_cursor_overlay_rects(cell_rect: RECT, style: TerminalDisplayCursorStyle) -> Vec<RECT> {
-    let width = (cell_rect.right - cell_rect.left).max(1);
-    let height = (cell_rect.bottom - cell_rect.top).max(1);
+fn terminal_cursor_overlay_rects(
+    cell_rect: ClientRect,
+    style: TerminalDisplayCursorStyle,
+) -> Vec<ClientRect> {
+    let width = cell_rect.width().max(1);
+    let height = cell_rect.height().max(1);
     let thickness = (width.min(height) / 6).clamp(2, 4);
 
     match style {
-        TerminalDisplayCursorStyle::Bar => vec![RECT {
-            left: cell_rect.left,
-            top: cell_rect.top,
-            right: (cell_rect.left + thickness).min(cell_rect.right),
-            bottom: cell_rect.bottom,
-        }],
+        TerminalDisplayCursorStyle::Bar => vec![ClientRect::new(
+            cell_rect.left(),
+            cell_rect.top(),
+            (cell_rect.left() + thickness).min(cell_rect.right()),
+            cell_rect.bottom(),
+        )],
         TerminalDisplayCursorStyle::Block => vec![cell_rect],
-        TerminalDisplayCursorStyle::Underline => vec![RECT {
-            left: cell_rect.left,
-            top: (cell_rect.bottom - thickness).max(cell_rect.top),
-            right: cell_rect.right,
-            bottom: cell_rect.bottom,
-        }],
+        TerminalDisplayCursorStyle::Underline => vec![ClientRect::new(
+            cell_rect.left(),
+            (cell_rect.bottom() - thickness).max(cell_rect.top()),
+            cell_rect.right(),
+            cell_rect.bottom(),
+        )],
         TerminalDisplayCursorStyle::BlockHollow => vec![
-            RECT {
-                left: cell_rect.left,
-                top: cell_rect.top,
-                right: cell_rect.right,
-                bottom: (cell_rect.top + thickness).min(cell_rect.bottom),
-            },
-            RECT {
-                left: cell_rect.left,
-                top: (cell_rect.bottom - thickness).max(cell_rect.top),
-                right: cell_rect.right,
-                bottom: cell_rect.bottom,
-            },
-            RECT {
-                left: cell_rect.left,
-                top: cell_rect.top,
-                right: (cell_rect.left + thickness).min(cell_rect.right),
-                bottom: cell_rect.bottom,
-            },
-            RECT {
-                left: (cell_rect.right - thickness).max(cell_rect.left),
-                top: cell_rect.top,
-                right: cell_rect.right,
-                bottom: cell_rect.bottom,
-            },
+            ClientRect::new(
+                cell_rect.left(),
+                cell_rect.top(),
+                cell_rect.right(),
+                (cell_rect.top() + thickness).min(cell_rect.bottom()),
+            ),
+            ClientRect::new(
+                cell_rect.left(),
+                (cell_rect.bottom() - thickness).max(cell_rect.top()),
+                cell_rect.right(),
+                cell_rect.bottom(),
+            ),
+            ClientRect::new(
+                cell_rect.left(),
+                cell_rect.top(),
+                (cell_rect.left() + thickness).min(cell_rect.right()),
+                cell_rect.bottom(),
+            ),
+            ClientRect::new(
+                (cell_rect.right() - thickness).max(cell_rect.left()),
+                cell_rect.top(),
+                cell_rect.right(),
+                cell_rect.bottom(),
+            ),
         ],
     }
 }
@@ -892,15 +854,6 @@ fn build_output_panel_text(state: &AppState) -> String {
             state.terminal.cols(),
             state.terminal.rows()
         )
-    }
-}
-
-fn inset_rect(rect: RECT, amount: i32) -> RECT {
-    RECT {
-        left: rect.left + amount,
-        top: rect.top + amount,
-        right: (rect.right - amount).max(rect.left + amount),
-        bottom: (rect.bottom - amount).max(rect.top + amount),
     }
 }
 
@@ -960,8 +913,8 @@ fn handle_mouse_wheel(hwnd: WindowHandle, wparam: WPARAM, lparam: LPARAM) -> eyr
     with_app_state(|state| {
         let layout = client_layout(hwnd, state.terminal_cell_width, state.terminal_cell_height)?;
         let point = screen_to_client_point(hwnd, lparam)?;
-        let in_terminal = point_in_rect(point, layout.terminal_rect());
-        let in_output = point_in_rect(point, layout.result_panel_rect());
+        let in_terminal = layout.terminal_rect().contains(point);
+        let in_output = layout.result_panel_rect().contains(point);
         if !in_terminal && !in_output {
             return Ok(false);
         }
@@ -1021,8 +974,8 @@ fn client_layout(
 ) -> eyre::Result<TerminalLayout> {
     let rect = hwnd.client_rect()?;
     Ok(TerminalLayout {
-        client_width: rect.right - rect.left,
-        client_height: rect.bottom - rect.top,
+        client_width: rect.width(),
+        client_height: rect.height(),
         cell_width,
         cell_height,
     })
@@ -1049,11 +1002,8 @@ fn handle_left_button_up(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Result<boo
         };
 
         let layout = client_layout(hwnd, state.terminal_cell_width, state.terminal_cell_height)?;
-        let point = POINT {
-            x: extract_signed_coordinate(lparam.0),
-            y: extract_signed_coordinate(lparam.0 >> 16),
-        };
-        if !point_in_rect(point, layout.plus_button_rect()) {
+        let point = ClientPoint::from_lparam(lparam);
+        if !layout.plus_button_rect().contains(point) {
             return Ok(false);
         }
 
@@ -1082,10 +1032,7 @@ fn handle_left_button_up(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Result<boo
 }
 
 fn handle_left_button_down(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Result<bool> {
-    let point = POINT {
-        x: extract_signed_coordinate(lparam.0),
-        y: extract_signed_coordinate(lparam.0 >> 16),
-    };
+    let point = ClientPoint::from_lparam(lparam);
     let in_drag_handle = hit_test_drag_handle_point(hwnd, point)?;
 
     with_app_state(|state| {
@@ -1100,10 +1047,7 @@ fn handle_left_button_down(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Result<b
 }
 
 fn handle_mouse_move(hwnd: WindowHandle, wparam: WPARAM, lparam: LPARAM) -> eyre::Result<bool> {
-    let point = POINT {
-        x: extract_signed_coordinate(lparam.0),
-        y: extract_signed_coordinate(lparam.0 >> 16),
-    };
+    let point = ClientPoint::from_lparam(lparam);
 
     let action = with_app_state(|state| {
         let Some(pending_drag) = state.pending_window_drag else {
@@ -1136,7 +1080,7 @@ fn handle_mouse_move(hwnd: WindowHandle, wparam: WPARAM, lparam: LPARAM) -> eyre
 
 fn update_pending_drag_action(
     pending_drag: PendingWindowDrag,
-    point: POINT,
+    point: ClientPoint,
     left_button_down: bool,
     threshold_x: i32,
     threshold_y: i32,
@@ -1152,59 +1096,51 @@ fn update_pending_drag_action(
     PendingDragAction::StartSystemDrag
 }
 
-fn hit_test_drag_handle_point(hwnd: WindowHandle, point: POINT) -> eyre::Result<bool> {
+fn hit_test_drag_handle_point(hwnd: WindowHandle, point: ClientPoint) -> eyre::Result<bool> {
     with_app_state(|state| {
         let layout = client_layout(hwnd, state.terminal_cell_width, state.terminal_cell_height)?;
-        Ok(point_in_rect(point, layout.drag_handle_rect()))
+        Ok(layout.drag_handle_rect().contains(point))
     })
 }
 
-fn begin_system_window_drag(hwnd: WindowHandle, client_point: POINT) -> eyre::Result<()> {
+fn begin_system_window_drag(hwnd: WindowHandle, client_point: ClientPoint) -> eyre::Result<()> {
     let screen_point = client_to_screen_point(hwnd, client_point)?;
-    let (wparam, lparam) = system_drag_message(screen_point);
+    let (wparam, lparam) = system_drag_message(screen_point)?;
     hwnd.post_system_drag(wparam, lparam);
     Ok(())
 }
 
-fn system_drag_message(screen_point: POINT) -> (WPARAM, LPARAM) {
-    (
+fn system_drag_message(screen_point: ScreenPoint) -> eyre::Result<(WPARAM, LPARAM)> {
+    Ok((
         WPARAM(usize::try_from(HTCAPTION).expect("HTCAPTION fits in usize")),
-        LPARAM(pack_point_lparam(screen_point)),
-    )
+        LPARAM(screen_point.pack_lparam()?),
+    ))
 }
 
-fn screen_to_client_point(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Result<POINT> {
-    let screen_point = POINT {
-        x: signed_word_i32(lparam.0),
-        y: signed_word_i32(lparam.0 >> 16),
-    };
+fn screen_to_client_point(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Result<ClientPoint> {
+    let screen_point = ScreenPoint::from_lparam(lparam);
     screen_to_client_point_from_screen(hwnd, screen_point)
 }
 
-fn cursor_client_point(hwnd: WindowHandle) -> eyre::Result<POINT> {
+fn cursor_client_point(hwnd: WindowHandle) -> eyre::Result<ClientPoint> {
     let screen_point = query_cursor_pos()?;
     screen_to_client_point_from_screen(hwnd, screen_point)
 }
 
 fn screen_to_client_point_from_screen(
     hwnd: WindowHandle,
-    screen_point: POINT,
-) -> eyre::Result<POINT> {
-    let window_rect = hwnd.window_rect()?;
-
-    Ok(POINT {
-        x: screen_point.x - window_rect.left,
-        y: screen_point.y - window_rect.top,
-    })
+    screen_point: ScreenPoint,
+) -> eyre::Result<ClientPoint> {
+    let transform = ScreenToClientTransform::for_window(hwnd.window_rect()?);
+    Ok(transform.screen_to_client(screen_point))
 }
 
-fn client_to_screen_point(hwnd: WindowHandle, client_point: POINT) -> eyre::Result<POINT> {
-    let window_rect = hwnd.window_rect()?;
-
-    Ok(POINT {
-        x: window_rect.left + client_point.x,
-        y: window_rect.top + client_point.y,
-    })
+fn client_to_screen_point(
+    hwnd: WindowHandle,
+    client_point: ClientPoint,
+) -> eyre::Result<ScreenPoint> {
+    let transform = ScreenToClientTransform::for_window(hwnd.window_rect()?);
+    Ok(transform.client_to_screen(client_point))
 }
 
 fn handle_set_cursor(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Result<bool> {
@@ -1228,7 +1164,7 @@ fn handle_set_cursor(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Result<bool> {
     Ok(true)
 }
 
-fn hit_test_resize_border(hwnd: WindowHandle, point: POINT) -> eyre::Result<Option<LRESULT>> {
+fn hit_test_resize_border(hwnd: WindowHandle, point: ClientPoint) -> eyre::Result<Option<LRESULT>> {
     let client_rect = hwnd
         .client_rect()
         .wrap_err("failed to query client rect for hit testing")?;
@@ -1246,31 +1182,10 @@ fn resize_border_thickness(size_frame_metric: SYSTEM_METRICS_INDEX) -> i32 {
     (size_frame + padded_border).max(MIN_RESIZE_BORDER_THICKNESS)
 }
 
-fn point_in_rect(point: POINT, rect: RECT) -> bool {
-    point.x >= rect.left && point.x < rect.right && point.y >= rect.top && point.y < rect.bottom
-}
-
 fn fail_and_close(hwnd: WindowHandle, error: &eyre::Error) -> LRESULT {
     tracing::error!(?error, "terminal window failed");
     hwnd.destroy();
     LRESULT(0)
-}
-
-fn extract_signed_coordinate(value: isize) -> i32 {
-    signed_word_i32(value)
-}
-
-fn drag_threshold_exceeded(
-    origin: POINT,
-    current: POINT,
-    threshold_x: i32,
-    threshold_y: i32,
-) -> bool {
-    if threshold_x <= 0 || threshold_y <= 0 {
-        return true;
-    }
-
-    (current.x - origin.x).abs() >= threshold_x || (current.y - origin.y).abs() >= threshold_y
 }
 
 fn wide_null_terminated(value: &str) -> Vec<u16> {
@@ -1282,67 +1197,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn resize_border_prefers_top_left_corner() {
-        let client_rect = RECT {
-            left: 0,
-            top: 0,
-            right: 400,
-            bottom: 300,
-        };
-        let point = POINT { x: 2, y: 3 };
-
-        let hit = classify_resize_border_hit(client_rect, point, 8, 8);
-
-        assert_eq!(hit, Some(HTTOPLEFT));
-    }
-
-    #[test]
-    fn resize_border_prefers_bottom_right_corner() {
-        let client_rect = RECT {
-            left: 0,
-            top: 0,
-            right: 400,
-            bottom: 300,
-        };
-        let point = POINT { x: 399, y: 299 };
-
-        let hit = classify_resize_border_hit(client_rect, point, 8, 8);
-
-        assert_eq!(hit, Some(HTBOTTOMRIGHT));
-    }
-
-    #[test]
-    fn resize_border_ignores_interior_points() {
-        let client_rect = RECT {
-            left: 0,
-            top: 0,
-            right: 400,
-            bottom: 300,
-        };
-        let point = POINT { x: 200, y: 120 };
-
-        let hit = classify_resize_border_hit(client_rect, point, 8, 8);
-
-        assert_eq!(hit, None);
-    }
-
-    #[test]
     fn hollow_cursor_builds_four_border_rects() {
         let rects = terminal_cursor_overlay_rects(
-            RECT {
-                left: 10,
-                top: 20,
-                right: 18,
-                bottom: 36,
-            },
+            ClientRect::new(10, 20, 18, 36),
             TerminalDisplayCursorStyle::BlockHollow,
         );
 
         assert_eq!(rects.len(), 4);
-        assert_eq!(rects[0].top, 20);
-        assert_eq!(rects[1].bottom, 36);
-        assert_eq!(rects[2].left, 10);
-        assert_eq!(rects[3].right, 18);
+        assert_eq!(rects[0].top(), 20);
+        assert_eq!(rects[1].bottom(), 36);
+        assert_eq!(rects[2].left(), 10);
+        assert_eq!(rects[3].right(), 18);
     }
 
     #[test]
@@ -1352,48 +1217,12 @@ mod tests {
     }
 
     #[test]
-    fn zero_drag_threshold_has_no_deadzone() {
-        assert!(drag_threshold_exceeded(
-            POINT { x: 10, y: 20 },
-            POINT { x: 10, y: 20 },
-            0,
-            0,
-        ));
-    }
-
-    #[test]
-    fn positive_drag_threshold_requires_real_motion() {
-        assert!(!drag_threshold_exceeded(
-            POINT { x: 10, y: 20 },
-            POINT { x: 10, y: 20 },
-            1,
-            1,
-        ));
-    }
-
-    #[test]
-    fn drag_threshold_starts_native_drag_after_one_pixel_of_motion() {
-        assert!(drag_threshold_exceeded(
-            POINT { x: 10, y: 20 },
-            POINT { x: 11, y: 20 },
-            1,
-            1,
-        ));
-        assert!(drag_threshold_exceeded(
-            POINT { x: 10, y: 20 },
-            POINT { x: 10, y: 21 },
-            1,
-            1,
-        ));
-    }
-
-    #[test]
     fn pending_drag_is_consumed_before_threshold_is_crossed() {
         let action = update_pending_drag_action(
             PendingWindowDrag {
-                origin: POINT { x: 10, y: 20 },
+                origin: ClientPoint::new(10, 20),
             },
-            POINT { x: 10, y: 20 },
+            ClientPoint::new(10, 20),
             true,
             1,
             1,
@@ -1407,9 +1236,9 @@ mod tests {
     fn pending_drag_starts_immediately_when_threshold_is_zero() {
         let action = update_pending_drag_action(
             PendingWindowDrag {
-                origin: POINT { x: 10, y: 20 },
+                origin: ClientPoint::new(10, 20),
             },
-            POINT { x: 10, y: 20 },
+            ClientPoint::new(10, 20),
             true,
             0,
             0,
@@ -1423,9 +1252,9 @@ mod tests {
     fn pending_drag_requests_native_drag_after_threshold_is_crossed() {
         let action = update_pending_drag_action(
             PendingWindowDrag {
-                origin: POINT { x: 10, y: 20 },
+                origin: ClientPoint::new(10, 20),
             },
-            POINT { x: 11, y: 20 },
+            ClientPoint::new(11, 20),
             true,
             DRAG_START_THRESHOLD_PX,
             DRAG_START_THRESHOLD_PX,
@@ -1439,9 +1268,9 @@ mod tests {
     fn pending_drag_clears_when_button_is_released() {
         let action = update_pending_drag_action(
             PendingWindowDrag {
-                origin: POINT { x: 10, y: 20 },
+                origin: ClientPoint::new(10, 20),
             },
-            POINT { x: 10, y: 20 },
+            ClientPoint::new(10, 20),
             false,
             DRAG_START_THRESHOLD_PX,
             DRAG_START_THRESHOLD_PX,
@@ -1453,10 +1282,10 @@ mod tests {
 
     #[test]
     fn system_drag_message_targets_caption_with_screen_coordinates() {
-        let (wparam, lparam) = system_drag_message(POINT { x: 300, y: 400 });
+        let (wparam, lparam) = system_drag_message(ScreenPoint::new(300, 400)).unwrap();
 
         assert_eq!(wparam.0, usize::try_from(HTCAPTION).unwrap());
-        assert_eq!(lparam.0, pack_point_lparam(POINT { x: 300, y: 400 }));
+        assert_eq!(lparam.0, ScreenPoint::new(300, 400).pack_lparam().unwrap());
     }
 
     #[test]
@@ -1480,36 +1309,4 @@ fn should_override_drag_cursor(in_move_size_loop: bool) -> bool {
 
 fn should_render_from_poll_timer(in_move_size_loop: bool) -> bool {
     in_move_size_loop
-}
-
-fn classify_resize_border_hit(
-    client_rect: RECT,
-    point: POINT,
-    resize_border_x: i32,
-    resize_border_y: i32,
-) -> Option<u32> {
-    let left = point.x < client_rect.left + resize_border_x;
-    let right = point.x >= client_rect.right - resize_border_x;
-    let top = point.y < client_rect.top + resize_border_y;
-    let bottom = point.y >= client_rect.bottom - resize_border_y;
-
-    if top && left {
-        Some(HTTOPLEFT)
-    } else if top && right {
-        Some(HTTOPRIGHT)
-    } else if bottom && left {
-        Some(HTBOTTOMLEFT)
-    } else if bottom && right {
-        Some(HTBOTTOMRIGHT)
-    } else if left {
-        Some(HTLEFT)
-    } else if right {
-        Some(HTRIGHT)
-    } else if top {
-        Some(HTTOP)
-    } else if bottom {
-        Some(HTBOTTOM)
-    } else {
-        None
-    }
 }

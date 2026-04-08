@@ -694,37 +694,37 @@ pub fn build_panel_scene(layout: TerminalLayout) -> RenderScene {
         effect: PanelEffect::BlueBackground,
     });
     panels.push(PanelRect {
-        rect: layout.sidecar_rect(),
+        rect: layout.sidecar_rect().to_win32_rect(),
         color: sidecar,
         effect: PanelEffect::Sidecar,
     });
     panels.push(PanelRect {
-        rect: layout.drag_handle_rect(),
+        rect: layout.drag_handle_rect().to_win32_rect(),
         color: drag,
         effect: PanelEffect::DragHandle,
     });
     panels.push(PanelRect {
-        rect: layout.code_panel_rect(),
+        rect: layout.code_panel_rect().to_win32_rect(),
         color: code,
         effect: PanelEffect::CodePanel,
     });
     panels.push(PanelRect {
-        rect: layout.result_panel_rect(),
+        rect: layout.result_panel_rect().to_win32_rect(),
         color: result,
         effect: PanelEffect::ResultPanel,
     });
     panels.push(PanelRect {
-        rect: layout.plus_button_rect(),
+        rect: layout.plus_button_rect().to_win32_rect(),
         color: button,
         effect: PanelEffect::PlusButton,
     });
     panels.push(PanelRect {
-        rect: layout.sidecar_button_rect(0),
+        rect: layout.sidecar_button_rect(0).to_win32_rect(),
         color: button,
         effect: PanelEffect::PlayButton,
     });
     panels.push(PanelRect {
-        rect: layout.sidecar_button_rect(1),
+        rect: layout.sidecar_button_rect(1).to_win32_rect(),
         color: button,
         effect: PanelEffect::StopButton,
     });

@@ -12,7 +12,6 @@ use libghostty_vt::style::RgbColor;
 use libghostty_vt::{Terminal, TerminalOptions};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use tracing::{debug, info};
-use windows::Win32::Foundation::RECT;
 use windows::Win32::System::Console::{
     CAPSLOCK_ON, LEFT_ALT_PRESSED, LEFT_CTRL_PRESSED, NUMLOCK_ON, RIGHT_ALT_PRESSED,
     RIGHT_CTRL_PRESSED, SHIFT_PRESSED,
@@ -20,6 +19,8 @@ use windows::Win32::System::Console::{
 use windows::Win32::UI::Input::KeyboardAndMouse::GetKeyState;
 
 use crate::paths::AppHome;
+
+use super::spatial::{ClientRect, TerminalCellPoint};
 
 pub const DRAG_STRIP_HEIGHT: i32 = 76;
 pub const WINDOW_PADDING: i32 = 18;
@@ -73,16 +74,14 @@ pub struct PumpResult {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct TerminalDisplayGlyph {
-    pub column: i32,
-    pub row: i32,
+    pub cell: TerminalCellPoint,
     pub character: char,
     pub color: [f32; 4],
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TerminalDisplayBackground {
-    pub column: i32,
-    pub row: i32,
+    pub cell: TerminalCellPoint,
     pub color: [f32; 4],
 }
 
@@ -96,8 +95,7 @@ pub enum TerminalDisplayCursorStyle {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TerminalDisplayCursor {
-    pub column: i32,
-    pub row: i32,
+    pub cell: TerminalCellPoint,
     pub color: [f32; 4],
     pub style: TerminalDisplayCursorStyle,
 }
@@ -167,118 +165,114 @@ pub struct TerminalLayout {
 
 impl TerminalLayout {
     #[must_use]
-    pub fn frame_rect(self) -> RECT {
-        RECT {
-            left: WINDOW_PADDING,
-            top: WINDOW_PADDING,
-            right: (self.client_width - WINDOW_PADDING).max(WINDOW_PADDING),
-            bottom: (self.client_height - WINDOW_PADDING).max(WINDOW_PADDING),
-        }
+    pub fn frame_rect(self) -> ClientRect {
+        ClientRect::new(
+            WINDOW_PADDING,
+            WINDOW_PADDING,
+            (self.client_width - WINDOW_PADDING).max(WINDOW_PADDING),
+            (self.client_height - WINDOW_PADDING).max(WINDOW_PADDING),
+        )
     }
 
     #[must_use]
-    pub fn sidecar_rect(self) -> RECT {
+    pub fn sidecar_rect(self) -> ClientRect {
         let frame = self.frame_rect();
         let code = self.code_panel_rect();
-        RECT {
-            left: frame.left,
-            top: frame.top,
-            right: (frame.left + SIDECAR_WIDTH).min(frame.right),
-            bottom: code.bottom,
-        }
+        ClientRect::new(
+            frame.left(),
+            frame.top(),
+            (frame.left() + SIDECAR_WIDTH).min(frame.right()),
+            code.bottom(),
+        )
     }
 
     #[must_use]
-    pub fn drag_handle_rect(self) -> RECT {
+    pub fn drag_handle_rect(self) -> ClientRect {
         let sidecar = self.sidecar_rect();
-        RECT {
-            left: sidecar.left,
-            top: sidecar.top,
-            right: sidecar.right,
-            bottom: (sidecar.top + DRAG_STRIP_HEIGHT).min(sidecar.bottom),
-        }
+        ClientRect::new(
+            sidecar.left(),
+            sidecar.top(),
+            sidecar.right(),
+            (sidecar.top() + DRAG_STRIP_HEIGHT).min(sidecar.bottom()),
+        )
     }
 
     #[must_use]
-    pub fn code_panel_rect(self) -> RECT {
+    pub fn code_panel_rect(self) -> ClientRect {
         let frame = self.frame_rect();
-        let code_left = (frame.left + SIDECAR_WIDTH + CELL_PANEL_GAP).min(frame.right);
-        let code_right = frame.right;
+        let code_left = (frame.left() + SIDECAR_WIDTH + CELL_PANEL_GAP).min(frame.right());
+        let code_right = frame.right();
         let plus = self.plus_button_rect();
-        let result_bottom = plus.top - CELL_PANEL_GAP;
+        let result_bottom = plus.top() - CELL_PANEL_GAP;
         let desired_result_top = result_bottom - RESULT_PANEL_HEIGHT;
-        let minimum_code_bottom = frame.top + MIN_CODE_PANEL_HEIGHT;
+        let minimum_code_bottom = frame.top() + MIN_CODE_PANEL_HEIGHT;
         let code_bottom = (desired_result_top - CELL_PANEL_GAP)
             .max(minimum_code_bottom)
             .min(result_bottom - CELL_PANEL_GAP);
 
-        RECT {
-            left: code_left,
-            top: frame.top,
-            right: code_right,
-            bottom: code_bottom.max(frame.top + 1),
-        }
+        ClientRect::new(
+            code_left,
+            frame.top(),
+            code_right,
+            code_bottom.max(frame.top() + 1),
+        )
     }
 
     #[must_use]
-    pub fn result_panel_rect(self) -> RECT {
+    pub fn result_panel_rect(self) -> ClientRect {
         let code = self.code_panel_rect();
         let plus = self.plus_button_rect();
-        RECT {
-            left: code.left,
-            top: code.bottom + CELL_PANEL_GAP,
-            right: code.right,
-            bottom: plus.top - CELL_PANEL_GAP,
-        }
+        ClientRect::new(
+            code.left(),
+            code.bottom() + CELL_PANEL_GAP,
+            code.right(),
+            plus.top() - CELL_PANEL_GAP,
+        )
     }
 
     #[must_use]
-    pub fn plus_button_rect(self) -> RECT {
+    pub fn plus_button_rect(self) -> ClientRect {
         let frame = self.frame_rect();
-        let code_left = (frame.left + SIDECAR_WIDTH + CELL_PANEL_GAP).min(frame.right);
-        let code_right = frame.right;
+        let code_left = (frame.left() + SIDECAR_WIDTH + CELL_PANEL_GAP).min(frame.right());
+        let code_right = frame.right();
         let center_x = code_left + ((code_right - code_left).max(PLUS_BUTTON_SIZE) / 2);
         let left = (center_x - (PLUS_BUTTON_SIZE / 2)).max(code_left);
-        RECT {
+        ClientRect::new(
             left,
-            top: frame.bottom - PLUS_BUTTON_SIZE,
-            right: (left + PLUS_BUTTON_SIZE).min(code_right),
-            bottom: frame.bottom,
-        }
+            frame.bottom() - PLUS_BUTTON_SIZE,
+            (left + PLUS_BUTTON_SIZE).min(code_right),
+            frame.bottom(),
+        )
     }
 
     #[must_use]
-    pub fn sidecar_button_rect(self, index: usize) -> RECT {
+    pub fn sidecar_button_rect(self, index: usize) -> ClientRect {
         let sidecar = self.sidecar_rect();
-        let top = self.drag_handle_rect().bottom
+        let top = self.drag_handle_rect().bottom()
             + 22
             + (i32::try_from(index).unwrap_or_default()
                 * (SIDECAR_BUTTON_SIZE + SIDECAR_BUTTON_GAP));
-        let left = sidecar.left + ((sidecar.right - sidecar.left - SIDECAR_BUTTON_SIZE).max(0) / 2);
-        RECT {
+        let left =
+            sidecar.left() + ((sidecar.right() - sidecar.left() - SIDECAR_BUTTON_SIZE).max(0) / 2);
+        ClientRect::new(
             left,
             top,
-            right: left + SIDECAR_BUTTON_SIZE,
-            bottom: top + SIDECAR_BUTTON_SIZE,
-        }
+            left + SIDECAR_BUTTON_SIZE,
+            top + SIDECAR_BUTTON_SIZE,
+        )
     }
 
     #[must_use]
-    pub fn terminal_rect(self) -> RECT {
+    pub fn terminal_rect(self) -> ClientRect {
         let code = self.code_panel_rect();
-        RECT {
-            left: code.left,
-            top: code.top,
-            right: code.right,
-            bottom: code.bottom,
-        }
+        ClientRect::new(code.left(), code.top(), code.right(), code.bottom())
     }
 
     #[must_use]
     pub fn grid_size(self) -> (u16, u16) {
         let rect = self.terminal_rect();
-        let width = (rect.right - rect.left).max(self.cell_width.max(1));
-        let height = (rect.bottom - rect.top).max(self.cell_height.max(1));
+        let width = rect.width().max(self.cell_width.max(1));
+        let height = rect.height().max(self.cell_height.max(1));
         let cols = (width / self.cell_width.max(1)).max(1);
         let rows = (height / self.cell_height.max(1)).max(1);
         (
@@ -418,14 +412,10 @@ impl TerminalSession {
             .resize(PtySize {
                 cols,
                 rows,
-                pixel_width: u16::try_from(
-                    (layout.terminal_rect().right - layout.terminal_rect().left).max(0),
-                )
-                .unwrap_or(u16::MAX),
-                pixel_height: u16::try_from(
-                    (layout.terminal_rect().bottom - layout.terminal_rect().top).max(0),
-                )
-                .unwrap_or(u16::MAX),
+                pixel_width: u16::try_from(layout.terminal_rect().width().max(0))
+                    .unwrap_or(u16::MAX),
+                pixel_height: u16::try_from(layout.terminal_rect().height().max(0))
+                    .unwrap_or(u16::MAX),
             })
             .map_err(|error| eyre::eyre!("failed to resize PTY: {error}"))?;
 
@@ -798,8 +788,7 @@ impl TerminalSession {
 
                 if let Some(color) = background_color {
                     display.backgrounds.push(TerminalDisplayBackground {
-                        column: column_index,
-                        row: row_index,
+                        cell: TerminalCellPoint::new(column_index, row_index),
                         color,
                     });
                 }
@@ -807,8 +796,7 @@ impl TerminalSession {
                 if !graphemes.is_empty() {
                     for character in graphemes {
                         display.glyphs.push(TerminalDisplayGlyph {
-                            column: column_index,
-                            row: row_index,
+                            cell: TerminalCellPoint::new(column_index, row_index),
                             character,
                             color: glyph_color,
                         });
@@ -978,8 +966,7 @@ fn build_terminal_cursor(
         .unwrap_or(colors.foreground);
 
     Ok(Some(TerminalDisplayCursor {
-        column: i32::from(viewport.x),
-        row: i32::from(viewport.y),
+        cell: TerminalCellPoint::new(i32::from(viewport.x), i32::from(viewport.y)),
         color: rgb_to_rgba(cursor_color),
         style: map_cursor_style(style),
     }))
@@ -1430,13 +1417,13 @@ mod tests {
         let plus = layout.plus_button_rect();
         let terminal = layout.terminal_rect();
 
-        assert!(sidecar.right <= code.left);
-        assert!(code.bottom < result.top);
-        assert!(result.bottom < plus.top);
-        assert_eq!(terminal.left, code.left);
-        assert_eq!(terminal.right, code.right);
-        assert_eq!(terminal.bottom, code.bottom);
-        assert!((code.bottom - code.top) >= MIN_CODE_PANEL_HEIGHT);
+        assert!(sidecar.right() <= code.left());
+        assert!(code.bottom() < result.top());
+        assert!(result.bottom() < plus.top());
+        assert_eq!(terminal.left(), code.left());
+        assert_eq!(terminal.right(), code.right());
+        assert_eq!(terminal.bottom(), code.bottom());
+        assert!(code.height() >= MIN_CODE_PANEL_HEIGHT);
     }
 
     #[test]
@@ -1498,10 +1485,10 @@ mod tests {
         let drag = layout.drag_handle_rect();
         let sidecar = layout.sidecar_rect();
 
-        assert!(drag.left >= sidecar.left);
-        assert!(drag.right <= sidecar.right);
-        assert!(drag.top >= sidecar.top);
-        assert!(drag.bottom <= sidecar.bottom);
+        assert!(drag.left() >= sidecar.left());
+        assert!(drag.right() <= sidecar.right());
+        assert!(drag.top() >= sidecar.top());
+        assert!(drag.bottom() <= sidecar.bottom());
     }
 
     #[test]

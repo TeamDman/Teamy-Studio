@@ -1,4 +1,6 @@
 #[cfg(windows)]
+mod spatial;
+#[cfg(windows)]
 mod windows_app;
 #[cfg(windows)]
 mod windows_d3d12_renderer;
