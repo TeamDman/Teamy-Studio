@@ -1,3 +1,4 @@
+use tracing::trace;
 use std::cell::RefCell;
 use std::path::Path;
 use std::thread;
@@ -41,8 +42,8 @@ use super::windows_terminal::{
 
 const WINDOW_CLASS_NAME: PCWSTR = w!("TeamyStudioTerminalWindow");
 const WINDOW_TITLE: &str = "Teamy Studio Terminal";
-const TERMINAL_FONT_HEIGHT: i32 = -32;
-const OUTPUT_FONT_HEIGHT: i32 = -32;
+const TERMINAL_FONT_HEIGHT: i32 = -16;
+const OUTPUT_FONT_HEIGHT: i32 = -16;
 const FONT_FAMILY: &str = "CaskaydiaCove Nerd Font Mono";
 const MIN_FONT_HEIGHT: i32 = -12;
 const MAX_FONT_HEIGHT: i32 = -72;
@@ -278,7 +279,7 @@ extern "system" fn window_proc(
             // cli[impl window.interaction.input]
             match with_app_state(|state| state.terminal.handle_char(wparam.0 as u32, lparam.0)) {
                 Ok(result) => {
-                    debug!(
+                    trace!(
                         message = "WM_CHAR",
                         code_unit = wparam.0 as u32,
                         lparam = lparam.0,
@@ -305,7 +306,7 @@ extern "system" fn window_proc(
             )
         }) {
             Ok(consumed) => {
-                debug!(
+                trace!(
                     message = if message == WM_SYSKEYDOWN {
                         "WM_SYSKEYDOWN"
                     } else {
@@ -335,7 +336,7 @@ extern "system" fn window_proc(
             )
         }) {
             Ok(consumed) => {
-                debug!(
+                trace!(
                     message = if message == WM_SYSKEYUP {
                         "WM_SYSKEYUP"
                     } else {
@@ -747,6 +748,11 @@ fn handle_mouse_wheel(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) -> eyre::Resul
             }
 
             let (cell_width, cell_height) = measure_terminal_cell_size(next_font_height)?;
+            debug!(
+                font_height = next_font_height,
+                const_name = "TERMINAL_FONT_HEIGHT",
+                "terminal zoom changed; use this font height for the default constant"
+            );
             state.terminal_font_height = next_font_height;
             state.terminal_cell_width = cell_width;
             state.terminal_cell_height = cell_height;
@@ -764,6 +770,11 @@ fn handle_mouse_wheel(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) -> eyre::Resul
         }
 
         let (cell_width, cell_height) = measure_terminal_cell_size(next_font_height)?;
+        debug!(
+            font_height = next_font_height,
+            const_name = "OUTPUT_FONT_HEIGHT",
+            "output zoom changed; use this font height for the default constant"
+        );
         state.output_font_height = next_font_height;
         state.output_cell_width = cell_width;
         state.output_cell_height = cell_height;

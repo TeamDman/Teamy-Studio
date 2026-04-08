@@ -1,3 +1,4 @@
+use tracing::trace;
 use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::io::{Read, Write};
@@ -452,7 +453,7 @@ impl TerminalSession {
     }
 
     pub fn handle_char(&mut self, code_unit: u32, lparam: isize) -> eyre::Result<bool> {
-        debug!(
+        trace!(
             code_unit,
             lparam,
             win32_input_mode = self.win32_input_mode,
@@ -522,7 +523,7 @@ impl TerminalSession {
             return Ok(false);
         };
 
-        debug!(
+        trace!(
             vkey,
             lparam,
             ?mapped_key,
