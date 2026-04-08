@@ -263,6 +263,7 @@ impl TerminalLayout {
     }
 
     #[must_use]
+    /// behavior[impl window.appearance.code-panel.terminal-alignment]
     pub fn terminal_rect(self) -> ClientRect {
         let code = self.code_panel_rect();
         ClientRect::new(code.left(), code.top(), code.right(), code.bottom())
@@ -918,6 +919,7 @@ fn rgb_to_rgba(color: RgbColor) -> [f32; 4] {
     ]
 }
 
+/// behavior[impl window.appearance.terminal.selection.inverse]
 fn resolve_terminal_cell_colors(
     colors: &libghostty_vt::render::Colors,
     foreground: Option<RgbColor>,
@@ -939,6 +941,7 @@ fn resolve_terminal_cell_colors(
     )
 }
 
+/// behavior[impl window.appearance.terminal.cursor.visible]
 fn build_terminal_cursor(
     snapshot: &libghostty_vt::render::Snapshot<'_, '_>,
     colors: &libghostty_vt::render::Colors,
@@ -999,6 +1002,7 @@ fn map_virtual_key(vkey: u32, lparam: isize) -> Option<(key::Key, char)> {
     })
 }
 
+/// behavior[impl window.interaction.input.numpad-numlock-text]
 fn map_printable_virtual_key(vkey: u32) -> Option<(key::Key, char)> {
     match vkey {
         0x20 => Some((key::Key::Space, ' ')),

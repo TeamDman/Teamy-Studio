@@ -327,6 +327,7 @@ pub fn run(
     message_loop()
 }
 
+/// os[impl window.appearance.os-chrome-none]
 fn create_window(window_thread: WindowThread) -> eyre::Result<WindowHandle> {
     let instance = get_current_module().wrap_err("failed to get module handle")?;
 
@@ -489,6 +490,7 @@ fn handle_timer(hwnd: WindowHandle) -> LRESULT {
     }
 }
 
+/// behavior[impl window.interaction.input]
 fn handle_char_message(
     hwnd: WindowHandle,
     message: u32,
@@ -519,6 +521,7 @@ fn handle_char_message(
     }
 }
 
+/// behavior[impl window.interaction.input]
 fn handle_key_down_message(
     hwnd: WindowHandle,
     message: u32,
@@ -619,6 +622,7 @@ fn handle_bool_message(
     }
 }
 
+/// os[impl window.interaction.resize.native-edges]
 fn handle_non_client_hit_test(hwnd: WindowHandle, lparam: LPARAM) -> LRESULT {
     let point = match screen_to_client_point(hwnd, lparam) {
         Ok(point) => point,
@@ -659,6 +663,10 @@ fn render_frame() -> eyre::Result<()> {
     })
 }
 
+/// behavior[impl window.interaction.drag.live]
+/// behavior[impl window.interaction.resize.live]
+/// behavior[impl window.interaction.resize.terminal-live-output]
+/// behavior[impl window.interaction.resize.low-latency]
 fn handle_poll_timer(hwnd: WindowHandle) -> eyre::Result<bool> {
     with_app_state(|state| {
         let result = state.terminal.pump()?;
@@ -728,6 +736,7 @@ fn render_current_frame(
     renderer.render(&scene)
 }
 
+/// behavior[impl window.appearance.terminal.cursor.legible-block]
 fn push_terminal_display(
     scene: &mut RenderScene,
     terminal_rect: ClientRect,
@@ -1032,6 +1041,7 @@ fn handle_left_button_up(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Result<boo
     })
 }
 
+/// behavior[impl window.interaction.drag]
 fn handle_left_button_down(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Result<bool> {
     let point = ClientPoint::from_lparam(lparam);
     let in_drag_handle = hit_test_drag_handle_point(hwnd, point)?;
@@ -1079,6 +1089,7 @@ fn handle_mouse_move(hwnd: WindowHandle, wparam: WPARAM, lparam: LPARAM) -> eyre
     }
 }
 
+/// os[impl window.interaction.drag.threshold]
 fn update_pending_drag_action(
     pending_drag: PendingWindowDrag,
     point: ClientPoint,
@@ -1144,6 +1155,7 @@ fn client_to_screen_point(
     Ok(transform.client_to_screen(client_point))
 }
 
+/// behavior[impl window.appearance.drag-cursor]
 fn handle_set_cursor(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Result<bool> {
     if !should_override_drag_cursor(with_app_state(|state| Ok(state.in_move_size_loop))?) {
         return Ok(false);

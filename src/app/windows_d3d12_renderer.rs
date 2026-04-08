@@ -676,6 +676,9 @@ impl Drop for D3d12PanelRenderer {
     }
 }
 
+/// behavior[impl window.appearance.chrome]
+/// behavior[impl window.appearance.backgrounds.blue-half-transparent]
+/// behavior[impl window.appearance.code-panel.single-surface]
 pub fn build_panel_scene(layout: TerminalLayout) -> RenderScene {
     let blue = [0.11, 0.44, 0.94, 0.5];
     let sidecar = [0.55, 0.14, 0.14, 1.0];
@@ -2245,6 +2248,8 @@ fn shader_path() -> PathBuf {
         .join("windows_panel_shaders.hlsl")
 }
 
+/// behavior[impl window.appearance.panel-borders.absolute-pixels]
+/// behavior[impl window.appearance.backgrounds.animated-time-based]
 fn build_shader_params(width: f32, height: f32, elapsed_seconds: f32) -> ShaderParams {
     let safe_width = width.max(1.0);
     let safe_height = height.max(1.0);
