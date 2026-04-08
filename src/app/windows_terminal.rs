@@ -188,10 +188,18 @@ struct Win32InputModeKeyEvent {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum PromptInputState {
+    #[default]
+    Inactive,
+    AwaitingPristine,
+    AwaitingEdited,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct SemanticPromptTracking {
     markers_observed: bool,
     at_shell_prompt: bool,
-    awaiting_input: bool,
+    input_state: PromptInputState,
 }
 
 pub struct TerminalSession {
@@ -587,6 +595,7 @@ impl TerminalSession {
                 return Ok(false);
             };
 
+            self.mark_prompt_input_written();
             self.write_win32_input_mode_char_event(pending_key, character, lparam)?;
             self.repaint.needs_repaint = true;
             return Ok(true);
@@ -607,6 +616,7 @@ impl TerminalSession {
                 self.repaint.needs_repaint = true;
                 return Ok(true);
             }
+            self.mark_prompt_input_written();
             self.write_input(&[control])?;
             self.repaint.needs_repaint = true;
             return Ok(true);
@@ -614,6 +624,7 @@ impl TerminalSession {
 
         let mut bytes = [0_u8; 4];
         let encoded = character.encode_utf8(&mut bytes);
+        self.mark_prompt_input_written();
         self.write_input(encoded.as_bytes())?;
         self.repaint.needs_repaint = true;
         Ok(true)
@@ -654,6 +665,10 @@ impl TerminalSession {
             self.write_input(CTRL_D_EXIT_COMMAND)?;
             self.repaint.needs_repaint = true;
             return Ok(true);
+        }
+
+        if should_mark_prompt_input_written_for_key(key_event, was_down, is_release) {
+            self.mark_prompt_input_written();
         }
 
         if is_release && !self.win32_input.enabled && !self.should_report_key_releases()? {
@@ -926,15 +941,14 @@ impl TerminalSession {
         (
             self.semantic_prompt.markers_observed,
             self.semantic_prompt.at_shell_prompt,
-            self.semantic_prompt.awaiting_input,
+            matches!(
+                self.semantic_prompt.input_state,
+                PromptInputState::AwaitingPristine | PromptInputState::AwaitingEdited
+            ),
         )
     }
 
     fn write_input(&mut self, data: &[u8]) -> eyre::Result<()> {
-        if self.semantic_prompt.awaiting_input && data != [CTRL_D_EOF] {
-            self.semantic_prompt.awaiting_input = false;
-        }
-
         let mut writer = self
             .writer
             .lock()
@@ -1044,6 +1058,15 @@ impl TerminalSession {
         Ok(())
     }
 
+    fn mark_prompt_input_written(&mut self) {
+        if matches!(
+            self.semantic_prompt.input_state,
+            PromptInputState::AwaitingPristine
+        ) {
+            self.semantic_prompt.input_state = PromptInputState::AwaitingEdited;
+        }
+    }
+
     fn observe_semantic_prompt_sequences(&mut self, data: &[u8]) {
         let mut combined = std::mem::take(&mut self.semantic_prompt_buffer);
         combined.extend_from_slice(data);
@@ -1088,7 +1111,7 @@ impl TerminalSession {
         match action {
             b'B' | b'I' => {
                 self.semantic_prompt.markers_observed = true;
-                self.semantic_prompt.awaiting_input = true;
+                self.semantic_prompt.input_state = PromptInputState::AwaitingPristine;
                 debug!(
                     action = %char::from(action),
                     "detected OSC 133 shell awaiting-input marker"
@@ -1096,7 +1119,7 @@ impl TerminalSession {
             }
             b'A' | b'C' | b'D' | b'N' | b'P' => {
                 self.semantic_prompt.markers_observed = true;
-                self.semantic_prompt.awaiting_input = false;
+                self.semantic_prompt.input_state = PromptInputState::Inactive;
             }
             b'L' => {
                 self.semantic_prompt.markers_observed = true;
@@ -1189,19 +1212,21 @@ fn semantic_prompt_tracking(
     Ok(SemanticPromptTracking {
         markers_observed,
         at_shell_prompt,
-        awaiting_input: false,
+        input_state: PromptInputState::Inactive,
     })
 }
 
 fn should_close_from_echoed_ctrl_d(tracking: SemanticPromptTracking, data: &[u8]) -> bool {
     tracking.markers_observed
         && tracking.at_shell_prompt
-        && tracking.awaiting_input
+        && matches!(tracking.input_state, PromptInputState::AwaitingPristine)
         && data.contains(&CTRL_D_EOF)
 }
 
 fn should_translate_ctrl_d_to_exit(tracking: SemanticPromptTracking) -> bool {
-    tracking.markers_observed && tracking.at_shell_prompt
+    tracking.markers_observed
+        && tracking.at_shell_prompt
+        && matches!(tracking.input_state, PromptInputState::AwaitingPristine)
 }
 
 /// behavior[impl window.interaction.input.ctrl-d-exits-current-shell-at-prompt]
@@ -1212,6 +1237,26 @@ fn should_translate_ctrl_d_key(
     should_translate_ctrl_d_to_exit(tracking)
         && key_event.mapped_key == key::Key::D
         && key_event.mods.contains(key::Mods::CTRL)
+}
+
+fn should_mark_prompt_input_written_for_key(
+    key_event: PendingWin32CharKey,
+    was_down: bool,
+    is_release: bool,
+) -> bool {
+    !was_down && !is_release && !is_modifier_key(key_event.mapped_key)
+}
+
+fn is_modifier_key(mapped_key: key::Key) -> bool {
+    matches!(
+        mapped_key,
+        key::Key::ShiftLeft
+            | key::Key::ShiftRight
+            | key::Key::ControlLeft
+            | key::Key::ControlRight
+            | key::Key::AltLeft
+            | key::Key::AltRight
+    )
 }
 
 fn strip_echoed_ctrl_d(data: &[u8]) -> Cow<'_, [u8]> {
@@ -1783,11 +1828,12 @@ fn legacy_special_key_bytes(mapped_key: key::Key, mods: key::Mods) -> Option<Vec
 #[cfg(test)]
 mod tests {
     use super::{
-        MIN_CODE_PANEL_HEIGHT, PendingWin32CharKey, SemanticPromptTracking,
+        MIN_CODE_PANEL_HEIGHT, PendingWin32CharKey, PromptInputState, SemanticPromptTracking,
         TerminalDisplayCursorStyle, TerminalLayout, TerminalSelection, TerminalSelectionMode,
         extract_selected_text, map_cursor_style, map_virtual_key, osc_terminator,
         partial_osc_133_prefix_len, resolve_terminal_cell_colors, should_close_from_echoed_ctrl_d,
-        should_translate_ctrl_d_key, should_translate_ctrl_d_to_exit, strip_echoed_ctrl_d,
+        should_mark_prompt_input_written_for_key, should_translate_ctrl_d_key,
+        should_translate_ctrl_d_to_exit, strip_echoed_ctrl_d,
     };
     use crate::app::spatial::TerminalCellPoint;
     use libghostty_vt::key;
@@ -1939,7 +1985,7 @@ mod tests {
             SemanticPromptTracking {
                 markers_observed: true,
                 at_shell_prompt: false,
-                awaiting_input: true,
+                input_state: PromptInputState::AwaitingPristine,
             },
             &[0x04]
         ));
@@ -1947,7 +1993,7 @@ mod tests {
             SemanticPromptTracking {
                 markers_observed: true,
                 at_shell_prompt: true,
-                awaiting_input: false,
+                input_state: PromptInputState::Inactive,
             },
             b"not-eof"
         ));
@@ -1955,7 +2001,7 @@ mod tests {
             SemanticPromptTracking {
                 markers_observed: true,
                 at_shell_prompt: true,
-                awaiting_input: false,
+                input_state: PromptInputState::Inactive,
             },
             &[0x04]
         ));
@@ -1963,7 +2009,7 @@ mod tests {
             SemanticPromptTracking {
                 markers_observed: true,
                 at_shell_prompt: true,
-                awaiting_input: true,
+                input_state: PromptInputState::AwaitingPristine,
             },
             &[0x04]
         ));
@@ -1971,7 +2017,7 @@ mod tests {
             SemanticPromptTracking {
                 markers_observed: true,
                 at_shell_prompt: true,
-                awaiting_input: true,
+                input_state: PromptInputState::AwaitingPristine,
             },
             b"\x1b]133;D;0\x07\x04"
         ));
@@ -1999,12 +2045,17 @@ mod tests {
         assert!(!should_translate_ctrl_d_to_exit(SemanticPromptTracking {
             markers_observed: true,
             at_shell_prompt: false,
-            awaiting_input: true,
+            input_state: PromptInputState::AwaitingPristine,
         }));
         assert!(should_translate_ctrl_d_to_exit(SemanticPromptTracking {
             markers_observed: true,
             at_shell_prompt: true,
-            awaiting_input: false,
+            input_state: PromptInputState::AwaitingPristine,
+        }));
+        assert!(!should_translate_ctrl_d_to_exit(SemanticPromptTracking {
+            markers_observed: true,
+            at_shell_prompt: true,
+            input_state: PromptInputState::AwaitingEdited,
         }));
     }
 
@@ -2014,7 +2065,7 @@ mod tests {
         let tracking = SemanticPromptTracking {
             markers_observed: true,
             at_shell_prompt: true,
-            awaiting_input: false,
+            input_state: PromptInputState::AwaitingPristine,
         };
         let ctrl_d = PendingWin32CharKey {
             vkey: 0x44,
@@ -2033,6 +2084,45 @@ mod tests {
         assert!(!should_translate_ctrl_d_key(
             ctrl_d,
             SemanticPromptTracking::default()
+        ));
+        assert!(!should_translate_ctrl_d_key(
+            ctrl_d,
+            SemanticPromptTracking {
+                markers_observed: true,
+                at_shell_prompt: true,
+                input_state: PromptInputState::AwaitingEdited,
+            }
+        ));
+    }
+
+    #[test]
+    fn prompt_input_write_tracking_ignores_modifier_keydowns() {
+        let ctrl_key = PendingWin32CharKey {
+            vkey: 0x11,
+            lparam: 0,
+            mapped_key: key::Key::ControlLeft,
+            unshifted_codepoint: '\0',
+            mods: key::Mods::CTRL,
+        };
+        let a_key = PendingWin32CharKey {
+            vkey: 0x41,
+            lparam: 0,
+            mapped_key: key::Key::A,
+            unshifted_codepoint: 'a',
+            mods: key::Mods::empty(),
+        };
+
+        assert!(!should_mark_prompt_input_written_for_key(
+            ctrl_key, false, false
+        ));
+        assert!(should_mark_prompt_input_written_for_key(
+            a_key, false, false
+        ));
+        assert!(!should_mark_prompt_input_written_for_key(
+            a_key, true, false
+        ));
+        assert!(!should_mark_prompt_input_written_for_key(
+            a_key, false, true
         ));
     }
 

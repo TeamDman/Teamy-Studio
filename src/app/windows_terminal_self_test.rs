@@ -22,8 +22,10 @@ const WINDOWS_KEY_PROBE_READY: &str = "WINDOWS_KEY_PROBE_READY";
 const WIN32_INPUT_MODE_UNSUPPORTED: &str = "WIN32_INPUT_MODE_UNSUPPORTED";
 const DEFAULT_RATATUI_KEY_DEBUG_PATH: &str =
     "g:\\Programming\\Repos\\ratatui-key-debug\\target\\debug\\ratatui_key_debug.exe";
+const CTRL_D_EXIT_COMMAND: &[u8] = b"exit\r";
 const PWSH_CTRL_D_AT_PROMPT_CASE: &str = "pwsh-ctrl-d-at-prompt";
 const PWSH_NESTED_CTRL_D_CASE: &str = "pwsh-nested-ctrl-d";
+const PWSH_CTRL_D_AFTER_TYPED_INPUT_CASE: &str = "pwsh-ctrl-d-after-typed-input";
 const WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 const PROBE_DETECTION_TIMEOUT: Duration = Duration::from_millis(250);
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
@@ -71,6 +73,10 @@ fn run_outside(app_home: &AppHome, scenario: Option<&str>) -> eyre::Result<()> {
 
     if scenario.as_deref() == Some(PWSH_NESTED_CTRL_D_CASE) {
         return run_pwsh_nested_ctrl_d_reproduction(&mut terminal);
+    }
+
+    if scenario.as_deref() == Some(PWSH_CTRL_D_AFTER_TYPED_INPUT_CASE) {
+        return run_pwsh_ctrl_d_after_typed_input_reproduction(&mut terminal);
     }
 
     if wait_for_screen(
@@ -243,6 +249,8 @@ fn run_pwsh_nested_ctrl_d_reproduction(terminal: &mut TerminalSession) -> eyre::
     press_ctrl_d(terminal)?;
     let after_ctrl_d = assert_stays_open(terminal, Duration::from_millis(600))?;
 
+    clear_echoed_ctrl_d_marker(terminal)?;
+
     for _ in 0..2 {
         type_text(terminal, "exit")?;
         press_enter(terminal)?;
@@ -255,6 +263,48 @@ fn run_pwsh_nested_ctrl_d_reproduction(terminal: &mut TerminalSession) -> eyre::
     let final_screen = wait_for_child_exit(terminal, WAIT_TIMEOUT)?;
     let transcript = format!(
         "scenario: {PWSH_NESTED_CTRL_D_CASE}\n\n=== initial_screen ===\n{initial_screen}\n\n=== nested_screen ===\n{nested_screen}\n\n=== after_ctrl_d ===\n{after_ctrl_d}\n\n=== final_screen ===\n{final_screen}"
+    );
+
+    println!("{transcript}");
+    Ok(())
+}
+
+fn run_pwsh_ctrl_d_after_typed_input_reproduction(
+    terminal: &mut TerminalSession,
+) -> eyre::Result<()> {
+    let initial_screen = wait_for_semantic_prompt(terminal, WAIT_TIMEOUT)?;
+    let _ = terminal.take_input_trace();
+
+    send_text_character(terminal, 'a')?;
+    press_backspace(terminal)?;
+    let _ = wait_for_quiet_screen(terminal, Duration::from_millis(150), WAIT_TIMEOUT)?;
+    let _ = terminal.take_input_trace();
+
+    press_ctrl_d(terminal)?;
+    let input_trace = terminal.take_input_trace();
+    let after_ctrl_d = assert_stays_open(terminal, Duration::from_millis(600))?;
+
+    if input_trace.iter().any(|chunk| chunk == CTRL_D_EXIT_COMMAND) {
+        eyre::bail!(
+            "Ctrl+D after prior prompt input should not translate to exit\\r\n\n=== initial_screen ===\n{initial_screen}\n\n=== input_trace ===\n{}\n\n=== after_ctrl_d ===\n{after_ctrl_d}",
+            format_chunks(&input_trace),
+        );
+    }
+
+    if input_trace.is_empty() {
+        eyre::bail!(
+            "Ctrl+D after prior prompt input should produce PTY input without translating to exit\n\n=== initial_screen ===\n{initial_screen}\n\n=== input_trace ===\n{}\n\n=== after_ctrl_d ===\n{after_ctrl_d}",
+            format_chunks(&input_trace),
+        );
+    }
+
+    clear_echoed_ctrl_d_marker(terminal)?;
+    type_text(terminal, "exit")?;
+    press_enter(terminal)?;
+    let final_screen = wait_for_child_exit(terminal, WAIT_TIMEOUT)?;
+    let transcript = format!(
+        "scenario: {PWSH_CTRL_D_AFTER_TYPED_INPUT_CASE}\n\n=== initial_screen ===\n{initial_screen}\n\n=== input_trace ===\n{}\n\n=== after_ctrl_d ===\n{after_ctrl_d}\n\n=== final_screen ===\n{final_screen}",
+        format_chunks(&input_trace),
     );
 
     println!("{transcript}");
@@ -625,6 +675,19 @@ fn press_ctrl_d(terminal: &mut TerminalSession) -> eyre::Result<()> {
     let _ = terminal.handle_char(0x04, char_lparam(0x20))?;
     send_keyup(terminal, 0x44, 0x20, ctrl_mods)?;
     send_keyup(terminal, 0x11, 0x1D, ctrl_mods)?;
+    Ok(())
+}
+
+fn clear_echoed_ctrl_d_marker(terminal: &mut TerminalSession) -> eyre::Result<()> {
+    press_backspace(terminal)?;
+    let _ = wait_for_quiet_screen(terminal, Duration::from_millis(150), WAIT_TIMEOUT)?;
+    Ok(())
+}
+
+fn press_backspace(terminal: &mut TerminalSession) -> eyre::Result<()> {
+    send_keydown(terminal, 0x08, 0x0E, key::Mods::empty())?;
+    let _ = terminal.handle_char(u32::from('\u{8}'), char_lparam(0x0E))?;
+    send_keyup(terminal, 0x08, 0x0E, key::Mods::empty())?;
     Ok(())
 }
 
