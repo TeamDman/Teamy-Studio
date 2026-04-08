@@ -7,6 +7,11 @@ use figue::{self as args};
 #[derive(Facet, Arbitrary, Debug, PartialEq)]
 #[facet(rename_all = "kebab-case")]
 pub struct SelfTestKeyboardInputArgs {
+    /// cli[impl self-test.keyboard-input.scenario-optional]
+    /// Optional reproduction scenario to run from the outer harness.
+    #[facet(args::positional)]
+    pub scenario: Option<String>,
+
     /// cli[impl self-test.keyboard-input.inside-flag]
     /// Run the terminal-side probe instead of the outer harness.
     #[facet(args::named, default)]
@@ -23,6 +28,6 @@ impl SelfTestKeyboardInputArgs {
         cache_home: &crate::paths::CacheHome,
     ) -> eyre::Result<()> {
         let _ = cache_home;
-        crate::app::run_keyboard_input_self_test(app_home, self.inside)
+        crate::app::run_keyboard_input_self_test(app_home, self.inside, self.scenario.as_deref())
     }
 }

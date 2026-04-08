@@ -46,6 +46,9 @@ The `self-test` command group must expose a `keyboard-input` subcommand.
 cli[self-test.keyboard-input.inside-flag]
 The `self-test keyboard-input` command must support `--inside` to run the terminal-side probe instead of the outer harness.
 
+cli[self-test.keyboard-input.scenario-optional]
+The `self-test keyboard-input` command must accept an optional scenario argument so reproducible terminal regressions can be exercised from the outer harness.
+
 cli[command.surface.window]
 The CLI must expose a `window` command group.
 

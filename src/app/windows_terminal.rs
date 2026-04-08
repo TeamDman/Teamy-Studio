@@ -8,6 +8,7 @@ use tracing::trace;
 use eyre::Context;
 use libghostty_vt::key;
 use libghostty_vt::render::{CellIterator, CursorVisualStyle, RenderState, RowIterator};
+use libghostty_vt::screen::RowSemanticPrompt;
 use libghostty_vt::style::RgbColor;
 use libghostty_vt::{Terminal, TerminalOptions};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
@@ -39,6 +40,9 @@ const SIDECAR_BUTTON_SIZE: i32 = 34;
 const SIDECAR_BUTTON_GAP: i32 = 12;
 const WIN32_INPUT_MODE_ENABLE: &[u8] = b"\x1b[?9001h";
 const WIN32_INPUT_MODE_DISABLE: &[u8] = b"\x1b[?9001l";
+const CTRL_D_EOF: u8 = 0x04;
+const CTRL_D_EXIT_COMMAND: &[u8] = b"exit\r";
+const OSC_133_PREFIX: &[u8] = b"\x1b]133;";
 
 type PtyWriter = Box<dyn Write + Send>;
 
@@ -183,6 +187,13 @@ struct Win32InputModeKeyEvent {
     key_down: bool,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct SemanticPromptTracking {
+    markers_observed: bool,
+    at_shell_prompt: bool,
+    awaiting_input: bool,
+}
+
 pub struct TerminalSession {
     terminal: Terminal<'static, 'static>,
     render_state: RenderState<'static>,
@@ -199,6 +210,8 @@ pub struct TerminalSession {
     suppressed_chars: VecDeque<SuppressedChar>,
     win32_input: Win32InputState,
     win32_input_mode_buffer: Vec<u8>,
+    semantic_prompt_buffer: Vec<u8>,
+    semantic_prompt: SemanticPromptTracking,
     closed: bool,
 }
 
@@ -429,6 +442,8 @@ impl TerminalSession {
             suppressed_chars: VecDeque::new(),
             win32_input: Win32InputState::default(),
             win32_input_mode_buffer: Vec::new(),
+            semantic_prompt_buffer: Vec::new(),
+            semantic_prompt: SemanticPromptTracking::default(),
             closed: false,
         })
     }
@@ -476,14 +491,37 @@ impl TerminalSession {
 
     pub fn pump(&mut self) -> eyre::Result<PumpResult> {
         let mut changed = false;
+        let mut output_processed = false;
 
         while let Ok(message) = self.reader.try_recv() {
             match message {
                 Ok(bytes) => {
                     let bytes = normalize_cursor_visibility_mode_sequence(&bytes);
                     let bytes = self.strip_win32_input_mode_sequence(bytes.as_ref());
+                    let semantic_prompt_before_output = self.semantic_prompt;
+
+                    if should_close_from_echoed_ctrl_d(
+                        semantic_prompt_before_output,
+                        bytes.as_ref(),
+                    ) {
+                        let bytes = strip_echoed_ctrl_d(bytes.as_ref());
+                        if !bytes.is_empty() {
+                            self.terminal.vt_write(bytes.as_ref());
+                            changed = true;
+                            output_processed = true;
+                        }
+                        info!(
+                            semantic_prompt = ?self.semantic_prompt,
+                            "closing terminal after shell echoed Ctrl+D at the prompt"
+                        );
+                        self.closed = true;
+                        break;
+                    }
+
+                    self.observe_semantic_prompt_sequences(bytes.as_ref());
                     self.terminal.vt_write(bytes.as_ref());
                     changed = true;
+                    output_processed = true;
                 }
                 Err(error) => {
                     self.terminal
@@ -492,6 +530,10 @@ impl TerminalSession {
                     self.closed = true;
                 }
             }
+        }
+
+        if output_processed {
+            self.refresh_semantic_prompt_tracking()?;
         }
 
         if self
@@ -556,6 +598,15 @@ impl TerminalSession {
 
         if character < ' ' {
             let control = u8::try_from(u32::from(character)).unwrap_or_default();
+            if control == CTRL_D_EOF && should_translate_ctrl_d_to_exit(self.semantic_prompt) {
+                debug!(
+                    semantic_prompt = ?self.semantic_prompt,
+                    "translating Ctrl+D at shell prompt into `exit`"
+                );
+                self.write_input(CTRL_D_EXIT_COMMAND)?;
+                self.repaint.needs_repaint = true;
+                return Ok(true);
+            }
             self.write_input(&[control])?;
             self.repaint.needs_repaint = true;
             return Ok(true);
@@ -591,6 +642,19 @@ impl TerminalSession {
             win32_input_mode = self.win32_input.enabled,
             "handling key event"
         );
+
+        if !is_release && !was_down && should_translate_ctrl_d_key(key_event, self.semantic_prompt)
+        {
+            self.suppressed_chars
+                .push_back(SuppressedChar::single(u32::from(CTRL_D_EOF)));
+            debug!(
+                semantic_prompt = ?self.semantic_prompt,
+                "translating Ctrl+D key press at shell prompt into `exit`"
+            );
+            self.write_input(CTRL_D_EXIT_COMMAND)?;
+            self.repaint.needs_repaint = true;
+            return Ok(true);
+        }
 
         if is_release && !self.win32_input.enabled && !self.should_report_key_releases()? {
             return Ok(false);
@@ -857,7 +921,20 @@ impl TerminalSession {
         std::mem::take(&mut self.input_trace)
     }
 
+    #[must_use]
+    pub fn semantic_prompt_state(&self) -> (bool, bool, bool) {
+        (
+            self.semantic_prompt.markers_observed,
+            self.semantic_prompt.at_shell_prompt,
+            self.semantic_prompt.awaiting_input,
+        )
+    }
+
     fn write_input(&mut self, data: &[u8]) -> eyre::Result<()> {
+        if self.semantic_prompt.awaiting_input && data != [CTRL_D_EOF] {
+            self.semantic_prompt.awaiting_input = false;
+        }
+
         let mut writer = self
             .writer
             .lock()
@@ -950,6 +1027,84 @@ impl TerminalSession {
         Cow::Owned(output)
     }
 
+    fn refresh_semantic_prompt_tracking(&mut self) -> eyre::Result<()> {
+        let next = semantic_prompt_tracking(&mut self.render_state, &self.terminal)?;
+        if !self.semantic_prompt.markers_observed && next.markers_observed {
+            info!("detected OSC 133 semantic prompt markers from shell output");
+        }
+        if self.semantic_prompt.at_shell_prompt != next.at_shell_prompt {
+            info!(
+                at_shell_prompt = next.at_shell_prompt,
+                "terminal shell prompt state changed"
+            );
+        }
+        self.semantic_prompt.markers_observed =
+            self.semantic_prompt.markers_observed || next.markers_observed;
+        self.semantic_prompt.at_shell_prompt = next.at_shell_prompt;
+        Ok(())
+    }
+
+    fn observe_semantic_prompt_sequences(&mut self, data: &[u8]) {
+        let mut combined = std::mem::take(&mut self.semantic_prompt_buffer);
+        combined.extend_from_slice(data);
+
+        let mut index = 0;
+        while index < combined.len() {
+            let Some(relative_start) = combined[index..]
+                .windows(OSC_133_PREFIX.len())
+                .position(|window| window == OSC_133_PREFIX)
+            else {
+                break;
+            };
+
+            let start = index + relative_start;
+            let payload_start = start + OSC_133_PREFIX.len();
+            let Some((payload_end, terminator_len)) = osc_terminator(&combined[payload_start..])
+            else {
+                self.semantic_prompt_buffer
+                    .extend_from_slice(&combined[start..]);
+                return;
+            };
+
+            let payload = &combined[payload_start..payload_start + payload_end];
+            self.apply_semantic_prompt_payload(payload);
+            index = payload_start + payload_end + terminator_len;
+        }
+
+        if index < combined.len() {
+            let trailing = &combined[index..];
+            if let Some(partial_len) = partial_osc_133_prefix_len(trailing) {
+                self.semantic_prompt_buffer
+                    .extend_from_slice(&trailing[trailing.len() - partial_len..]);
+            }
+        }
+    }
+
+    fn apply_semantic_prompt_payload(&mut self, payload: &[u8]) {
+        let Some(action) = payload.first().copied() else {
+            return;
+        };
+
+        match action {
+            b'B' | b'I' => {
+                self.semantic_prompt.markers_observed = true;
+                self.semantic_prompt.awaiting_input = true;
+                debug!(
+                    action = %char::from(action),
+                    "detected OSC 133 shell awaiting-input marker"
+                );
+            }
+            b'A' | b'C' | b'D' | b'N' | b'P' => {
+                self.semantic_prompt.markers_observed = true;
+                self.semantic_prompt.awaiting_input = false;
+            }
+            b'L' => {
+                self.semantic_prompt.markers_observed = true;
+            }
+            _ => {}
+        }
+    }
+
     fn visible_cell_text_rows(&mut self) -> eyre::Result<Vec<Vec<String>>> {
         let snapshot = self
             .render_state
@@ -991,6 +1146,102 @@ fn ordered_linear_bounds(
     } else {
         (focus, anchor)
     }
+}
+
+fn semantic_prompt_tracking(
+    render_state: &mut RenderState<'static>,
+    terminal: &Terminal<'static, 'static>,
+) -> eyre::Result<SemanticPromptTracking> {
+    let snapshot = render_state
+        .update(terminal)
+        .wrap_err("failed to update terminal render state for semantic prompt tracking")?;
+    let cursor_row = snapshot
+        .cursor_viewport()
+        .wrap_err("failed to query terminal cursor viewport for semantic prompt tracking")?
+        .map(|cursor| cursor.y);
+
+    let mut rows = RowIterator::new().wrap_err("failed to create row iterator")?;
+    let mut row_iter = rows
+        .update(&snapshot)
+        .wrap_err("failed to update row iterator")?;
+
+    let mut row_index = 0_u16;
+    let mut markers_observed = false;
+    let mut at_shell_prompt = false;
+
+    while let Some(row) = row_iter.next() {
+        let semantic_prompt = row
+            .raw_row()
+            .wrap_err("failed to query raw terminal row for semantic prompt tracking")?
+            .semantic_prompt()
+            .wrap_err("failed to query terminal row semantic prompt state")?;
+
+        if semantic_prompt != RowSemanticPrompt::None {
+            markers_observed = true;
+            if cursor_row == Some(row_index) {
+                at_shell_prompt = true;
+            }
+        }
+
+        row_index = row_index.saturating_add(1);
+    }
+
+    Ok(SemanticPromptTracking {
+        markers_observed,
+        at_shell_prompt,
+        awaiting_input: false,
+    })
+}
+
+fn should_close_from_echoed_ctrl_d(tracking: SemanticPromptTracking, data: &[u8]) -> bool {
+    tracking.markers_observed
+        && tracking.at_shell_prompt
+        && tracking.awaiting_input
+        && data.contains(&CTRL_D_EOF)
+}
+
+fn should_translate_ctrl_d_to_exit(tracking: SemanticPromptTracking) -> bool {
+    tracking.markers_observed && tracking.at_shell_prompt
+}
+
+/// behavior[impl window.interaction.input.ctrl-d-exits-current-shell-at-prompt]
+fn should_translate_ctrl_d_key(
+    key_event: PendingWin32CharKey,
+    tracking: SemanticPromptTracking,
+) -> bool {
+    should_translate_ctrl_d_to_exit(tracking)
+        && key_event.mapped_key == key::Key::D
+        && key_event.mods.contains(key::Mods::CTRL)
+}
+
+fn strip_echoed_ctrl_d(data: &[u8]) -> Cow<'_, [u8]> {
+    if !data.contains(&CTRL_D_EOF) {
+        return Cow::Borrowed(data);
+    }
+
+    Cow::Owned(
+        data.iter()
+            .copied()
+            .filter(|byte| *byte != CTRL_D_EOF)
+            .collect(),
+    )
+}
+
+fn osc_terminator(data: &[u8]) -> Option<(usize, usize)> {
+    if let Some(index) = data.iter().position(|byte| *byte == b'\x07') {
+        return Some((index, 1));
+    }
+
+    data.windows(2)
+        .position(|window| window == b"\x1b\\")
+        .map(|index| (index, 2))
+}
+
+fn partial_osc_133_prefix_len(data: &[u8]) -> Option<usize> {
+    let max_len = data.len().min(OSC_133_PREFIX.len().saturating_sub(1));
+    (1..=max_len)
+        .rev()
+        .find(|len| OSC_133_PREFIX.starts_with(&data[data.len() - len..]))
 }
 
 fn ordered_block_bounds(
@@ -1532,11 +1783,14 @@ fn legacy_special_key_bytes(mapped_key: key::Key, mods: key::Mods) -> Option<Vec
 #[cfg(test)]
 mod tests {
     use super::{
-        MIN_CODE_PANEL_HEIGHT, TerminalDisplayCursorStyle, TerminalLayout, TerminalSelection,
-        TerminalSelectionMode, extract_selected_text, map_cursor_style, map_virtual_key,
-        resolve_terminal_cell_colors,
+        MIN_CODE_PANEL_HEIGHT, PendingWin32CharKey, SemanticPromptTracking,
+        TerminalDisplayCursorStyle, TerminalLayout, TerminalSelection, TerminalSelectionMode,
+        extract_selected_text, map_cursor_style, map_virtual_key, osc_terminator,
+        partial_osc_133_prefix_len, resolve_terminal_cell_colors, should_close_from_echoed_ctrl_d,
+        should_translate_ctrl_d_key, should_translate_ctrl_d_to_exit, strip_echoed_ctrl_d,
     };
     use crate::app::spatial::TerminalCellPoint;
+    use libghostty_vt::key;
     use libghostty_vt::render::Colors;
     use libghostty_vt::style::RgbColor;
 
@@ -1673,6 +1927,126 @@ mod tests {
                 "unexpected char for numpad vkey {vkey:#X}"
             );
         }
+    }
+
+    #[test]
+    fn echoed_ctrl_d_only_closes_once_semantic_prompt_markers_report_shell_input() {
+        assert!(!should_close_from_echoed_ctrl_d(
+            SemanticPromptTracking::default(),
+            &[0x04]
+        ));
+        assert!(!should_close_from_echoed_ctrl_d(
+            SemanticPromptTracking {
+                markers_observed: true,
+                at_shell_prompt: false,
+                awaiting_input: true,
+            },
+            &[0x04]
+        ));
+        assert!(!should_close_from_echoed_ctrl_d(
+            SemanticPromptTracking {
+                markers_observed: true,
+                at_shell_prompt: true,
+                awaiting_input: false,
+            },
+            b"not-eof"
+        ));
+        assert!(!should_close_from_echoed_ctrl_d(
+            SemanticPromptTracking {
+                markers_observed: true,
+                at_shell_prompt: true,
+                awaiting_input: false,
+            },
+            &[0x04]
+        ));
+        assert!(should_close_from_echoed_ctrl_d(
+            SemanticPromptTracking {
+                markers_observed: true,
+                at_shell_prompt: true,
+                awaiting_input: true,
+            },
+            &[0x04]
+        ));
+        assert!(should_close_from_echoed_ctrl_d(
+            SemanticPromptTracking {
+                markers_observed: true,
+                at_shell_prompt: true,
+                awaiting_input: true,
+            },
+            b"\x1b]133;D;0\x07\x04"
+        ));
+    }
+
+    #[test]
+    fn strip_echoed_ctrl_d_removes_eof_byte_from_mixed_output() {
+        assert_eq!(
+            strip_echoed_ctrl_d(b"prefix\x04suffix").as_ref(),
+            b"prefixsuffix"
+        );
+        assert_eq!(strip_echoed_ctrl_d(&[0x04]).as_ref(), b"");
+        assert_eq!(
+            strip_echoed_ctrl_d(b"plain output").as_ref(),
+            b"plain output"
+        );
+    }
+
+    // behavior[verify window.interaction.input.ctrl-d-exits-current-shell-at-prompt]
+    #[test]
+    fn ctrl_d_translation_targets_shell_prompt_rows() {
+        assert!(!should_translate_ctrl_d_to_exit(
+            SemanticPromptTracking::default()
+        ));
+        assert!(!should_translate_ctrl_d_to_exit(SemanticPromptTracking {
+            markers_observed: true,
+            at_shell_prompt: false,
+            awaiting_input: true,
+        }));
+        assert!(should_translate_ctrl_d_to_exit(SemanticPromptTracking {
+            markers_observed: true,
+            at_shell_prompt: true,
+            awaiting_input: false,
+        }));
+    }
+
+    // behavior[verify window.interaction.input.ctrl-d-exits-current-shell-at-prompt]
+    #[test]
+    fn ctrl_d_key_translation_requires_ctrl_modified_d_at_shell_prompt() {
+        let tracking = SemanticPromptTracking {
+            markers_observed: true,
+            at_shell_prompt: true,
+            awaiting_input: false,
+        };
+        let ctrl_d = PendingWin32CharKey {
+            vkey: 0x44,
+            lparam: 0,
+            mapped_key: key::Key::D,
+            unshifted_codepoint: 'd',
+            mods: key::Mods::CTRL,
+        };
+        let plain_d = PendingWin32CharKey {
+            mods: key::Mods::empty(),
+            ..ctrl_d
+        };
+
+        assert!(should_translate_ctrl_d_key(ctrl_d, tracking));
+        assert!(!should_translate_ctrl_d_key(plain_d, tracking));
+        assert!(!should_translate_ctrl_d_key(
+            ctrl_d,
+            SemanticPromptTracking::default()
+        ));
+    }
+
+    #[test]
+    fn osc_terminator_accepts_bel_and_st() {
+        assert_eq!(osc_terminator(b"B\x07rest"), Some((1, 1)));
+        assert_eq!(osc_terminator(b"B\x1b\\rest"), Some((1, 2)));
+        assert_eq!(osc_terminator(b"B"), None);
+    }
+
+    #[test]
+    fn partial_osc_133_prefix_len_tracks_split_prefixes() {
+        assert_eq!(partial_osc_133_prefix_len(b"abc\x1b]13"), Some(4));
+        assert_eq!(partial_osc_133_prefix_len(b"plain"), None);
     }
 
     // behavior[verify window.interaction.selection.linear]

@@ -76,6 +76,12 @@ Interactive resize must prioritize minimal latency so panel layout and terminal 
 behavior[window.interaction.input]
 The launched terminal window must forward keyboard input into the PTY-backed shell session.
 
+behavior[window.interaction.input.semantic-prompt-aware-shell-integration]
+When the default shell is an interactive PowerShell session, Teamy Studio must enable shell integration that emits OSC 133 prompt markers so prompt-aware terminal behavior can detect when the shell is awaiting input.
+
+behavior[window.interaction.input.ctrl-d-exits-current-shell-at-prompt]
+When Ctrl+D is pressed while the cursor is at a shell prompt, Teamy Studio must exit the current shell session instead of closing the whole application, so nested shells return to their parent prompt and the top-level shell exits cleanly.
+
 behavior[window.interaction.input.numpad-numlock-text]
 When NumLock is enabled, numpad digit and operator keys must be forwarded as their text characters rather than being dropped.
 

@@ -136,16 +136,21 @@ pub fn run_inline_shell(app_home: &AppHome) -> eyre::Result<()> {
 /// # Errors
 ///
 /// This function will return an error if the Windows-only self-test cannot be launched.
-pub fn run_keyboard_input_self_test(app_home: &AppHome, inside: bool) -> eyre::Result<()> {
+pub fn run_keyboard_input_self_test(
+    app_home: &AppHome,
+    inside: bool,
+    scenario: Option<&str>,
+) -> eyre::Result<()> {
     #[cfg(windows)]
     {
-        windows_terminal_self_test::run(app_home, inside)
+        windows_terminal_self_test::run(app_home, inside, scenario)
     }
 
     #[cfg(not(windows))]
     {
         let _ = app_home;
         let _ = inside;
+        let _ = scenario;
         eyre::bail!("Teamy Studio keyboard self-test currently only supports Windows")
     }
 }

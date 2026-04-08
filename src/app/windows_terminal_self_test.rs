@@ -22,20 +22,34 @@ const WINDOWS_KEY_PROBE_READY: &str = "WINDOWS_KEY_PROBE_READY";
 const WIN32_INPUT_MODE_UNSUPPORTED: &str = "WIN32_INPUT_MODE_UNSUPPORTED";
 const DEFAULT_RATATUI_KEY_DEBUG_PATH: &str =
     "g:\\Programming\\Repos\\ratatui-key-debug\\target\\debug\\ratatui_key_debug.exe";
+const PWSH_CTRL_D_AT_PROMPT_CASE: &str = "pwsh-ctrl-d-at-prompt";
+const PWSH_NESTED_CTRL_D_CASE: &str = "pwsh-nested-ctrl-d";
 const WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 const PROBE_DETECTION_TIMEOUT: Duration = Duration::from_millis(250);
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
 
-pub fn run(app_home: &AppHome, inside: bool) -> eyre::Result<()> {
+pub fn run(app_home: &AppHome, inside: bool, scenario: Option<&str>) -> eyre::Result<()> {
     if inside {
         run_inside()
     } else {
-        run_outside(app_home)
+        run_outside(app_home, scenario)
     }
 }
 
-fn run_outside(app_home: &AppHome) -> eyre::Result<()> {
-    let mut terminal = TerminalSession::new(app_home, None)?;
+fn run_outside(app_home: &AppHome, scenario: Option<&str>) -> eyre::Result<()> {
+    let scenario = scenario
+        .map(std::borrow::ToOwned::to_owned)
+        .or_else(|| std::env::var("TEAMY_KEYBOARD_SELF_TEST_CASE").ok());
+
+    let mut terminal = if scenario.as_deref() == Some(PWSH_CTRL_D_AT_PROMPT_CASE) {
+        let command = crate::shell_default::command_builder_from_argv(&[
+            "pwsh.exe".to_owned(),
+            "-NoLogo".to_owned(),
+        ])?;
+        TerminalSession::new_with_command(command)?
+    } else {
+        TerminalSession::new(app_home, None)?
+    };
     terminal.resize(TerminalLayout {
         client_width: 1600,
         client_height: 900,
@@ -43,14 +57,20 @@ fn run_outside(app_home: &AppHome) -> eyre::Result<()> {
         cell_height: 16,
     })?;
 
-    if std::env::var("TEAMY_KEYBOARD_SELF_TEST_CASE").as_deref() == Ok("default-cmd-enter") {
+    if scenario.as_deref() == Some("default-cmd-enter") {
         return run_default_cmd_enter_reproduction(&mut terminal);
     }
 
-    if std::env::var("TEAMY_KEYBOARD_SELF_TEST_CASE").as_deref()
-        == Ok("default-cmd-ratatui-key-debug")
-    {
+    if scenario.as_deref() == Some("default-cmd-ratatui-key-debug") {
         return run_default_cmd_ratatui_key_debug_reproduction(&mut terminal);
+    }
+
+    if scenario.as_deref() == Some(PWSH_CTRL_D_AT_PROMPT_CASE) {
+        return run_pwsh_ctrl_d_at_prompt_reproduction(&mut terminal);
+    }
+
+    if scenario.as_deref() == Some(PWSH_NESTED_CTRL_D_CASE) {
+        return run_pwsh_nested_ctrl_d_reproduction(&mut terminal);
     }
 
     if wait_for_screen(
@@ -182,6 +202,59 @@ fn run_default_cmd_ratatui_key_debug_reproduction(
 
     let transcript = format!(
         "launched: {ratatui_path}\nkitty_flags: {initial_flags:?}\n\n=== after_a_release ===\n{after_a_release}\n\n=== after_ctrl_backspace_press ===\n{after_ctrl_backspace_press}\n\n=== after_ratatui_exit ===\n{after_ratatui_exit}\n\n=== final_screen ===\n{final_screen}"
+    );
+
+    println!("{transcript}");
+    Ok(())
+}
+
+fn run_pwsh_ctrl_d_at_prompt_reproduction(terminal: &mut TerminalSession) -> eyre::Result<()> {
+    let initial_screen = wait_for_semantic_prompt(terminal, WAIT_TIMEOUT)?;
+    let _ = terminal.take_input_trace();
+
+    press_ctrl_d(terminal)?;
+    let input_trace = terminal.take_input_trace();
+    let final_screen = wait_for_child_exit(terminal, WAIT_TIMEOUT)?;
+    let (markers_observed, at_shell_prompt, awaiting_input) = terminal.semantic_prompt_state();
+
+    if final_screen.contains("warning(stream): invalid C0 character, ignoring: 0x4") {
+        eyre::bail!(
+            "Ctrl+D at the prompt still leaked 0x04 into Ghostty\n\n=== initial_screen ===\n{initial_screen}\n\n=== input_trace ===\n{}\n\n=== final_screen ===\n{final_screen}",
+            format_chunks(&input_trace),
+        );
+    }
+
+    let transcript = format!(
+        "scenario: {PWSH_CTRL_D_AT_PROMPT_CASE}\nmarkers_observed: {markers_observed}\nat_shell_prompt: {at_shell_prompt}\nawaiting_input: {awaiting_input}\n\n=== initial_screen ===\n{initial_screen}\n\n=== input_trace ===\n{}\n\n=== final_screen ===\n{final_screen}",
+        format_chunks(&input_trace),
+    );
+
+    println!("{transcript}");
+    Ok(())
+}
+
+fn run_pwsh_nested_ctrl_d_reproduction(terminal: &mut TerminalSession) -> eyre::Result<()> {
+    let initial_screen = wait_for_semantic_prompt(terminal, WAIT_TIMEOUT)?;
+
+    type_text(terminal, "pwsh")?;
+    press_enter(terminal)?;
+    let nested_screen = wait_for_quiet_screen(terminal, Duration::from_millis(300), WAIT_TIMEOUT)?;
+
+    press_ctrl_d(terminal)?;
+    let after_ctrl_d = assert_stays_open(terminal, Duration::from_millis(600))?;
+
+    for _ in 0..2 {
+        type_text(terminal, "exit")?;
+        press_enter(terminal)?;
+        if terminal.pump()?.should_close {
+            break;
+        }
+        let _ = wait_for_quiet_screen(terminal, Duration::from_millis(150), WAIT_TIMEOUT)?;
+    }
+
+    let final_screen = wait_for_child_exit(terminal, WAIT_TIMEOUT)?;
+    let transcript = format!(
+        "scenario: {PWSH_NESTED_CTRL_D_CASE}\n\n=== initial_screen ===\n{initial_screen}\n\n=== nested_screen ===\n{nested_screen}\n\n=== after_ctrl_d ===\n{after_ctrl_d}\n\n=== final_screen ===\n{final_screen}"
     );
 
     println!("{transcript}");
@@ -545,6 +618,16 @@ fn press_enter(terminal: &mut TerminalSession) -> eyre::Result<()> {
     Ok(())
 }
 
+fn press_ctrl_d(terminal: &mut TerminalSession) -> eyre::Result<()> {
+    let ctrl_mods = key::Mods::CTRL | key::Mods::CTRL_SIDE;
+    send_keydown(terminal, 0x11, 0x1D, ctrl_mods)?;
+    send_keydown(terminal, 0x44, 0x20, ctrl_mods)?;
+    let _ = terminal.handle_char(0x04, char_lparam(0x20))?;
+    send_keyup(terminal, 0x44, 0x20, ctrl_mods)?;
+    send_keyup(terminal, 0x11, 0x1D, ctrl_mods)?;
+    Ok(())
+}
+
 fn type_text(terminal: &mut TerminalSession, text: &str) -> eyre::Result<()> {
     for character in text.chars() {
         send_text_character(terminal, character)?;
@@ -760,6 +843,42 @@ fn wait_for_screen(
         }
         thread::sleep(POLL_INTERVAL);
     }
+}
+
+fn wait_for_semantic_prompt(
+    terminal: &mut TerminalSession,
+    timeout: Duration,
+) -> eyre::Result<String> {
+    let started = Instant::now();
+    loop {
+        let _ = terminal.pump()?;
+        let screen = terminal.visible_text()?;
+        let (markers_observed, at_shell_prompt, awaiting_input) = terminal.semantic_prompt_state();
+        if markers_observed && at_shell_prompt && awaiting_input {
+            return Ok(screen);
+        }
+        if started.elapsed() >= timeout {
+            eyre::bail!(
+                "timed out waiting for semantic shell prompt markers\n\nmarkers_observed: {markers_observed}\nat_shell_prompt: {at_shell_prompt}\nawaiting_input: {awaiting_input}\n\n{screen}"
+            );
+        }
+        thread::sleep(POLL_INTERVAL);
+    }
+}
+
+fn assert_stays_open(terminal: &mut TerminalSession, duration: Duration) -> eyre::Result<String> {
+    let started = Instant::now();
+    let mut last_screen = String::new();
+    while started.elapsed() < duration {
+        let result = terminal.pump()?;
+        last_screen = terminal.visible_text()?;
+        if result.should_close {
+            eyre::bail!("terminal closed unexpectedly\n\n{last_screen}");
+        }
+        thread::sleep(POLL_INTERVAL);
+    }
+
+    Ok(last_screen)
 }
 
 fn wait_for_screen_line(

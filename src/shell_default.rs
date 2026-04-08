@@ -15,6 +15,9 @@ use portable_pty::CommandBuilder;
 
 const DEFAULT_SHELL_FILENAME: &str = "default-shell.txt";
 
+#[cfg(windows)]
+const TEAMY_PWSH_OSC133_BOOTSTRAP: &str = r#"$global:__teamy_prompt_seen = $false; if (Test-Path Function:\prompt) { $function:__teamy_original_prompt = $function:prompt }; function global:prompt { $status = if ($?) { 0 } elseif ($null -ne $LASTEXITCODE) { [int]$LASTEXITCODE } else { 1 }; if ($global:__teamy_prompt_seen) { [Console]::Out.Write("`e]133;D;$status`a") } else { $global:__teamy_prompt_seen = $true }; [Console]::Out.Write("`e]133;A`a"); $promptText = if (Test-Path Function:\__teamy_original_prompt) { & $function:__teamy_original_prompt } else { "PS $($executionContext.SessionState.Path.CurrentLocation)$('>' * ($nestedPromptLevel + 1)) " }; [Console]::Out.Write("`e]133;B`a"); $promptText }"#;
+
 #[must_use]
 /// cli[impl shell.default.persisted-in-app-home]
 pub fn default_shell_path(app_home: &AppHome) -> PathBuf {
@@ -116,7 +119,52 @@ pub fn command_builder_from_argv(command_argv: &[String]) -> eyre::Result<Comman
     for argument in args {
         command.arg(argument);
     }
+    maybe_enable_pwsh_osc133(&mut command, program, args);
     Ok(command)
+}
+
+#[cfg(windows)]
+/// behavior[impl window.interaction.input.semantic-prompt-aware-shell-integration]
+fn maybe_enable_pwsh_osc133(command: &mut CommandBuilder, program: &str, args: &[String]) {
+    if !is_pwsh_program(program) || !is_interactive_pwsh_launch(args) {
+        return;
+    }
+
+    command.env("TEAMY_SHELL_INTEGRATION", "osc133-pwsh-prompt");
+    command.arg("-NoExit");
+    command.arg("-Command");
+    command.arg(TEAMY_PWSH_OSC133_BOOTSTRAP);
+}
+
+#[cfg(windows)]
+fn is_pwsh_program(program: &str) -> bool {
+    Path::new(program)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            let name = name.to_ascii_lowercase();
+            matches!(
+                name.as_str(),
+                "pwsh" | "pwsh.exe" | "powershell" | "powershell.exe"
+            )
+        })
+}
+
+#[cfg(windows)]
+fn is_interactive_pwsh_launch(args: &[String]) -> bool {
+    !args.iter().any(|argument| {
+        matches!(
+            argument.to_ascii_lowercase().as_str(),
+            "-command"
+                | "-c"
+                | "-encodedcommand"
+                | "-ec"
+                | "-file"
+                | "-f"
+                | "-commandwithargs"
+                | "-noninteractive"
+        )
+    })
 }
 
 #[cfg(windows)]
@@ -268,8 +316,9 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        command_builder_from_argv, default_shell_path, format_command_line, load_configured_argv,
-        parse_shell_file, save_configured_argv, serialize_shell_file,
+        TEAMY_PWSH_OSC133_BOOTSTRAP, command_builder_from_argv, default_shell_path,
+        format_command_line, load_configured_argv, parse_shell_file, save_configured_argv,
+        serialize_shell_file,
     };
     use crate::paths::AppHome;
 
@@ -354,5 +403,58 @@ mod tests {
             .to_string();
 
         assert!(program.to_ascii_lowercase().ends_with("cmd.exe"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn interactive_pwsh_launch_adds_teamy_osc133_bootstrap() {
+        let command = command_builder_from_argv(&["pwsh.exe".to_owned(), "-NoLogo".to_owned()])
+            .expect("command builder should accept interactive pwsh argv");
+
+        let argv = command
+            .get_argv()
+            .iter()
+            .map(|value| value.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        assert_eq!(argv[1], "-NoLogo");
+        assert_eq!(argv[2], "-NoExit");
+        assert_eq!(argv[3], "-Command");
+        assert_eq!(argv[4], TEAMY_PWSH_OSC133_BOOTSTRAP);
+        assert_eq!(
+            command
+                .get_env("TEAMY_SHELL_INTEGRATION")
+                .expect("pwsh bootstrap should set integration env var"),
+            "osc133-pwsh-prompt"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn noninteractive_pwsh_command_does_not_add_teamy_osc133_bootstrap() {
+        let command = command_builder_from_argv(&[
+            "pwsh.exe".to_owned(),
+            "-NoLogo".to_owned(),
+            "-Command".to_owned(),
+            "Write-Host hi".to_owned(),
+        ])
+        .expect("command builder should accept noninteractive pwsh argv");
+
+        let argv = command
+            .get_argv()
+            .iter()
+            .map(|value| value.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            argv,
+            vec![
+                argv[0].clone(),
+                "-NoLogo".to_owned(),
+                "-Command".to_owned(),
+                "Write-Host hi".to_owned(),
+            ]
+        );
+        assert!(command.get_env("TEAMY_SHELL_INTEGRATION").is_none());
     }
 }
