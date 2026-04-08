@@ -24,6 +24,9 @@ The frameless drag strip must support a zero-pixel drag threshold so the native 
 os[window.interaction.resize.native-edges]
 The launched terminal window must still resize from its edges and corners using native OS hit-testing semantics and native resize cursors even though OS-managed chrome is hidden.
 
+os[window.interaction.clipboard.multiline-paste-confirmation.native-dialog]
+The multiline paste confirmation flow should use a native Windows dialog positioned relative to the Teamy Studio window rather than a custom in-client prompt.
+
 ## Windows Implementation Direction
 
 os[os.windows.rendering.direct3d12]

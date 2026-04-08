@@ -5,6 +5,8 @@ mod windows_app;
 #[cfg(windows)]
 mod windows_d3d12_renderer;
 #[cfg(windows)]
+mod windows_dialogs;
+#[cfg(windows)]
 mod windows_terminal;
 #[cfg(windows)]
 mod windows_terminal_self_test;

@@ -107,6 +107,53 @@ pub struct TerminalDisplayState {
     pub cursor: Option<TerminalDisplayCursor>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TerminalSelectionMode {
+    Linear,
+    Block,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TerminalSelection {
+    anchor: TerminalCellPoint,
+    focus: TerminalCellPoint,
+    mode: TerminalSelectionMode,
+}
+
+impl TerminalSelection {
+    #[must_use]
+    pub fn new(
+        anchor: TerminalCellPoint,
+        focus: TerminalCellPoint,
+        mode: TerminalSelectionMode,
+    ) -> Self {
+        Self {
+            anchor,
+            focus,
+            mode,
+        }
+    }
+
+    #[must_use]
+    pub fn mode(self) -> TerminalSelectionMode {
+        self.mode
+    }
+
+    #[must_use]
+    pub fn contains(self, cell: TerminalCellPoint) -> bool {
+        match self.mode {
+            TerminalSelectionMode::Linear => {
+                let (start, end) = ordered_linear_bounds(self.anchor, self.focus);
+                linear_selection_contains(start, end, cell)
+            }
+            TerminalSelectionMode::Block => {
+                let (left, top, right, bottom) = ordered_block_bounds(self.anchor, self.focus);
+                (left..=right).contains(&cell.column()) && (top..=bottom).contains(&cell.row())
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 struct PendingWin32CharKey {
     vkey: u32,
@@ -720,40 +767,28 @@ impl TerminalSession {
         self.win32_input.enabled
     }
 
-    pub fn visible_text(&mut self) -> eyre::Result<String> {
-        let snapshot = self
-            .render_state
-            .update(&self.terminal)
-            .wrap_err("failed to update terminal render state")?;
-        let mut rows = RowIterator::new().wrap_err("failed to create row iterator")?;
-        let mut cells = CellIterator::new().wrap_err("failed to create cell iterator")?;
-        let mut lines = Vec::new();
-
-        let mut row_iter = rows
-            .update(&snapshot)
-            .wrap_err("failed to update row iterator")?;
-        while let Some(row) = row_iter.next() {
-            let mut line = String::new();
-            let mut cell_iter = cells
-                .update(row)
-                .wrap_err("failed to update cell iterator")?;
-            while let Some(cell) = cell_iter.next() {
-                let graphemes = cell.graphemes().wrap_err("failed to read cell text")?;
-                if graphemes.is_empty() {
-                    line.push(' ');
-                } else {
-                    for grapheme in graphemes {
-                        line.push(grapheme);
-                    }
-                }
-            }
-            lines.push(line.trim_end_matches(' ').to_owned());
-        }
-
-        Ok(lines.join("\n"))
+    pub fn handle_paste(&mut self, text: &str) -> eyre::Result<()> {
+        self.write_input(text.as_bytes())
     }
 
-    pub fn visible_display_state(&mut self) -> eyre::Result<TerminalDisplayState> {
+    pub fn selected_text(&mut self, selection: TerminalSelection) -> eyre::Result<String> {
+        let rows = self.visible_cell_text_rows()?;
+        Ok(extract_selected_text(&rows, selection))
+    }
+
+    pub fn visible_text(&mut self) -> eyre::Result<String> {
+        let rows = self.visible_cell_text_rows()?;
+        Ok(rows
+            .into_iter()
+            .map(|row| row.concat().trim_end_matches(' ').to_owned())
+            .collect::<Vec<_>>()
+            .join("\n"))
+    }
+
+    pub fn visible_display_state_with_selection(
+        &mut self,
+        selection: Option<TerminalSelection>,
+    ) -> eyre::Result<TerminalDisplayState> {
         let snapshot = self
             .render_state
             .update(&self.terminal)
@@ -784,12 +819,18 @@ impl TerminalSession {
                 let graphemes = cell.graphemes().wrap_err("failed to read cell text")?;
                 let foreground = cell.fg_color().wrap_err("failed to read cell foreground")?;
                 let background = cell.bg_color().wrap_err("failed to read cell background")?;
-                let (glyph_color, background_color) =
-                    resolve_terminal_cell_colors(&colors, foreground, background, style.inverse);
+                let cell_position = TerminalCellPoint::new(column_index, row_index);
+                let selected = selection.is_some_and(|selection| selection.contains(cell_position));
+                let (glyph_color, background_color) = resolve_terminal_cell_colors(
+                    &colors,
+                    foreground,
+                    background,
+                    style.inverse ^ selected,
+                );
 
                 if let Some(color) = background_color {
                     display.backgrounds.push(TerminalDisplayBackground {
-                        cell: TerminalCellPoint::new(column_index, row_index),
+                        cell: cell_position,
                         color,
                     });
                 }
@@ -797,7 +838,7 @@ impl TerminalSession {
                 if !graphemes.is_empty() {
                     for character in graphemes {
                         display.glyphs.push(TerminalDisplayGlyph {
-                            cell: TerminalCellPoint::new(column_index, row_index),
+                            cell: cell_position,
                             character,
                             color: glyph_color,
                         });
@@ -908,6 +949,97 @@ impl TerminalSession {
 
         Cow::Owned(output)
     }
+
+    fn visible_cell_text_rows(&mut self) -> eyre::Result<Vec<Vec<String>>> {
+        let snapshot = self
+            .render_state
+            .update(&self.terminal)
+            .wrap_err("failed to update terminal render state")?;
+        let mut rows = RowIterator::new().wrap_err("failed to create row iterator")?;
+        let mut cells = CellIterator::new().wrap_err("failed to create cell iterator")?;
+        let mut text_rows = Vec::new();
+
+        let mut row_iter = rows
+            .update(&snapshot)
+            .wrap_err("failed to update row iterator")?;
+        while let Some(row) = row_iter.next() {
+            let mut row_cells = Vec::new();
+            let mut cell_iter = cells
+                .update(row)
+                .wrap_err("failed to update cell iterator")?;
+            while let Some(cell) = cell_iter.next() {
+                let graphemes = cell.graphemes().wrap_err("failed to read cell text")?;
+                if graphemes.is_empty() {
+                    row_cells.push(" ".to_owned());
+                } else {
+                    row_cells.push(graphemes.iter().collect());
+                }
+            }
+            text_rows.push(row_cells);
+        }
+
+        Ok(text_rows)
+    }
+}
+
+fn ordered_linear_bounds(
+    anchor: TerminalCellPoint,
+    focus: TerminalCellPoint,
+) -> (TerminalCellPoint, TerminalCellPoint) {
+    if (anchor.row(), anchor.column()) <= (focus.row(), focus.column()) {
+        (anchor, focus)
+    } else {
+        (focus, anchor)
+    }
+}
+
+fn ordered_block_bounds(
+    anchor: TerminalCellPoint,
+    focus: TerminalCellPoint,
+) -> (i32, i32, i32, i32) {
+    (
+        anchor.column().min(focus.column()),
+        anchor.row().min(focus.row()),
+        anchor.column().max(focus.column()),
+        anchor.row().max(focus.row()),
+    )
+}
+
+fn linear_selection_contains(
+    start: TerminalCellPoint,
+    end: TerminalCellPoint,
+    cell: TerminalCellPoint,
+) -> bool {
+    (cell.row(), cell.column()) >= (start.row(), start.column())
+        && (cell.row(), cell.column()) <= (end.row(), end.column())
+}
+
+fn extract_selected_text(rows: &[Vec<String>], selection: TerminalSelection) -> String {
+    let mut selected_rows = Vec::new();
+
+    for (row_index, row) in rows.iter().enumerate() {
+        let mut selected = String::new();
+        for (column_index, cell_text) in row.iter().enumerate() {
+            let cell = TerminalCellPoint::new(
+                i32::try_from(column_index).unwrap_or(i32::MAX),
+                i32::try_from(row_index).unwrap_or(i32::MAX),
+            );
+            if selection.contains(cell) {
+                selected.push_str(cell_text);
+            }
+        }
+
+        if !selected.is_empty() {
+            let normalized = if selection.mode() == TerminalSelectionMode::Linear {
+                selected.trim_end_matches(' ').to_owned()
+            } else {
+                selected
+            };
+            selected_rows.push(normalized);
+        }
+    }
+
+    selected_rows.join("\n")
 }
 
 fn rgb_to_rgba(color: RgbColor) -> [f32; 4] {
@@ -1400,9 +1532,11 @@ fn legacy_special_key_bytes(mapped_key: key::Key, mods: key::Mods) -> Option<Vec
 #[cfg(test)]
 mod tests {
     use super::{
-        MIN_CODE_PANEL_HEIGHT, TerminalDisplayCursorStyle, TerminalLayout, map_cursor_style,
-        map_virtual_key, resolve_terminal_cell_colors,
+        MIN_CODE_PANEL_HEIGHT, TerminalDisplayCursorStyle, TerminalLayout, TerminalSelection,
+        TerminalSelectionMode, extract_selected_text, map_cursor_style, map_virtual_key,
+        resolve_terminal_cell_colors,
     };
+    use crate::app::spatial::TerminalCellPoint;
     use libghostty_vt::render::Colors;
     use libghostty_vt::style::RgbColor;
 
@@ -1539,5 +1673,96 @@ mod tests {
                 "unexpected char for numpad vkey {vkey:#X}"
             );
         }
+    }
+
+    // behavior[verify window.interaction.selection.linear]
+    #[test]
+    fn linear_selection_wraps_across_rows() {
+        let selection = TerminalSelection::new(
+            TerminalCellPoint::new(2, 0),
+            TerminalCellPoint::new(1, 1),
+            TerminalSelectionMode::Linear,
+        );
+
+        assert!(selection.contains(TerminalCellPoint::new(2, 0)));
+        assert!(selection.contains(TerminalCellPoint::new(3, 0)));
+        assert!(selection.contains(TerminalCellPoint::new(0, 1)));
+        assert!(selection.contains(TerminalCellPoint::new(1, 1)));
+        assert!(!selection.contains(TerminalCellPoint::new(1, 0)));
+        assert!(!selection.contains(TerminalCellPoint::new(2, 1)));
+    }
+
+    // behavior[verify window.interaction.selection.block-alt-drag]
+    #[test]
+    fn block_selection_uses_a_rectangle() {
+        let selection = TerminalSelection::new(
+            TerminalCellPoint::new(3, 1),
+            TerminalCellPoint::new(1, 3),
+            TerminalSelectionMode::Block,
+        );
+
+        assert!(selection.contains(TerminalCellPoint::new(1, 1)));
+        assert!(selection.contains(TerminalCellPoint::new(2, 2)));
+        assert!(selection.contains(TerminalCellPoint::new(3, 3)));
+        assert!(!selection.contains(TerminalCellPoint::new(0, 2)));
+        assert!(!selection.contains(TerminalCellPoint::new(4, 2)));
+    }
+
+    // behavior[verify window.interaction.clipboard.right-click-copy-selection]
+    #[test]
+    fn extract_selected_text_wraps_linear_selection_by_row() {
+        let rows = vec![
+            vec![
+                "a".to_owned(),
+                "b".to_owned(),
+                "c".to_owned(),
+                "d".to_owned(),
+            ],
+            vec![
+                "e".to_owned(),
+                "f".to_owned(),
+                "g".to_owned(),
+                "h".to_owned(),
+            ],
+        ];
+        let selection = TerminalSelection::new(
+            TerminalCellPoint::new(2, 0),
+            TerminalCellPoint::new(1, 1),
+            TerminalSelectionMode::Linear,
+        );
+
+        assert_eq!(extract_selected_text(&rows, selection), "cd\nef");
+    }
+
+    // behavior[verify window.interaction.clipboard.right-click-copy-selection]
+    #[test]
+    fn extract_selected_text_preserves_block_rows() {
+        let rows = vec![
+            vec![
+                "a".to_owned(),
+                "b".to_owned(),
+                "c".to_owned(),
+                "d".to_owned(),
+            ],
+            vec![
+                "e".to_owned(),
+                "f".to_owned(),
+                "g".to_owned(),
+                "h".to_owned(),
+            ],
+            vec![
+                "i".to_owned(),
+                "j".to_owned(),
+                "k".to_owned(),
+                "l".to_owned(),
+            ],
+        ];
+        let selection = TerminalSelection::new(
+            TerminalCellPoint::new(1, 0),
+            TerminalCellPoint::new(2, 2),
+            TerminalSelectionMode::Block,
+        );
+
+        assert_eq!(extract_selected_text(&rows, selection), "bc\nfg\njk");
     }
 }

@@ -79,6 +79,21 @@ The launched terminal window must forward keyboard input into the PTY-backed she
 behavior[window.interaction.input.numpad-numlock-text]
 When NumLock is enabled, numpad digit and operator keys must be forwarded as their text characters rather than being dropped.
 
+behavior[window.interaction.selection.linear]
+Dragging with the left mouse button across the terminal area must create a text selection that wraps along terminal rows.
+
+behavior[window.interaction.selection.block-alt-drag]
+Holding Alt while dragging with the left mouse button across the terminal area must create a rectangular box selection instead of a row-wrapping selection.
+
+behavior[window.interaction.clipboard.right-click-copy-selection]
+When a terminal selection is present, right clicking in the terminal area must copy the selected text to the clipboard and clear the selection.
+
+behavior[window.interaction.clipboard.right-click-paste]
+When no terminal selection is present, right clicking in the terminal area must paste the current clipboard text into the PTY-backed shell session.
+
+behavior[window.interaction.clipboard.right-click-paste.confirm-multiline]
+When the clipboard text contains a newline, right clicking to paste in the terminal area must first show a confirmation dialog before the paste is allowed to proceed.
+
 behavior[window.interaction.zoom.terminal]
 Holding Ctrl while scrolling over the terminal area must adjust the terminal text scale and recompute the terminal column and row count to fit the resized cell grid.
 

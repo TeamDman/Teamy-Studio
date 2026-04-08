@@ -5,6 +5,7 @@ use std::thread;
 use tracing::trace;
 
 use eyre::Context;
+use teamy_windows::clipboard::{read_clipboard, write_clipboard};
 use teamy_windows::module::get_current_module;
 use tracing::{debug, error, info};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
@@ -12,7 +13,7 @@ use windows::Win32::Graphics::Gdi::{
     BeginPaint, CLEARTYPE_QUALITY, CreateFontIndirectW, DeleteObject, EndPaint, GetDC,
     GetTextExtentPoint32W, HFONT, LOGFONTW, PAINTSTRUCT, ReleaseDC, SelectObject,
 };
-use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_CONTROL};
+use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_CONTROL, VK_MENU};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect, GetCursorPos,
     GetSystemMetrics, GetWindowRect, HTCAPTION, HTCLIENT, IDC_ARROW, IDC_SIZEALL, LoadCursorW, MSG,
@@ -21,8 +22,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SetCursor, SetTimer, ShowWindow, TranslateMessage, WM_CHAR, WM_DESTROY, WM_ENTERSIZEMOVE,
     WM_ERASEBKGND, WM_EXITSIZEMOVE, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP,
     WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCALCSIZE, WM_NCHITTEST, WM_NCLBUTTONDOWN, WM_PAINT, WM_QUIT,
-    WM_SETCURSOR, WM_SIZE, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WNDCLASSEXW, WS_EX_APPWINDOW,
-    WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP, WS_THICKFRAME, WS_VISIBLE,
+    WM_RBUTTONUP, WM_SETCURSOR, WM_SIZE, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WNDCLASSEXW,
+    WS_EX_APPWINDOW, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP, WS_THICKFRAME, WS_VISIBLE,
 };
 use windows::core::{PCWSTR, w};
 
@@ -37,9 +38,12 @@ use super::windows_d3d12_renderer::{
     D3d12PanelRenderer, PanelEffect, RenderScene, build_panel_scene, push_centered_text,
     push_glyph, push_overlay_panel, push_panel, push_text_block,
 };
+use super::windows_dialogs::{
+    PasteConfirmationChoice, paste_confirmation_required, show_multiline_paste_confirmation_dialog,
+};
 use super::windows_terminal::{
     POLL_INTERVAL_MS, POLL_TIMER_ID, TerminalDisplayCursorStyle, TerminalDisplayState,
-    TerminalLayout, TerminalSession, keyboard_mods,
+    TerminalLayout, TerminalSelection, TerminalSelectionMode, TerminalSession, keyboard_mods,
 };
 
 const WINDOW_CLASS_NAME: PCWSTR = w!("TeamyStudioTerminalWindow");
@@ -64,6 +68,8 @@ struct AppState {
     hwnd: Option<WindowHandle>,
     workspace_window: Option<WorkspaceWindowState>,
     pending_window_drag: Option<PendingWindowDrag>,
+    terminal_selection: Option<TerminalSelection>,
+    pending_terminal_selection: Option<PendingTerminalSelection>,
     in_move_size_loop: bool,
     terminal_font_height: i32,
     terminal_cell_width: i32,
@@ -176,10 +182,30 @@ struct PendingWindowDrag {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PendingTerminalSelection {
+    anchor: TerminalCellPoint,
+    mode: TerminalSelectionMode,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PendingDragAction {
     NotHandled,
     Consumed,
     StartSystemDrag,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RightClickTerminalAction {
+    CopySelection,
+    Paste,
+    ConfirmPaste,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum RightClickTerminalPreparation {
+    NotTerminal,
+    CopySelection(String),
+    QueryClipboard,
 }
 
 impl PendingDragAction {
@@ -232,6 +258,12 @@ fn system_metric(metric: SYSTEM_METRICS_INDEX) -> i32 {
 fn control_key_is_down() -> bool {
     // Safety: querying key state for VK_CONTROL does not require additional invariants.
     let state = unsafe { GetKeyState(i32::from(VK_CONTROL.0)) };
+    (state.cast_unsigned() & 0x8000) != 0
+}
+
+fn alt_key_is_down() -> bool {
+    // Safety: querying key state for VK_MENU does not require additional invariants.
+    let state = unsafe { GetKeyState(i32::from(VK_MENU.0)) };
     (state.cast_unsigned() & 0x8000) != 0
 }
 
@@ -297,6 +329,8 @@ pub fn run(
             hwnd: None,
             workspace_window,
             pending_window_drag: None,
+            terminal_selection: None,
+            pending_terminal_selection: None,
             in_move_size_loop: false,
             terminal_font_height,
             terminal_cell_width,
@@ -421,6 +455,9 @@ extern "system" fn window_proc(
         },
         WM_LBUTTONUP => handle_bool_message(hwnd, message, wparam, lparam, |hwnd| {
             handle_left_button_up(hwnd, lparam)
+        }),
+        WM_RBUTTONUP => handle_bool_message(hwnd, message, wparam, lparam, |hwnd| {
+            handle_right_button_up(hwnd, lparam)
         }),
         WM_MOUSEWHEEL => handle_bool_message(hwnd, message, wparam, lparam, |hwnd| {
             handle_mouse_wheel(hwnd, wparam, lparam)
@@ -705,7 +742,9 @@ fn render_current_frame(
         .as_ref()
         .map_or(1, |workspace_window| workspace_window.cell_number);
     let output_text = build_output_panel_text(state);
-    let terminal_display = state.terminal.visible_display_state()?;
+    let terminal_display = state
+        .terminal
+        .visible_display_state_with_selection(state.terminal_selection)?;
 
     push_centered_text(
         &mut scene,
@@ -795,6 +834,38 @@ fn terminal_cell_rect(
     cell_height: i32,
 ) -> ClientRect {
     cell.to_client_rect(terminal_rect, cell_width, cell_height)
+}
+
+fn terminal_render_rect(layout: TerminalLayout) -> ClientRect {
+    layout.terminal_rect().inset(4)
+}
+
+fn terminal_cell_from_client_point(
+    layout: TerminalLayout,
+    point: ClientPoint,
+    clamp_to_viewport: bool,
+) -> Option<TerminalCellPoint> {
+    let terminal_rect = terminal_render_rect(layout);
+    if terminal_rect.width() <= 0 || terminal_rect.height() <= 0 {
+        return None;
+    }
+
+    if !terminal_rect.contains(point) && !clamp_to_viewport {
+        return None;
+    }
+
+    let point = point.to_win32_point().ok()?;
+    let x = point.x;
+    let y = point.y;
+    let clamped_x = x.clamp(terminal_rect.left(), terminal_rect.right() - 1);
+    let clamped_y = y.clamp(terminal_rect.top(), terminal_rect.bottom() - 1);
+    let relative_x = clamped_x - terminal_rect.left();
+    let relative_y = clamped_y - terminal_rect.top();
+
+    let (grid_cols, grid_rows) = layout.grid_size();
+    let column = (relative_x / layout.cell_width.max(1)).clamp(0, i32::from(grid_cols) - 1);
+    let row = (relative_y / layout.cell_height.max(1)).clamp(0, i32::from(grid_rows) - 1);
+    Some(TerminalCellPoint::new(column, row))
 }
 
 fn terminal_cursor_overlay_rects(
@@ -1007,6 +1078,21 @@ fn handle_left_button_up(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Result<boo
             return Ok(true);
         }
 
+        if let Some(pending_selection) = state.pending_terminal_selection.take() {
+            let layout =
+                client_layout(hwnd, state.terminal_cell_width, state.terminal_cell_height)?;
+            if let Some(cell) =
+                terminal_cell_from_client_point(layout, ClientPoint::from_lparam(lparam), true)
+            {
+                state.terminal_selection = Some(TerminalSelection::new(
+                    pending_selection.anchor,
+                    cell,
+                    pending_selection.mode,
+                ));
+            }
+            return Ok(true);
+        }
+
         let Some(workspace_window) = state.workspace_window.clone() else {
             return Ok(false);
         };
@@ -1042,16 +1128,39 @@ fn handle_left_button_up(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Result<boo
 }
 
 /// behavior[impl window.interaction.drag]
+/// behavior[impl window.interaction.selection.linear]
+/// behavior[impl window.interaction.selection.block-alt-drag]
 fn handle_left_button_down(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Result<bool> {
     let point = ClientPoint::from_lparam(lparam);
     let in_drag_handle = hit_test_drag_handle_point(hwnd, point)?;
+    let selection_mode = if alt_key_is_down() {
+        TerminalSelectionMode::Block
+    } else {
+        TerminalSelectionMode::Linear
+    };
 
     with_app_state(|state| {
         state.pending_window_drag = None;
         if !in_drag_handle {
+            let layout =
+                client_layout(hwnd, state.terminal_cell_width, state.terminal_cell_height)?;
+            state.pending_terminal_selection = None;
+            if let Some(cell) = terminal_cell_from_client_point(layout, point, false) {
+                let selection = TerminalSelection::new(cell, cell, selection_mode);
+                state.terminal_selection = Some(selection);
+                state.pending_terminal_selection = Some(PendingTerminalSelection {
+                    anchor: cell,
+                    mode: selection_mode,
+                });
+                return Ok(true);
+            }
+
+            state.terminal_selection = None;
             return Ok(false);
         }
 
+        state.terminal_selection = None;
+        state.pending_terminal_selection = None;
         state.pending_window_drag = Some(PendingWindowDrag { origin: point });
         Ok(true)
     })
@@ -1059,6 +1168,33 @@ fn handle_left_button_down(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Result<b
 
 fn handle_mouse_move(hwnd: WindowHandle, wparam: WPARAM, lparam: LPARAM) -> eyre::Result<bool> {
     let point = ClientPoint::from_lparam(lparam);
+
+    let selection_result = with_app_state(|state| {
+        let Some(pending_selection) = state.pending_terminal_selection else {
+            return Ok(None);
+        };
+
+        if (wparam.0 & 0x0001) == 0 {
+            state.pending_terminal_selection = None;
+            return Ok(Some(state.terminal_selection.is_some()));
+        }
+
+        let layout = client_layout(hwnd, state.terminal_cell_width, state.terminal_cell_height)?;
+        let Some(cell) = terminal_cell_from_client_point(layout, point, true) else {
+            return Ok(Some(true));
+        };
+
+        state.terminal_selection = Some(TerminalSelection::new(
+            pending_selection.anchor,
+            cell,
+            pending_selection.mode,
+        ));
+        Ok(Some(true))
+    })?;
+
+    if let Some(consumed) = selection_result {
+        return Ok(consumed);
+    }
 
     let action = with_app_state(|state| {
         let Some(pending_drag) = state.pending_window_drag else {
@@ -1086,6 +1222,95 @@ fn handle_mouse_move(hwnd: WindowHandle, wparam: WPARAM, lparam: LPARAM) -> eyre
                 .wrap_err("failed to hand deferred drag strip motion to the native move loop")?;
             Ok(true)
         }
+    }
+}
+
+/// behavior[impl window.interaction.clipboard.right-click-copy-selection]
+/// behavior[impl window.interaction.clipboard.right-click-paste]
+/// behavior[impl window.interaction.clipboard.right-click-paste.confirm-multiline]
+fn handle_right_button_up(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Result<bool> {
+    let point = ClientPoint::from_lparam(lparam);
+
+    let preparation = with_app_state(|state| {
+        let layout = client_layout(hwnd, state.terminal_cell_width, state.terminal_cell_height)?;
+        if !terminal_render_rect(layout).contains(point) {
+            return Ok(RightClickTerminalPreparation::NotTerminal);
+        }
+
+        state.pending_terminal_selection = None;
+
+        if let Some(selection) = state.terminal_selection.take() {
+            return Ok(RightClickTerminalPreparation::CopySelection(
+                state.terminal.selected_text(selection)?,
+            ));
+        }
+
+        Ok(RightClickTerminalPreparation::QueryClipboard)
+    })?;
+
+    match preparation {
+        RightClickTerminalPreparation::NotTerminal => Ok(false),
+        RightClickTerminalPreparation::CopySelection(selected_text) => {
+            if !selected_text.is_empty()
+                && let Err(error) = write_clipboard(&selected_text)
+            {
+                error!(?error, "failed to copy terminal selection to the clipboard");
+            }
+            Ok(true)
+        }
+        RightClickTerminalPreparation::QueryClipboard => {
+            let clipboard_text = match read_clipboard() {
+                Ok(clipboard_text) => clipboard_text,
+                Err(error) => {
+                    error!(?error, "failed to read clipboard text for terminal paste");
+                    return Ok(true);
+                }
+            };
+
+            match right_click_terminal_action(false, &clipboard_text) {
+                Some(RightClickTerminalAction::Paste) => {
+                    with_app_state(|state| {
+                        state.terminal.handle_paste(&clipboard_text)?;
+                        Ok(())
+                    })?;
+                    Ok(true)
+                }
+                Some(RightClickTerminalAction::ConfirmPaste) => {
+                    // Native modal dialogs pump the message loop, so they must not run while
+                    // the mutable APP_STATE RefCell borrow is held.
+                    let choice = show_multiline_paste_confirmation_dialog(
+                        Some(hwnd.raw()),
+                        &clipboard_text,
+                    )?;
+                    if choice == PasteConfirmationChoice::Paste {
+                        with_app_state(|state| {
+                            state.terminal.handle_paste(&clipboard_text)?;
+                            Ok(())
+                        })?;
+                    }
+                    Ok(true)
+                }
+                Some(RightClickTerminalAction::CopySelection) => {
+                    unreachable!("selection copies are prepared before clipboard lookup")
+                }
+                None => Ok(true),
+            }
+        }
+    }
+}
+
+fn right_click_terminal_action(
+    has_selection: bool,
+    clipboard_text: &str,
+) -> Option<RightClickTerminalAction> {
+    if has_selection {
+        Some(RightClickTerminalAction::CopySelection)
+    } else if clipboard_text.is_empty() {
+        None
+    } else if paste_confirmation_required(clipboard_text) {
+        Some(RightClickTerminalAction::ConfirmPaste)
+    } else {
+        Some(RightClickTerminalAction::Paste)
     }
 }
 
@@ -1323,6 +1548,26 @@ mod tests {
             terminal_cursor_overlay_color([0.8, 0.9, 1.0, 1.0], TerminalDisplayCursorStyle::Block);
 
         assert_eq!(color, [0.8, 0.9, 1.0, 0.42]);
+    }
+
+    // behavior[verify window.interaction.clipboard.right-click-copy-selection]
+    // behavior[verify window.interaction.clipboard.right-click-paste]
+    // behavior[verify window.interaction.clipboard.right-click-paste.confirm-multiline]
+    #[test]
+    fn right_click_terminal_action_prefers_copy_then_paste_then_confirm() {
+        assert_eq!(
+            right_click_terminal_action(true, "ignored"),
+            Some(RightClickTerminalAction::CopySelection)
+        );
+        assert_eq!(
+            right_click_terminal_action(false, "single line"),
+            Some(RightClickTerminalAction::Paste)
+        );
+        assert_eq!(
+            right_click_terminal_action(false, "first\nsecond"),
+            Some(RightClickTerminalAction::ConfirmPaste)
+        );
+        assert_eq!(right_click_terminal_action(false, ""), None);
     }
 }
 
