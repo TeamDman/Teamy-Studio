@@ -42,9 +42,15 @@ use super::windows_dialogs::{
     PasteConfirmationChoice, paste_confirmation_required, show_multiline_paste_confirmation_dialog,
 };
 use super::windows_terminal::{
-    POLL_INTERVAL_MS, POLL_TIMER_ID, TerminalDisplayCursorStyle, TerminalDisplayState,
-    TerminalLayout, TerminalSelection, TerminalSelectionMode, TerminalSession, keyboard_mods,
+    POLL_INTERVAL_MS, POLL_TIMER_ID, TerminalDisplayCursorStyle, TerminalDisplayScrollbar,
+    TerminalDisplayState, TerminalLayout, TerminalSelection, TerminalSelectionMode,
+    TerminalSession, keyboard_mods,
 };
+
+unsafe extern "system" {
+    fn SetCapture(hwnd: HWND) -> HWND;
+    fn ReleaseCapture() -> i32;
+}
 
 const WINDOW_CLASS_NAME: PCWSTR = w!("TeamyStudioTerminalWindow");
 const WINDOW_TITLE: &str = "Teamy Studio Terminal";
@@ -74,6 +80,8 @@ struct AppState {
     terminal_selection: Option<TerminalSelection>,
     pending_terminal_selection: Option<PendingTerminalSelection>,
     terminal_selection_drag_point: Option<ClientPoint>,
+    terminal_scrollbar_hovered_part: Option<TerminalScrollbarPart>,
+    terminal_scrollbar_drag: Option<TerminalScrollbarDrag>,
     in_move_size_loop: bool,
     terminal_font_height: i32,
     terminal_cell_width: i32,
@@ -178,6 +186,22 @@ impl WindowHandle {
     fn post_quit_message(self) {
         self.window_thread.post_quit_message();
     }
+
+    fn capture_mouse(self) {
+        self.window_thread.assert_window_thread();
+        // Safety: capturing mouse input for this live window during a pointer drag is valid.
+        unsafe {
+            let _ = SetCapture(self.hwnd);
+        }
+    }
+
+    fn release_mouse_capture(self) {
+        self.window_thread.assert_window_thread();
+        // Safety: releasing mouse capture after pointer interaction completes is valid.
+        unsafe {
+            let _ = ReleaseCapture();
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -211,6 +235,32 @@ enum RightClickTerminalAction {
     CopySelection,
     Paste,
     ConfirmPaste,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TerminalScrollbarPart {
+    Track,
+    Thumb,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TerminalScrollbarDrag {
+    grab_offset_y: i32,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct TerminalScrollbarVisualState {
+    track_hovered: bool,
+    thumb_hovered: bool,
+    thumb_grabbed: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TerminalScrollbarGeometry {
+    thumb_rect: ClientRect,
+    thumb_height: i32,
+    travel: i32,
+    max_offset: u64,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -344,6 +394,8 @@ pub fn run(
             terminal_selection: None,
             pending_terminal_selection: None,
             terminal_selection_drag_point: None,
+            terminal_scrollbar_hovered_part: None,
+            terminal_scrollbar_drag: None,
             in_move_size_loop: false,
             terminal_font_height,
             terminal_cell_width,
@@ -776,7 +828,12 @@ fn render_current_frame(
         state.terminal_cell_height,
         &terminal_display,
     );
-    push_terminal_scrollbar(&mut scene, scrollbar_rect, terminal_display.scrollbar);
+    push_terminal_scrollbar(
+        &mut scene,
+        scrollbar_rect,
+        terminal_display.scrollbar,
+        terminal_scrollbar_visual_state(state),
+    );
     push_text_block(
         &mut scene,
         layout.result_panel_rect().inset(14).to_win32_rect(),
@@ -837,6 +894,7 @@ fn push_terminal_scrollbar(
     scene: &mut RenderScene,
     scrollbar_rect: ClientRect,
     scrollbar: Option<super::windows_terminal::TerminalDisplayScrollbar>,
+    visual_state: TerminalScrollbarVisualState,
 ) {
     if scrollbar_rect.width() <= 0 || scrollbar_rect.height() <= 0 {
         return;
@@ -845,41 +903,138 @@ fn push_terminal_scrollbar(
     push_panel(
         scene,
         scrollbar_rect.to_win32_rect(),
-        [0.12, 0.15, 0.20, 0.78],
+        if visual_state.track_hovered {
+            [0.28, 0.10, 0.40, 0.90]
+        } else {
+            [0.19, 0.08, 0.28, 0.78]
+        },
         PanelEffect::TerminalScrollbarTrack,
     );
 
     let Some(scrollbar) = scrollbar else {
         return;
     };
-    if scrollbar.total == 0 {
+    let Some(geometry) = terminal_scrollbar_geometry(scrollbar_rect, scrollbar) else {
         return;
-    }
-
-    let track_height = u64::try_from(scrollbar_rect.height().max(1)).unwrap_or(1);
-    let min_thumb_height = scrollbar_rect.width().max(18);
-    let proportional_thumb = (track_height.saturating_mul(scrollbar.visible) / scrollbar.total)
-        .max(u64::try_from(min_thumb_height).unwrap_or(1));
-    let thumb_height = i32::try_from(proportional_thumb.min(track_height))
-        .unwrap_or(i32::MAX)
-        .clamp(min_thumb_height, scrollbar_rect.height().max(1));
-    let travel = u64::try_from((scrollbar_rect.height() - thumb_height).max(0)).unwrap_or_default();
-    let thumb_top = scrollbar_rect.top()
-        + i32::try_from(travel.saturating_mul(scrollbar.offset) / scrollbar.total)
-            .unwrap_or_default();
-    let thumb_rect = ClientRect::new(
-        scrollbar_rect.left(),
-        thumb_top,
-        scrollbar_rect.right(),
-        (thumb_top + thumb_height).min(scrollbar_rect.bottom()),
-    );
+    };
 
     push_panel(
         scene,
-        thumb_rect.to_win32_rect(),
-        [0.74, 0.80, 0.90, 0.92],
+        geometry.thumb_rect.to_win32_rect(),
+        if visual_state.thumb_grabbed {
+            [1.00, 0.72, 1.00, 1.00]
+        } else if visual_state.thumb_hovered {
+            [0.92, 0.55, 1.00, 0.96]
+        } else {
+            [0.82, 0.38, 0.98, 0.88]
+        },
         PanelEffect::TerminalScrollbarThumb,
     );
+}
+
+fn terminal_scrollbar_visual_state(state: &AppState) -> TerminalScrollbarVisualState {
+    let thumb_grabbed = state.terminal_scrollbar_drag.is_some();
+    let hovered_part = if thumb_grabbed {
+        Some(TerminalScrollbarPart::Thumb)
+    } else {
+        state.terminal_scrollbar_hovered_part
+    };
+
+    TerminalScrollbarVisualState {
+        track_hovered: hovered_part.is_some(),
+        thumb_hovered: matches!(hovered_part, Some(TerminalScrollbarPart::Thumb)),
+        thumb_grabbed,
+    }
+}
+
+fn terminal_scrollbar_geometry(
+    scrollbar_rect: ClientRect,
+    scrollbar: TerminalDisplayScrollbar,
+) -> Option<TerminalScrollbarGeometry> {
+    if scrollbar_rect.width() <= 0
+        || scrollbar_rect.height() <= 0
+        || scrollbar.total == 0
+        || scrollbar.visible == 0
+    {
+        return None;
+    }
+
+    let track_height = u64::try_from(scrollbar_rect.height().max(1)).ok()?;
+    let min_thumb_height = scrollbar_rect.width().max(22);
+    let proportional_thumb = (track_height.saturating_mul(scrollbar.visible) / scrollbar.total)
+        .max(u64::try_from(min_thumb_height).ok()?);
+    let thumb_height = i32::try_from(proportional_thumb.min(track_height))
+        .ok()?
+        .clamp(min_thumb_height, scrollbar_rect.height().max(1));
+    let travel = (scrollbar_rect.height() - thumb_height).max(0);
+    let max_offset = scrollbar.total.saturating_sub(scrollbar.visible);
+    let clamped_offset = scrollbar.offset.min(max_offset);
+    let thumb_offset = if travel == 0 || max_offset == 0 {
+        0
+    } else {
+        let travel = u64::try_from(travel).ok()?;
+        i32::try_from(travel.saturating_mul(clamped_offset) / max_offset).ok()?
+    };
+    let thumb_top = scrollbar_rect.top() + thumb_offset;
+
+    Some(TerminalScrollbarGeometry {
+        thumb_rect: ClientRect::new(
+            scrollbar_rect.left(),
+            thumb_top,
+            scrollbar_rect.right(),
+            (thumb_top + thumb_height).min(scrollbar_rect.bottom()),
+        ),
+        thumb_height,
+        travel,
+        max_offset,
+    })
+}
+
+fn terminal_scrollbar_hit_test(
+    scrollbar_rect: ClientRect,
+    scrollbar: TerminalDisplayScrollbar,
+    point: ClientPoint,
+) -> Option<TerminalScrollbarPart> {
+    if !scrollbar_rect.contains(point) {
+        return None;
+    }
+
+    let geometry = terminal_scrollbar_geometry(scrollbar_rect, scrollbar)?;
+    Some(if geometry.thumb_rect.contains(point) {
+        TerminalScrollbarPart::Thumb
+    } else {
+        TerminalScrollbarPart::Track
+    })
+}
+
+fn terminal_scrollbar_offset_for_pointer(
+    scrollbar_rect: ClientRect,
+    geometry: TerminalScrollbarGeometry,
+    point: ClientPoint,
+    grab_offset_y: i32,
+) -> eyre::Result<u64> {
+    if geometry.travel <= 0 || geometry.max_offset == 0 {
+        return Ok(0);
+    }
+
+    let y = point.to_win32_point()?.y;
+    let thumb_top = (y - scrollbar_rect.top() - grab_offset_y).clamp(0, geometry.travel);
+    let thumb_top = u64::try_from(thumb_top).unwrap_or_default();
+    let travel = u64::try_from(geometry.travel).unwrap_or(1);
+    Ok((thumb_top.saturating_mul(geometry.max_offset) + (travel / 2)) / travel)
+}
+
+fn current_terminal_scrollbar(state: &AppState) -> eyre::Result<Option<TerminalDisplayScrollbar>> {
+    let viewport = state.terminal.viewport_metrics()?;
+    if viewport.total == 0 || viewport.visible == 0 {
+        return Ok(None);
+    }
+
+    Ok(Some(TerminalDisplayScrollbar {
+        total: viewport.total,
+        offset: viewport.offset,
+        visible: viewport.visible,
+    }))
 }
 
 fn terminal_cursor_overlay_color(
@@ -1162,6 +1317,22 @@ fn with_app_state<T>(f: impl FnOnce(&mut AppState) -> eyre::Result<T>) -> eyre::
 
 fn handle_left_button_up(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Result<bool> {
     with_app_state(|state| {
+        if state.terminal_scrollbar_drag.take().is_some() {
+            let point = ClientPoint::from_lparam(lparam);
+            let layout =
+                client_layout(hwnd, state.terminal_cell_width, state.terminal_cell_height)?;
+            state.terminal_scrollbar_hovered_part =
+                current_terminal_scrollbar(state)?.and_then(|scrollbar| {
+                    terminal_scrollbar_hit_test(
+                        layout.terminal_scrollbar_rect().inset(4),
+                        scrollbar,
+                        point,
+                    )
+                });
+            hwnd.release_mouse_capture();
+            return Ok(true);
+        }
+
         if state.pending_window_drag.take().is_some() {
             return Ok(true);
         }
@@ -1235,8 +1406,40 @@ fn handle_left_button_down(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Result<b
         if !in_drag_handle {
             let layout =
                 client_layout(hwnd, state.terminal_cell_width, state.terminal_cell_height)?;
-            state.terminal_selection = None;
             state.pending_terminal_selection = None;
+
+            if let Some(scrollbar) = current_terminal_scrollbar(state)? {
+                let scrollbar_rect = layout.terminal_scrollbar_rect().inset(4);
+                if let Some(part) = terminal_scrollbar_hit_test(scrollbar_rect, scrollbar, point) {
+                    let Some(geometry) = terminal_scrollbar_geometry(scrollbar_rect, scrollbar)
+                    else {
+                        return Ok(false);
+                    };
+                    let point_y = point.to_win32_point()?.y;
+                    let grab_offset_y = match part {
+                        TerminalScrollbarPart::Thumb => point_y - geometry.thumb_rect.top(),
+                        TerminalScrollbarPart::Track => geometry.thumb_height / 2,
+                    };
+                    let target_offset = match part {
+                        TerminalScrollbarPart::Thumb => scrollbar.offset.min(geometry.max_offset),
+                        TerminalScrollbarPart::Track => terminal_scrollbar_offset_for_pointer(
+                            scrollbar_rect,
+                            geometry,
+                            point,
+                            grab_offset_y,
+                        )?,
+                    };
+
+                    state.terminal_scrollbar_hovered_part = Some(part);
+                    state.terminal_scrollbar_drag = Some(TerminalScrollbarDrag { grab_offset_y });
+                    state.terminal.scroll_viewport_to_offset(target_offset)?;
+                    hwnd.capture_mouse();
+                    return Ok(true);
+                }
+            }
+
+            state.terminal_selection = None;
+            state.terminal_scrollbar_hovered_part = None;
             if let Some(cell) = terminal_cell_from_client_point(layout, point, false) {
                 let anchor = state.terminal.viewport_to_screen_cell(cell)?;
                 state.pending_terminal_selection = Some(PendingTerminalSelection {
@@ -1254,6 +1457,8 @@ fn handle_left_button_down(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Result<b
         state.terminal_selection = None;
         state.pending_terminal_selection = None;
         state.terminal_selection_drag_point = None;
+        state.terminal_scrollbar_hovered_part = None;
+        state.terminal_scrollbar_drag = None;
         state.pending_window_drag = Some(PendingWindowDrag { origin: point });
         Ok(true)
     })
@@ -1300,6 +1505,13 @@ fn handle_mouse_move(hwnd: WindowHandle, wparam: WPARAM, lparam: LPARAM) -> eyre
         return Ok(consumed);
     }
 
+    let scrollbar_result =
+        with_app_state(|state| handle_terminal_scrollbar_mouse_move(state, hwnd, point))?;
+
+    if let Some(consumed) = scrollbar_result {
+        return Ok(consumed);
+    }
+
     let action = with_app_state(|state| {
         let Some(pending_drag) = state.pending_window_drag else {
             return Ok(PendingDragAction::NotHandled);
@@ -1329,6 +1541,58 @@ fn handle_mouse_move(hwnd: WindowHandle, wparam: WPARAM, lparam: LPARAM) -> eyre
     }
 }
 
+fn handle_terminal_scrollbar_mouse_move(
+    state: &mut AppState,
+    hwnd: WindowHandle,
+    point: ClientPoint,
+) -> eyre::Result<Option<bool>> {
+    let layout = client_layout(hwnd, state.terminal_cell_width, state.terminal_cell_height)?;
+    let scrollbar_rect = layout.terminal_scrollbar_rect().inset(4);
+    let scrollbar = current_terminal_scrollbar(state)?;
+
+    if let Some(drag) = state.terminal_scrollbar_drag {
+        if !left_mouse_button_is_down() {
+            state.terminal_scrollbar_drag = None;
+            state.terminal_scrollbar_hovered_part = None;
+            hwnd.release_mouse_capture();
+            return Ok(Some(true));
+        }
+
+        let Some(scrollbar) = scrollbar else {
+            state.terminal_scrollbar_drag = None;
+            state.terminal_scrollbar_hovered_part = None;
+            hwnd.release_mouse_capture();
+            return Ok(Some(true));
+        };
+        let Some(geometry) = terminal_scrollbar_geometry(scrollbar_rect, scrollbar) else {
+            state.terminal_scrollbar_drag = None;
+            state.terminal_scrollbar_hovered_part = None;
+            hwnd.release_mouse_capture();
+            return Ok(Some(true));
+        };
+
+        state.terminal_scrollbar_hovered_part =
+            terminal_scrollbar_hit_test(scrollbar_rect, scrollbar, point);
+        let target_offset = terminal_scrollbar_offset_for_pointer(
+            scrollbar_rect,
+            geometry,
+            point,
+            drag.grab_offset_y,
+        )?;
+        state.terminal.scroll_viewport_to_offset(target_offset)?;
+        return Ok(Some(true));
+    }
+
+    if state.pending_window_drag.is_some() {
+        return Ok(None);
+    }
+
+    let hovered_part = scrollbar
+        .and_then(|scrollbar| terminal_scrollbar_hit_test(scrollbar_rect, scrollbar, point));
+    state.terminal_scrollbar_hovered_part = hovered_part;
+    Ok(hovered_part.map(|_| true))
+}
+
 /// behavior[impl window.interaction.clipboard.right-click-copy-selection]
 /// behavior[impl window.interaction.clipboard.right-click-paste]
 /// behavior[impl window.interaction.clipboard.right-click-paste.confirm-multiline]
@@ -1343,6 +1607,9 @@ fn handle_right_button_up(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Result<bo
 
         state.pending_terminal_selection = None;
         state.terminal_selection_drag_point = None;
+        if state.terminal_scrollbar_drag.take().is_some() {
+            hwnd.release_mouse_capture();
+        }
 
         if let Some(selection) = state.terminal_selection.take() {
             return Ok(RightClickTerminalPreparation::CopySelection(
@@ -1822,6 +2089,54 @@ mod tests {
         assert_eq!(scroll_lines_for_overshoot(1, 16), 1);
         assert_eq!(scroll_lines_for_overshoot(16, 16), 2);
         assert!(scroll_lines_for_overshoot(160, 16) > scroll_lines_for_overshoot(16, 16));
+    }
+
+    #[test]
+    fn terminal_scrollbar_thumb_reaches_track_end_at_max_offset() {
+        let rect = ClientRect::new(0, 0, 16, 100);
+        let geometry = terminal_scrollbar_geometry(
+            rect,
+            TerminalDisplayScrollbar {
+                total: 200,
+                offset: 150,
+                visible: 50,
+            },
+        )
+        .expect("scrollbar geometry should exist");
+
+        assert_eq!(geometry.thumb_rect.bottom(), rect.bottom());
+    }
+
+    #[test]
+    fn terminal_scrollbar_pointer_mapping_clamps_to_scrollable_range() {
+        let rect = ClientRect::new(0, 0, 16, 100);
+        let geometry = terminal_scrollbar_geometry(
+            rect,
+            TerminalDisplayScrollbar {
+                total: 200,
+                offset: 60,
+                visible: 50,
+            },
+        )
+        .expect("scrollbar geometry should exist");
+
+        let top_offset = terminal_scrollbar_offset_for_pointer(
+            rect,
+            geometry,
+            ClientPoint::new(8, -20),
+            geometry.thumb_height / 2,
+        )
+        .expect("top pointer should map");
+        let bottom_offset = terminal_scrollbar_offset_for_pointer(
+            rect,
+            geometry,
+            ClientPoint::new(8, 140),
+            geometry.thumb_height / 2,
+        )
+        .expect("bottom pointer should map");
+
+        assert_eq!(top_offset, 0);
+        assert_eq!(bottom_offset, geometry.max_offset);
     }
 
     // behavior[verify window.interaction.drag]

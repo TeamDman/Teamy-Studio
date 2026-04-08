@@ -39,7 +39,7 @@ const MIN_CODE_PANEL_HEIGHT: i32 = 180;
 const PLUS_BUTTON_SIZE: i32 = 42;
 const SIDECAR_BUTTON_SIZE: i32 = 34;
 const SIDECAR_BUTTON_GAP: i32 = 12;
-const TERMINAL_SCROLLBAR_WIDTH: i32 = 12;
+const TERMINAL_SCROLLBAR_WIDTH: i32 = 16;
 const TERMINAL_SCROLLBAR_GAP: i32 = 8;
 const WIN32_INPUT_MODE_ENABLE: &[u8] = b"\x1b[?9001h";
 const WIN32_INPUT_MODE_DISABLE: &[u8] = b"\x1b[?9001l";
@@ -948,6 +948,29 @@ impl TerminalSession {
         self.terminal.scroll_viewport(ScrollViewport::Delta(delta));
         self.repaint.needs_repaint = true;
         self.repaint.full_repaint_pending = true;
+    }
+
+    pub fn scroll_viewport_to_offset(&mut self, offset: u64) -> eyre::Result<()> {
+        let viewport = self.viewport_metrics()?;
+        let max_offset = viewport.total.saturating_sub(viewport.visible);
+        let target_offset = offset.min(max_offset);
+        if target_offset == viewport.offset {
+            return Ok(());
+        }
+
+        if target_offset == 0 {
+            self.terminal.scroll_viewport(ScrollViewport::Top);
+        } else if target_offset == max_offset {
+            self.terminal.scroll_viewport(ScrollViewport::Bottom);
+        } else {
+            let delta = i128::from(target_offset) - i128::from(viewport.offset);
+            let delta = delta.clamp(isize::MIN as i128, isize::MAX as i128) as isize;
+            self.terminal.scroll_viewport(ScrollViewport::Delta(delta));
+        }
+
+        self.repaint.needs_repaint = true;
+        self.repaint.full_repaint_pending = true;
+        Ok(())
     }
 
     pub fn visible_display_state_with_selection(

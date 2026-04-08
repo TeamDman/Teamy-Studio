@@ -59,6 +59,9 @@ Block-style terminal cursors must keep the glyph beneath them legible instead of
 behavior[window.appearance.terminal.scrollbar.shader]
 The terminal area must render a visible scrollbar track and thumb using the panel shader pipeline rather than native window chrome.
 
+behavior[window.appearance.terminal.scrollbar.stateful]
+The terminal scrollbar must visibly respond to hover and active dragging with a higher-contrast animated treatment so its interactive state is obvious.
+
 ## Window Interaction
 
 behavior[window.interaction.drag]
@@ -99,6 +102,12 @@ Holding Alt while dragging with the left mouse button across the terminal area m
 
 behavior[window.interaction.selection.drag-auto-scroll]
 When a terminal text selection drag moves beyond the top or bottom edge of the visible terminal viewport, the viewport must keep scrolling in that direction without requiring mouse-wheel input or a mouse release, and the scrollback velocity must increase with the pointer's distance beyond the viewport.
+
+behavior[window.interaction.scrollback.scrollbar-drag]
+Dragging the terminal scrollbar thumb must directly adjust the terminal viewport through scrollback, keep the thumb position synchronized with the viewport offset, and continue tracking pointer motion until mouse release even if the pointer leaves the window bounds after the drag begins.
+
+behavior[window.interaction.scrollback.scrollbar-track-grab]
+Pressing the terminal scrollbar track must move the thumb toward the pointer and continue as a drag without requiring a second click.
 
 behavior[window.interaction.clipboard.right-click-copy-selection]
 When a terminal selection is present, right clicking in the terminal area must copy the selected text to the clipboard and clear the selection.

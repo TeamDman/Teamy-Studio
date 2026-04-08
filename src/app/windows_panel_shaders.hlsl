@@ -374,17 +374,27 @@ float4 apply_button(float2 uv, float4 color, float effect) {
 
 float4 apply_terminal_scrollbar_track(float2 uv, float4 color) {
     float t = PanelTime();
-    float groove = 0.88 + (0.05 * sin((uv.y * 15.0) + (t * 0.75)));
-    float inset = 0.92 - (0.12 * abs((uv.x - 0.5) * 2.0));
-    return float4(color.rgb * groove * inset, color.a);
+    float hover = saturate((color.a - 0.78) / 0.12);
+    float center = 1.0 - smoothstep(0.08, 0.95, abs((uv.x - 0.5) * 2.0));
+    float ribbon = 0.5 + (0.5 * sin((uv.y * 24.0) - (t * 2.1)));
+    float shimmer = 0.5 + (0.5 * sin((uv.x * 8.0) + (uv.y * 10.0) + (t * 1.3)));
+    float pulse = 0.94 + (0.06 * sin((uv.y * 7.0) + (t * 0.9)));
+    float glow = pulse + (center * (0.12 + (0.10 * hover))) + (ribbon * 0.08) + (shimmer * 0.04);
+    float3 tint = lerp(color.rgb * float3(0.92, 0.86, 1.08), color.rgb * float3(1.08, 0.94, 1.20), hover);
+    return float4(tint * glow, color.a);
 }
 
 float4 apply_terminal_scrollbar_thumb(float2 uv, float4 color) {
     float t = PanelTime();
-    float sheen = 0.95 + (0.08 * sin((uv.y * 9.0) - (t * 1.1)));
-    float ridge = 1.0 - (0.14 * abs((uv.x - 0.5) * 2.0));
-    float cap = 0.96 + (0.05 * sin((uv.x * 12.0) + (t * 0.6)));
-    return float4(color.rgb * sheen * ridge * cap, color.a);
+    float hover = saturate((color.a - 0.88) / 0.08);
+    float grabbed = saturate((color.a - 0.97) / 0.03);
+    float center = 1.0 - smoothstep(0.10, 0.98, abs((uv.x - 0.5) * 2.0));
+    float ribbon = 0.5 + (0.5 * sin((uv.y * 32.0) - (t * (2.6 + grabbed))));
+    float sparkle = 0.5 + (0.5 * sin((uv.x * 9.0) + (uv.y * 18.0) + (t * 3.2)));
+    float cap = 0.94 + (0.06 * sin((uv.x * 15.0) - (t * 1.1)));
+    float intensity = cap + (center * (0.16 + (0.10 * hover) + (0.08 * grabbed))) + (ribbon * (0.08 + (0.08 * grabbed))) + (sparkle * (0.03 + (0.06 * hover)));
+    float3 tint = lerp(color.rgb * float3(1.02, 0.92, 1.04), float3(1.00, 0.84, 1.00), grabbed);
+    return float4(tint * intensity, color.a);
 }
 
 float4 PSMain(PsInput input) : SV_TARGET {
