@@ -1,6 +1,6 @@
 # CLI
 
-This specification covers the current user-facing command line behavior exposed by Teamy Studio.
+This specification covers the current Teamy Studio command surface, command-specific behavior, parser model, and path resolution rules.
 
 ## Command Surface
 
@@ -72,9 +72,6 @@ The `workspace run` command must create a new workspace when no workspace target
 cli[workspace.run.target-by-id-or-name]
 The `workspace run` command must resolve an existing workspace by exact id or exact name when a target is provided.
 
-cli[workspace.plus-button.appends-cell]
-Clicking the plus button in a workspace cell window must append a new cell to that workspace and open the new cell in its own window.
-
 ## Shell Defaults
 
 cli[shell.default.persisted-in-app-home]
@@ -86,100 +83,8 @@ The `shell default show` command must print the effective default shell command 
 cli[shell.default.fallback.builtin]
 If no persisted default shell command exists, Teamy Studio must fall back to a built-in default shell command.
 
-cli[shell.default.fallback.windows-comspec]
-On Windows, the built-in default shell command must use `COMSPEC` when it is set or `cmd.exe` otherwise, and it must include `/D`.
-
-cli[shell.default.windows-launch-resolves-program-on-path]
-On Windows, when the configured default shell program is a bare executable name without path separators, Teamy Studio must resolve it through `PATH` and `PATHEXT` before launching it inside the PTY-backed window.
-
 cli[shell.default.set.double-dash-trailing-args]
 The `shell default set` command must accept dash-prefixed shell arguments after a `--` delimiter so they are treated as trailing shell arguments rather than Teamy Studio CLI flags.
-
-## Window Behavior
-
-cli[window.startup.centered]
-The launched terminal window must open centered on screen.
-
-cli[window.startup.size]
-The launched terminal window must start at a fixed size suitable for an 80x24-style shell surface.
-
-cli[window.appearance.translucent]
-The launched terminal window must use layered-window alpha so the shell surface remains translucent.
-
-cli[window.appearance.os-chrome-none]
-The launched terminal window must not show OS-managed chrome or decorations such as the title bar, icon, caption buttons, or user-preference-colored window borders.
-
-cli[window.appearance.shell]
-The launched window must host a shell backed by a PTY and render terminal content through `libghostty-vt`.
-
-cli[window.appearance.shell-configured-default]
-The launched window must start the effective default shell command rather than a hard-coded shell executable.
-
-cli[window.appearance.shell-starts-in-workspace-cell-dir]
-When a workspace is launched, the PTY-backed shell must start in that workspace's selected cell directory.
-
-cli[window.appearance.chrome]
-The launched terminal window must render a visible accent strip above the terminal grid.
-
-cli[window.appearance.drag-cursor]
-Hovering the pointer over the purple drag strip must show a move-style drag affordance instead of the default arrow cursor.
-
-cli[window.appearance.panel-borders.absolute-pixels]
-Panel edge highlights must use absolute pixel thickness rather than proportional UV scaling so the border treatment stays visually consistent across large and small panels.
-
-cli[window.appearance.backgrounds.animated-time-based]
-Shader-driven panel backgrounds must animate from elapsed time rather than frame count so the motion reads the same at different refresh rates.
-
-cli[window.appearance.backgrounds.blue-half-transparent]
-The blue background panel must render at 50% alpha beneath the opaque notebook panels.
-
-cli[window.appearance.code-panel.single-surface]
-The code area must read as a single panel surface rather than an outer code panel containing a second nested framed terminal panel.
-
-cli[window.appearance.code-panel.terminal-alignment]
-The terminal area must align with the bottom-left of the code area instead of appearing as a separately inset framed region.
-
-cli[window.appearance.terminal.selection.inverse]
-Selected terminal cells must render with visible reverse-video style rather than only dimming the foreground glyphs.
-
-cli[window.appearance.terminal.cursor.visible]
-The terminal caret must be visibly rendered using the terminal's active cursor position and cursor style.
-
-cli[window.appearance.terminal.cursor.legible-block]
-Block-style terminal cursors must keep the glyph beneath them legible instead of fully obliterating the cell contents.
-
-cli[window.interaction.drag]
-The launched terminal window must be draggable by clicking and dragging on the top accent strip.
-
-cli[window.interaction.drag.live]
-While the user is holding the top accent strip to reposition the window, the app must keep presenting frames immediately, without a noticeable startup pause, even if the pointer pauses and the window bounds temporarily stop changing.
-
-cli[window.interaction.drag.threshold]
-The frameless drag strip must support a zero-pixel drag threshold so the native window move loop can begin with no deadzone when that behavior is configured.
-
-cli[window.interaction.resize.native-edges]
-The launched terminal window must still resize from its edges and corners using native OS hit-testing semantics and native resize cursors even though OS-managed chrome is hidden.
-
-cli[window.interaction.resize.live]
-While the user is actively resizing the window, the presented UI must continue reacting immediately during the full grab, including moments when the pointer pauses and the client size is temporarily unchanged, instead of freezing and snapping only after the drag ends.
-
-cli[window.interaction.resize.terminal-live-output]
-Interactive resize must not stall terminal output presentation while other app-rendered panels continue updating.
-
-cli[window.interaction.resize.low-latency]
-Interactive resize must prioritize minimal latency so panel layout and terminal presentation track the live window dimensions as closely as possible.
-
-cli[window.interaction.input]
-The launched terminal window must forward keyboard input into the PTY-backed shell session.
-
-cli[window.interaction.input.numpad-numlock-text]
-When NumLock is enabled, numpad digit and operator keys must be forwarded as their text characters rather than being dropped.
-
-cli[window.interaction.zoom.terminal]
-Holding Ctrl while scrolling over the terminal area must adjust the terminal text scale and recompute the terminal column and row count to fit the resized cell grid.
-
-cli[window.interaction.zoom.output]
-Holding Ctrl while scrolling over the output panel must adjust only the output panel text scale and must not change the terminal grid size.
 
 ## Parser Model
 

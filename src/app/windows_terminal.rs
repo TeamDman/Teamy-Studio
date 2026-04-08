@@ -283,8 +283,8 @@ impl TerminalLayout {
 }
 
 impl TerminalSession {
-    /// cli[impl window.appearance.shell]
-    /// cli[impl window.appearance.shell-configured-default]
+    /// behavior[impl window.appearance.shell]
+    /// behavior[impl window.appearance.shell-configured-default]
     pub fn new(app_home: &AppHome, working_dir: Option<&Path>) -> eyre::Result<Self> {
         let mut command = crate::shell_default::load_effective_command_builder(app_home)?;
         if let Some(working_dir) = working_dir {

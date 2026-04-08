@@ -232,7 +232,7 @@ fn test_shell_default_set_and_show_roundtrip_with_app_home_override() {
 }
 
 // cli[verify shell.default.fallback.builtin]
-// cli[verify shell.default.fallback.windows-comspec]
+// os[verify shell.default.fallback.windows-comspec]
 #[test]
 fn test_shell_default_show_uses_builtin_fallback_when_unset() {
     let app_home = TempDirGuard::new("teamy-studio-cli-shell-fallback");

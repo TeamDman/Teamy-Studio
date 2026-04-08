@@ -1,7 +1,7 @@
 #![cfg(windows)]
 //! cli[verify command.surface.self-test]
 //! cli[verify command.surface.self-test-keyboard-input]
-//! cli[verify window.interaction.input]
+//! behavior[verify window.interaction.input]
 
 use std::path::{Path, PathBuf};
 use std::process::Command;

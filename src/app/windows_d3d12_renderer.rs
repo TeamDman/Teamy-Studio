@@ -27,6 +27,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::time::Instant;
 
+// os[impl os.windows.rendering.direct3d12]
 use eyre::Context;
 use fontdb::{Database, Family, Query, Source};
 use image::{ImageBuffer, Rgba};

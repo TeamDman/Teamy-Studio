@@ -132,7 +132,7 @@ pub fn open_workspace(cache_home: &CacheHome, target: Option<&str>) -> Result<Wo
     }
 }
 
-/// cli[impl workspace.plus-button.appends-cell]
+/// behavior[impl workspace.plus-button.appends-cell]
 ///
 /// # Errors
 ///

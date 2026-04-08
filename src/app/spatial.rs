@@ -12,6 +12,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
 sguaba::system!(pub(crate) struct ScreenSpace using right-handed XYZ);
 sguaba::system!(pub(crate) struct ClientSpace using right-handed XYZ);
 
+// convention[impl convention.types.newtypes-for-domain-boundaries]
+// convention[impl convention.measurements.use-uom]
+// convention[impl convention.spatial.transforms.use-sguaba]
 #[derive(Debug, PartialEq)]
 pub(crate) struct Point<Space> {
     coordinate: Coordinate<Space>,

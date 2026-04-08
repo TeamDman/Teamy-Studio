@@ -75,6 +75,7 @@ struct AppState {
     renderer: Option<D3d12PanelRenderer>,
 }
 
+// convention[impl convention.invariants.encode-in-types]
 #[derive(Clone, Copy, Debug)]
 struct WindowThread {
     _thread_affinity: PhantomData<*mut ()>,
@@ -270,9 +271,9 @@ fn dispatch_message(message: &MSG) {
 }
 
 /// Launch the Teamy Studio terminal window and block until it closes.
-/// cli[impl window.startup.centered]
-/// cli[impl window.startup.size]
-/// cli[impl window.appearance.translucent]
+/// behavior[impl window.startup.centered]
+/// behavior[impl window.startup.size]
+/// os[impl window.appearance.translucent]
 ///
 /// # Errors
 ///
@@ -903,8 +904,8 @@ fn terminal_font_definition(font_height: i32) -> LOGFONTW {
 }
 
 fn handle_mouse_wheel(hwnd: WindowHandle, wparam: WPARAM, lparam: LPARAM) -> eyre::Result<bool> {
-    // cli[impl window.interaction.zoom.terminal]
-    // cli[impl window.interaction.zoom.output]
+    // behavior[impl window.interaction.zoom.terminal]
+    // behavior[impl window.interaction.zoom.output]
     let ctrl_down = control_key_is_down();
     if !ctrl_down {
         return Ok(false);

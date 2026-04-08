@@ -33,7 +33,7 @@ pub fn run(app_home: &AppHome) -> eyre::Result<()> {
 }
 
 /// Run the Teamy Studio application shell with an explicit starting directory.
-/// cli[impl window.appearance.shell-starts-in-workspace-cell-dir]
+/// behavior[impl window.appearance.shell-starts-in-workspace-cell-dir]
 ///
 /// # Errors
 ///

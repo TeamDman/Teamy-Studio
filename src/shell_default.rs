@@ -22,7 +22,7 @@ pub fn default_shell_path(app_home: &AppHome) -> PathBuf {
 }
 
 /// cli[impl shell.default.fallback.builtin]
-/// cli[impl shell.default.fallback.windows-comspec]
+/// os[impl shell.default.fallback.windows-comspec]
 ///
 /// # Errors
 ///
@@ -120,7 +120,7 @@ pub fn command_builder_from_argv(command_argv: &[String]) -> eyre::Result<Comman
 }
 
 #[cfg(windows)]
-/// cli[impl shell.default.windows-launch-resolves-program-on-path]
+/// os[impl shell.default.windows-launch-resolves-program-on-path]
 fn resolve_windows_program(program: &str) -> PathBuf {
     resolve_windows_program_on_path(program).unwrap_or_else(|| PathBuf::from(program))
 }
@@ -342,7 +342,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    // cli[verify shell.default.windows-launch-resolves-program-on-path]
+    // os[verify shell.default.windows-launch-resolves-program-on-path]
     fn command_builder_resolves_bare_windows_program_names() {
         let command = command_builder_from_argv(&["cmd".to_owned(), "/D".to_owned()])
             .expect("command builder should resolve cmd through PATH");

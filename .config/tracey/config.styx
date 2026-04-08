@@ -45,4 +45,40 @@ specs (
             }
         )
     }
+    {
+        name teamy-studio-behavior
+        source_url https://github.com/TeamDman/Teamy-Studio
+        include (docs/spec/product/behavior.md)
+        impls (
+            {
+                name rust
+                include (src/**/*.rs)
+                test_include (tests/**/*.rs)
+            }
+        )
+    }
+    {
+        name teamy-studio-convention
+        source_url https://github.com/TeamDman/Teamy-Studio
+        include (docs/spec/product/conventions.md)
+        impls (
+            {
+                name rust
+                include (src/**/*.rs)
+                test_include (tests/**/*.rs)
+            }
+        )
+    }
+    {
+        name teamy-studio-os
+        source_url https://github.com/TeamDman/Teamy-Studio
+        include (docs/spec/product/os.md)
+        impls (
+            {
+                name rust
+                include (src/**/*.rs)
+                test_include (tests/**/*.rs)
+            }
+        )
+    }
 )
