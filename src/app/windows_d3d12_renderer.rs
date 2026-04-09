@@ -175,7 +175,7 @@ pub struct GlyphQuad {
     pub character: char,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct RenderScene {
     pub panels: Vec<PanelRect>,
     pub glyphs: Vec<GlyphQuad>,
@@ -454,8 +454,17 @@ impl D3d12PanelRenderer {
         }
     }
 
-    #[cfg_attr(feature = "tracy", instrument(level = "debug", skip_all, fields(panel_count = scene.panels.len(), glyph_count = scene.glyphs.len(), overlay_count = scene.overlay_panels.len())))]
+    #[expect(
+        dead_code,
+        reason = "compatibility wrapper while callers migrate to fragment-based rendering"
+    )]
+    #[cfg_attr(feature = "tracy", instrument(level = "debug", skip_all))]
     pub fn render(&mut self, scene: &RenderScene) -> eyre::Result<()> {
+        self.render_fragments(&[scene])
+    }
+
+    #[cfg_attr(feature = "tracy", instrument(level = "debug", skip_all))]
+    pub fn render_fragments(&mut self, scenes: &[&RenderScene]) -> eyre::Result<()> {
         {
             #[cfg(feature = "tracy")]
             let _span = debug_span!("wait_for_frame_sync").entered();
@@ -464,19 +473,19 @@ impl D3d12PanelRenderer {
         let frame_index = unsafe { self.swap_chain.GetCurrentBackBufferIndex() as usize };
         {
             #[cfg(feature = "tracy")]
-            let _span = debug_span!("wait_for_frame_fence", frame_index).entered();
+            let _span = debug_span!("wait_for_frame_fence").entered();
             self.wait_for_frame(frame_index)?;
         }
 
         {
             #[cfg(feature = "tracy")]
             let _span = debug_span!("update_slug_curves").entered();
-            self.update_slug_curves(scene)?;
+            self.update_slug_curves_for_fragments(scenes)?;
         }
         let vertex_count = {
             #[cfg(feature = "tracy")]
             let _span = debug_span!("update_scene_vertices").entered();
-            self.update_scene_vertices(scene)?
+            self.update_scene_vertices_for_fragments(scenes)?
         };
         let current_target = self.render_targets[frame_index]
             .as_ref()
@@ -485,7 +494,7 @@ impl D3d12PanelRenderer {
 
         {
             #[cfg(feature = "tracy")]
-            let _span = debug_span!("record_render_commands", frame_index, vertex_count).entered();
+            let _span = debug_span!("record_render_commands").entered();
             unsafe {
                 command_allocator.Reset()?;
                 self.command_list
@@ -545,7 +554,7 @@ impl D3d12PanelRenderer {
         let command_lists = [Some(self.command_list.cast::<ID3D12CommandList>()?)];
         {
             #[cfg(feature = "tracy")]
-            let _span = debug_span!("submit_and_present_frame", frame_index).entered();
+            let _span = debug_span!("submit_and_present_frame").entered();
             unsafe {
                 self.command_queue.ExecuteCommandLists(&command_lists);
                 self.swap_chain.Present(0, DXGI_PRESENT(0)).ok()?;
@@ -558,40 +567,47 @@ impl D3d12PanelRenderer {
         Ok(())
     }
 
-    fn update_scene_vertices(&self, scene: &RenderScene) -> eyre::Result<usize> {
-        let mut vertices = Vec::with_capacity(scene.panels.len() * 6);
-        for panel in &scene.panels {
-            append_rect(
-                &mut vertices,
-                panel.rect,
-                panel.color,
-                panel.effect as u32,
-                0,
-            );
-        }
-        for glyph in &scene.glyphs {
-            let slug_glyph = self
-                .glyph_cache
-                .get(&glyph.character)
-                .or_else(|| self.glyph_cache.get(&FALLBACK_GLYPH))
-                .copied()
-                .unwrap_or_else(|| SlugGlyph::empty(&self.font));
-            append_text_rect(
-                &mut vertices,
-                glyph.rect,
-                glyph.color,
-                slug_glyph,
-                &self.font,
-            );
-        }
-        for panel in &scene.overlay_panels {
-            append_rect(
-                &mut vertices,
-                panel.rect,
-                panel.color,
-                panel.effect as u32,
-                0,
-            );
+    fn update_scene_vertices_for_fragments(&self, scenes: &[&RenderScene]) -> eyre::Result<usize> {
+        let vertex_capacity = scenes
+            .iter()
+            .map(|scene| scene.panels.len() + scene.glyphs.len() + scene.overlay_panels.len())
+            .sum::<usize>()
+            * 6;
+        let mut vertices = Vec::with_capacity(vertex_capacity);
+        for scene in scenes {
+            for panel in &scene.panels {
+                append_rect(
+                    &mut vertices,
+                    panel.rect,
+                    panel.color,
+                    panel.effect as u32,
+                    0,
+                );
+            }
+            for glyph in &scene.glyphs {
+                let slug_glyph = self
+                    .glyph_cache
+                    .get(&glyph.character)
+                    .or_else(|| self.glyph_cache.get(&FALLBACK_GLYPH))
+                    .copied()
+                    .unwrap_or_else(|| SlugGlyph::empty(&self.font));
+                append_text_rect(
+                    &mut vertices,
+                    glyph.rect,
+                    glyph.color,
+                    slug_glyph,
+                    &self.font,
+                );
+            }
+            for panel in &scene.overlay_panels {
+                append_rect(
+                    &mut vertices,
+                    panel.rect,
+                    panel.color,
+                    panel.effect as u32,
+                    0,
+                );
+            }
         }
 
         unsafe {
@@ -604,8 +620,16 @@ impl D3d12PanelRenderer {
         Ok(vertices.len())
     }
 
-    fn update_slug_curves(&mut self, scene: &RenderScene) -> eyre::Result<()> {
-        let scene_chars = collect_scene_chars(scene);
+    #[expect(
+        dead_code,
+        reason = "compatibility wrapper while callers migrate to fragment-based rendering"
+    )]
+    fn update_scene_vertices(&self, scene: &RenderScene) -> eyre::Result<usize> {
+        self.update_scene_vertices_for_fragments(&[scene])
+    }
+
+    fn update_slug_curves_for_fragments(&mut self, scenes: &[&RenderScene]) -> eyre::Result<()> {
+        let scene_chars = collect_scene_chars_from_fragments(scenes);
         if scene_chars == self.cached_chars {
             return Ok(());
         }
@@ -671,6 +695,14 @@ impl D3d12PanelRenderer {
         }
 
         Ok(())
+    }
+
+    #[expect(
+        dead_code,
+        reason = "compatibility wrapper while callers migrate to fragment-based rendering"
+    )]
+    fn update_slug_curves(&mut self, scene: &RenderScene) -> eyre::Result<()> {
+        self.update_slug_curves_for_fragments(&[scene])
     }
 
     fn wait_for_frame(&self, frame_index: usize) -> eyre::Result<()> {
@@ -889,12 +921,26 @@ pub fn push_glyph(scene: &mut RenderScene, rect: RECT, character: char, color: [
     });
 }
 
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "compatibility wrapper while callers migrate to fragment-based rendering"
+    )
+)]
 fn collect_scene_chars(scene: &RenderScene) -> Vec<char> {
-    let mut chars = Vec::with_capacity(scene.glyphs.len() + 1);
+    collect_scene_chars_from_fragments(&[scene])
+}
+
+fn collect_scene_chars_from_fragments(scenes: &[&RenderScene]) -> Vec<char> {
+    let glyph_capacity = scenes.iter().map(|scene| scene.glyphs.len()).sum::<usize>() + 1;
+    let mut chars = Vec::with_capacity(glyph_capacity);
     chars.push(FALLBACK_GLYPH);
-    for glyph in &scene.glyphs {
-        if !chars.contains(&glyph.character) {
-            chars.push(glyph.character);
+    for scene in scenes {
+        for glyph in &scene.glyphs {
+            if !chars.contains(&glyph.character) {
+                chars.push(glyph.character);
+            }
         }
     }
     chars

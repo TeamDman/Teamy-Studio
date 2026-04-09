@@ -158,6 +158,23 @@ Usually avoid:
 
 If a function takes large or noisy arguments, use `skip_all` or explicit `skip(...)`.
 
+For Teamy-Studio specifically, avoid adding fields to short, high-frequency spans that you expect to inspect in Tracy statistics.
+Tracy groups span statistics by the rendered span name, so a hot span like `flush_pending_output{queued_bytes=6246}` fragments into many distinct entries instead of one useful aggregate.
+
+Use fields on:
+
+- long-lived coarse spans
+- startup spans
+- infrequent spans where per-instance metadata is actually the point
+
+Avoid fields on:
+
+- per-frame spans
+- per-poll spans
+- per-message spans
+- per-chunk parsing spans
+- other hot short-lived spans you want Tracy to group cleanly
+
 ### 6. Instrument hierarchically
 
 Work top down.
@@ -208,6 +225,7 @@ Mirror the style already established in teamy-mft:
 - `#[cfg(feature = "tracy")] let _span = debug_span!(...).entered();` in tight loops
 - always-on `info_span!` around important higher-level phases
 - `skip_all` on functions whose arguments are large or noisy
+- omit fields on popular short-lived Tracy spans so statistics aggregate cleanly
 
 For Teamy-Studio specifically, Clippy may enforce both `semicolon_outside_block` and `semicolon_if_nothing_returned`.
 When a scoped span block triggers both lints, prefer this shape:
@@ -271,6 +289,7 @@ Before finishing, verify all of these:
 - Hot-loop spans are gated behind `feature = "tracy"`.
 - Coarse phase spans remain available without Tracy.
 - Span fields are bounded and useful.
+- Hot short-lived spans that matter in Tracy statistics are not parameterized.
 - Large arguments are skipped.
 - The resulting capture is easier to reason about than the uninstrumented trace.
 
@@ -281,6 +300,7 @@ Avoid these mistakes:
 - adding spans to every function in a file
 - guarding every span behind `feature = "tracy"`
 - leaving high-volume inner spans always-on in render or parsing loops
+- parameterizing hot short-lived spans and fragmenting Tracy statistics
 - putting huge payloads in span fields
 - using spans where a normal log message is the better tool
 - adding detail before first adding a coarse parent span

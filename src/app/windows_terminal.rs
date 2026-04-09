@@ -3,6 +3,7 @@ use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::{Arc, Mutex, mpsc};
+use std::time::{Duration, Instant};
 #[cfg(feature = "tracy")]
 use tracing::debug_span;
 use tracing::trace;
@@ -34,9 +35,13 @@ pub const POLL_INTERVAL_MS: u32 = 16;
 const DEFAULT_COLS: u16 = 80;
 const DEFAULT_ROWS: u16 = 24;
 const MAX_SCROLLBACK: usize = 20_000;
-const TERMINAL_OUTPUT_SLICE_BYTES: usize = 2_048;
-const TERMINAL_OUTPUT_PUMP_BYTE_BUDGET: usize = 16 * 1_024;
+const PTY_READ_BUFFER_BYTES: usize = 128 * 1_024;
+const PTY_READ_CHANNEL_CAPACITY: usize = 8;
+const TERMINAL_OUTPUT_SLICE_BYTES: usize = 256;
 const TERMINAL_OUTPUT_QUEUE_SOFT_LIMIT_BYTES: usize = 64 * 1_024;
+const TERMINAL_WORKER_IDLE_TIMEOUT: Duration = Duration::from_millis(1);
+const TERMINAL_WORKER_PUMP_TIME_BUDGET: Duration = Duration::from_millis(2);
+const TERMINAL_DISPLAY_PUBLISH_INTERVAL: Duration = Duration::from_millis(16);
 const CELL_PANEL_GAP: i32 = 14;
 const SIDECAR_WIDTH: i32 = 86;
 const RESULT_PANEL_HEIGHT: i32 = 152;
@@ -81,6 +86,11 @@ impl SuppressedChar {
 }
 
 pub struct PumpResult {
+    pub should_close: bool,
+}
+
+pub struct PollPtyOutputResult {
+    pub queued_output: bool,
     pub should_close: bool,
 }
 
@@ -233,6 +243,14 @@ struct SemanticPromptTracking {
 }
 
 pub struct TerminalSession {
+    worker_tx: mpsc::Sender<TerminalWorkerRequest>,
+    worker_updates: mpsc::Receiver<TerminalWorkerUpdate>,
+    snapshot: TerminalSnapshot,
+    worker_queued_output: bool,
+    cached_display: TerminalDisplayState,
+}
+
+struct TerminalCore {
     terminal: Terminal<'static, 'static>,
     render_state: RenderState<'static>,
     key_encoder: key::Encoder<'static>,
@@ -251,10 +269,79 @@ pub struct TerminalSession {
     win32_input_mode_buffer: Vec<u8>,
     semantic_prompt_buffer: Vec<u8>,
     semantic_prompt: SemanticPromptTracking,
+    cached_display: TerminalDisplayState,
+    display_cache_dirty: bool,
     closed: bool,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TerminalSnapshot {
+    cols: u16,
+    rows: u16,
+    pending_output_bytes: usize,
+    closed: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum TerminalWorkerCommand {
+    Resize(TerminalLayout),
+    HandleChar {
+        code_unit: u32,
+        lparam: isize,
+    },
+    HandleKeyEvent {
+        vkey: u32,
+        lparam: isize,
+        was_down: bool,
+        is_release: bool,
+        mods: key::Mods,
+    },
+    HandlePaste(String),
+    SelectedText(TerminalSelection),
+    VisibleText,
+    ViewportMetrics,
+    ViewportToScreenCell(TerminalCellPoint),
+    ScrollViewportBy(isize),
+    ScrollViewportToOffset(u64),
+    VisibleDisplayStateWithSelection(Option<TerminalSelection>),
+    CurrentKittyKeyboardFlags,
+    Win32InputModeEnabled,
+    TakeInputTrace,
+    SemanticPromptState,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum TerminalWorkerUpdate {
+    Snapshot(TerminalSnapshot),
+    DisplayState(TerminalDisplayState),
+    PtyOutputQueued,
+    RepaintRequested,
+    ChildExited,
+}
+
+struct TerminalWorkerRequest {
+    command: TerminalWorkerCommand,
+    reply_tx: mpsc::SyncSender<eyre::Result<TerminalWorkerResponse>>,
+}
+
+struct TerminalWorkerResponse {
+    snapshot: TerminalSnapshot,
+    payload: TerminalWorkerResponsePayload,
+}
+
+enum TerminalWorkerResponsePayload {
+    Unit,
+    Bool(bool),
+    String(String),
+    ViewportMetrics(TerminalViewportMetrics),
+    ScreenCell(TerminalCellPoint),
+    DisplayState(TerminalDisplayState),
+    KittyKeyboardFlags(key::KittyKeyFlags),
+    InputTrace(Vec<Vec<u8>>),
+    SemanticPromptState((bool, bool, bool)),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TerminalLayout {
     pub client_width: i32,
     pub client_height: i32,
@@ -405,9 +492,6 @@ impl TerminalLayout {
 }
 
 impl TerminalSession {
-    /// behavior[impl window.appearance.shell]
-    /// behavior[impl window.appearance.shell-configured-default]
-    #[instrument(level = "info", skip_all, fields(has_working_dir = working_dir.is_some()))]
     pub fn new(app_home: &AppHome, working_dir: Option<&Path>) -> eyre::Result<Self> {
         let mut command = crate::shell_default::load_effective_command_builder(app_home)?;
         if let Some(working_dir) = working_dir {
@@ -416,6 +500,512 @@ impl TerminalSession {
         Self::new_with_command(command)
     }
 
+    pub fn new_with_command(shell: CommandBuilder) -> eyre::Result<Self> {
+        let (request_tx, request_rx) = mpsc::channel();
+        let (update_tx, update_rx) = mpsc::channel();
+        let (startup_tx, startup_rx) = mpsc::sync_channel(1);
+
+        std::thread::Builder::new()
+            .name("teamy-terminal-worker".to_owned())
+            .spawn(move || {
+                let startup_result = TerminalCore::new_with_command(shell).map(|core| {
+                    let snapshot = core.snapshot();
+                    (
+                        TerminalWorkerRunner::new(core, request_rx, update_tx),
+                        snapshot,
+                    )
+                });
+
+                match startup_result {
+                    Ok((mut runner, snapshot)) => {
+                        let _ = startup_tx.send(Ok(snapshot));
+                        runner.run();
+                    }
+                    Err(error) => {
+                        let _ = startup_tx.send(Err(error));
+                    }
+                }
+            })
+            .map_err(|error| eyre::eyre!("failed to spawn terminal worker thread: {error}"))?;
+
+        let snapshot = startup_rx.recv().map_err(|error| {
+            eyre::eyre!("terminal worker failed to report startup state: {error}")
+        })??;
+
+        Ok(Self {
+            worker_tx: request_tx,
+            worker_updates: update_rx,
+            snapshot,
+            worker_queued_output: false,
+            cached_display: TerminalDisplayState::default(),
+        })
+    }
+
+    pub fn cols(&self) -> u16 {
+        self.snapshot.cols
+    }
+
+    pub fn rows(&self) -> u16 {
+        self.snapshot.rows
+    }
+
+    pub fn has_pending_output(&self) -> bool {
+        self.snapshot.pending_output_bytes > 0
+    }
+
+    pub fn resize(&mut self, layout: TerminalLayout) -> eyre::Result<()> {
+        let response = self.request(TerminalWorkerCommand::Resize(layout))?;
+        match response.payload {
+            TerminalWorkerResponsePayload::Unit => Ok(()),
+            payload => Self::unexpected_response("Resize", payload),
+        }
+    }
+
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "keeps the existing TerminalSession API stable while the worker owns autonomous pumping"
+    )]
+    pub fn pump(&mut self) -> eyre::Result<PumpResult> {
+        self.drain_worker_updates();
+        Ok(PumpResult {
+            should_close: self.snapshot.closed,
+        })
+    }
+
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "keeps the existing TerminalSession API stable while the worker owns PTY polling"
+    )]
+    pub fn poll_pty_output(&mut self) -> eyre::Result<PollPtyOutputResult> {
+        self.drain_worker_updates();
+        let queued_output = std::mem::take(&mut self.worker_queued_output);
+        Ok(PollPtyOutputResult {
+            queued_output,
+            should_close: self.snapshot.closed,
+        })
+    }
+
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "keeps the existing TerminalSession API stable while the worker owns terminal mutation"
+    )]
+    pub fn pump_pending_output(&mut self) -> eyre::Result<PumpResult> {
+        self.drain_worker_updates();
+        Ok(PumpResult {
+            should_close: self.snapshot.closed,
+        })
+    }
+
+    pub fn handle_char(&mut self, code_unit: u32, lparam: isize) -> eyre::Result<bool> {
+        let response = self.request(TerminalWorkerCommand::HandleChar { code_unit, lparam })?;
+        match response.payload {
+            TerminalWorkerResponsePayload::Bool(handled) => Ok(handled),
+            payload => Self::unexpected_response("HandleChar", payload),
+        }
+    }
+
+    pub fn handle_key_event(
+        &mut self,
+        vkey: u32,
+        lparam: isize,
+        was_down: bool,
+        is_release: bool,
+        mods: key::Mods,
+    ) -> eyre::Result<bool> {
+        let response = self.request(TerminalWorkerCommand::HandleKeyEvent {
+            vkey,
+            lparam,
+            was_down,
+            is_release,
+            mods,
+        })?;
+        match response.payload {
+            TerminalWorkerResponsePayload::Bool(handled) => Ok(handled),
+            payload => Self::unexpected_response("HandleKeyEvent", payload),
+        }
+    }
+
+    pub fn current_kitty_keyboard_flags(&self) -> eyre::Result<key::KittyKeyFlags> {
+        let response = self.request_read_only(TerminalWorkerCommand::CurrentKittyKeyboardFlags)?;
+        match response.payload {
+            TerminalWorkerResponsePayload::KittyKeyboardFlags(flags) => Ok(flags),
+            payload => Self::unexpected_response("CurrentKittyKeyboardFlags", payload),
+        }
+    }
+
+    pub fn win32_input_mode_enabled(&self) -> bool {
+        match self.request_read_only(TerminalWorkerCommand::Win32InputModeEnabled) {
+            Ok(response) => match response.payload {
+                TerminalWorkerResponsePayload::Bool(enabled) => enabled,
+                _ => self.snapshot.closed,
+            },
+            Err(_) => self.snapshot.closed,
+        }
+    }
+
+    pub fn handle_paste(&mut self, text: &str) -> eyre::Result<()> {
+        let response = self.request(TerminalWorkerCommand::HandlePaste(text.to_owned()))?;
+        match response.payload {
+            TerminalWorkerResponsePayload::Unit => Ok(()),
+            payload => Self::unexpected_response("HandlePaste", payload),
+        }
+    }
+
+    pub fn selected_text(&mut self, selection: TerminalSelection) -> eyre::Result<String> {
+        let response = self.request(TerminalWorkerCommand::SelectedText(selection))?;
+        match response.payload {
+            TerminalWorkerResponsePayload::String(text) => Ok(text),
+            payload => Self::unexpected_response("SelectedText", payload),
+        }
+    }
+
+    pub fn visible_text(&mut self) -> eyre::Result<String> {
+        let response = self.request(TerminalWorkerCommand::VisibleText)?;
+        match response.payload {
+            TerminalWorkerResponsePayload::String(text) => Ok(text),
+            payload => Self::unexpected_response("VisibleText", payload),
+        }
+    }
+
+    pub fn viewport_metrics(&self) -> eyre::Result<TerminalViewportMetrics> {
+        let response = self.request_read_only(TerminalWorkerCommand::ViewportMetrics)?;
+        match response.payload {
+            TerminalWorkerResponsePayload::ViewportMetrics(metrics) => Ok(metrics),
+            payload => Self::unexpected_response("ViewportMetrics", payload),
+        }
+    }
+
+    pub fn viewport_to_screen_cell(
+        &self,
+        cell: TerminalCellPoint,
+    ) -> eyre::Result<TerminalCellPoint> {
+        let response = self.request_read_only(TerminalWorkerCommand::ViewportToScreenCell(cell))?;
+        match response.payload {
+            TerminalWorkerResponsePayload::ScreenCell(screen_cell) => Ok(screen_cell),
+            payload => Self::unexpected_response("ViewportToScreenCell", payload),
+        }
+    }
+
+    pub fn scroll_viewport_by(&mut self, delta: isize) {
+        let _ = self.request(TerminalWorkerCommand::ScrollViewportBy(delta));
+    }
+
+    pub fn scroll_viewport_to_offset(&mut self, offset: u64) -> eyre::Result<()> {
+        let response = self.request(TerminalWorkerCommand::ScrollViewportToOffset(offset))?;
+        match response.payload {
+            TerminalWorkerResponsePayload::Unit => Ok(()),
+            payload => Self::unexpected_response("ScrollViewportToOffset", payload),
+        }
+    }
+
+    pub fn visible_display_state_with_selection(
+        &mut self,
+        selection: Option<TerminalSelection>,
+    ) -> eyre::Result<TerminalDisplayState> {
+        self.drain_worker_updates();
+        if selection.is_none() {
+            return Ok(self.cached_display.clone());
+        }
+
+        let response = self.request(TerminalWorkerCommand::VisibleDisplayStateWithSelection(
+            selection,
+        ))?;
+        match response.payload {
+            TerminalWorkerResponsePayload::DisplayState(display) => Ok(display),
+            payload => Self::unexpected_response("VisibleDisplayStateWithSelection", payload),
+        }
+    }
+
+    #[must_use]
+    pub fn take_input_trace(&mut self) -> Vec<Vec<u8>> {
+        match self.request(TerminalWorkerCommand::TakeInputTrace) {
+            Ok(response) => match response.payload {
+                TerminalWorkerResponsePayload::InputTrace(trace) => trace,
+                _ => Vec::new(),
+            },
+            Err(_) => Vec::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn semantic_prompt_state(&self) -> (bool, bool, bool) {
+        match self.request_read_only(TerminalWorkerCommand::SemanticPromptState) {
+            Ok(response) => match response.payload {
+                TerminalWorkerResponsePayload::SemanticPromptState(state) => state,
+                _ => (false, false, false),
+            },
+            Err(_) => (false, false, false),
+        }
+    }
+
+    fn request(&mut self, command: TerminalWorkerCommand) -> eyre::Result<TerminalWorkerResponse> {
+        self.drain_worker_updates();
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        self.worker_tx
+            .send(TerminalWorkerRequest { command, reply_tx })
+            .map_err(|error| eyre::eyre!("failed to send terminal worker request: {error}"))?;
+        let response = reply_rx
+            .recv()
+            .map_err(|error| eyre::eyre!("terminal worker dropped response channel: {error}"))??;
+        self.snapshot = response.snapshot;
+        self.drain_worker_updates();
+        Ok(response)
+    }
+
+    fn request_read_only(
+        &self,
+        command: TerminalWorkerCommand,
+    ) -> eyre::Result<TerminalWorkerResponse> {
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        self.worker_tx
+            .send(TerminalWorkerRequest { command, reply_tx })
+            .map_err(|error| eyre::eyre!("failed to send terminal worker request: {error}"))?;
+        reply_rx
+            .recv()
+            .map_err(|error| eyre::eyre!("terminal worker dropped response channel: {error}"))?
+    }
+
+    fn drain_worker_updates(&mut self) {
+        while let Ok(update) = self.worker_updates.try_recv() {
+            match update {
+                TerminalWorkerUpdate::Snapshot(snapshot) => {
+                    self.snapshot = snapshot;
+                }
+                TerminalWorkerUpdate::DisplayState(display) => {
+                    self.cached_display = display;
+                }
+                TerminalWorkerUpdate::PtyOutputQueued => {
+                    self.worker_queued_output = true;
+                }
+                TerminalWorkerUpdate::ChildExited => {
+                    self.snapshot.closed = true;
+                }
+                TerminalWorkerUpdate::RepaintRequested => {}
+            }
+        }
+    }
+
+    fn unexpected_response<T>(
+        command_name: &str,
+        _payload: TerminalWorkerResponsePayload,
+    ) -> eyre::Result<T> {
+        eyre::bail!("terminal worker returned an unexpected response for {command_name}")
+    }
+}
+
+struct TerminalWorkerRunner {
+    core: TerminalCore,
+    request_rx: mpsc::Receiver<TerminalWorkerRequest>,
+    update_tx: mpsc::Sender<TerminalWorkerUpdate>,
+    last_snapshot: TerminalSnapshot,
+    last_display_publish_at: Instant,
+}
+
+impl TerminalWorkerRunner {
+    fn new(
+        core: TerminalCore,
+        request_rx: mpsc::Receiver<TerminalWorkerRequest>,
+        update_tx: mpsc::Sender<TerminalWorkerUpdate>,
+    ) -> Self {
+        let last_snapshot = core.snapshot();
+        Self {
+            core,
+            request_rx,
+            update_tx,
+            last_snapshot,
+            last_display_publish_at: Instant::now()
+                .checked_sub(TERMINAL_DISPLAY_PUBLISH_INTERVAL)
+                .unwrap_or_else(Instant::now),
+        }
+    }
+
+    fn run(&mut self) {
+        let _ = self
+            .update_tx
+            .send(TerminalWorkerUpdate::Snapshot(self.last_snapshot));
+        let _ = self.publish_display_state_if_due();
+
+        loop {
+            match self.request_rx.recv_timeout(TERMINAL_WORKER_IDLE_TIMEOUT) {
+                Ok(request) => {
+                    if self.handle_request(request).is_err() {
+                        break;
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+
+            if self.service_background_output().is_err() {
+                let _ = self.update_tx.send(TerminalWorkerUpdate::ChildExited);
+                break;
+            }
+        }
+    }
+
+    fn handle_request(&mut self, request: TerminalWorkerRequest) -> eyre::Result<()> {
+        let payload = match request.command {
+            TerminalWorkerCommand::Resize(layout) => {
+                self.core.resize(layout)?;
+                TerminalWorkerResponsePayload::Unit
+            }
+            TerminalWorkerCommand::HandleChar { code_unit, lparam } => {
+                TerminalWorkerResponsePayload::Bool(self.core.handle_char(code_unit, lparam)?)
+            }
+            TerminalWorkerCommand::HandleKeyEvent {
+                vkey,
+                lparam,
+                was_down,
+                is_release,
+                mods,
+            } => TerminalWorkerResponsePayload::Bool(
+                self.core
+                    .handle_key_event(vkey, lparam, was_down, is_release, mods)?,
+            ),
+            TerminalWorkerCommand::HandlePaste(text) => {
+                self.core.handle_paste(&text)?;
+                TerminalWorkerResponsePayload::Unit
+            }
+            TerminalWorkerCommand::SelectedText(selection) => {
+                TerminalWorkerResponsePayload::String(self.core.selected_text(selection)?)
+            }
+            TerminalWorkerCommand::VisibleText => {
+                TerminalWorkerResponsePayload::String(self.core.visible_text()?)
+            }
+            TerminalWorkerCommand::ViewportMetrics => {
+                TerminalWorkerResponsePayload::ViewportMetrics(self.core.viewport_metrics()?)
+            }
+            TerminalWorkerCommand::ViewportToScreenCell(cell) => {
+                TerminalWorkerResponsePayload::ScreenCell(self.core.viewport_to_screen_cell(cell)?)
+            }
+            TerminalWorkerCommand::ScrollViewportBy(delta) => {
+                self.core.scroll_viewport_by(delta);
+                TerminalWorkerResponsePayload::Unit
+            }
+            TerminalWorkerCommand::ScrollViewportToOffset(offset) => {
+                self.core.scroll_viewport_to_offset(offset)?;
+                TerminalWorkerResponsePayload::Unit
+            }
+            TerminalWorkerCommand::VisibleDisplayStateWithSelection(selection) => {
+                TerminalWorkerResponsePayload::DisplayState(
+                    self.core.visible_display_state_with_selection(selection)?,
+                )
+            }
+            TerminalWorkerCommand::CurrentKittyKeyboardFlags => {
+                TerminalWorkerResponsePayload::KittyKeyboardFlags(
+                    self.core.current_kitty_keyboard_flags()?,
+                )
+            }
+            TerminalWorkerCommand::Win32InputModeEnabled => {
+                TerminalWorkerResponsePayload::Bool(self.core.win32_input_mode_enabled())
+            }
+            TerminalWorkerCommand::TakeInputTrace => {
+                TerminalWorkerResponsePayload::InputTrace(self.core.take_input_trace())
+            }
+            TerminalWorkerCommand::SemanticPromptState => {
+                TerminalWorkerResponsePayload::SemanticPromptState(
+                    self.core.semantic_prompt_state(),
+                )
+            }
+        };
+
+        self.publish_snapshot_if_changed()?;
+        let response = TerminalWorkerResponse {
+            snapshot: self.last_snapshot,
+            payload,
+        };
+        let _ = request.reply_tx.send(Ok(response));
+        Ok(())
+    }
+
+    fn service_background_output(&mut self) -> eyre::Result<()> {
+        let poll_result = self.core.poll_pty_output()?;
+        if poll_result.queued_output {
+            let _ = self.update_tx.send(TerminalWorkerUpdate::PtyOutputQueued);
+        }
+
+        let pump_started_at = Instant::now();
+        let mut processed_output = false;
+        while self.core.has_pending_output() {
+            if let Ok(request) = self.request_rx.try_recv() {
+                if processed_output {
+                    self.core.refresh_semantic_prompt_tracking()?;
+                }
+                self.handle_request(request)?;
+                self.publish_snapshot_if_changed()?;
+                self.publish_display_state_if_due()?;
+                return Ok(());
+            }
+
+            let processed_output_bytes = self.core.pump_pending_output_slice();
+            if processed_output_bytes == 0 {
+                break;
+            }
+            processed_output = true;
+
+            self.publish_snapshot_if_changed()?;
+            self.publish_display_state_if_due()?;
+
+            if pump_started_at.elapsed() >= TERMINAL_WORKER_PUMP_TIME_BUDGET {
+                break;
+            }
+        }
+
+        if processed_output {
+            self.core.refresh_semantic_prompt_tracking()?;
+        }
+
+        self.core.refresh_child_exit_state()?;
+
+        self.publish_snapshot_if_changed()?;
+        self.publish_display_state_if_due()?;
+        if self.last_snapshot.closed {
+            let _ = self.update_tx.send(TerminalWorkerUpdate::ChildExited);
+        }
+        Ok(())
+    }
+
+    fn publish_display_state_if_due(&mut self) -> eyre::Result<()> {
+        if !self.core.display_cache_dirty {
+            return Ok(());
+        }
+
+        if self.core.has_pending_output()
+            && self.last_display_publish_at.elapsed() < TERMINAL_DISPLAY_PUBLISH_INTERVAL
+        {
+            return Ok(());
+        }
+
+        let display = {
+            #[cfg(feature = "tracy")]
+            let _span = debug_span!("publish_cached_terminal_display_state").entered();
+            self.core.cached_display_state()?.clone()
+        };
+        self.last_display_publish_at = Instant::now();
+        self.update_tx
+            .send(TerminalWorkerUpdate::DisplayState(display))
+            .map_err(|error| {
+                eyre::eyre!("failed to publish terminal worker display state: {error}")
+            })?;
+        let _ = self.update_tx.send(TerminalWorkerUpdate::RepaintRequested);
+        Ok(())
+    }
+
+    fn publish_snapshot_if_changed(&mut self) -> eyre::Result<()> {
+        let snapshot = self.core.snapshot();
+        if snapshot != self.last_snapshot {
+            self.last_snapshot = snapshot;
+            self.update_tx
+                .send(TerminalWorkerUpdate::Snapshot(snapshot))
+                .map_err(|error| {
+                    eyre::eyre!("failed to publish terminal worker snapshot: {error}")
+                })?;
+        }
+        Ok(())
+    }
+}
+
+impl TerminalCore {
     #[instrument(level = "info", skip_all)]
     pub fn new_with_command(shell: CommandBuilder) -> eyre::Result<Self> {
         let pty_system = native_pty_system();
@@ -478,9 +1068,9 @@ impl TerminalSession {
                 .try_clone_reader()
                 .map_err(|error| eyre::eyre!("failed to clone PTY reader: {error}"))
         })?;
-        let (reader_tx, reader_rx) = mpsc::channel();
+        let (reader_tx, reader_rx) = mpsc::sync_channel(PTY_READ_CHANNEL_CAPACITY);
         std::thread::spawn(move || {
-            let mut buffer = [0_u8; 8192];
+            let mut buffer = vec![0_u8; PTY_READ_BUFFER_BYTES];
             loop {
                 match cloned_reader.read(&mut buffer) {
                     Ok(0) => break,
@@ -519,16 +1109,24 @@ impl TerminalSession {
             win32_input_mode_buffer: Vec::new(),
             semantic_prompt_buffer: Vec::new(),
             semantic_prompt: SemanticPromptTracking::default(),
+            cached_display: TerminalDisplayState::default(),
+            display_cache_dirty: true,
             closed: false,
         })
     }
 
-    pub fn cols(&self) -> u16 {
-        self.cols
+    #[must_use]
+    fn snapshot(&self) -> TerminalSnapshot {
+        TerminalSnapshot {
+            cols: self.cols,
+            rows: self.rows,
+            pending_output_bytes: self.pending_output.len(),
+            closed: self.closed,
+        }
     }
 
-    pub fn rows(&self) -> u16 {
-        self.rows
+    pub fn has_pending_output(&self) -> bool {
+        !self.pending_output.is_empty()
     }
 
     #[instrument(level = "info", skip_all, fields(client_width = layout.client_width, client_height = layout.client_height))]
@@ -562,64 +1160,87 @@ impl TerminalSession {
         self.rows = rows;
         self.repaint.needs_repaint = true;
         self.repaint.full_repaint_pending = true;
+        self.invalidate_display_cache();
         Ok(())
     }
 
     #[cfg_attr(feature = "tracy", instrument(level = "debug", skip_all))]
-    pub fn pump(&mut self) -> eyre::Result<PumpResult> {
-        let mut changed = false;
-        let mut output_processed = false;
+    pub fn poll_pty_output(&mut self) -> eyre::Result<PollPtyOutputResult> {
+        let mut queued_output = false;
 
-        while let Ok(message) = self.reader.try_recv() {
-            match message {
-                Ok(bytes) => {
-                    let normalized_bytes = {
-                        #[cfg(feature = "tracy")]
-                        let _span =
-                            debug_span!("normalize_terminal_output_bytes", len = bytes.len())
-                                .entered();
-                        normalize_cursor_visibility_mode_sequence(&bytes)
-                    };
-                    let bytes = self.strip_win32_input_mode_sequence(normalized_bytes.as_ref());
-                    let semantic_prompt_before_output = self.semantic_prompt;
+        let () = {
+            #[cfg(feature = "tracy")]
+            let _span = debug_span!("drain_pty_reader_messages").entered();
 
-                    if should_close_from_echoed_ctrl_d(
-                        semantic_prompt_before_output,
-                        bytes.as_ref(),
-                    ) {
-                        let bytes = strip_echoed_ctrl_d(bytes.as_ref());
-                        if !bytes.is_empty() {
-                            self.terminal.vt_write(bytes.as_ref());
-                            changed = true;
-                            output_processed = true;
+            while let Ok(message) = self.reader.try_recv() {
+                match message {
+                    Ok(bytes) => {
+                        let normalized_bytes = {
+                            #[cfg(feature = "tracy")]
+                            let _span = debug_span!("normalize_terminal_output_bytes").entered();
+                            normalize_cursor_visibility_mode_sequence(&bytes)
+                        };
+                        let bytes = self.strip_win32_input_mode_sequence(normalized_bytes.as_ref());
+                        let semantic_prompt_before_output = self.semantic_prompt;
+
+                        let () = {
+                            #[cfg(feature = "tracy")]
+                            let _span = debug_span!("queue_pty_output_message").entered();
+
+                            if should_close_from_echoed_ctrl_d(
+                                semantic_prompt_before_output,
+                                bytes.as_ref(),
+                            ) {
+                                let bytes = strip_echoed_ctrl_d(bytes.as_ref());
+                                if !bytes.is_empty() {
+                                    self.queue_terminal_output(bytes.as_ref());
+                                    queued_output = true;
+                                }
+                                info!(
+                                    semantic_prompt = ?self.semantic_prompt,
+                                    "closing terminal after shell echoed Ctrl+D at the prompt"
+                                );
+                                self.closed = true;
+                                break;
+                            }
+
+                            self.queue_terminal_output(bytes.as_ref());
+                            queued_output = true;
+                        };
+
+                        if self.pending_output.len() >= TERMINAL_OUTPUT_QUEUE_SOFT_LIMIT_BYTES {
+                            break;
                         }
-                        info!(
-                            semantic_prompt = ?self.semantic_prompt,
-                            "closing terminal after shell echoed Ctrl+D at the prompt"
-                        );
-                        self.closed = true;
-                        break;
                     }
-
-                    self.queue_terminal_output(bytes.as_ref());
-                    if self.pending_output.len() >= TERMINAL_OUTPUT_QUEUE_SOFT_LIMIT_BYTES {
-                        break;
+                    Err(error) => {
+                        let message = format!("\r\n[pty read error: {error}]\r\n");
+                        let () = {
+                            #[cfg(feature = "tracy")]
+                            let _span = debug_span!("queue_pty_read_error_message").entered();
+                            self.queue_terminal_output(message.as_bytes());
+                            queued_output = true;
+                            self.closed = true;
+                        };
                     }
-                }
-                Err(error) => {
-                    self.terminal
-                        .vt_write(format!("\r\n[pty read error: {error}]\r\n").as_bytes());
-                    changed = true;
-                    self.closed = true;
                 }
             }
-        }
+        };
 
-        let processed_output_bytes = self.flush_pending_output();
-        if processed_output_bytes > 0 {
-            changed = true;
-            output_processed = true;
-        }
+        self.refresh_child_exit_state()?;
+
+        Ok(PollPtyOutputResult {
+            queued_output,
+            should_close: self.closed,
+        })
+    }
+
+    #[cfg_attr(feature = "tracy", instrument(level = "debug", skip_all))]
+    #[expect(
+        dead_code,
+        reason = "keeps the pre-worker TerminalCore API available while the worker now drives output slices directly"
+    )]
+    pub fn pump_pending_output(&mut self) -> eyre::Result<PumpResult> {
+        let output_processed = self.pump_pending_output_slice() > 0;
 
         if output_processed {
             #[cfg(feature = "tracy")]
@@ -627,6 +1248,26 @@ impl TerminalSession {
             self.refresh_semantic_prompt_tracking()?;
         }
 
+        self.refresh_child_exit_state()?;
+
+        Ok(PumpResult {
+            should_close: self.closed,
+        })
+    }
+
+    fn pump_pending_output_slice(&mut self) -> usize {
+        let processed_output_bytes = self.flush_pending_output();
+        if processed_output_bytes > 0 {
+            self.repaint.needs_repaint = true;
+            self.invalidate_display_cache();
+        }
+
+        processed_output_bytes
+    }
+
+    fn refresh_child_exit_state(&mut self) -> eyre::Result<()> {
+        #[cfg(feature = "tracy")]
+        let _span = debug_span!("query_terminal_child_exit").entered();
         if self
             .child
             .try_wait()
@@ -636,45 +1277,38 @@ impl TerminalSession {
             self.closed = true;
         }
 
-        self.repaint.needs_repaint |= changed;
-        Ok(PumpResult {
-            should_close: self.closed,
-        })
+        Ok(())
     }
 
     fn queue_terminal_output(&mut self, data: &[u8]) {
         self.pending_output.extend(data.iter().copied());
     }
 
-    #[cfg_attr(feature = "tracy", instrument(level = "debug", skip_all, fields(queued_bytes = self.pending_output.len())))]
+    #[cfg_attr(feature = "tracy", instrument(level = "debug", skip_all))]
     fn flush_pending_output(&mut self) -> usize {
-        let mut processed_output_bytes = 0usize;
-
-        while processed_output_bytes < TERMINAL_OUTPUT_PUMP_BYTE_BUDGET
-            && !self.pending_output.is_empty()
-        {
-            let remaining_budget = TERMINAL_OUTPUT_PUMP_BYTE_BUDGET - processed_output_bytes;
-            let slice_len = TERMINAL_OUTPUT_SLICE_BYTES
-                .min(remaining_budget)
-                .min(self.pending_output.len());
-            let slice: Vec<u8> = self.pending_output.drain(..slice_len).collect();
-
-            let () = {
-                #[cfg(feature = "tracy")]
-                let _span = debug_span!(
-                    "process_terminal_output_chunk",
-                    len = slice.len(),
-                    remaining_bytes = self.pending_output.len(),
-                )
-                .entered();
-                self.observe_semantic_prompt_sequences(&slice);
-                self.terminal.vt_write(&slice);
-            };
-
-            processed_output_bytes += slice.len();
+        if self.pending_output.is_empty() {
+            return 0;
         }
 
-        processed_output_bytes
+        let slice_len = TERMINAL_OUTPUT_SLICE_BYTES.min(self.pending_output.len());
+        let slice: Vec<u8> = self.pending_output.drain(..slice_len).collect();
+
+        let () = {
+            #[cfg(feature = "tracy")]
+            let _span = debug_span!("process_terminal_output_chunk").entered();
+            let () = {
+                #[cfg(feature = "tracy")]
+                let _span = debug_span!("observe_semantic_prompt_sequences").entered();
+                self.observe_semantic_prompt_sequences(&slice);
+            };
+            let () = {
+                #[cfg(feature = "tracy")]
+                let _span = debug_span!("vt_write_terminal_output_slice").entered();
+                self.terminal.vt_write(&slice);
+            };
+        };
+
+        slice.len()
     }
 
     pub fn handle_char(&mut self, code_unit: u32, lparam: isize) -> eyre::Result<bool> {
@@ -1019,6 +1653,7 @@ impl TerminalSession {
         self.terminal.scroll_viewport(ScrollViewport::Delta(delta));
         self.repaint.needs_repaint = true;
         self.repaint.full_repaint_pending = true;
+        self.invalidate_display_cache();
     }
 
     pub fn scroll_viewport_to_offset(&mut self, offset: u64) -> eyre::Result<()> {
@@ -1041,11 +1676,38 @@ impl TerminalSession {
 
         self.repaint.needs_repaint = true;
         self.repaint.full_repaint_pending = true;
+        self.invalidate_display_cache();
         Ok(())
     }
 
-    #[cfg_attr(feature = "tracy", instrument(level = "debug", skip_all, fields(has_selection = selection.is_some())))]
+    #[cfg_attr(feature = "tracy", instrument(level = "debug", skip_all))]
     pub fn visible_display_state_with_selection(
+        &mut self,
+        selection: Option<TerminalSelection>,
+    ) -> eyre::Result<TerminalDisplayState> {
+        if selection.is_none() {
+            return Ok(self.cached_display_state()?.clone());
+        }
+
+        self.build_display_state(selection)
+    }
+
+    fn invalidate_display_cache(&mut self) {
+        self.display_cache_dirty = true;
+    }
+
+    fn cached_display_state(&mut self) -> eyre::Result<&TerminalDisplayState> {
+        if self.display_cache_dirty {
+            let display = self.build_display_state(None)?;
+            self.cached_display = display;
+            self.display_cache_dirty = false;
+        }
+
+        Ok(&self.cached_display)
+    }
+
+    #[cfg_attr(feature = "tracy", instrument(level = "debug", skip_all))]
+    fn build_display_state(
         &mut self,
         selection: Option<TerminalSelection>,
     ) -> eyre::Result<TerminalDisplayState> {

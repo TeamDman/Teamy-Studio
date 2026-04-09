@@ -94,7 +94,16 @@ struct AppState {
     output_cell_width: i32,
     output_cell_height: i32,
     terminal: TerminalSession,
+    cached_terminal_scene: Option<CachedTerminalScene>,
     renderer: Option<D3d12PanelRenderer>,
+}
+
+#[derive(Clone, Debug)]
+struct CachedTerminalScene {
+    layout: TerminalLayout,
+    display: TerminalDisplayState,
+    visual_state: TerminalScrollbarVisualState,
+    scene: RenderScene,
 }
 
 // convention[impl convention.invariants.encode-in-types]
@@ -426,6 +435,7 @@ pub fn run(
             output_cell_width,
             output_cell_height,
             terminal,
+            cached_terminal_scene: None,
             renderer: None,
         });
     });
@@ -788,8 +798,33 @@ fn render_frame() -> eyre::Result<()> {
         let Some(hwnd) = state.hwnd else {
             return Ok(());
         };
+
+        service_pending_terminal_output(state, hwnd)?;
         render_current_frame(state, hwnd, None)
     })
+}
+
+#[cfg_attr(feature = "tracy", instrument(level = "debug", skip_all))]
+fn service_pending_terminal_output(state: &mut AppState, hwnd: WindowHandle) -> eyre::Result<()> {
+    if !(state.terminal_poll_pending || state.terminal.has_pending_output()) {
+        return Ok(());
+    }
+
+    let poll_pending = state.terminal_poll_pending;
+    if poll_pending {
+        state.terminal_poll_pending = false;
+    }
+
+    #[cfg(feature = "tracy")]
+    let _span = debug_span!("pump_terminal_on_idle").entered();
+
+    if state.terminal.pump_pending_output()?.should_close {
+        hwnd.post_close();
+        return Ok(());
+    }
+
+    state.terminal_poll_pending |= state.terminal.has_pending_output();
+    Ok(())
 }
 
 /// behavior[impl window.interaction.drag.live]
@@ -799,7 +834,14 @@ fn render_frame() -> eyre::Result<()> {
 #[cfg_attr(feature = "tracy", instrument(level = "debug", skip_all))]
 fn handle_poll_timer(hwnd: WindowHandle) -> eyre::Result<bool> {
     with_app_state(|state| {
-        state.terminal_poll_pending = true;
+        let poll_result = state.terminal.poll_pty_output()?;
+        state.terminal_poll_pending |=
+            poll_result.queued_output || state.terminal.has_pending_output();
+
+        if poll_result.should_close {
+            hwnd.post_close();
+            return Ok(false);
+        }
 
         let selection_scrolled = auto_scroll_pending_terminal_selection(state, hwnd)?;
 
@@ -811,30 +853,12 @@ fn handle_poll_timer(hwnd: WindowHandle) -> eyre::Result<bool> {
     })
 }
 
-#[cfg_attr(feature = "tracy", instrument(level = "debug", skip_all, fields(resize = resize.is_some())))]
+#[cfg_attr(feature = "tracy", instrument(level = "debug", skip_all))]
 fn render_current_frame(
     state: &mut AppState,
     hwnd: WindowHandle,
     resize: Option<(u32, u32)>,
 ) -> eyre::Result<()> {
-    let poll_pending = state.terminal_poll_pending;
-    let should_pump_terminal = poll_pending || resize.is_some() || state.in_move_size_loop;
-    if should_pump_terminal {
-        state.terminal_poll_pending = false;
-        #[cfg(feature = "tracy")]
-        let _span = debug_span!(
-            "pump_terminal_for_frame",
-            from_poll_timer = poll_pending,
-            resize = resize.is_some(),
-            in_move_size_loop = state.in_move_size_loop,
-        )
-        .entered();
-        if state.terminal.pump()?.should_close {
-            hwnd.post_close();
-            return Ok(());
-        }
-    }
-
     if let Some((width, height)) = resize
         && let Some(renderer) = state.renderer.as_mut()
     {
@@ -846,15 +870,15 @@ fn render_current_frame(
         let _span = debug_span!("compute_client_layout").entered();
         client_layout(hwnd, state.terminal_cell_width, state.terminal_cell_height)?
     };
-    let mut scene = {
-        #[cfg(feature = "tracy")]
-        let _span = debug_span!("build_panel_scene").entered();
-        build_panel_scene(layout)
-    };
     let cell_number = state
         .workspace_window
         .as_ref()
         .map_or(1, |workspace_window| workspace_window.cell_number);
+    let chrome_scene = {
+        #[cfg(feature = "tracy")]
+        let _span = debug_span!("build_chrome_scene_fragment").entered();
+        chrome_scene_fragment(layout, cell_number)
+    };
     let output_text = {
         #[cfg(feature = "tracy")]
         let _span = debug_span!("build_output_panel_text").entered();
@@ -867,45 +891,65 @@ fn render_current_frame(
             .terminal
             .visible_display_state_with_selection(state.terminal_selection)?
     };
-
-    let () = {
+    let terminal_visual_state = terminal_scrollbar_visual_state(state);
+    let terminal_scene = {
         #[cfg(feature = "tracy")]
-        let _span = debug_span!("populate_render_scene").entered();
-        push_centered_text(
-            &mut scene,
-            layout.drag_handle_rect().to_win32_rect(),
-            &cell_number.to_string(),
-            [0.95, 0.95, 0.98, 1.0],
-        );
-        let terminal_rect = layout.terminal_viewport_rect().inset(4);
-        let scrollbar_rect = layout.terminal_scrollbar_rect().inset(4);
-        push_terminal_display(
-            &mut scene,
-            terminal_rect,
-            state.terminal_cell_width,
-            state.terminal_cell_height,
-            &terminal_display,
-        );
-        push_terminal_scrollbar(
-            &mut scene,
-            scrollbar_rect,
-            terminal_display.scrollbar,
-            terminal_scrollbar_visual_state(state),
-        );
-        push_text_block(
-            &mut scene,
-            layout.result_panel_rect().inset(14).to_win32_rect(),
+        let _span = debug_span!("build_terminal_scene_fragment").entered();
+        terminal_scene_fragment(state, layout, &terminal_display, terminal_visual_state)
+    };
+    let output_scene = {
+        #[cfg(feature = "tracy")]
+        let _span = debug_span!("build_output_scene_fragment").entered();
+        output_scene_fragment(
+            layout,
             &output_text,
             state.output_cell_width,
             state.output_cell_height,
-            [0.96, 0.95, 0.90, 1.0],
-        );
+        )
     };
 
     let Some(renderer) = state.renderer.as_mut() else {
         return Ok(());
     };
-    renderer.render(&scene)
+    let () = {
+        #[cfg(feature = "tracy")]
+        let _span = debug_span!("render_scene_fragments").entered();
+        renderer.render_fragments(&[&chrome_scene, &terminal_scene, &output_scene])?;
+    };
+    Ok(())
+}
+
+fn chrome_scene_fragment(layout: TerminalLayout, cell_number: usize) -> RenderScene {
+    let mut scene = build_panel_scene(layout);
+    push_centered_text(
+        &mut scene,
+        layout.drag_handle_rect().to_win32_rect(),
+        &cell_number.to_string(),
+        [0.95, 0.95, 0.98, 1.0],
+    );
+    scene
+}
+
+fn output_scene_fragment(
+    layout: TerminalLayout,
+    output_text: &str,
+    output_cell_width: i32,
+    output_cell_height: i32,
+) -> RenderScene {
+    let mut scene = RenderScene {
+        panels: Vec::new(),
+        glyphs: Vec::with_capacity(output_text.chars().count()),
+        overlay_panels: Vec::new(),
+    };
+    push_text_block(
+        &mut scene,
+        layout.result_panel_rect().inset(14).to_win32_rect(),
+        output_text,
+        output_cell_width,
+        output_cell_height,
+        [0.96, 0.95, 0.90, 1.0],
+    );
+    scene
 }
 
 /// behavior[impl window.appearance.terminal.cursor.legible-block]
@@ -989,6 +1033,46 @@ fn push_terminal_scrollbar(
         },
         PanelEffect::TerminalScrollbarThumb,
     );
+}
+
+fn terminal_scene_fragment(
+    state: &mut AppState,
+    layout: TerminalLayout,
+    display: &TerminalDisplayState,
+    visual_state: TerminalScrollbarVisualState,
+) -> RenderScene {
+    if let Some(cached) = state.cached_terminal_scene.as_ref()
+        && cached.layout == layout
+        && cached.display == *display
+        && cached.visual_state == visual_state
+    {
+        return cached.scene.clone();
+    }
+
+    let mut scene = RenderScene {
+        panels: Vec::with_capacity(display.backgrounds.len().saturating_add(2)),
+        glyphs: Vec::with_capacity(display.glyphs.len()),
+        overlay_panels: Vec::with_capacity(8),
+    };
+    let terminal_rect = layout.terminal_viewport_rect().inset(4);
+    let scrollbar_rect = layout.terminal_scrollbar_rect().inset(4);
+    push_terminal_display(
+        &mut scene,
+        terminal_rect,
+        state.terminal_cell_width,
+        state.terminal_cell_height,
+        display,
+    );
+    push_terminal_scrollbar(&mut scene, scrollbar_rect, display.scrollbar, visual_state);
+
+    state.cached_terminal_scene = Some(CachedTerminalScene {
+        layout,
+        display: display.clone(),
+        visual_state,
+        scene: scene.clone(),
+    });
+
+    scene
 }
 
 fn terminal_scrollbar_visual_state(state: &AppState) -> TerminalScrollbarVisualState {
