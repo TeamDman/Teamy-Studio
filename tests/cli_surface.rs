@@ -195,6 +195,7 @@ fn test_keyboard_input_help_shows_inside_flag() {
 // tool[verify cli.help.position-independent]
 // cli[verify command.surface.self-test-terminal-throughput]
 // cli[verify self-test.terminal-throughput.line-count-flag]
+// cli[verify self-test.terminal-throughput.samples-flag]
 #[test]
 fn test_terminal_throughput_help_shows_line_count_flag() {
     let output = run_teamy_studio(&["self-test", "terminal-throughput", "--help"], &[]);
@@ -207,6 +208,10 @@ fn test_terminal_throughput_help_shows_line_count_flag() {
     assert!(
         text.contains("--line-count"),
         "missing --line-count in help:\n{text}"
+    );
+    assert!(
+        text.contains("--samples"),
+        "missing --samples in help:\n{text}"
     );
 }
 

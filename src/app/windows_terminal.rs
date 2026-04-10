@@ -41,9 +41,16 @@ const MAX_SCROLLBACK: usize = 20_000;
 const PTY_READ_BUFFER_BYTES: usize = 128 * 1_024;
 const PTY_READ_CHANNEL_CAPACITY: usize = 8;
 const TERMINAL_OUTPUT_SLICE_BYTES: usize = 256;
+const TERMINAL_OUTPUT_MEDIUM_SLICE_BYTES: usize = 1024;
+const TERMINAL_OUTPUT_BURST_SLICE_BYTES: usize = 4096;
 const TERMINAL_OUTPUT_QUEUE_SOFT_LIMIT_BYTES: usize = 64 * 1_024;
+const TERMINAL_DISPLAY_PUBLISH_INTERVAL: Duration = Duration::from_millis(16);
+const TERMINAL_DISPLAY_MEDIUM_PUBLISH_INTERVAL: Duration = Duration::from_millis(33);
+const TERMINAL_DISPLAY_BURST_PUBLISH_INTERVAL: Duration = Duration::from_millis(50);
 const TERMINAL_WORKER_IDLE_TIMEOUT: Duration = Duration::from_millis(1);
 const TERMINAL_WORKER_PUMP_TIME_BUDGET: Duration = Duration::from_millis(2);
+const TERMINAL_WORKER_MEDIUM_PUMP_TIME_BUDGET: Duration = Duration::from_millis(6);
+const TERMINAL_WORKER_BURST_PUMP_TIME_BUDGET: Duration = Duration::from_millis(12);
 const CELL_PANEL_GAP: i32 = 14;
 const SIDECAR_WIDTH: i32 = 86;
 const RESULT_PANEL_HEIGHT: i32 = 152;
@@ -132,12 +139,20 @@ pub struct TerminalDisplayScrollbar {
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
-pub struct TerminalDisplayState {
+pub struct TerminalDisplayRow {
+    pub row: i32,
     pub backgrounds: Vec<TerminalDisplayBackground>,
     pub glyphs: Vec<TerminalDisplayGlyph>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TerminalDisplayState {
+    pub rows: Vec<TerminalDisplayRow>,
     pub cursor: Option<TerminalDisplayCursor>,
     pub scrollbar: Option<TerminalDisplayScrollbar>,
 }
+
+pub type SharedTerminalDisplayState = Arc<TerminalDisplayState>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TerminalViewportMetrics {
@@ -251,7 +266,7 @@ pub struct TerminalSession {
     snapshot: TerminalSnapshot,
     worker_queued_output: bool,
     repaint_requested: bool,
-    cached_display: TerminalDisplayState,
+    cached_display: SharedTerminalDisplayState,
 }
 
 struct TerminalCore {
@@ -273,7 +288,7 @@ struct TerminalCore {
     win32_input_mode_buffer: Vec<u8>,
     semantic_prompt_buffer: Vec<u8>,
     semantic_prompt: SemanticPromptTracking,
-    cached_display: TerminalDisplayState,
+    cached_display: SharedTerminalDisplayState,
     display_cache_dirty: bool,
     closed: bool,
 }
@@ -317,7 +332,7 @@ enum TerminalWorkerCommand {
 #[derive(Clone, Debug, PartialEq)]
 enum TerminalWorkerUpdate {
     Snapshot(TerminalSnapshot),
-    DisplayState(TerminalDisplayState),
+    DisplayState(SharedTerminalDisplayState),
     PtyOutputQueued,
     RepaintRequested,
     ChildExited,
@@ -576,7 +591,7 @@ impl TerminalSession {
             snapshot,
             worker_queued_output: false,
             repaint_requested: false,
-            cached_display: TerminalDisplayState::default(),
+            cached_display: Arc::new(TerminalDisplayState::default()),
         })
     }
 
@@ -596,6 +611,11 @@ impl TerminalSession {
 
     pub fn has_pending_output(&self) -> bool {
         self.snapshot.pending_output_bytes > 0
+    }
+
+    pub fn cached_display_state(&mut self) -> SharedTerminalDisplayState {
+        self.drain_worker_updates();
+        Arc::clone(&self.cached_display)
     }
 
     pub fn take_repaint_requested(&mut self) -> bool {
@@ -754,7 +774,7 @@ impl TerminalSession {
     ) -> eyre::Result<TerminalDisplayState> {
         self.drain_worker_updates();
         if selection.is_none() {
-            return Ok(self.cached_display.clone());
+            return Ok(self.cached_display.as_ref().clone());
         }
 
         let response = self.request(TerminalWorkerCommand::VisibleDisplayStateWithSelection(
@@ -854,6 +874,8 @@ struct TerminalWorkerRunner {
     request_rx: mpsc::Receiver<TerminalWorkerRequest>,
     update_tx: mpsc::Sender<TerminalWorkerUpdate>,
     last_snapshot: TerminalSnapshot,
+    last_display_publish_at: Instant,
+    last_published_display: Option<SharedTerminalDisplayState>,
 }
 
 impl TerminalWorkerRunner {
@@ -868,6 +890,8 @@ impl TerminalWorkerRunner {
             request_rx,
             update_tx,
             last_snapshot,
+            last_display_publish_at: Instant::now(),
+            last_published_display: None,
         }
     }
 
@@ -981,7 +1005,11 @@ impl TerminalWorkerRunner {
         while self.core.has_pending_output() {
             if let Ok(request) = self.request_rx.try_recv() {
                 if processed_output {
-                    self.core.refresh_semantic_prompt_tracking()?;
+                    if should_refresh_semantic_prompt_tracking(self.core.pending_output.len()) {
+                        self.core.refresh_semantic_prompt_tracking()?;
+                    }
+                    self.publish_snapshot_if_changed()?;
+                    self.publish_display_state_if_due()?;
                 }
                 self.handle_request(request)?;
                 self.publish_snapshot_if_changed()?;
@@ -995,15 +1023,14 @@ impl TerminalWorkerRunner {
             }
             processed_output = true;
 
-            self.publish_snapshot_if_changed()?;
-            self.publish_display_state_if_due()?;
-
-            if pump_started_at.elapsed() >= TERMINAL_WORKER_PUMP_TIME_BUDGET {
+            if pump_started_at.elapsed()
+                >= pending_output_pump_time_budget(self.core.pending_output.len())
+            {
                 break;
             }
         }
 
-        if processed_output {
+        if processed_output && should_refresh_semantic_prompt_tracking(self.core.pending_output.len()) {
             self.core.refresh_semantic_prompt_tracking()?;
         }
 
@@ -1018,22 +1045,41 @@ impl TerminalWorkerRunner {
     }
 
     fn publish_display_state_if_due(&mut self) -> eyre::Result<()> {
-        if !self.core.display_cache_dirty {
+        if !self.should_publish_display_state() {
             return Ok(());
         }
 
         let display = {
             #[cfg(feature = "tracy")]
             let _span = debug_span!("publish_cached_terminal_display_state").entered();
-            self.core.cached_display_state()?.clone()
+            self.core.cached_display_state()?
         };
+        self.last_display_publish_at = Instant::now();
+
+        if !should_publish_terminal_display_update(
+            self.last_published_display.as_ref(),
+            &display,
+        ) {
+            return Ok(());
+        }
+
         self.update_tx
-            .send(TerminalWorkerUpdate::DisplayState(display))
+            .send(TerminalWorkerUpdate::DisplayState(Arc::clone(&display)))
             .map_err(|error| {
                 eyre::eyre!("failed to publish terminal worker display state: {error}")
             })?;
+        self.last_published_display = Some(display);
         let _ = self.update_tx.send(TerminalWorkerUpdate::RepaintRequested);
         Ok(())
+    }
+
+    fn should_publish_display_state(&self) -> bool {
+        should_publish_terminal_display_state(
+            self.core.display_cache_dirty,
+            self.core.pending_output.len(),
+            self.last_snapshot.closed,
+            self.last_display_publish_at.elapsed(),
+        )
     }
 
     fn publish_snapshot_if_changed(&mut self) -> eyre::Result<()> {
@@ -1154,7 +1200,7 @@ impl TerminalCore {
             win32_input_mode_buffer: Vec::new(),
             semantic_prompt_buffer: Vec::new(),
             semantic_prompt: SemanticPromptTracking::default(),
-            cached_display: TerminalDisplayState::default(),
+            cached_display: Arc::new(TerminalDisplayState::default()),
             display_cache_dirty: true,
             closed: false,
         })
@@ -1335,7 +1381,8 @@ impl TerminalCore {
             return 0;
         }
 
-        let slice_len = TERMINAL_OUTPUT_SLICE_BYTES.min(self.pending_output.len());
+        let slice_len = pending_output_slice_bytes(self.pending_output.len())
+            .min(self.pending_output.len());
         let slice: Vec<u8> = self.pending_output.drain(..slice_len).collect();
 
         let () = {
@@ -1731,7 +1778,7 @@ impl TerminalCore {
         selection: Option<TerminalSelection>,
     ) -> eyre::Result<TerminalDisplayState> {
         if selection.is_none() {
-            return Ok(self.cached_display_state()?.clone());
+            return Ok(self.cached_display_state()?.as_ref().clone());
         }
 
         self.build_display_state(selection)
@@ -1741,14 +1788,14 @@ impl TerminalCore {
         self.display_cache_dirty = true;
     }
 
-    fn cached_display_state(&mut self) -> eyre::Result<&TerminalDisplayState> {
+    fn cached_display_state(&mut self) -> eyre::Result<SharedTerminalDisplayState> {
         if self.display_cache_dirty {
             let display = self.build_display_state(None)?;
-            self.cached_display = display;
+            self.cached_display = Arc::new(display);
             self.display_cache_dirty = false;
         }
 
-        Ok(&self.cached_display)
+        Ok(Arc::clone(&self.cached_display))
     }
 
     #[cfg_attr(feature = "tracy", instrument(level = "debug", skip_all))]
@@ -1771,8 +1818,7 @@ impl TerminalCore {
         let mut cells = CellIterator::new().wrap_err("failed to create cell iterator")?;
         let cursor = build_terminal_cursor(&snapshot, &colors)?;
         let mut display = TerminalDisplayState {
-            backgrounds: Vec::new(),
-            glyphs: Vec::new(),
+            rows: Vec::new(),
             cursor,
             scrollbar: Some(TerminalDisplayScrollbar {
                 total: viewport.total,
@@ -1790,6 +1836,11 @@ impl TerminalCore {
                 .wrap_err("failed to update row iterator")?;
             while let Some(row) = row_iter.next() {
                 let mut column_index = 0_i32;
+                let mut display_row = TerminalDisplayRow {
+                    row: row_index,
+                    backgrounds: Vec::new(),
+                    glyphs: Vec::new(),
+                };
                 let mut cell_iter = cells
                     .update(row)
                     .wrap_err("failed to update cell iterator")?;
@@ -1813,7 +1864,7 @@ impl TerminalCore {
                     );
 
                     if let Some(color) = background_color {
-                        display.backgrounds.push(TerminalDisplayBackground {
+                        display_row.backgrounds.push(TerminalDisplayBackground {
                             cell: viewport_cell,
                             color,
                         });
@@ -1821,7 +1872,7 @@ impl TerminalCore {
 
                     if !graphemes.is_empty() {
                         for character in graphemes {
-                            display.glyphs.push(TerminalDisplayGlyph {
+                            display_row.glyphs.push(TerminalDisplayGlyph {
                                 cell: viewport_cell,
                                 character,
                                 color: glyph_color,
@@ -1830,6 +1881,7 @@ impl TerminalCore {
                     }
                     column_index += 1;
                 }
+                display.rows.push(display_row);
                 row_index += 1;
             }
         }
@@ -1908,6 +1960,10 @@ impl TerminalCore {
     }
 
     fn strip_win32_input_mode_sequence<'a>(&mut self, data: &'a [u8]) -> Cow<'a, [u8]> {
+        if self.win32_input_mode_buffer.is_empty() && !data.contains(&0x1B) {
+            return Cow::Borrowed(data);
+        }
+
         let mut combined = std::mem::take(&mut self.win32_input_mode_buffer);
         combined.extend_from_slice(data);
         let mut output = Vec::with_capacity(combined.len());
@@ -2811,20 +2867,97 @@ fn legacy_special_key_bytes(mapped_key: key::Key, mods: key::Mods) -> Option<Vec
     Some(response)
 }
 
+fn should_publish_terminal_display_state(
+    display_cache_dirty: bool,
+    pending_output_len: usize,
+    child_closed: bool,
+    elapsed_since_last_publish: Duration,
+) -> bool {
+    if !display_cache_dirty {
+        return false;
+    }
+
+    if child_closed || pending_output_len == 0 {
+        return true;
+    }
+
+    elapsed_since_last_publish >= pending_output_display_publish_interval(pending_output_len)
+}
+
+fn should_publish_terminal_display_update(
+    last_published_display: Option<&SharedTerminalDisplayState>,
+    display: &SharedTerminalDisplayState,
+) -> bool {
+    last_published_display.is_none_or(|last_published| {
+        !Arc::ptr_eq(last_published, display) && last_published.as_ref() != display.as_ref()
+    })
+}
+
+fn pending_output_display_publish_interval(pending_output_len: usize) -> Duration {
+    if pending_output_len >= 8 * 1024 {
+        return TERMINAL_DISPLAY_BURST_PUBLISH_INTERVAL;
+    }
+
+    if pending_output_len >= 1024 {
+        return TERMINAL_DISPLAY_MEDIUM_PUBLISH_INTERVAL;
+    }
+
+    TERMINAL_DISPLAY_PUBLISH_INTERVAL
+}
+
+fn pending_output_slice_bytes(pending_output_len: usize) -> usize {
+    if pending_output_len >= 8 * 1024 {
+        return TERMINAL_OUTPUT_BURST_SLICE_BYTES;
+    }
+
+    if pending_output_len >= 1024 {
+        return TERMINAL_OUTPUT_MEDIUM_SLICE_BYTES;
+    }
+
+    TERMINAL_OUTPUT_SLICE_BYTES
+}
+
+fn pending_output_pump_time_budget(pending_output_len: usize) -> Duration {
+    if pending_output_len >= 8 * 1024 {
+        return TERMINAL_WORKER_BURST_PUMP_TIME_BUDGET;
+    }
+
+    if pending_output_len >= 1024 {
+        return TERMINAL_WORKER_MEDIUM_PUMP_TIME_BUDGET;
+    }
+
+    TERMINAL_WORKER_PUMP_TIME_BUDGET
+}
+
+fn should_refresh_semantic_prompt_tracking(pending_output_len: usize) -> bool {
+    pending_output_len < 1024
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        MIN_CODE_PANEL_HEIGHT, PendingWin32CharKey, PromptInputState, SemanticPromptTracking,
-        TerminalDisplayCursorStyle, TerminalLayout, TerminalSelection, TerminalSelectionMode,
-        TerminalTextRow, extract_selected_text, map_cursor_style, map_virtual_key, osc_terminator,
-        partial_osc_133_prefix_len, resolve_terminal_cell_colors, should_close_from_echoed_ctrl_d,
-        should_mark_prompt_input_written_for_key, should_translate_ctrl_d_key,
-        should_translate_ctrl_d_to_exit, strip_echoed_ctrl_d,
+        MIN_CODE_PANEL_HEIGHT, PendingWin32CharKey, PromptInputState,
+        SemanticPromptTracking, TERMINAL_DISPLAY_BURST_PUBLISH_INTERVAL,
+        TERMINAL_DISPLAY_MEDIUM_PUBLISH_INTERVAL, TERMINAL_DISPLAY_PUBLISH_INTERVAL,
+        TERMINAL_OUTPUT_BURST_SLICE_BYTES, TERMINAL_OUTPUT_MEDIUM_SLICE_BYTES,
+        TERMINAL_OUTPUT_SLICE_BYTES,
+        TERMINAL_WORKER_BURST_PUMP_TIME_BUDGET, TERMINAL_WORKER_MEDIUM_PUMP_TIME_BUDGET,
+        TERMINAL_WORKER_PUMP_TIME_BUDGET,
+        TerminalDisplayCursorStyle, TerminalDisplayState, TerminalLayout, TerminalSelection,
+        TerminalSelectionMode, TerminalTextRow, extract_selected_text, map_cursor_style, map_virtual_key,
+        osc_terminator, partial_osc_133_prefix_len, pending_output_display_publish_interval,
+        pending_output_pump_time_budget, pending_output_slice_bytes,
+        resolve_terminal_cell_colors, should_close_from_echoed_ctrl_d,
+        should_mark_prompt_input_written_for_key, should_refresh_semantic_prompt_tracking,
+        should_publish_terminal_display_state, should_publish_terminal_display_update,
+        should_translate_ctrl_d_key, should_translate_ctrl_d_to_exit, strip_echoed_ctrl_d,
     };
     use crate::app::spatial::TerminalCellPoint;
     use libghostty_vt::key;
     use libghostty_vt::render::Colors;
     use libghostty_vt::style::RgbColor;
+    use std::sync::Arc;
+    use std::time::Duration;
 
     // behavior[verify window.appearance.code-panel.terminal-alignment]
     #[test]
@@ -2900,6 +3033,134 @@ mod tests {
             map_cursor_style(libghostty_vt::render::CursorVisualStyle::BlockHollow),
             TerminalDisplayCursorStyle::BlockHollow
         );
+    }
+
+    #[test]
+    fn display_publish_is_throttled_while_output_is_still_bursting() {
+        assert!(!should_publish_terminal_display_state(
+            true,
+            512,
+            false,
+            TERMINAL_DISPLAY_PUBLISH_INTERVAL.saturating_sub(Duration::from_millis(1)),
+        ));
+    }
+
+    #[test]
+    fn display_publish_is_immediate_when_output_burst_finishes() {
+        assert!(should_publish_terminal_display_state(
+            true,
+            0,
+            false,
+            Duration::ZERO,
+        ));
+    }
+
+    #[test]
+    fn display_publish_is_immediate_when_child_has_closed() {
+        assert!(should_publish_terminal_display_state(
+            true,
+            512,
+            true,
+            Duration::ZERO,
+        ));
+    }
+
+    #[test]
+    fn display_publish_update_is_skipped_when_snapshot_is_unchanged() {
+        let display = Arc::new(TerminalDisplayState::default());
+
+        assert!(!should_publish_terminal_display_update(
+            Some(&display),
+            &Arc::clone(&display),
+        ));
+        assert!(!should_publish_terminal_display_update(
+            Some(&display),
+            &Arc::new(TerminalDisplayState::default()),
+        ));
+    }
+
+    #[test]
+    fn display_publish_update_runs_when_snapshot_changes() {
+        let previous = Arc::new(TerminalDisplayState::default());
+        let next = Arc::new(TerminalDisplayState {
+            rows: vec![Default::default()],
+            cursor: None,
+            scrollbar: None,
+        });
+
+        assert!(should_publish_terminal_display_update(Some(&previous), &next));
+    }
+
+    #[test]
+    fn pending_output_uses_small_display_publish_interval_for_interactive_backlog() {
+        assert_eq!(
+            pending_output_display_publish_interval(512),
+            TERMINAL_DISPLAY_PUBLISH_INTERVAL,
+        );
+    }
+
+    #[test]
+    fn pending_output_uses_medium_display_publish_interval_for_moderate_backlog() {
+        assert_eq!(
+            pending_output_display_publish_interval(1024),
+            TERMINAL_DISPLAY_MEDIUM_PUBLISH_INTERVAL,
+        );
+    }
+
+    #[test]
+    fn pending_output_uses_burst_display_publish_interval_for_large_backlog() {
+        assert_eq!(
+            pending_output_display_publish_interval(8 * 1024),
+            TERMINAL_DISPLAY_BURST_PUBLISH_INTERVAL,
+        );
+    }
+
+    #[test]
+    fn pending_output_uses_small_slices_for_interactive_backlog() {
+        assert_eq!(pending_output_slice_bytes(512), TERMINAL_OUTPUT_SLICE_BYTES);
+    }
+
+    #[test]
+    fn pending_output_uses_medium_slices_for_moderate_backlog() {
+        assert_eq!(pending_output_slice_bytes(1024), TERMINAL_OUTPUT_MEDIUM_SLICE_BYTES);
+    }
+
+    #[test]
+    fn pending_output_uses_burst_slices_for_large_backlog() {
+        assert_eq!(pending_output_slice_bytes(8 * 1024), TERMINAL_OUTPUT_BURST_SLICE_BYTES);
+    }
+
+    #[test]
+    fn pending_output_uses_small_pump_budget_for_interactive_backlog() {
+        assert_eq!(pending_output_pump_time_budget(512), TERMINAL_WORKER_PUMP_TIME_BUDGET);
+    }
+
+    #[test]
+    fn pending_output_uses_medium_pump_budget_for_moderate_backlog() {
+        assert_eq!(
+            pending_output_pump_time_budget(1024),
+            TERMINAL_WORKER_MEDIUM_PUMP_TIME_BUDGET,
+        );
+    }
+
+    #[test]
+    fn pending_output_uses_burst_pump_budget_for_large_backlog() {
+        assert_eq!(
+            pending_output_pump_time_budget(8 * 1024),
+            TERMINAL_WORKER_BURST_PUMP_TIME_BUDGET,
+        );
+    }
+
+    #[test]
+    fn semantic_prompt_refresh_is_deferred_during_large_backlog() {
+        assert!(!should_refresh_semantic_prompt_tracking(1024));
+        assert!(!should_refresh_semantic_prompt_tracking(8 * 1024));
+    }
+
+    #[test]
+    fn semantic_prompt_refresh_runs_when_backlog_is_small() {
+        assert!(should_refresh_semantic_prompt_tracking(0));
+        assert!(should_refresh_semantic_prompt_tracking(512));
     }
 
     // behavior[verify window.appearance.chrome]

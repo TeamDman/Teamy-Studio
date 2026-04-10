@@ -1,6 +1,7 @@
 use std::cell::RefCell;
 use std::marker::PhantomData;
 use std::path::Path;
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 #[cfg(feature = "tracy")]
@@ -14,20 +15,21 @@ use tracing::{debug, error, info, info_span, instrument};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, CLEARTYPE_QUALITY, CreateFontIndirectW, DeleteObject, EndPaint, GetDC,
-    GetTextExtentPoint32W, HFONT, LOGFONTW, PAINTSTRUCT, ReleaseDC, SelectObject,
+    GetDeviceCaps, GetTextExtentPoint32W, HFONT, LOGFONTW, PAINTSTRUCT, ReleaseDC, SelectObject,
+    VREFRESH,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_CONTROL, VK_LBUTTON, VK_MENU};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect, GetCursorPos,
     GetMessageW, GetSystemMetrics, GetWindowRect, HTCAPTION, HTCLIENT, IDC_ARROW, IDC_SIZEALL,
-    LoadCursorW, MSG, PostMessageW, PostQuitMessage, RegisterClassExW, SM_CXPADDEDBORDER,
-    SM_CXSCREEN, SM_CXSIZEFRAME, SM_CYSCREEN, SM_CYSIZEFRAME, SW_SHOW, SYSTEM_METRICS_INDEX,
-    SetCursor, SetTimer, ShowWindow, TranslateMessage, WM_CHAR, WM_CLOSE, WM_DESTROY,
-    WM_ENTERSIZEMOVE, WM_ERASEBKGND, WM_EXITSIZEMOVE, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN,
-    WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCALCSIZE, WM_NCHITTEST, WM_NCLBUTTONDOWN,
-    WM_PAINT, WM_RBUTTONUP, WM_SETCURSOR, WM_SIZE, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER,
-    WNDCLASSEXW, WS_EX_APPWINDOW, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP, WS_THICKFRAME,
-    WS_VISIBLE,
+    KillTimer, LoadCursorW, MSG, PostMessageW, PostQuitMessage, RegisterClassExW,
+    SM_CXPADDEDBORDER, SM_CXSCREEN, SM_CXSIZEFRAME, SM_CYSCREEN, SM_CYSIZEFRAME, SW_SHOW,
+    SYSTEM_METRICS_INDEX, SetCursor, SetTimer, ShowWindow, TranslateMessage, WM_CHAR, WM_CLOSE,
+    WM_DESTROY, WM_ENTERSIZEMOVE, WM_ERASEBKGND, WM_EXITSIZEMOVE, WM_KEYDOWN, WM_KEYUP,
+    WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCALCSIZE,
+    WM_NCHITTEST, WM_NCLBUTTONDOWN, WM_PAINT, WM_RBUTTONUP, WM_SETCURSOR, WM_SETFOCUS, WM_SIZE,
+    WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WNDCLASSEXW, WS_EX_APPWINDOW, WS_MAXIMIZEBOX,
+    WS_MINIMIZEBOX, WS_POPUP, WS_THICKFRAME, WS_VISIBLE,
 };
 use windows::core::{PCWSTR, w};
 
@@ -71,6 +73,7 @@ const MIN_RESIZE_BORDER_THICKNESS: i32 = 1;
 const MOUSE_WHEEL_DELTA: i16 = 120;
 const TERMINAL_WHEEL_SCROLL_LINES: isize = 3;
 const SELECTION_AUTO_SCROLL_MAX_LINES: isize = 12;
+const FOCUSED_RENDER_TIMER_ID: usize = 2;
 const TERMINAL_THROUGHPUT_BENCHMARK_START_MARKER: &str = "__TEAMY_TERMINAL_THROUGHPUT_START__";
 const TERMINAL_THROUGHPUT_BENCHMARK_DONE_MARKER: &str = "__TEAMY_TERMINAL_THROUGHPUT_DONE__";
 const TERMINAL_THROUGHPUT_BENCHMARK_MEASURE_PREFIX: &str =
@@ -93,7 +96,9 @@ struct AppState {
     terminal_scrollbar_hovered_part: Option<TerminalScrollbarPart>,
     terminal_scrollbar_drag: Option<TerminalScrollbarDrag>,
     in_move_size_loop: bool,
+    window_focused: bool,
     terminal_poll_pending: bool,
+    focused_render_interval_ms: u32,
     terminal_font_height: i32,
     terminal_cell_width: i32,
     terminal_cell_height: i32,
@@ -185,11 +190,25 @@ impl WindowHandle {
     }
 
     fn set_poll_timer(self) -> eyre::Result<()> {
+        self.set_timer(POLL_TIMER_ID, POLL_INTERVAL_MS)
+    }
+
+    fn set_focused_render_timer(self, interval_ms: u32) -> eyre::Result<()> {
+        self.set_timer(FOCUSED_RENDER_TIMER_ID, interval_ms)
+    }
+
+    fn clear_focused_render_timer(self) {
+        self.window_thread.assert_window_thread();
+        // Safety: removing a thread-owned timer from this live HWND is valid.
+        let _ = unsafe { KillTimer(Some(self.hwnd), FOCUSED_RENDER_TIMER_ID) };
+    }
+
+    fn set_timer(self, timer_id: usize, interval_ms: u32) -> eyre::Result<()> {
         self.window_thread.assert_window_thread();
         // Safety: installing a thread-owned timer on a live HWND is valid.
-        let timer = unsafe { SetTimer(Some(self.hwnd), POLL_TIMER_ID, POLL_INTERVAL_MS, None) };
+        let timer = unsafe { SetTimer(Some(self.hwnd), timer_id, interval_ms, None) };
         if timer == 0 {
-            eyre::bail!("failed to start terminal poll timer")
+            eyre::bail!("failed to start window timer")
         }
         Ok(())
     }
@@ -405,6 +424,7 @@ pub fn run(
         font_height = output_font_height,
     )
     .in_scope(|| measure_terminal_cell_size(output_font_height))?;
+    let focused_render_interval_ms = measure_focused_render_interval_ms();
     let terminal = info_span!("create_terminal_session")
         .in_scope(|| TerminalSession::new(app_home, working_dir))?;
 
@@ -420,7 +440,9 @@ pub fn run(
             terminal_scrollbar_hovered_part: None,
             terminal_scrollbar_drag: None,
             in_move_size_loop: false,
+            window_focused: false,
             terminal_poll_pending: false,
+            focused_render_interval_ms,
             terminal_font_height,
             terminal_cell_width,
             terminal_cell_height,
@@ -462,7 +484,75 @@ pub fn run_terminal_throughput_self_test(
     _app_home: &AppHome,
     mode: TerminalThroughputBenchmarkMode,
     line_count: usize,
+    samples: usize,
 ) -> eyre::Result<()> {
+    let mut sample_results = Vec::with_capacity(samples);
+    for sample_index in 0..samples {
+        let result = run_terminal_throughput_self_test_sample(_app_home, mode, line_count)?;
+        if samples > 1 {
+            println!(
+                "sample: {}\nmeasure_command_ms: {:.3}\ngraphical_completion_ms: {:.3}\ndelta_ms: {:.3}\nratio: {:.3}\nframes_rendered: {}\nterminal_closed: {}\n",
+                sample_index + 1,
+                result.measure_command_ms,
+                result.graphical_completion_ms,
+                result.graphical_completion_ms - result.measure_command_ms,
+                result.ratio(),
+                result.frames_rendered,
+                result.terminal_closed,
+            );
+        }
+        sample_results.push(result);
+    }
+
+    let median_measure_command_ms = median_sample_metric(&sample_results, |result| result.measure_command_ms);
+    let median_graphical_completion_ms =
+        median_sample_metric(&sample_results, |result| result.graphical_completion_ms);
+    let median_frames_rendered = median_sample_metric(&sample_results, |result| result.frames_rendered as f64);
+    let last_result = sample_results
+        .last()
+        .ok_or_else(|| eyre::eyre!("terminal throughput benchmark did not produce any samples"))?;
+    let delta_ms = median_graphical_completion_ms - median_measure_command_ms;
+    let ratio = if median_measure_command_ms > 0.0 {
+        median_graphical_completion_ms / median_measure_command_ms
+    } else {
+        0.0
+    };
+
+    println!(
+        "scenario: {}\nline_count: {line_count}\nsamples: {samples}\nmeasure_command_ms: {median_measure_command_ms:.3}\ngraphical_completion_ms: {median_graphical_completion_ms:.3}\ndelta_ms: {delta_ms:.3}\nratio: {ratio:.3}\nframes_rendered: {:.0}\nterminal_closed: {}\n\n=== final_screen ===\n{}",
+        terminal_throughput_mode_name(mode),
+        median_frames_rendered,
+        last_result.terminal_closed,
+        last_result.last_screen,
+    );
+
+    Ok(())
+}
+
+#[derive(Clone, Debug)]
+struct TerminalThroughputBenchmarkSampleResult {
+    measure_command_ms: f64,
+    graphical_completion_ms: f64,
+    frames_rendered: u64,
+    terminal_closed: bool,
+    last_screen: String,
+}
+
+impl TerminalThroughputBenchmarkSampleResult {
+    fn ratio(&self) -> f64 {
+        if self.measure_command_ms > 0.0 {
+            self.graphical_completion_ms / self.measure_command_ms
+        } else {
+            0.0
+        }
+    }
+}
+
+fn run_terminal_throughput_self_test_sample(
+    _app_home: &AppHome,
+    mode: TerminalThroughputBenchmarkMode,
+    line_count: usize,
+) -> eyre::Result<TerminalThroughputBenchmarkSampleResult> {
     let window_thread = WindowThread::current();
     let terminal_font_height = TERMINAL_FONT_HEIGHT;
     let (terminal_cell_width, terminal_cell_height) = info_span!(
@@ -486,7 +576,7 @@ pub fn run_terminal_throughput_self_test(
     let renderer = info_span!("create_terminal_benchmark_renderer")
         .in_scope(|| RenderThreadProxy::new(hwnd.raw()))?;
 
-    let benchmark_result = (|| -> eyre::Result<()> {
+    let benchmark_result = (|| -> eyre::Result<TerminalThroughputBenchmarkSampleResult> {
         terminal.set_wake_window(hwnd.raw());
         let layout = client_layout(hwnd, terminal_cell_width, terminal_cell_height)?;
         terminal.resize(layout)?;
@@ -494,7 +584,7 @@ pub fn run_terminal_throughput_self_test(
         let benchmark_started_at = Instant::now();
         let mut visual_started_at = None;
         let mut frames_rendered = 0_u64;
-        let mut last_screen;
+        let mut last_screen = String::new();
 
         loop {
             let poll_result = terminal.poll_pty_output()?;
@@ -502,10 +592,7 @@ pub fn run_terminal_throughput_self_test(
             let repaint_requested = terminal.take_repaint_requested();
             let pending_output = terminal.has_pending_output();
 
-            let should_render = frames_rendered == 0
-                || poll_result.queued_output
-                || pending_output
-                || repaint_requested;
+            let should_render = frames_rendered == 0 || poll_result.queued_output || repaint_requested;
             if should_render {
                 if visual_started_at.is_none() && (poll_result.queued_output || pending_output) {
                     visual_started_at = Some(Instant::now());
@@ -524,21 +611,14 @@ pub fn run_terminal_throughput_self_test(
                 frames_rendered += 1;
             }
 
-            let screen = terminal.visible_text()?;
-            if visual_started_at.is_none()
-                && screen.contains(TERMINAL_THROUGHPUT_BENCHMARK_START_MARKER)
-            {
-                visual_started_at = Some(Instant::now());
-            }
-
-            let done_visible = screen.contains(TERMINAL_THROUGHPUT_BENCHMARK_DONE_MARKER);
+            let terminal_closed = pump_result.should_close || poll_result.should_close;
             let pending_output_after_render = terminal.has_pending_output();
-            last_screen = screen;
 
             if let Some(visual_started_at) = visual_started_at
-                && done_visible
+                && terminal_closed
                 && !pending_output_after_render
             {
+                last_screen = terminal.visible_text()?;
                 let measure_command_ms =
                     parse_terminal_throughput_measure_command_ms(&last_screen)?;
                 let graphical_completion_ms = visual_started_at.elapsed().as_secs_f64() * 1000.0;
@@ -549,15 +629,21 @@ pub fn run_terminal_throughput_self_test(
                     0.0
                 };
 
-                println!(
-                    "scenario: {}\nline_count: {line_count}\nmeasure_command_ms: {measure_command_ms:.3}\ngraphical_completion_ms: {graphical_completion_ms:.3}\ndelta_ms: {delta_ms:.3}\nratio: {ratio:.3}\nframes_rendered: {frames_rendered}\nterminal_closed: {}\n\n=== final_screen ===\n{last_screen}",
-                    terminal_throughput_mode_name(mode),
-                    pump_result.should_close || poll_result.should_close,
-                );
-                return Ok(());
+                let _ = delta_ms;
+                let _ = ratio;
+                return Ok(TerminalThroughputBenchmarkSampleResult {
+                    measure_command_ms,
+                    graphical_completion_ms,
+                    frames_rendered,
+                    terminal_closed,
+                    last_screen,
+                });
             }
 
             if benchmark_started_at.elapsed() >= TERMINAL_THROUGHPUT_BENCHMARK_TIMEOUT {
+                if last_screen.is_empty() {
+                    last_screen = terminal.visible_text().unwrap_or_default();
+                }
                 eyre::bail!(
                     "timed out waiting for terminal throughput benchmark completion\n\n=== final_screen ===\n{last_screen}"
                 );
@@ -570,6 +656,20 @@ pub fn run_terminal_throughput_self_test(
     drop(renderer);
     hwnd.destroy();
     benchmark_result
+}
+
+fn median_sample_metric<T>(samples: &[TerminalThroughputBenchmarkSampleResult], selector: T) -> f64
+where
+    T: Fn(&TerminalThroughputBenchmarkSampleResult) -> f64,
+{
+    let mut values = samples.iter().map(selector).collect::<Vec<_>>();
+    values.sort_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal));
+    let mid = values.len() / 2;
+    if values.len() % 2 == 0 {
+        (values[mid - 1] + values[mid]) / 2.0
+    } else {
+        values[mid]
+    }
 }
 
 /// os[impl window.appearance.os-chrome-none]
@@ -704,11 +804,14 @@ extern "system" fn window_proc(
     let hwnd = WindowHandle::new(WindowThread::current(), hwnd);
     match message {
         WM_NCCALCSIZE => LRESULT(0),
+        WM_SETFOCUS => handle_focus_changed(hwnd, true),
+        WM_KILLFOCUS => handle_focus_changed(hwnd, false),
         WM_ENTERSIZEMOVE => handle_enter_size_move(hwnd),
         WM_EXITSIZEMOVE => handle_exit_size_move(hwnd),
         WM_SIZE => handle_size(hwnd),
         TERMINAL_WORKER_WAKE_MESSAGE => handle_terminal_worker_wake(hwnd),
         WM_TIMER if wparam.0 == POLL_TIMER_ID => handle_timer(hwnd),
+        WM_TIMER if wparam.0 == FOCUSED_RENDER_TIMER_ID => handle_focused_render_timer(hwnd),
         WM_CHAR => handle_char_message(hwnd, message, wparam, lparam),
         WM_KEYDOWN | WM_SYSKEYDOWN => handle_key_down_message(hwnd, message, wparam, lparam),
         WM_KEYUP | WM_SYSKEYUP => handle_key_up_message(hwnd, message, wparam, lparam),
@@ -792,6 +895,40 @@ fn handle_timer(hwnd: WindowHandle) -> LRESULT {
             }
             LRESULT(0)
         }
+        Err(error) => fail_and_close(hwnd, &error),
+    }
+}
+
+fn handle_focused_render_timer(hwnd: WindowHandle) -> LRESULT {
+    match with_app_state(|state| {
+        if !state.window_focused {
+            return Ok(());
+        }
+
+        let () = {
+            #[cfg(feature = "tracy")]
+            let _span = debug_span!("render_focused_animation_frame").entered();
+            render_current_frame_with_options(state, hwnd, None, true)?;
+        };
+        Ok(())
+    }) {
+        Ok(()) => LRESULT(0),
+        Err(error) => fail_and_close(hwnd, &error),
+    }
+}
+
+fn handle_focus_changed(hwnd: WindowHandle, focused: bool) -> LRESULT {
+    match with_app_state(|state| {
+        state.window_focused = focused;
+        if focused {
+            hwnd.set_focused_render_timer(state.focused_render_interval_ms)?;
+            render_current_frame_with_options(state, hwnd, None, true)?;
+        } else {
+            hwnd.clear_focused_render_timer();
+        }
+        Ok(())
+    }) {
+        Ok(()) => LRESULT(0),
         Err(error) => fail_and_close(hwnd, &error),
     }
 }
@@ -1011,6 +1148,15 @@ fn render_current_frame(
     hwnd: WindowHandle,
     resize: Option<(u32, u32)>,
 ) -> eyre::Result<()> {
+    render_current_frame_with_options(state, hwnd, resize, false)
+}
+
+fn render_current_frame_with_options(
+    state: &mut AppState,
+    hwnd: WindowHandle,
+    resize: Option<(u32, u32)>,
+    force_redraw: bool,
+) -> eyre::Result<()> {
     if let Some((width, height)) = resize
         && let Some(renderer) = state.renderer.as_mut()
     {
@@ -1030,9 +1176,15 @@ fn render_current_frame(
     let terminal_display = {
         #[cfg(feature = "tracy")]
         let _span = debug_span!("build_terminal_display_state").entered();
-        state
-            .terminal
-            .visible_display_state_with_selection(state.terminal_selection)?
+        if let Some(selection) = state.terminal_selection {
+            Arc::new(
+                state
+                    .terminal
+                    .visible_display_state_with_selection(Some(selection))?,
+            )
+        } else {
+            state.terminal.cached_display_state()
+        }
     };
     let terminal_visual_state = terminal_scrollbar_visual_state(state);
 
@@ -1042,7 +1194,7 @@ fn render_current_frame(
     let () = {
         #[cfg(feature = "tracy")]
         let _span = debug_span!("submit_render_frame_model").entered();
-        renderer.render_frame_model(RenderFrameModel {
+        let frame = RenderFrameModel {
             layout,
             cell_number: state
                 .workspace_window
@@ -1059,9 +1211,34 @@ fn render_current_frame(
                 thumb_hovered: terminal_visual_state.thumb_hovered,
                 thumb_grabbed: terminal_visual_state.thumb_grabbed,
             },
-        })?;
+        };
+        if force_redraw {
+            renderer.render_frame_model_force_redraw(frame)?;
+        } else {
+            renderer.render_frame_model(frame)?;
+        }
     };
     Ok(())
+}
+
+fn measure_focused_render_interval_ms() -> u32 {
+    // Safety: querying the screen DC with a null HWND is valid.
+    let hdc = unsafe { GetDC(None) };
+    if hdc.0.is_null() {
+        return 16;
+    }
+
+    // Safety: querying a device capability from a live screen DC is valid.
+    let refresh_hz = unsafe { GetDeviceCaps(Some(hdc), VREFRESH) };
+    // Safety: releasing the screen DC after GetDC(None) is required.
+    unsafe { ReleaseDC(None, hdc) };
+
+    let refresh_hz = u32::try_from(refresh_hz).unwrap_or(60);
+    if refresh_hz <= 1 {
+        return 16;
+    }
+
+    (1_000 / refresh_hz).max(1)
 }
 
 fn terminal_scrollbar_visual_state(state: &AppState) -> TerminalScrollbarVisualState {
@@ -1329,7 +1506,7 @@ fn render_terminal_throughput_benchmark_frame(
     let layout = client_layout(hwnd, terminal_cell_width, terminal_cell_height)?;
     let output_text =
         build_terminal_throughput_benchmark_output_panel_text(terminal, mode, line_count);
-    let terminal_display = terminal.visible_display_state_with_selection(None)?;
+    let terminal_display = terminal.cached_display_state();
 
     renderer.render_frame_model_blocking(RenderFrameModel {
         layout,

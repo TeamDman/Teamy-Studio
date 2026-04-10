@@ -169,10 +169,11 @@ pub fn run_terminal_throughput_self_test(
     app_home: &AppHome,
     mode: TerminalThroughputBenchmarkMode,
     line_count: usize,
+    samples: usize,
 ) -> eyre::Result<()> {
     #[cfg(windows)]
     {
-        windows_app::run_terminal_throughput_self_test(app_home, mode, line_count)
+        windows_app::run_terminal_throughput_self_test(app_home, mode, line_count, samples)
     }
 
     #[cfg(not(windows))]
@@ -180,6 +181,7 @@ pub fn run_terminal_throughput_self_test(
         let _ = app_home;
         let _ = mode;
         let _ = line_count;
+        let _ = samples;
         eyre::bail!("Teamy Studio terminal throughput self-test currently only supports Windows")
     }
 }
