@@ -22,7 +22,6 @@
     clippy::wildcard_imports
 )]
 use std::collections::{BTreeSet, HashMap};
-use std::ops::Range;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex, mpsc};
@@ -53,8 +52,7 @@ use windows::core::{Error, HSTRING, Interface, Owned, PCSTR, s};
 
 use super::spatial::{ClientRect, TerminalCellPoint};
 use super::windows_terminal::{
-    SharedTerminalDisplayState, TerminalDisplayCursor, TerminalDisplayCursorStyle,
-    TerminalDisplayRow, TerminalDisplayScrollbar, TerminalLayout,
+    TerminalDisplayCursorStyle, TerminalDisplayScrollbar, TerminalDisplayState, TerminalLayout,
 };
 
 const FRAME_COUNT: usize = 2;
@@ -253,7 +251,7 @@ pub struct RendererTerminalVisualState {
     pub thumb_grabbed: bool,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct RenderFrameModel {
     pub layout: TerminalLayout,
     pub cell_number: usize,
@@ -262,30 +260,15 @@ pub struct RenderFrameModel {
     pub output_cell_height: i32,
     pub terminal_cell_width: i32,
     pub terminal_cell_height: i32,
-    pub terminal_display: SharedTerminalDisplayState,
+    pub terminal_display: TerminalDisplayState,
     pub terminal_visual_state: RendererTerminalVisualState,
-}
-
-impl PartialEq for RenderFrameModel {
-    fn eq(&self, other: &Self) -> bool {
-        self.layout == other.layout
-            && self.cell_number == other.cell_number
-            && self.output_text == other.output_text
-            && self.output_cell_width == other.output_cell_width
-            && self.output_cell_height == other.output_cell_height
-            && self.terminal_cell_width == other.terminal_cell_width
-            && self.terminal_cell_height == other.terminal_cell_height
-            && (Arc::ptr_eq(&self.terminal_display, &other.terminal_display)
-                || self.terminal_display == other.terminal_display)
-            && self.terminal_visual_state == other.terminal_visual_state
-    }
 }
 
 #[derive(Clone, Debug)]
 struct CachedChromeScene {
     layout: TerminalLayout,
     cell_number: usize,
-    scene: Arc<RenderScene>,
+    scene: RenderScene,
 }
 
 #[derive(Clone, Debug)]
@@ -294,23 +277,15 @@ struct CachedOutputScene {
     output_text: String,
     output_cell_width: i32,
     output_cell_height: i32,
-    scene: Arc<RenderScene>,
-}
-
-#[derive(Clone, Debug)]
-struct CachedTerminalRowScene {
-    scene: Arc<RenderScene>,
+    scene: RenderScene,
 }
 
 #[derive(Clone, Debug)]
 struct CachedTerminalScene {
     layout: TerminalLayout,
-    rows: Vec<CachedTerminalRowScene>,
-    cursor: Option<TerminalDisplayCursor>,
-    cursor_scene: Option<Arc<RenderScene>>,
-    scrollbar: Option<TerminalDisplayScrollbar>,
+    display: TerminalDisplayState,
     visual_state: RendererTerminalVisualState,
-    scrollbar_scene: Arc<RenderScene>,
+    scene: RenderScene,
 }
 
 #[derive(Default)]
@@ -321,19 +296,12 @@ struct RenderThreadSceneCache {
     output: Option<CachedOutputScene>,
     output_vertices: Option<CachedSceneVertices>,
     terminal: Option<CachedTerminalScene>,
-    terminal_vertices: Vec<Option<CachedSceneVertices>>,
-    composited_vertices: Option<CachedCompositedVertices>,
+    terminal_vertices: Option<CachedSceneVertices>,
 }
 
 #[derive(Clone, Debug)]
 struct CachedSceneVertices {
     glyph_cache_generation: u64,
-    vertices: Vec<Vertex>,
-}
-
-#[derive(Clone, Debug, Default)]
-struct CachedCompositedVertices {
-    fragment_ranges: Vec<Range<usize>>,
     vertices: Vec<Vertex>,
 }
 
@@ -823,7 +791,7 @@ impl D3d12PanelRenderer {
 
         let (chrome_scene, chrome_reused) =
             chrome_scene_fragment(&mut scene_cache.chrome, frame.layout, frame.cell_number);
-        let (terminal_scenes, terminal_reused) = terminal_scene_fragments(
+        let (terminal_scene, terminal_reused) = terminal_scene_fragment(
             &mut scene_cache.terminal,
             frame.layout,
             &frame.terminal_display,
@@ -842,18 +810,14 @@ impl D3d12PanelRenderer {
         let glyph_cache_changed = {
             #[cfg(feature = "tracy")]
             let _span = debug_span!("update_slug_curves").entered();
-            let mut scenes = Vec::with_capacity(terminal_scenes.len() + 2);
-            scenes.push(chrome_scene.as_ref());
-            scenes.extend(terminal_scenes.iter().map(Arc::as_ref));
-            scenes.push(output_scene.as_ref());
-            self.update_slug_curves_for_fragments(&scenes)?
+            self.update_slug_curves_for_fragments(&[&chrome_scene, &terminal_scene, &output_scene])?
         };
 
         let chrome_vertices = {
             #[cfg(feature = "tracy")]
             let _span = debug_span!("update_chrome_vertices").entered();
             self.cached_fragment_vertices(
-                chrome_scene.as_ref(),
+                &chrome_scene,
                 chrome_reused && !glyph_cache_changed,
                 &mut scene_cache.chrome_vertices,
             )
@@ -861,27 +825,17 @@ impl D3d12PanelRenderer {
         let terminal_vertices = {
             #[cfg(feature = "tracy")]
             let _span = debug_span!("update_terminal_vertices").entered();
-            scene_cache
-                .terminal_vertices
-                .resize_with(terminal_scenes.len(), || None);
-            let mut vertices = Vec::with_capacity(terminal_scenes.len());
-            for (scene, cached_vertices) in terminal_scenes
-                .iter()
-                .zip(scene_cache.terminal_vertices.iter_mut())
-            {
-                vertices.push(self.cached_fragment_vertices(
-                    scene.as_ref(),
-                    terminal_reused[vertices.len()] && !glyph_cache_changed,
-                    cached_vertices,
-                ));
-            }
-            vertices
+            self.cached_fragment_vertices(
+                &terminal_scene,
+                terminal_reused && !glyph_cache_changed,
+                &mut scene_cache.terminal_vertices,
+            )
         };
         let output_vertices = {
             #[cfg(feature = "tracy")]
             let _span = debug_span!("update_output_vertices").entered();
             self.cached_fragment_vertices(
-                output_scene.as_ref(),
+                &output_scene,
                 output_reused && !glyph_cache_changed,
                 &mut scene_cache.output_vertices,
             )
@@ -890,23 +844,11 @@ impl D3d12PanelRenderer {
         let vertex_count = {
             #[cfg(feature = "tracy")]
             let _span = debug_span!("update_scene_vertices").entered();
-            let mut fragments = Vec::with_capacity(terminal_vertices.len() + 2);
-            let mut fragment_reused = Vec::with_capacity(terminal_vertices.len() + 2);
-            fragments.push(chrome_vertices);
-            fragment_reused.push(chrome_reused && !glyph_cache_changed);
-            fragments.extend(terminal_vertices);
-            fragment_reused.extend(
-                terminal_reused
-                    .iter()
-                    .map(|reused| *reused && !glyph_cache_changed),
-            );
-            fragments.push(output_vertices);
-            fragment_reused.push(output_reused && !glyph_cache_changed);
-            self.upload_composited_fragment_vertices(
-                &fragments,
-                &fragment_reused,
-                &mut scene_cache.composited_vertices,
-            )?
+            self.upload_cached_fragment_vertices(&[
+                chrome_vertices,
+                terminal_vertices,
+                output_vertices,
+            ])?
         };
 
         scene_cache.last_frame = Some(frame.clone());
@@ -1008,77 +950,6 @@ impl D3d12PanelRenderer {
         }
 
         Ok(vertex_count)
-    }
-
-    fn upload_composited_fragment_vertices(
-        &self,
-        fragments: &[&[Vertex]],
-        fragment_reused: &[bool],
-        cached_vertices: &mut Option<CachedCompositedVertices>,
-    ) -> eyre::Result<usize> {
-        debug_assert_eq!(fragments.len(), fragment_reused.len());
-
-        let fragment_ranges = fragment_vertex_ranges(fragments);
-        let vertex_count = fragment_ranges.last().map_or(0, |range| range.end);
-
-        if cached_vertices
-            .as_ref()
-            .is_none_or(|cached| !fragment_ranges_match(&cached.fragment_ranges, &fragment_ranges))
-        {
-            let mut vertices = Vec::with_capacity(vertex_count);
-            for fragment in fragments {
-                vertices.extend_from_slice(fragment);
-            }
-            self.upload_vertex_ranges(&vertices, &[0..vertex_count])?;
-            *cached_vertices = Some(CachedCompositedVertices {
-                fragment_ranges,
-                vertices,
-            });
-            return Ok(vertex_count);
-        }
-
-        let Some(cached_vertices) = cached_vertices.as_mut() else {
-            return Ok(vertex_count);
-        };
-
-        let dirty_ranges = dirty_fragment_ranges(
-            &cached_vertices.fragment_ranges,
-            fragments,
-            fragment_reused,
-            &mut cached_vertices.vertices,
-        );
-        self.upload_vertex_ranges(&cached_vertices.vertices, &dirty_ranges)?;
-        Ok(vertex_count)
-    }
-
-    fn upload_vertex_ranges(
-        &self,
-        vertices: &[Vertex],
-        ranges: &[Range<usize>],
-    ) -> eyre::Result<()> {
-        if ranges.is_empty() {
-            return Ok(());
-        }
-
-        unsafe {
-            let mut mapped = std::ptr::null_mut();
-            self.vertex_buffer.Map(0, None, Some(&mut mapped))?;
-            let base_ptr = mapped as *mut Vertex;
-            for range in ranges {
-                if range.is_empty() {
-                    continue;
-                }
-
-                std::ptr::copy_nonoverlapping(
-                    vertices[range.clone()].as_ptr(),
-                    base_ptr.add(range.start),
-                    range.len(),
-                );
-            }
-            self.vertex_buffer.Unmap(0, None);
-        }
-
-        Ok(())
     }
 
     fn execute_prepared_frame(&mut self, vertex_count: usize) -> eyre::Result<()> {
@@ -1313,55 +1184,6 @@ fn can_reuse_cached_scene_vertices(
             .is_some_and(|cached| cached.glyph_cache_generation == glyph_cache_generation)
 }
 
-fn fragment_vertex_ranges(fragments: &[&[Vertex]]) -> Vec<Range<usize>> {
-    let mut next_start = 0;
-    let mut ranges = Vec::with_capacity(fragments.len());
-    for fragment in fragments {
-        let start = next_start;
-        next_start += fragment.len();
-        ranges.push(start..next_start);
-    }
-    ranges
-}
-
-fn fragment_ranges_match(current: &[Range<usize>], next: &[Range<usize>]) -> bool {
-    current.len() == next.len()
-        && current
-            .iter()
-            .zip(next)
-            .all(|(current, next)| current.len() == next.len())
-}
-
-fn dirty_fragment_ranges(
-    fragment_ranges: &[Range<usize>],
-    fragments: &[&[Vertex]],
-    fragment_reused: &[bool],
-    cached_vertices: &mut [Vertex],
-) -> Vec<Range<usize>> {
-    debug_assert_eq!(fragment_ranges.len(), fragments.len());
-    debug_assert_eq!(fragments.len(), fragment_reused.len());
-
-    let mut dirty_ranges: Vec<Range<usize>> = Vec::new();
-
-    for (index, fragment) in fragments.iter().enumerate() {
-        if fragment_reused[index] {
-            continue;
-        }
-
-        let range = fragment_ranges[index].clone();
-        cached_vertices[range.clone()].copy_from_slice(fragment);
-        if let Some(previous) = dirty_ranges.last_mut()
-            && previous.end == range.start
-        {
-            previous.end = range.end;
-            continue;
-        }
-        dirty_ranges.push(range);
-    }
-
-    dirty_ranges
-}
-
 impl Drop for D3d12PanelRenderer {
     fn drop(&mut self) {
         let _ = self.wait_for_gpu();
@@ -1380,12 +1202,12 @@ fn chrome_scene_fragment(
     cached_chrome_scene: &mut Option<CachedChromeScene>,
     layout: TerminalLayout,
     cell_number: usize,
-) -> (Arc<RenderScene>, bool) {
+) -> (RenderScene, bool) {
     if let Some(cached) = cached_chrome_scene.as_ref()
         && cached.layout == layout
         && cached.cell_number == cell_number
     {
-        return (Arc::clone(&cached.scene), true);
+        return (cached.scene.clone(), true);
     }
 
     let mut scene = build_panel_scene(layout);
@@ -1395,13 +1217,13 @@ fn chrome_scene_fragment(
         &cell_number.to_string(),
         [0.95, 0.95, 0.98, 1.0],
     );
-    let scene = Arc::new(scene);
+    let scene_clone = scene.clone();
     *cached_chrome_scene = Some(CachedChromeScene {
         layout,
         cell_number,
-        scene: Arc::clone(&scene),
+        scene: scene_clone.clone(),
     });
-    (scene, false)
+    (scene_clone, false)
 }
 
 fn output_scene_fragment(
@@ -1410,14 +1232,14 @@ fn output_scene_fragment(
     output_text: &str,
     output_cell_width: i32,
     output_cell_height: i32,
-) -> (Arc<RenderScene>, bool) {
+) -> (RenderScene, bool) {
     if let Some(cached) = cached_output_scene.as_ref()
         && cached.layout == layout
         && cached.output_text == output_text
         && cached.output_cell_width == output_cell_width
         && cached.output_cell_height == output_cell_height
     {
-        return (Arc::clone(&cached.scene), true);
+        return (cached.scene.clone(), true);
     }
 
     let mut scene = RenderScene {
@@ -1433,127 +1255,70 @@ fn output_scene_fragment(
         output_cell_height,
         [0.96, 0.95, 0.90, 1.0],
     );
-    let scene = Arc::new(scene);
+    let scene_clone = scene.clone();
     *cached_output_scene = Some(CachedOutputScene {
         layout,
         output_text: output_text.to_owned(),
         output_cell_width,
         output_cell_height,
-        scene: Arc::clone(&scene),
+        scene: scene_clone.clone(),
     });
-    (scene, false)
+    (scene_clone, false)
 }
 
-fn terminal_scene_fragments(
+fn terminal_scene_fragment(
     cached_terminal_scene: &mut Option<CachedTerminalScene>,
     layout: TerminalLayout,
-    display: &SharedTerminalDisplayState,
+    display: &TerminalDisplayState,
     visual_state: RendererTerminalVisualState,
     terminal_cell_width: i32,
     terminal_cell_height: i32,
-) -> (Vec<Arc<RenderScene>>, Vec<bool>) {
-    let terminal_rect = layout.terminal_viewport_rect().inset(4);
-    let scrollbar_rect = layout.terminal_scrollbar_rect().inset(4);
-
-    let cached = cached_terminal_scene
-        .as_ref()
-        .filter(|cached| cached.layout == layout);
-
-    let mut row_fragments = Vec::with_capacity(display.rows.len() + 2);
-    let mut reused = Vec::with_capacity(display.rows.len() + 2);
-    let mut cached_rows = Vec::with_capacity(display.rows.len());
-    let dirty_rows = &display.dirty_rows;
-
-    for (index, row) in display.rows.iter().enumerate() {
-        let cached_row = cached.and_then(|cached| cached.rows.get(index));
-        let row_is_dirty = dirty_rows.binary_search(&index).is_ok();
-        if let Some(cached_row) = cached_row && !row_is_dirty {
-            row_fragments.push(Arc::clone(&cached_row.scene));
-            reused.push(true);
-            cached_rows.push(cached_row.clone());
-            continue;
-        }
-
-        let scene = Arc::new(build_terminal_row_scene(
-            terminal_rect,
-            terminal_cell_width,
-            terminal_cell_height,
-            row,
-        ));
-        row_fragments.push(Arc::clone(&scene));
-        reused.push(false);
-        cached_rows.push(CachedTerminalRowScene { scene });
-    }
-
-    let (cursor_scene, cursor_reused) = if let Some(cached) = cached
-        && cached.cursor == display.cursor
-    {
-        (cached.cursor_scene.clone(), true)
-    } else {
-        (
-            display.cursor.map(|cursor| {
-                Arc::new(build_terminal_cursor_scene(
-                    terminal_rect,
-                    terminal_cell_width,
-                    terminal_cell_height,
-                    cursor,
-                ))
-            }),
-            false,
-        )
-    };
-
-    if let Some(cursor_scene) = cursor_scene.as_ref() {
-        row_fragments.push(Arc::clone(cursor_scene));
-        reused.push(cursor_reused);
-    }
-
-    let (scrollbar_scene, scrollbar_reused) = if let Some(cached) = cached
-        && cached.scrollbar == display.scrollbar
+) -> (RenderScene, bool) {
+    if let Some(cached) = cached_terminal_scene.as_ref()
+        && cached.layout == layout
+        && cached.display == *display
         && cached.visual_state == visual_state
     {
-        (Arc::clone(&cached.scrollbar_scene), true)
-    } else {
-        (
-            Arc::new(build_terminal_scrollbar_scene(
-                scrollbar_rect,
-                display.scrollbar,
-                visual_state,
-            )),
-            false,
-        )
-    };
-    row_fragments.push(Arc::clone(&scrollbar_scene));
-    reused.push(scrollbar_reused);
+        return (cached.scene.clone(), true);
+    }
 
+    let mut scene = RenderScene {
+        panels: Vec::with_capacity(display.backgrounds.len().saturating_add(2)),
+        glyphs: Vec::with_capacity(display.glyphs.len()),
+        overlay_panels: Vec::with_capacity(8),
+    };
+    let terminal_rect = layout.terminal_viewport_rect().inset(4);
+    let scrollbar_rect = layout.terminal_scrollbar_rect().inset(4);
+    push_terminal_display(
+        &mut scene,
+        terminal_rect,
+        terminal_cell_width,
+        terminal_cell_height,
+        display,
+    );
+    push_terminal_scrollbar(&mut scene, scrollbar_rect, display.scrollbar, visual_state);
+
+    let scene_clone = scene.clone();
     *cached_terminal_scene = Some(CachedTerminalScene {
         layout,
-        rows: cached_rows,
-        cursor: display.cursor,
-        cursor_scene,
-        scrollbar: display.scrollbar,
+        display: display.clone(),
         visual_state,
-        scrollbar_scene,
+        scene: scene_clone.clone(),
     });
 
-    (row_fragments, reused)
+    (scene_clone, false)
 }
 
-fn build_terminal_row_scene(
+fn push_terminal_display(
+    scene: &mut RenderScene,
     terminal_rect: ClientRect,
     cell_width: i32,
     cell_height: i32,
-    row: &TerminalDisplayRow,
-) -> RenderScene {
-    let mut scene = RenderScene {
-        panels: Vec::with_capacity(row.backgrounds.len()),
-        glyphs: Vec::with_capacity(row.glyphs.len()),
-        overlay_panels: Vec::new(),
-    };
-
-    for background in &row.backgrounds {
+    display: &TerminalDisplayState,
+) {
+    for background in &display.backgrounds {
         push_panel(
-            &mut scene,
+            scene,
             terminal_cell_rect(terminal_rect, background.cell, cell_width, cell_height)
                 .to_win32_rect(),
             background.color,
@@ -1561,58 +1326,40 @@ fn build_terminal_row_scene(
         );
     }
 
-    for glyph in &row.glyphs {
+    for glyph in &display.glyphs {
         push_glyph(
-            &mut scene,
+            scene,
             terminal_cell_rect(terminal_rect, glyph.cell, cell_width, cell_height).to_win32_rect(),
             glyph.character,
             glyph.color,
         );
     }
 
-    scene
-}
-
-fn build_terminal_cursor_scene(
-    terminal_rect: ClientRect,
-    cell_width: i32,
-    cell_height: i32,
-    cursor: TerminalDisplayCursor,
-) -> RenderScene {
-    let mut scene = RenderScene {
-        panels: Vec::new(),
-        glyphs: Vec::new(),
-        overlay_panels: Vec::with_capacity(4),
-    };
-    let cell_rect = terminal_cell_rect(terminal_rect, cursor.cell, cell_width, cell_height);
-    for rect in terminal_cursor_overlay_rects(cell_rect, cursor.style) {
-        push_overlay_panel(
-            &mut scene,
-            rect.to_win32_rect(),
-            terminal_cursor_overlay_color(cursor.color, cursor.style),
-            PanelEffect::TerminalCursor,
-        );
+    if let Some(cursor) = display.cursor {
+        let cell_rect = terminal_cell_rect(terminal_rect, cursor.cell, cell_width, cell_height);
+        for rect in terminal_cursor_overlay_rects(cell_rect, cursor.style) {
+            push_overlay_panel(
+                scene,
+                rect.to_win32_rect(),
+                terminal_cursor_overlay_color(cursor.color, cursor.style),
+                PanelEffect::TerminalCursor,
+            );
+        }
     }
-
-    scene
 }
 
-fn build_terminal_scrollbar_scene(
+fn push_terminal_scrollbar(
+    scene: &mut RenderScene,
     scrollbar_rect: ClientRect,
     scrollbar: Option<TerminalDisplayScrollbar>,
     visual_state: RendererTerminalVisualState,
-) -> RenderScene {
-    let mut scene = RenderScene {
-        panels: Vec::with_capacity(2),
-        glyphs: Vec::new(),
-        overlay_panels: Vec::new(),
-    };
+) {
     if scrollbar_rect.width() <= 0 || scrollbar_rect.height() <= 0 {
-        return scene;
+        return;
     }
 
     push_panel(
-        &mut scene,
+        scene,
         scrollbar_rect.to_win32_rect(),
         if visual_state.track_hovered {
             [0.28, 0.10, 0.40, 0.90]
@@ -1623,14 +1370,14 @@ fn build_terminal_scrollbar_scene(
     );
 
     let Some(scrollbar) = scrollbar else {
-        return scene;
+        return;
     };
     let Some(geometry) = terminal_scrollbar_geometry(scrollbar_rect, scrollbar) else {
-        return scene;
+        return;
     };
 
     push_panel(
-        &mut scene,
+        scene,
         geometry.thumb_rect.to_win32_rect(),
         if visual_state.thumb_grabbed {
             [1.00, 0.72, 1.00, 1.00]
@@ -1641,8 +1388,6 @@ fn build_terminal_scrollbar_scene(
         },
         PanelEffect::TerminalScrollbarThumb,
     );
-
-    scene
 }
 
 fn terminal_scrollbar_geometry(
@@ -3782,11 +3527,10 @@ fn issue_transition_barrier(
 #[cfg(test)]
 mod tests {
     use super::{
-        CachedSceneVertices, FALLBACK_GLYPH, PanelEffect, RenderScene, Vertex, append_rect,
+        CachedSceneVertices, FALLBACK_GLYPH, PanelEffect, RenderScene, append_rect,
         append_slug_band_data, build_panel_scene, build_shader_params,
         can_reuse_cached_scene_vertices, collect_scene_chars, cpu_slug_coverage,
-        cpu_slug_coverage_all_curves, dirty_fragment_ranges, extract_glyph_curves,
-        fragment_ranges_match, fragment_vertex_ranges, load_terminal_font, push_centered_text,
+        cpu_slug_coverage_all_curves, extract_glyph_curves, load_terminal_font, push_centered_text,
         push_glyph, push_overlay_panel, push_panel, push_text_block,
         render_snapshot_glyph_into_image,
     };
@@ -3868,82 +3612,6 @@ mod tests {
             Some(&cached_vertices),
             4,
         ));
-    }
-
-    #[test]
-    fn fragment_vertex_ranges_follow_fragment_lengths() {
-        let vertex = Vertex {
-            position: [0.0; 3],
-            color: [0.0; 4],
-            uv: [0.0; 2],
-            effect: 0.0,
-            glyph: 0.0,
-            glyph_data: [0.0; 4],
-            banding: [0.0; 4],
-            normal: [0.0; 2],
-            jacobian: [0.0; 4],
-            _padding: [0.0; 2],
-        };
-        let fragment_a = vec![vertex];
-        let fragment_b = vec![vertex; 3];
-        let fragments = vec![fragment_a.as_slice(), fragment_b.as_slice()];
-
-        assert_eq!(fragment_vertex_ranges(&fragments), vec![0..1, 1..4]);
-    }
-
-    #[test]
-    fn fragment_ranges_match_only_when_fragment_lengths_match() {
-        assert!(fragment_ranges_match(&[0..2, 2..5], &[0..2, 2..5]));
-        assert!(fragment_ranges_match(&[4..6, 6..9], &[0..2, 2..5]));
-        assert!(!fragment_ranges_match(&[0..2, 2..5], &[0..2, 2..6]));
-        assert!(!fragment_ranges_match(&[0..2], &[0..2, 2..5]));
-    }
-
-    #[test]
-    fn dirty_fragment_ranges_patch_and_merge_adjacent_updates() {
-        let base_vertex = Vertex {
-            position: [0.0; 3],
-            color: [0.0; 4],
-            uv: [0.0; 2],
-            effect: 0.0,
-            glyph: 0.0,
-            glyph_data: [0.0; 4],
-            banding: [0.0; 4],
-            normal: [0.0; 2],
-            jacobian: [0.0; 4],
-            _padding: [0.0; 2],
-        };
-        let fragment_a = vec![Vertex {
-            position: [1.0, 0.0, 0.0],
-            ..base_vertex
-        }];
-        let fragment_b = vec![Vertex {
-            position: [2.0, 0.0, 0.0],
-            ..base_vertex
-        }];
-        let fragment_c = vec![Vertex {
-            position: [3.0, 0.0, 0.0],
-            ..base_vertex
-        }];
-        let fragments = vec![
-            fragment_a.as_slice(),
-            fragment_b.as_slice(),
-            fragment_c.as_slice(),
-        ];
-        let ranges = fragment_vertex_ranges(&fragments);
-        let mut cached_vertices = vec![base_vertex; 3];
-
-        let dirty_ranges = dirty_fragment_ranges(
-            &ranges,
-            &fragments,
-            &[false, false, true],
-            &mut cached_vertices,
-        );
-
-        assert_eq!(dirty_ranges, vec![0..2]);
-        assert_eq!(cached_vertices[0].position[0], 1.0);
-        assert_eq!(cached_vertices[1].position[0], 2.0);
-        assert_eq!(cached_vertices[2].position[0], 0.0);
     }
 
     #[test]

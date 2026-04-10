@@ -58,9 +58,6 @@ The `self-test terminal-throughput` command must accept an optional benchmark mo
 cli[self-test.terminal-throughput.line-count-flag]
 The `self-test terminal-throughput` command must support `--line-count` to control the emitted `Out-Host` line count.
 
-cli[self-test.terminal-throughput.samples-flag]
-The `self-test terminal-throughput` command must support `--samples` to run multiple benchmark samples and report median results.
-
 cli[command.surface.window]
 The CLI must expose a `window` command group.
 

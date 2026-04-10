@@ -1,7 +1,6 @@
 use std::cell::RefCell;
 use std::marker::PhantomData;
 use std::path::Path;
-use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 #[cfg(feature = "tracy")]
@@ -484,75 +483,7 @@ pub fn run_terminal_throughput_self_test(
     _app_home: &AppHome,
     mode: TerminalThroughputBenchmarkMode,
     line_count: usize,
-    samples: usize,
 ) -> eyre::Result<()> {
-    let mut sample_results = Vec::with_capacity(samples);
-    for sample_index in 0..samples {
-        let result = run_terminal_throughput_self_test_sample(_app_home, mode, line_count)?;
-        if samples > 1 {
-            println!(
-                "sample: {}\nmeasure_command_ms: {:.3}\ngraphical_completion_ms: {:.3}\ndelta_ms: {:.3}\nratio: {:.3}\nframes_rendered: {}\nterminal_closed: {}\n",
-                sample_index + 1,
-                result.measure_command_ms,
-                result.graphical_completion_ms,
-                result.graphical_completion_ms - result.measure_command_ms,
-                result.ratio(),
-                result.frames_rendered,
-                result.terminal_closed,
-            );
-        }
-        sample_results.push(result);
-    }
-
-    let median_measure_command_ms = median_sample_metric(&sample_results, |result| result.measure_command_ms);
-    let median_graphical_completion_ms =
-        median_sample_metric(&sample_results, |result| result.graphical_completion_ms);
-    let median_frames_rendered = median_sample_metric(&sample_results, |result| result.frames_rendered as f64);
-    let last_result = sample_results
-        .last()
-        .ok_or_else(|| eyre::eyre!("terminal throughput benchmark did not produce any samples"))?;
-    let delta_ms = median_graphical_completion_ms - median_measure_command_ms;
-    let ratio = if median_measure_command_ms > 0.0 {
-        median_graphical_completion_ms / median_measure_command_ms
-    } else {
-        0.0
-    };
-
-    println!(
-        "scenario: {}\nline_count: {line_count}\nsamples: {samples}\nmeasure_command_ms: {median_measure_command_ms:.3}\ngraphical_completion_ms: {median_graphical_completion_ms:.3}\ndelta_ms: {delta_ms:.3}\nratio: {ratio:.3}\nframes_rendered: {:.0}\nterminal_closed: {}\n\n=== final_screen ===\n{}",
-        terminal_throughput_mode_name(mode),
-        median_frames_rendered,
-        last_result.terminal_closed,
-        last_result.last_screen,
-    );
-
-    Ok(())
-}
-
-#[derive(Clone, Debug)]
-struct TerminalThroughputBenchmarkSampleResult {
-    measure_command_ms: f64,
-    graphical_completion_ms: f64,
-    frames_rendered: u64,
-    terminal_closed: bool,
-    last_screen: String,
-}
-
-impl TerminalThroughputBenchmarkSampleResult {
-    fn ratio(&self) -> f64 {
-        if self.measure_command_ms > 0.0 {
-            self.graphical_completion_ms / self.measure_command_ms
-        } else {
-            0.0
-        }
-    }
-}
-
-fn run_terminal_throughput_self_test_sample(
-    _app_home: &AppHome,
-    mode: TerminalThroughputBenchmarkMode,
-    line_count: usize,
-) -> eyre::Result<TerminalThroughputBenchmarkSampleResult> {
     let window_thread = WindowThread::current();
     let terminal_font_height = TERMINAL_FONT_HEIGHT;
     let (terminal_cell_width, terminal_cell_height) = info_span!(
@@ -576,7 +507,7 @@ fn run_terminal_throughput_self_test_sample(
     let renderer = info_span!("create_terminal_benchmark_renderer")
         .in_scope(|| RenderThreadProxy::new(hwnd.raw()))?;
 
-    let benchmark_result = (|| -> eyre::Result<TerminalThroughputBenchmarkSampleResult> {
+    let benchmark_result = (|| -> eyre::Result<()> {
         terminal.set_wake_window(hwnd.raw());
         let layout = client_layout(hwnd, terminal_cell_width, terminal_cell_height)?;
         terminal.resize(layout)?;
@@ -584,7 +515,7 @@ fn run_terminal_throughput_self_test_sample(
         let benchmark_started_at = Instant::now();
         let mut visual_started_at = None;
         let mut frames_rendered = 0_u64;
-        let mut last_screen = String::new();
+        let mut last_screen;
 
         loop {
             let poll_result = terminal.poll_pty_output()?;
@@ -592,7 +523,10 @@ fn run_terminal_throughput_self_test_sample(
             let repaint_requested = terminal.take_repaint_requested();
             let pending_output = terminal.has_pending_output();
 
-            let should_render = frames_rendered == 0 || poll_result.queued_output || repaint_requested;
+            let should_render = frames_rendered == 0
+                || poll_result.queued_output
+                || pending_output
+                || repaint_requested;
             if should_render {
                 if visual_started_at.is_none() && (poll_result.queued_output || pending_output) {
                     visual_started_at = Some(Instant::now());
@@ -611,14 +545,21 @@ fn run_terminal_throughput_self_test_sample(
                 frames_rendered += 1;
             }
 
-            let terminal_closed = pump_result.should_close || poll_result.should_close;
+            let screen = terminal.visible_text()?;
+            if visual_started_at.is_none()
+                && screen.contains(TERMINAL_THROUGHPUT_BENCHMARK_START_MARKER)
+            {
+                visual_started_at = Some(Instant::now());
+            }
+
+            let done_visible = screen.contains(TERMINAL_THROUGHPUT_BENCHMARK_DONE_MARKER);
             let pending_output_after_render = terminal.has_pending_output();
+            last_screen = screen;
 
             if let Some(visual_started_at) = visual_started_at
-                && terminal_closed
+                && done_visible
                 && !pending_output_after_render
             {
-                last_screen = terminal.visible_text()?;
                 let measure_command_ms =
                     parse_terminal_throughput_measure_command_ms(&last_screen)?;
                 let graphical_completion_ms = visual_started_at.elapsed().as_secs_f64() * 1000.0;
@@ -629,21 +570,15 @@ fn run_terminal_throughput_self_test_sample(
                     0.0
                 };
 
-                let _ = delta_ms;
-                let _ = ratio;
-                return Ok(TerminalThroughputBenchmarkSampleResult {
-                    measure_command_ms,
-                    graphical_completion_ms,
-                    frames_rendered,
-                    terminal_closed,
-                    last_screen,
-                });
+                println!(
+                    "scenario: {}\nline_count: {line_count}\nmeasure_command_ms: {measure_command_ms:.3}\ngraphical_completion_ms: {graphical_completion_ms:.3}\ndelta_ms: {delta_ms:.3}\nratio: {ratio:.3}\nframes_rendered: {frames_rendered}\nterminal_closed: {}\n\n=== final_screen ===\n{last_screen}",
+                    terminal_throughput_mode_name(mode),
+                    pump_result.should_close || poll_result.should_close,
+                );
+                return Ok(());
             }
 
             if benchmark_started_at.elapsed() >= TERMINAL_THROUGHPUT_BENCHMARK_TIMEOUT {
-                if last_screen.is_empty() {
-                    last_screen = terminal.visible_text().unwrap_or_default();
-                }
                 eyre::bail!(
                     "timed out waiting for terminal throughput benchmark completion\n\n=== final_screen ===\n{last_screen}"
                 );
@@ -656,20 +591,6 @@ fn run_terminal_throughput_self_test_sample(
     drop(renderer);
     hwnd.destroy();
     benchmark_result
-}
-
-fn median_sample_metric<T>(samples: &[TerminalThroughputBenchmarkSampleResult], selector: T) -> f64
-where
-    T: Fn(&TerminalThroughputBenchmarkSampleResult) -> f64,
-{
-    let mut values = samples.iter().map(selector).collect::<Vec<_>>();
-    values.sort_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal));
-    let mid = values.len() / 2;
-    if values.len() % 2 == 0 {
-        (values[mid - 1] + values[mid]) / 2.0
-    } else {
-        values[mid]
-    }
 }
 
 /// os[impl window.appearance.os-chrome-none]
@@ -1176,15 +1097,9 @@ fn render_current_frame_with_options(
     let terminal_display = {
         #[cfg(feature = "tracy")]
         let _span = debug_span!("build_terminal_display_state").entered();
-        if let Some(selection) = state.terminal_selection {
-            Arc::new(
-                state
-                    .terminal
-                    .visible_display_state_with_selection(Some(selection))?,
-            )
-        } else {
-            state.terminal.cached_display_state()
-        }
+        state
+            .terminal
+            .visible_display_state_with_selection(state.terminal_selection)?
     };
     let terminal_visual_state = terminal_scrollbar_visual_state(state);
 
@@ -1506,7 +1421,7 @@ fn render_terminal_throughput_benchmark_frame(
     let layout = client_layout(hwnd, terminal_cell_width, terminal_cell_height)?;
     let output_text =
         build_terminal_throughput_benchmark_output_panel_text(terminal, mode, line_count);
-    let terminal_display = terminal.cached_display_state();
+    let terminal_display = terminal.visible_display_state_with_selection(None)?;
 
     renderer.render_frame_model_blocking(RenderFrameModel {
         layout,

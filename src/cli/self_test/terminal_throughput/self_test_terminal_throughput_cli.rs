@@ -32,11 +32,6 @@ pub struct SelfTestTerminalThroughputArgs {
     /// Number of lines to emit through `Out-Host`.
     #[facet(args::named)]
     pub line_count: Option<usize>,
-
-    /// cli[impl self-test.terminal-throughput.samples-flag]
-    /// Number of benchmark samples to run before reporting results.
-    #[facet(args::named)]
-    pub samples: Option<usize>,
 }
 
 impl SelfTestTerminalThroughputArgs {
@@ -55,7 +50,6 @@ impl SelfTestTerminalThroughputArgs {
                 .unwrap_or(SelfTestTerminalThroughputMode::MeasureCommandOutHost)
                 .into(),
             self.line_count.unwrap_or(10_000),
-            self.samples.unwrap_or(1).max(1),
         )
     }
 }
