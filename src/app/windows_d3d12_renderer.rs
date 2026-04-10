@@ -299,7 +299,6 @@ struct CachedOutputScene {
 
 #[derive(Clone, Debug)]
 struct CachedTerminalRowScene {
-    row: TerminalDisplayRow,
     scene: Arc<RenderScene>,
 }
 
@@ -1463,10 +1462,12 @@ fn terminal_scene_fragments(
     let mut row_fragments = Vec::with_capacity(display.rows.len() + 2);
     let mut reused = Vec::with_capacity(display.rows.len() + 2);
     let mut cached_rows = Vec::with_capacity(display.rows.len());
+    let dirty_rows = &display.dirty_rows;
 
     for (index, row) in display.rows.iter().enumerate() {
         let cached_row = cached.and_then(|cached| cached.rows.get(index));
-        if let Some(cached_row) = cached_row && cached_row.row == *row {
+        let row_is_dirty = dirty_rows.binary_search(&index).is_ok();
+        if let Some(cached_row) = cached_row && !row_is_dirty {
             row_fragments.push(Arc::clone(&cached_row.scene));
             reused.push(true);
             cached_rows.push(cached_row.clone());
@@ -1481,10 +1482,7 @@ fn terminal_scene_fragments(
         ));
         row_fragments.push(Arc::clone(&scene));
         reused.push(false);
-        cached_rows.push(CachedTerminalRowScene {
-            row: row.clone(),
-            scene,
-        });
+        cached_rows.push(CachedTerminalRowScene { scene });
     }
 
     let (cursor_scene, cursor_reused) = if let Some(cached) = cached

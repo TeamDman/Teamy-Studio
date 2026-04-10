@@ -145,11 +145,20 @@ pub struct TerminalDisplayRow {
     pub glyphs: Vec<TerminalDisplayGlyph>,
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default)]
 pub struct TerminalDisplayState {
     pub rows: Vec<TerminalDisplayRow>,
+    pub dirty_rows: Vec<usize>,
     pub cursor: Option<TerminalDisplayCursor>,
     pub scrollbar: Option<TerminalDisplayScrollbar>,
+}
+
+impl PartialEq for TerminalDisplayState {
+    fn eq(&self, other: &Self) -> bool {
+        self.rows == other.rows
+            && self.cursor == other.cursor
+            && self.scrollbar == other.scrollbar
+    }
 }
 
 pub type SharedTerminalDisplayState = Arc<TerminalDisplayState>;
@@ -1819,6 +1828,7 @@ impl TerminalCore {
         let cursor = build_terminal_cursor(&snapshot, &colors)?;
         let mut display = TerminalDisplayState {
             rows: Vec::new(),
+            dirty_rows: Vec::new(),
             cursor,
             scrollbar: Some(TerminalDisplayScrollbar {
                 total: viewport.total,
@@ -1885,6 +1895,8 @@ impl TerminalCore {
                 row_index += 1;
             }
         }
+
+        display.dirty_rows = dirty_terminal_row_indices(self.cached_display.as_ref(), &display);
 
         Ok(display)
     }
@@ -2893,6 +2905,21 @@ fn should_publish_terminal_display_update(
     })
 }
 
+fn dirty_terminal_row_indices(
+    previous: &TerminalDisplayState,
+    next: &TerminalDisplayState,
+) -> Vec<usize> {
+    if previous.rows.len() != next.rows.len() {
+        return (0..next.rows.len()).collect();
+    }
+
+    next.rows
+        .iter()
+        .enumerate()
+        .filter_map(|(index, row)| (previous.rows[index] != *row).then_some(index))
+        .collect()
+}
+
 fn pending_output_display_publish_interval(pending_output_len: usize) -> Duration {
     if pending_output_len >= 8 * 1024 {
         return TERMINAL_DISPLAY_BURST_PUBLISH_INTERVAL;
@@ -2943,11 +2970,13 @@ mod tests {
         TERMINAL_OUTPUT_SLICE_BYTES,
         TERMINAL_WORKER_BURST_PUMP_TIME_BUDGET, TERMINAL_WORKER_MEDIUM_PUMP_TIME_BUDGET,
         TERMINAL_WORKER_PUMP_TIME_BUDGET,
-        TerminalDisplayCursorStyle, TerminalDisplayState, TerminalLayout, TerminalSelection,
+        TerminalDisplayCursorStyle, TerminalDisplayGlyph, TerminalDisplayRow,
+        TerminalDisplayState, TerminalLayout, TerminalSelection,
         TerminalSelectionMode, TerminalTextRow, extract_selected_text, map_cursor_style, map_virtual_key,
         osc_terminator, partial_osc_133_prefix_len, pending_output_display_publish_interval,
         pending_output_pump_time_budget, pending_output_slice_bytes,
         resolve_terminal_cell_colors, should_close_from_echoed_ctrl_d,
+        dirty_terminal_row_indices,
         should_mark_prompt_input_written_for_key, should_refresh_semantic_prompt_tracking,
         should_publish_terminal_display_state, should_publish_terminal_display_update,
         should_translate_ctrl_d_key, should_translate_ctrl_d_to_exit, strip_echoed_ctrl_d,
@@ -3013,6 +3042,73 @@ mod tests {
             background,
             Some([1.0 / 255.0, 2.0 / 255.0, 3.0 / 255.0, 1.0])
         );
+    }
+
+    #[test]
+    fn terminal_display_state_equality_ignores_dirty_rows() {
+        let left = TerminalDisplayState {
+            rows: vec![TerminalDisplayRow {
+                row: 0,
+                backgrounds: Vec::new(),
+                glyphs: Vec::new(),
+            }],
+            dirty_rows: vec![0],
+            cursor: None,
+            scrollbar: None,
+        };
+        let right = TerminalDisplayState {
+            rows: vec![TerminalDisplayRow {
+                row: 0,
+                backgrounds: Vec::new(),
+                glyphs: Vec::new(),
+            }],
+            dirty_rows: Vec::new(),
+            cursor: None,
+            scrollbar: None,
+        };
+
+        assert_eq!(left, right);
+    }
+
+    #[test]
+    fn dirty_terminal_row_indices_marks_only_changed_rows() {
+        let unchanged_row = TerminalDisplayRow {
+            row: 0,
+            backgrounds: Vec::new(),
+            glyphs: Vec::new(),
+        };
+        let changed_row_before = TerminalDisplayRow {
+            row: 1,
+            backgrounds: Vec::new(),
+            glyphs: vec![TerminalDisplayGlyph {
+                cell: TerminalCellPoint::new(0, 1),
+                character: 'a',
+                color: [1.0, 1.0, 1.0, 1.0],
+            }],
+        };
+        let changed_row_after = TerminalDisplayRow {
+            row: 1,
+            backgrounds: Vec::new(),
+            glyphs: vec![TerminalDisplayGlyph {
+                cell: TerminalCellPoint::new(0, 1),
+                character: 'b',
+                color: [1.0, 1.0, 1.0, 1.0],
+            }],
+        };
+        let previous = TerminalDisplayState {
+            rows: vec![unchanged_row.clone(), changed_row_before],
+            dirty_rows: Vec::new(),
+            cursor: None,
+            scrollbar: None,
+        };
+        let next = TerminalDisplayState {
+            rows: vec![unchanged_row, changed_row_after],
+            dirty_rows: Vec::new(),
+            cursor: None,
+            scrollbar: None,
+        };
+
+        assert_eq!(dirty_terminal_row_indices(&previous, &next), vec![1]);
     }
 
     #[test]
@@ -3084,6 +3180,7 @@ mod tests {
         let previous = Arc::new(TerminalDisplayState::default());
         let next = Arc::new(TerminalDisplayState {
             rows: vec![Default::default()],
+            dirty_rows: vec![0],
             cursor: None,
             scrollbar: None,
         });

@@ -129,6 +129,7 @@ What is now true:
 
 - no-selection frames render from asynchronously published cached display snapshots
 - the hot no-selection path now shares cached terminal display state across worker, UI, and renderer instead of deep-cloning at each handoff
+- worker-published display snapshots now include dirty-row metadata so the renderer can reuse unchanged row scenes without re-diffing every row deeply
 
 Remaining gap:
 
@@ -146,12 +147,13 @@ What is now true:
 - fragment scenes and fragment vertices are cached
 - cached terminal display and cached render scenes now use shared ownership to avoid some deep copies
 - the renderer now caches the composited frame vertex stream and patches only changed fragment ranges into the GPU vertex buffer when fragment sizes stay stable
+- the renderer now trusts worker-published dirty-row metadata for row-scene reuse instead of rediscovering unchanged rows by full row comparison on every published frame
 - focused redraws can force present without defeating duplicate-frame elision for normal steady-state frames
 
 Remaining gap:
 
 - the renderer still rebuilds terminal fragment content from full display snapshots when the terminal changes
-- the worker still does not publish explicit dirty-row metadata, so terminal fragment reuse is inferred after full snapshot extraction
+- the worker still publishes dirty-row metadata only after whole-snapshot extraction instead of exposing a cheaper incremental damage path directly from mutation
 - there is still no partial-present or dirty-rect presentation path
 - terminal updates still produce many intermediate frames under heavy burst output
 
