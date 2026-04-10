@@ -192,6 +192,24 @@ fn test_keyboard_input_help_shows_inside_flag() {
     );
 }
 
+// tool[verify cli.help.position-independent]
+// cli[verify command.surface.self-test-terminal-throughput]
+// cli[verify self-test.terminal-throughput.line-count-flag]
+#[test]
+fn test_terminal_throughput_help_shows_line_count_flag() {
+    let output = run_teamy_studio(&["self-test", "terminal-throughput", "--help"], &[]);
+    let text = output_text(&output);
+
+    assert!(
+        output.status.success(),
+        "terminal-throughput help failed:\n{text}"
+    );
+    assert!(
+        text.contains("--line-count"),
+        "missing --line-count in help:\n{text}"
+    );
+}
+
 // cli[verify command.surface.shell-default-set]
 // cli[verify command.surface.shell-default-show]
 // cli[verify shell.default.persisted-in-app-home]

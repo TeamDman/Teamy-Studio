@@ -21,10 +21,11 @@
     clippy::vec_init_then_push,
     clippy::wildcard_imports
 )]
-
 use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::{Arc, Condvar, Mutex, mpsc};
+use std::thread;
 use std::time::Instant;
 
 // os[impl os.windows.rendering.direct3d12]
@@ -49,7 +50,10 @@ use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObj
 use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
 use windows::core::{Error, HSTRING, Interface, Owned, PCSTR, s};
 
-use super::windows_terminal::TerminalLayout;
+use super::spatial::{ClientRect, TerminalCellPoint};
+use super::windows_terminal::{
+    TerminalDisplayCursorStyle, TerminalDisplayScrollbar, TerminalDisplayState, TerminalLayout,
+};
 
 const FRAME_COUNT: usize = 2;
 const MAX_PANEL_COUNT: usize = 8_192;
@@ -210,11 +214,294 @@ pub struct D3d12PanelRenderer {
     font: LoadedTerminalFont,
     glyph_cache: HashMap<char, SlugGlyph>,
     cached_chars: Vec<char>,
+    glyph_cache_generation: u64,
     viewport: D3D12_VIEWPORT,
     scissor_rect: RECT,
     width: u32,
     height: u32,
     animation_start: Instant,
+}
+
+#[derive(Debug)]
+struct RenderThreadShared {
+    pending_resize: Option<(u32, u32)>,
+    pending_frame: Option<QueuedRenderFrame>,
+    next_submission_id: u64,
+    completed_submission_id: u64,
+    shutdown: bool,
+    error: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct QueuedRenderFrame {
+    submission_id: u64,
+    frame: RenderFrameModel,
+}
+
+pub struct RenderThreadProxy {
+    shared: Arc<(Mutex<RenderThreadShared>, Condvar)>,
+    worker: Option<thread::JoinHandle<()>>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RendererTerminalVisualState {
+    pub track_hovered: bool,
+    pub thumb_hovered: bool,
+    pub thumb_grabbed: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct RenderFrameModel {
+    pub layout: TerminalLayout,
+    pub cell_number: usize,
+    pub output_text: String,
+    pub output_cell_width: i32,
+    pub output_cell_height: i32,
+    pub terminal_cell_width: i32,
+    pub terminal_cell_height: i32,
+    pub terminal_display: TerminalDisplayState,
+    pub terminal_visual_state: RendererTerminalVisualState,
+}
+
+#[derive(Clone, Debug)]
+struct CachedChromeScene {
+    layout: TerminalLayout,
+    cell_number: usize,
+    scene: RenderScene,
+}
+
+#[derive(Clone, Debug)]
+struct CachedOutputScene {
+    layout: TerminalLayout,
+    output_text: String,
+    output_cell_width: i32,
+    output_cell_height: i32,
+    scene: RenderScene,
+}
+
+#[derive(Clone, Debug)]
+struct CachedTerminalScene {
+    layout: TerminalLayout,
+    display: TerminalDisplayState,
+    visual_state: RendererTerminalVisualState,
+    scene: RenderScene,
+}
+
+#[derive(Default)]
+struct RenderThreadSceneCache {
+    last_frame: Option<RenderFrameModel>,
+    chrome: Option<CachedChromeScene>,
+    chrome_vertices: Option<CachedSceneVertices>,
+    output: Option<CachedOutputScene>,
+    output_vertices: Option<CachedSceneVertices>,
+    terminal: Option<CachedTerminalScene>,
+    terminal_vertices: Option<CachedSceneVertices>,
+}
+
+#[derive(Clone, Debug)]
+struct CachedSceneVertices {
+    glyph_cache_generation: u64,
+    vertices: Vec<Vertex>,
+}
+
+impl RenderThreadProxy {
+    #[instrument(level = "info", skip_all)]
+    pub fn new(hwnd: HWND) -> eyre::Result<Self> {
+        let shared = Arc::new((
+            Mutex::new(RenderThreadShared {
+                pending_resize: None,
+                pending_frame: None,
+                next_submission_id: 0,
+                completed_submission_id: 0,
+                shutdown: false,
+                error: None,
+            }),
+            Condvar::new(),
+        ));
+        let shared_for_worker = Arc::clone(&shared);
+        let (startup_tx, startup_rx) = mpsc::sync_channel(1);
+        let raw_hwnd = hwnd.0 as isize;
+
+        let worker = thread::Builder::new()
+            .name("teamy-d3d12-renderer".to_owned())
+            .spawn(move || {
+                let startup_result =
+                    D3d12PanelRenderer::new(HWND(raw_hwnd as *mut core::ffi::c_void));
+                match startup_result {
+                    Ok(mut renderer) => {
+                        let _ = startup_tx.send(Ok(()));
+                        render_thread_main_loop(&shared_for_worker, &mut renderer);
+                    }
+                    Err(error) => {
+                        let message = format!("failed to create D3D12 renderer thread: {error}");
+                        if let Ok(mut state) = shared_for_worker.0.lock() {
+                            state.error = Some(message.clone());
+                        }
+                        let _ = startup_tx.send(Err(eyre::eyre!(message)));
+                    }
+                }
+            })
+            .map_err(|error| eyre::eyre!("failed to spawn D3D12 renderer thread: {error}"))?;
+
+        startup_rx
+            .recv()
+            .map_err(|error| eyre::eyre!("renderer thread failed to report startup: {error}"))??;
+
+        Ok(Self {
+            shared,
+            worker: Some(worker),
+        })
+    }
+
+    pub fn resize(&self, width: u32, height: u32) -> eyre::Result<()> {
+        self.check_error()?;
+        let (state_lock, wake) = &*self.shared;
+        let mut state = state_lock
+            .lock()
+            .map_err(|error| eyre::eyre!("failed to lock renderer thread state: {error}"))?;
+        state.pending_resize = Some((width, height));
+        wake.notify_one();
+        Ok(())
+    }
+
+    pub fn render_frame_model(&self, frame: RenderFrameModel) -> eyre::Result<()> {
+        let _ = self.submit_render_frame_model(frame)?;
+        Ok(())
+    }
+
+    pub fn render_frame_model_blocking(&self, frame: RenderFrameModel) -> eyre::Result<()> {
+        let submission_id = self.submit_render_frame_model(frame)?;
+        let (state_lock, wake) = &*self.shared;
+        let mut state = state_lock
+            .lock()
+            .map_err(|error| eyre::eyre!("failed to lock renderer thread state: {error}"))?;
+
+        while state.completed_submission_id < submission_id {
+            if let Some(error) = state.error.as_ref() {
+                eyre::bail!(error.clone());
+            }
+
+            state = wake.wait(state).map_err(|error| {
+                eyre::eyre!("failed to wait for renderer thread completion: {error}")
+            })?;
+        }
+
+        if let Some(error) = state.error.as_ref() {
+            eyre::bail!(error.clone());
+        }
+
+        Ok(())
+    }
+
+    fn submit_render_frame_model(&self, frame: RenderFrameModel) -> eyre::Result<u64> {
+        self.check_error()?;
+        let (state_lock, wake) = &*self.shared;
+        let mut state = state_lock
+            .lock()
+            .map_err(|error| eyre::eyre!("failed to lock renderer thread state: {error}"))?;
+        state.next_submission_id += 1;
+        let submission_id = state.next_submission_id;
+        state.pending_frame = Some(QueuedRenderFrame {
+            submission_id,
+            frame,
+        });
+        wake.notify_one();
+        Ok(submission_id)
+    }
+
+    fn check_error(&self) -> eyre::Result<()> {
+        let state = self
+            .shared
+            .0
+            .lock()
+            .map_err(|error| eyre::eyre!("failed to lock renderer thread state: {error}"))?;
+        if let Some(error) = state.error.as_ref() {
+            eyre::bail!(error.clone());
+        }
+        Ok(())
+    }
+}
+
+impl Drop for RenderThreadProxy {
+    fn drop(&mut self) {
+        let (state_lock, wake) = &*self.shared;
+        if let Ok(mut state) = state_lock.lock() {
+            state.shutdown = true;
+            wake.notify_one();
+        }
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+fn render_thread_main_loop(
+    shared: &Arc<(Mutex<RenderThreadShared>, Condvar)>,
+    renderer: &mut D3d12PanelRenderer,
+) {
+    let mut scene_cache = RenderThreadSceneCache::default();
+    loop {
+        let (pending_resize, pending_frame) = {
+            let (state_lock, wake) = &**shared;
+            let Ok(mut state) = state_lock.lock() else {
+                return;
+            };
+
+            while !state.shutdown
+                && state.pending_resize.is_none()
+                && state.pending_frame.is_none()
+                && state.error.is_none()
+            {
+                state = match wake.wait(state) {
+                    Ok(state) => state,
+                    Err(_) => return,
+                };
+            }
+
+            if state.shutdown || state.error.is_some() {
+                return;
+            }
+
+            (state.pending_resize.take(), state.pending_frame.take())
+        };
+
+        let result = (|| -> eyre::Result<()> {
+            if let Some((width, height)) = pending_resize {
+                #[cfg(feature = "tracy")]
+                let _span = debug_span!("render_thread_resize_swap_chain").entered();
+                renderer.resize(width, height)?;
+            }
+
+            if let Some(queued_frame) = pending_frame.as_ref() {
+                #[cfg(feature = "tracy")]
+                let _span = debug_span!("render_thread_render_frame").entered();
+                renderer.render_frame_model(
+                    &queued_frame.frame,
+                    pending_resize.is_some(),
+                    &mut scene_cache,
+                )?;
+            }
+
+            Ok(())
+        })();
+
+        if let Err(error) = result {
+            if let Ok(mut state) = shared.0.lock() {
+                state.error = Some(error.to_string());
+                shared.1.notify_all();
+            }
+            return;
+        }
+
+        if let Some(queued_frame) = pending_frame
+            && let Ok(mut state) = shared.0.lock()
+        {
+            state.completed_submission_id = state
+                .completed_submission_id
+                .max(queued_frame.submission_id);
+            shared.1.notify_all();
+        }
+    }
 }
 
 impl D3d12PanelRenderer {
@@ -304,6 +591,7 @@ impl D3d12PanelRenderer {
             font,
             glyph_cache: HashMap::new(),
             cached_chars: Vec::new(),
+            glyph_cache_generation: 0,
             viewport,
             scissor_rect,
             width,
@@ -467,6 +755,193 @@ impl D3d12PanelRenderer {
     pub fn render_fragments(&mut self, scenes: &[&RenderScene]) -> eyre::Result<()> {
         {
             #[cfg(feature = "tracy")]
+            let _span = debug_span!("update_slug_curves").entered();
+            let _ = self.update_slug_curves_for_fragments(scenes)?;
+        }
+        let vertex_count = {
+            #[cfg(feature = "tracy")]
+            let _span = debug_span!("update_scene_vertices").entered();
+            self.update_scene_vertices_for_fragments(scenes)?
+        };
+        self.execute_prepared_frame(vertex_count)
+    }
+
+    fn render_frame_model(
+        &mut self,
+        frame: &RenderFrameModel,
+        resized: bool,
+        scene_cache: &mut RenderThreadSceneCache,
+    ) -> eyre::Result<()> {
+        if !resized && scene_cache.last_frame.as_ref() == Some(frame) {
+            return Ok(());
+        }
+
+        let (chrome_scene, chrome_reused) =
+            chrome_scene_fragment(&mut scene_cache.chrome, frame.layout, frame.cell_number);
+        let (terminal_scene, terminal_reused) = terminal_scene_fragment(
+            &mut scene_cache.terminal,
+            frame.layout,
+            &frame.terminal_display,
+            frame.terminal_visual_state,
+            frame.terminal_cell_width,
+            frame.terminal_cell_height,
+        );
+        let (output_scene, output_reused) = output_scene_fragment(
+            &mut scene_cache.output,
+            frame.layout,
+            &frame.output_text,
+            frame.output_cell_width,
+            frame.output_cell_height,
+        );
+
+        let glyph_cache_changed = {
+            #[cfg(feature = "tracy")]
+            let _span = debug_span!("update_slug_curves").entered();
+            self.update_slug_curves_for_fragments(&[&chrome_scene, &terminal_scene, &output_scene])?
+        };
+
+        let chrome_vertices = {
+            #[cfg(feature = "tracy")]
+            let _span = debug_span!("update_chrome_vertices").entered();
+            self.cached_fragment_vertices(
+                &chrome_scene,
+                chrome_reused && !glyph_cache_changed,
+                &mut scene_cache.chrome_vertices,
+            )
+        };
+        let terminal_vertices = {
+            #[cfg(feature = "tracy")]
+            let _span = debug_span!("update_terminal_vertices").entered();
+            self.cached_fragment_vertices(
+                &terminal_scene,
+                terminal_reused && !glyph_cache_changed,
+                &mut scene_cache.terminal_vertices,
+            )
+        };
+        let output_vertices = {
+            #[cfg(feature = "tracy")]
+            let _span = debug_span!("update_output_vertices").entered();
+            self.cached_fragment_vertices(
+                &output_scene,
+                output_reused && !glyph_cache_changed,
+                &mut scene_cache.output_vertices,
+            )
+        };
+
+        let vertex_count = {
+            #[cfg(feature = "tracy")]
+            let _span = debug_span!("update_scene_vertices").entered();
+            self.upload_cached_fragment_vertices(&[
+                chrome_vertices,
+                terminal_vertices,
+                output_vertices,
+            ])?
+        };
+
+        scene_cache.last_frame = Some(frame.clone());
+
+        self.execute_prepared_frame(vertex_count)
+    }
+
+    fn update_scene_vertices_for_fragments(&self, scenes: &[&RenderScene]) -> eyre::Result<usize> {
+        let built_fragments = scenes
+            .iter()
+            .map(|scene| self.build_scene_vertices(scene))
+            .collect::<Vec<_>>();
+        let fragment_slices = built_fragments
+            .iter()
+            .map(Vec::as_slice)
+            .collect::<Vec<_>>();
+        self.upload_cached_fragment_vertices(&fragment_slices)
+    }
+
+    fn cached_fragment_vertices<'a>(
+        &self,
+        scene: &RenderScene,
+        reused: bool,
+        cached_vertices: &'a mut Option<CachedSceneVertices>,
+    ) -> &'a [Vertex] {
+        let can_reuse = can_reuse_cached_scene_vertices(
+            reused,
+            cached_vertices.as_ref(),
+            self.glyph_cache_generation,
+        );
+
+        if !can_reuse {
+            *cached_vertices = Some(CachedSceneVertices {
+                glyph_cache_generation: self.glyph_cache_generation,
+                vertices: self.build_scene_vertices(scene),
+            });
+        }
+
+        cached_vertices
+            .as_ref()
+            .map_or(&[], |cached| cached.vertices.as_slice())
+    }
+
+    fn build_scene_vertices(&self, scene: &RenderScene) -> Vec<Vertex> {
+        let mut vertices = Vec::with_capacity(
+            (scene.panels.len() + scene.glyphs.len() + scene.overlay_panels.len()) * 6,
+        );
+        for panel in &scene.panels {
+            append_rect(
+                &mut vertices,
+                panel.rect,
+                panel.color,
+                panel.effect as u32,
+                0,
+            );
+        }
+        for glyph in &scene.glyphs {
+            let slug_glyph = self
+                .glyph_cache
+                .get(&glyph.character)
+                .or_else(|| self.glyph_cache.get(&FALLBACK_GLYPH))
+                .copied()
+                .unwrap_or_else(|| SlugGlyph::empty(&self.font));
+            append_text_rect(
+                &mut vertices,
+                glyph.rect,
+                glyph.color,
+                slug_glyph,
+                &self.font,
+            );
+        }
+        for panel in &scene.overlay_panels {
+            append_rect(
+                &mut vertices,
+                panel.rect,
+                panel.color,
+                panel.effect as u32,
+                0,
+            );
+        }
+        vertices
+    }
+
+    fn upload_cached_fragment_vertices(&self, fragments: &[&[Vertex]]) -> eyre::Result<usize> {
+        let vertex_count = fragments
+            .iter()
+            .map(|fragment| fragment.len())
+            .sum::<usize>();
+
+        unsafe {
+            let mut mapped = std::ptr::null_mut();
+            self.vertex_buffer.Map(0, None, Some(&mut mapped))?;
+            let mut write_ptr = mapped as *mut Vertex;
+            for fragment in fragments {
+                std::ptr::copy_nonoverlapping(fragment.as_ptr(), write_ptr, fragment.len());
+                write_ptr = write_ptr.add(fragment.len());
+            }
+            self.vertex_buffer.Unmap(0, None);
+        }
+
+        Ok(vertex_count)
+    }
+
+    fn execute_prepared_frame(&mut self, vertex_count: usize) -> eyre::Result<()> {
+        {
+            #[cfg(feature = "tracy")]
             let _span = debug_span!("wait_for_frame_sync").entered();
             self.wait_for_frame_latency()?;
         }
@@ -477,16 +952,6 @@ impl D3d12PanelRenderer {
             self.wait_for_frame(frame_index)?;
         }
 
-        {
-            #[cfg(feature = "tracy")]
-            let _span = debug_span!("update_slug_curves").entered();
-            self.update_slug_curves_for_fragments(scenes)?;
-        }
-        let vertex_count = {
-            #[cfg(feature = "tracy")]
-            let _span = debug_span!("update_scene_vertices").entered();
-            self.update_scene_vertices_for_fragments(scenes)?
-        };
         let current_target = self.render_targets[frame_index]
             .as_ref()
             .ok_or_else(|| eyre::eyre!("render target was missing for current frame"))?;
@@ -567,59 +1032,6 @@ impl D3d12PanelRenderer {
         Ok(())
     }
 
-    fn update_scene_vertices_for_fragments(&self, scenes: &[&RenderScene]) -> eyre::Result<usize> {
-        let vertex_capacity = scenes
-            .iter()
-            .map(|scene| scene.panels.len() + scene.glyphs.len() + scene.overlay_panels.len())
-            .sum::<usize>()
-            * 6;
-        let mut vertices = Vec::with_capacity(vertex_capacity);
-        for scene in scenes {
-            for panel in &scene.panels {
-                append_rect(
-                    &mut vertices,
-                    panel.rect,
-                    panel.color,
-                    panel.effect as u32,
-                    0,
-                );
-            }
-            for glyph in &scene.glyphs {
-                let slug_glyph = self
-                    .glyph_cache
-                    .get(&glyph.character)
-                    .or_else(|| self.glyph_cache.get(&FALLBACK_GLYPH))
-                    .copied()
-                    .unwrap_or_else(|| SlugGlyph::empty(&self.font));
-                append_text_rect(
-                    &mut vertices,
-                    glyph.rect,
-                    glyph.color,
-                    slug_glyph,
-                    &self.font,
-                );
-            }
-            for panel in &scene.overlay_panels {
-                append_rect(
-                    &mut vertices,
-                    panel.rect,
-                    panel.color,
-                    panel.effect as u32,
-                    0,
-                );
-            }
-        }
-
-        unsafe {
-            let mut mapped = std::ptr::null_mut();
-            self.vertex_buffer.Map(0, None, Some(&mut mapped))?;
-            std::ptr::copy_nonoverlapping(vertices.as_ptr(), mapped as *mut Vertex, vertices.len());
-            self.vertex_buffer.Unmap(0, None);
-        }
-
-        Ok(vertices.len())
-    }
-
     #[expect(
         dead_code,
         reason = "compatibility wrapper while callers migrate to fragment-based rendering"
@@ -628,10 +1040,10 @@ impl D3d12PanelRenderer {
         self.update_scene_vertices_for_fragments(&[scene])
     }
 
-    fn update_slug_curves_for_fragments(&mut self, scenes: &[&RenderScene]) -> eyre::Result<()> {
+    fn update_slug_curves_for_fragments(&mut self, scenes: &[&RenderScene]) -> eyre::Result<bool> {
         let scene_chars = collect_scene_chars_from_fragments(scenes);
         if scene_chars == self.cached_chars {
-            return Ok(());
+            return Ok(false);
         }
 
         let (curve_data, band_data, glyph_cache) =
@@ -668,7 +1080,8 @@ impl D3d12PanelRenderer {
 
         self.glyph_cache = glyph_cache;
         self.cached_chars = scene_chars;
-        Ok(())
+        self.glyph_cache_generation += 1;
+        Ok(true)
     }
 
     fn update_shader_params(&self) -> eyre::Result<()> {
@@ -702,7 +1115,8 @@ impl D3d12PanelRenderer {
         reason = "compatibility wrapper while callers migrate to fragment-based rendering"
     )]
     fn update_slug_curves(&mut self, scene: &RenderScene) -> eyre::Result<()> {
-        self.update_slug_curves_for_fragments(&[scene])
+        let _ = self.update_slug_curves_for_fragments(&[scene])?;
+        Ok(())
     }
 
     fn wait_for_frame(&self, frame_index: usize) -> eyre::Result<()> {
@@ -747,9 +1161,334 @@ impl D3d12PanelRenderer {
     }
 }
 
+fn can_reuse_cached_scene_vertices(
+    reused: bool,
+    cached_vertices: Option<&CachedSceneVertices>,
+    glyph_cache_generation: u64,
+) -> bool {
+    reused
+        && cached_vertices
+            .is_some_and(|cached| cached.glyph_cache_generation == glyph_cache_generation)
+}
+
 impl Drop for D3d12PanelRenderer {
     fn drop(&mut self) {
         let _ = self.wait_for_gpu();
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TerminalScrollbarGeometry {
+    thumb_rect: ClientRect,
+    thumb_height: i32,
+    travel: i32,
+    max_offset: u64,
+}
+
+fn chrome_scene_fragment(
+    cached_chrome_scene: &mut Option<CachedChromeScene>,
+    layout: TerminalLayout,
+    cell_number: usize,
+) -> (RenderScene, bool) {
+    if let Some(cached) = cached_chrome_scene.as_ref()
+        && cached.layout == layout
+        && cached.cell_number == cell_number
+    {
+        return (cached.scene.clone(), true);
+    }
+
+    let mut scene = build_panel_scene(layout);
+    push_centered_text(
+        &mut scene,
+        layout.drag_handle_rect().to_win32_rect(),
+        &cell_number.to_string(),
+        [0.95, 0.95, 0.98, 1.0],
+    );
+    let scene_clone = scene.clone();
+    *cached_chrome_scene = Some(CachedChromeScene {
+        layout,
+        cell_number,
+        scene: scene_clone.clone(),
+    });
+    (scene_clone, false)
+}
+
+fn output_scene_fragment(
+    cached_output_scene: &mut Option<CachedOutputScene>,
+    layout: TerminalLayout,
+    output_text: &str,
+    output_cell_width: i32,
+    output_cell_height: i32,
+) -> (RenderScene, bool) {
+    if let Some(cached) = cached_output_scene.as_ref()
+        && cached.layout == layout
+        && cached.output_text == output_text
+        && cached.output_cell_width == output_cell_width
+        && cached.output_cell_height == output_cell_height
+    {
+        return (cached.scene.clone(), true);
+    }
+
+    let mut scene = RenderScene {
+        panels: Vec::new(),
+        glyphs: Vec::with_capacity(output_text.chars().count()),
+        overlay_panels: Vec::new(),
+    };
+    push_text_block(
+        &mut scene,
+        layout.result_panel_rect().inset(14).to_win32_rect(),
+        output_text,
+        output_cell_width,
+        output_cell_height,
+        [0.96, 0.95, 0.90, 1.0],
+    );
+    let scene_clone = scene.clone();
+    *cached_output_scene = Some(CachedOutputScene {
+        layout,
+        output_text: output_text.to_owned(),
+        output_cell_width,
+        output_cell_height,
+        scene: scene_clone.clone(),
+    });
+    (scene_clone, false)
+}
+
+fn terminal_scene_fragment(
+    cached_terminal_scene: &mut Option<CachedTerminalScene>,
+    layout: TerminalLayout,
+    display: &TerminalDisplayState,
+    visual_state: RendererTerminalVisualState,
+    terminal_cell_width: i32,
+    terminal_cell_height: i32,
+) -> (RenderScene, bool) {
+    if let Some(cached) = cached_terminal_scene.as_ref()
+        && cached.layout == layout
+        && cached.display == *display
+        && cached.visual_state == visual_state
+    {
+        return (cached.scene.clone(), true);
+    }
+
+    let mut scene = RenderScene {
+        panels: Vec::with_capacity(display.backgrounds.len().saturating_add(2)),
+        glyphs: Vec::with_capacity(display.glyphs.len()),
+        overlay_panels: Vec::with_capacity(8),
+    };
+    let terminal_rect = layout.terminal_viewport_rect().inset(4);
+    let scrollbar_rect = layout.terminal_scrollbar_rect().inset(4);
+    push_terminal_display(
+        &mut scene,
+        terminal_rect,
+        terminal_cell_width,
+        terminal_cell_height,
+        display,
+    );
+    push_terminal_scrollbar(&mut scene, scrollbar_rect, display.scrollbar, visual_state);
+
+    let scene_clone = scene.clone();
+    *cached_terminal_scene = Some(CachedTerminalScene {
+        layout,
+        display: display.clone(),
+        visual_state,
+        scene: scene_clone.clone(),
+    });
+
+    (scene_clone, false)
+}
+
+fn push_terminal_display(
+    scene: &mut RenderScene,
+    terminal_rect: ClientRect,
+    cell_width: i32,
+    cell_height: i32,
+    display: &TerminalDisplayState,
+) {
+    for background in &display.backgrounds {
+        push_panel(
+            scene,
+            terminal_cell_rect(terminal_rect, background.cell, cell_width, cell_height)
+                .to_win32_rect(),
+            background.color,
+            PanelEffect::TerminalFill,
+        );
+    }
+
+    for glyph in &display.glyphs {
+        push_glyph(
+            scene,
+            terminal_cell_rect(terminal_rect, glyph.cell, cell_width, cell_height).to_win32_rect(),
+            glyph.character,
+            glyph.color,
+        );
+    }
+
+    if let Some(cursor) = display.cursor {
+        let cell_rect = terminal_cell_rect(terminal_rect, cursor.cell, cell_width, cell_height);
+        for rect in terminal_cursor_overlay_rects(cell_rect, cursor.style) {
+            push_overlay_panel(
+                scene,
+                rect.to_win32_rect(),
+                terminal_cursor_overlay_color(cursor.color, cursor.style),
+                PanelEffect::TerminalCursor,
+            );
+        }
+    }
+}
+
+fn push_terminal_scrollbar(
+    scene: &mut RenderScene,
+    scrollbar_rect: ClientRect,
+    scrollbar: Option<TerminalDisplayScrollbar>,
+    visual_state: RendererTerminalVisualState,
+) {
+    if scrollbar_rect.width() <= 0 || scrollbar_rect.height() <= 0 {
+        return;
+    }
+
+    push_panel(
+        scene,
+        scrollbar_rect.to_win32_rect(),
+        if visual_state.track_hovered {
+            [0.28, 0.10, 0.40, 0.90]
+        } else {
+            [0.19, 0.08, 0.28, 0.78]
+        },
+        PanelEffect::TerminalScrollbarTrack,
+    );
+
+    let Some(scrollbar) = scrollbar else {
+        return;
+    };
+    let Some(geometry) = terminal_scrollbar_geometry(scrollbar_rect, scrollbar) else {
+        return;
+    };
+
+    push_panel(
+        scene,
+        geometry.thumb_rect.to_win32_rect(),
+        if visual_state.thumb_grabbed {
+            [1.00, 0.72, 1.00, 1.00]
+        } else if visual_state.thumb_hovered {
+            [0.92, 0.55, 1.00, 0.96]
+        } else {
+            [0.82, 0.38, 0.98, 0.88]
+        },
+        PanelEffect::TerminalScrollbarThumb,
+    );
+}
+
+fn terminal_scrollbar_geometry(
+    scrollbar_rect: ClientRect,
+    scrollbar: TerminalDisplayScrollbar,
+) -> Option<TerminalScrollbarGeometry> {
+    if scrollbar_rect.width() <= 0
+        || scrollbar_rect.height() <= 0
+        || scrollbar.total == 0
+        || scrollbar.visible == 0
+    {
+        return None;
+    }
+
+    let track_height = u64::try_from(scrollbar_rect.height().max(1)).ok()?;
+    let min_thumb_height = scrollbar_rect.width().max(22);
+    let proportional_thumb = (track_height.saturating_mul(scrollbar.visible) / scrollbar.total)
+        .max(u64::try_from(min_thumb_height).ok()?);
+    let thumb_height = i32::try_from(proportional_thumb.min(track_height))
+        .ok()?
+        .clamp(min_thumb_height, scrollbar_rect.height().max(1));
+    let travel = (scrollbar_rect.height() - thumb_height).max(0);
+    let max_offset = scrollbar.total.saturating_sub(scrollbar.visible);
+    let clamped_offset = scrollbar.offset.min(max_offset);
+    let thumb_offset = if travel == 0 || max_offset == 0 {
+        0
+    } else {
+        let travel = u64::try_from(travel).ok()?;
+        i32::try_from(travel.saturating_mul(clamped_offset) / max_offset).ok()?
+    };
+    let thumb_top = scrollbar_rect.top() + thumb_offset;
+
+    Some(TerminalScrollbarGeometry {
+        thumb_rect: ClientRect::new(
+            scrollbar_rect.left(),
+            thumb_top,
+            scrollbar_rect.right(),
+            (thumb_top + thumb_height).min(scrollbar_rect.bottom()),
+        ),
+        thumb_height,
+        travel,
+        max_offset,
+    })
+}
+
+fn terminal_cursor_overlay_color(
+    mut color: [f32; 4],
+    style: TerminalDisplayCursorStyle,
+) -> [f32; 4] {
+    color[3] = match style {
+        TerminalDisplayCursorStyle::Block => 0.42,
+        TerminalDisplayCursorStyle::BlockHollow => 0.95,
+        TerminalDisplayCursorStyle::Bar | TerminalDisplayCursorStyle::Underline => 0.9,
+    };
+    color
+}
+
+fn terminal_cell_rect(
+    terminal_rect: ClientRect,
+    cell: TerminalCellPoint,
+    cell_width: i32,
+    cell_height: i32,
+) -> ClientRect {
+    cell.to_client_rect(terminal_rect, cell_width, cell_height)
+}
+
+fn terminal_cursor_overlay_rects(
+    cell_rect: ClientRect,
+    style: TerminalDisplayCursorStyle,
+) -> Vec<ClientRect> {
+    let width = cell_rect.width().max(1);
+    let height = cell_rect.height().max(1);
+    let thickness = (width.min(height) / 6).clamp(2, 4);
+
+    match style {
+        TerminalDisplayCursorStyle::Bar => vec![ClientRect::new(
+            cell_rect.left(),
+            cell_rect.top(),
+            (cell_rect.left() + thickness).min(cell_rect.right()),
+            cell_rect.bottom(),
+        )],
+        TerminalDisplayCursorStyle::Block => vec![cell_rect],
+        TerminalDisplayCursorStyle::Underline => vec![ClientRect::new(
+            cell_rect.left(),
+            (cell_rect.bottom() - thickness).max(cell_rect.top()),
+            cell_rect.right(),
+            cell_rect.bottom(),
+        )],
+        TerminalDisplayCursorStyle::BlockHollow => vec![
+            ClientRect::new(
+                cell_rect.left(),
+                cell_rect.top(),
+                cell_rect.right(),
+                (cell_rect.top() + thickness).min(cell_rect.bottom()),
+            ),
+            ClientRect::new(
+                cell_rect.left(),
+                (cell_rect.bottom() - thickness).max(cell_rect.top()),
+                cell_rect.right(),
+                cell_rect.bottom(),
+            ),
+            ClientRect::new(
+                cell_rect.left(),
+                cell_rect.top(),
+                (cell_rect.left() + thickness).min(cell_rect.right()),
+                cell_rect.bottom(),
+            ),
+            ClientRect::new(
+                (cell_rect.right() - thickness).max(cell_rect.left()),
+                cell_rect.top(),
+                cell_rect.right(),
+                cell_rect.bottom(),
+            ),
+        ],
     }
 }
 
@@ -2775,8 +3514,9 @@ fn issue_transition_barrier(
 #[cfg(test)]
 mod tests {
     use super::{
-        FALLBACK_GLYPH, PanelEffect, RenderScene, append_rect, append_slug_band_data,
-        build_panel_scene, build_shader_params, collect_scene_chars, cpu_slug_coverage,
+        CachedSceneVertices, FALLBACK_GLYPH, PanelEffect, RenderScene, append_rect,
+        append_slug_band_data, build_panel_scene, build_shader_params,
+        can_reuse_cached_scene_vertices, collect_scene_chars, cpu_slug_coverage,
         cpu_slug_coverage_all_curves, extract_glyph_curves, load_terminal_font, push_centered_text,
         push_glyph, push_overlay_panel, push_panel, push_text_block,
         render_snapshot_glyph_into_image,
@@ -2831,6 +3571,34 @@ mod tests {
         );
 
         assert_eq!(scene.glyphs.len(), 1);
+    }
+
+    #[test]
+    fn cached_scene_vertices_are_not_reused_after_glyph_cache_generation_changes() {
+        let cached_vertices = CachedSceneVertices {
+            glyph_cache_generation: 4,
+            vertices: Vec::new(),
+        };
+
+        assert!(!can_reuse_cached_scene_vertices(
+            true,
+            Some(&cached_vertices),
+            5,
+        ));
+    }
+
+    #[test]
+    fn cached_scene_vertices_are_reused_when_generation_matches() {
+        let cached_vertices = CachedSceneVertices {
+            glyph_cache_generation: 4,
+            vertices: Vec::new(),
+        };
+
+        assert!(can_reuse_cached_scene_vertices(
+            true,
+            Some(&cached_vertices),
+            4,
+        ));
     }
 
     #[test]

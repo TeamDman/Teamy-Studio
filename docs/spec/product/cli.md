@@ -43,11 +43,20 @@ The CLI must expose a `self-test` command group.
 cli[command.surface.self-test-keyboard-input]
 The `self-test` command group must expose a `keyboard-input` subcommand.
 
+cli[command.surface.self-test-terminal-throughput]
+The `self-test` command group must expose a `terminal-throughput` subcommand.
+
 cli[self-test.keyboard-input.inside-flag]
 The `self-test keyboard-input` command must support `--inside` to run the terminal-side probe instead of the outer harness.
 
 cli[self-test.keyboard-input.scenario-optional]
 The `self-test keyboard-input` command must accept an optional scenario argument so reproducible terminal regressions can be exercised from the outer harness.
+
+cli[self-test.terminal-throughput.mode-optional]
+The `self-test terminal-throughput` command must accept an optional benchmark mode argument.
+
+cli[self-test.terminal-throughput.line-count-flag]
+The `self-test terminal-throughput` command must support `--line-count` to control the emitted `Out-Host` line count.
 
 cli[command.surface.window]
 The CLI must expose a `window` command group.

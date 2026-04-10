@@ -16,6 +16,11 @@ use std::path::Path;
 use crate::paths::{AppHome, CacheHome, CellId};
 use crate::workspace::{WorkspaceLaunch, WorkspaceSummary};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TerminalThroughputBenchmarkMode {
+    MeasureCommandOutHost,
+}
+
 #[derive(Clone, Debug)]
 pub struct WorkspaceWindowState {
     pub cache_home: CacheHome,
@@ -152,6 +157,30 @@ pub fn run_keyboard_input_self_test(
         let _ = inside;
         let _ = scenario;
         eyre::bail!("Teamy Studio keyboard self-test currently only supports Windows")
+    }
+}
+
+/// Run the terminal throughput self-test benchmark.
+///
+/// # Errors
+///
+/// This function will return an error if the Windows-only benchmark cannot be launched.
+pub fn run_terminal_throughput_self_test(
+    app_home: &AppHome,
+    mode: TerminalThroughputBenchmarkMode,
+    line_count: usize,
+) -> eyre::Result<()> {
+    #[cfg(windows)]
+    {
+        windows_app::run_terminal_throughput_self_test(app_home, mode, line_count)
+    }
+
+    #[cfg(not(windows))]
+    {
+        let _ = app_home;
+        let _ = mode;
+        let _ = line_count;
+        eyre::bail!("Teamy Studio terminal throughput self-test currently only supports Windows")
     }
 }
 

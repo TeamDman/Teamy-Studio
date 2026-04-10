@@ -2,6 +2,7 @@ use std::cell::RefCell;
 use std::marker::PhantomData;
 use std::path::Path;
 use std::thread;
+use std::time::{Duration, Instant};
 #[cfg(feature = "tracy")]
 use tracing::debug_span;
 use tracing::trace;
@@ -18,13 +19,13 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_CONTROL, VK_LBUTTON, VK_MENU};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect, GetCursorPos,
-    GetSystemMetrics, GetWindowRect, HTCAPTION, HTCLIENT, IDC_ARROW, IDC_SIZEALL, LoadCursorW, MSG,
-    PM_REMOVE, PeekMessageW, PostMessageW, PostQuitMessage, RegisterClassExW, SM_CXPADDEDBORDER,
+    GetMessageW, GetSystemMetrics, GetWindowRect, HTCAPTION, HTCLIENT, IDC_ARROW, IDC_SIZEALL,
+    LoadCursorW, MSG, PostMessageW, PostQuitMessage, RegisterClassExW, SM_CXPADDEDBORDER,
     SM_CXSCREEN, SM_CXSIZEFRAME, SM_CYSCREEN, SM_CYSIZEFRAME, SW_SHOW, SYSTEM_METRICS_INDEX,
     SetCursor, SetTimer, ShowWindow, TranslateMessage, WM_CHAR, WM_CLOSE, WM_DESTROY,
     WM_ENTERSIZEMOVE, WM_ERASEBKGND, WM_EXITSIZEMOVE, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN,
     WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCALCSIZE, WM_NCHITTEST, WM_NCLBUTTONDOWN,
-    WM_PAINT, WM_QUIT, WM_RBUTTONUP, WM_SETCURSOR, WM_SIZE, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER,
+    WM_PAINT, WM_RBUTTONUP, WM_SETCURSOR, WM_SIZE, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER,
     WNDCLASSEXW, WS_EX_APPWINDOW, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP, WS_THICKFRAME,
     WS_VISIBLE,
 };
@@ -32,23 +33,22 @@ use windows::core::{PCWSTR, w};
 
 use crate::paths::AppHome;
 
-use super::WorkspaceWindowState;
 use super::spatial::{
     ClientPoint, ClientRect, ScreenPoint, ScreenRect, ScreenToClientTransform, TerminalCellPoint,
     classify_resize_border_hit, drag_threshold_exceeded,
 };
 use super::windows_d3d12_renderer::{
-    D3d12PanelRenderer, PanelEffect, RenderScene, build_panel_scene, push_centered_text,
-    push_glyph, push_overlay_panel, push_panel, push_text_block,
+    RenderFrameModel, RenderThreadProxy, RendererTerminalVisualState,
 };
 use super::windows_dialogs::{
     PasteConfirmationChoice, paste_confirmation_required, show_multiline_paste_confirmation_dialog,
 };
 use super::windows_terminal::{
-    POLL_INTERVAL_MS, POLL_TIMER_ID, TerminalDisplayCursorStyle, TerminalDisplayScrollbar,
-    TerminalDisplayState, TerminalLayout, TerminalSelection, TerminalSelectionMode,
+    POLL_INTERVAL_MS, POLL_TIMER_ID, TERMINAL_WORKER_WAKE_MESSAGE, TerminalDisplayCursorStyle,
+    TerminalDisplayScrollbar, TerminalLayout, TerminalSelection, TerminalSelectionMode,
     TerminalSession, keyboard_mods,
 };
+use super::{TerminalThroughputBenchmarkMode, WorkspaceWindowState};
 
 unsafe extern "system" {
     fn SetCapture(hwnd: HWND) -> HWND;
@@ -56,6 +56,7 @@ unsafe extern "system" {
 }
 
 const WINDOW_CLASS_NAME: PCWSTR = w!("TeamyStudioTerminalWindow");
+const BENCHMARK_WINDOW_CLASS_NAME: PCWSTR = w!("TeamyStudioTerminalBenchmarkWindow");
 const WINDOW_TITLE: &str = "Teamy Studio Terminal";
 const TERMINAL_FONT_HEIGHT: i32 = -16;
 const OUTPUT_FONT_HEIGHT: i32 = -16;
@@ -70,6 +71,12 @@ const MIN_RESIZE_BORDER_THICKNESS: i32 = 1;
 const MOUSE_WHEEL_DELTA: i16 = 120;
 const TERMINAL_WHEEL_SCROLL_LINES: isize = 3;
 const SELECTION_AUTO_SCROLL_MAX_LINES: isize = 12;
+const TERMINAL_THROUGHPUT_BENCHMARK_START_MARKER: &str = "__TEAMY_TERMINAL_THROUGHPUT_START__";
+const TERMINAL_THROUGHPUT_BENCHMARK_DONE_MARKER: &str = "__TEAMY_TERMINAL_THROUGHPUT_DONE__";
+const TERMINAL_THROUGHPUT_BENCHMARK_MEASURE_PREFIX: &str =
+    "__TEAMY_TERMINAL_THROUGHPUT_MEASURE_MS=";
+const TERMINAL_THROUGHPUT_BENCHMARK_TIMEOUT: Duration = Duration::from_secs(60);
+const TERMINAL_THROUGHPUT_BENCHMARK_POLL_INTERVAL: Duration = Duration::from_millis(1);
 
 thread_local! {
     static APP_STATE: RefCell<Option<AppState>> = const { RefCell::new(None) };
@@ -94,16 +101,7 @@ struct AppState {
     output_cell_width: i32,
     output_cell_height: i32,
     terminal: TerminalSession,
-    cached_terminal_scene: Option<CachedTerminalScene>,
-    renderer: Option<D3d12PanelRenderer>,
-}
-
-#[derive(Clone, Debug)]
-struct CachedTerminalScene {
-    layout: TerminalLayout,
-    display: TerminalDisplayState,
-    visual_state: TerminalScrollbarVisualState,
-    scene: RenderScene,
+    renderer: Option<RenderThreadProxy>,
 }
 
 // convention[impl convention.invariants.encode-in-types]
@@ -368,18 +366,13 @@ fn end_paint(hwnd: WindowHandle, paint: &PAINTSTRUCT) {
     let _ = unsafe { EndPaint(hwnd.raw(), &raw const *paint) };
 }
 
-fn peek_message(message: &mut MSG) -> bool {
-    // Safety: `message` is a valid out-pointer for PeekMessageW.
-    unsafe { PeekMessageW(&raw mut *message, None, 0, 0, PM_REMOVE) }.into()
-}
-
 fn translate_message(message: &MSG) {
-    // Safety: `message` was produced by PeekMessageW in this thread.
+    // Safety: `message` was produced by GetMessageW/DispatchMessageW on this thread.
     let _ = unsafe { TranslateMessage(&raw const *message) };
 }
 
 fn dispatch_message(message: &MSG) {
-    // Safety: `message` was produced by PeekMessageW in this thread.
+    // Safety: `message` was produced by GetMessageW on this thread.
     unsafe { DispatchMessageW(&raw const *message) };
 }
 
@@ -435,16 +428,16 @@ pub fn run(
             output_cell_width,
             output_cell_height,
             terminal,
-            cached_terminal_scene: None,
             renderer: None,
         });
     });
 
     let hwnd = info_span!("create_terminal_window").in_scope(|| create_window(window_thread))?;
-    let renderer =
-        info_span!("create_d3d12_renderer").in_scope(|| D3d12PanelRenderer::new(hwnd.raw()))?;
+    let renderer = info_span!("create_d3d12_renderer_thread")
+        .in_scope(|| RenderThreadProxy::new(hwnd.raw()))?;
     with_app_state(|state| {
         state.hwnd = Some(hwnd);
+        state.terminal.set_wake_window(hwnd.raw());
         state.renderer = Some(renderer);
         Ok(())
     })?;
@@ -458,8 +451,125 @@ pub fn run(
         })
     })?;
 
+    with_app_state(|state| render_current_frame(state, hwnd, None))?;
+
     info!("Teamy Studio terminal window shown");
     message_loop()
+}
+
+#[instrument(level = "info", skip_all, fields(?mode, line_count))]
+pub fn run_terminal_throughput_self_test(
+    _app_home: &AppHome,
+    mode: TerminalThroughputBenchmarkMode,
+    line_count: usize,
+) -> eyre::Result<()> {
+    let window_thread = WindowThread::current();
+    let terminal_font_height = TERMINAL_FONT_HEIGHT;
+    let (terminal_cell_width, terminal_cell_height) = info_span!(
+        "measure_terminal_cell_size",
+        kind = "terminal-benchmark",
+        font_height = terminal_font_height,
+    )
+    .in_scope(|| measure_terminal_cell_size(terminal_font_height))?;
+    let output_font_height = OUTPUT_FONT_HEIGHT;
+    let (output_cell_width, output_cell_height) = info_span!(
+        "measure_terminal_cell_size",
+        kind = "output-benchmark",
+        font_height = output_font_height,
+    )
+    .in_scope(|| measure_terminal_cell_size(output_font_height))?;
+    let command = terminal_throughput_benchmark_command(mode, line_count)?;
+    let mut terminal = info_span!("create_terminal_benchmark_session")
+        .in_scope(|| TerminalSession::new_with_command(command))?;
+    let hwnd = info_span!("create_terminal_benchmark_window")
+        .in_scope(|| create_benchmark_window(window_thread))?;
+    let renderer = info_span!("create_terminal_benchmark_renderer")
+        .in_scope(|| RenderThreadProxy::new(hwnd.raw()))?;
+
+    let benchmark_result = (|| -> eyre::Result<()> {
+        terminal.set_wake_window(hwnd.raw());
+        let layout = client_layout(hwnd, terminal_cell_width, terminal_cell_height)?;
+        terminal.resize(layout)?;
+
+        let benchmark_started_at = Instant::now();
+        let mut visual_started_at = None;
+        let mut frames_rendered = 0_u64;
+        let mut last_screen;
+
+        loop {
+            let poll_result = terminal.poll_pty_output()?;
+            let pump_result = terminal.pump_pending_output()?;
+            let repaint_requested = terminal.take_repaint_requested();
+            let pending_output = terminal.has_pending_output();
+
+            let should_render = frames_rendered == 0
+                || poll_result.queued_output
+                || pending_output
+                || repaint_requested;
+            if should_render {
+                if visual_started_at.is_none() && (poll_result.queued_output || pending_output) {
+                    visual_started_at = Some(Instant::now());
+                }
+                render_terminal_throughput_benchmark_frame(
+                    hwnd,
+                    &renderer,
+                    &mut terminal,
+                    terminal_cell_width,
+                    terminal_cell_height,
+                    output_cell_width,
+                    output_cell_height,
+                    mode,
+                    line_count,
+                )?;
+                frames_rendered += 1;
+            }
+
+            let screen = terminal.visible_text()?;
+            if visual_started_at.is_none()
+                && screen.contains(TERMINAL_THROUGHPUT_BENCHMARK_START_MARKER)
+            {
+                visual_started_at = Some(Instant::now());
+            }
+
+            let done_visible = screen.contains(TERMINAL_THROUGHPUT_BENCHMARK_DONE_MARKER);
+            let pending_output_after_render = terminal.has_pending_output();
+            last_screen = screen;
+
+            if let Some(visual_started_at) = visual_started_at
+                && done_visible
+                && !pending_output_after_render
+            {
+                let measure_command_ms =
+                    parse_terminal_throughput_measure_command_ms(&last_screen)?;
+                let graphical_completion_ms = visual_started_at.elapsed().as_secs_f64() * 1000.0;
+                let delta_ms = graphical_completion_ms - measure_command_ms;
+                let ratio = if measure_command_ms > 0.0 {
+                    graphical_completion_ms / measure_command_ms
+                } else {
+                    0.0
+                };
+
+                println!(
+                    "scenario: {}\nline_count: {line_count}\nmeasure_command_ms: {measure_command_ms:.3}\ngraphical_completion_ms: {graphical_completion_ms:.3}\ndelta_ms: {delta_ms:.3}\nratio: {ratio:.3}\nframes_rendered: {frames_rendered}\nterminal_closed: {}\n\n=== final_screen ===\n{last_screen}",
+                    terminal_throughput_mode_name(mode),
+                    pump_result.should_close || poll_result.should_close,
+                );
+                return Ok(());
+            }
+
+            if benchmark_started_at.elapsed() >= TERMINAL_THROUGHPUT_BENCHMARK_TIMEOUT {
+                eyre::bail!(
+                    "timed out waiting for terminal throughput benchmark completion\n\n=== final_screen ===\n{last_screen}"
+                );
+            }
+
+            thread::sleep(TERMINAL_THROUGHPUT_BENCHMARK_POLL_INTERVAL);
+        }
+    })();
+
+    drop(renderer);
+    hwnd.destroy();
+    benchmark_result
 }
 
 /// os[impl window.appearance.os-chrome-none]
@@ -513,19 +623,75 @@ fn create_window(window_thread: WindowThread) -> eyre::Result<WindowHandle> {
     Ok(window)
 }
 
+#[instrument(level = "info", skip_all)]
+fn create_benchmark_window(window_thread: WindowThread) -> eyre::Result<WindowHandle> {
+    let instance = get_current_module().wrap_err("failed to get module handle")?;
+
+    let class = WNDCLASSEXW {
+        cbSize: u32::try_from(std::mem::size_of::<WNDCLASSEXW>())
+            .expect("WNDCLASSEXW size must fit in u32"),
+        hInstance: instance.into(),
+        lpszClassName: BENCHMARK_WINDOW_CLASS_NAME,
+        lpfnWndProc: Some(benchmark_window_proc),
+        hCursor: load_cursor(IDC_ARROW),
+        ..Default::default()
+    };
+    let atom = register_window_class(&class);
+    if atom == 0 {
+        debug!("benchmark window class already registered or registration deferred");
+    }
+
+    let title = wide_null_terminated(WINDOW_TITLE);
+    // Safety: all pointers and handles passed to CreateWindowExW are valid for the duration of the call.
+    let hwnd = unsafe {
+        CreateWindowExW(
+            WS_EX_APPWINDOW,
+            BENCHMARK_WINDOW_CLASS_NAME,
+            PCWSTR(title.as_ptr()),
+            WS_POPUP | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX,
+            0,
+            0,
+            INITIAL_WINDOW_WIDTH,
+            INITIAL_WINDOW_HEIGHT,
+            None,
+            None,
+            Some(instance.into()),
+            None,
+        )
+    }
+    .wrap_err("failed to create terminal benchmark window")?;
+
+    Ok(WindowHandle::new(window_thread, hwnd))
+}
+
 fn message_loop() -> eyre::Result<()> {
     loop {
         let mut message = MSG::default();
-        while peek_message(&mut message) {
-            if message.message == WM_QUIT {
-                return Ok(());
-            }
-
-            translate_message(&message);
-            dispatch_message(&message);
+        // Safety: `message` is a valid out-pointer for GetMessageW on this UI thread.
+        let status = unsafe { GetMessageW(&raw mut message, None, 0, 0) };
+        if status.0 == -1 {
+            eyre::bail!("failed to get next window message")
+        }
+        if status.0 == 0 {
+            return Ok(());
         }
 
-        render_frame()?;
+        translate_message(&message);
+        dispatch_message(&message);
+    }
+}
+
+extern "system" fn benchmark_window_proc(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    let hwnd = WindowHandle::new(WindowThread::current(), hwnd);
+    match message {
+        WM_NCCALCSIZE => LRESULT(0),
+        WM_ERASEBKGND => LRESULT(1),
+        _ => def_window_proc(hwnd, message, wparam, lparam),
     }
 }
 
@@ -541,6 +707,7 @@ extern "system" fn window_proc(
         WM_ENTERSIZEMOVE => handle_enter_size_move(hwnd),
         WM_EXITSIZEMOVE => handle_exit_size_move(hwnd),
         WM_SIZE => handle_size(hwnd),
+        TERMINAL_WORKER_WAKE_MESSAGE => handle_terminal_worker_wake(hwnd),
         WM_TIMER if wparam.0 == POLL_TIMER_ID => handle_timer(hwnd),
         WM_CHAR => handle_char_message(hwnd, message, wparam, lparam),
         WM_KEYDOWN | WM_SYSKEYDOWN => handle_key_down_message(hwnd, message, wparam, lparam),
@@ -625,6 +792,25 @@ fn handle_timer(hwnd: WindowHandle) -> LRESULT {
             }
             LRESULT(0)
         }
+        Err(error) => fail_and_close(hwnd, &error),
+    }
+}
+
+fn handle_terminal_worker_wake(hwnd: WindowHandle) -> LRESULT {
+    match with_app_state(|state| {
+        let repaint_requested = state.terminal.take_repaint_requested();
+        if state.terminal.pump()?.should_close {
+            hwnd.post_close();
+            return Ok(());
+        }
+
+        if repaint_requested {
+            render_current_frame(state, hwnd, None)?;
+        }
+
+        Ok(())
+    }) {
+        Ok(()) => LRESULT(0),
         Err(error) => fail_and_close(hwnd, &error),
     }
 }
@@ -793,40 +979,6 @@ fn acknowledge_paint(hwnd: WindowHandle) -> eyre::Result<()> {
     Ok(())
 }
 
-fn render_frame() -> eyre::Result<()> {
-    with_app_state(|state| {
-        let Some(hwnd) = state.hwnd else {
-            return Ok(());
-        };
-
-        service_pending_terminal_output(state, hwnd)?;
-        render_current_frame(state, hwnd, None)
-    })
-}
-
-#[cfg_attr(feature = "tracy", instrument(level = "debug", skip_all))]
-fn service_pending_terminal_output(state: &mut AppState, hwnd: WindowHandle) -> eyre::Result<()> {
-    if !(state.terminal_poll_pending || state.terminal.has_pending_output()) {
-        return Ok(());
-    }
-
-    let poll_pending = state.terminal_poll_pending;
-    if poll_pending {
-        state.terminal_poll_pending = false;
-    }
-
-    #[cfg(feature = "tracy")]
-    let _span = debug_span!("pump_terminal_on_idle").entered();
-
-    if state.terminal.pump_pending_output()?.should_close {
-        hwnd.post_close();
-        return Ok(());
-    }
-
-    state.terminal_poll_pending |= state.terminal.has_pending_output();
-    Ok(())
-}
-
 /// behavior[impl window.interaction.drag.live]
 /// behavior[impl window.interaction.resize.live]
 /// behavior[impl window.interaction.resize.terminal-live-output]
@@ -870,15 +1022,6 @@ fn render_current_frame(
         let _span = debug_span!("compute_client_layout").entered();
         client_layout(hwnd, state.terminal_cell_width, state.terminal_cell_height)?
     };
-    let cell_number = state
-        .workspace_window
-        .as_ref()
-        .map_or(1, |workspace_window| workspace_window.cell_number);
-    let chrome_scene = {
-        #[cfg(feature = "tracy")]
-        let _span = debug_span!("build_chrome_scene_fragment").entered();
-        chrome_scene_fragment(layout, cell_number)
-    };
     let output_text = {
         #[cfg(feature = "tracy")]
         let _span = debug_span!("build_output_panel_text").entered();
@@ -892,187 +1035,33 @@ fn render_current_frame(
             .visible_display_state_with_selection(state.terminal_selection)?
     };
     let terminal_visual_state = terminal_scrollbar_visual_state(state);
-    let terminal_scene = {
-        #[cfg(feature = "tracy")]
-        let _span = debug_span!("build_terminal_scene_fragment").entered();
-        terminal_scene_fragment(state, layout, &terminal_display, terminal_visual_state)
-    };
-    let output_scene = {
-        #[cfg(feature = "tracy")]
-        let _span = debug_span!("build_output_scene_fragment").entered();
-        output_scene_fragment(
-            layout,
-            &output_text,
-            state.output_cell_width,
-            state.output_cell_height,
-        )
-    };
 
     let Some(renderer) = state.renderer.as_mut() else {
         return Ok(());
     };
     let () = {
         #[cfg(feature = "tracy")]
-        let _span = debug_span!("render_scene_fragments").entered();
-        renderer.render_fragments(&[&chrome_scene, &terminal_scene, &output_scene])?;
+        let _span = debug_span!("submit_render_frame_model").entered();
+        renderer.render_frame_model(RenderFrameModel {
+            layout,
+            cell_number: state
+                .workspace_window
+                .as_ref()
+                .map_or(1, |workspace_window| workspace_window.cell_number),
+            output_text,
+            output_cell_width: state.output_cell_width,
+            output_cell_height: state.output_cell_height,
+            terminal_cell_width: state.terminal_cell_width,
+            terminal_cell_height: state.terminal_cell_height,
+            terminal_display,
+            terminal_visual_state: RendererTerminalVisualState {
+                track_hovered: terminal_visual_state.track_hovered,
+                thumb_hovered: terminal_visual_state.thumb_hovered,
+                thumb_grabbed: terminal_visual_state.thumb_grabbed,
+            },
+        })?;
     };
     Ok(())
-}
-
-fn chrome_scene_fragment(layout: TerminalLayout, cell_number: usize) -> RenderScene {
-    let mut scene = build_panel_scene(layout);
-    push_centered_text(
-        &mut scene,
-        layout.drag_handle_rect().to_win32_rect(),
-        &cell_number.to_string(),
-        [0.95, 0.95, 0.98, 1.0],
-    );
-    scene
-}
-
-fn output_scene_fragment(
-    layout: TerminalLayout,
-    output_text: &str,
-    output_cell_width: i32,
-    output_cell_height: i32,
-) -> RenderScene {
-    let mut scene = RenderScene {
-        panels: Vec::new(),
-        glyphs: Vec::with_capacity(output_text.chars().count()),
-        overlay_panels: Vec::new(),
-    };
-    push_text_block(
-        &mut scene,
-        layout.result_panel_rect().inset(14).to_win32_rect(),
-        output_text,
-        output_cell_width,
-        output_cell_height,
-        [0.96, 0.95, 0.90, 1.0],
-    );
-    scene
-}
-
-/// behavior[impl window.appearance.terminal.cursor.legible-block]
-fn push_terminal_display(
-    scene: &mut RenderScene,
-    terminal_rect: ClientRect,
-    cell_width: i32,
-    cell_height: i32,
-    display: &TerminalDisplayState,
-) {
-    for background in &display.backgrounds {
-        push_panel(
-            scene,
-            terminal_cell_rect(terminal_rect, background.cell, cell_width, cell_height)
-                .to_win32_rect(),
-            background.color,
-            PanelEffect::TerminalFill,
-        );
-    }
-
-    for glyph in &display.glyphs {
-        push_glyph(
-            scene,
-            terminal_cell_rect(terminal_rect, glyph.cell, cell_width, cell_height).to_win32_rect(),
-            glyph.character,
-            glyph.color,
-        );
-    }
-
-    if let Some(cursor) = display.cursor {
-        let cell_rect = terminal_cell_rect(terminal_rect, cursor.cell, cell_width, cell_height);
-        for rect in terminal_cursor_overlay_rects(cell_rect, cursor.style) {
-            push_overlay_panel(
-                scene,
-                rect.to_win32_rect(),
-                terminal_cursor_overlay_color(cursor.color, cursor.style),
-                PanelEffect::TerminalCursor,
-            );
-        }
-    }
-}
-
-/// behavior[impl window.appearance.terminal.scrollbar.shader]
-fn push_terminal_scrollbar(
-    scene: &mut RenderScene,
-    scrollbar_rect: ClientRect,
-    scrollbar: Option<super::windows_terminal::TerminalDisplayScrollbar>,
-    visual_state: TerminalScrollbarVisualState,
-) {
-    if scrollbar_rect.width() <= 0 || scrollbar_rect.height() <= 0 {
-        return;
-    }
-
-    push_panel(
-        scene,
-        scrollbar_rect.to_win32_rect(),
-        if visual_state.track_hovered {
-            [0.28, 0.10, 0.40, 0.90]
-        } else {
-            [0.19, 0.08, 0.28, 0.78]
-        },
-        PanelEffect::TerminalScrollbarTrack,
-    );
-
-    let Some(scrollbar) = scrollbar else {
-        return;
-    };
-    let Some(geometry) = terminal_scrollbar_geometry(scrollbar_rect, scrollbar) else {
-        return;
-    };
-
-    push_panel(
-        scene,
-        geometry.thumb_rect.to_win32_rect(),
-        if visual_state.thumb_grabbed {
-            [1.00, 0.72, 1.00, 1.00]
-        } else if visual_state.thumb_hovered {
-            [0.92, 0.55, 1.00, 0.96]
-        } else {
-            [0.82, 0.38, 0.98, 0.88]
-        },
-        PanelEffect::TerminalScrollbarThumb,
-    );
-}
-
-fn terminal_scene_fragment(
-    state: &mut AppState,
-    layout: TerminalLayout,
-    display: &TerminalDisplayState,
-    visual_state: TerminalScrollbarVisualState,
-) -> RenderScene {
-    if let Some(cached) = state.cached_terminal_scene.as_ref()
-        && cached.layout == layout
-        && cached.display == *display
-        && cached.visual_state == visual_state
-    {
-        return cached.scene.clone();
-    }
-
-    let mut scene = RenderScene {
-        panels: Vec::with_capacity(display.backgrounds.len().saturating_add(2)),
-        glyphs: Vec::with_capacity(display.glyphs.len()),
-        overlay_panels: Vec::with_capacity(8),
-    };
-    let terminal_rect = layout.terminal_viewport_rect().inset(4);
-    let scrollbar_rect = layout.terminal_scrollbar_rect().inset(4);
-    push_terminal_display(
-        &mut scene,
-        terminal_rect,
-        state.terminal_cell_width,
-        state.terminal_cell_height,
-        display,
-    );
-    push_terminal_scrollbar(&mut scene, scrollbar_rect, display.scrollbar, visual_state);
-
-    state.cached_terminal_scene = Some(CachedTerminalScene {
-        layout,
-        display: display.clone(),
-        visual_state,
-        scene: scene.clone(),
-    });
-
-    scene
 }
 
 fn terminal_scrollbar_visual_state(state: &AppState) -> TerminalScrollbarVisualState {
@@ -1180,6 +1169,13 @@ fn current_terminal_scrollbar(state: &AppState) -> eyre::Result<Option<TerminalD
     }))
 }
 
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "cursor overlay helper now lives on the render thread and this copy remains for focused tests"
+    )
+)]
 fn terminal_cursor_overlay_color(
     mut color: [f32; 4],
     style: TerminalDisplayCursorStyle,
@@ -1190,15 +1186,6 @@ fn terminal_cursor_overlay_color(
         TerminalDisplayCursorStyle::Bar | TerminalDisplayCursorStyle::Underline => 0.9,
     };
     color
-}
-
-fn terminal_cell_rect(
-    terminal_rect: ClientRect,
-    cell: TerminalCellPoint,
-    cell_width: i32,
-    cell_height: i32,
-) -> ClientRect {
-    cell.to_client_rect(terminal_rect, cell_width, cell_height)
 }
 
 fn terminal_render_rect(layout: TerminalLayout) -> ClientRect {
@@ -1233,6 +1220,13 @@ fn terminal_cell_from_client_point(
     Some(TerminalCellPoint::new(column, row))
 }
 
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "cursor overlay helper now lives on the render thread and this copy remains for focused tests"
+    )
+)]
 fn terminal_cursor_overlay_rects(
     cell_rect: ClientRect,
     style: TerminalDisplayCursorStyle,
@@ -1301,6 +1295,104 @@ fn build_output_panel_text(state: &AppState) -> String {
             state.terminal.rows()
         )
     }
+}
+
+fn build_terminal_throughput_benchmark_output_panel_text(
+    terminal: &TerminalSession,
+    mode: TerminalThroughputBenchmarkMode,
+    line_count: usize,
+) -> String {
+    format!(
+        "self-test {}\n{} lines\n{} cols x {} rows",
+        terminal_throughput_mode_name(mode),
+        line_count,
+        terminal.cols(),
+        terminal.rows()
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "keeps the benchmark frame builder explicit while mirroring the render path inputs"
+)]
+fn render_terminal_throughput_benchmark_frame(
+    hwnd: WindowHandle,
+    renderer: &RenderThreadProxy,
+    terminal: &mut TerminalSession,
+    terminal_cell_width: i32,
+    terminal_cell_height: i32,
+    output_cell_width: i32,
+    output_cell_height: i32,
+    mode: TerminalThroughputBenchmarkMode,
+    line_count: usize,
+) -> eyre::Result<()> {
+    let layout = client_layout(hwnd, terminal_cell_width, terminal_cell_height)?;
+    let output_text =
+        build_terminal_throughput_benchmark_output_panel_text(terminal, mode, line_count);
+    let terminal_display = terminal.visible_display_state_with_selection(None)?;
+
+    renderer.render_frame_model_blocking(RenderFrameModel {
+        layout,
+        cell_number: 1,
+        output_text,
+        output_cell_width,
+        output_cell_height,
+        terminal_cell_width,
+        terminal_cell_height,
+        terminal_display,
+        terminal_visual_state: RendererTerminalVisualState::default(),
+    })
+}
+
+fn terminal_throughput_benchmark_command(
+    mode: TerminalThroughputBenchmarkMode,
+    line_count: usize,
+) -> eyre::Result<portable_pty::CommandBuilder> {
+    let script = match mode {
+        TerminalThroughputBenchmarkMode::MeasureCommandOutHost => format!(
+            concat!(
+                "$ErrorActionPreference = 'Stop'\n",
+                "Write-Host '{start_marker}'\n",
+                "Start-Sleep -Milliseconds 100\n",
+                "$duration = Measure-Command {{ 1..{line_count} | Out-Host }}\n",
+                "$measureMs = [string]::Format([System.Globalization.CultureInfo]::InvariantCulture, '{{0:F3}}', $duration.TotalMilliseconds)\n",
+                "Write-Host ('{measure_prefix}' + $measureMs)\n",
+                "Write-Host '{done_marker}'\n"
+            ),
+            start_marker = TERMINAL_THROUGHPUT_BENCHMARK_START_MARKER,
+            line_count = line_count,
+            measure_prefix = TERMINAL_THROUGHPUT_BENCHMARK_MEASURE_PREFIX,
+            done_marker = TERMINAL_THROUGHPUT_BENCHMARK_DONE_MARKER,
+        ),
+    };
+
+    crate::shell_default::command_builder_from_argv(&[
+        "pwsh.exe".to_owned(),
+        "-NoLogo".to_owned(),
+        "-NoProfile".to_owned(),
+        "-Command".to_owned(),
+        script,
+    ])
+}
+
+fn terminal_throughput_mode_name(mode: TerminalThroughputBenchmarkMode) -> &'static str {
+    match mode {
+        TerminalThroughputBenchmarkMode::MeasureCommandOutHost => "measure-command-out-host",
+    }
+}
+
+fn parse_terminal_throughput_measure_command_ms(screen: &str) -> eyre::Result<f64> {
+    for line in screen.lines() {
+        if let Some(value) = line.strip_prefix(TERMINAL_THROUGHPUT_BENCHMARK_MEASURE_PREFIX) {
+            return value.trim().parse::<f64>().wrap_err_with(|| {
+                format!("failed to parse benchmark measure-command output line `{line}`")
+            });
+        }
+    }
+
+    eyre::bail!(
+        "terminal throughput benchmark output did not include `{TERMINAL_THROUGHPUT_BENCHMARK_MEASURE_PREFIX}`\n\n=== screen ===\n{screen}"
+    )
 }
 
 fn measure_terminal_cell_size(font_height: i32) -> eyre::Result<(i32, i32)> {
@@ -1373,6 +1465,7 @@ fn handle_mouse_wheel(hwnd: WindowHandle, wparam: WPARAM, lparam: LPARAM) -> eyr
             };
             let line_delta = -steps * TERMINAL_WHEEL_SCROLL_LINES;
             state.terminal.scroll_viewport_by(line_delta);
+            render_current_frame(state, hwnd, None)?;
             Ok(true)
         });
     }
@@ -1412,6 +1505,7 @@ fn handle_mouse_wheel(hwnd: WindowHandle, wparam: WPARAM, lparam: LPARAM) -> eyr
             let layout =
                 client_layout(hwnd, state.terminal_cell_width, state.terminal_cell_height)?;
             state.terminal.resize(layout)?;
+            render_current_frame(state, hwnd, None)?;
             return Ok(true);
         }
 
@@ -1430,6 +1524,7 @@ fn handle_mouse_wheel(hwnd: WindowHandle, wparam: WPARAM, lparam: LPARAM) -> eyr
         state.output_font_height = next_font_height;
         state.output_cell_width = cell_width;
         state.output_cell_height = cell_height;
+        render_current_frame(state, hwnd, None)?;
         Ok(true)
     })
 }
@@ -1473,6 +1568,7 @@ fn handle_left_button_up(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Result<boo
                     )
                 });
             hwnd.release_mouse_capture();
+            render_current_frame(state, hwnd, None)?;
             return Ok(true);
         }
 
@@ -1493,6 +1589,7 @@ fn handle_left_button_up(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Result<boo
             {
                 state.terminal_selection = Some(selection);
             }
+            render_current_frame(state, hwnd, None)?;
             return Ok(true);
         }
 
@@ -1577,6 +1674,7 @@ fn handle_left_button_down(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Result<b
                     state.terminal_scrollbar_drag = Some(TerminalScrollbarDrag { grab_offset_y });
                     state.terminal.scroll_viewport_to_offset(target_offset)?;
                     hwnd.capture_mouse();
+                    render_current_frame(state, hwnd, None)?;
                     return Ok(true);
                 }
             }
@@ -1591,6 +1689,7 @@ fn handle_left_button_down(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Result<b
                     mode: selection_mode,
                 });
                 state.terminal_selection_drag_point = Some(point);
+                render_current_frame(state, hwnd, None)?;
                 return Ok(true);
             }
 
@@ -1645,6 +1744,9 @@ fn handle_mouse_move(hwnd: WindowHandle, wparam: WPARAM, lparam: LPARAM) -> eyre
     })?;
 
     if let Some(consumed) = selection_result {
+        if consumed {
+            with_app_state(|state| render_current_frame(state, hwnd, None))?;
+        }
         return Ok(consumed);
     }
 
@@ -1652,6 +1754,9 @@ fn handle_mouse_move(hwnd: WindowHandle, wparam: WPARAM, lparam: LPARAM) -> eyre
         with_app_state(|state| handle_terminal_scrollbar_mouse_move(state, hwnd, point))?;
 
     if let Some(consumed) = scrollbar_result {
+        if consumed {
+            with_app_state(|state| render_current_frame(state, hwnd, None))?;
+        }
         return Ok(consumed);
     }
 
@@ -2144,6 +2249,20 @@ mod tests {
 
         assert_eq!(action, PendingDragAction::NotHandled);
         assert!(action.clears_pending_drag());
+    }
+
+    #[test]
+    fn parses_terminal_throughput_measure_command_marker() {
+        let screen = concat!(
+            "header\n",
+            "__TEAMY_TERMINAL_THROUGHPUT_MEASURE_MS=123.456\n",
+            "footer\n"
+        );
+
+        let measure_ms = parse_terminal_throughput_measure_command_ms(screen)
+            .expect("benchmark marker should parse");
+
+        assert_eq!(measure_ms, 123.456);
     }
 
     // behavior[verify window.interaction.selection.click-dismiss]

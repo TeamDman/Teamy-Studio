@@ -40,6 +40,9 @@ The CLI must expose a `shell` command surface that supports inline launch and de
 tool[cli.surface.self-test]
 The CLI must expose a `self-test keyboard-input` command surface.
 
+tool[cli.surface.self-test-terminal-throughput]
+The CLI must expose a `self-test terminal-throughput` command surface.
+
 tool[cli.help.position-independent]
 The CLI must support requesting help from nested command positions.
 

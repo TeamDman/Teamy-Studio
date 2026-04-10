@@ -1,4 +1,5 @@
 use crate::cli::self_test::keyboard_input::SelfTestKeyboardInputArgs;
+use crate::cli::self_test::terminal_throughput::SelfTestTerminalThroughputArgs;
 use arbitrary::Arbitrary;
 use facet::Facet;
 use figue as args;
@@ -21,6 +22,9 @@ pub enum SelfTestCommand {
     /// cli[impl command.surface.self-test-keyboard-input]
     /// Run the keyboard input self-test harness.
     KeyboardInput(SelfTestKeyboardInputArgs),
+    /// cli[impl command.surface.self-test-terminal-throughput]
+    /// Run the terminal throughput benchmark.
+    TerminalThroughput(SelfTestTerminalThroughputArgs),
 }
 
 impl SelfTestArgs {
@@ -34,6 +38,7 @@ impl SelfTestArgs {
     ) -> eyre::Result<()> {
         match self.command {
             SelfTestCommand::KeyboardInput(args) => args.invoke(app_home, cache_home),
+            SelfTestCommand::TerminalThroughput(args) => args.invoke(app_home, cache_home),
         }
     }
 }

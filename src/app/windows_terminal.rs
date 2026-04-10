@@ -17,11 +17,13 @@ use libghostty_vt::terminal::{Point, PointCoordinate, ScrollViewport};
 use libghostty_vt::{Terminal, TerminalOptions};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use tracing::{debug, info, info_span, instrument};
+use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::System::Console::{
     CAPSLOCK_ON, LEFT_ALT_PRESSED, LEFT_CTRL_PRESSED, NUMLOCK_ON, RIGHT_ALT_PRESSED,
     RIGHT_CTRL_PRESSED, SHIFT_PRESSED,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::GetKeyState;
+use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_APP};
 
 use crate::paths::AppHome;
 
@@ -31,6 +33,7 @@ pub const DRAG_STRIP_HEIGHT: i32 = 76;
 pub const WINDOW_PADDING: i32 = 18;
 pub const POLL_TIMER_ID: usize = 1;
 pub const POLL_INTERVAL_MS: u32 = 16;
+pub const TERMINAL_WORKER_WAKE_MESSAGE: u32 = WM_APP + 1;
 
 const DEFAULT_COLS: u16 = 80;
 const DEFAULT_ROWS: u16 = 24;
@@ -41,7 +44,6 @@ const TERMINAL_OUTPUT_SLICE_BYTES: usize = 256;
 const TERMINAL_OUTPUT_QUEUE_SOFT_LIMIT_BYTES: usize = 64 * 1_024;
 const TERMINAL_WORKER_IDLE_TIMEOUT: Duration = Duration::from_millis(1);
 const TERMINAL_WORKER_PUMP_TIME_BUDGET: Duration = Duration::from_millis(2);
-const TERMINAL_DISPLAY_PUBLISH_INTERVAL: Duration = Duration::from_millis(16);
 const CELL_PANEL_GAP: i32 = 14;
 const SIDECAR_WIDTH: i32 = 86;
 const RESULT_PANEL_HEIGHT: i32 = 152;
@@ -244,9 +246,11 @@ struct SemanticPromptTracking {
 
 pub struct TerminalSession {
     worker_tx: mpsc::Sender<TerminalWorkerRequest>,
-    worker_updates: mpsc::Receiver<TerminalWorkerUpdate>,
+    pending_updates: Arc<Mutex<VecDeque<TerminalWorkerUpdate>>>,
+    wake_window: Arc<Mutex<Option<isize>>>,
     snapshot: TerminalSnapshot,
     worker_queued_output: bool,
+    repaint_requested: bool,
     cached_display: TerminalDisplayState,
 }
 
@@ -504,6 +508,39 @@ impl TerminalSession {
         let (request_tx, request_rx) = mpsc::channel();
         let (update_tx, update_rx) = mpsc::channel();
         let (startup_tx, startup_rx) = mpsc::sync_channel(1);
+        let pending_updates = Arc::new(Mutex::new(VecDeque::new()));
+        let wake_window = Arc::new(Mutex::new(None));
+        let pending_updates_for_bridge = Arc::clone(&pending_updates);
+        let wake_window_for_bridge = Arc::clone(&wake_window);
+
+        std::thread::Builder::new()
+            .name("teamy-terminal-update-bridge".to_owned())
+            .spawn(move || {
+                while let Ok(update) = update_rx.recv() {
+                    if let Ok(mut pending_updates) = pending_updates_for_bridge.lock() {
+                        pending_updates.push_back(update);
+                    }
+
+                    let wake_target = wake_window_for_bridge
+                        .lock()
+                        .ok()
+                        .and_then(|wake_window| *wake_window);
+                    if let Some(raw_hwnd) = wake_target {
+                        // Safety: this reconstructs the live window handle value previously stored by the UI thread and posts a message without dereferencing it.
+                        let _ = unsafe {
+                            PostMessageW(
+                                Some(HWND(raw_hwnd as *mut core::ffi::c_void)),
+                                TERMINAL_WORKER_WAKE_MESSAGE,
+                                WPARAM(0),
+                                LPARAM(0),
+                            )
+                        };
+                    }
+                }
+            })
+            .map_err(|error| {
+                eyre::eyre!("failed to spawn terminal update bridge thread: {error}")
+            })?;
 
         std::thread::Builder::new()
             .name("teamy-terminal-worker".to_owned())
@@ -534,11 +571,19 @@ impl TerminalSession {
 
         Ok(Self {
             worker_tx: request_tx,
-            worker_updates: update_rx,
+            pending_updates,
+            wake_window,
             snapshot,
             worker_queued_output: false,
+            repaint_requested: false,
             cached_display: TerminalDisplayState::default(),
         })
+    }
+
+    pub fn set_wake_window(&mut self, hwnd: HWND) {
+        if let Ok(mut wake_window) = self.wake_window.lock() {
+            *wake_window = Some(hwnd.0 as isize);
+        }
     }
 
     pub fn cols(&self) -> u16 {
@@ -551,6 +596,11 @@ impl TerminalSession {
 
     pub fn has_pending_output(&self) -> bool {
         self.snapshot.pending_output_bytes > 0
+    }
+
+    pub fn take_repaint_requested(&mut self) -> bool {
+        self.drain_worker_updates();
+        std::mem::take(&mut self.repaint_requested)
     }
 
     pub fn resize(&mut self, layout: TerminalLayout) -> eyre::Result<()> {
@@ -766,7 +816,11 @@ impl TerminalSession {
     }
 
     fn drain_worker_updates(&mut self) {
-        while let Ok(update) = self.worker_updates.try_recv() {
+        let Ok(mut pending_updates) = self.pending_updates.lock() else {
+            return;
+        };
+
+        while let Some(update) = pending_updates.pop_front() {
             match update {
                 TerminalWorkerUpdate::Snapshot(snapshot) => {
                     self.snapshot = snapshot;
@@ -780,7 +834,9 @@ impl TerminalSession {
                 TerminalWorkerUpdate::ChildExited => {
                     self.snapshot.closed = true;
                 }
-                TerminalWorkerUpdate::RepaintRequested => {}
+                TerminalWorkerUpdate::RepaintRequested => {
+                    self.repaint_requested = true;
+                }
             }
         }
     }
@@ -798,7 +854,6 @@ struct TerminalWorkerRunner {
     request_rx: mpsc::Receiver<TerminalWorkerRequest>,
     update_tx: mpsc::Sender<TerminalWorkerUpdate>,
     last_snapshot: TerminalSnapshot,
-    last_display_publish_at: Instant,
 }
 
 impl TerminalWorkerRunner {
@@ -813,9 +868,6 @@ impl TerminalWorkerRunner {
             request_rx,
             update_tx,
             last_snapshot,
-            last_display_publish_at: Instant::now()
-                .checked_sub(TERMINAL_DISPLAY_PUBLISH_INTERVAL)
-                .unwrap_or_else(Instant::now),
         }
     }
 
@@ -970,18 +1022,11 @@ impl TerminalWorkerRunner {
             return Ok(());
         }
 
-        if self.core.has_pending_output()
-            && self.last_display_publish_at.elapsed() < TERMINAL_DISPLAY_PUBLISH_INTERVAL
-        {
-            return Ok(());
-        }
-
         let display = {
             #[cfg(feature = "tracy")]
             let _span = debug_span!("publish_cached_terminal_display_state").entered();
             self.core.cached_display_state()?.clone()
         };
-        self.last_display_publish_at = Instant::now();
         self.update_tx
             .send(TerminalWorkerUpdate::DisplayState(display))
             .map_err(|error| {
