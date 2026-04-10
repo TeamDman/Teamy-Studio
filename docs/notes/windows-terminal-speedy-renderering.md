@@ -53,6 +53,7 @@ Recent measured progress:
 
 - earlier graphical completion baseline: about `9545 ms`
 - current graphical completion range after the latest burst-path work: about `6945-6995 ms`
+- current median after teaching the renderer to reuse moved rows from worker-published scroll-shift metadata: about `7307 ms`, down from the prior `7703 ms` median on the same `--samples 3` benchmark gate
 - current full-run frame count: about `50` frames instead of the earlier `200+`
 - current shell-side `measure_command_ms` can now land just under `5000 ms` on single-sample runs after avoiding unconditional PTY-read chunk copies in the Win32-input-mode stripping path
 
@@ -130,12 +131,14 @@ What is now true:
 - no-selection frames render from asynchronously published cached display snapshots
 - the hot no-selection path now shares cached terminal display state across worker, UI, and renderer instead of deep-cloning at each handoff
 - worker-published display snapshots now include dirty-row metadata so the renderer can reuse unchanged row scenes without re-diffing every row deeply
+- worker-published display snapshots now also include scroll-shift metadata so the renderer can distinguish viewport movement from true row-content replacement
 
 Remaining gap:
 
 - display extraction is still whole-snapshot based
 - selection rendering still falls back to synchronous display rebuilding
 - there is still no dirty-row or dirty-region extraction path
+- the worker still derives scroll metadata only after whole-snapshot extraction rather than from a cheaper incremental damage feed
 
 ### Phase 5. Reduce render-scene cost
 
@@ -148,6 +151,7 @@ What is now true:
 - cached terminal display and cached render scenes now use shared ownership to avoid some deep copies
 - the renderer now caches the composited frame vertex stream and patches only changed fragment ranges into the GPU vertex buffer when fragment sizes stay stable
 - the renderer now trusts worker-published dirty-row metadata for row-scene reuse instead of rediscovering unchanged rows by full row comparison on every published frame
+- the renderer now consumes worker-published scroll-shift metadata so moved viewport rows can reuse cached scenes and cached vertices via translation instead of rebuilding from text
 - focused redraws can force present without defeating duplicate-frame elision for normal steady-state frames
 
 Remaining gap:
@@ -354,9 +358,19 @@ The plan is still directionally correct, but it needs to be read as:
 The next high-value work should therefore be:
 
 1. add dirty-row or dirty-region tracking to terminal display extraction so the worker can publish narrower terminal invalidation data instead of whole visible snapshots
-2. teach the renderer to rebuild or upload only the terminal rows or regions that actually changed
+2. teach the renderer to rebuild or upload only the terminal rows or regions that actually changed now that viewport movement is represented explicitly
 3. investigate whether partial-present style behavior is viable after incremental terminal invalidation exists
-4. keep using Tracy and the throughput benchmark to verify that each change reduces both `graphical_completion_ms` and `frames_rendered`
+4. profile whether the next bottleneck is still scene rebuilding for exposed rows or full-surface presentation/compositor cost
+5. keep using Tracy and the throughput benchmark to verify that each change reduces both `graphical_completion_ms` and `frames_rendered`
+
+Recent rejected ideas worth not repeating blindly:
+
+- libghostty render-state row-dirty flags alone were not enough to improve the throughput benchmark in Teamy-Studio's current pipeline
+- throttling viewport/scrollbar metric queries during burst cached-display builds regressed benchmark medians
+- adding a second "extreme burst" worker threshold tier for larger slices and more aggressive publish/pump cadence regressed the current best median from about `7307 ms` to about `7467 ms`, so further publish-budget tuning still looks incremental and noisy rather than transformational
+- making the D3D12 debug layer opt-in by default did not produce a meaningful throughput improvement in this benchmark
+- reusing translated cached display rows on the worker and only re-extracting exposed rows regressed the current best median from about `7243 ms` to about `7819 ms`, so the added row-model translation work is not a win in the current pipeline
+- switching the swap chain to `FLIP_SEQUENTIAL` and adding conservative dirty-rect `Present1` logic regressed the current best median from about `7307 ms` to about `7392 ms`, so partial-present work should wait until traces show presentation bandwidth, not scene reuse, as the dominant remaining cost
 
 For day-to-day non-interactive validation, the throughput benchmark command should be treated as the default progress gate:
 
