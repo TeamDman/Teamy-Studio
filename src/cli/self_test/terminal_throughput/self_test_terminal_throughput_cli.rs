@@ -8,12 +8,22 @@ use figue::{self as args};
 #[repr(u8)]
 pub enum SelfTestTerminalThroughputMode {
     MeasureCommandOutHost,
+    StreamSmallBatches,
+    WideLines,
+    ScrollFlood,
+    PromptBursts,
+    ResizeDuringOutput,
 }
 
 impl From<SelfTestTerminalThroughputMode> for crate::app::TerminalThroughputBenchmarkMode {
     fn from(value: SelfTestTerminalThroughputMode) -> Self {
         match value {
             SelfTestTerminalThroughputMode::MeasureCommandOutHost => Self::MeasureCommandOutHost,
+            SelfTestTerminalThroughputMode::StreamSmallBatches => Self::StreamSmallBatches,
+            SelfTestTerminalThroughputMode::WideLines => Self::WideLines,
+            SelfTestTerminalThroughputMode::ScrollFlood => Self::ScrollFlood,
+            SelfTestTerminalThroughputMode::PromptBursts => Self::PromptBursts,
+            SelfTestTerminalThroughputMode::ResizeDuringOutput => Self::ResizeDuringOutput,
         }
     }
 }
@@ -48,12 +58,10 @@ impl SelfTestTerminalThroughputArgs {
         app_home: &crate::paths::AppHome,
         cache_home: &crate::paths::CacheHome,
     ) -> eyre::Result<()> {
-        let _ = cache_home;
         crate::app::run_terminal_throughput_self_test(
             app_home,
-            self.mode
-                .unwrap_or(SelfTestTerminalThroughputMode::MeasureCommandOutHost)
-                .into(),
+            cache_home,
+            self.mode.map(Into::into),
             self.line_count.unwrap_or(10_000),
             self.samples.unwrap_or(1).max(1),
         )

@@ -8,7 +8,9 @@ use std::time::{Duration, Instant};
 use tracing::debug_span;
 use tracing::trace;
 
+use chrono::Utc;
 use eyre::Context;
+use facet::Facet;
 use teamy_windows::clipboard::{read_clipboard, write_clipboard};
 use teamy_windows::module::get_current_module;
 use tracing::{debug, error, info, info_span, instrument};
@@ -22,7 +24,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_CONTROL, VK_LB
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect, GetCursorPos,
     GetMessageW, GetSystemMetrics, GetWindowRect, HTCAPTION, HTCLIENT, IDC_ARROW, IDC_SIZEALL,
-    KillTimer, LoadCursorW, MSG, PostMessageW, PostQuitMessage, RegisterClassExW,
+    KillTimer, LoadCursorW, MSG, MoveWindow, PostMessageW, PostQuitMessage, RegisterClassExW,
     SM_CXPADDEDBORDER, SM_CXSCREEN, SM_CXSIZEFRAME, SM_CYSCREEN, SM_CYSIZEFRAME, SW_SHOW,
     SYSTEM_METRICS_INDEX, SetCursor, SetTimer, ShowWindow, TranslateMessage, WM_CHAR, WM_CLOSE,
     WM_DESTROY, WM_ENTERSIZEMOVE, WM_ERASEBKGND, WM_EXITSIZEMOVE, WM_KEYDOWN, WM_KEYUP,
@@ -33,7 +35,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::{PCWSTR, w};
 
-use crate::paths::AppHome;
+use crate::paths::{AppHome, CacheHome};
 
 use super::spatial::{
     ClientPoint, ClientRect, ScreenPoint, ScreenRect, ScreenToClientTransform, TerminalCellPoint,
@@ -47,8 +49,8 @@ use super::windows_dialogs::{
 };
 use super::windows_terminal::{
     POLL_INTERVAL_MS, POLL_TIMER_ID, TERMINAL_WORKER_WAKE_MESSAGE, TerminalDisplayCursorStyle,
-    TerminalDisplayScrollbar, TerminalLayout, TerminalSelection, TerminalSelectionMode,
-    TerminalSession, keyboard_mods,
+    TerminalDisplayScrollbar, TerminalDisplayState, TerminalLayout, TerminalPerformanceSnapshot,
+    TerminalSelection, TerminalSelectionMode, TerminalSession, keyboard_mods,
 };
 use super::{TerminalThroughputBenchmarkMode, WorkspaceWindowState};
 
@@ -80,6 +82,7 @@ const TERMINAL_THROUGHPUT_BENCHMARK_MEASURE_PREFIX: &str =
     "__TEAMY_TERMINAL_THROUGHPUT_MEASURE_MS=";
 const TERMINAL_THROUGHPUT_BENCHMARK_TIMEOUT: Duration = Duration::from_secs(60);
 const TERMINAL_THROUGHPUT_BENCHMARK_POLL_INTERVAL: Duration = Duration::from_millis(1);
+const TERMINAL_THROUGHPUT_RESULTS_DIR: &str = "self-test/terminal-throughput";
 
 thread_local! {
     static APP_STATE: RefCell<Option<AppState>> = const { RefCell::new(None) };
@@ -97,6 +100,8 @@ struct AppState {
     terminal_scrollbar_drag: Option<TerminalScrollbarDrag>,
     in_move_size_loop: bool,
     window_focused: bool,
+    terminal_layout: Option<TerminalLayout>,
+    pending_terminal_resize: Option<TerminalLayout>,
     terminal_poll_pending: bool,
     focused_render_interval_ms: u32,
     terminal_font_height: i32,
@@ -441,6 +446,8 @@ pub fn run(
             terminal_scrollbar_drag: None,
             in_move_size_loop: false,
             window_focused: false,
+            terminal_layout: None,
+            pending_terminal_resize: None,
             terminal_poll_pending: false,
             focused_render_interval_ms,
             terminal_font_height,
@@ -469,7 +476,8 @@ pub fn run(
         with_app_state(|state| {
             let layout =
                 client_layout(hwnd, state.terminal_cell_width, state.terminal_cell_height)?;
-            state.terminal.resize(layout)
+            apply_terminal_resize(state, layout)?;
+            Ok(())
         })
     })?;
 
@@ -479,66 +487,30 @@ pub fn run(
     message_loop()
 }
 
-#[instrument(level = "info", skip_all, fields(?mode, line_count))]
-pub fn run_terminal_throughput_self_test(
-    _app_home: &AppHome,
+#[derive(Clone, Copy, Debug)]
+struct TerminalThroughputBenchmarkPlan {
     mode: TerminalThroughputBenchmarkMode,
     line_count: usize,
-    samples: usize,
-) -> eyre::Result<()> {
-    let mut sample_results = Vec::with_capacity(samples);
-    for sample_index in 0..samples {
-        let result = run_terminal_throughput_self_test_sample(_app_home, mode, line_count)?;
-        if samples > 1 {
-            println!(
-                "sample: {}\nmeasure_command_ms: {:.3}\ngraphical_completion_ms: {:.3}\ndelta_ms: {:.3}\nratio: {:.3}\nframes_rendered: {}\nterminal_closed: {}\n",
-                sample_index + 1,
-                result.measure_command_ms,
-                result.graphical_completion_ms,
-                result.graphical_completion_ms - result.measure_command_ms,
-                result.ratio(),
-                result.frames_rendered,
-                result.terminal_closed,
-            );
-        }
-        sample_results.push(result);
-    }
-
-    let median_measure_command_ms = median_sample_metric(&sample_results, |result| result.measure_command_ms);
-    let median_graphical_completion_ms =
-        median_sample_metric(&sample_results, |result| result.graphical_completion_ms);
-    let median_frames_rendered = median_sample_metric(&sample_results, |result| result.frames_rendered as f64);
-    let last_result = sample_results
-        .last()
-        .ok_or_else(|| eyre::eyre!("terminal throughput benchmark did not produce any samples"))?;
-    let delta_ms = median_graphical_completion_ms - median_measure_command_ms;
-    let ratio = if median_measure_command_ms > 0.0 {
-        median_graphical_completion_ms / median_measure_command_ms
-    } else {
-        0.0
-    };
-
-    println!(
-        "scenario: {}\nline_count: {line_count}\nsamples: {samples}\nmeasure_command_ms: {median_measure_command_ms:.3}\ngraphical_completion_ms: {median_graphical_completion_ms:.3}\ndelta_ms: {delta_ms:.3}\nratio: {ratio:.3}\nframes_rendered: {:.0}\nterminal_closed: {}\n\n=== final_screen ===\n{}",
-        terminal_throughput_mode_name(mode),
-        median_frames_rendered,
-        last_result.terminal_closed,
-        last_result.last_screen,
-    );
-
-    Ok(())
+    resize_target_client_size: Option<(u32, u32)>,
 }
 
 #[derive(Clone, Debug)]
 struct TerminalThroughputBenchmarkSampleResult {
+    mode: TerminalThroughputBenchmarkMode,
+    line_count: usize,
     measure_command_ms: f64,
     graphical_completion_ms: f64,
     frames_rendered: u64,
     terminal_closed: bool,
     last_screen: String,
+    performance: TerminalPerformanceSnapshot,
 }
 
 impl TerminalThroughputBenchmarkSampleResult {
+    fn delta_ms(&self) -> f64 {
+        self.graphical_completion_ms - self.measure_command_ms
+    }
+
     fn ratio(&self) -> f64 {
         if self.measure_command_ms > 0.0 {
             self.graphical_completion_ms / self.measure_command_ms
@@ -548,10 +520,221 @@ impl TerminalThroughputBenchmarkSampleResult {
     }
 }
 
-fn run_terminal_throughput_self_test_sample(
-    _app_home: &AppHome,
-    mode: TerminalThroughputBenchmarkMode,
+#[derive(Clone, Debug)]
+struct TerminalThroughputBenchmarkScenarioResult {
+    plan: TerminalThroughputBenchmarkPlan,
+    sample_results: Vec<TerminalThroughputBenchmarkSampleResult>,
+}
+
+#[derive(Debug, Facet)]
+struct TerminalThroughputBenchmarkResultsReport {
+    generated_at_utc: String,
+    app_home: String,
+    scenario_count: usize,
+    scenarios: Vec<TerminalThroughputBenchmarkScenarioReport>,
+}
+
+#[derive(Debug, Facet)]
+struct TerminalThroughputBenchmarkScenarioReport {
+    mode: String,
     line_count: usize,
+    resize_target_client_size: Option<TerminalThroughputClientSizeReport>,
+    summary: TerminalThroughputBenchmarkScenarioSummaryReport,
+    samples: Vec<TerminalThroughputBenchmarkSampleReport>,
+}
+
+#[derive(Debug, Facet)]
+struct TerminalThroughputClientSizeReport {
+    width: u32,
+    height: u32,
+}
+
+#[derive(Debug, Facet)]
+struct TerminalThroughputBenchmarkScenarioSummaryReport {
+    samples: usize,
+    median_measure_command_ms: f64,
+    median_graphical_completion_ms: f64,
+    median_delta_ms: f64,
+    median_ratio: f64,
+    median_frames_rendered: u64,
+    median_max_pending_output_bytes: u64,
+    median_avg_pending_output_bytes: f64,
+    median_max_queue_latency_ms: f64,
+    median_vt_write_calls: u64,
+    median_vt_write_bytes: u64,
+    median_display_publications: u64,
+    median_dirty_rows_published: u64,
+    terminal_closed: bool,
+}
+
+#[derive(Debug, Facet)]
+struct TerminalThroughputBenchmarkSampleReport {
+    mode: String,
+    line_count: usize,
+    measure_command_ms: f64,
+    graphical_completion_ms: f64,
+    delta_ms: f64,
+    ratio: f64,
+    frames_rendered: u64,
+    terminal_closed: bool,
+    performance: TerminalPerformanceSnapshotReport,
+    last_screen: String,
+}
+
+#[derive(Debug, Facet)]
+struct TerminalPerformanceSnapshotReport {
+    pending_output_bytes: usize,
+    max_pending_output_bytes: usize,
+    pending_output_observations: u64,
+    total_pending_output_bytes: u64,
+    average_pending_output_bytes: f64,
+    vt_write_calls: u64,
+    vt_write_bytes: u64,
+    display_publications: u64,
+    dirty_rows_published: u64,
+    max_dirty_rows_published: usize,
+    queue_latency_observations: u64,
+    max_queue_latency_us: u64,
+    total_queue_latency_us: u64,
+    average_queue_latency_ms: f64,
+    max_queue_latency_ms: f64,
+}
+
+impl TerminalThroughputBenchmarkScenarioResult {
+    fn last_result(&self) -> eyre::Result<&TerminalThroughputBenchmarkSampleResult> {
+        self.sample_results
+            .last()
+            .ok_or_else(|| eyre::eyre!("terminal throughput benchmark did not produce any samples"))
+    }
+
+    fn median_measure_command_ms(&self) -> f64 {
+        median_sample_metric(&self.sample_results, |result| result.measure_command_ms)
+    }
+
+    fn median_graphical_completion_ms(&self) -> f64 {
+        median_sample_metric(&self.sample_results, |result| {
+            result.graphical_completion_ms
+        })
+    }
+
+    fn median_delta_ms(&self) -> f64 {
+        median_sample_metric(
+            &self.sample_results,
+            TerminalThroughputBenchmarkSampleResult::delta_ms,
+        )
+    }
+
+    fn median_ratio(&self) -> f64 {
+        median_sample_metric(
+            &self.sample_results,
+            TerminalThroughputBenchmarkSampleResult::ratio,
+        )
+    }
+
+    fn median_frames_rendered(&self) -> u64 {
+        median_sample_u64_metric(&self.sample_results, |result| result.frames_rendered)
+    }
+
+    fn median_max_pending_output_bytes(&self) -> u64 {
+        median_sample_u64_metric(&self.sample_results, |result| {
+            u64::try_from(result.performance.max_pending_output_bytes).unwrap_or(u64::MAX)
+        })
+    }
+
+    fn median_avg_pending_output_bytes(&self) -> f64 {
+        median_sample_metric(&self.sample_results, |result| {
+            result.performance.average_pending_output_bytes()
+        })
+    }
+
+    fn median_max_queue_latency_ms(&self) -> f64 {
+        median_sample_metric(&self.sample_results, |result| {
+            result.performance.max_queue_latency_ms()
+        })
+    }
+
+    fn median_vt_write_calls(&self) -> u64 {
+        median_sample_u64_metric(&self.sample_results, |result| {
+            result.performance.vt_write_calls
+        })
+    }
+
+    fn median_vt_write_bytes(&self) -> u64 {
+        median_sample_u64_metric(&self.sample_results, |result| {
+            result.performance.vt_write_bytes
+        })
+    }
+
+    fn median_display_publications(&self) -> u64 {
+        median_sample_u64_metric(&self.sample_results, |result| {
+            result.performance.display_publications
+        })
+    }
+
+    fn median_dirty_rows_published(&self) -> u64 {
+        median_sample_u64_metric(&self.sample_results, |result| {
+            result.performance.dirty_rows_published
+        })
+    }
+}
+
+#[instrument(level = "info", skip_all, fields(?mode, line_count, samples))]
+pub fn run_terminal_throughput_self_test(
+    app_home: &AppHome,
+    cache_home: &CacheHome,
+    mode: Option<TerminalThroughputBenchmarkMode>,
+    line_count: usize,
+    samples: usize,
+) -> eyre::Result<()> {
+    let benchmark_plans = terminal_throughput_benchmark_plans(mode, line_count);
+    let mut scenario_results = Vec::with_capacity(benchmark_plans.len());
+
+    for plan in benchmark_plans {
+        let mut sample_results = Vec::with_capacity(samples);
+        for sample_index in 0..samples {
+            let result = run_terminal_throughput_self_test_sample(plan)?;
+            if samples > 1 {
+                println!(
+                    "scenario: {}\nsample: {}\nmeasure_command_ms: {:.3}\ngraphical_completion_ms: {:.3}\ndelta_ms: {:.3}\nratio: {:.3}\nframes_rendered: {}\nmax_pending_output_bytes: {}\navg_pending_output_bytes: {:.3}\nmax_queue_latency_ms: {:.3}\nvt_write_calls: {}\nvt_write_bytes: {}\ndisplay_publications: {}\ndirty_rows_published: {}\nterminal_closed: {}\n",
+                    terminal_throughput_mode_name(plan.mode),
+                    sample_index + 1,
+                    result.measure_command_ms,
+                    result.graphical_completion_ms,
+                    result.delta_ms(),
+                    result.ratio(),
+                    result.frames_rendered,
+                    result.performance.max_pending_output_bytes,
+                    result.performance.average_pending_output_bytes(),
+                    result.performance.max_queue_latency_ms(),
+                    result.performance.vt_write_calls,
+                    result.performance.vt_write_bytes,
+                    result.performance.display_publications,
+                    result.performance.dirty_rows_published,
+                    result.terminal_closed,
+                );
+            }
+            sample_results.push(result);
+        }
+
+        let scenario_result = TerminalThroughputBenchmarkScenarioResult {
+            plan,
+            sample_results,
+        };
+        print_terminal_throughput_scenario_summary(&scenario_result)?;
+        scenario_results.push(scenario_result);
+    }
+
+    let results_path = write_terminal_throughput_results(app_home, cache_home, &scenario_results)?;
+    println!("results_path: {}", results_path.display());
+    Ok(())
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "the benchmark loop keeps terminal, window, and renderer state transitions in one place"
+)]
+fn run_terminal_throughput_self_test_sample(
+    plan: TerminalThroughputBenchmarkPlan,
 ) -> eyre::Result<TerminalThroughputBenchmarkSampleResult> {
     let window_thread = WindowThread::current();
     let terminal_font_height = TERMINAL_FONT_HEIGHT;
@@ -568,7 +751,7 @@ fn run_terminal_throughput_self_test_sample(
         font_height = output_font_height,
     )
     .in_scope(|| measure_terminal_cell_size(output_font_height))?;
-    let command = terminal_throughput_benchmark_command(mode, line_count)?;
+    let command = terminal_throughput_benchmark_command(plan.mode, plan.line_count)?;
     let mut terminal = info_span!("create_terminal_benchmark_session")
         .in_scope(|| TerminalSession::new_with_command(command))?;
     let hwnd = info_span!("create_terminal_benchmark_window")
@@ -585,6 +768,7 @@ fn run_terminal_throughput_self_test_sample(
         let mut visual_started_at = None;
         let mut frames_rendered = 0_u64;
         let mut last_screen = String::new();
+        let mut resize_performed = false;
 
         loop {
             let poll_result = terminal.poll_pty_output()?;
@@ -592,7 +776,8 @@ fn run_terminal_throughput_self_test_sample(
             let repaint_requested = terminal.take_repaint_requested();
             let pending_output = terminal.has_pending_output();
 
-            let should_render = frames_rendered == 0 || poll_result.queued_output || repaint_requested;
+            let should_render =
+                frames_rendered == 0 || poll_result.queued_output || repaint_requested;
             if should_render {
                 if visual_started_at.is_none() && (poll_result.queued_output || pending_output) {
                     visual_started_at = Some(Instant::now());
@@ -605,10 +790,26 @@ fn run_terminal_throughput_self_test_sample(
                     terminal_cell_height,
                     output_cell_width,
                     output_cell_height,
-                    mode,
-                    line_count,
+                    plan.mode,
+                    plan.line_count,
                 )?;
                 frames_rendered += 1;
+            }
+
+            if !resize_performed
+                && let Some((client_width, client_height)) = plan.resize_target_client_size
+                && visual_started_at.is_some()
+                && frames_rendered >= 3
+            {
+                resize_benchmark_window_client(
+                    hwnd,
+                    i32::try_from(client_width).unwrap_or(i32::MAX),
+                    i32::try_from(client_height).unwrap_or(i32::MAX),
+                )?;
+                let layout = client_layout(hwnd, terminal_cell_width, terminal_cell_height)?;
+                renderer.resize(client_width, client_height)?;
+                terminal.resize(layout)?;
+                resize_performed = true;
             }
 
             let terminal_closed = pump_result.should_close || poll_result.should_close;
@@ -622,21 +823,16 @@ fn run_terminal_throughput_self_test_sample(
                 let measure_command_ms =
                     parse_terminal_throughput_measure_command_ms(&last_screen)?;
                 let graphical_completion_ms = visual_started_at.elapsed().as_secs_f64() * 1000.0;
-                let delta_ms = graphical_completion_ms - measure_command_ms;
-                let ratio = if measure_command_ms > 0.0 {
-                    graphical_completion_ms / measure_command_ms
-                } else {
-                    0.0
-                };
-
-                let _ = delta_ms;
-                let _ = ratio;
+                let performance = terminal.performance_snapshot()?;
                 return Ok(TerminalThroughputBenchmarkSampleResult {
+                    mode: plan.mode,
+                    line_count: plan.line_count,
                     measure_command_ms,
                     graphical_completion_ms,
                     frames_rendered,
                     terminal_closed,
                     last_screen,
+                    performance,
                 });
             }
 
@@ -666,7 +862,24 @@ where
     values.sort_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal));
     let mid = values.len() / 2;
     if values.len() % 2 == 0 {
-        (values[mid - 1] + values[mid]) / 2.0
+        f64::midpoint(values[mid - 1], values[mid])
+    } else {
+        values[mid]
+    }
+}
+
+fn median_sample_u64_metric<T>(
+    samples: &[TerminalThroughputBenchmarkSampleResult],
+    selector: T,
+) -> u64
+where
+    T: Fn(&TerminalThroughputBenchmarkSampleResult) -> u64,
+{
+    let mut values = samples.iter().map(selector).collect::<Vec<_>>();
+    values.sort_unstable();
+    let mid = values.len() / 2;
+    if values.len() % 2 == 0 {
+        u64::midpoint(values[mid - 1], values[mid])
     } else {
         values[mid]
     }
@@ -860,6 +1073,7 @@ fn handle_enter_size_move(hwnd: WindowHandle) -> LRESULT {
 fn handle_exit_size_move(hwnd: WindowHandle) -> LRESULT {
     match with_app_state(|state| {
         state.in_move_size_loop = false;
+        apply_pending_terminal_resize(state)?;
         render_current_frame(state, hwnd, None)?;
         Ok(())
     }) {
@@ -871,7 +1085,12 @@ fn handle_exit_size_move(hwnd: WindowHandle) -> LRESULT {
 fn handle_size(hwnd: WindowHandle) -> LRESULT {
     match with_app_state(|state| {
         let layout = client_layout(hwnd, state.terminal_cell_width, state.terminal_cell_height)?;
-        state.terminal.resize(layout)?;
+        if state.in_move_size_loop {
+            state.pending_terminal_resize = Some(layout);
+        } else {
+            state.pending_terminal_resize = None;
+            apply_terminal_resize(state, layout)?;
+        }
         render_current_frame(
             state,
             hwnd,
@@ -1171,12 +1390,12 @@ fn render_current_frame_with_options(
     let output_text = {
         #[cfg(feature = "tracy")]
         let _span = debug_span!("build_output_panel_text").entered();
-        build_output_panel_text(state)
+        build_output_panel_text(state, layout)
     };
     let terminal_display = {
         #[cfg(feature = "tracy")]
         let _span = debug_span!("build_terminal_display_state").entered();
-        if let Some(selection) = state.terminal_selection {
+        let display = if let Some(selection) = state.terminal_selection {
             Arc::new(
                 state
                     .terminal
@@ -1184,7 +1403,13 @@ fn render_current_frame_with_options(
             )
         } else {
             state.terminal.cached_display_state()
-        }
+        };
+        clip_terminal_display_to_layout(
+            display,
+            layout,
+            state.terminal_cell_width,
+            state.terminal_cell_height,
+        )
     };
     let terminal_visual_state = terminal_scrollbar_visual_state(state);
 
@@ -1366,7 +1591,7 @@ fn terminal_cursor_overlay_color(
 }
 
 fn terminal_render_rect(layout: TerminalLayout) -> ClientRect {
-    layout.terminal_viewport_rect().inset(4)
+    layout.terminal_content_rect()
 }
 
 fn terminal_cell_from_client_point(
@@ -1391,9 +1616,11 @@ fn terminal_cell_from_client_point(
     let relative_x = clamped_x - terminal_rect.left();
     let relative_y = clamped_y - terminal_rect.top();
 
-    let (grid_cols, grid_rows) = layout.grid_size();
-    let column = (relative_x / layout.cell_width.max(1)).clamp(0, i32::from(grid_cols) - 1);
-    let row = (relative_y / layout.cell_height.max(1)).clamp(0, i32::from(grid_rows) - 1);
+    let (visible_cols, visible_rows) = layout.visible_grid_size();
+    let grid_cols = visible_cols.max(1);
+    let grid_rows = visible_rows.max(1);
+    let column = (relative_x / layout.cell_width.max(1)).clamp(0, grid_cols - 1);
+    let row = (relative_y / layout.cell_height.max(1)).clamp(0, grid_rows - 1);
     Some(TerminalCellPoint::new(column, row))
 }
 
@@ -1455,22 +1682,19 @@ fn terminal_cursor_overlay_rects(
     }
 }
 
-fn build_output_panel_text(state: &AppState) -> String {
+fn build_output_panel_text(state: &AppState, layout: TerminalLayout) -> String {
+    let (cols, rows) = effective_terminal_grid_size(layout);
     if let Some(workspace_window) = &state.workspace_window {
         format!(
             "workspace {}\ncell {} of {}\n{} cols x {} rows",
             workspace_window.workspace.name,
             workspace_window.cell_number,
             workspace_window.workspace.cell_count,
-            state.terminal.cols(),
-            state.terminal.rows()
+            cols,
+            rows
         )
     } else {
-        format!(
-            "standalone shell\n{} cols x {} rows",
-            state.terminal.cols(),
-            state.terminal.rows()
-        )
+        format!("standalone shell\n{cols} cols x {rows} rows")
     }
 }
 
@@ -1486,6 +1710,203 @@ fn build_terminal_throughput_benchmark_output_panel_text(
         terminal.cols(),
         terminal.rows()
     )
+}
+
+fn terminal_throughput_benchmark_plans(
+    mode: Option<TerminalThroughputBenchmarkMode>,
+    line_count: usize,
+) -> Vec<TerminalThroughputBenchmarkPlan> {
+    let build_plan = |mode| TerminalThroughputBenchmarkPlan {
+        mode,
+        line_count,
+        resize_target_client_size: match mode {
+            TerminalThroughputBenchmarkMode::ResizeDuringOutput => Some((820, 520)),
+            _ => None,
+        },
+    };
+
+    if let Some(mode) = mode {
+        vec![build_plan(mode)]
+    } else {
+        vec![
+            build_plan(TerminalThroughputBenchmarkMode::MeasureCommandOutHost),
+            build_plan(TerminalThroughputBenchmarkMode::StreamSmallBatches),
+            build_plan(TerminalThroughputBenchmarkMode::WideLines),
+            build_plan(TerminalThroughputBenchmarkMode::ScrollFlood),
+            build_plan(TerminalThroughputBenchmarkMode::PromptBursts),
+            build_plan(TerminalThroughputBenchmarkMode::ResizeDuringOutput),
+        ]
+    }
+}
+
+fn print_terminal_throughput_scenario_summary(
+    scenario_result: &TerminalThroughputBenchmarkScenarioResult,
+) -> eyre::Result<()> {
+    let last_result = scenario_result.last_result()?;
+    println!(
+        "scenario: {}\nline_count: {}\nsamples: {}\nmeasure_command_ms: {:.3}\ngraphical_completion_ms: {:.3}\ndelta_ms: {:.3}\nratio: {:.3}\nframes_rendered: {}\nmax_pending_output_bytes: {}\navg_pending_output_bytes: {:.3}\nmax_queue_latency_ms: {:.3}\nvt_write_calls: {}\nvt_write_bytes: {}\ndisplay_publications: {}\ndirty_rows_published: {}\nterminal_closed: {}\n\n=== final_screen ===\n{}",
+        terminal_throughput_mode_name(scenario_result.plan.mode),
+        scenario_result.plan.line_count,
+        scenario_result.sample_results.len(),
+        scenario_result.median_measure_command_ms(),
+        scenario_result.median_graphical_completion_ms(),
+        scenario_result.median_delta_ms(),
+        scenario_result.median_ratio(),
+        scenario_result.median_frames_rendered(),
+        scenario_result.median_max_pending_output_bytes(),
+        scenario_result.median_avg_pending_output_bytes(),
+        scenario_result.median_max_queue_latency_ms(),
+        scenario_result.median_vt_write_calls(),
+        scenario_result.median_vt_write_bytes(),
+        scenario_result.median_display_publications(),
+        scenario_result.median_dirty_rows_published(),
+        last_result.terminal_closed,
+        last_result.last_screen,
+    );
+    Ok(())
+}
+
+fn write_terminal_throughput_results(
+    app_home: &AppHome,
+    cache_home: &CacheHome,
+    scenario_results: &[TerminalThroughputBenchmarkScenarioResult],
+) -> eyre::Result<std::path::PathBuf> {
+    let results_dir = cache_home.join(TERMINAL_THROUGHPUT_RESULTS_DIR);
+    std::fs::create_dir_all(&results_dir).wrap_err_with(|| {
+        format!(
+            "failed to create terminal throughput results directory {}",
+            results_dir.display()
+        )
+    })?;
+
+    let timestamp = Utc::now();
+    let results_path = results_dir.join(format!(
+        "terminal-throughput-{}.json",
+        timestamp.format("%Y%m%dT%H%M%SZ")
+    ));
+    let report = build_terminal_throughput_results_report(app_home, timestamp, scenario_results);
+    let json = facet_json::to_string_pretty(&report)
+        .wrap_err("failed to serialize terminal throughput benchmark results")?;
+    std::fs::write(&results_path, json)
+        .wrap_err_with(|| format!("failed to write {}", results_path.display()))?;
+    Ok(results_path)
+}
+
+fn build_terminal_throughput_results_report(
+    app_home: &AppHome,
+    generated_at: chrono::DateTime<Utc>,
+    scenario_results: &[TerminalThroughputBenchmarkScenarioResult],
+) -> TerminalThroughputBenchmarkResultsReport {
+    TerminalThroughputBenchmarkResultsReport {
+        generated_at_utc: generated_at.to_rfc3339(),
+        app_home: app_home.display().to_string(),
+        scenario_count: scenario_results.len(),
+        scenarios: scenario_results
+            .iter()
+            .map(terminal_throughput_scenario_report)
+            .collect(),
+    }
+}
+
+fn terminal_throughput_scenario_report(
+    scenario_result: &TerminalThroughputBenchmarkScenarioResult,
+) -> TerminalThroughputBenchmarkScenarioReport {
+    let last_result = scenario_result
+        .last_result()
+        .expect("scenario results should contain at least one sample");
+    TerminalThroughputBenchmarkScenarioReport {
+        mode: terminal_throughput_mode_name(scenario_result.plan.mode).to_owned(),
+        line_count: scenario_result.plan.line_count,
+        resize_target_client_size: scenario_result
+            .plan
+            .resize_target_client_size
+            .map(|(width, height)| TerminalThroughputClientSizeReport { width, height }),
+        summary: TerminalThroughputBenchmarkScenarioSummaryReport {
+            samples: scenario_result.sample_results.len(),
+            median_measure_command_ms: scenario_result.median_measure_command_ms(),
+            median_graphical_completion_ms: scenario_result.median_graphical_completion_ms(),
+            median_delta_ms: scenario_result.median_delta_ms(),
+            median_ratio: scenario_result.median_ratio(),
+            median_frames_rendered: scenario_result.median_frames_rendered(),
+            median_max_pending_output_bytes: scenario_result.median_max_pending_output_bytes(),
+            median_avg_pending_output_bytes: scenario_result.median_avg_pending_output_bytes(),
+            median_max_queue_latency_ms: scenario_result.median_max_queue_latency_ms(),
+            median_vt_write_calls: scenario_result.median_vt_write_calls(),
+            median_vt_write_bytes: scenario_result.median_vt_write_bytes(),
+            median_display_publications: scenario_result.median_display_publications(),
+            median_dirty_rows_published: scenario_result.median_dirty_rows_published(),
+            terminal_closed: last_result.terminal_closed,
+        },
+        samples: scenario_result
+            .sample_results
+            .iter()
+            .map(terminal_throughput_sample_report)
+            .collect(),
+    }
+}
+
+fn terminal_throughput_sample_report(
+    sample_result: &TerminalThroughputBenchmarkSampleResult,
+) -> TerminalThroughputBenchmarkSampleReport {
+    TerminalThroughputBenchmarkSampleReport {
+        mode: terminal_throughput_mode_name(sample_result.mode).to_owned(),
+        line_count: sample_result.line_count,
+        measure_command_ms: sample_result.measure_command_ms,
+        graphical_completion_ms: sample_result.graphical_completion_ms,
+        delta_ms: sample_result.delta_ms(),
+        ratio: sample_result.ratio(),
+        frames_rendered: sample_result.frames_rendered,
+        terminal_closed: sample_result.terminal_closed,
+        performance: TerminalPerformanceSnapshotReport {
+            pending_output_bytes: sample_result.performance.pending_output_bytes,
+            max_pending_output_bytes: sample_result.performance.max_pending_output_bytes,
+            pending_output_observations: sample_result.performance.pending_output_observations,
+            total_pending_output_bytes: sample_result.performance.total_pending_output_bytes,
+            average_pending_output_bytes: sample_result.performance.average_pending_output_bytes(),
+            vt_write_calls: sample_result.performance.vt_write_calls,
+            vt_write_bytes: sample_result.performance.vt_write_bytes,
+            display_publications: sample_result.performance.display_publications,
+            dirty_rows_published: sample_result.performance.dirty_rows_published,
+            max_dirty_rows_published: sample_result.performance.max_dirty_rows_published,
+            queue_latency_observations: sample_result.performance.queue_latency_observations,
+            max_queue_latency_us: sample_result.performance.max_queue_latency_us,
+            total_queue_latency_us: sample_result.performance.total_queue_latency_us,
+            average_queue_latency_ms: sample_result.performance.average_queue_latency_ms(),
+            max_queue_latency_ms: sample_result.performance.max_queue_latency_ms(),
+        },
+        last_screen: sample_result.last_screen.clone(),
+    }
+}
+
+fn resize_benchmark_window_client(
+    hwnd: WindowHandle,
+    client_width: i32,
+    client_height: i32,
+) -> eyre::Result<()> {
+    let window_rect = hwnd.window_rect()?;
+    let client_rect = hwnd.client_rect()?;
+    let frame_width = window_rect.width() - client_rect.width();
+    let frame_height = window_rect.height() - client_rect.height();
+    let outer_width = client_width + frame_width;
+    let outer_height = client_height + frame_height;
+
+    // Safety: the benchmark window is live on the current thread and the computed outer bounds preserve its position.
+    if unsafe {
+        MoveWindow(
+            hwnd.raw(),
+            window_rect.left(),
+            window_rect.top(),
+            outer_width,
+            outer_height,
+            true,
+        )
+    }
+    .is_err()
+    {
+        eyre::bail!("failed to resize benchmark window")
+    }
+
+    Ok(())
 }
 
 #[expect(
@@ -1521,6 +1942,10 @@ fn render_terminal_throughput_benchmark_frame(
     })
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "the benchmark script table stays easier to compare when each scenario script is inline"
+)]
 fn terminal_throughput_benchmark_command(
     mode: TerminalThroughputBenchmarkMode,
     line_count: usize,
@@ -1541,6 +1966,107 @@ fn terminal_throughput_benchmark_command(
             measure_prefix = TERMINAL_THROUGHPUT_BENCHMARK_MEASURE_PREFIX,
             done_marker = TERMINAL_THROUGHPUT_BENCHMARK_DONE_MARKER,
         ),
+        TerminalThroughputBenchmarkMode::StreamSmallBatches => format!(
+            concat!(
+                "$ErrorActionPreference = 'Stop'\n",
+                "Write-Host '{start_marker}'\n",
+                "Start-Sleep -Milliseconds 100\n",
+                "$duration = Measure-Command {{\n",
+                "  for ($i = 1; $i -le {line_count}; $i++) {{\n",
+                "    [Console]::Out.Write(('chunk-' + $i.ToString([System.Globalization.CultureInfo]::InvariantCulture) + '`r`n'))\n",
+                "    if (($i % 32) -eq 0) {{ Start-Sleep -Milliseconds 1 }}\n",
+                "  }}\n",
+                "}}\n",
+                "$measureMs = [string]::Format([System.Globalization.CultureInfo]::InvariantCulture, '{{0:F3}}', $duration.TotalMilliseconds)\n",
+                "Write-Host ('{measure_prefix}' + $measureMs)\n",
+                "Write-Host '{done_marker}'\n"
+            ),
+            start_marker = TERMINAL_THROUGHPUT_BENCHMARK_START_MARKER,
+            line_count = line_count,
+            measure_prefix = TERMINAL_THROUGHPUT_BENCHMARK_MEASURE_PREFIX,
+            done_marker = TERMINAL_THROUGHPUT_BENCHMARK_DONE_MARKER,
+        ),
+        TerminalThroughputBenchmarkMode::WideLines => format!(
+            concat!(
+                "$ErrorActionPreference = 'Stop'\n",
+                "$wide = ('W' * 320)\n",
+                "Write-Host '{start_marker}'\n",
+                "Start-Sleep -Milliseconds 100\n",
+                "$duration = Measure-Command {{\n",
+                "  for ($i = 1; $i -le {line_count}; $i++) {{\n",
+                "    [Console]::Out.Write(($wide + '|' + $i.ToString([System.Globalization.CultureInfo]::InvariantCulture) + '`r`n'))\n",
+                "  }}\n",
+                "}}\n",
+                "$measureMs = [string]::Format([System.Globalization.CultureInfo]::InvariantCulture, '{{0:F3}}', $duration.TotalMilliseconds)\n",
+                "Write-Host ('{measure_prefix}' + $measureMs)\n",
+                "Write-Host '{done_marker}'\n"
+            ),
+            start_marker = TERMINAL_THROUGHPUT_BENCHMARK_START_MARKER,
+            line_count = line_count,
+            measure_prefix = TERMINAL_THROUGHPUT_BENCHMARK_MEASURE_PREFIX,
+            done_marker = TERMINAL_THROUGHPUT_BENCHMARK_DONE_MARKER,
+        ),
+        TerminalThroughputBenchmarkMode::ScrollFlood => format!(
+            concat!(
+                "$ErrorActionPreference = 'Stop'\n",
+                "Write-Host '{start_marker}'\n",
+                "Start-Sleep -Milliseconds 100\n",
+                "$duration = Measure-Command {{\n",
+                "  for ($i = 1; $i -le {line_count}; $i++) {{\n",
+                "    [Console]::Out.Write(('scroll-' + $i.ToString([System.Globalization.CultureInfo]::InvariantCulture).PadLeft(6, '0') + ' ' + ('#' * 120) + '`r`n'))\n",
+                "    if (($i % 128) -eq 0) {{ [Console]::Out.Flush() }}\n",
+                "  }}\n",
+                "}}\n",
+                "$measureMs = [string]::Format([System.Globalization.CultureInfo]::InvariantCulture, '{{0:F3}}', $duration.TotalMilliseconds)\n",
+                "Write-Host ('{measure_prefix}' + $measureMs)\n",
+                "Write-Host '{done_marker}'\n"
+            ),
+            start_marker = TERMINAL_THROUGHPUT_BENCHMARK_START_MARKER,
+            line_count = line_count.saturating_mul(4),
+            measure_prefix = TERMINAL_THROUGHPUT_BENCHMARK_MEASURE_PREFIX,
+            done_marker = TERMINAL_THROUGHPUT_BENCHMARK_DONE_MARKER,
+        ),
+        TerminalThroughputBenchmarkMode::PromptBursts => format!(
+            concat!(
+                "$ErrorActionPreference = 'Stop'\n",
+                "Write-Host '{start_marker}'\n",
+                "Start-Sleep -Milliseconds 100\n",
+                "$duration = Measure-Command {{\n",
+                "  for ($i = 1; $i -le {line_count}; $i++) {{\n",
+                "    [Console]::Out.Write(('PS benchmark> command-' + $i.ToString([System.Globalization.CultureInfo]::InvariantCulture) + '`r`n'))\n",
+                "    [Console]::Out.Write(('result-' + $i.ToString([System.Globalization.CultureInfo]::InvariantCulture) + ': ' + ('*' * 48) + '`r`n'))\n",
+                "    if (($i % 24) -eq 0) {{ Start-Sleep -Milliseconds 2 }}\n",
+                "  }}\n",
+                "}}\n",
+                "$measureMs = [string]::Format([System.Globalization.CultureInfo]::InvariantCulture, '{{0:F3}}', $duration.TotalMilliseconds)\n",
+                "Write-Host ('{measure_prefix}' + $measureMs)\n",
+                "Write-Host '{done_marker}'\n"
+            ),
+            start_marker = TERMINAL_THROUGHPUT_BENCHMARK_START_MARKER,
+            line_count = line_count.max(1),
+            measure_prefix = TERMINAL_THROUGHPUT_BENCHMARK_MEASURE_PREFIX,
+            done_marker = TERMINAL_THROUGHPUT_BENCHMARK_DONE_MARKER,
+        ),
+        TerminalThroughputBenchmarkMode::ResizeDuringOutput => format!(
+            concat!(
+                "$ErrorActionPreference = 'Stop'\n",
+                "Write-Host '{start_marker}'\n",
+                "Start-Sleep -Milliseconds 100\n",
+                "$duration = Measure-Command {{\n",
+                "  for ($i = 1; $i -le {line_count}; $i++) {{\n",
+                "    [Console]::Out.Write(('resize-' + $i.ToString([System.Globalization.CultureInfo]::InvariantCulture) + ' ' + ('=' * 160) + '`r`n'))\n",
+                "    if (($i % 16) -eq 0) {{ Start-Sleep -Milliseconds 2 }}\n",
+                "  }}\n",
+                "}}\n",
+                "$measureMs = [string]::Format([System.Globalization.CultureInfo]::InvariantCulture, '{{0:F3}}', $duration.TotalMilliseconds)\n",
+                "Write-Host ('{measure_prefix}' + $measureMs)\n",
+                "Write-Host '{done_marker}'\n"
+            ),
+            start_marker = TERMINAL_THROUGHPUT_BENCHMARK_START_MARKER,
+            line_count = line_count.max(1),
+            measure_prefix = TERMINAL_THROUGHPUT_BENCHMARK_MEASURE_PREFIX,
+            done_marker = TERMINAL_THROUGHPUT_BENCHMARK_DONE_MARKER,
+        ),
     };
 
     crate::shell_default::command_builder_from_argv(&[
@@ -1555,6 +2081,11 @@ fn terminal_throughput_benchmark_command(
 fn terminal_throughput_mode_name(mode: TerminalThroughputBenchmarkMode) -> &'static str {
     match mode {
         TerminalThroughputBenchmarkMode::MeasureCommandOutHost => "measure-command-out-host",
+        TerminalThroughputBenchmarkMode::StreamSmallBatches => "stream-small-batches",
+        TerminalThroughputBenchmarkMode::WideLines => "wide-lines",
+        TerminalThroughputBenchmarkMode::ScrollFlood => "scroll-flood",
+        TerminalThroughputBenchmarkMode::PromptBursts => "prompt-bursts",
+        TerminalThroughputBenchmarkMode::ResizeDuringOutput => "resize-during-output",
     }
 }
 
@@ -1681,7 +2212,8 @@ fn handle_mouse_wheel(hwnd: WindowHandle, wparam: WPARAM, lparam: LPARAM) -> eyr
 
             let layout =
                 client_layout(hwnd, state.terminal_cell_width, state.terminal_cell_height)?;
-            state.terminal.resize(layout)?;
+            state.pending_terminal_resize = None;
+            apply_terminal_resize(state, layout)?;
             render_current_frame(state, hwnd, None)?;
             return Ok(true);
         }
@@ -1718,6 +2250,105 @@ fn client_layout(
         cell_width,
         cell_height,
     })
+}
+
+fn effective_terminal_grid_size(layout: TerminalLayout) -> (u16, u16) {
+    layout.grid_size()
+}
+
+fn visible_terminal_display_capacity(
+    layout: TerminalLayout,
+    terminal_cell_width: i32,
+    terminal_cell_height: i32,
+) -> (i32, i32) {
+    let _ = (terminal_cell_width, terminal_cell_height);
+    layout.visible_grid_size()
+}
+
+fn clip_terminal_display_to_layout(
+    display: Arc<TerminalDisplayState>,
+    layout: TerminalLayout,
+    terminal_cell_width: i32,
+    terminal_cell_height: i32,
+) -> Arc<TerminalDisplayState> {
+    let (visible_cols, visible_rows) =
+        visible_terminal_display_capacity(layout, terminal_cell_width, terminal_cell_height);
+    let visible_row_count = usize::try_from(visible_rows).unwrap_or_default();
+
+    let needs_clip = display.rows.len() > visible_row_count
+        || display.cursor.is_some_and(|cursor| {
+            cursor.cell.column() >= visible_cols || cursor.cell.row() >= visible_rows
+        })
+        || display.scrollbar.is_some_and(|scrollbar| {
+            scrollbar.visible
+                != scrollbar
+                    .visible
+                    .min(u64::try_from(visible_row_count).unwrap_or(u64::MAX))
+        })
+        || display.rows.iter().take(visible_row_count).any(|row| {
+            row.backgrounds.iter().any(|background| {
+                background.cell.column() >= visible_cols || background.cell.row() >= visible_rows
+            }) || row.glyphs.iter().any(|glyph| {
+                glyph.cell.column() >= visible_cols || glyph.cell.row() >= visible_rows
+            })
+        });
+
+    if !needs_clip {
+        return display;
+    }
+
+    let mut rows = Vec::with_capacity(display.rows.len().min(visible_row_count));
+    for row in display.rows.iter().take(visible_row_count) {
+        let mut row = row.clone();
+        row.backgrounds.retain(|background| {
+            background.cell.column() >= 0
+                && background.cell.column() < visible_cols
+                && background.cell.row() >= 0
+                && background.cell.row() < visible_rows
+        });
+        row.glyphs.retain(|glyph| {
+            glyph.cell.column() >= 0
+                && glyph.cell.column() < visible_cols
+                && glyph.cell.row() >= 0
+                && glyph.cell.row() < visible_rows
+        });
+        rows.push(row);
+    }
+
+    Arc::new(TerminalDisplayState {
+        rows,
+        dirty_rows: (0..visible_row_count.min(display.rows.len())).collect(),
+        cursor: display.cursor.filter(|cursor| {
+            cursor.cell.column() >= 0
+                && cursor.cell.column() < visible_cols
+                && cursor.cell.row() >= 0
+                && cursor.cell.row() < visible_rows
+        }),
+        scrollbar: display.scrollbar.map(|mut scrollbar| {
+            scrollbar.visible = scrollbar
+                .visible
+                .min(u64::try_from(visible_row_count).unwrap_or(u64::MAX));
+            scrollbar
+        }),
+    })
+}
+
+fn apply_terminal_resize(state: &mut AppState, layout: TerminalLayout) -> eyre::Result<bool> {
+    if state.terminal_layout == Some(layout) {
+        return Ok(false);
+    }
+
+    state.terminal.resize(layout)?;
+    state.terminal_layout = Some(layout);
+    Ok(true)
+}
+
+fn apply_pending_terminal_resize(state: &mut AppState) -> eyre::Result<bool> {
+    let Some(layout) = state.pending_terminal_resize.take() else {
+        return Ok(false);
+    };
+
+    apply_terminal_resize(state, layout)
 }
 
 fn with_app_state<T>(f: impl FnOnce(&mut AppState) -> eyre::Result<T>) -> eyre::Result<T> {
@@ -1878,7 +2509,7 @@ fn handle_left_button_down(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Result<b
         state.terminal_selection_drag_point = None;
         state.terminal_scrollbar_hovered_part = None;
         state.terminal_scrollbar_drag = None;
-        state.pending_window_drag = Some(PendingWindowDrag { origin: point });
+        begin_system_window_drag(hwnd, point)?;
         Ok(true)
     })
 }
@@ -2426,6 +3057,31 @@ mod tests {
 
         assert_eq!(action, PendingDragAction::NotHandled);
         assert!(action.clears_pending_drag());
+    }
+
+    #[test]
+    fn clips_terminal_display_when_layout_cannot_show_any_full_rows() {
+        let layout = TerminalLayout {
+            client_width: 320,
+            client_height: 40,
+            cell_width: 8,
+            cell_height: 16,
+        };
+        let display = Arc::new(TerminalDisplayState {
+            rows: vec![crate::app::windows_terminal::TerminalDisplayRow::default()],
+            dirty_rows: vec![0],
+            cursor: None,
+            scrollbar: Some(TerminalDisplayScrollbar {
+                total: 100,
+                offset: 0,
+                visible: 1,
+            }),
+        });
+
+        let clipped = clip_terminal_display_to_layout(display, layout, 8, 16);
+
+        assert!(clipped.rows.is_empty());
+        assert_eq!(clipped.scrollbar.expect("scrollbar preserved").visible, 0,);
     }
 
     #[test]

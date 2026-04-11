@@ -1029,7 +1029,8 @@ impl D3d12PanelRenderer {
             for fragment in fragments {
                 vertices.extend_from_slice(fragment);
             }
-            self.upload_vertex_ranges(&vertices, &[0..vertex_count])?;
+            let full_range = 0..vertex_count;
+            self.upload_vertex_ranges(&vertices, std::slice::from_ref(&full_range))?;
             *cached_vertices = Some(CachedCompositedVertices {
                 fragment_ranges,
                 vertices,
@@ -1452,7 +1453,7 @@ fn terminal_scene_fragments(
     terminal_cell_width: i32,
     terminal_cell_height: i32,
 ) -> (Vec<Arc<RenderScene>>, Vec<bool>) {
-    let terminal_rect = layout.terminal_viewport_rect().inset(4);
+    let terminal_rect = layout.terminal_content_rect();
     let scrollbar_rect = layout.terminal_scrollbar_rect().inset(4);
 
     let cached = cached_terminal_scene
@@ -1467,7 +1468,9 @@ fn terminal_scene_fragments(
     for (index, row) in display.rows.iter().enumerate() {
         let cached_row = cached.and_then(|cached| cached.rows.get(index));
         let row_is_dirty = dirty_rows.binary_search(&index).is_ok();
-        if let Some(cached_row) = cached_row && !row_is_dirty {
+        if let Some(cached_row) = cached_row
+            && !row_is_dirty
+        {
             row_fragments.push(Arc::clone(&cached_row.scene));
             reused.push(true);
             cached_rows.push(cached_row.clone());

@@ -10,13 +10,13 @@ use tracing::trace;
 
 use eyre::Context;
 use libghostty_vt::key;
-use libghostty_vt::render::{CellIterator, CursorVisualStyle, RenderState, RowIterator};
+use libghostty_vt::render::{CellIterator, CursorVisualStyle, Dirty, RenderState, RowIterator};
 use libghostty_vt::screen::RowSemanticPrompt;
 use libghostty_vt::style::RgbColor;
 use libghostty_vt::terminal::{Point, PointCoordinate, ScrollViewport};
 use libghostty_vt::{Terminal, TerminalOptions};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
-use tracing::{debug, info, info_span, instrument};
+use tracing::{debug, error, info, info_span, instrument};
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::System::Console::{
     CAPSLOCK_ON, LEFT_ALT_PRESSED, LEFT_CTRL_PRESSED, NUMLOCK_ON, RIGHT_ALT_PRESSED,
@@ -41,16 +41,16 @@ const MAX_SCROLLBACK: usize = 20_000;
 const PTY_READ_BUFFER_BYTES: usize = 128 * 1_024;
 const PTY_READ_CHANNEL_CAPACITY: usize = 8;
 const TERMINAL_OUTPUT_SLICE_BYTES: usize = 256;
-const TERMINAL_OUTPUT_MEDIUM_SLICE_BYTES: usize = 1024;
-const TERMINAL_OUTPUT_BURST_SLICE_BYTES: usize = 4096;
+const TERMINAL_OUTPUT_MEDIUM_SLICE_BYTES: usize = 512;
+const TERMINAL_OUTPUT_BURST_SLICE_BYTES: usize = 1024;
 const TERMINAL_OUTPUT_QUEUE_SOFT_LIMIT_BYTES: usize = 64 * 1_024;
 const TERMINAL_DISPLAY_PUBLISH_INTERVAL: Duration = Duration::from_millis(16);
-const TERMINAL_DISPLAY_MEDIUM_PUBLISH_INTERVAL: Duration = Duration::from_millis(33);
-const TERMINAL_DISPLAY_BURST_PUBLISH_INTERVAL: Duration = Duration::from_millis(50);
+const TERMINAL_DISPLAY_MEDIUM_PUBLISH_INTERVAL: Duration = Duration::from_millis(20);
+const TERMINAL_DISPLAY_BURST_PUBLISH_INTERVAL: Duration = Duration::from_millis(24);
 const TERMINAL_WORKER_IDLE_TIMEOUT: Duration = Duration::from_millis(1);
 const TERMINAL_WORKER_PUMP_TIME_BUDGET: Duration = Duration::from_millis(2);
-const TERMINAL_WORKER_MEDIUM_PUMP_TIME_BUDGET: Duration = Duration::from_millis(6);
-const TERMINAL_WORKER_BURST_PUMP_TIME_BUDGET: Duration = Duration::from_millis(12);
+const TERMINAL_WORKER_MEDIUM_PUMP_TIME_BUDGET: Duration = Duration::from_millis(3);
+const TERMINAL_WORKER_BURST_PUMP_TIME_BUDGET: Duration = Duration::from_millis(4);
 const CELL_PANEL_GAP: i32 = 14;
 const SIDECAR_WIDTH: i32 = 86;
 const RESULT_PANEL_HEIGHT: i32 = 152;
@@ -101,6 +101,62 @@ pub struct PumpResult {
 pub struct PollPtyOutputResult {
     pub queued_output: bool,
     pub should_close: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TerminalPerformanceSnapshot {
+    pub pending_output_bytes: usize,
+    pub max_pending_output_bytes: usize,
+    pub pending_output_observations: u64,
+    pub total_pending_output_bytes: u64,
+    pub vt_write_calls: u64,
+    pub vt_write_bytes: u64,
+    pub display_publications: u64,
+    pub dirty_rows_published: u64,
+    pub max_dirty_rows_published: usize,
+    pub queue_latency_observations: u64,
+    pub max_queue_latency_us: u64,
+    pub total_queue_latency_us: u64,
+}
+
+impl TerminalPerformanceSnapshot {
+    #[must_use]
+    pub fn average_pending_output_bytes(self) -> f64 {
+        if self.pending_output_observations == 0 {
+            return 0.0;
+        }
+
+        u64_to_f64(self.total_pending_output_bytes) / u64_to_f64(self.pending_output_observations)
+    }
+
+    #[must_use]
+    pub fn average_queue_latency_ms(self) -> f64 {
+        if self.queue_latency_observations == 0 {
+            return 0.0;
+        }
+
+        (u64_to_f64(self.total_queue_latency_us) / u64_to_f64(self.queue_latency_observations))
+            / 1000.0
+    }
+
+    #[must_use]
+    pub fn max_queue_latency_ms(self) -> f64 {
+        u64_to_f64(self.max_queue_latency_us) / 1000.0
+    }
+}
+
+fn u64_to_f64(value: u64) -> f64 {
+    const TWO_POW_32: f64 = 4_294_967_296.0;
+
+    let upper = u32::try_from(value >> 32).unwrap_or(u32::MAX);
+    let lower = u32::try_from(value & u64::from(u32::MAX)).unwrap_or(u32::MAX);
+    f64::from(upper) * TWO_POW_32 + f64::from(lower)
+}
+
+#[derive(Debug)]
+enum PtyReaderMessage {
+    Output { bytes: Vec<u8>, read_at: Instant },
+    Error(String),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -155,9 +211,7 @@ pub struct TerminalDisplayState {
 
 impl PartialEq for TerminalDisplayState {
     fn eq(&self, other: &Self) -> bool {
-        self.rows == other.rows
-            && self.cursor == other.cursor
-            && self.scrollbar == other.scrollbar
+        self.rows == other.rows && self.cursor == other.cursor && self.scrollbar == other.scrollbar
     }
 }
 
@@ -270,7 +324,7 @@ struct SemanticPromptTracking {
 
 pub struct TerminalSession {
     worker_tx: mpsc::Sender<TerminalWorkerRequest>,
-    pending_updates: Arc<Mutex<VecDeque<TerminalWorkerUpdate>>>,
+    pending_updates: Arc<Mutex<PendingTerminalWorkerUpdates>>,
     wake_window: Arc<Mutex<Option<isize>>>,
     snapshot: TerminalSnapshot,
     worker_queued_output: bool,
@@ -286,8 +340,9 @@ struct TerminalCore {
     master: Box<dyn MasterPty + Send>,
     child: Box<dyn Child + Send>,
     writer: Arc<Mutex<PtyWriter>>,
-    reader: mpsc::Receiver<std::io::Result<Vec<u8>>>,
+    reader: mpsc::Receiver<PtyReaderMessage>,
     pending_output: VecDeque<u8>,
+    pending_output_first_read_at: Option<Instant>,
     cols: u16,
     rows: u16,
     repaint: RepaintState,
@@ -299,6 +354,7 @@ struct TerminalCore {
     semantic_prompt: SemanticPromptTracking,
     cached_display: SharedTerminalDisplayState,
     display_cache_dirty: bool,
+    performance: TerminalPerformanceSnapshot,
     closed: bool,
 }
 
@@ -334,6 +390,7 @@ enum TerminalWorkerCommand {
     VisibleDisplayStateWithSelection(Option<TerminalSelection>),
     CurrentKittyKeyboardFlags,
     Win32InputModeEnabled,
+    PerformanceSnapshot,
     TakeInputTrace,
     SemanticPromptState,
 }
@@ -345,6 +402,49 @@ enum TerminalWorkerUpdate {
     PtyOutputQueued,
     RepaintRequested,
     ChildExited,
+}
+
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "the bridge coalesces several independent sticky flags before the UI thread drains them"
+)]
+#[derive(Debug, Default)]
+struct PendingTerminalWorkerUpdates {
+    latest_snapshot: Option<TerminalSnapshot>,
+    latest_display: Option<SharedTerminalDisplayState>,
+    queued_output: bool,
+    child_exited: bool,
+    repaint_requested: bool,
+    wake_posted: bool,
+}
+
+impl PendingTerminalWorkerUpdates {
+    fn record(&mut self, update: TerminalWorkerUpdate) -> bool {
+        match update {
+            TerminalWorkerUpdate::Snapshot(snapshot) => {
+                self.latest_snapshot = Some(snapshot);
+            }
+            TerminalWorkerUpdate::DisplayState(display) => {
+                self.latest_display = Some(display);
+            }
+            TerminalWorkerUpdate::PtyOutputQueued => {
+                self.queued_output = true;
+            }
+            TerminalWorkerUpdate::RepaintRequested => {
+                self.repaint_requested = true;
+            }
+            TerminalWorkerUpdate::ChildExited => {
+                self.child_exited = true;
+            }
+        }
+
+        if self.wake_posted {
+            false
+        } else {
+            self.wake_posted = true;
+            true
+        }
+    }
 }
 
 struct TerminalWorkerRequest {
@@ -365,6 +465,7 @@ enum TerminalWorkerResponsePayload {
     ScreenCell(TerminalCellPoint),
     DisplayState(TerminalDisplayState),
     KittyKeyboardFlags(key::KittyKeyFlags),
+    PerformanceSnapshot(TerminalPerformanceSnapshot),
     InputTrace(Vec<Vec<u8>>),
     SemanticPromptState((bool, bool, bool)),
 }
@@ -378,6 +479,12 @@ pub struct TerminalLayout {
 }
 
 impl TerminalLayout {
+    #[must_use]
+    fn has_room_for_panel_stack(self) -> bool {
+        self.frame_rect().height()
+            >= MIN_CODE_PANEL_HEIGHT + RESULT_PANEL_HEIGHT + PLUS_BUTTON_SIZE + (CELL_PANEL_GAP * 3)
+    }
+
     #[must_use]
     pub fn frame_rect(self) -> ClientRect {
         ClientRect::new(
@@ -416,6 +523,15 @@ impl TerminalLayout {
         let frame = self.frame_rect();
         let code_left = (frame.left() + SIDECAR_WIDTH + CELL_PANEL_GAP).min(frame.right());
         let code_right = frame.right();
+        if !self.has_room_for_panel_stack() {
+            return ClientRect::new(
+                code_left,
+                frame.top(),
+                code_right,
+                frame.bottom().max(frame.top() + 1),
+            );
+        }
+
         let plus = self.plus_button_rect();
         let result_bottom = plus.top() - CELL_PANEL_GAP;
         let desired_result_top = result_bottom - RESULT_PANEL_HEIGHT;
@@ -435,6 +551,10 @@ impl TerminalLayout {
     #[must_use]
     pub fn result_panel_rect(self) -> ClientRect {
         let code = self.code_panel_rect();
+        if !self.has_room_for_panel_stack() {
+            return ClientRect::new(code.left(), code.bottom(), code.right(), code.bottom());
+        }
+
         let plus = self.plus_button_rect();
         ClientRect::new(
             code.left(),
@@ -449,6 +569,10 @@ impl TerminalLayout {
         let frame = self.frame_rect();
         let code_left = (frame.left() + SIDECAR_WIDTH + CELL_PANEL_GAP).min(frame.right());
         let code_right = frame.right();
+        if !self.has_room_for_panel_stack() {
+            return ClientRect::new(code_right, frame.bottom(), code_right, frame.bottom());
+        }
+
         let center_x = code_left + ((code_right - code_left).max(PLUS_BUTTON_SIZE) / 2);
         let left = (center_x - (PLUS_BUTTON_SIZE / 2)).max(code_left);
         ClientRect::new(
@@ -479,7 +603,7 @@ impl TerminalLayout {
     #[must_use]
     /// behavior[impl window.appearance.code-panel.terminal-alignment]
     pub fn terminal_rect(self) -> ClientRect {
-        self.terminal_viewport_rect()
+        self.terminal_content_rect()
     }
 
     #[must_use]
@@ -506,12 +630,23 @@ impl TerminalLayout {
     }
 
     #[must_use]
+    pub fn terminal_content_rect(self) -> ClientRect {
+        self.terminal_viewport_rect().inset(4)
+    }
+
+    #[must_use]
+    pub fn visible_grid_size(self) -> (i32, i32) {
+        let rect = self.terminal_content_rect();
+        let cols = (rect.width() / self.cell_width.max(1)).max(0);
+        let rows = (rect.height() / self.cell_height.max(1)).max(0);
+        (cols, rows)
+    }
+
+    #[must_use]
     pub fn grid_size(self) -> (u16, u16) {
-        let rect = self.terminal_viewport_rect();
-        let width = rect.width().max(self.cell_width.max(1));
-        let height = rect.height().max(self.cell_height.max(1));
-        let cols = (width / self.cell_width.max(1)).max(1);
-        let rows = (height / self.cell_height.max(1)).max(1);
+        let (visible_cols, visible_rows) = self.visible_grid_size();
+        let cols = visible_cols.max(1);
+        let rows = visible_rows.max(1);
         (
             u16::try_from(cols).unwrap_or(u16::MAX),
             u16::try_from(rows).unwrap_or(u16::MAX),
@@ -532,7 +667,7 @@ impl TerminalSession {
         let (request_tx, request_rx) = mpsc::channel();
         let (update_tx, update_rx) = mpsc::channel();
         let (startup_tx, startup_rx) = mpsc::sync_channel(1);
-        let pending_updates = Arc::new(Mutex::new(VecDeque::new()));
+        let pending_updates = Arc::new(Mutex::new(PendingTerminalWorkerUpdates::default()));
         let wake_window = Arc::new(Mutex::new(None));
         let pending_updates_for_bridge = Arc::clone(&pending_updates);
         let wake_window_for_bridge = Arc::clone(&wake_window);
@@ -541,8 +676,13 @@ impl TerminalSession {
             .name("teamy-terminal-update-bridge".to_owned())
             .spawn(move || {
                 while let Ok(update) = update_rx.recv() {
-                    if let Ok(mut pending_updates) = pending_updates_for_bridge.lock() {
-                        pending_updates.push_back(update);
+                    let should_post_wake = pending_updates_for_bridge
+                        .lock()
+                        .ok()
+                        .is_some_and(|mut pending_updates| pending_updates.record(update));
+
+                    if !should_post_wake {
+                        continue;
                     }
 
                     let wake_target = wake_window_for_bridge
@@ -630,6 +770,14 @@ impl TerminalSession {
     pub fn take_repaint_requested(&mut self) -> bool {
         self.drain_worker_updates();
         std::mem::take(&mut self.repaint_requested)
+    }
+
+    pub fn performance_snapshot(&self) -> eyre::Result<TerminalPerformanceSnapshot> {
+        let response = self.request_read_only(TerminalWorkerCommand::PerformanceSnapshot)?;
+        match response.payload {
+            TerminalWorkerResponsePayload::PerformanceSnapshot(snapshot) => Ok(snapshot),
+            payload => Self::unexpected_response("PerformanceSnapshot", payload),
+        }
     }
 
     pub fn resize(&mut self, layout: TerminalLayout) -> eyre::Result<()> {
@@ -845,29 +993,32 @@ impl TerminalSession {
     }
 
     fn drain_worker_updates(&mut self) {
+        #[cfg(feature = "tracy")]
+        let _span = debug_span!("drain_terminal_worker_updates").entered();
+
         let Ok(mut pending_updates) = self.pending_updates.lock() else {
             return;
         };
 
-        while let Some(update) = pending_updates.pop_front() {
-            match update {
-                TerminalWorkerUpdate::Snapshot(snapshot) => {
-                    self.snapshot = snapshot;
-                }
-                TerminalWorkerUpdate::DisplayState(display) => {
-                    self.cached_display = display;
-                }
-                TerminalWorkerUpdate::PtyOutputQueued => {
-                    self.worker_queued_output = true;
-                }
-                TerminalWorkerUpdate::ChildExited => {
-                    self.snapshot.closed = true;
-                }
-                TerminalWorkerUpdate::RepaintRequested => {
-                    self.repaint_requested = true;
-                }
-            }
+        if let Some(snapshot) = pending_updates.latest_snapshot.take() {
+            self.snapshot = snapshot;
         }
+        if let Some(display) = pending_updates.latest_display.take() {
+            self.cached_display = display;
+        }
+        if pending_updates.queued_output {
+            self.worker_queued_output = true;
+            pending_updates.queued_output = false;
+        }
+        if pending_updates.child_exited {
+            self.snapshot.closed = true;
+            pending_updates.child_exited = false;
+        }
+        if pending_updates.repaint_requested {
+            self.repaint_requested = true;
+            pending_updates.repaint_requested = false;
+        }
+        pending_updates.wake_posted = false;
     }
 
     fn unexpected_response<T>(
@@ -908,12 +1059,18 @@ impl TerminalWorkerRunner {
         let _ = self
             .update_tx
             .send(TerminalWorkerUpdate::Snapshot(self.last_snapshot));
-        let _ = self.publish_display_state_if_due();
+        if let Err(error) = self.publish_display_state_if_due() {
+            error!(
+                ?error,
+                "terminal worker failed to publish initial display state"
+            );
+        }
 
         loop {
             match self.request_rx.recv_timeout(TERMINAL_WORKER_IDLE_TIMEOUT) {
                 Ok(request) => {
-                    if self.handle_request(request).is_err() {
+                    if let Err(error) = self.handle_request(request) {
+                        error!(?error, "terminal worker request handling failed");
                         break;
                     }
                 }
@@ -921,7 +1078,8 @@ impl TerminalWorkerRunner {
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
 
-            if self.service_background_output().is_err() {
+            if let Err(error) = self.service_background_output() {
+                error!(?error, "terminal worker background service failed");
                 let _ = self.update_tx.send(TerminalWorkerUpdate::ChildExited);
                 break;
             }
@@ -932,6 +1090,7 @@ impl TerminalWorkerRunner {
         let payload = match request.command {
             TerminalWorkerCommand::Resize(layout) => {
                 self.core.resize(layout)?;
+                self.publish_display_state_after_resize()?;
                 TerminalWorkerResponsePayload::Unit
             }
             TerminalWorkerCommand::HandleChar { code_unit, lparam } => {
@@ -984,6 +1143,9 @@ impl TerminalWorkerRunner {
             TerminalWorkerCommand::Win32InputModeEnabled => {
                 TerminalWorkerResponsePayload::Bool(self.core.win32_input_mode_enabled())
             }
+            TerminalWorkerCommand::PerformanceSnapshot => {
+                TerminalWorkerResponsePayload::PerformanceSnapshot(self.core.performance_snapshot())
+            }
             TerminalWorkerCommand::TakeInputTrace => {
                 TerminalWorkerResponsePayload::InputTrace(self.core.take_input_trace())
             }
@@ -1003,6 +1165,22 @@ impl TerminalWorkerRunner {
         Ok(())
     }
 
+    fn publish_display_state_after_resize(&mut self) -> eyre::Result<()> {
+        let display = self.core.cached_display_state()?;
+        self.last_display_publish_at = Instant::now();
+        self.core
+            .record_display_publication(display.dirty_rows.len());
+        self.update_tx
+            .send(TerminalWorkerUpdate::DisplayState(Arc::clone(&display)))
+            .map_err(|error| {
+                eyre::eyre!("failed to publish resized terminal worker display state: {error}")
+            })?;
+        self.last_published_display = Some(display);
+        let _ = self.update_tx.send(TerminalWorkerUpdate::RepaintRequested);
+        Ok(())
+    }
+
+    #[cfg_attr(feature = "tracy", instrument(level = "debug", skip_all))]
     fn service_background_output(&mut self) -> eyre::Result<()> {
         let poll_result = self.core.poll_pty_output()?;
         if poll_result.queued_output {
@@ -1039,7 +1217,9 @@ impl TerminalWorkerRunner {
             }
         }
 
-        if processed_output && should_refresh_semantic_prompt_tracking(self.core.pending_output.len()) {
+        if processed_output
+            && should_refresh_semantic_prompt_tracking(self.core.pending_output.len())
+        {
             self.core.refresh_semantic_prompt_tracking()?;
         }
 
@@ -1053,6 +1233,7 @@ impl TerminalWorkerRunner {
         Ok(())
     }
 
+    #[cfg_attr(feature = "tracy", instrument(level = "debug", skip_all))]
     fn publish_display_state_if_due(&mut self) -> eyre::Result<()> {
         if !self.should_publish_display_state() {
             return Ok(());
@@ -1065,12 +1246,12 @@ impl TerminalWorkerRunner {
         };
         self.last_display_publish_at = Instant::now();
 
-        if !should_publish_terminal_display_update(
-            self.last_published_display.as_ref(),
-            &display,
-        ) {
+        if !should_publish_terminal_display_update(self.last_published_display.as_ref(), &display) {
             return Ok(());
         }
+
+        self.core
+            .record_display_publication(display.dirty_rows.len());
 
         self.update_tx
             .send(TerminalWorkerUpdate::DisplayState(Arc::clone(&display)))
@@ -1106,6 +1287,10 @@ impl TerminalWorkerRunner {
 }
 
 impl TerminalCore {
+    #[expect(
+        clippy::too_many_lines,
+        reason = "PTY setup, libghostty initialization, and reader-thread wiring are kept together for clarity"
+    )]
     #[instrument(level = "info", skip_all)]
     pub fn new_with_command(shell: CommandBuilder) -> eyre::Result<Self> {
         let pty_system = native_pty_system();
@@ -1175,12 +1360,18 @@ impl TerminalCore {
                 match cloned_reader.read(&mut buffer) {
                     Ok(0) => break,
                     Ok(bytes_read) => {
-                        if reader_tx.send(Ok(buffer[..bytes_read].to_vec())).is_err() {
+                        if reader_tx
+                            .send(PtyReaderMessage::Output {
+                                bytes: buffer[..bytes_read].to_vec(),
+                                read_at: Instant::now(),
+                            })
+                            .is_err()
+                        {
                             break;
                         }
                     }
                     Err(error) => {
-                        let _ = reader_tx.send(Err(error));
+                        let _ = reader_tx.send(PtyReaderMessage::Error(error.to_string()));
                         break;
                     }
                 }
@@ -1197,6 +1388,7 @@ impl TerminalCore {
             writer,
             reader: reader_rx,
             pending_output: VecDeque::new(),
+            pending_output_first_read_at: None,
             cols: DEFAULT_COLS,
             rows: DEFAULT_ROWS,
             repaint: RepaintState {
@@ -1211,6 +1403,7 @@ impl TerminalCore {
             semantic_prompt: SemanticPromptTracking::default(),
             cached_display: Arc::new(TerminalDisplayState::default()),
             display_cache_dirty: true,
+            performance: TerminalPerformanceSnapshot::default(),
             closed: false,
         })
     }
@@ -1225,12 +1418,22 @@ impl TerminalCore {
         }
     }
 
+    fn performance_snapshot(&self) -> TerminalPerformanceSnapshot {
+        let mut snapshot = self.performance;
+        snapshot.pending_output_bytes = self.pending_output.len();
+        snapshot
+    }
+
     pub fn has_pending_output(&self) -> bool {
         !self.pending_output.is_empty()
     }
 
-    #[instrument(level = "info", skip_all, fields(client_width = layout.client_width, client_height = layout.client_height))]
+    #[instrument(level = "info", skip_all)]
     pub fn resize(&mut self, layout: TerminalLayout) -> eyre::Result<()> {
+        let keep_viewport_pinned_to_bottom = self
+            .viewport_metrics()
+            .map(viewport_is_bottom_anchored)
+            .unwrap_or(false);
         let (cols, rows) = layout.grid_size();
         if cols == self.cols && rows == self.rows {
             return Ok(());
@@ -1249,18 +1452,23 @@ impl TerminalCore {
             .resize(PtySize {
                 cols,
                 rows,
-                pixel_width: u16::try_from(layout.terminal_viewport_rect().width().max(0))
+                pixel_width: u16::try_from(layout.terminal_content_rect().width().max(0))
                     .unwrap_or(u16::MAX),
-                pixel_height: u16::try_from(layout.terminal_viewport_rect().height().max(0))
+                pixel_height: u16::try_from(layout.terminal_content_rect().height().max(0))
                     .unwrap_or(u16::MAX),
             })
             .map_err(|error| eyre::eyre!("failed to resize PTY: {error}"))?;
+
+        if keep_viewport_pinned_to_bottom {
+            self.terminal.scroll_viewport(ScrollViewport::Bottom);
+        }
 
         self.cols = cols;
         self.rows = rows;
         self.repaint.needs_repaint = true;
         self.repaint.full_repaint_pending = true;
         self.invalidate_display_cache();
+        self.refresh_semantic_prompt_tracking()?;
         Ok(())
     }
 
@@ -1274,7 +1482,7 @@ impl TerminalCore {
 
             while let Ok(message) = self.reader.try_recv() {
                 match message {
-                    Ok(bytes) => {
+                    PtyReaderMessage::Output { bytes, read_at } => {
                         let normalized_bytes = {
                             #[cfg(feature = "tracy")]
                             let _span = debug_span!("normalize_terminal_output_bytes").entered();
@@ -1293,7 +1501,7 @@ impl TerminalCore {
                             ) {
                                 let bytes = strip_echoed_ctrl_d(bytes.as_ref());
                                 if !bytes.is_empty() {
-                                    self.queue_terminal_output(bytes.as_ref());
+                                    self.queue_terminal_output(bytes.as_ref(), read_at);
                                     queued_output = true;
                                 }
                                 info!(
@@ -1304,7 +1512,7 @@ impl TerminalCore {
                                 break;
                             }
 
-                            self.queue_terminal_output(bytes.as_ref());
+                            self.queue_terminal_output(bytes.as_ref(), read_at);
                             queued_output = true;
                         };
 
@@ -1312,12 +1520,12 @@ impl TerminalCore {
                             break;
                         }
                     }
-                    Err(error) => {
+                    PtyReaderMessage::Error(error) => {
                         let message = format!("\r\n[pty read error: {error}]\r\n");
                         let () = {
                             #[cfg(feature = "tracy")]
                             let _span = debug_span!("queue_pty_read_error_message").entered();
-                            self.queue_terminal_output(message.as_bytes());
+                            self.queue_terminal_output(message.as_bytes(), Instant::now());
                             queued_output = true;
                             self.closed = true;
                         };
@@ -1380,8 +1588,16 @@ impl TerminalCore {
         Ok(())
     }
 
-    fn queue_terminal_output(&mut self, data: &[u8]) {
+    fn queue_terminal_output(&mut self, data: &[u8], read_at: Instant) {
+        if data.is_empty() {
+            return;
+        }
+
+        if self.pending_output.is_empty() {
+            self.pending_output_first_read_at = Some(read_at);
+        }
         self.pending_output.extend(data.iter().copied());
+        self.observe_pending_output_depth();
     }
 
     #[cfg_attr(feature = "tracy", instrument(level = "debug", skip_all))]
@@ -1390,9 +1606,26 @@ impl TerminalCore {
             return 0;
         }
 
-        let slice_len = pending_output_slice_bytes(self.pending_output.len())
-            .min(self.pending_output.len());
+        let slice_len =
+            pending_output_slice_bytes(self.pending_output.len()).min(self.pending_output.len());
         let slice: Vec<u8> = self.pending_output.drain(..slice_len).collect();
+
+        if let Some(read_at) = self.pending_output_first_read_at {
+            let queue_latency_us = u64::try_from(
+                Instant::now()
+                    .saturating_duration_since(read_at)
+                    .as_micros()
+                    .min(u128::from(u64::MAX)),
+            )
+            .unwrap_or(u64::MAX);
+            self.performance.queue_latency_observations += 1;
+            self.performance.total_queue_latency_us = self
+                .performance
+                .total_queue_latency_us
+                .saturating_add(queue_latency_us);
+            self.performance.max_queue_latency_us =
+                self.performance.max_queue_latency_us.max(queue_latency_us);
+        }
 
         let () = {
             #[cfg(feature = "tracy")]
@@ -1409,7 +1642,43 @@ impl TerminalCore {
             };
         };
 
+        self.performance.vt_write_calls += 1;
+        self.performance.vt_write_bytes = self
+            .performance
+            .vt_write_bytes
+            .saturating_add(u64::try_from(slice.len()).unwrap_or(u64::MAX));
+
+        if self.pending_output.is_empty() {
+            self.pending_output_first_read_at = None;
+        }
+        self.observe_pending_output_depth();
+
         slice.len()
+    }
+
+    fn observe_pending_output_depth(&mut self) {
+        let pending_output_len = self.pending_output.len();
+        self.performance.pending_output_observations += 1;
+        self.performance.total_pending_output_bytes = self
+            .performance
+            .total_pending_output_bytes
+            .saturating_add(u64::try_from(pending_output_len).unwrap_or(u64::MAX));
+        self.performance.max_pending_output_bytes = self
+            .performance
+            .max_pending_output_bytes
+            .max(pending_output_len);
+    }
+
+    fn record_display_publication(&mut self, dirty_row_count: usize) {
+        self.performance.display_publications += 1;
+        self.performance.dirty_rows_published = self
+            .performance
+            .dirty_rows_published
+            .saturating_add(u64::try_from(dirty_row_count).unwrap_or(u64::MAX));
+        self.performance.max_dirty_rows_published = self
+            .performance
+            .max_dirty_rows_published
+            .max(dirty_row_count);
     }
 
     pub fn handle_char(&mut self, code_unit: u32, lparam: isize) -> eyre::Result<bool> {
@@ -1807,6 +2076,10 @@ impl TerminalCore {
         Ok(Arc::clone(&self.cached_display))
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "incremental row extraction keeps the render-state walk and dirty-row policy together"
+    )]
     #[cfg_attr(feature = "tracy", instrument(level = "debug", skip_all))]
     fn build_display_state(
         &mut self,
@@ -1837,6 +2110,16 @@ impl TerminalCore {
             }),
         };
 
+        let selection_active = selection.is_some();
+        let snapshot_dirty = snapshot.dirty().unwrap_or_else(|error| {
+            debug!(
+                ?error,
+                "falling back to full redraw after dirty-state query failure"
+            );
+            Dirty::Full
+        });
+        let previous_rows = (!selection_active).then_some(&self.cached_display.rows);
+
         {
             #[cfg(feature = "tracy")]
             let _span = debug_span!("collect_visible_terminal_cells").entered();
@@ -1845,6 +2128,31 @@ impl TerminalCore {
                 .update(&snapshot)
                 .wrap_err("failed to update row iterator")?;
             while let Some(row) = row_iter.next() {
+                let row_position = usize::try_from(row_index).unwrap_or_default();
+                let row_dirty = if selection_active || matches!(snapshot_dirty, Dirty::Full) {
+                    true
+                } else if let Some(previous_rows) = previous_rows {
+                    row.dirty().unwrap_or_else(|error| {
+                        debug!(
+                            ?error,
+                            row_position,
+                            "falling back to dirty row after row dirty-state query failure"
+                        );
+                        true
+                    }) || previous_rows.get(row_position).is_none()
+                } else {
+                    true
+                };
+
+                if !row_dirty
+                    && let Some(previous_row) =
+                        previous_rows.and_then(|rows| rows.get(row_position))
+                {
+                    display.rows.push(previous_row.clone());
+                    row_index += 1;
+                    continue;
+                }
+
                 let mut column_index = 0_i32;
                 let mut display_row = TerminalDisplayRow {
                     row: row_index,
@@ -1892,11 +2200,32 @@ impl TerminalCore {
                     column_index += 1;
                 }
                 display.rows.push(display_row);
+
+                if row_dirty {
+                    display.dirty_rows.push(row_position);
+                }
+
+                if !selection_active && let Err(error) = row.set_dirty(false) {
+                    debug!(
+                        ?error,
+                        row_position, "failed to clear terminal row dirty flag"
+                    );
+                }
+
                 row_index += 1;
             }
         }
 
-        display.dirty_rows = dirty_terminal_row_indices(self.cached_display.as_ref(), &display);
+        if selection_active
+            || matches!(snapshot_dirty, Dirty::Full)
+            || self.cached_display.rows.len() != display.rows.len()
+        {
+            display.dirty_rows = (0..display.rows.len()).collect();
+        }
+
+        if !selection_active && let Err(error) = snapshot.set_dirty(Dirty::Clean) {
+            debug!(?error, "failed to clear terminal render-state dirty flag");
+        }
 
         Ok(display)
     }
@@ -2905,6 +3234,7 @@ fn should_publish_terminal_display_update(
     })
 }
 
+#[cfg(test)]
 fn dirty_terminal_row_indices(
     previous: &TerminalDisplayState,
     next: &TerminalDisplayState,
@@ -2960,26 +3290,28 @@ fn should_refresh_semantic_prompt_tracking(pending_output_len: usize) -> bool {
     pending_output_len < 1024
 }
 
+fn viewport_is_bottom_anchored(viewport: TerminalViewportMetrics) -> bool {
+    viewport.offset >= viewport.total.saturating_sub(viewport.visible)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        MIN_CODE_PANEL_HEIGHT, PendingWin32CharKey, PromptInputState,
-        SemanticPromptTracking, TERMINAL_DISPLAY_BURST_PUBLISH_INTERVAL,
-        TERMINAL_DISPLAY_MEDIUM_PUBLISH_INTERVAL, TERMINAL_DISPLAY_PUBLISH_INTERVAL,
-        TERMINAL_OUTPUT_BURST_SLICE_BYTES, TERMINAL_OUTPUT_MEDIUM_SLICE_BYTES,
-        TERMINAL_OUTPUT_SLICE_BYTES,
+        MIN_CODE_PANEL_HEIGHT, PendingWin32CharKey, PromptInputState, SemanticPromptTracking,
+        TERMINAL_DISPLAY_BURST_PUBLISH_INTERVAL, TERMINAL_DISPLAY_MEDIUM_PUBLISH_INTERVAL,
+        TERMINAL_DISPLAY_PUBLISH_INTERVAL, TERMINAL_OUTPUT_BURST_SLICE_BYTES,
+        TERMINAL_OUTPUT_MEDIUM_SLICE_BYTES, TERMINAL_OUTPUT_SLICE_BYTES,
         TERMINAL_WORKER_BURST_PUMP_TIME_BUDGET, TERMINAL_WORKER_MEDIUM_PUMP_TIME_BUDGET,
-        TERMINAL_WORKER_PUMP_TIME_BUDGET,
-        TerminalDisplayCursorStyle, TerminalDisplayGlyph, TerminalDisplayRow,
-        TerminalDisplayState, TerminalLayout, TerminalSelection,
-        TerminalSelectionMode, TerminalTextRow, extract_selected_text, map_cursor_style, map_virtual_key,
+        TERMINAL_WORKER_PUMP_TIME_BUDGET, TerminalDisplayCursorStyle, TerminalDisplayGlyph,
+        TerminalDisplayRow, TerminalDisplayState, TerminalLayout, TerminalSelection,
+        TerminalSelectionMode, TerminalTextRow, TerminalViewportMetrics,
+        dirty_terminal_row_indices, extract_selected_text, map_cursor_style, map_virtual_key,
         osc_terminator, partial_osc_133_prefix_len, pending_output_display_publish_interval,
-        pending_output_pump_time_budget, pending_output_slice_bytes,
-        resolve_terminal_cell_colors, should_close_from_echoed_ctrl_d,
-        dirty_terminal_row_indices,
-        should_mark_prompt_input_written_for_key, should_refresh_semantic_prompt_tracking,
+        pending_output_pump_time_budget, pending_output_slice_bytes, resolve_terminal_cell_colors,
+        should_close_from_echoed_ctrl_d, should_mark_prompt_input_written_for_key,
         should_publish_terminal_display_state, should_publish_terminal_display_update,
-        should_translate_ctrl_d_key, should_translate_ctrl_d_to_exit, strip_echoed_ctrl_d,
+        should_refresh_semantic_prompt_tracking, should_translate_ctrl_d_key,
+        should_translate_ctrl_d_to_exit, strip_echoed_ctrl_d, viewport_is_bottom_anchored,
     };
     use crate::app::spatial::TerminalCellPoint;
     use libghostty_vt::key;
@@ -3014,6 +3346,48 @@ mod tests {
         assert_eq!(scrollbar.right(), code.right());
         assert_eq!(scrollbar.bottom(), code.bottom());
         assert!(code.height() >= MIN_CODE_PANEL_HEIGHT);
+        assert!(layout.terminal_content_rect().width() <= terminal.width());
+        assert!(layout.terminal_content_rect().height() <= terminal.height());
+    }
+
+    #[test]
+    fn tiny_terminal_layout_collapses_stack_without_inverted_rects() {
+        let layout = TerminalLayout {
+            client_width: 320,
+            client_height: 140,
+            cell_width: 8,
+            cell_height: 16,
+        };
+
+        let code = layout.code_panel_rect();
+        let result = layout.result_panel_rect();
+        let plus = layout.plus_button_rect();
+        let terminal = layout.terminal_viewport_rect();
+        let scrollbar = layout.terminal_scrollbar_rect();
+
+        assert!(code.height() >= 1);
+        assert!(result.height() >= 0);
+        assert!(plus.height() >= 0);
+        assert!(terminal.height() >= 0);
+        assert!(scrollbar.height() >= 0);
+        assert!(result.top() <= result.bottom());
+        assert!(plus.top() <= plus.bottom());
+    }
+
+    #[test]
+    fn grid_size_uses_terminal_content_rect() {
+        let layout = TerminalLayout {
+            client_width: 1040,
+            client_height: 680,
+            cell_width: 8,
+            cell_height: 16,
+        };
+
+        let (visible_cols, visible_rows) = layout.visible_grid_size();
+        let (grid_cols, grid_rows) = layout.grid_size();
+
+        assert_eq!(i32::from(grid_cols), visible_cols.max(1));
+        assert_eq!(i32::from(grid_rows), visible_rows.max(1));
     }
 
     // behavior[verify window.appearance.terminal.selection.inverse]
@@ -3185,7 +3559,10 @@ mod tests {
             scrollbar: None,
         });
 
-        assert!(should_publish_terminal_display_update(Some(&previous), &next));
+        assert!(should_publish_terminal_display_update(
+            Some(&previous),
+            &next
+        ));
     }
 
     #[test]
@@ -3219,17 +3596,26 @@ mod tests {
 
     #[test]
     fn pending_output_uses_medium_slices_for_moderate_backlog() {
-        assert_eq!(pending_output_slice_bytes(1024), TERMINAL_OUTPUT_MEDIUM_SLICE_BYTES);
+        assert_eq!(
+            pending_output_slice_bytes(1024),
+            TERMINAL_OUTPUT_MEDIUM_SLICE_BYTES
+        );
     }
 
     #[test]
     fn pending_output_uses_burst_slices_for_large_backlog() {
-        assert_eq!(pending_output_slice_bytes(8 * 1024), TERMINAL_OUTPUT_BURST_SLICE_BYTES);
+        assert_eq!(
+            pending_output_slice_bytes(8 * 1024),
+            TERMINAL_OUTPUT_BURST_SLICE_BYTES
+        );
     }
 
     #[test]
     fn pending_output_uses_small_pump_budget_for_interactive_backlog() {
-        assert_eq!(pending_output_pump_time_budget(512), TERMINAL_WORKER_PUMP_TIME_BUDGET);
+        assert_eq!(
+            pending_output_pump_time_budget(512),
+            TERMINAL_WORKER_PUMP_TIME_BUDGET
+        );
     }
 
     #[test]
@@ -3258,6 +3644,28 @@ mod tests {
     fn semantic_prompt_refresh_runs_when_backlog_is_small() {
         assert!(should_refresh_semantic_prompt_tracking(0));
         assert!(should_refresh_semantic_prompt_tracking(512));
+    }
+
+    #[test]
+    fn viewport_bottom_anchoring_detects_bottom_position() {
+        assert!(viewport_is_bottom_anchored(TerminalViewportMetrics {
+            total: 200,
+            offset: 176,
+            visible: 24,
+            scrollback: 176,
+        }));
+        assert!(viewport_is_bottom_anchored(TerminalViewportMetrics {
+            total: 10,
+            offset: 0,
+            visible: 24,
+            scrollback: 0,
+        }));
+        assert!(!viewport_is_bottom_anchored(TerminalViewportMetrics {
+            total: 200,
+            offset: 100,
+            visible: 24,
+            scrollback: 176,
+        }));
     }
 
     // behavior[verify window.appearance.chrome]

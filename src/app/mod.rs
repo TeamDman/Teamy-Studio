@@ -19,6 +19,11 @@ use crate::workspace::{WorkspaceLaunch, WorkspaceSummary};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TerminalThroughputBenchmarkMode {
     MeasureCommandOutHost,
+    StreamSmallBatches,
+    WideLines,
+    ScrollFlood,
+    PromptBursts,
+    ResizeDuringOutput,
 }
 
 #[derive(Clone, Debug)]
@@ -167,18 +172,22 @@ pub fn run_keyboard_input_self_test(
 /// This function will return an error if the Windows-only benchmark cannot be launched.
 pub fn run_terminal_throughput_self_test(
     app_home: &AppHome,
-    mode: TerminalThroughputBenchmarkMode,
+    cache_home: &CacheHome,
+    mode: Option<TerminalThroughputBenchmarkMode>,
     line_count: usize,
     samples: usize,
 ) -> eyre::Result<()> {
     #[cfg(windows)]
     {
-        windows_app::run_terminal_throughput_self_test(app_home, mode, line_count, samples)
+        windows_app::run_terminal_throughput_self_test(
+            app_home, cache_home, mode, line_count, samples,
+        )
     }
 
     #[cfg(not(windows))]
     {
         let _ = app_home;
+        let _ = cache_home;
         let _ = mode;
         let _ = line_count;
         let _ = samples;

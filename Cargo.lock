@@ -2351,6 +2351,7 @@ dependencies = [
  "embed-resource",
  "eyre",
  "facet",
+ "facet-json",
  "fontdb",
  "fontdue",
  "image",
