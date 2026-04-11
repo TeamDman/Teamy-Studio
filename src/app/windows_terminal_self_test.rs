@@ -374,6 +374,10 @@ fn run_pwsh_ctrl_l_redraw_reproduction(
     let latency_after_ctrl_l = terminal.performance_snapshot()?;
     let (markers_observed, at_shell_prompt, awaiting_input) = terminal.semantic_prompt_state();
 
+    assert_prompt_markers_do_not_leak_to_screen("initial_screen", &initial_screen)?;
+    assert_prompt_markers_do_not_leak_to_screen("before_ctrl_l", &before_ctrl_l)?;
+    assert_prompt_markers_do_not_leak_to_screen("after_ctrl_l", &after_ctrl_l)?;
+
     let ctrl_l_response_latency_ms = delta_latency_ms(
         latency_before_ctrl_l.total_input_response_latency_us,
         latency_after_ctrl_l.total_input_response_latency_us,
@@ -487,6 +491,16 @@ fn emit_transcript(transcript: &str, artifact_output: Option<&Path>) -> eyre::Re
                 artifact_output.display()
             )
         })?;
+    }
+
+    Ok(())
+}
+
+fn assert_prompt_markers_do_not_leak_to_screen(label: &str, screen: &str) -> eyre::Result<()> {
+    if screen.contains("133;") {
+        eyre::bail!(
+            "{label} leaked raw OSC 133 prompt markers into the visible screen\n\n=== {label} ===\n{screen}"
+        );
     }
 
     Ok(())

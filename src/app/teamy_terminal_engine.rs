@@ -12,6 +12,8 @@ enum EscapeState {
     Ground,
     Escape,
     Csi(String),
+    Osc(String),
+    OscEscape(String),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Facet)]
@@ -330,7 +332,7 @@ impl TeamyTerminalEngine {
             let _span = debug_span!("teamy_terminal_process_text").entered();
 
             for character in text.chars() {
-                match &mut self.escape_state {
+                match std::mem::replace(&mut self.escape_state, EscapeState::Ground) {
                     EscapeState::Ground => match character {
                         '\u{1b}' => {
                             self.record_event("escape", None, None, None);
@@ -359,33 +361,57 @@ impl TeamyTerminalEngine {
                         character if character < ' ' => {}
                         character => self.write_character(character),
                     },
-                    EscapeState::Escape => {
-                        self.escape_state = if character == '[' {
+                    EscapeState::Escape => match character {
+                        '[' => {
                             self.record_event("csi-start", None, None, None);
-                            EscapeState::Csi(String::new())
-                        } else {
+                            self.escape_state = EscapeState::Csi(String::new());
+                        }
+                        ']' => {
+                            self.record_event("osc-start", None, None, None);
+                            self.escape_state = EscapeState::Osc(String::new());
+                        }
+                        _ => {
                             self.record_event(
                                 "escape-cancel",
                                 Some(character.to_string()),
                                 None,
                                 None,
                             );
-                            EscapeState::Ground
-                        };
-                    }
-                    EscapeState::Csi(parameters) => {
+                        }
+                    },
+                    EscapeState::Csi(mut parameters) => {
                         if matches!(character, '0'..='9' | ';' | '?' | '>') {
                             parameters.push(character);
+                            self.escape_state = EscapeState::Csi(parameters);
                             continue;
                         }
 
-                        let parameters = parameters.clone();
-                        self.escape_state = EscapeState::Ground;
                         self.apply_csi(&parameters, character);
+                    }
+                    EscapeState::Osc(mut payload) => match character {
+                        '\u{07}' => self.apply_osc(&payload),
+                        '\u{1b}' => self.escape_state = EscapeState::OscEscape(payload),
+                        _ => {
+                            payload.push(character);
+                            self.escape_state = EscapeState::Osc(payload);
+                        }
+                    },
+                    EscapeState::OscEscape(mut payload) => {
+                        if character == '\\' {
+                            self.apply_osc(&payload);
+                        } else {
+                            payload.push('\u{1b}');
+                            payload.push(character);
+                            self.escape_state = EscapeState::Osc(payload);
+                        }
                     }
                 }
             }
         };
+    }
+
+    fn apply_osc(&mut self, payload: &str) {
+        self.record_event("osc", Some(payload.to_owned()), None, None);
     }
 
     fn apply_csi(&mut self, parameters: &str, final_byte: char) {
@@ -906,6 +932,40 @@ mod tests {
         engine.vt_write(b"abc\r\nxyz\x1b[H\x1b[2J");
 
         assert_eq!(engine.visible_text(), "");
+    }
+
+    #[test]
+    fn raw_prompt_marker_text_without_escape_stays_visible() {
+        let mut engine = TeamyTerminalEngine::new(32, 3, 8);
+        engine.vt_write(b"133;D;0133;A133;B~");
+
+        assert_eq!(engine.visible_text(), "133;D;0133;A133;B~");
+    }
+
+    #[test]
+    fn osc_133_prompt_markers_do_not_render_into_visible_text() {
+        let mut engine = TeamyTerminalEngine::new(32, 3, 8);
+        engine.vt_write(b"\x1b]133;D;0\x07\x1b]133;A\x07\x1b]133;B\x07~");
+
+        assert_eq!(engine.visible_text(), "~");
+    }
+
+    #[test]
+    fn osc_title_sequence_does_not_render_into_visible_text() {
+        let mut engine = TeamyTerminalEngine::new(32, 3, 8);
+        engine.vt_write(b"\x1b]0;C:\\Program Files\\PowerShell\\7\\pwsh.EXE\x07~");
+
+        assert_eq!(engine.visible_text(), "~");
+    }
+
+    #[test]
+    fn osc_sequence_split_across_writes_is_buffered_until_terminated() {
+        let mut engine = TeamyTerminalEngine::new(32, 3, 8);
+        engine.vt_write(b"\x1b]133;A");
+        engine.vt_write(b"\x07\x1b]133;B");
+        engine.vt_write(b"\x1b\\~");
+
+        assert_eq!(engine.visible_text(), "~");
     }
 
     #[test]

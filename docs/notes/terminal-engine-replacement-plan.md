@@ -695,6 +695,8 @@ The current leading hypothesis is that Teamy is still missing terminal-originate
 
 That means the next live-performance slices must focus on protocol completeness for query-and-reply behavior, not on more generic chunk-size tuning or render-loop tuning.
 
+The latest prompt-artifact fix narrowed another important gap: Teamy also needs to consume non-rendered OSC control traffic inside the VT engine itself, not only in the worker's semantic-prompt sidecar. Prompt markers and title updates were already being observed for shell-state tracking, but the Teamy display engine was still painting those bytes into the visible grid until the OSC parser path was added. That points to the next architectural cleanup: move non-rendered control-sequence handling toward a shared Teamy-owned parser layer so prompt tracking, title handling, and future control-only channels do not require parallel byte scanning paths.
+
 - `[done]` multi-scenario throughput self-test exists
 - `[done]` queue-latency and pending-output instrumentation exists in Teamy-Studio
 - `[done]` terminal display publication and damage-oriented row reuse groundwork exists in Teamy-Studio
@@ -702,9 +704,12 @@ That means the next live-performance slices must focus on protocol completeness 
 - `[done]` add transcript capture and deterministic replay fixtures
 - `[done]` add a headless render-to-image path for `RenderFrameModel`
 - `[done]` add differential tests comparing Ghostty and Teamy engines over captured transcripts
-- `[next]` add Teamy-owned PTY reply coverage for terminal queries that block shell redraw flows
-- `[next]` extend self-tests so `pwsh` redraw scenarios can be run against `--vt-engine teamy` with explicit latency thresholds
+- `[done]` add Teamy-owned PTY reply coverage for terminal queries that block shell redraw flows
+- `[done]` extend self-tests so `pwsh` redraw scenarios can be run against `--vt-engine teamy` with explicit latency thresholds
+- `[done]` consume non-rendered OSC prompt and title sequences inside the Teamy VT engine so prompt markers do not leak into the visible screen
 - `[next]` capture and reduce any remaining unsupported query or styling sequences after the PTY reply path lands
+- `[next]` collapse the worker-side semantic prompt observer and Teamy VT engine OSC handling toward a shared Teamy-owned control-sequence parser
+- `[next]` move more keyboard encoding responsibility behind the Teamy engine boundary so Ghostty-specific key helpers stop defining the live runtime contract
 - `[later]` implement Teamy parser and screen model for the benchmark-first subset beyond the current redraw/query subset
 - `[later]` move hot-path data structures toward reusable arena/scratch allocation domains
 - `[later]` implement Teamy keyboard encoder and full prompt-state ownership
@@ -747,8 +752,8 @@ When resuming this effort, do not start by tuning chunk sizes again.
 Start with:
 
 1. keeping the live `pwsh` redraw problem reproducible through the keyboard self-test harness against `--vt-engine teamy`
-2. implementing and verifying Teamy-owned terminal reply behavior for the minimal query set that live PowerShell redraws depend on
-3. using the Teamy unsupported-CSI diagnostics and latency counters to reduce the next remaining live mismatch to a small permanent regression case
-4. only after that, returning to broader parser completeness and throughput tuning
+2. reducing the next unsupported live mismatch from current Teamy warnings into a small permanent regression case using the existing redraw harnesses and transcript fixtures
+3. collapsing prompt-marker and other control-only OSC handling into a shared Teamy-owned parser path instead of maintaining parallel worker-side and display-engine observers
+4. moving keyboard encoding and other terminal-originated behavior behind the Teamy engine boundary before returning to broader parser completeness and throughput tuning
 
 Those steps turn this from an aspiration into an executable migration.

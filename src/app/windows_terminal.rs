@@ -1611,35 +1611,38 @@ impl TerminalCore {
                 .map_err(|error| eyre::eyre!("failed to clone PTY reader: {error}"))
         })?;
         let (reader_tx, reader_rx) = mpsc::sync_channel(PTY_READ_CHANNEL_CAPACITY);
-        std::thread::spawn(move || {
-            let mut buffer = vec![0_u8; PTY_READ_BUFFER_BYTES];
-            loop {
-                let read_result = {
-                    #[cfg(feature = "tracy")]
-                    let _span = debug_span!("wait_for_pty_output_read").entered();
-                    cloned_reader.read(&mut buffer)
-                };
+        std::thread::Builder::new()
+            .name("teamy-terminal-pty-reader".to_owned())
+            .spawn(move || {
+                let mut buffer = vec![0_u8; PTY_READ_BUFFER_BYTES];
+                loop {
+                    let read_result = {
+                        #[cfg(feature = "tracy")]
+                        let _span = debug_span!("wait_for_pty_output_read").entered();
+                        cloned_reader.read(&mut buffer)
+                    };
 
-                match read_result {
-                    Ok(0) => break,
-                    Ok(bytes_read) => {
-                        if reader_tx
-                            .send(PtyReaderMessage::Output {
-                                bytes: buffer[..bytes_read].to_vec(),
-                                read_at: Instant::now(),
-                            })
-                            .is_err()
-                        {
+                    match read_result {
+                        Ok(0) => break,
+                        Ok(bytes_read) => {
+                            if reader_tx
+                                .send(PtyReaderMessage::Output {
+                                    bytes: buffer[..bytes_read].to_vec(),
+                                    read_at: Instant::now(),
+                                })
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        Err(error) => {
+                            let _ = reader_tx.send(PtyReaderMessage::Error(error.to_string()));
                             break;
                         }
                     }
-                    Err(error) => {
-                        let _ = reader_tx.send(PtyReaderMessage::Error(error.to_string()));
-                        break;
-                    }
                 }
-            }
-        });
+            })
+            .map_err(|error| eyre::eyre!("failed to spawn PTY reader thread: {error}"))?;
 
         Ok(Self {
             engine,
