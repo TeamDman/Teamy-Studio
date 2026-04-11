@@ -708,6 +708,7 @@ The latest prompt-artifact fix narrowed another important gap: Teamy also needs 
 - `[done]` extend self-tests so `pwsh` redraw scenarios can be run against `--vt-engine teamy` with explicit latency thresholds
 - `[done]` consume non-rendered OSC prompt and title sequences inside the Teamy VT engine so prompt markers do not leak into the visible screen
 - `[next]` capture and reduce any remaining unsupported query or styling sequences after the PTY reply path lands
+- `[next]` implement and verify Teamy colorization and SGR coverage so shell prompts, command output, selection contrast, and future parity checks stop using the current single-color fallback
 - `[next]` collapse the worker-side semantic prompt observer and Teamy VT engine OSC handling toward a shared Teamy-owned control-sequence parser
 - `[next]` move more keyboard encoding responsibility behind the Teamy engine boundary so Ghostty-specific key helpers stop defining the live runtime contract
 - `[later]` implement Teamy parser and screen model for the benchmark-first subset beyond the current redraw/query subset

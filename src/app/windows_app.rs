@@ -1102,7 +1102,9 @@ fn handle_exit_size_move(hwnd: WindowHandle) -> LRESULT {
 fn handle_size(hwnd: WindowHandle) -> LRESULT {
     match with_app_state(|state| {
         let layout = client_layout(hwnd, state.terminal_cell_width, state.terminal_cell_height)?;
-        if state.in_move_size_loop {
+        if state.in_move_size_loop
+            && should_defer_terminal_resize_during_move_size(state.terminal_layout, layout)
+        {
             state.pending_terminal_resize = Some(layout);
         } else {
             state.pending_terminal_resize = None;
@@ -2399,6 +2401,23 @@ fn apply_pending_terminal_resize(state: &mut AppState) -> eyre::Result<bool> {
     apply_terminal_resize(state, layout)
 }
 
+fn should_defer_terminal_resize_during_move_size(
+    current_layout: Option<TerminalLayout>,
+    next_layout: TerminalLayout,
+) -> bool {
+    let Some(current_layout) = current_layout else {
+        return false;
+    };
+
+    layout_has_visible_terminal_cells(current_layout)
+        && layout_has_visible_terminal_cells(next_layout)
+}
+
+fn layout_has_visible_terminal_cells(layout: TerminalLayout) -> bool {
+    let (visible_cols, visible_rows) = layout.visible_grid_size();
+    visible_cols > 0 && visible_rows > 0
+}
+
 fn with_app_state<T>(f: impl FnOnce(&mut AppState) -> eyre::Result<T>) -> eyre::Result<T> {
     APP_STATE.with(|state| {
         let mut borrowed = state.borrow_mut();
@@ -3130,6 +3149,69 @@ mod tests {
 
         assert!(clipped.rows.is_empty());
         assert_eq!(clipped.scrollbar.expect("scrollbar preserved").visible, 0,);
+    }
+
+    #[test]
+    fn move_size_resize_is_deferred_while_terminal_stays_visible() {
+        let current = TerminalLayout {
+            client_width: 1040,
+            client_height: 680,
+            cell_width: 8,
+            cell_height: 16,
+        };
+        let next = TerminalLayout {
+            client_width: 980,
+            client_height: 540,
+            cell_width: 8,
+            cell_height: 16,
+        };
+
+        assert!(should_defer_terminal_resize_during_move_size(
+            Some(current),
+            next
+        ));
+    }
+
+    #[test]
+    fn move_size_resize_is_not_deferred_when_terminal_collapses_to_zero_rows() {
+        let current = TerminalLayout {
+            client_width: 1040,
+            client_height: 680,
+            cell_width: 8,
+            cell_height: 16,
+        };
+        let next = TerminalLayout {
+            client_width: 320,
+            client_height: 40,
+            cell_width: 8,
+            cell_height: 16,
+        };
+
+        assert!(!should_defer_terminal_resize_during_move_size(
+            Some(current),
+            next
+        ));
+    }
+
+    #[test]
+    fn move_size_resize_is_not_deferred_when_restoring_from_zero_rows() {
+        let current = TerminalLayout {
+            client_width: 320,
+            client_height: 40,
+            cell_width: 8,
+            cell_height: 16,
+        };
+        let next = TerminalLayout {
+            client_width: 1040,
+            client_height: 680,
+            cell_width: 8,
+            cell_height: 16,
+        };
+
+        assert!(!should_defer_terminal_resize_during_move_size(
+            Some(current),
+            next
+        ));
     }
 
     #[test]
