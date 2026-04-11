@@ -29,7 +29,7 @@ use crate::paths::AppHome;
 
 use super::VtEngineChoice;
 use super::spatial::{ClientRect, TerminalCellPoint};
-use super::teamy_terminal_engine::{TeamyTerminalEngine, TeamyViewportMetrics};
+use super::teamy_terminal_engine::{TeamyColor, TeamyTerminalEngine, TeamyViewportMetrics};
 use super::windows_terminal_engine::GhosttyTerminalEngine;
 
 pub const DRAG_STRIP_HEIGHT: i32 = 76;
@@ -2807,6 +2807,7 @@ fn build_teamy_display_state(
     viewport: TerminalViewportMetrics,
 ) -> TerminalDisplayState {
     const TEAMY_FOREGROUND: [f32; 4] = [0.93, 0.95, 0.98, 1.0];
+    const TEAMY_BACKGROUND: [f32; 4] = [0.06, 0.07, 0.09, 1.0];
     const TEAMY_SELECTION_FOREGROUND: [f32; 4] = [0.06, 0.07, 0.09, 1.0];
     const TEAMY_SELECTION_BACKGROUND: [f32; 4] = [0.42, 0.67, 0.98, 1.0];
 
@@ -2817,89 +2818,55 @@ fn build_teamy_display_state(
         let teamy_display = engine.display_state();
         let visible_rows = usize::try_from(viewport.visible).unwrap_or_default();
 
-        if selection.is_none() {
-            let rows = teamy_display
-                .visible_rows
-                .iter()
-                .map(|row| TerminalDisplayRow {
-                    row: i32::try_from(row.row).unwrap_or(i32::MAX),
-                    backgrounds: Vec::new(),
-                    glyphs: row
-                        .glyphs
-                        .iter()
-                        .map(|glyph| TerminalDisplayGlyph {
-                            cell: TerminalCellPoint::new(
-                                i32::try_from(glyph.column).unwrap_or(i32::MAX),
-                                i32::try_from(glyph.row).unwrap_or(i32::MAX),
-                            ),
-                            character: glyph.character,
-                            color: TEAMY_FOREGROUND,
-                        })
-                        .collect(),
-                })
-                .collect::<Vec<_>>();
-
-            let cursor = (teamy_display.cursor.row < visible_rows).then(|| TerminalDisplayCursor {
-                cell: TerminalCellPoint::new(
-                    i32::try_from(teamy_display.cursor.column).unwrap_or(i32::MAX),
-                    i32::try_from(teamy_display.cursor.row).unwrap_or(i32::MAX),
-                ),
-                color: TEAMY_FOREGROUND,
-                style: TerminalDisplayCursorStyle::Block,
-            });
-
-            return TerminalDisplayState {
-                dirty_rows: (0..rows.len()).collect(),
-                rows,
-                cursor,
-                scrollbar: Some(TerminalDisplayScrollbar {
-                    total: viewport.total,
-                    offset: viewport.offset,
-                    visible: viewport.visible,
-                }),
-            };
-        }
-
         let mut rows = Vec::with_capacity(visible_rows);
         for row_index in 0..visible_rows {
             let screen_row = usize::try_from(viewport.offset)
                 .unwrap_or_default()
                 .saturating_add(row_index);
-            let row_cells = engine.screen_row_cells(u32::try_from(screen_row).unwrap_or_default());
+            let row_cells =
+                engine.screen_row_display_cells(u32::try_from(screen_row).unwrap_or_default());
             let mut display_row = TerminalDisplayRow {
                 row: i32::try_from(row_index).unwrap_or(i32::MAX),
                 backgrounds: Vec::new(),
                 glyphs: Vec::new(),
             };
 
-            for (column_index, cell_text) in row_cells.iter().enumerate() {
+            for cell in row_cells {
                 let viewport_cell = TerminalCellPoint::new(
-                    i32::try_from(column_index).unwrap_or(i32::MAX),
+                    i32::try_from(cell.column).unwrap_or(i32::MAX),
                     i32::try_from(row_index).unwrap_or(i32::MAX),
                 );
                 let selection_cell = TerminalCellPoint::new(
-                    i32::try_from(column_index).unwrap_or(i32::MAX),
+                    i32::try_from(cell.column).unwrap_or(i32::MAX),
                     i32::try_from(screen_row).unwrap_or(i32::MAX),
                 );
                 let selected =
                     selection.is_some_and(|selection| selection.contains(selection_cell));
 
-                if selected {
+                let (glyph_color, background_color) = if selected {
+                    (TEAMY_SELECTION_FOREGROUND, Some(TEAMY_SELECTION_BACKGROUND))
+                } else {
+                    resolve_teamy_cell_colors(
+                        cell.foreground,
+                        cell.background,
+                        cell.inverse,
+                        TEAMY_FOREGROUND,
+                        TEAMY_BACKGROUND,
+                    )
+                };
+
+                if let Some(color) = background_color {
                     display_row.backgrounds.push(TerminalDisplayBackground {
                         cell: viewport_cell,
-                        color: TEAMY_SELECTION_BACKGROUND,
+                        color,
                     });
                 }
 
-                for character in cell_text.chars().filter(|character| *character != ' ') {
+                if cell.character != ' ' {
                     display_row.glyphs.push(TerminalDisplayGlyph {
                         cell: viewport_cell,
-                        character,
-                        color: if selected {
-                            TEAMY_SELECTION_FOREGROUND
-                        } else {
-                            TEAMY_FOREGROUND
-                        },
+                        character: cell.character,
+                        color: glyph_color,
                     });
                 }
             }
@@ -2927,6 +2894,78 @@ fn build_teamy_display_state(
             }),
         }
     }
+}
+
+fn resolve_teamy_cell_colors(
+    foreground: TeamyColor,
+    background: TeamyColor,
+    inverse: bool,
+    default_foreground: [f32; 4],
+    default_background: [f32; 4],
+) -> ([f32; 4], Option<[f32; 4]>) {
+    let mut foreground = teamy_color_to_rgba(foreground, default_foreground);
+    let mut background_rgba = teamy_color_to_rgba(background, default_background);
+    let mut draw_background = background != TeamyColor::Default;
+
+    if inverse {
+        std::mem::swap(&mut foreground, &mut background_rgba);
+        draw_background = true;
+    }
+
+    (foreground, draw_background.then_some(background_rgba))
+}
+
+fn teamy_color_to_rgba(color: TeamyColor, default_color: [f32; 4]) -> [f32; 4] {
+    match color {
+        TeamyColor::Default => default_color,
+        TeamyColor::Rgb { r, g, b } => [
+            f32::from(r) / 255.0,
+            f32::from(g) / 255.0,
+            f32::from(b) / 255.0,
+            1.0,
+        ],
+        TeamyColor::Indexed(index) => xterm_palette_color(index),
+    }
+}
+
+fn xterm_palette_color(index: u8) -> [f32; 4] {
+    let (r, g, b) = match index {
+        0 => (0, 0, 0),
+        1 => (205, 49, 49),
+        2 => (13, 188, 121),
+        3 => (229, 229, 16),
+        4 => (36, 114, 200),
+        5 => (188, 63, 188),
+        6 => (17, 168, 205),
+        7 => (229, 229, 229),
+        8 => (102, 102, 102),
+        9 => (241, 76, 76),
+        10 => (35, 209, 139),
+        11 => (245, 245, 67),
+        12 => (59, 142, 234),
+        13 => (214, 112, 214),
+        14 => (41, 184, 219),
+        15 => (255, 255, 255),
+        16..=231 => {
+            let palette_index = index - 16;
+            let red = palette_index / 36;
+            let green = (palette_index % 36) / 6;
+            let blue = palette_index % 6;
+            let component = |value: u8| if value == 0 { 0 } else { 55 + (value * 40) };
+            (component(red), component(green), component(blue))
+        }
+        232..=255 => {
+            let shade = 8 + ((index - 232) * 10);
+            (shade, shade, shade)
+        }
+    };
+
+    [
+        f32::from(r) / 255.0,
+        f32::from(g) / 255.0,
+        f32::from(b) / 255.0,
+        1.0,
+    ]
 }
 
 fn visible_ghostty_cell_text_rows(
@@ -3813,17 +3852,18 @@ mod tests {
         TERMINAL_WORKER_BURST_PUMP_TIME_BUDGET, TERMINAL_WORKER_MEDIUM_PUMP_TIME_BUDGET,
         TERMINAL_WORKER_PUMP_TIME_BUDGET, TerminalDisplayCursorStyle, TerminalDisplayGlyph,
         TerminalDisplayRow, TerminalDisplayState, TerminalLayout, TerminalSelection,
-        TerminalSelectionMode, TerminalTextRow, TerminalViewportMetrics,
+        TerminalSelectionMode, TerminalTextRow, TerminalViewportMetrics, build_teamy_display_state,
         dirty_terminal_row_indices, extract_selected_text, map_cursor_style, map_virtual_key,
         osc_terminator, partial_osc_133_prefix_len, pending_output_display_publish_interval,
-        pending_output_pump_time_budget, pending_output_slice_bytes, resolve_terminal_cell_colors,
-        should_close_from_echoed_ctrl_d, should_mark_prompt_input_written_for_key,
-        should_publish_terminal_display_state, should_publish_terminal_display_update,
-        should_refresh_semantic_prompt_tracking, should_translate_ctrl_d_key,
-        should_translate_ctrl_d_to_exit, should_translate_ctrl_l_key,
+        pending_output_pump_time_budget, pending_output_slice_bytes, resolve_teamy_cell_colors,
+        resolve_terminal_cell_colors, should_close_from_echoed_ctrl_d,
+        should_mark_prompt_input_written_for_key, should_publish_terminal_display_state,
+        should_publish_terminal_display_update, should_refresh_semantic_prompt_tracking,
+        should_translate_ctrl_d_key, should_translate_ctrl_d_to_exit, should_translate_ctrl_l_key,
         should_translate_ctrl_l_to_form_feed, strip_echoed_ctrl_d, viewport_is_bottom_anchored,
     };
     use crate::app::spatial::TerminalCellPoint;
+    use crate::app::teamy_terminal_engine::{TeamyColor, TeamyTerminalEngine};
     use libghostty_vt::key;
     use libghostty_vt::render::Colors;
     use libghostty_vt::style::RgbColor;
@@ -3926,6 +3966,55 @@ mod tests {
             background,
             Some([1.0 / 255.0, 2.0 / 255.0, 3.0 / 255.0, 1.0])
         );
+    }
+
+    #[test]
+    fn teamy_truecolor_cells_resolve_to_rgba() {
+        let (foreground, background) = resolve_teamy_cell_colors(
+            TeamyColor::Rgb {
+                r: 12,
+                g: 34,
+                b: 56,
+            },
+            TeamyColor::Rgb { r: 7, g: 8, b: 9 },
+            false,
+            [1.0, 1.0, 1.0, 1.0],
+            [0.0, 0.0, 0.0, 1.0],
+        );
+
+        assert_eq!(foreground, [12.0 / 255.0, 34.0 / 255.0, 56.0 / 255.0, 1.0]);
+        assert_eq!(
+            background,
+            Some([7.0 / 255.0, 8.0 / 255.0, 9.0 / 255.0, 1.0])
+        );
+    }
+
+    #[test]
+    fn teamy_display_state_emits_backgrounds_for_colored_cells() {
+        let mut engine = TeamyTerminalEngine::new(8, 2, 8);
+        engine.vt_write(b"\x1b[48;2;1;2;3m \x1b[38;2;4;5;6mX\x1b[0m");
+
+        let display = build_teamy_display_state(
+            &engine,
+            None,
+            TerminalViewportMetrics {
+                total: 2,
+                offset: 0,
+                visible: 2,
+                scrollback: 0,
+            },
+        );
+
+        assert!(
+            display.rows[0]
+                .backgrounds
+                .iter()
+                .any(|background| background.cell == TerminalCellPoint::new(0, 0))
+        );
+        assert!(display.rows[0].glyphs.iter().any(|glyph| {
+            glyph.cell == TerminalCellPoint::new(1, 0)
+                && glyph.color == [4.0 / 255.0, 5.0 / 255.0, 6.0 / 255.0, 1.0]
+        }));
     }
 
     #[test]

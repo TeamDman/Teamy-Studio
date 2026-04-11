@@ -16,11 +16,66 @@ enum EscapeState {
     OscEscape(String),
 }
 
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Facet)]
+pub enum TeamyColor {
+    #[default]
+    Default,
+    Indexed(u8),
+    Rgb {
+        r: u8,
+        g: u8,
+        b: u8,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Facet)]
+pub struct TeamyCellStyle {
+    pub foreground: TeamyColor,
+    pub background: TeamyColor,
+    pub inverse: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TeamyCell {
+    character: char,
+    style: TeamyCellStyle,
+}
+
+impl TeamyCell {
+    fn blank() -> Self {
+        Self {
+            character: ' ',
+            style: TeamyCellStyle::default(),
+        }
+    }
+
+    fn blank_with_style(style: TeamyCellStyle) -> Self {
+        Self {
+            character: ' ',
+            style,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Facet)]
 pub struct TeamyDisplayGlyph {
     pub row: usize,
     pub column: usize,
     pub character: char,
+    pub foreground: TeamyColor,
+    pub background: TeamyColor,
+    pub inverse: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Facet)]
+pub struct TeamyDisplayCell {
+    pub row: usize,
+    pub column: usize,
+    pub character: char,
+    pub foreground: TeamyColor,
+    pub background: TeamyColor,
+    pub inverse: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Facet)]
@@ -75,11 +130,12 @@ pub struct TeamyTerminalEngine {
     cols: usize,
     rows: usize,
     max_scrollback: usize,
-    visible_rows: Vec<Vec<char>>,
-    scrollback_rows: Vec<Vec<char>>,
+    visible_rows: Vec<Vec<TeamyCell>>,
+    scrollback_rows: Vec<Vec<TeamyCell>>,
     viewport_offset: usize,
     cursor_col: usize,
     cursor_row: usize,
+    current_style: TeamyCellStyle,
     pending_utf8: Vec<u8>,
     escape_state: EscapeState,
     trace_events: Vec<TeamyTraceEvent>,
@@ -96,11 +152,12 @@ impl TeamyTerminalEngine {
             cols,
             rows,
             max_scrollback,
-            visible_rows: vec![vec![' '; cols]; rows],
+            visible_rows: vec![vec![TeamyCell::blank(); cols]; rows],
             scrollback_rows: Vec::new(),
             viewport_offset: 0,
             cursor_col: 0,
             cursor_row: 0,
+            current_style: TeamyCellStyle::default(),
             pending_utf8: Vec::new(),
             escape_state: EscapeState::Ground,
             trace_events: Vec::new(),
@@ -167,6 +224,7 @@ impl TeamyTerminalEngine {
             .iter()
             .map(|row| {
                 row.iter()
+                    .map(|cell| cell.character)
                     .collect::<String>()
                     .trim_end_matches(' ')
                     .to_owned()
@@ -215,10 +273,10 @@ impl TeamyTerminalEngine {
 
         if cols != self.cols {
             for row in &mut self.scrollback_rows {
-                row.resize(cols, ' ');
+                row.resize(cols, TeamyCell::blank());
             }
             for row in &mut self.visible_rows {
-                row.resize(cols, ' ');
+                row.resize(cols, TeamyCell::blank());
             }
             self.cols = cols;
             self.cursor_col = self.cursor_col.min(self.cols.saturating_sub(1));
@@ -227,7 +285,7 @@ impl TeamyTerminalEngine {
         if rows != self.rows {
             if rows > self.rows {
                 self.visible_rows
-                    .extend((0..(rows - self.rows)).map(|_| vec![' '; self.cols]));
+                    .extend((0..(rows - self.rows)).map(|_| vec![TeamyCell::blank(); self.cols]));
             } else {
                 let rows_to_scroll = self.cursor_row.saturating_add(1).saturating_sub(rows);
                 for _ in 0..rows_to_scroll {
@@ -250,7 +308,8 @@ impl TeamyTerminalEngine {
             self.cursor_row = self.cursor_row.min(self.rows.saturating_sub(1));
             if self.visible_rows.len() < self.rows {
                 self.visible_rows.extend(
-                    (0..(self.rows - self.visible_rows.len())).map(|_| vec![' '; self.cols]),
+                    (0..(self.rows - self.visible_rows.len()))
+                        .map(|_| vec![TeamyCell::blank(); self.cols]),
                 );
             }
         }
@@ -301,9 +360,28 @@ impl TeamyTerminalEngine {
         let row_index = usize::try_from(row).unwrap_or(usize::MAX);
         self.screen_row(row_index)
             .cloned()
-            .unwrap_or_else(|| vec![' '; self.cols])
+            .unwrap_or_else(|| vec![TeamyCell::blank(); self.cols])
             .into_iter()
-            .map(|character| character.to_string())
+            .map(|cell| cell.character.to_string())
+            .collect()
+    }
+
+    #[must_use]
+    pub fn screen_row_display_cells(&self, row: u32) -> Vec<TeamyDisplayCell> {
+        let row_index = usize::try_from(row).unwrap_or(usize::MAX);
+        self.screen_row(row_index)
+            .cloned()
+            .unwrap_or_else(|| vec![TeamyCell::blank(); self.cols])
+            .into_iter()
+            .enumerate()
+            .map(|(column, cell)| TeamyDisplayCell {
+                row: row_index,
+                column,
+                character: cell.character,
+                foreground: cell.style.foreground,
+                background: cell.style.background,
+                inverse: cell.style.inverse,
+            })
             .collect()
     }
 
@@ -330,11 +408,14 @@ impl TeamyTerminalEngine {
                     glyphs: row
                         .iter()
                         .enumerate()
-                        .filter_map(|(column_index, character)| {
-                            (*character != ' ').then_some(TeamyDisplayGlyph {
+                        .filter_map(|(column_index, cell)| {
+                            (cell.character != ' ').then_some(TeamyDisplayGlyph {
                                 row: row_index,
                                 column: column_index,
-                                character: *character,
+                                character: cell.character,
+                                foreground: cell.style.foreground,
+                                background: cell.style.background,
+                                inverse: cell.style.inverse,
                             })
                         })
                         .collect(),
@@ -525,17 +606,61 @@ impl TeamyTerminalEngine {
                         .unwrap_or(1);
                     self.delete_character(count.max(1));
                 }
-                'h' | 'l' | 'm' | 't' => self.record_event(
+                'h' | 'l' | 't' => self.record_event(
                     "ignored-csi",
                     Some(final_byte.to_string()),
                     None,
                     Some(parameters.to_owned()),
                 ),
+                'm' => self.apply_sgr(parameters),
                 'c' => self.reply_device_attributes(parameters),
                 'n' => self.reply_device_status_report(parameters),
                 _ => self.warn_unsupported_csi(parameters, final_byte),
             }
         };
+    }
+
+    fn apply_sgr(&mut self, parameters: &str) {
+        self.record_event("sgr", None, None, Some(parameters.to_owned()));
+
+        let mut fields = if parameters.is_empty() {
+            vec![0]
+        } else {
+            parameters
+                .split(';')
+                .map(|field| field.parse::<u16>().unwrap_or(0))
+                .collect::<Vec<_>>()
+        }
+        .into_iter();
+
+        while let Some(code) = fields.next() {
+            match code {
+                0 => self.current_style = TeamyCellStyle::default(),
+                7 => self.current_style.inverse = true,
+                27 => self.current_style.inverse = false,
+                30..=37 => self.current_style.foreground = TeamyColor::Indexed((code - 30) as u8),
+                39 => self.current_style.foreground = TeamyColor::Default,
+                40..=47 => self.current_style.background = TeamyColor::Indexed((code - 40) as u8),
+                49 => self.current_style.background = TeamyColor::Default,
+                90..=97 => {
+                    self.current_style.foreground = TeamyColor::Indexed((code - 90 + 8) as u8)
+                }
+                100..=107 => {
+                    self.current_style.background = TeamyColor::Indexed((code - 100 + 8) as u8)
+                }
+                38 => {
+                    if let Some(color) = parse_extended_sgr_color(&mut fields) {
+                        self.current_style.foreground = color;
+                    }
+                }
+                48 => {
+                    if let Some(color) = parse_extended_sgr_color(&mut fields) {
+                        self.current_style.background = color;
+                    }
+                }
+                _ => {}
+            }
+        }
     }
 
     fn reply_device_attributes(&mut self, parameters: &str) {
@@ -643,23 +768,23 @@ impl TeamyTerminalEngine {
                     .iter_mut()
                     .skip(self.cursor_row.saturating_add(1))
                 {
-                    row.fill(' ');
+                    row.fill(TeamyCell::blank_with_style(self.current_style));
                 }
             }
             1 => {
                 for row in self.visible_rows.iter_mut().take(self.cursor_row) {
-                    row.fill(' ');
+                    row.fill(TeamyCell::blank_with_style(self.current_style));
                 }
                 if let Some(row) = self.visible_rows.get_mut(self.cursor_row) {
                     let end = self.cursor_col.min(self.cols.saturating_sub(1));
                     for cell in row.iter_mut().take(end.saturating_add(1)) {
-                        *cell = ' ';
+                        *cell = TeamyCell::blank_with_style(self.current_style);
                     }
                 }
             }
             2 | 3 => {
                 for row in &mut self.visible_rows {
-                    row.fill(' ');
+                    row.fill(TeamyCell::blank_with_style(self.current_style));
                 }
             }
             _ => {}
@@ -675,16 +800,16 @@ impl TeamyTerminalEngine {
         match mode {
             0 => {
                 for cell in row.iter_mut().skip(self.cursor_col.min(self.cols)) {
-                    *cell = ' ';
+                    *cell = TeamyCell::blank_with_style(self.current_style);
                 }
             }
             1 => {
                 let end = self.cursor_col.min(self.cols.saturating_sub(1));
                 for cell in row.iter_mut().take(end.saturating_add(1)) {
-                    *cell = ' ';
+                    *cell = TeamyCell::blank_with_style(self.current_style);
                 }
             }
-            2 => row.fill(' '),
+            2 => row.fill(TeamyCell::blank_with_style(self.current_style)),
             _ => {}
         }
     }
@@ -707,7 +832,7 @@ impl TeamyTerminalEngine {
             row.copy_within(tail_start..tail_start + tail_len, start);
         }
         for cell in row.iter_mut().skip(self.cols.saturating_sub(count)) {
-            *cell = ' ';
+            *cell = TeamyCell::blank_with_style(self.current_style);
         }
     }
 
@@ -721,7 +846,10 @@ impl TeamyTerminalEngine {
         if let Some(row) = self.visible_rows.get_mut(self.cursor_row)
             && let Some(cell) = row.get_mut(self.cursor_col)
         {
-            *cell = character;
+            *cell = TeamyCell {
+                character,
+                style: self.current_style,
+            };
         }
 
         self.cursor_col += 1;
@@ -753,7 +881,7 @@ impl TeamyTerminalEngine {
         }
         self.visible_rows.rotate_left(1);
         if let Some(last_row) = self.visible_rows.last_mut() {
-            last_row.fill(' ');
+            last_row.fill(TeamyCell::blank_with_style(self.current_style));
         }
 
         self.clamp_viewport_offset();
@@ -779,7 +907,7 @@ impl TeamyTerminalEngine {
         });
     }
 
-    fn viewport_rows(&self) -> Vec<&Vec<char>> {
+    fn viewport_rows(&self) -> Vec<&Vec<TeamyCell>> {
         let metrics = self.viewport_metrics();
         let start = usize::try_from(metrics.offset).unwrap_or_default();
         let visible = usize::try_from(metrics.visible).unwrap_or(self.rows);
@@ -788,7 +916,7 @@ impl TeamyTerminalEngine {
             .collect()
     }
 
-    fn screen_row(&self, row_index: usize) -> Option<&Vec<char>> {
+    fn screen_row(&self, row_index: usize) -> Option<&Vec<TeamyCell>> {
         if row_index < self.scrollback_rows.len() {
             self.scrollback_rows.get(row_index)
         } else {
@@ -818,6 +946,19 @@ impl TeamyTerminalEngine {
     }
 }
 
+fn parse_extended_sgr_color(parameters: &mut impl Iterator<Item = u16>) -> Option<TeamyColor> {
+    match parameters.next()? {
+        2 => {
+            let r = u8::try_from(parameters.next()?).ok()?;
+            let g = u8::try_from(parameters.next()?).ok()?;
+            let b = u8::try_from(parameters.next()?).ok()?;
+            Some(TeamyColor::Rgb { r, g, b })
+        }
+        5 => Some(TeamyColor::Indexed(u8::try_from(parameters.next()?).ok()?)),
+        _ => None,
+    }
+}
+
 fn csi_likely_requires_terminal_response(parameters: &str, final_byte: char) -> bool {
     parameters.starts_with('?')
         || parameters.starts_with('>')
@@ -829,7 +970,7 @@ mod tests {
     use libghostty_vt::terminal::ScrollViewport;
     use std::sync::{Arc, Mutex};
 
-    use super::{TeamyDisplayCursor, TeamyTerminalEngine};
+    use super::{TeamyColor, TeamyDisplayCursor, TeamyTerminalEngine};
 
     fn capture_pty_writes(engine: &mut TeamyTerminalEngine) -> Arc<Mutex<Vec<Vec<u8>>>> {
         let writes = Arc::new(Mutex::new(Vec::new()));
@@ -1097,6 +1238,46 @@ mod tests {
         assert_eq!(display.visible_rows[1].glyphs.len(), 1);
         assert_eq!(display.visible_rows[1].glyphs[0].column, 2);
         assert_eq!(display.visible_rows[1].glyphs[0].character, 'Z');
+        assert_eq!(
+            display.visible_rows[1].glyphs[0].foreground,
+            TeamyColor::Default
+        );
+    }
+
+    #[test]
+    fn sgr_truecolor_and_indexed_colors_are_exported() {
+        let mut engine = TeamyTerminalEngine::new(16, 3, 8);
+        engine.vt_write(b"\x1b[38;2;12;34;56mA\x1b[48;5;196mB\x1b[0mC");
+
+        let display = engine.display_state();
+
+        assert_eq!(
+            display.visible_rows[0].glyphs[0].foreground,
+            TeamyColor::Rgb {
+                r: 12,
+                g: 34,
+                b: 56,
+            }
+        );
+        assert_eq!(
+            display.visible_rows[0].glyphs[1].background,
+            TeamyColor::Indexed(196)
+        );
+        assert_eq!(
+            display.visible_rows[0].glyphs[2].foreground,
+            TeamyColor::Default
+        );
+    }
+
+    #[test]
+    fn screen_row_display_cells_keep_backgrounds_for_space_cells() {
+        let mut engine = TeamyTerminalEngine::new(8, 2, 8);
+        engine.vt_write(b"\x1b[48;2;1;2;3m \x1b[0m");
+
+        let cells = engine.screen_row_display_cells(0);
+
+        assert_eq!(cells[0].background, TeamyColor::Rgb { r: 1, g: 2, b: 3 });
+        assert_eq!(cells[0].character, ' ');
     }
 
     #[test]
