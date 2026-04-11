@@ -1660,13 +1660,14 @@ fn terminal_scrollbar_geometry(
         return None;
     }
 
-    let track_height = u64::try_from(scrollbar_rect.height().max(1)).ok()?;
-    let min_thumb_height = scrollbar_rect.width().max(22);
+    let track_height_i32 = scrollbar_rect.height().max(1);
+    let track_height = u64::try_from(track_height_i32).ok()?;
+    let min_thumb_height = scrollbar_rect.width().max(22).min(track_height_i32);
     let proportional_thumb = (track_height.saturating_mul(scrollbar.visible) / scrollbar.total)
         .max(u64::try_from(min_thumb_height).ok()?);
     let thumb_height = i32::try_from(proportional_thumb.min(track_height))
         .ok()?
-        .clamp(min_thumb_height, scrollbar_rect.height().max(1));
+        .clamp(min_thumb_height, track_height_i32);
     let travel = (scrollbar_rect.height() - thumb_height).max(0);
     let max_offset = scrollbar.total.saturating_sub(scrollbar.visible);
     let clamped_offset = scrollbar.offset.min(max_offset);
@@ -4005,8 +4006,10 @@ mod tests {
         cpu_slug_coverage_all_curves, dirty_fragment_ranges, extract_glyph_curves,
         fragment_ranges_match, fragment_vertex_ranges, load_terminal_font, push_centered_text,
         push_glyph, push_overlay_panel, push_panel, push_text_block,
-        render_snapshot_glyph_into_image,
+        render_snapshot_glyph_into_image, terminal_scrollbar_geometry,
     };
+    use crate::app::spatial::ClientRect;
+    use crate::app::windows_terminal::TerminalDisplayScrollbar;
     use crate::app::windows_terminal::TerminalLayout;
     use eyre::WrapErr;
     use image::RgbaImage;
@@ -4324,6 +4327,23 @@ mod tests {
 
         assert_eq!(scene.panels.len(), 1);
         assert_eq!(scene.overlay_panels.len(), 1);
+    }
+
+    #[test]
+    fn terminal_scrollbar_geometry_clamps_min_thumb_height_to_track_height() {
+        let geometry = terminal_scrollbar_geometry(
+            ClientRect::new(0, 0, 16, 21),
+            TerminalDisplayScrollbar {
+                total: 100,
+                offset: 40,
+                visible: 24,
+            },
+        )
+        .expect("short scrollbar track should still produce geometry");
+
+        assert_eq!(geometry.thumb_height, 21);
+        assert_eq!(geometry.thumb_rect.height(), 21);
+        assert_eq!(geometry.travel, 0);
     }
 
     #[test]
