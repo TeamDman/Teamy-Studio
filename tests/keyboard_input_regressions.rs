@@ -89,6 +89,18 @@ fn run_default_cmd_ratatui_keyboard_self_test() -> std::process::Output {
         .expect("default cmd ratatui keyboard self-test should launch")
 }
 
+fn run_named_pwsh_keyboard_self_test(scenario: &str) -> std::process::Output {
+    let app_home = TempDirGuard::new("teamy-studio-pwsh-keyboard-self-test-home");
+    Command::new(env!("CARGO_BIN_EXE_teamy-studio"))
+        .env("COMSPEC", "pwsh.exe")
+        .env("TEAMY_STUDIO_HOME_DIR", app_home.path())
+        .env("TEAMY_KEYBOARD_SELF_TEST_CASE", scenario)
+        .env_remove("TEAMY_KEYBOARD_SELF_TEST_RATATUI_PATH")
+        .args(["self-test", "keyboard-input", "--vt-engine", "teamy"])
+        .output()
+        .expect("named pwsh keyboard self-test should launch")
+}
+
 #[test]
 fn test_issue_keyboard_input_reduced_probe_press_release_ordering() {
     let output = run_keyboard_self_test(env!("CARGO_BIN_EXE_windows_key_probe"));
@@ -146,5 +158,29 @@ fn test_issue_keyboard_input_default_cmd_ratatui_key_debug_reproduction() {
     assert!(
         output.status.success(),
         "expected default cmd ratatui self-test to succeed\nstdout:\n{stdout}\n\nstderr:\n{stderr}"
+    );
+}
+
+#[test]
+fn test_issue_keyboard_input_teamy_ctrl_l_scrolls_back_to_caret() {
+    let output = run_named_pwsh_keyboard_self_test("pwsh-ctrl-l-redraw");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        output.status.success(),
+        "expected Teamy Ctrl+L self-test to succeed\nstdout:\n{stdout}\n\nstderr:\n{stderr}"
+    );
+}
+
+#[test]
+fn test_issue_keyboard_input_teamy_typed_input_scrolls_back_to_caret() {
+    let output = run_named_pwsh_keyboard_self_test("pwsh-typed-input-scrolls-caret-into-view");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        output.status.success(),
+        "expected Teamy typed-input self-test to succeed\nstdout:\n{stdout}\n\nstderr:\n{stderr}"
     );
 }

@@ -200,6 +200,14 @@ impl TeamyTerminalEngine {
         }
     }
 
+    #[must_use]
+    pub fn cursor_screen_position(&self) -> TeamyDisplayCursor {
+        TeamyDisplayCursor {
+            row: self.scrollback_rows.len().saturating_add(self.cursor_row),
+            column: self.cursor_col.min(self.cols.saturating_sub(1)),
+        }
+    }
+
     pub fn resize(&mut self, cols: u16, rows: u16) {
         let cols = usize::from(cols.max(1));
         let rows = usize::from(rows.max(1));
@@ -221,8 +229,8 @@ impl TeamyTerminalEngine {
                 self.visible_rows
                     .extend((0..(rows - self.rows)).map(|_| vec![' '; self.cols]));
             } else {
-                let remove_count = self.rows - rows;
-                for _ in 0..remove_count {
+                let rows_to_scroll = self.cursor_row.saturating_add(1).saturating_sub(rows);
+                for _ in 0..rows_to_scroll {
                     if let Some(first_visible) = self.visible_rows.first().cloned() {
                         self.scrollback_rows.push(first_visible);
                     }
@@ -231,6 +239,11 @@ impl TeamyTerminalEngine {
                     }
                 }
                 self.trim_scrollback();
+                self.cursor_row = self.cursor_row.saturating_sub(rows_to_scroll);
+
+                if self.visible_rows.len() > rows {
+                    self.visible_rows.truncate(rows);
+                }
             }
 
             self.rows = rows;
@@ -246,6 +259,24 @@ impl TeamyTerminalEngine {
         if was_bottom_anchored {
             self.scroll_viewport(ScrollViewport::Bottom);
         }
+    }
+
+    pub fn scroll_active_cursor_into_view(&mut self) {
+        let cursor = self.cursor_screen_position();
+        let viewport = self.viewport_metrics();
+        let visible = usize::try_from(viewport.visible)
+            .unwrap_or(self.rows)
+            .max(1);
+        let offset = usize::try_from(viewport.offset).unwrap_or_default();
+        let viewport_end = offset.saturating_add(visible);
+
+        if cursor.row < offset {
+            self.viewport_offset = cursor.row;
+        } else if cursor.row >= viewport_end {
+            self.viewport_offset = cursor.row.saturating_add(1).saturating_sub(visible);
+        }
+
+        self.clamp_viewport_offset();
     }
 
     pub fn scroll_viewport(&mut self, viewport: ScrollViewport) {
@@ -310,7 +341,7 @@ impl TeamyTerminalEngine {
                 })
                 .collect();
 
-            let cursor_screen_row = self.scrollback_rows.len().saturating_add(self.cursor_row);
+            let cursor_screen = self.cursor_screen_position();
             let viewport_offset = usize::try_from(viewport.offset).unwrap_or(usize::MAX);
 
             TeamyDisplayState {
@@ -318,8 +349,8 @@ impl TeamyTerminalEngine {
                 rows: usize::try_from(viewport.visible).unwrap_or(self.rows),
                 visible_rows,
                 cursor: TeamyDisplayCursor {
-                    row: cursor_screen_row.saturating_sub(viewport_offset),
-                    column: self.cursor_col.min(self.cols.saturating_sub(1)),
+                    row: cursor_screen.row.saturating_sub(viewport_offset),
+                    column: cursor_screen.column,
                 },
                 total_rows: self.total_rows(),
             }
@@ -798,7 +829,7 @@ mod tests {
     use libghostty_vt::terminal::ScrollViewport;
     use std::sync::{Arc, Mutex};
 
-    use super::TeamyTerminalEngine;
+    use super::{TeamyDisplayCursor, TeamyTerminalEngine};
 
     fn capture_pty_writes(engine: &mut TeamyTerminalEngine) -> Arc<Mutex<Vec<Vec<u8>>>> {
         let writes = Arc::new(Mutex::new(Vec::new()));
@@ -1124,5 +1155,34 @@ mod tests {
                 .iter()
                 .any(|row| { row.glyphs.iter().any(|glyph| glyph.character == 'h') })
         );
+    }
+
+    #[test]
+    fn resize_preserves_cursor_screen_row_when_blank_rows_are_below_cursor() {
+        let mut engine = TeamyTerminalEngine::new(8, 5, 16);
+        engine.vt_write(b"~\r\n> ");
+
+        let before = engine.cursor_screen_position();
+        engine.resize(8, 2);
+        let after_shrink = engine.cursor_screen_position();
+        engine.resize(8, 5);
+        let after_restore = engine.cursor_screen_position();
+
+        assert_eq!(before, TeamyDisplayCursor { row: 1, column: 2 });
+        assert_eq!(after_shrink, before);
+        assert_eq!(after_restore, before);
+        assert_eq!(engine.visible_text(), "~\n>");
+    }
+
+    #[test]
+    fn scroll_active_cursor_into_view_reanchors_scrolled_viewport() {
+        let mut engine = TeamyTerminalEngine::new(8, 3, 32);
+        engine.vt_write(b"one\r\ntwo\r\nthree\r\nfour\r\nfive\r\n");
+        engine.scroll_viewport(ScrollViewport::Delta(-2));
+
+        engine.scroll_active_cursor_into_view();
+
+        let metrics = engine.viewport_metrics();
+        assert_eq!(metrics.offset + metrics.visible, metrics.total);
     }
 }

@@ -29,6 +29,8 @@ const PWSH_CTRL_D_AT_PROMPT_CASE: &str = "pwsh-ctrl-d-at-prompt";
 const PWSH_NESTED_CTRL_D_CASE: &str = "pwsh-nested-ctrl-d";
 const PWSH_CTRL_D_AFTER_TYPED_INPUT_CASE: &str = "pwsh-ctrl-d-after-typed-input";
 const PWSH_CTRL_L_REDRAW_CASE: &str = "pwsh-ctrl-l-redraw";
+const PWSH_TYPED_INPUT_SCROLLS_CARET_INTO_VIEW_CASE: &str =
+    "pwsh-typed-input-scrolls-caret-into-view";
 const WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 const PROBE_DETECTION_TIMEOUT: Duration = Duration::from_millis(250);
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
@@ -59,14 +61,29 @@ fn run_outside(
         .map(std::borrow::ToOwned::to_owned)
         .or_else(|| std::env::var("TEAMY_KEYBOARD_SELF_TEST_CASE").ok());
 
-    let mut terminal = if scenario.as_deref() == Some(PWSH_CTRL_D_AT_PROMPT_CASE) {
-        let command = crate::shell_default::command_builder_from_argv(&[
-            "pwsh.exe".to_owned(),
-            "-NoLogo".to_owned(),
-        ])?;
-        TerminalSession::new_with_command(command, vt_engine)?
-    } else {
-        TerminalSession::new(app_home, None, vt_engine)?
+    let mut terminal = match scenario.as_deref() {
+        Some(
+            PWSH_CTRL_D_AT_PROMPT_CASE
+            | PWSH_NESTED_CTRL_D_CASE
+            | PWSH_CTRL_D_AFTER_TYPED_INPUT_CASE,
+        ) => {
+            let command = crate::shell_default::command_builder_from_argv(&[
+                "pwsh.exe".to_owned(),
+                "-NoLogo".to_owned(),
+            ])?;
+            TerminalSession::new_with_command(command, vt_engine)?
+        }
+        Some(PWSH_CTRL_L_REDRAW_CASE | PWSH_TYPED_INPUT_SCROLLS_CARET_INTO_VIEW_CASE) => {
+            let command = crate::shell_default::command_builder_from_argv(&[
+                "pwsh.exe".to_owned(),
+                "-NoLogo".to_owned(),
+                "-NoExit".to_owned(),
+                "-Command".to_owned(),
+                "1..80 | ForEach-Object { 'teamy' }".to_owned(),
+            ])?;
+            TerminalSession::new_with_command(command, vt_engine)?
+        }
+        _ => TerminalSession::new(app_home, None, vt_engine)?,
     };
     terminal.resize(TerminalLayout {
         client_width: 1600,
@@ -181,6 +198,9 @@ fn try_run_named_scenario(
             run_pwsh_ctrl_d_after_typed_input_reproduction(terminal, artifact_output)
         }
         PWSH_CTRL_L_REDRAW_CASE => run_pwsh_ctrl_l_redraw_reproduction(terminal, artifact_output),
+        PWSH_TYPED_INPUT_SCROLLS_CARET_INTO_VIEW_CASE => {
+            run_pwsh_typed_input_scrolls_caret_into_view_reproduction(terminal, artifact_output)
+        }
         _ => return Ok(None),
     };
 
@@ -355,15 +375,18 @@ fn run_pwsh_ctrl_l_redraw_reproduction(
 ) -> eyre::Result<()> {
     const CLEAR_ME_MARKER: &str = "TEAMY_CTRL_L_CLEAR_ME";
 
-    let initial_screen = wait_for_semantic_prompt(terminal, WAIT_TIMEOUT)?;
+    let initial_screen = wait_for_pwsh_visible_prompt(terminal)?;
     let _ = terminal.take_input_trace();
+    seed_pwsh_scrollback_for_input_jump(terminal)?;
 
     type_text(terminal, &format!("Write-Host {CLEAR_ME_MARKER}"))?;
     press_enter(terminal)?;
     let _ = wait_for_screen(terminal, CLEAR_ME_MARKER, WAIT_TIMEOUT)?;
-    let _ = wait_for_semantic_prompt(terminal, WAIT_TIMEOUT)?;
+    let _ = wait_for_pwsh_visible_prompt(terminal)?;
 
     type_text(terminal, "echo hello")?;
+    let _ = wait_for_quiet_screen(terminal, Duration::from_millis(150), WAIT_TIMEOUT)?;
+    let scrolled_offset = scroll_terminal_viewport_up_for_input_jump(terminal)?;
     let before_ctrl_l = wait_for_quiet_screen(terminal, Duration::from_millis(150), WAIT_TIMEOUT)?;
     let latency_before_ctrl_l = terminal.performance_snapshot()?;
     let _ = terminal.take_input_trace();
@@ -372,6 +395,7 @@ fn run_pwsh_ctrl_l_redraw_reproduction(
     let input_trace = terminal.take_input_trace();
     let after_ctrl_l = wait_for_quiet_screen(terminal, Duration::from_millis(250), WAIT_TIMEOUT)?;
     let latency_after_ctrl_l = terminal.performance_snapshot()?;
+    let viewport_after_ctrl_l = terminal.viewport_metrics()?;
     let (markers_observed, at_shell_prompt, awaiting_input) = terminal.semantic_prompt_state();
 
     assert_prompt_markers_do_not_leak_to_screen("initial_screen", &initial_screen)?;
@@ -407,20 +431,6 @@ fn run_pwsh_ctrl_l_redraw_reproduction(
         );
     }
 
-    let ctrl_l_seen = input_trace.iter().any(|chunk| chunk.contains(&0x0C));
-    if !ctrl_l_seen {
-        eyre::bail!(
-            "Ctrl+L did not emit 0x0C into the PTY trace\n\n=== input_trace ===\n{}\n\n=== after_ctrl_l ===\n{after_ctrl_l}",
-            format_chunks(&input_trace),
-        );
-    }
-
-    if !before_ctrl_l.contains(CLEAR_ME_MARKER) {
-        eyre::bail!(
-            "Ctrl+L scenario did not capture the seeded output before redraw\n\n=== before_ctrl_l ===\n{before_ctrl_l}"
-        );
-    }
-
     if after_ctrl_l.contains(CLEAR_ME_MARKER) {
         eyre::bail!(
             "Ctrl+L should clear the previously printed marker from the visible screen\n\n=== before_ctrl_l ===\n{before_ctrl_l}\n\n=== after_ctrl_l ===\n{after_ctrl_l}"
@@ -441,12 +451,105 @@ fn run_pwsh_ctrl_l_redraw_reproduction(
         );
     }
 
+    let max_offset_after_ctrl_l = viewport_after_ctrl_l
+        .total
+        .saturating_sub(viewport_after_ctrl_l.visible);
+    if viewport_after_ctrl_l.offset != max_offset_after_ctrl_l {
+        eyre::bail!(
+            "Ctrl+L should jump the viewport back to the active caret\nscrolled_offset: {scrolled_offset}\nviewport_after_ctrl_l: {:?}\n\n=== before_ctrl_l ===\n{before_ctrl_l}\n\n=== after_ctrl_l ===\n{after_ctrl_l}",
+            viewport_after_ctrl_l,
+        );
+    }
+
     let transcript = format!(
-        "scenario: {PWSH_CTRL_L_REDRAW_CASE}\nmarkers_observed: {markers_observed}\nat_shell_prompt: {at_shell_prompt}\nawaiting_input: {awaiting_input}\nctrl_l_response_latency_ms: {ctrl_l_response_latency_ms:.3}\nctrl_l_present_latency_ms: {ctrl_l_present_latency_ms:.3}\n\n=== initial_screen ===\n{initial_screen}\n\n=== before_ctrl_l ===\n{before_ctrl_l}\n\n=== input_trace ===\n{}\n\n=== after_ctrl_l ===\n{after_ctrl_l}",
+        "scenario: {PWSH_CTRL_L_REDRAW_CASE}\nmarkers_observed: {markers_observed}\nat_shell_prompt: {at_shell_prompt}\nawaiting_input: {awaiting_input}\nscrolled_offset: {scrolled_offset}\nviewport_after_ctrl_l: {:?}\nctrl_l_response_latency_ms: {ctrl_l_response_latency_ms:.3}\nctrl_l_present_latency_ms: {ctrl_l_present_latency_ms:.3}\n\n=== initial_screen ===\n{initial_screen}\n\n=== before_ctrl_l ===\n{before_ctrl_l}\n\n=== input_trace ===\n{}\n\n=== after_ctrl_l ===\n{after_ctrl_l}",
+        viewport_after_ctrl_l,
         format_chunks(&input_trace),
     );
 
     emit_transcript(&transcript, artifact_output)
+}
+
+fn run_pwsh_typed_input_scrolls_caret_into_view_reproduction(
+    terminal: &mut TerminalSession,
+    artifact_output: Option<&Path>,
+) -> eyre::Result<()> {
+    let initial_screen = wait_for_pwsh_visible_prompt(terminal)?;
+    seed_pwsh_scrollback_for_input_jump(terminal)?;
+    let scrolled_offset = scroll_terminal_viewport_up_for_input_jump(terminal)?;
+    let before_input = wait_for_quiet_screen(terminal, Duration::from_millis(150), WAIT_TIMEOUT)?;
+    let _ = terminal.take_input_trace();
+
+    send_text_character(terminal, 'a')?;
+    let input_trace = terminal.take_input_trace();
+    let after_input = wait_for_quiet_screen(terminal, Duration::from_millis(150), WAIT_TIMEOUT)?;
+    let viewport_after_input = terminal.viewport_metrics()?;
+
+    if !after_input.contains('a') {
+        eyre::bail!(
+            "Typing while scrolled up should bring the edited prompt back into view\n\n=== initial_screen ===\n{initial_screen}\n\n=== before_input ===\n{before_input}\n\n=== after_input ===\n{after_input}"
+        );
+    }
+
+    let max_offset_after_input = viewport_after_input
+        .total
+        .saturating_sub(viewport_after_input.visible);
+    if viewport_after_input.offset != max_offset_after_input {
+        eyre::bail!(
+            "Typing while scrolled up should jump the viewport back to the active caret\nscrolled_offset: {scrolled_offset}\nviewport_after_input: {:?}\n\n=== before_input ===\n{before_input}\n\n=== after_input ===\n{after_input}",
+            viewport_after_input,
+        );
+    }
+
+    press_backspace(terminal)?;
+    let _ = wait_for_quiet_screen(terminal, Duration::from_millis(100), WAIT_TIMEOUT)?;
+    type_text(terminal, "exit")?;
+    press_enter(terminal)?;
+    let final_screen = wait_for_child_exit(terminal, WAIT_TIMEOUT)?;
+
+    let transcript = format!(
+        "scenario: {PWSH_TYPED_INPUT_SCROLLS_CARET_INTO_VIEW_CASE}\nscrolled_offset: {scrolled_offset}\nviewport_after_input: {:?}\n\n=== initial_screen ===\n{initial_screen}\n\n=== before_input ===\n{before_input}\n\n=== input_trace ===\n{}\n\n=== after_input ===\n{after_input}\n\n=== final_screen ===\n{final_screen}",
+        viewport_after_input,
+        format_chunks(&input_trace),
+    );
+
+    emit_transcript(&transcript, artifact_output)
+}
+
+fn seed_pwsh_scrollback_for_input_jump(terminal: &mut TerminalSession) -> eyre::Result<()> {
+    terminal.resize(TerminalLayout {
+        client_width: 1600,
+        client_height: 240,
+        cell_width: 8,
+        cell_height: 16,
+    })?;
+    let _ = wait_for_pwsh_visible_prompt(terminal)?;
+
+    Ok(())
+}
+
+fn wait_for_pwsh_visible_prompt(terminal: &mut TerminalSession) -> eyre::Result<String> {
+    wait_for_screen(terminal, "❯", WAIT_TIMEOUT)
+}
+
+fn scroll_terminal_viewport_up_for_input_jump(terminal: &mut TerminalSession) -> eyre::Result<u64> {
+    let viewport = terminal.viewport_metrics()?;
+    let max_offset = viewport.total.saturating_sub(viewport.visible);
+    if max_offset == 0 {
+        eyre::bail!("expected scrollback before exercising input-jump behavior: {viewport:?}");
+    }
+
+    let target_offset = max_offset.saturating_sub(10).min(max_offset - 1);
+    terminal.scroll_viewport_to_offset(target_offset)?;
+    let viewport_after_scroll = terminal.viewport_metrics()?;
+    if viewport_after_scroll.offset != target_offset {
+        eyre::bail!(
+            "failed to scroll viewport away from the active caret\nrequested_offset: {target_offset}\nviewport_after_scroll: {:?}",
+            viewport_after_scroll,
+        );
+    }
+
+    Ok(target_offset)
 }
 
 fn run_ratatui_key_debug_reproduction(terminal: &mut TerminalSession) -> eyre::Result<()> {

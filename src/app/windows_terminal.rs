@@ -417,6 +417,13 @@ impl RuntimeTerminalEngine {
         }
     }
 
+    fn scroll_active_cursor_into_view(&mut self) {
+        match self {
+            Self::Ghostty(engine) => engine.scroll_viewport(ScrollViewport::Bottom),
+            Self::Teamy(engine) => engine.scroll_active_cursor_into_view(),
+        }
+    }
+
     fn kitty_keyboard_flags(&self) -> eyre::Result<key::KittyKeyFlags> {
         match self {
             Self::Ghostty(engine) => engine.kitty_keyboard_flags(),
@@ -2403,8 +2410,24 @@ impl TerminalCore {
             .write_all(data)
             .wrap_err("failed to write input to PTY")?;
         writer.flush().wrap_err("failed to flush PTY input")?;
+        drop(writer);
         self.pending_input_response_starts.push_back(Instant::now());
         self.input_trace.push(data.to_vec());
+        self.scroll_active_cursor_into_view_after_input()?;
+        Ok(())
+    }
+
+    fn scroll_active_cursor_into_view_after_input(&mut self) -> eyre::Result<()> {
+        let viewport = self.viewport_metrics()?;
+        let max_offset = viewport.total.saturating_sub(viewport.visible);
+        if viewport.offset >= max_offset {
+            return Ok(());
+        }
+
+        self.engine.scroll_active_cursor_into_view();
+        self.repaint.needs_repaint = true;
+        self.repaint.full_repaint_pending = true;
+        self.invalidate_display_cache();
         Ok(())
     }
 

@@ -1409,7 +1409,7 @@ fn render_current_frame_with_options(
     let output_text = {
         #[cfg(feature = "tracy")]
         let _span = debug_span!("build_output_panel_text").entered();
-        build_output_panel_text(state, layout)
+        build_output_panel_text(state, layout)?
     };
     let terminal_display = {
         #[cfg(feature = "tracy")]
@@ -1514,12 +1514,11 @@ fn terminal_scrollbar_geometry(
     }
 
     let track_height = u64::try_from(scrollbar_rect.height().max(1)).ok()?;
-    let min_thumb_height = scrollbar_rect.width().max(22);
+    let track_height_i32 = scrollbar_rect.height().max(1);
+    let min_thumb_height = scrollbar_rect.width().max(22).min(track_height_i32);
     let proportional_thumb = (track_height.saturating_mul(scrollbar.visible) / scrollbar.total)
         .max(u64::try_from(min_thumb_height).ok()?);
-    let thumb_height = i32::try_from(proportional_thumb.min(track_height))
-        .ok()?
-        .clamp(min_thumb_height, scrollbar_rect.height().max(1));
+    let thumb_height = i32::try_from(proportional_thumb.min(track_height)).ok()?;
     let travel = (scrollbar_rect.height() - thumb_height).max(0);
     let max_offset = scrollbar.total.saturating_sub(scrollbar.visible);
     let clamped_offset = scrollbar.offset.min(max_offset);
@@ -1702,9 +1701,35 @@ fn terminal_cursor_overlay_rects(
     }
 }
 
-fn build_output_panel_text(state: &AppState, layout: TerminalLayout) -> String {
+fn build_output_panel_text(state: &mut AppState, layout: TerminalLayout) -> eyre::Result<String> {
     let (cols, rows) = effective_terminal_grid_size(layout);
-    if let Some(workspace_window) = &state.workspace_window {
+    let viewport = state.terminal.viewport_metrics()?;
+    let display = state.terminal.cached_display_state();
+    let caret = display.cursor.map_or_else(
+        || {
+            format!(
+                "caret offscreen | viewport {}+{} / {}",
+                viewport.offset, viewport.visible, viewport.total
+            )
+        },
+        |cursor| {
+            let screen_row =
+                i64::from(cursor.cell.row()) + i64::try_from(viewport.offset).unwrap_or(i64::MAX);
+            let screen_col = i64::from(cursor.cell.column());
+            format!(
+                "caret {},{} | screen {},{} | viewport {}+{} / {}",
+                cursor.cell.column() + 1,
+                cursor.cell.row() + 1,
+                screen_col + 1,
+                screen_row + 1,
+                viewport.offset,
+                viewport.visible,
+                viewport.total
+            )
+        },
+    );
+
+    Ok(if let Some(workspace_window) = &state.workspace_window {
         format!(
             "workspace {}\ncell {} of {}\n{} cols x {} rows",
             workspace_window.workspace.name,
@@ -1715,7 +1740,7 @@ fn build_output_panel_text(state: &AppState, layout: TerminalLayout) -> String {
         )
     } else {
         format!("standalone shell\n{cols} cols x {rows} rows")
-    }
+    } + &format!("\n{caret}"))
 }
 
 fn build_terminal_throughput_benchmark_output_panel_text(
@@ -3362,6 +3387,23 @@ mod tests {
 
         assert_eq!(top_offset, 0);
         assert_eq!(bottom_offset, geometry.max_offset);
+    }
+
+    #[test]
+    fn terminal_scrollbar_geometry_clamps_min_thumb_height_to_track_height() {
+        let rect = ClientRect::new(0, 0, 16, 12);
+        let geometry = terminal_scrollbar_geometry(
+            rect,
+            TerminalDisplayScrollbar {
+                total: 10,
+                offset: 0,
+                visible: 1,
+            },
+        )
+        .expect("scrollbar geometry should exist");
+
+        assert_eq!(geometry.thumb_height, rect.height());
+        assert_eq!(geometry.thumb_rect.bottom(), rect.bottom());
     }
 
     // behavior[verify window.interaction.drag]
