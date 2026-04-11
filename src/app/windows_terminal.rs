@@ -29,7 +29,9 @@ use crate::paths::AppHome;
 
 use super::VtEngineChoice;
 use super::spatial::{ClientRect, TerminalCellPoint};
-use super::teamy_terminal_engine::{TeamyColor, TeamyTerminalEngine, TeamyViewportMetrics};
+use super::teamy_terminal_engine::{
+    TeamyColor, TeamyCursorStyle, TeamyTerminalEngine, TeamyViewportMetrics,
+};
 use super::windows_terminal_engine::GhosttyTerminalEngine;
 
 pub const DRAG_STRIP_HEIGHT: i32 = 76;
@@ -2874,14 +2876,15 @@ fn build_teamy_display_state(
             rows.push(display_row);
         }
 
-        let cursor = (teamy_display.cursor.row < visible_rows).then(|| TerminalDisplayCursor {
-            cell: TerminalCellPoint::new(
-                i32::try_from(teamy_display.cursor.column).unwrap_or(i32::MAX),
-                i32::try_from(teamy_display.cursor.row).unwrap_or(i32::MAX),
-            ),
-            color: TEAMY_FOREGROUND,
-            style: TerminalDisplayCursorStyle::Block,
-        });
+        let cursor = (teamy_display.cursor_visible && teamy_display.cursor.row < visible_rows)
+            .then(|| TerminalDisplayCursor {
+                cell: TerminalCellPoint::new(
+                    i32::try_from(teamy_display.cursor.column).unwrap_or(i32::MAX),
+                    i32::try_from(teamy_display.cursor.row).unwrap_or(i32::MAX),
+                ),
+                color: TEAMY_FOREGROUND,
+                style: map_teamy_cursor_style(teamy_display.cursor.style),
+            });
 
         TerminalDisplayState {
             dirty_rows: (0..rows.len()).collect(),
@@ -3340,6 +3343,14 @@ fn map_cursor_style(style: CursorVisualStyle) -> TerminalDisplayCursorStyle {
         CursorVisualStyle::Underline => TerminalDisplayCursorStyle::Underline,
         CursorVisualStyle::BlockHollow => TerminalDisplayCursorStyle::BlockHollow,
         _ => TerminalDisplayCursorStyle::Block,
+    }
+}
+
+fn map_teamy_cursor_style(style: TeamyCursorStyle) -> TerminalDisplayCursorStyle {
+    match style {
+        TeamyCursorStyle::Block => TerminalDisplayCursorStyle::Block,
+        TeamyCursorStyle::Underline => TerminalDisplayCursorStyle::Underline,
+        TeamyCursorStyle::Bar => TerminalDisplayCursorStyle::Bar,
     }
 }
 

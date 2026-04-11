@@ -8,7 +8,8 @@ use libghostty_vt::TerminalOptions;
 use libghostty_vt::render::{CellIterator, RowIterator};
 
 use crate::app::teamy_terminal_engine::{
-    TeamyDisplayCursor, TeamyDisplayState, TeamyTerminalEngine, TeamyTraceSnapshot,
+    TeamyCursorStyle, TeamyDisplayCursor, TeamyDisplayState, TeamyTerminalEngine,
+    TeamyTraceSnapshot,
 };
 
 use super::windows_terminal_engine::GhosttyTerminalEngine;
@@ -178,7 +179,12 @@ fn run_ghostty_terminal_replay_sample(
             cols: usize::from(fixture.cols.max(1)),
             rows: usize::from(fixture.rows.max(1)),
             visible_rows: Vec::new(),
-            cursor: TeamyDisplayCursor { row: 0, column: 0 },
+            cursor: TeamyDisplayCursor {
+                row: 0,
+                column: 0,
+                style: TeamyCursorStyle::Block,
+            },
+            cursor_visible: true,
             total_rows: 0,
         },
         trace: TeamyTraceSnapshot { events: Vec::new() },

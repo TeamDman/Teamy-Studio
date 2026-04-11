@@ -11,7 +11,10 @@ type PtyWriteEffect = Box<dyn FnMut(&[u8]) + Send>;
 enum EscapeState {
     Ground,
     Escape,
-    Csi(String),
+    Csi {
+        parameters: String,
+        intermediates: String,
+    },
     Osc(String),
     OscEscape(String),
 }
@@ -58,6 +61,26 @@ impl TeamyCell {
     }
 }
 
+#[derive(Clone, Debug)]
+struct TeamySavedScreen {
+    visible_rows: Vec<Vec<TeamyCell>>,
+    scrollback_rows: Vec<Vec<TeamyCell>>,
+    viewport_offset: usize,
+    cursor_col: usize,
+    cursor_row: usize,
+    current_style: TeamyCellStyle,
+    cursor_style: TeamyCursorStyle,
+    cursor_visible: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TeamySavedCursor {
+    col: usize,
+    row: usize,
+    style: TeamyCursorStyle,
+    visible: bool,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Facet)]
 pub struct TeamyDisplayGlyph {
     pub row: usize,
@@ -98,6 +121,16 @@ pub struct TeamyDisplayRow {
 pub struct TeamyDisplayCursor {
     pub row: usize,
     pub column: usize,
+    pub style: TeamyCursorStyle,
+}
+
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Facet)]
+pub enum TeamyCursorStyle {
+    #[default]
+    Block,
+    Underline,
+    Bar,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Facet)]
@@ -106,6 +139,7 @@ pub struct TeamyDisplayState {
     pub rows: usize,
     pub visible_rows: Vec<TeamyDisplayRow>,
     pub cursor: TeamyDisplayCursor,
+    pub cursor_visible: bool,
     pub total_rows: usize,
 }
 
@@ -136,10 +170,14 @@ pub struct TeamyTerminalEngine {
     cursor_col: usize,
     cursor_row: usize,
     current_style: TeamyCellStyle,
+    cursor_style: TeamyCursorStyle,
+    cursor_visible: bool,
+    alternate_screen: Option<TeamySavedScreen>,
+    saved_cursor: Option<TeamySavedCursor>,
     pending_utf8: Vec<u8>,
     escape_state: EscapeState,
     trace_events: Vec<TeamyTraceEvent>,
-    warned_unsupported_csi: Vec<(String, char)>,
+    warned_unsupported_csi: Vec<(String, String, char)>,
     pty_write_effect: Option<PtyWriteEffect>,
 }
 
@@ -158,6 +196,10 @@ impl TeamyTerminalEngine {
             cursor_col: 0,
             cursor_row: 0,
             current_style: TeamyCellStyle::default(),
+            cursor_style: TeamyCursorStyle::Block,
+            cursor_visible: true,
+            alternate_screen: None,
+            saved_cursor: None,
             pending_utf8: Vec::new(),
             escape_state: EscapeState::Ground,
             trace_events: Vec::new(),
@@ -263,6 +305,7 @@ impl TeamyTerminalEngine {
         TeamyDisplayCursor {
             row: self.scrollback_rows.len().saturating_add(self.cursor_row),
             column: self.cursor_col.min(self.cols.saturating_sub(1)),
+            style: self.cursor_style,
         }
     }
 
@@ -432,7 +475,9 @@ impl TeamyTerminalEngine {
                 cursor: TeamyDisplayCursor {
                     row: cursor_screen.row.saturating_sub(viewport_offset),
                     column: cursor_screen.column,
+                    style: cursor_screen.style,
                 },
+                cursor_visible: self.cursor_visible,
                 total_rows: self.total_rows(),
             }
         }
@@ -476,7 +521,10 @@ impl TeamyTerminalEngine {
                     EscapeState::Escape => match character {
                         '[' => {
                             self.record_event("csi-start", None, None, None);
-                            self.escape_state = EscapeState::Csi(String::new());
+                            self.escape_state = EscapeState::Csi {
+                                parameters: String::new(),
+                                intermediates: String::new(),
+                            };
                         }
                         ']' => {
                             self.record_event("osc-start", None, None, None);
@@ -491,14 +539,31 @@ impl TeamyTerminalEngine {
                             );
                         }
                     },
-                    EscapeState::Csi(mut parameters) => {
-                        if matches!(character, '0'..='9' | ';' | '?' | '>') {
+                    EscapeState::Csi {
+                        mut parameters,
+                        mut intermediates,
+                    } => {
+                        if intermediates.is_empty()
+                            && matches!(character, '0'..='9' | ';' | '?' | '>')
+                        {
                             parameters.push(character);
-                            self.escape_state = EscapeState::Csi(parameters);
+                            self.escape_state = EscapeState::Csi {
+                                parameters,
+                                intermediates,
+                            };
                             continue;
                         }
 
-                        self.apply_csi(&parameters, character);
+                        if (' '..='/').contains(&character) {
+                            intermediates.push(character);
+                            self.escape_state = EscapeState::Csi {
+                                parameters,
+                                intermediates,
+                            };
+                            continue;
+                        }
+
+                        self.apply_csi(&parameters, &intermediates, character);
                     }
                     EscapeState::Osc(mut payload) => match character {
                         '\u{07}' => self.apply_osc(&payload),
@@ -526,7 +591,7 @@ impl TeamyTerminalEngine {
         self.record_event("osc", Some(payload.to_owned()), None, None);
     }
 
-    fn apply_csi(&mut self, parameters: &str, final_byte: char) {
+    fn apply_csi(&mut self, parameters: &str, intermediates: &str, final_byte: char) {
         let () = {
             #[cfg(feature = "tracy")]
             let _span = debug_span!("teamy_terminal_apply_csi").entered();
@@ -535,8 +600,18 @@ impl TeamyTerminalEngine {
                 "csi",
                 Some(final_byte.to_string()),
                 None,
-                Some(parameters.to_owned()),
+                Some(if intermediates.is_empty() {
+                    parameters.to_owned()
+                } else {
+                    format!("{parameters}|{intermediates}")
+                }),
             );
+
+            if intermediates == " " && final_byte == 'q' {
+                self.apply_cursor_style(parameters);
+                return;
+            }
+
             match final_byte {
                 'C' => {
                     let count = parameters
@@ -606,7 +681,9 @@ impl TeamyTerminalEngine {
                         .unwrap_or(1);
                     self.delete_character(count.max(1));
                 }
-                'h' | 'l' | 't' => self.record_event(
+                'h' => self.apply_mode(parameters, true),
+                'l' => self.apply_mode(parameters, false),
+                't' => self.record_event(
                     "ignored-csi",
                     Some(final_byte.to_string()),
                     None,
@@ -615,8 +692,60 @@ impl TeamyTerminalEngine {
                 'm' => self.apply_sgr(parameters),
                 'c' => self.reply_device_attributes(parameters),
                 'n' => self.reply_device_status_report(parameters),
-                _ => self.warn_unsupported_csi(parameters, final_byte),
+                _ => self.warn_unsupported_csi(parameters, intermediates, final_byte),
             }
+        };
+    }
+
+    fn apply_mode(&mut self, parameters: &str, enabled: bool) {
+        self.record_event(
+            if enabled { "set-mode" } else { "reset-mode" },
+            None,
+            None,
+            Some(parameters.to_owned()),
+        );
+
+        match parameters {
+            "?25" => self.cursor_visible = enabled,
+            "?1047" | "?1049" => {
+                if enabled {
+                    if parameters == "?1049" {
+                        self.save_cursor_state();
+                    }
+                    self.enter_alternate_screen();
+                } else {
+                    self.exit_alternate_screen();
+                    if parameters == "?1049" {
+                        self.restore_cursor_state();
+                    }
+                }
+            }
+            "?1048" => {
+                if enabled {
+                    self.save_cursor_state();
+                } else {
+                    self.restore_cursor_state();
+                }
+            }
+            _ => self.record_event(
+                "ignored-csi",
+                Some(if enabled {
+                    "h".to_owned()
+                } else {
+                    "l".to_owned()
+                }),
+                None,
+                Some(parameters.to_owned()),
+            ),
+        }
+    }
+
+    fn apply_cursor_style(&mut self, parameters: &str) {
+        self.record_event("cursor-style", None, None, Some(parameters.to_owned()));
+        self.cursor_style = match parameters.parse::<u8>().unwrap_or(0) {
+            3 | 4 => TeamyCursorStyle::Underline,
+            5 | 6 => TeamyCursorStyle::Bar,
+            _ => TeamyCursorStyle::Block,
         };
     }
 
@@ -679,7 +808,7 @@ impl TeamyTerminalEngine {
             );
             self.emit_pty_write(response.as_ref());
         } else {
-            self.warn_unsupported_csi(parameters, 'c');
+            self.warn_unsupported_csi(parameters, "", 'c');
         }
     }
 
@@ -704,12 +833,12 @@ impl TeamyTerminalEngine {
             );
             self.emit_pty_write(response.as_bytes());
         } else {
-            self.warn_unsupported_csi(parameters, 'n');
+            self.warn_unsupported_csi(parameters, "", 'n');
         }
     }
 
-    fn warn_unsupported_csi(&mut self, parameters: &str, final_byte: char) {
-        let key = (parameters.to_owned(), final_byte);
+    fn warn_unsupported_csi(&mut self, parameters: &str, intermediates: &str, final_byte: char) {
+        let key = (parameters.to_owned(), intermediates.to_owned(), final_byte);
         if self.warned_unsupported_csi.contains(&key) {
             return;
         }
@@ -717,6 +846,7 @@ impl TeamyTerminalEngine {
         self.warned_unsupported_csi.push(key);
         warn!(
             parameters,
+            intermediates,
             final_byte = %final_byte,
             requires_terminal_response =
                 csi_likely_requires_terminal_response(parameters, final_byte),
@@ -890,6 +1020,68 @@ impl TeamyTerminalEngine {
         }
     }
 
+    fn save_cursor_state(&mut self) {
+        self.saved_cursor = Some(TeamySavedCursor {
+            col: self.cursor_col,
+            row: self.cursor_row,
+            style: self.cursor_style,
+            visible: self.cursor_visible,
+        });
+    }
+
+    fn restore_cursor_state(&mut self) {
+        let Some(saved_cursor) = self.saved_cursor.take() else {
+            return;
+        };
+
+        self.cursor_col = saved_cursor.col.min(self.cols.saturating_sub(1));
+        self.cursor_row = saved_cursor.row.min(self.rows.saturating_sub(1));
+        self.cursor_style = saved_cursor.style;
+        self.cursor_visible = saved_cursor.visible;
+    }
+
+    fn enter_alternate_screen(&mut self) {
+        if self.alternate_screen.is_some() {
+            return;
+        }
+
+        self.alternate_screen = Some(TeamySavedScreen {
+            visible_rows: self.visible_rows.clone(),
+            scrollback_rows: self.scrollback_rows.clone(),
+            viewport_offset: self.viewport_offset,
+            cursor_col: self.cursor_col,
+            cursor_row: self.cursor_row,
+            current_style: self.current_style,
+            cursor_style: self.cursor_style,
+            cursor_visible: self.cursor_visible,
+        });
+
+        self.visible_rows = vec![vec![TeamyCell::blank(); self.cols]; self.rows];
+        self.scrollback_rows.clear();
+        self.viewport_offset = 0;
+        self.cursor_col = 0;
+        self.cursor_row = 0;
+        self.current_style = TeamyCellStyle::default();
+        self.cursor_style = TeamyCursorStyle::Block;
+        self.cursor_visible = true;
+    }
+
+    fn exit_alternate_screen(&mut self) {
+        let Some(saved_screen) = self.alternate_screen.take() else {
+            return;
+        };
+
+        self.visible_rows = saved_screen.visible_rows;
+        self.scrollback_rows = saved_screen.scrollback_rows;
+        self.viewport_offset = saved_screen.viewport_offset;
+        self.cursor_col = saved_screen.cursor_col;
+        self.cursor_row = saved_screen.cursor_row;
+        self.current_style = saved_screen.current_style;
+        self.cursor_style = saved_screen.cursor_style;
+        self.cursor_visible = saved_screen.cursor_visible;
+        self.clamp_viewport_offset();
+    }
+
     fn record_event(
         &mut self,
         action: &str,
@@ -970,7 +1162,7 @@ mod tests {
     use libghostty_vt::terminal::ScrollViewport;
     use std::sync::{Arc, Mutex};
 
-    use super::{TeamyColor, TeamyDisplayCursor, TeamyTerminalEngine};
+    use super::{TeamyColor, TeamyCursorStyle, TeamyTerminalEngine};
 
     fn capture_pty_writes(engine: &mut TeamyTerminalEngine) -> Arc<Mutex<Vec<Vec<u8>>>> {
         let writes = Arc::new(Mutex::new(Vec::new()));
@@ -1242,6 +1434,8 @@ mod tests {
             display.visible_rows[1].glyphs[0].foreground,
             TeamyColor::Default
         );
+        assert_eq!(display.cursor.style, TeamyCursorStyle::Block);
+        assert!(display.cursor_visible);
     }
 
     #[test]
@@ -1278,6 +1472,37 @@ mod tests {
 
         assert_eq!(cells[0].background, TeamyColor::Rgb { r: 1, g: 2, b: 3 });
         assert_eq!(cells[0].character, ' ');
+    }
+
+    #[test]
+    fn csi_cursor_style_sequence_with_space_intermediate_updates_cursor_style() {
+        let mut engine = TeamyTerminalEngine::new(8, 2, 8);
+        engine.vt_write(b"\x1b[6 q");
+
+        assert_eq!(engine.display_state().cursor.style, TeamyCursorStyle::Bar);
+    }
+
+    #[test]
+    fn alternate_screen_restore_recovers_normal_screen() {
+        let mut engine = TeamyTerminalEngine::new(16, 4, 16);
+        engine.vt_write(b"shell\r\nprompt\r\n");
+
+        engine.vt_write(b"\x1b[?1049hhello from alt");
+        assert!(engine.visible_text().contains("hello from alt"));
+
+        engine.vt_write(b"\x1b[?1049l");
+
+        assert_eq!(engine.visible_text(), "shell\nprompt");
+    }
+
+    #[test]
+    fn private_cursor_visibility_mode_hides_cursor_until_restored() {
+        let mut engine = TeamyTerminalEngine::new(8, 2, 8);
+        engine.vt_write(b"\x1b[?25l");
+        assert!(!engine.display_state().cursor_visible);
+
+        engine.vt_write(b"\x1b[?25h");
+        assert!(engine.display_state().cursor_visible);
     }
 
     #[test]
@@ -1349,7 +1574,8 @@ mod tests {
         engine.resize(8, 5);
         let after_restore = engine.cursor_screen_position();
 
-        assert_eq!(before, TeamyDisplayCursor { row: 1, column: 2 });
+        assert_eq!(before.row, 1);
+        assert_eq!(before.column, 2);
         assert_eq!(after_shrink, before);
         assert_eq!(after_restore, before);
         assert_eq!(engine.visible_text(), "~\n>");
