@@ -52,7 +52,7 @@ use super::windows_terminal::{
     TerminalDisplayScrollbar, TerminalDisplayState, TerminalLayout, TerminalPerformanceSnapshot,
     TerminalSelection, TerminalSelectionMode, TerminalSession, keyboard_mods,
 };
-use super::{TerminalThroughputBenchmarkMode, WorkspaceWindowState};
+use super::{TerminalThroughputBenchmarkMode, VtEngineChoice, WorkspaceWindowState};
 
 unsafe extern "system" {
     fn SetCapture(hwnd: HWND) -> HWND;
@@ -413,6 +413,7 @@ pub fn run(
     app_home: &AppHome,
     working_dir: Option<&Path>,
     workspace_window: Option<WorkspaceWindowState>,
+    vt_engine: VtEngineChoice,
 ) -> eyre::Result<()> {
     let window_thread = WindowThread::current();
     let terminal_font_height = TERMINAL_FONT_HEIGHT;
@@ -431,7 +432,7 @@ pub fn run(
     .in_scope(|| measure_terminal_cell_size(output_font_height))?;
     let focused_render_interval_ms = measure_focused_render_interval_ms();
     let terminal = info_span!("create_terminal_session")
-        .in_scope(|| TerminalSession::new(app_home, working_dir))?;
+        .in_scope(|| TerminalSession::new(app_home, working_dir, vt_engine))?;
 
     APP_STATE.with(|state| {
         *state.borrow_mut() = Some(AppState {
@@ -598,6 +599,16 @@ struct TerminalPerformanceSnapshotReport {
     total_queue_latency_us: u64,
     average_queue_latency_ms: f64,
     max_queue_latency_ms: f64,
+    input_response_latency_observations: u64,
+    max_input_response_latency_us: u64,
+    total_input_response_latency_us: u64,
+    average_input_response_latency_ms: f64,
+    max_input_response_latency_ms: f64,
+    input_present_latency_observations: u64,
+    max_input_present_latency_us: u64,
+    total_input_present_latency_us: u64,
+    average_input_present_latency_ms: f64,
+    max_input_present_latency_ms: f64,
 }
 
 impl TerminalThroughputBenchmarkScenarioResult {
@@ -695,7 +706,7 @@ pub fn run_terminal_throughput_self_test(
             let result = run_terminal_throughput_self_test_sample(plan)?;
             if samples > 1 {
                 println!(
-                    "scenario: {}\nsample: {}\nmeasure_command_ms: {:.3}\ngraphical_completion_ms: {:.3}\ndelta_ms: {:.3}\nratio: {:.3}\nframes_rendered: {}\nmax_pending_output_bytes: {}\navg_pending_output_bytes: {:.3}\nmax_queue_latency_ms: {:.3}\nvt_write_calls: {}\nvt_write_bytes: {}\ndisplay_publications: {}\ndirty_rows_published: {}\nterminal_closed: {}\n",
+                    "scenario: {}\nsample: {}\nmeasure_command_ms: {:.3}\ngraphical_completion_ms: {:.3}\ndelta_ms: {:.3}\nratio: {:.3}\nframes_rendered: {}\nmax_pending_output_bytes: {}\navg_pending_output_bytes: {:.3}\nmax_queue_latency_ms: {:.3}\nmax_input_response_latency_ms: {:.3}\nmax_input_present_latency_ms: {:.3}\nvt_write_calls: {}\nvt_write_bytes: {}\ndisplay_publications: {}\ndirty_rows_published: {}\nterminal_closed: {}\n",
                     terminal_throughput_mode_name(plan.mode),
                     sample_index + 1,
                     result.measure_command_ms,
@@ -706,6 +717,8 @@ pub fn run_terminal_throughput_self_test(
                     result.performance.max_pending_output_bytes,
                     result.performance.average_pending_output_bytes(),
                     result.performance.max_queue_latency_ms(),
+                    result.performance.max_input_response_latency_ms(),
+                    result.performance.max_input_present_latency_ms(),
                     result.performance.vt_write_calls,
                     result.performance.vt_write_bytes,
                     result.performance.display_publications,
@@ -753,7 +766,7 @@ fn run_terminal_throughput_self_test_sample(
     .in_scope(|| measure_terminal_cell_size(output_font_height))?;
     let command = terminal_throughput_benchmark_command(plan.mode, plan.line_count)?;
     let mut terminal = info_span!("create_terminal_benchmark_session")
-        .in_scope(|| TerminalSession::new_with_command(command))?;
+        .in_scope(|| TerminalSession::new_with_command(command, VtEngineChoice::Ghostty))?;
     let hwnd = info_span!("create_terminal_benchmark_window")
         .in_scope(|| create_benchmark_window(window_thread))?;
     let renderer = info_span!("create_terminal_benchmark_renderer")
@@ -980,8 +993,12 @@ fn create_benchmark_window(window_thread: WindowThread) -> eyre::Result<WindowHa
 fn message_loop() -> eyre::Result<()> {
     loop {
         let mut message = MSG::default();
-        // Safety: `message` is a valid out-pointer for GetMessageW on this UI thread.
-        let status = unsafe { GetMessageW(&raw mut message, None, 0, 0) };
+        let status = {
+            #[cfg(feature = "tracy")]
+            let _span = debug_span!("wait_for_window_message").entered();
+            // Safety: `message` is a valid out-pointer for GetMessageW on this UI thread.
+            unsafe { GetMessageW(&raw mut message, None, 0, 0) }
+        };
         if status.0 == -1 {
             eyre::bail!("failed to get next window message")
         }
@@ -1443,6 +1460,7 @@ fn render_current_frame_with_options(
             renderer.render_frame_model(frame)?;
         }
     };
+    state.terminal.note_frame_presented();
     Ok(())
 }
 
@@ -1744,7 +1762,7 @@ fn print_terminal_throughput_scenario_summary(
 ) -> eyre::Result<()> {
     let last_result = scenario_result.last_result()?;
     println!(
-        "scenario: {}\nline_count: {}\nsamples: {}\nmeasure_command_ms: {:.3}\ngraphical_completion_ms: {:.3}\ndelta_ms: {:.3}\nratio: {:.3}\nframes_rendered: {}\nmax_pending_output_bytes: {}\navg_pending_output_bytes: {:.3}\nmax_queue_latency_ms: {:.3}\nvt_write_calls: {}\nvt_write_bytes: {}\ndisplay_publications: {}\ndirty_rows_published: {}\nterminal_closed: {}\n\n=== final_screen ===\n{}",
+        "scenario: {}\nline_count: {}\nsamples: {}\nmeasure_command_ms: {:.3}\ngraphical_completion_ms: {:.3}\ndelta_ms: {:.3}\nratio: {:.3}\nframes_rendered: {}\nmax_pending_output_bytes: {}\navg_pending_output_bytes: {:.3}\nmax_queue_latency_ms: {:.3}\nmax_input_response_latency_ms: {:.3}\nmax_input_present_latency_ms: {:.3}\nvt_write_calls: {}\nvt_write_bytes: {}\ndisplay_publications: {}\ndirty_rows_published: {}\nterminal_closed: {}\n\n=== final_screen ===\n{}",
         terminal_throughput_mode_name(scenario_result.plan.mode),
         scenario_result.plan.line_count,
         scenario_result.sample_results.len(),
@@ -1756,6 +1774,12 @@ fn print_terminal_throughput_scenario_summary(
         scenario_result.median_max_pending_output_bytes(),
         scenario_result.median_avg_pending_output_bytes(),
         scenario_result.median_max_queue_latency_ms(),
+        median_sample_metric(&scenario_result.sample_results, |result| {
+            result.performance.max_input_response_latency_ms()
+        }),
+        median_sample_metric(&scenario_result.sample_results, |result| {
+            result.performance.max_input_present_latency_ms()
+        }),
         scenario_result.median_vt_write_calls(),
         scenario_result.median_vt_write_bytes(),
         scenario_result.median_display_publications(),
@@ -1873,6 +1897,30 @@ fn terminal_throughput_sample_report(
             total_queue_latency_us: sample_result.performance.total_queue_latency_us,
             average_queue_latency_ms: sample_result.performance.average_queue_latency_ms(),
             max_queue_latency_ms: sample_result.performance.max_queue_latency_ms(),
+            input_response_latency_observations: sample_result
+                .performance
+                .input_response_latency_observations,
+            max_input_response_latency_us: sample_result.performance.max_input_response_latency_us,
+            total_input_response_latency_us: sample_result
+                .performance
+                .total_input_response_latency_us,
+            average_input_response_latency_ms: sample_result
+                .performance
+                .average_input_response_latency_ms(),
+            max_input_response_latency_ms: sample_result
+                .performance
+                .max_input_response_latency_ms(),
+            input_present_latency_observations: sample_result
+                .performance
+                .input_present_latency_observations,
+            max_input_present_latency_us: sample_result.performance.max_input_present_latency_us,
+            total_input_present_latency_us: sample_result
+                .performance
+                .total_input_present_latency_us,
+            average_input_present_latency_ms: sample_result
+                .performance
+                .average_input_present_latency_ms(),
+            max_input_present_latency_ms: sample_result.performance.max_input_present_latency_ms(),
         },
         last_screen: sample_result.last_screen.clone(),
     }

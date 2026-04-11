@@ -1,4 +1,6 @@
 use crate::cli::self_test::keyboard_input::SelfTestKeyboardInputArgs;
+use crate::cli::self_test::render_offscreen::SelfTestRenderOffscreenArgs;
+use crate::cli::self_test::terminal_replay::SelfTestTerminalReplayArgs;
 use crate::cli::self_test::terminal_throughput::SelfTestTerminalThroughputArgs;
 use arbitrary::Arbitrary;
 use facet::Facet;
@@ -25,6 +27,12 @@ pub enum SelfTestCommand {
     /// cli[impl command.surface.self-test-terminal-throughput]
     /// Run the terminal throughput benchmark.
     TerminalThroughput(SelfTestTerminalThroughputArgs),
+    /// cli[impl command.surface.self-test-terminal-replay]
+    /// Run a headless terminal transcript replay.
+    TerminalReplay(SelfTestTerminalReplayArgs),
+    /// cli[impl command.surface.self-test-render-offscreen]
+    /// Run a headless offscreen terminal render self-test.
+    RenderOffscreen(SelfTestRenderOffscreenArgs),
 }
 
 impl SelfTestArgs {
@@ -39,6 +47,8 @@ impl SelfTestArgs {
         match self.command {
             SelfTestCommand::KeyboardInput(args) => args.invoke(app_home, cache_home),
             SelfTestCommand::TerminalThroughput(args) => args.invoke(app_home, cache_home),
+            SelfTestCommand::TerminalReplay(args) => args.invoke(app_home, cache_home),
+            SelfTestCommand::RenderOffscreen(args) => args.invoke(app_home, cache_home),
         }
     }
 }

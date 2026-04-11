@@ -4,6 +4,12 @@ G:\Programming\Repos\Teamy-Studio
 There is the smooth-but-slow branch checked out as a worktree.
 G:\Programming\Repos\teamy-studio-smooth-but-slow
 
+Status note:
+
+- this document remains useful as a record of measured findings and already-landed pipeline work
+- future implementation planning is now centered on [docs/notes/terminal-engine-replacement-plan.md](docs/notes/terminal-engine-replacement-plan.md)
+- in particular, the earlier "keep libghostty for now" direction should be treated as historical context rather than the current plan
+
 This document turns the current investigation into an execution plan.
 
 The core conclusion from the investigation is:

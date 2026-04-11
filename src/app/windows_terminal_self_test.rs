@@ -1,6 +1,8 @@
 use eyre::Context;
 use libghostty_vt::key;
+use std::fs;
 use std::io::{self, Write};
+use std::path::Path;
 use std::thread;
 use std::time::{Duration, Instant};
 use windows::Win32::System::Console::{
@@ -26,19 +28,33 @@ const CTRL_D_EXIT_COMMAND: &[u8] = b"exit\r";
 const PWSH_CTRL_D_AT_PROMPT_CASE: &str = "pwsh-ctrl-d-at-prompt";
 const PWSH_NESTED_CTRL_D_CASE: &str = "pwsh-nested-ctrl-d";
 const PWSH_CTRL_D_AFTER_TYPED_INPUT_CASE: &str = "pwsh-ctrl-d-after-typed-input";
+const PWSH_CTRL_L_REDRAW_CASE: &str = "pwsh-ctrl-l-redraw";
 const WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 const PROBE_DETECTION_TIMEOUT: Duration = Duration::from_millis(250);
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
+const MAX_CTRL_L_RESPONSE_LATENCY_MS: f64 = 1000.0;
+const MAX_CTRL_L_PRESENT_LATENCY_MS: f64 = 1000.0;
 
-pub fn run(app_home: &AppHome, inside: bool, scenario: Option<&str>) -> eyre::Result<()> {
+pub fn run(
+    app_home: &AppHome,
+    inside: bool,
+    scenario: Option<&str>,
+    artifact_output: Option<&Path>,
+    vt_engine: super::VtEngineChoice,
+) -> eyre::Result<()> {
     if inside {
         run_inside()
     } else {
-        run_outside(app_home, scenario)
+        run_outside(app_home, scenario, artifact_output, vt_engine)
     }
 }
 
-fn run_outside(app_home: &AppHome, scenario: Option<&str>) -> eyre::Result<()> {
+fn run_outside(
+    app_home: &AppHome,
+    scenario: Option<&str>,
+    artifact_output: Option<&Path>,
+    vt_engine: super::VtEngineChoice,
+) -> eyre::Result<()> {
     let scenario = scenario
         .map(std::borrow::ToOwned::to_owned)
         .or_else(|| std::env::var("TEAMY_KEYBOARD_SELF_TEST_CASE").ok());
@@ -48,9 +64,9 @@ fn run_outside(app_home: &AppHome, scenario: Option<&str>) -> eyre::Result<()> {
             "pwsh.exe".to_owned(),
             "-NoLogo".to_owned(),
         ])?;
-        TerminalSession::new_with_command(command)?
+        TerminalSession::new_with_command(command, vt_engine)?
     } else {
-        TerminalSession::new(app_home, None)?
+        TerminalSession::new(app_home, None, vt_engine)?
     };
     terminal.resize(TerminalLayout {
         client_width: 1600,
@@ -59,24 +75,10 @@ fn run_outside(app_home: &AppHome, scenario: Option<&str>) -> eyre::Result<()> {
         cell_height: 16,
     })?;
 
-    if scenario.as_deref() == Some("default-cmd-enter") {
-        return run_default_cmd_enter_reproduction(&mut terminal);
-    }
-
-    if scenario.as_deref() == Some("default-cmd-ratatui-key-debug") {
-        return run_default_cmd_ratatui_key_debug_reproduction(&mut terminal);
-    }
-
-    if scenario.as_deref() == Some(PWSH_CTRL_D_AT_PROMPT_CASE) {
-        return run_pwsh_ctrl_d_at_prompt_reproduction(&mut terminal);
-    }
-
-    if scenario.as_deref() == Some(PWSH_NESTED_CTRL_D_CASE) {
-        return run_pwsh_nested_ctrl_d_reproduction(&mut terminal);
-    }
-
-    if scenario.as_deref() == Some(PWSH_CTRL_D_AFTER_TYPED_INPUT_CASE) {
-        return run_pwsh_ctrl_d_after_typed_input_reproduction(&mut terminal);
+    if let Some(result) =
+        try_run_named_scenario(&mut terminal, scenario.as_deref(), artifact_output)?
+    {
+        return Ok(result);
     }
 
     if wait_for_screen(
@@ -154,11 +156,41 @@ fn run_outside(app_home: &AppHome, scenario: Option<&str>) -> eyre::Result<()> {
         transcript: &transcript,
     })?;
 
-    println!("{transcript}");
-    Ok(())
+    emit_transcript(&transcript, artifact_output)
 }
 
-fn run_default_cmd_enter_reproduction(terminal: &mut TerminalSession) -> eyre::Result<()> {
+fn try_run_named_scenario(
+    terminal: &mut TerminalSession,
+    scenario: Option<&str>,
+    artifact_output: Option<&Path>,
+) -> eyre::Result<Option<()>> {
+    let Some(scenario) = scenario else {
+        return Ok(None);
+    };
+
+    let result = match scenario {
+        "default-cmd-enter" => run_default_cmd_enter_reproduction(terminal, artifact_output),
+        "default-cmd-ratatui-key-debug" => {
+            run_default_cmd_ratatui_key_debug_reproduction(terminal, artifact_output)
+        }
+        PWSH_CTRL_D_AT_PROMPT_CASE => {
+            run_pwsh_ctrl_d_at_prompt_reproduction(terminal, artifact_output)
+        }
+        PWSH_NESTED_CTRL_D_CASE => run_pwsh_nested_ctrl_d_reproduction(terminal, artifact_output),
+        PWSH_CTRL_D_AFTER_TYPED_INPUT_CASE => {
+            run_pwsh_ctrl_d_after_typed_input_reproduction(terminal, artifact_output)
+        }
+        PWSH_CTRL_L_REDRAW_CASE => run_pwsh_ctrl_l_redraw_reproduction(terminal, artifact_output),
+        _ => return Ok(None),
+    };
+
+    result.map(Some)
+}
+
+fn run_default_cmd_enter_reproduction(
+    terminal: &mut TerminalSession,
+    artifact_output: Option<&Path>,
+) -> eyre::Result<()> {
     let _ = wait_for_quiet_screen(terminal, Duration::from_millis(150), WAIT_TIMEOUT)?;
 
     type_text(terminal, "echo hi")?;
@@ -169,12 +201,15 @@ fn run_default_cmd_enter_reproduction(terminal: &mut TerminalSession) -> eyre::R
         eyre::bail!("default cmd Enter did not run `echo hi`\n\n{screen}");
     }
 
-    println!("=== default_cmd_enter ===\n{screen}");
-    Ok(())
+    emit_transcript(
+        &format!("=== default_cmd_enter ===\n{screen}"),
+        artifact_output,
+    )
 }
 
 fn run_default_cmd_ratatui_key_debug_reproduction(
     terminal: &mut TerminalSession,
+    artifact_output: Option<&Path>,
 ) -> eyre::Result<()> {
     let ratatui_path = std::env::var("TEAMY_KEYBOARD_SELF_TEST_RATATUI_PATH")
         .unwrap_or_else(|_| DEFAULT_RATATUI_KEY_DEBUG_PATH.to_owned());
@@ -210,11 +245,13 @@ fn run_default_cmd_ratatui_key_debug_reproduction(
         "launched: {ratatui_path}\nkitty_flags: {initial_flags:?}\n\n=== after_a_release ===\n{after_a_release}\n\n=== after_ctrl_backspace_press ===\n{after_ctrl_backspace_press}\n\n=== after_ratatui_exit ===\n{after_ratatui_exit}\n\n=== final_screen ===\n{final_screen}"
     );
 
-    println!("{transcript}");
-    Ok(())
+    emit_transcript(&transcript, artifact_output)
 }
 
-fn run_pwsh_ctrl_d_at_prompt_reproduction(terminal: &mut TerminalSession) -> eyre::Result<()> {
+fn run_pwsh_ctrl_d_at_prompt_reproduction(
+    terminal: &mut TerminalSession,
+    artifact_output: Option<&Path>,
+) -> eyre::Result<()> {
     let initial_screen = wait_for_semantic_prompt(terminal, WAIT_TIMEOUT)?;
     let _ = terminal.take_input_trace();
 
@@ -235,11 +272,13 @@ fn run_pwsh_ctrl_d_at_prompt_reproduction(terminal: &mut TerminalSession) -> eyr
         format_chunks(&input_trace),
     );
 
-    println!("{transcript}");
-    Ok(())
+    emit_transcript(&transcript, artifact_output)
 }
 
-fn run_pwsh_nested_ctrl_d_reproduction(terminal: &mut TerminalSession) -> eyre::Result<()> {
+fn run_pwsh_nested_ctrl_d_reproduction(
+    terminal: &mut TerminalSession,
+    artifact_output: Option<&Path>,
+) -> eyre::Result<()> {
     let initial_screen = wait_for_semantic_prompt(terminal, WAIT_TIMEOUT)?;
 
     type_text(terminal, "pwsh")?;
@@ -265,12 +304,12 @@ fn run_pwsh_nested_ctrl_d_reproduction(terminal: &mut TerminalSession) -> eyre::
         "scenario: {PWSH_NESTED_CTRL_D_CASE}\n\n=== initial_screen ===\n{initial_screen}\n\n=== nested_screen ===\n{nested_screen}\n\n=== after_ctrl_d ===\n{after_ctrl_d}\n\n=== final_screen ===\n{final_screen}"
     );
 
-    println!("{transcript}");
-    Ok(())
+    emit_transcript(&transcript, artifact_output)
 }
 
 fn run_pwsh_ctrl_d_after_typed_input_reproduction(
     terminal: &mut TerminalSession,
+    artifact_output: Option<&Path>,
 ) -> eyre::Result<()> {
     let initial_screen = wait_for_semantic_prompt(terminal, WAIT_TIMEOUT)?;
     let _ = terminal.take_input_trace();
@@ -307,8 +346,103 @@ fn run_pwsh_ctrl_d_after_typed_input_reproduction(
         format_chunks(&input_trace),
     );
 
-    println!("{transcript}");
-    Ok(())
+    emit_transcript(&transcript, artifact_output)
+}
+
+fn run_pwsh_ctrl_l_redraw_reproduction(
+    terminal: &mut TerminalSession,
+    artifact_output: Option<&Path>,
+) -> eyre::Result<()> {
+    const CLEAR_ME_MARKER: &str = "TEAMY_CTRL_L_CLEAR_ME";
+
+    let initial_screen = wait_for_semantic_prompt(terminal, WAIT_TIMEOUT)?;
+    let _ = terminal.take_input_trace();
+
+    type_text(terminal, &format!("Write-Host {CLEAR_ME_MARKER}"))?;
+    press_enter(terminal)?;
+    let _ = wait_for_screen(terminal, CLEAR_ME_MARKER, WAIT_TIMEOUT)?;
+    let _ = wait_for_semantic_prompt(terminal, WAIT_TIMEOUT)?;
+
+    type_text(terminal, "echo hello")?;
+    let before_ctrl_l = wait_for_quiet_screen(terminal, Duration::from_millis(150), WAIT_TIMEOUT)?;
+    let latency_before_ctrl_l = terminal.performance_snapshot()?;
+    let _ = terminal.take_input_trace();
+
+    press_ctrl_l(terminal)?;
+    let input_trace = terminal.take_input_trace();
+    let after_ctrl_l = wait_for_quiet_screen(terminal, Duration::from_millis(250), WAIT_TIMEOUT)?;
+    let latency_after_ctrl_l = terminal.performance_snapshot()?;
+    let (markers_observed, at_shell_prompt, awaiting_input) = terminal.semantic_prompt_state();
+
+    let ctrl_l_response_latency_ms = delta_latency_ms(
+        latency_before_ctrl_l.total_input_response_latency_us,
+        latency_after_ctrl_l.total_input_response_latency_us,
+        latency_before_ctrl_l.input_response_latency_observations,
+        latency_after_ctrl_l.input_response_latency_observations,
+    )
+    .ok_or_else(|| {
+        eyre::eyre!(
+            "Ctrl+L redraw did not record any input-response latency sample\n\n=== before_ctrl_l ===\n{before_ctrl_l}\n\n=== after_ctrl_l ===\n{after_ctrl_l}"
+        )
+    })?;
+    let ctrl_l_present_latency_ms = delta_latency_ms(
+        latency_before_ctrl_l.total_input_present_latency_us,
+        latency_after_ctrl_l.total_input_present_latency_us,
+        latency_before_ctrl_l.input_present_latency_observations,
+        latency_after_ctrl_l.input_present_latency_observations,
+    )
+    .ok_or_else(|| {
+        eyre::eyre!(
+            "Ctrl+L redraw did not record any input-present latency sample\n\n=== before_ctrl_l ===\n{before_ctrl_l}\n\n=== after_ctrl_l ===\n{after_ctrl_l}"
+        )
+    })?;
+
+    if input_trace.is_empty() {
+        eyre::bail!(
+            "Ctrl+L should produce PTY input for pwsh redraw investigation\n\n=== initial_screen ===\n{initial_screen}\n\n=== before_ctrl_l ===\n{before_ctrl_l}\n\n=== after_ctrl_l ===\n{after_ctrl_l}"
+        );
+    }
+
+    let ctrl_l_seen = input_trace.iter().any(|chunk| chunk.contains(&0x0C));
+    if !ctrl_l_seen {
+        eyre::bail!(
+            "Ctrl+L did not emit 0x0C into the PTY trace\n\n=== input_trace ===\n{}\n\n=== after_ctrl_l ===\n{after_ctrl_l}",
+            format_chunks(&input_trace),
+        );
+    }
+
+    if !before_ctrl_l.contains(CLEAR_ME_MARKER) {
+        eyre::bail!(
+            "Ctrl+L scenario did not capture the seeded output before redraw\n\n=== before_ctrl_l ===\n{before_ctrl_l}"
+        );
+    }
+
+    if after_ctrl_l.contains(CLEAR_ME_MARKER) {
+        eyre::bail!(
+            "Ctrl+L should clear the previously printed marker from the visible screen\n\n=== before_ctrl_l ===\n{before_ctrl_l}\n\n=== after_ctrl_l ===\n{after_ctrl_l}"
+        );
+    }
+
+    if ctrl_l_response_latency_ms > MAX_CTRL_L_RESPONSE_LATENCY_MS {
+        eyre::bail!(
+            "Ctrl+L response latency exceeded threshold\nresponse_latency_ms: {ctrl_l_response_latency_ms:.3}\nthreshold_ms: {MAX_CTRL_L_RESPONSE_LATENCY_MS:.3}\n\n=== input_trace ===\n{}\n\n=== after_ctrl_l ===\n{after_ctrl_l}",
+            format_chunks(&input_trace),
+        );
+    }
+
+    if ctrl_l_present_latency_ms > MAX_CTRL_L_PRESENT_LATENCY_MS {
+        eyre::bail!(
+            "Ctrl+L present latency exceeded threshold\npresent_latency_ms: {ctrl_l_present_latency_ms:.3}\nthreshold_ms: {MAX_CTRL_L_PRESENT_LATENCY_MS:.3}\n\n=== input_trace ===\n{}\n\n=== after_ctrl_l ===\n{after_ctrl_l}",
+            format_chunks(&input_trace),
+        );
+    }
+
+    let transcript = format!(
+        "scenario: {PWSH_CTRL_L_REDRAW_CASE}\nmarkers_observed: {markers_observed}\nat_shell_prompt: {at_shell_prompt}\nawaiting_input: {awaiting_input}\nctrl_l_response_latency_ms: {ctrl_l_response_latency_ms:.3}\nctrl_l_present_latency_ms: {ctrl_l_present_latency_ms:.3}\n\n=== initial_screen ===\n{initial_screen}\n\n=== before_ctrl_l ===\n{before_ctrl_l}\n\n=== input_trace ===\n{}\n\n=== after_ctrl_l ===\n{after_ctrl_l}",
+        format_chunks(&input_trace),
+    );
+
+    emit_transcript(&transcript, artifact_output)
 }
 
 fn run_ratatui_key_debug_reproduction(terminal: &mut TerminalSession) -> eyre::Result<()> {
@@ -332,6 +466,53 @@ fn run_ratatui_key_debug_reproduction(terminal: &mut TerminalSession) -> eyre::R
 
     println!("{transcript}");
     Ok(())
+}
+
+fn emit_transcript(transcript: &str, artifact_output: Option<&Path>) -> eyre::Result<()> {
+    println!("{transcript}");
+
+    if let Some(artifact_output) = artifact_output {
+        if let Some(parent) = artifact_output.parent() {
+            fs::create_dir_all(parent).wrap_err_with(|| {
+                format!(
+                    "failed to create keyboard self-test artifact directory {}",
+                    parent.display()
+                )
+            })?;
+        }
+
+        fs::write(artifact_output, transcript).wrap_err_with(|| {
+            format!(
+                "failed to write keyboard self-test artifact {}",
+                artifact_output.display()
+            )
+        })?;
+    }
+
+    Ok(())
+}
+
+fn delta_latency_ms(
+    total_before_us: u64,
+    total_after_us: u64,
+    observations_before: u64,
+    observations_after: u64,
+) -> Option<f64> {
+    let delta_observations = observations_after.checked_sub(observations_before)?;
+    if delta_observations == 0 {
+        return None;
+    }
+
+    let delta_total_us = total_after_us.checked_sub(total_before_us)?;
+    Some(u64_to_f64(delta_total_us) / u64_to_f64(delta_observations) / 1000.0)
+}
+
+fn u64_to_f64(value: u64) -> f64 {
+    const TWO_POW_32: f64 = 4_294_967_296.0;
+
+    let upper = u32::try_from(value >> 32).unwrap_or(u32::MAX);
+    let lower = u32::try_from(value & u64::from(u32::MAX)).unwrap_or(u32::MAX);
+    f64::from(upper) * TWO_POW_32 + f64::from(lower)
 }
 
 fn exercise_ratatui_key_debug(
@@ -678,6 +859,16 @@ fn press_ctrl_d(terminal: &mut TerminalSession) -> eyre::Result<()> {
     Ok(())
 }
 
+fn press_ctrl_l(terminal: &mut TerminalSession) -> eyre::Result<()> {
+    let ctrl_mods = key::Mods::CTRL | key::Mods::CTRL_SIDE;
+    send_keydown(terminal, 0x11, 0x1D, ctrl_mods)?;
+    send_keydown(terminal, 0x4C, 0x26, ctrl_mods)?;
+    let _ = terminal.handle_char(0x0C, char_lparam(0x26))?;
+    send_keyup(terminal, 0x4C, 0x26, ctrl_mods)?;
+    send_keyup(terminal, 0x11, 0x1D, ctrl_mods)?;
+    Ok(())
+}
+
 fn clear_echoed_ctrl_d_marker(terminal: &mut TerminalSession) -> eyre::Result<()> {
     press_backspace(terminal)?;
     let _ = wait_for_quiet_screen(terminal, Duration::from_millis(150), WAIT_TIMEOUT)?;
@@ -914,8 +1105,7 @@ fn wait_for_semantic_prompt(
 ) -> eyre::Result<String> {
     let started = Instant::now();
     loop {
-        let _ = terminal.pump()?;
-        let screen = terminal.visible_text()?;
+        let screen = collect_screen(terminal)?;
         let (markers_observed, at_shell_prompt, awaiting_input) = terminal.semantic_prompt_state();
         if markers_observed && at_shell_prompt && awaiting_input {
             return Ok(screen);
@@ -1009,7 +1199,7 @@ fn wait_for_win32_input_mode(
             return Ok(());
         }
         if started.elapsed() >= timeout {
-            let screen = terminal.visible_text()?;
+            let screen = collect_screen(terminal)?;
             eyre::bail!("timed out waiting for ConPTY win32-input-mode\n\n{screen}");
         }
         thread::sleep(POLL_INTERVAL);
@@ -1122,5 +1312,7 @@ fn wait_for_child_exit(terminal: &mut TerminalSession, timeout: Duration) -> eyr
 
 fn collect_screen(terminal: &mut TerminalSession) -> eyre::Result<String> {
     let _ = terminal.pump()?;
-    terminal.visible_text()
+    let screen = terminal.visible_text()?;
+    terminal.note_frame_presented();
+    Ok(screen)
 }

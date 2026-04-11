@@ -1,0 +1,11 @@
+{
+  "cols": 8,
+  "rows": 3,
+  "max_scrollback": 64,
+  "chunks": [
+    {
+      "text": "one\r\ntwo\r\n",
+      "repeat": 2
+    }
+  ]
+}

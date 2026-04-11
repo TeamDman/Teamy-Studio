@@ -177,6 +177,8 @@ fn test_nested_shell_default_help_is_available() {
 // tool[verify cli.help.position-independent]
 // cli[verify command.surface.self-test-keyboard-input]
 // cli[verify self-test.keyboard-input.inside-flag]
+// cli[verify self-test.keyboard-input.artifact-output]
+// cli[verify self-test.keyboard-input.vt-engine-flag]
 #[test]
 fn test_keyboard_input_help_shows_inside_flag() {
     let output = run_teamy_studio(&["self-test", "keyboard-input", "--help"], &[]);
@@ -189,6 +191,22 @@ fn test_keyboard_input_help_shows_inside_flag() {
     assert!(
         text.contains("--inside"),
         "missing --inside in help:\n{text}"
+    );
+    assert!(
+        text.contains("--artifact-output"),
+        "missing --artifact-output in help:\n{text}"
+    );
+    assert!(
+        text.contains("--vt-engine"),
+        "missing --vt-engine in help:\n{text}"
+    );
+    assert!(
+        text.contains("ghostty"),
+        "missing ghostty choice in help:\n{text}"
+    );
+    assert!(
+        text.contains("teamy"),
+        "missing teamy choice in help:\n{text}"
     );
 }
 
@@ -212,6 +230,69 @@ fn test_terminal_throughput_help_shows_line_count_flag() {
     assert!(
         text.contains("--samples"),
         "missing --samples in help:\n{text}"
+    );
+}
+
+// tool[verify cli.help.position-independent]
+// cli[verify command.surface.self-test-terminal-replay]
+// cli[verify self-test.terminal-replay.artifact-output]
+#[test]
+fn test_terminal_replay_help_shows_fixture_and_artifact_flags() {
+    let output = run_teamy_studio(&["self-test", "terminal-replay", "--help"], &[]);
+    let text = output_text(&output);
+
+    assert!(
+        output.status.success(),
+        "terminal-replay help failed:\n{text}"
+    );
+    assert!(
+        text.contains("--fixture"),
+        "missing --fixture in help:\n{text}"
+    );
+    assert!(
+        text.contains("--artifact-output"),
+        "missing --artifact-output in help:\n{text}"
+    );
+}
+
+// tool[verify cli.help.position-independent]
+// cli[verify command.surface.self-test-render-offscreen]
+// cli[verify self-test.render-offscreen.artifact-output]
+#[test]
+fn test_render_offscreen_help_shows_artifact_flag() {
+    let output = run_teamy_studio(&["self-test", "render-offscreen", "--help"], &[]);
+    let text = output_text(&output);
+
+    assert!(
+        output.status.success(),
+        "render-offscreen help failed:\n{text}"
+    );
+    assert!(
+        text.contains("--artifact-output"),
+        "missing --artifact-output in help:\n{text}"
+    );
+}
+
+// tool[verify cli.help.position-independent]
+// cli[verify command.surface.window-show]
+// cli[verify window.show.vt-engine-flag]
+#[test]
+fn test_window_show_help_shows_vt_engine_flag() {
+    let output = run_teamy_studio(&["window", "show", "--help"], &[]);
+    let text = output_text(&output);
+
+    assert!(output.status.success(), "window show help failed:\n{text}");
+    assert!(
+        text.contains("--vt-engine"),
+        "missing --vt-engine in help:\n{text}"
+    );
+    assert!(
+        text.contains("ghostty"),
+        "missing ghostty choice in help:\n{text}"
+    );
+    assert!(
+        text.contains("teamy"),
+        "missing teamy choice in help:\n{text}"
     );
 }
 

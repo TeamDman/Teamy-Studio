@@ -20,6 +20,9 @@ The launched terminal window must start at a fixed size suitable for an 80x24-st
 behavior[window.appearance.shell]
 The launched window must host a shell backed by a PTY and render terminal content through `libghostty-vt`.
 
+behavior[window.appearance.shell.teamy-terminal-engine]
+The launched window must eventually render terminal content through a Teamy-Studio-owned Rust terminal engine rather than depending on `libghostty-vt`.
+
 behavior[window.appearance.shell-configured-default]
 The launched window must start the effective default shell command rather than a hard-coded shell executable.
 
@@ -56,6 +59,21 @@ The terminal caret must be visibly rendered using the terminal's active cursor p
 behavior[window.appearance.terminal.cursor.legible-block]
 Block-style terminal cursors must keep the glyph beneath them legible instead of fully obliterating the cell contents.
 
+behavior[window.appearance.terminal.csi-erase-line]
+The Teamy-owned terminal engine must honor CSI erase-in-line sequences so prompt redraws and in-place shell updates clear stale cells instead of leaving literal escape text or leftover glyphs behind.
+
+behavior[window.appearance.terminal.csi-cursor-left]
+The Teamy-owned terminal engine must honor CSI cursor-left sequences so in-place shell redraws can move back within the current row before rewriting text.
+
+behavior[window.appearance.terminal.csi-cursor-horizontal-absolute]
+The Teamy-owned terminal engine must honor CSI horizontal-absolute sequences so prompt redraws can place the cursor at a specific column within the current row before rewriting text.
+
+behavior[window.appearance.terminal.csi-delete-character]
+The Teamy-owned terminal engine must honor CSI delete-character sequences so in-place shell redraws can remove stale characters and shift the remaining text left within the current row.
+
+behavior[window.appearance.terminal.csi-cursor-right]
+The Teamy-owned terminal engine must honor CSI cursor-right sequences so prompt redraws can move forward within the current row before writing replacement text.
+
 behavior[window.appearance.terminal.scrollbar.shader]
 The terminal area must render a visible scrollbar track and thumb using the panel shader pipeline rather than native window chrome.
 
@@ -78,6 +96,9 @@ Interactive resize must not stall terminal output presentation while other app-r
 
 behavior[window.interaction.resize.low-latency]
 Interactive resize must prioritize minimal latency so panel layout and terminal presentation track the live window dimensions as closely as possible.
+
+behavior[window.interaction.rendering.headless-verification]
+The terminal presentation pipeline must support headless verification so terminal states can be rendered and inspected without opening a visible window.
 
 behavior[window.interaction.input]
 The launched terminal window must forward keyboard input into the PTY-backed shell session.

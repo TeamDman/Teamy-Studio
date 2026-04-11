@@ -2168,6 +2168,77 @@ pub fn write_slug_snapshot_sheet_png(
     Ok(())
 }
 
+pub fn write_render_frame_model_offscreen_png(
+    frame: &RenderFrameModel,
+    output_path: &Path,
+) -> eyre::Result<()> {
+    let image = render_frame_model_offscreen_image(frame)?;
+    if let Some(parent) = output_path.parent() {
+        std::fs::create_dir_all(parent).wrap_err_with(|| {
+            format!(
+                "failed to create offscreen render directory {}",
+                parent.display()
+            )
+        })?;
+    }
+    image.save(output_path).wrap_err_with(|| {
+        format!(
+            "failed to write offscreen render png {}",
+            output_path.display()
+        )
+    })?;
+    Ok(())
+}
+
+/// os[impl os.windows.rendering.direct3d12.offscreen-terminal-verification]
+pub fn render_frame_model_offscreen_image(
+    frame: &RenderFrameModel,
+) -> eyre::Result<ImageBuffer<Rgba<u8>, Vec<u8>>> {
+    let mut chrome_cache = None;
+    let mut output_cache = None;
+    let mut terminal_cache = None;
+    let (chrome_scene, _) =
+        chrome_scene_fragment(&mut chrome_cache, frame.layout, frame.cell_number);
+    let (output_scene, _) = output_scene_fragment(
+        &mut output_cache,
+        frame.layout,
+        &frame.output_text,
+        frame.output_cell_width,
+        frame.output_cell_height,
+    );
+    let (terminal_fragments, _) = terminal_scene_fragments(
+        &mut terminal_cache,
+        frame.layout,
+        &frame.terminal_display,
+        frame.terminal_visual_state,
+        frame.terminal_cell_width,
+        frame.terminal_cell_height,
+    );
+
+    let width = u32::try_from(frame.layout.client_width.max(1)).unwrap_or(1);
+    let height = u32::try_from(frame.layout.client_height.max(1)).unwrap_or(1);
+    let mut image = ImageBuffer::<Rgba<u8>, Vec<u8>>::new(width, height);
+    for pixel in image.pixels_mut() {
+        *pixel = Rgba([0, 0, 0, 0]);
+    }
+
+    let font = load_terminal_font()?;
+    let face = Face::parse(&font.font_bytes, font.face_index)
+        .wrap_err("failed to parse terminal font for offscreen render")?;
+    let mut glyph_cache: HashMap<char, (Vec<QuadraticCurve>, Vec<u32>, SlugGlyph)> = HashMap::new();
+
+    let mut scenes = Vec::with_capacity(2 + terminal_fragments.len());
+    scenes.push(chrome_scene);
+    scenes.push(output_scene);
+    scenes.extend(terminal_fragments);
+
+    for scene in &scenes {
+        blend_scene_into_image(&mut image, scene, &font, &face, &mut glyph_cache)?;
+    }
+
+    Ok(image)
+}
+
 fn load_snapshot_glyph(
     font: &LoadedTerminalFont,
     face: &Face<'_>,
@@ -2193,6 +2264,149 @@ fn load_snapshot_glyph(
             ..glyph
         },
     ))
+}
+
+fn blend_scene_into_image(
+    image: &mut ImageBuffer<Rgba<u8>, Vec<u8>>,
+    scene: &RenderScene,
+    font: &LoadedTerminalFont,
+    face: &Face<'_>,
+    glyph_cache: &mut HashMap<char, (Vec<QuadraticCurve>, Vec<u32>, SlugGlyph)>,
+) -> eyre::Result<()> {
+    for panel in &scene.panels {
+        blend_rect_into_image(image, panel.rect, panel.color);
+    }
+    for glyph in &scene.glyphs {
+        let (curves, band_data, slug) = if let Some(cached) = glyph_cache.get(&glyph.character) {
+            cached
+        } else {
+            let loaded = load_snapshot_glyph(font, face, glyph.character)?;
+            glyph_cache.insert(glyph.character, loaded);
+            glyph_cache
+                .get(&glyph.character)
+                .expect("glyph cache should contain inserted glyph")
+        };
+        blend_glyph_into_image(
+            image,
+            glyph.rect,
+            glyph.color,
+            font,
+            curves,
+            band_data,
+            *slug,
+        );
+    }
+    for panel in &scene.overlay_panels {
+        blend_rect_into_image(image, panel.rect, panel.color);
+    }
+    Ok(())
+}
+
+fn blend_rect_into_image(image: &mut ImageBuffer<Rgba<u8>, Vec<u8>>, rect: RECT, color: [f32; 4]) {
+    let width = i32::try_from(image.width()).unwrap_or(i32::MAX);
+    let height = i32::try_from(image.height()).unwrap_or(i32::MAX);
+    let left = rect.left.clamp(0, width);
+    let top = rect.top.clamp(0, height);
+    let right = rect.right.clamp(left, width);
+    let bottom = rect.bottom.clamp(top, height);
+    for y in top..bottom {
+        for x in left..right {
+            blend_pixel(image, x as u32, y as u32, color, 1.0);
+        }
+    }
+}
+
+fn blend_glyph_into_image(
+    image: &mut ImageBuffer<Rgba<u8>, Vec<u8>>,
+    rect: RECT,
+    color: [f32; 4],
+    font: &LoadedTerminalFont,
+    curves: &[QuadraticCurve],
+    band_data: &[u32],
+    glyph: SlugGlyph,
+) {
+    let origin_x = u32::try_from(rect.left.max(0)).unwrap_or_default();
+    let origin_y = u32::try_from(rect.top.max(0)).unwrap_or_default();
+    let image_width = u32::try_from((rect.right - rect.left).max(1)).unwrap_or(1);
+    let image_height = u32::try_from((rect.bottom - rect.top).max(1)).unwrap_or(1);
+    let font_size_px = image_height.max(1);
+    let scale = font_size_px as f32 / font.units_per_em.max(1.0);
+    let uv_pad_x = SLUG_GLYPH_DILATION_PX / scale;
+    let uv_pad_y = SLUG_GLYPH_DILATION_PX / scale;
+    let glyph_width_px =
+        (((glyph.x_max - glyph.x_min) + (uv_pad_x * 2.0)).max(1.0) * scale).max(1.0);
+    let glyph_height_px =
+        (((glyph.y_max - glyph.y_min) + (uv_pad_y * 2.0)).max(1.0) * scale).max(1.0);
+    let offset_x = origin_x as f32 + ((image_width as f32 - glyph_width_px) * 0.5).max(0.0);
+    let offset_y = origin_y as f32 + ((image_height as f32 - glyph_height_px) * 0.5).max(0.0);
+    let render_x_min = glyph.x_min - uv_pad_x;
+    let render_y_max = glyph.y_max + uv_pad_y;
+    let start_x = offset_x.floor().max(origin_x as f32) as u32;
+    let end_x = (offset_x + glyph_width_px)
+        .ceil()
+        .min((origin_x + image_width) as f32)
+        .max(start_x as f32) as u32;
+    let start_y = offset_y.floor().max(origin_y as f32) as u32;
+    let end_y = (offset_y + glyph_height_px)
+        .ceil()
+        .min((origin_y + image_height) as f32)
+        .max(start_y as f32) as u32;
+
+    for y in start_y..end_y {
+        for x in start_x..end_x {
+            let sample_x = x as f32 + 0.5;
+            let sample_y = y as f32 + 0.5;
+            let render_coord = [
+                render_x_min + ((sample_x - offset_x) / scale),
+                render_y_max - ((sample_y - offset_y) / scale),
+            ];
+            let coverage = cpu_slug_coverage(render_coord, scale, curves, band_data, glyph);
+            if coverage <= 0.0 {
+                continue;
+            }
+            blend_pixel(image, x, y, color, coverage);
+        }
+    }
+}
+
+fn blend_pixel(
+    image: &mut ImageBuffer<Rgba<u8>, Vec<u8>>,
+    x: u32,
+    y: u32,
+    color: [f32; 4],
+    coverage: f32,
+) {
+    let src_a = (color[3] * coverage).clamp(0.0, 1.0);
+    if src_a <= 0.0 {
+        return;
+    }
+    let dst = image.get_pixel(x, y);
+    let dst_rgba = [
+        f32::from(dst[0]) / 255.0,
+        f32::from(dst[1]) / 255.0,
+        f32::from(dst[2]) / 255.0,
+        f32::from(dst[3]) / 255.0,
+    ];
+    let out_a = src_a + (dst_rgba[3] * (1.0 - src_a));
+    let out_rgb = if out_a <= f32::EPSILON {
+        [0.0, 0.0, 0.0]
+    } else {
+        [
+            ((color[0] * src_a) + (dst_rgba[0] * dst_rgba[3] * (1.0 - src_a))) / out_a,
+            ((color[1] * src_a) + (dst_rgba[1] * dst_rgba[3] * (1.0 - src_a))) / out_a,
+            ((color[2] * src_a) + (dst_rgba[2] * dst_rgba[3] * (1.0 - src_a))) / out_a,
+        ]
+    };
+    image.put_pixel(
+        x,
+        y,
+        Rgba([
+            (out_rgb[0] * 255.0).clamp(0.0, 255.0) as u8,
+            (out_rgb[1] * 255.0).clamp(0.0, 255.0) as u8,
+            (out_rgb[2] * 255.0).clamp(0.0, 255.0) as u8,
+            (out_a * 255.0).clamp(0.0, 255.0) as u8,
+        ]),
+    );
 }
 
 fn build_slug_glyph_from_face(

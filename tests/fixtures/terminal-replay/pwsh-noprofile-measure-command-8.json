@@ -1,0 +1,10 @@
+{
+  "cols": 80,
+  "rows": 12,
+  "max_scrollback": 128,
+  "chunks": [
+    {
+      "text": "__TEAMY_TERMINAL_THROUGHPUT_START__\n1\n2\n3\n4\n5\n6\n7\n8\n__TEAMY_TERMINAL_THROUGHPUT_MEASURE_MS=15.699\n__TEAMY_TERMINAL_THROUGHPUT_DONE__\n"
+    }
+  ]
+}

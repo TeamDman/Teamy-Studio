@@ -1,0 +1,10 @@
+{
+  "cols": 80,
+  "rows": 16,
+  "max_scrollback": 128,
+  "chunks": [
+    {
+      "text": "__TEAMY_TERMINAL_THROUGHPUT_START__\nPS benchmark> command-1\nresult-1: ************************************************\nPS benchmark> command-2\nresult-2: ************************************************\nPS benchmark> command-3\nresult-3: ************************************************\nPS benchmark> command-4\nresult-4: ************************************************\n__TEAMY_TERMINAL_THROUGHPUT_MEASURE_MS=24.143\n__TEAMY_TERMINAL_THROUGHPUT_DONE__\n"
+    }
+  ]
+}

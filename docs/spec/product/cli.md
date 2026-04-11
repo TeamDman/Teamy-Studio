@@ -46,11 +46,23 @@ The `self-test` command group must expose a `keyboard-input` subcommand.
 cli[command.surface.self-test-terminal-throughput]
 The `self-test` command group must expose a `terminal-throughput` subcommand.
 
+cli[command.surface.self-test-terminal-replay]
+The `self-test` command group must expose a headless terminal replay subcommand for deterministic transcript-driven validation.
+
+cli[command.surface.self-test-render-offscreen]
+The `self-test` command group must expose a headless offscreen render subcommand for terminal-frame verification without a visible window.
+
 cli[self-test.keyboard-input.inside-flag]
 The `self-test keyboard-input` command must support `--inside` to run the terminal-side probe instead of the outer harness.
 
 cli[self-test.keyboard-input.scenario-optional]
 The `self-test keyboard-input` command must accept an optional scenario argument so reproducible terminal regressions can be exercised from the outer harness.
+
+cli[self-test.keyboard-input.artifact-output]
+The `self-test keyboard-input` command must support optional artifact output so captured keyboard and redraw transcripts can be written to disk for reduction into regression fixtures.
+
+cli[self-test.keyboard-input.vt-engine-flag]
+The `self-test keyboard-input` command must support `--vt-engine ghostty|teamy` so live keyboard regressions can be replayed against either terminal backend.
 
 cli[self-test.terminal-throughput.mode-optional]
 The `self-test terminal-throughput` command must accept an optional benchmark mode argument.
@@ -61,11 +73,20 @@ The `self-test terminal-throughput` command must support `--line-count` to contr
 cli[self-test.terminal-throughput.samples-flag]
 The `self-test terminal-throughput` command must support `--samples` to run multiple benchmark samples and report median results.
 
+cli[self-test.terminal-replay.artifact-output]
+The headless terminal replay self-test must support writing failure artifacts so broken states can be inspected after automated runs.
+
+cli[self-test.render-offscreen.artifact-output]
+The headless offscreen render self-test must support writing image artifacts for automated verification and debugging.
+
 cli[command.surface.window]
 The CLI must expose a `window` command group.
 
 cli[command.surface.window-show]
 The `window` command group must expose a `show` subcommand that launches the main application terminal window.
+
+cli[window.show.vt-engine-flag]
+The `window show` command should support a `--vt-engine` flag so the live terminal window can be launched with either the Ghostty-backed engine or the Teamy-owned engine during the migration.
 
 ## Workspaces
 

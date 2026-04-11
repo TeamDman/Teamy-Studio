@@ -9,12 +9,12 @@ use tracing::debug_span;
 use tracing::trace;
 
 use eyre::Context;
+use libghostty_vt::TerminalOptions;
 use libghostty_vt::key;
-use libghostty_vt::render::{CellIterator, CursorVisualStyle, Dirty, RenderState, RowIterator};
+use libghostty_vt::render::{CellIterator, CursorVisualStyle, Dirty, RowIterator};
 use libghostty_vt::screen::RowSemanticPrompt;
 use libghostty_vt::style::RgbColor;
-use libghostty_vt::terminal::{Point, PointCoordinate, ScrollViewport};
-use libghostty_vt::{Terminal, TerminalOptions};
+use libghostty_vt::terminal::ScrollViewport;
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use tracing::{debug, error, info, info_span, instrument};
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
@@ -27,7 +27,10 @@ use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_APP};
 
 use crate::paths::AppHome;
 
+use super::VtEngineChoice;
 use super::spatial::{ClientRect, TerminalCellPoint};
+use super::teamy_terminal_engine::{TeamyTerminalEngine, TeamyViewportMetrics};
+use super::windows_terminal_engine::GhosttyTerminalEngine;
 
 pub const DRAG_STRIP_HEIGHT: i32 = 76;
 pub const WINDOW_PADDING: i32 = 18;
@@ -63,6 +66,7 @@ const TERMINAL_SCROLLBAR_GAP: i32 = 8;
 const WIN32_INPUT_MODE_ENABLE: &[u8] = b"\x1b[?9001h";
 const WIN32_INPUT_MODE_DISABLE: &[u8] = b"\x1b[?9001l";
 const CTRL_D_EOF: u8 = 0x04;
+const CTRL_L_FORM_FEED: u8 = 0x0C;
 const CTRL_D_EXIT_COMMAND: &[u8] = b"exit\r";
 const OSC_133_PREFIX: &[u8] = b"\x1b]133;";
 
@@ -117,6 +121,12 @@ pub struct TerminalPerformanceSnapshot {
     pub queue_latency_observations: u64,
     pub max_queue_latency_us: u64,
     pub total_queue_latency_us: u64,
+    pub input_response_latency_observations: u64,
+    pub max_input_response_latency_us: u64,
+    pub total_input_response_latency_us: u64,
+    pub input_present_latency_observations: u64,
+    pub max_input_present_latency_us: u64,
+    pub total_input_present_latency_us: u64,
 }
 
 impl TerminalPerformanceSnapshot {
@@ -142,6 +152,38 @@ impl TerminalPerformanceSnapshot {
     #[must_use]
     pub fn max_queue_latency_ms(self) -> f64 {
         u64_to_f64(self.max_queue_latency_us) / 1000.0
+    }
+
+    #[must_use]
+    pub fn average_input_response_latency_ms(self) -> f64 {
+        if self.input_response_latency_observations == 0 {
+            return 0.0;
+        }
+
+        (u64_to_f64(self.total_input_response_latency_us)
+            / u64_to_f64(self.input_response_latency_observations))
+            / 1000.0
+    }
+
+    #[must_use]
+    pub fn max_input_response_latency_ms(self) -> f64 {
+        u64_to_f64(self.max_input_response_latency_us) / 1000.0
+    }
+
+    #[must_use]
+    pub fn average_input_present_latency_ms(self) -> f64 {
+        if self.input_present_latency_observations == 0 {
+            return 0.0;
+        }
+
+        (u64_to_f64(self.total_input_present_latency_us)
+            / u64_to_f64(self.input_present_latency_observations))
+            / 1000.0
+    }
+
+    #[must_use]
+    pub fn max_input_present_latency_ms(self) -> f64 {
+        u64_to_f64(self.max_input_present_latency_us) / 1000.0
     }
 }
 
@@ -330,19 +372,132 @@ pub struct TerminalSession {
     worker_queued_output: bool,
     repaint_requested: bool,
     cached_display: SharedTerminalDisplayState,
+    pending_input_present_starts: VecDeque<Instant>,
+    ready_input_present_starts: VecDeque<Instant>,
+    input_present_latency_observations: u64,
+    max_input_present_latency_us: u64,
+    total_input_present_latency_us: u64,
+}
+
+enum RuntimeTerminalEngine {
+    Ghostty(GhosttyTerminalEngine),
+    Teamy(TeamyTerminalEngine),
+}
+
+impl RuntimeTerminalEngine {
+    fn vt_write(&mut self, bytes: &[u8]) {
+        match self {
+            Self::Ghostty(engine) => engine.vt_write(bytes),
+            Self::Teamy(engine) => engine.vt_write(bytes),
+        }
+    }
+
+    fn resize(
+        &mut self,
+        cols: u16,
+        rows: u16,
+        cell_width: u32,
+        cell_height: u32,
+    ) -> eyre::Result<()> {
+        match self {
+            Self::Ghostty(engine) => engine.resize(cols, rows, cell_width, cell_height),
+            Self::Teamy(engine) => {
+                let _ = cell_width;
+                let _ = cell_height;
+                engine.resize(cols, rows);
+                Ok(())
+            }
+        }
+    }
+
+    fn scroll_viewport(&mut self, viewport: ScrollViewport) {
+        match self {
+            Self::Ghostty(engine) => engine.scroll_viewport(viewport),
+            Self::Teamy(engine) => engine.scroll_viewport(viewport),
+        }
+    }
+
+    fn kitty_keyboard_flags(&self) -> eyre::Result<key::KittyKeyFlags> {
+        match self {
+            Self::Ghostty(engine) => engine.kitty_keyboard_flags(),
+            Self::Teamy(_) => Ok(key::KittyKeyFlags::empty()),
+        }
+    }
+
+    fn viewport_metrics(&self) -> eyre::Result<TerminalViewportMetrics> {
+        match self {
+            Self::Ghostty(engine) => {
+                let viewport = engine.viewport_metrics()?;
+                Ok(TerminalViewportMetrics {
+                    total: viewport.total,
+                    offset: viewport.offset,
+                    visible: viewport.visible,
+                    scrollback: u64::try_from(viewport.scrollback).unwrap_or(u64::MAX),
+                })
+            }
+            Self::Teamy(engine) => {
+                let TeamyViewportMetrics {
+                    total,
+                    offset,
+                    visible,
+                    scrollback,
+                } = engine.viewport_metrics();
+                Ok(TerminalViewportMetrics {
+                    total,
+                    offset,
+                    visible,
+                    scrollback: u64::try_from(scrollback).unwrap_or(u64::MAX),
+                })
+            }
+        }
+    }
+
+    fn total_rows(&self) -> eyre::Result<usize> {
+        match self {
+            Self::Ghostty(engine) => engine.total_rows(),
+            Self::Teamy(engine) => Ok(engine.total_rows()),
+        }
+    }
+
+    fn screen_row_cells(&self, row: u32, cols: u16) -> eyre::Result<Vec<String>> {
+        match self {
+            Self::Ghostty(engine) => ghostty_screen_row_cells(engine, cols, row),
+            Self::Teamy(engine) => Ok(engine.screen_row_cells(row)),
+        }
+    }
+
+    fn encode_key_event(
+        &mut self,
+        action: key::Action,
+        mapped_key: key::Key,
+        mods: key::Mods,
+        consumed_mods: key::Mods,
+        unshifted_codepoint: char,
+        response: &mut Vec<u8>,
+    ) -> eyre::Result<()> {
+        match self {
+            Self::Ghostty(engine) => engine.encode_key_event(
+                action,
+                mapped_key,
+                mods,
+                consumed_mods,
+                unshifted_codepoint,
+                response,
+            ),
+            Self::Teamy(_) => Ok(()),
+        }
+    }
 }
 
 struct TerminalCore {
-    terminal: Terminal<'static, 'static>,
-    render_state: RenderState<'static>,
-    key_encoder: key::Encoder<'static>,
-    key_event: key::Event<'static>,
+    engine: RuntimeTerminalEngine,
     master: Box<dyn MasterPty + Send>,
     child: Box<dyn Child + Send>,
     writer: Arc<Mutex<PtyWriter>>,
     reader: mpsc::Receiver<PtyReaderMessage>,
     pending_output: VecDeque<u8>,
     pending_output_first_read_at: Option<Instant>,
+    pending_input_response_starts: VecDeque<Instant>,
     cols: u16,
     rows: u16,
     repaint: RepaintState,
@@ -655,15 +810,22 @@ impl TerminalLayout {
 }
 
 impl TerminalSession {
-    pub fn new(app_home: &AppHome, working_dir: Option<&Path>) -> eyre::Result<Self> {
+    pub fn new(
+        app_home: &AppHome,
+        working_dir: Option<&Path>,
+        vt_engine: VtEngineChoice,
+    ) -> eyre::Result<Self> {
         let mut command = crate::shell_default::load_effective_command_builder(app_home)?;
         if let Some(working_dir) = working_dir {
             command.cwd(working_dir);
         }
-        Self::new_with_command(command)
+        Self::new_with_command(command, vt_engine)
     }
 
-    pub fn new_with_command(shell: CommandBuilder) -> eyre::Result<Self> {
+    pub fn new_with_command(
+        shell: CommandBuilder,
+        vt_engine: VtEngineChoice,
+    ) -> eyre::Result<Self> {
         let (request_tx, request_rx) = mpsc::channel();
         let (update_tx, update_rx) = mpsc::channel();
         let (startup_tx, startup_rx) = mpsc::sync_channel(1);
@@ -675,7 +837,16 @@ impl TerminalSession {
         std::thread::Builder::new()
             .name("teamy-terminal-update-bridge".to_owned())
             .spawn(move || {
-                while let Ok(update) = update_rx.recv() {
+                loop {
+                    let update = {
+                        #[cfg(feature = "tracy")]
+                        let _span = debug_span!("wait_for_terminal_worker_update").entered();
+                        update_rx.recv()
+                    };
+                    let Ok(update) = update else {
+                        break;
+                    };
+
                     let should_post_wake = pending_updates_for_bridge
                         .lock()
                         .ok()
@@ -690,14 +861,18 @@ impl TerminalSession {
                         .ok()
                         .and_then(|wake_window| *wake_window);
                     if let Some(raw_hwnd) = wake_target {
-                        // Safety: this reconstructs the live window handle value previously stored by the UI thread and posts a message without dereferencing it.
-                        let _ = unsafe {
-                            PostMessageW(
-                                Some(HWND(raw_hwnd as *mut core::ffi::c_void)),
-                                TERMINAL_WORKER_WAKE_MESSAGE,
-                                WPARAM(0),
-                                LPARAM(0),
-                            )
+                        let () = {
+                            #[cfg(feature = "tracy")]
+                            let _span = debug_span!("post_terminal_worker_wake").entered();
+                            // Safety: this reconstructs the live window handle value previously stored by the UI thread and posts a message without dereferencing it.
+                            let _ = unsafe {
+                                PostMessageW(
+                                    Some(HWND(raw_hwnd as *mut core::ffi::c_void)),
+                                    TERMINAL_WORKER_WAKE_MESSAGE,
+                                    WPARAM(0),
+                                    LPARAM(0),
+                                )
+                            };
                         };
                     }
                 }
@@ -709,7 +884,7 @@ impl TerminalSession {
         std::thread::Builder::new()
             .name("teamy-terminal-worker".to_owned())
             .spawn(move || {
-                let startup_result = TerminalCore::new_with_command(shell).map(|core| {
+                let startup_result = TerminalCore::new_with_command(shell, vt_engine).map(|core| {
                     let snapshot = core.snapshot();
                     (
                         TerminalWorkerRunner::new(core, request_rx, update_tx),
@@ -741,6 +916,11 @@ impl TerminalSession {
             worker_queued_output: false,
             repaint_requested: false,
             cached_display: Arc::new(TerminalDisplayState::default()),
+            pending_input_present_starts: VecDeque::new(),
+            ready_input_present_starts: VecDeque::new(),
+            input_present_latency_observations: 0,
+            max_input_present_latency_us: 0,
+            total_input_present_latency_us: 0,
         })
     }
 
@@ -775,7 +955,13 @@ impl TerminalSession {
     pub fn performance_snapshot(&self) -> eyre::Result<TerminalPerformanceSnapshot> {
         let response = self.request_read_only(TerminalWorkerCommand::PerformanceSnapshot)?;
         match response.payload {
-            TerminalWorkerResponsePayload::PerformanceSnapshot(snapshot) => Ok(snapshot),
+            TerminalWorkerResponsePayload::PerformanceSnapshot(mut snapshot) => {
+                snapshot.input_present_latency_observations =
+                    self.input_present_latency_observations;
+                snapshot.max_input_present_latency_us = self.max_input_present_latency_us;
+                snapshot.total_input_present_latency_us = self.total_input_present_latency_us;
+                Ok(snapshot)
+            }
             payload => Self::unexpected_response("PerformanceSnapshot", payload),
         }
     }
@@ -823,14 +1009,21 @@ impl TerminalSession {
         })
     }
 
+    #[cfg_attr(feature = "tracy", instrument(level = "debug", skip_all))]
     pub fn handle_char(&mut self, code_unit: u32, lparam: isize) -> eyre::Result<bool> {
         let response = self.request(TerminalWorkerCommand::HandleChar { code_unit, lparam })?;
         match response.payload {
-            TerminalWorkerResponsePayload::Bool(handled) => Ok(handled),
+            TerminalWorkerResponsePayload::Bool(handled) => {
+                if handled {
+                    self.note_input_latency_start();
+                }
+                Ok(handled)
+            }
             payload => Self::unexpected_response("HandleChar", payload),
         }
     }
 
+    #[cfg_attr(feature = "tracy", instrument(level = "debug", skip_all))]
     pub fn handle_key_event(
         &mut self,
         vkey: u32,
@@ -847,7 +1040,12 @@ impl TerminalSession {
             mods,
         })?;
         match response.payload {
-            TerminalWorkerResponsePayload::Bool(handled) => Ok(handled),
+            TerminalWorkerResponsePayload::Bool(handled) => {
+                if handled && !is_release {
+                    self.note_input_latency_start();
+                }
+                Ok(handled)
+            }
             payload => Self::unexpected_response("HandleKeyEvent", payload),
         }
     }
@@ -873,9 +1071,31 @@ impl TerminalSession {
     pub fn handle_paste(&mut self, text: &str) -> eyre::Result<()> {
         let response = self.request(TerminalWorkerCommand::HandlePaste(text.to_owned()))?;
         match response.payload {
-            TerminalWorkerResponsePayload::Unit => Ok(()),
+            TerminalWorkerResponsePayload::Unit => {
+                self.note_input_latency_start();
+                Ok(())
+            }
             payload => Self::unexpected_response("HandlePaste", payload),
         }
+    }
+
+    pub fn note_frame_presented(&mut self) {
+        let Some(started_at) = self.ready_input_present_starts.pop_front() else {
+            return;
+        };
+
+        let latency_us = u64::try_from(
+            Instant::now()
+                .saturating_duration_since(started_at)
+                .as_micros()
+                .min(u128::from(u64::MAX)),
+        )
+        .unwrap_or(u64::MAX);
+        self.input_present_latency_observations += 1;
+        self.total_input_present_latency_us = self
+            .total_input_present_latency_us
+            .saturating_add(latency_us);
+        self.max_input_present_latency_us = self.max_input_present_latency_us.max(latency_us);
     }
 
     pub fn selected_text(&mut self, selection: TerminalSelection) -> eyre::Result<String> {
@@ -965,20 +1185,25 @@ impl TerminalSession {
         }
     }
 
+    #[cfg_attr(feature = "tracy", instrument(level = "debug", skip_all))]
     fn request(&mut self, command: TerminalWorkerCommand) -> eyre::Result<TerminalWorkerResponse> {
         self.drain_worker_updates();
         let (reply_tx, reply_rx) = mpsc::sync_channel(1);
         self.worker_tx
             .send(TerminalWorkerRequest { command, reply_tx })
             .map_err(|error| eyre::eyre!("failed to send terminal worker request: {error}"))?;
-        let response = reply_rx
-            .recv()
-            .map_err(|error| eyre::eyre!("terminal worker dropped response channel: {error}"))??;
+        let response = {
+            #[cfg(feature = "tracy")]
+            let _span = debug_span!("wait_for_terminal_worker_response").entered();
+            reply_rx.recv()
+        }
+        .map_err(|error| eyre::eyre!("terminal worker dropped response channel: {error}"))??;
         self.snapshot = response.snapshot;
         self.drain_worker_updates();
         Ok(response)
     }
 
+    #[cfg_attr(feature = "tracy", instrument(level = "debug", skip_all))]
     fn request_read_only(
         &self,
         command: TerminalWorkerCommand,
@@ -987,9 +1212,12 @@ impl TerminalSession {
         self.worker_tx
             .send(TerminalWorkerRequest { command, reply_tx })
             .map_err(|error| eyre::eyre!("failed to send terminal worker request: {error}"))?;
-        reply_rx
-            .recv()
-            .map_err(|error| eyre::eyre!("terminal worker dropped response channel: {error}"))?
+        {
+            #[cfg(feature = "tracy")]
+            let _span = debug_span!("wait_for_terminal_worker_response").entered();
+            reply_rx.recv()
+        }
+        .map_err(|error| eyre::eyre!("terminal worker dropped response channel: {error}"))?
     }
 
     fn drain_worker_updates(&mut self) {
@@ -1005,6 +1233,9 @@ impl TerminalSession {
         }
         if let Some(display) = pending_updates.latest_display.take() {
             self.cached_display = display;
+            if let Some(started_at) = self.pending_input_present_starts.pop_front() {
+                self.ready_input_present_starts.push_back(started_at);
+            }
         }
         if pending_updates.queued_output {
             self.worker_queued_output = true;
@@ -1019,6 +1250,10 @@ impl TerminalSession {
             pending_updates.repaint_requested = false;
         }
         pending_updates.wake_posted = false;
+    }
+
+    fn note_input_latency_start(&mut self) {
+        self.pending_input_present_starts.push_back(Instant::now());
     }
 
     fn unexpected_response<T>(
@@ -1065,9 +1300,14 @@ impl TerminalWorkerRunner {
                 "terminal worker failed to publish initial display state"
             );
         }
-
         loop {
-            match self.request_rx.recv_timeout(TERMINAL_WORKER_IDLE_TIMEOUT) {
+            let request = {
+                #[cfg(feature = "tracy")]
+                let _span = debug_span!("wait_for_terminal_worker_request").entered();
+                self.request_rx.recv_timeout(TERMINAL_WORKER_IDLE_TIMEOUT)
+            };
+
+            match request {
                 Ok(request) => {
                     if let Err(error) = self.handle_request(request) {
                         error!(?error, "terminal worker request handling failed");
@@ -1086,6 +1326,7 @@ impl TerminalWorkerRunner {
         }
     }
 
+    #[cfg_attr(feature = "tracy", instrument(level = "debug", skip_all))]
     fn handle_request(&mut self, request: TerminalWorkerRequest) -> eyre::Result<()> {
         let payload = match request.command {
             TerminalWorkerCommand::Resize(layout) => {
@@ -1292,7 +1533,10 @@ impl TerminalCore {
         reason = "PTY setup, libghostty initialization, and reader-thread wiring are kept together for clarity"
     )]
     #[instrument(level = "info", skip_all)]
-    pub fn new_with_command(shell: CommandBuilder) -> eyre::Result<Self> {
+    pub fn new_with_command(
+        shell: CommandBuilder,
+        vt_engine: VtEngineChoice,
+    ) -> eyre::Result<Self> {
         let pty_system = native_pty_system();
         let initial_size = PtySize {
             cols: DEFAULT_COLS,
@@ -1315,24 +1559,37 @@ impl TerminalCore {
             Arc::new(Mutex::new(pair.master.take_writer().map_err(|error| {
                 eyre::eyre!("failed to open PTY writer: {error}")
             })?));
-        let writer_for_effect = Arc::clone(&writer);
-
-        let mut terminal = info_span!("create_libghostty_terminal").in_scope(|| {
-            Terminal::new(TerminalOptions {
-                cols: DEFAULT_COLS,
-                rows: DEFAULT_ROWS,
-                max_scrollback: MAX_SCROLLBACK,
-            })
-            .wrap_err("failed to create libghostty terminal")
-        })?;
-        terminal
-            .on_pty_write(move |_terminal, data| {
-                if let Ok(mut writer) = writer_for_effect.lock() {
-                    let _ = writer.write_all(data);
-                    let _ = writer.flush();
-                }
-            })
-            .wrap_err("failed to register PTY write effect")?;
+        let engine = match vt_engine {
+            VtEngineChoice::Ghostty => {
+                let writer_for_effect = Arc::clone(&writer);
+                let mut engine = info_span!("create_libghostty_terminal").in_scope(|| {
+                    GhosttyTerminalEngine::new(TerminalOptions {
+                        cols: DEFAULT_COLS,
+                        rows: DEFAULT_ROWS,
+                        max_scrollback: MAX_SCROLLBACK,
+                    })
+                })?;
+                engine.on_pty_write(move |_terminal, data| {
+                    if let Ok(mut writer) = writer_for_effect.lock() {
+                        let _ = writer.write_all(data);
+                        let _ = writer.flush();
+                    }
+                })?;
+                RuntimeTerminalEngine::Ghostty(engine)
+            }
+            VtEngineChoice::Teamy => {
+                let writer_for_effect = Arc::clone(&writer);
+                let mut engine =
+                    TeamyTerminalEngine::new(DEFAULT_COLS, DEFAULT_ROWS, MAX_SCROLLBACK);
+                engine.on_pty_write(move |data| {
+                    if let Ok(mut writer) = writer_for_effect.lock() {
+                        let _ = writer.write_all(data);
+                        let _ = writer.flush();
+                    }
+                });
+                RuntimeTerminalEngine::Teamy(engine)
+            }
+        };
 
         info!(
             program = shell.get_argv().first().map_or_else(
@@ -1357,7 +1614,13 @@ impl TerminalCore {
         std::thread::spawn(move || {
             let mut buffer = vec![0_u8; PTY_READ_BUFFER_BYTES];
             loop {
-                match cloned_reader.read(&mut buffer) {
+                let read_result = {
+                    #[cfg(feature = "tracy")]
+                    let _span = debug_span!("wait_for_pty_output_read").entered();
+                    cloned_reader.read(&mut buffer)
+                };
+
+                match read_result {
                     Ok(0) => break,
                     Ok(bytes_read) => {
                         if reader_tx
@@ -1379,16 +1642,14 @@ impl TerminalCore {
         });
 
         Ok(Self {
-            terminal,
-            render_state: RenderState::new().wrap_err("failed to create render state")?,
-            key_encoder: key::Encoder::new().wrap_err("failed to create key encoder")?,
-            key_event: key::Event::new().wrap_err("failed to create key event")?,
+            engine,
             master: pair.master,
             child,
             writer,
             reader: reader_rx,
             pending_output: VecDeque::new(),
             pending_output_first_read_at: None,
+            pending_input_response_starts: VecDeque::new(),
             cols: DEFAULT_COLS,
             rows: DEFAULT_ROWS,
             repaint: RepaintState {
@@ -1440,14 +1701,12 @@ impl TerminalCore {
         }
 
         debug!(cols, rows, "resizing terminal grid");
-        self.terminal
-            .resize(
-                cols,
-                rows,
-                u32::try_from(layout.cell_width.max(1)).unwrap_or(1),
-                u32::try_from(layout.cell_height.max(1)).unwrap_or(1),
-            )
-            .wrap_err("failed to resize libghostty terminal")?;
+        self.engine.resize(
+            cols,
+            rows,
+            u32::try_from(layout.cell_width.max(1)).unwrap_or(1),
+            u32::try_from(layout.cell_height.max(1)).unwrap_or(1),
+        )?;
         self.master
             .resize(PtySize {
                 cols,
@@ -1460,7 +1719,7 @@ impl TerminalCore {
             .map_err(|error| eyre::eyre!("failed to resize PTY: {error}"))?;
 
         if keep_viewport_pinned_to_bottom {
-            self.terminal.scroll_viewport(ScrollViewport::Bottom);
+            self.engine.scroll_viewport(ScrollViewport::Bottom);
         }
 
         self.cols = cols;
@@ -1593,6 +1852,25 @@ impl TerminalCore {
             return;
         }
 
+        if let Some(started_at) = self.pending_input_response_starts.pop_front() {
+            let latency_us = u64::try_from(
+                read_at
+                    .saturating_duration_since(started_at)
+                    .as_micros()
+                    .min(u128::from(u64::MAX)),
+            )
+            .unwrap_or(u64::MAX);
+            self.performance.input_response_latency_observations += 1;
+            self.performance.total_input_response_latency_us = self
+                .performance
+                .total_input_response_latency_us
+                .saturating_add(latency_us);
+            self.performance.max_input_response_latency_us = self
+                .performance
+                .max_input_response_latency_us
+                .max(latency_us);
+        }
+
         if self.pending_output.is_empty() {
             self.pending_output_first_read_at = Some(read_at);
         }
@@ -1638,7 +1916,7 @@ impl TerminalCore {
             let () = {
                 #[cfg(feature = "tracy")]
                 let _span = debug_span!("vt_write_terminal_output_slice").entered();
-                self.terminal.vt_write(&slice);
+                self.engine.vt_write(&slice);
             };
         };
 
@@ -1681,6 +1959,7 @@ impl TerminalCore {
             .max(dirty_row_count);
     }
 
+    #[cfg_attr(feature = "tracy", instrument(level = "debug", skip_all))]
     pub fn handle_char(&mut self, code_unit: u32, lparam: isize) -> eyre::Result<bool> {
         trace!(
             code_unit,
@@ -1752,6 +2031,7 @@ impl TerminalCore {
         Ok(true)
     }
 
+    #[cfg_attr(feature = "tracy", instrument(level = "debug", skip_all))]
     pub fn handle_key_event(
         &mut self,
         vkey: u32,
@@ -1785,6 +2065,20 @@ impl TerminalCore {
                 "translating Ctrl+D key press at shell prompt into `exit`"
             );
             self.write_input(CTRL_D_EXIT_COMMAND)?;
+            self.repaint.needs_repaint = true;
+            return Ok(true);
+        }
+
+        if !is_release && !was_down && should_translate_ctrl_l_key(key_event, self.semantic_prompt)
+        {
+            self.suppressed_chars
+                .push_back(SuppressedChar::single(u32::from(CTRL_L_FORM_FEED)));
+            debug!(
+                semantic_prompt = ?self.semantic_prompt,
+                "translating Ctrl+L key press at shell prompt into form feed"
+            );
+            self.mark_prompt_input_written();
+            self.write_input(&[CTRL_L_FORM_FEED])?;
             self.repaint.needs_repaint = true;
             return Ok(true);
         }
@@ -1922,18 +2216,14 @@ impl TerminalCore {
             consumed_mods |= key::Mods::SHIFT;
         }
 
-        self.key_event
-            .set_action(action)
-            .set_key(key_event.mapped_key)
-            .set_mods(key_event.mods)
-            .set_consumed_mods(consumed_mods)
-            .set_unshifted_codepoint(key_event.unshifted_codepoint)
-            .set_utf8::<String>(None);
-
-        self.key_encoder
-            .set_options_from_terminal(&self.terminal)
-            .encode_to_vec(&self.key_event, &mut response)
-            .wrap_err("failed to encode special key event")?;
+        self.engine.encode_key_event(
+            action,
+            key_event.mapped_key,
+            key_event.mods,
+            consumed_mods,
+            key_event.unshifted_codepoint,
+            &mut response,
+        )?;
 
         if response.is_empty() {
             return Ok(false);
@@ -1959,9 +2249,7 @@ impl TerminalCore {
     }
 
     pub fn current_kitty_keyboard_flags(&self) -> eyre::Result<key::KittyKeyFlags> {
-        self.terminal
-            .kitty_keyboard_flags()
-            .wrap_err("failed to query kitty keyboard flags")
+        self.engine.kitty_keyboard_flags()
     }
 
     pub fn win32_input_mode_enabled(&self) -> bool {
@@ -1987,21 +2275,7 @@ impl TerminalCore {
     }
 
     pub fn viewport_metrics(&self) -> eyre::Result<TerminalViewportMetrics> {
-        let scrollbar = self
-            .terminal
-            .scrollbar()
-            .wrap_err("failed to query terminal scrollbar state")?;
-        let scrollback_rows = self
-            .terminal
-            .scrollback_rows()
-            .wrap_err("failed to query terminal scrollback row count")?;
-
-        Ok(TerminalViewportMetrics {
-            total: scrollbar.total,
-            offset: scrollbar.offset,
-            visible: scrollbar.len,
-            scrollback: u64::try_from(scrollback_rows).unwrap_or(u64::MAX),
-        })
+        self.engine.viewport_metrics()
     }
 
     pub fn viewport_to_screen_cell(
@@ -2020,7 +2294,7 @@ impl TerminalCore {
             return;
         }
 
-        self.terminal.scroll_viewport(ScrollViewport::Delta(delta));
+        self.engine.scroll_viewport(ScrollViewport::Delta(delta));
         self.repaint.needs_repaint = true;
         self.repaint.full_repaint_pending = true;
         self.invalidate_display_cache();
@@ -2035,13 +2309,13 @@ impl TerminalCore {
         }
 
         if target_offset == 0 {
-            self.terminal.scroll_viewport(ScrollViewport::Top);
+            self.engine.scroll_viewport(ScrollViewport::Top);
         } else if target_offset == max_offset {
-            self.terminal.scroll_viewport(ScrollViewport::Bottom);
+            self.engine.scroll_viewport(ScrollViewport::Bottom);
         } else {
             let delta = i128::from(target_offset) - i128::from(viewport.offset);
             let delta = delta.clamp(isize::MIN as i128, isize::MAX as i128) as isize;
-            self.terminal.scroll_viewport(ScrollViewport::Delta(delta));
+            self.engine.scroll_viewport(ScrollViewport::Delta(delta));
         }
 
         self.repaint.needs_repaint = true;
@@ -2076,158 +2350,27 @@ impl TerminalCore {
         Ok(Arc::clone(&self.cached_display))
     }
 
-    #[expect(
-        clippy::too_many_lines,
-        reason = "incremental row extraction keeps the render-state walk and dirty-row policy together"
-    )]
     #[cfg_attr(feature = "tracy", instrument(level = "debug", skip_all))]
     fn build_display_state(
         &mut self,
         selection: Option<TerminalSelection>,
     ) -> eyre::Result<TerminalDisplayState> {
         let viewport = self.viewport_metrics()?;
-        let snapshot = {
-            #[cfg(feature = "tracy")]
-            let _span = debug_span!("update_terminal_render_state").entered();
-            self.render_state
-                .update(&self.terminal)
-                .wrap_err("failed to update terminal render state")?
-        };
-        let colors = snapshot
-            .colors()
-            .wrap_err("failed to fetch terminal colors")?;
-        let mut rows = RowIterator::new().wrap_err("failed to create row iterator")?;
-        let mut cells = CellIterator::new().wrap_err("failed to create cell iterator")?;
-        let cursor = build_terminal_cursor(&snapshot, &colors)?;
-        let mut display = TerminalDisplayState {
-            rows: Vec::new(),
-            dirty_rows: Vec::new(),
-            cursor,
-            scrollbar: Some(TerminalDisplayScrollbar {
-                total: viewport.total,
-                offset: viewport.offset,
-                visible: viewport.visible,
-            }),
-        };
-
         let selection_active = selection.is_some();
-        let snapshot_dirty = snapshot.dirty().unwrap_or_else(|error| {
-            debug!(
-                ?error,
-                "falling back to full redraw after dirty-state query failure"
-            );
-            Dirty::Full
-        });
-        let previous_rows = (!selection_active).then_some(&self.cached_display.rows);
+        let previous_display = (!selection_active).then(|| Arc::clone(&self.cached_display));
 
-        {
-            #[cfg(feature = "tracy")]
-            let _span = debug_span!("collect_visible_terminal_cells").entered();
-            let mut row_index = 0_i32;
-            let mut row_iter = rows
-                .update(&snapshot)
-                .wrap_err("failed to update row iterator")?;
-            while let Some(row) = row_iter.next() {
-                let row_position = usize::try_from(row_index).unwrap_or_default();
-                let row_dirty = if selection_active || matches!(snapshot_dirty, Dirty::Full) {
-                    true
-                } else if let Some(previous_rows) = previous_rows {
-                    row.dirty().unwrap_or_else(|error| {
-                        debug!(
-                            ?error,
-                            row_position,
-                            "falling back to dirty row after row dirty-state query failure"
-                        );
-                        true
-                    }) || previous_rows.get(row_position).is_none()
-                } else {
-                    true
-                };
-
-                if !row_dirty
-                    && let Some(previous_row) =
-                        previous_rows.and_then(|rows| rows.get(row_position))
-                {
-                    display.rows.push(previous_row.clone());
-                    row_index += 1;
-                    continue;
-                }
-
-                let mut column_index = 0_i32;
-                let mut display_row = TerminalDisplayRow {
-                    row: row_index,
-                    backgrounds: Vec::new(),
-                    glyphs: Vec::new(),
-                };
-                let mut cell_iter = cells
-                    .update(row)
-                    .wrap_err("failed to update cell iterator")?;
-                while let Some(cell) = cell_iter.next() {
-                    let style = cell.style().wrap_err("failed to read cell style")?;
-                    let graphemes = cell.graphemes().wrap_err("failed to read cell text")?;
-                    let foreground = cell.fg_color().wrap_err("failed to read cell foreground")?;
-                    let background = cell.bg_color().wrap_err("failed to read cell background")?;
-                    let viewport_cell = TerminalCellPoint::new(column_index, row_index);
-                    let selection_cell = TerminalCellPoint::new(
-                        column_index,
-                        i32::try_from(viewport.offset).unwrap_or(i32::MAX) + row_index,
-                    );
-                    let selected =
-                        selection.is_some_and(|selection| selection.contains(selection_cell));
-                    let (glyph_color, background_color) = resolve_terminal_cell_colors(
-                        &colors,
-                        foreground,
-                        background,
-                        style.inverse ^ selected,
-                    );
-
-                    if let Some(color) = background_color {
-                        display_row.backgrounds.push(TerminalDisplayBackground {
-                            cell: viewport_cell,
-                            color,
-                        });
-                    }
-
-                    if !graphemes.is_empty() {
-                        for character in graphemes {
-                            display_row.glyphs.push(TerminalDisplayGlyph {
-                                cell: viewport_cell,
-                                character,
-                                color: glyph_color,
-                            });
-                        }
-                    }
-                    column_index += 1;
-                }
-                display.rows.push(display_row);
-
-                if row_dirty {
-                    display.dirty_rows.push(row_position);
-                }
-
-                if !selection_active && let Err(error) = row.set_dirty(false) {
-                    debug!(
-                        ?error,
-                        row_position, "failed to clear terminal row dirty flag"
-                    );
-                }
-
-                row_index += 1;
+        match &mut self.engine {
+            RuntimeTerminalEngine::Ghostty(engine) => build_ghostty_display_state(
+                engine,
+                selection,
+                selection_active,
+                previous_display.as_deref(),
+                viewport,
+            ),
+            RuntimeTerminalEngine::Teamy(engine) => {
+                Ok(build_teamy_display_state(engine, selection, viewport))
             }
         }
-
-        if selection_active
-            || matches!(snapshot_dirty, Dirty::Full)
-            || self.cached_display.rows.len() != display.rows.len()
-        {
-            display.dirty_rows = (0..display.rows.len()).collect();
-        }
-
-        if !selection_active && let Err(error) = snapshot.set_dirty(Dirty::Clean) {
-            debug!(?error, "failed to clear terminal render-state dirty flag");
-        }
-
-        Ok(display)
     }
 
     #[must_use]
@@ -2247,6 +2390,7 @@ impl TerminalCore {
         )
     }
 
+    #[cfg_attr(feature = "tracy", instrument(level = "debug", skip_all))]
     fn write_input(&mut self, data: &[u8]) -> eyre::Result<()> {
         let mut writer = self
             .writer
@@ -2256,6 +2400,7 @@ impl TerminalCore {
             .write_all(data)
             .wrap_err("failed to write input to PTY")?;
         writer.flush().wrap_err("failed to flush PTY input")?;
+        self.pending_input_response_starts.push_back(Instant::now());
         self.input_trace.push(data.to_vec());
         Ok(())
     }
@@ -2345,7 +2490,10 @@ impl TerminalCore {
     }
 
     fn refresh_semantic_prompt_tracking(&mut self) -> eyre::Result<()> {
-        let next = semantic_prompt_tracking(&mut self.render_state, &self.terminal)?;
+        let next = match &mut self.engine {
+            RuntimeTerminalEngine::Ghostty(engine) => ghostty_semantic_prompt_tracking(engine)?,
+            RuntimeTerminalEngine::Teamy(_) => teamy_semantic_prompt_tracking(self.semantic_prompt),
+        };
         if !self.semantic_prompt.markers_observed && next.markers_observed {
             info!("detected OSC 133 semantic prompt markers from shell output");
         }
@@ -2433,16 +2581,339 @@ impl TerminalCore {
 
     fn visible_cell_text_rows(&mut self) -> eyre::Result<Vec<TerminalTextRow>> {
         let viewport = self.viewport_metrics()?;
-        let snapshot = self
-            .render_state
-            .update(&self.terminal)
-            .wrap_err("failed to update terminal render state")?;
+        match &mut self.engine {
+            RuntimeTerminalEngine::Ghostty(engine) => {
+                visible_ghostty_cell_text_rows(engine, viewport)
+            }
+            RuntimeTerminalEngine::Teamy(engine) => {
+                Ok(visible_teamy_cell_text_rows(engine, viewport))
+            }
+        }
+    }
+
+    fn selected_cell_text_rows(
+        &self,
+        selection: TerminalSelection,
+    ) -> eyre::Result<Vec<TerminalTextRow>> {
+        let total_rows = self.engine.total_rows()?;
+        if total_rows == 0 {
+            return Ok(Vec::new());
+        }
+
+        let (start_row, end_row) = selection_row_bounds(selection);
+        let max_row = i32::try_from(total_rows.saturating_sub(1)).unwrap_or(i32::MAX);
+        let clamped_start = start_row.clamp(0, max_row);
+        let clamped_end = end_row.clamp(0, max_row);
+        let mut rows = Vec::new();
+
+        for row in clamped_start..=clamped_end {
+            rows.push(TerminalTextRow {
+                row,
+                cells: self.screen_row_cells(u32::try_from(row).unwrap_or_default())?,
+            });
+        }
+
+        Ok(rows)
+    }
+
+    fn screen_row_cells(&self, row: u32) -> eyre::Result<Vec<String>> {
+        self.engine.screen_row_cells(row, self.cols)
+    }
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "incremental row extraction keeps the Ghostty render-state walk and dirty-row policy together"
+)]
+fn build_ghostty_display_state(
+    engine: &mut GhosttyTerminalEngine,
+    selection: Option<TerminalSelection>,
+    selection_active: bool,
+    previous_display: Option<&TerminalDisplayState>,
+    viewport: TerminalViewportMetrics,
+) -> eyre::Result<TerminalDisplayState> {
+    engine.with_snapshot(|snapshot| {
+        #[cfg(feature = "tracy")]
+        let _span = debug_span!("update_terminal_render_state").entered();
+
+        let colors = snapshot
+            .colors()
+            .wrap_err("failed to fetch terminal colors")?;
+        let mut rows = RowIterator::new().wrap_err("failed to create row iterator")?;
+        let mut cells = CellIterator::new().wrap_err("failed to create cell iterator")?;
+        let cursor = build_terminal_cursor(snapshot, &colors)?;
+        let mut display = TerminalDisplayState {
+            rows: Vec::new(),
+            dirty_rows: Vec::new(),
+            cursor,
+            scrollbar: Some(TerminalDisplayScrollbar {
+                total: viewport.total,
+                offset: viewport.offset,
+                visible: viewport.visible,
+            }),
+        };
+
+        let snapshot_dirty = snapshot.dirty().unwrap_or_else(|error| {
+            debug!(
+                ?error,
+                "falling back to full redraw after dirty-state query failure"
+            );
+            Dirty::Full
+        });
+
+        #[cfg(feature = "tracy")]
+        let _span = debug_span!("collect_visible_terminal_cells").entered();
+        let mut row_index = 0_i32;
+        let mut row_iter = rows
+            .update(snapshot)
+            .wrap_err("failed to update row iterator")?;
+        while let Some(row) = row_iter.next() {
+            let row_position = usize::try_from(row_index).unwrap_or_default();
+            let row_dirty = if selection_active || matches!(snapshot_dirty, Dirty::Full) {
+                true
+            } else if let Some(previous_display) = previous_display {
+                row.dirty().unwrap_or_else(|error| {
+                    debug!(
+                        ?error,
+                        row_position,
+                        "falling back to dirty row after row dirty-state query failure"
+                    );
+                    true
+                }) || previous_display.rows.get(row_position).is_none()
+            } else {
+                true
+            };
+
+            if !row_dirty
+                && let Some(previous_row) = previous_display
+                    .and_then(|previous_display| previous_display.rows.get(row_position))
+            {
+                display.rows.push(previous_row.clone());
+                row_index += 1;
+                continue;
+            }
+
+            let mut column_index = 0_i32;
+            let mut display_row = TerminalDisplayRow {
+                row: row_index,
+                backgrounds: Vec::new(),
+                glyphs: Vec::new(),
+            };
+            let mut cell_iter = cells
+                .update(row)
+                .wrap_err("failed to update cell iterator")?;
+            while let Some(cell) = cell_iter.next() {
+                let style = cell.style().wrap_err("failed to read cell style")?;
+                let graphemes = cell.graphemes().wrap_err("failed to read cell text")?;
+                let foreground = cell.fg_color().wrap_err("failed to read cell foreground")?;
+                let background = cell.bg_color().wrap_err("failed to read cell background")?;
+                let viewport_cell = TerminalCellPoint::new(column_index, row_index);
+                let selection_cell = TerminalCellPoint::new(
+                    column_index,
+                    i32::try_from(viewport.offset).unwrap_or(i32::MAX) + row_index,
+                );
+                let selected =
+                    selection.is_some_and(|selection| selection.contains(selection_cell));
+                let (glyph_color, background_color) = resolve_terminal_cell_colors(
+                    &colors,
+                    foreground,
+                    background,
+                    style.inverse ^ selected,
+                );
+
+                if let Some(color) = background_color {
+                    display_row.backgrounds.push(TerminalDisplayBackground {
+                        cell: viewport_cell,
+                        color,
+                    });
+                }
+
+                if !graphemes.is_empty() {
+                    for character in graphemes {
+                        display_row.glyphs.push(TerminalDisplayGlyph {
+                            cell: viewport_cell,
+                            character,
+                            color: glyph_color,
+                        });
+                    }
+                }
+                column_index += 1;
+            }
+            display.rows.push(display_row);
+
+            if row_dirty {
+                display.dirty_rows.push(row_position);
+            }
+
+            if !selection_active && let Err(error) = row.set_dirty(false) {
+                debug!(
+                    ?error,
+                    row_position, "failed to clear terminal row dirty flag"
+                );
+            }
+
+            row_index += 1;
+        }
+
+        if selection_active
+            || matches!(snapshot_dirty, Dirty::Full)
+            || previous_display
+                .is_some_and(|previous_display| previous_display.rows.len() != display.rows.len())
+        {
+            display.dirty_rows = (0..display.rows.len()).collect();
+        }
+
+        if !selection_active && let Err(error) = snapshot.set_dirty(Dirty::Clean) {
+            debug!(?error, "failed to clear terminal render-state dirty flag");
+        }
+
+        Ok(display)
+    })
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "the Teamy display helper keeps the fast no-selection path and the selection fallback together for profiling and comparison"
+)]
+fn build_teamy_display_state(
+    engine: &TeamyTerminalEngine,
+    selection: Option<TerminalSelection>,
+    viewport: TerminalViewportMetrics,
+) -> TerminalDisplayState {
+    const TEAMY_FOREGROUND: [f32; 4] = [0.93, 0.95, 0.98, 1.0];
+    const TEAMY_SELECTION_FOREGROUND: [f32; 4] = [0.06, 0.07, 0.09, 1.0];
+    const TEAMY_SELECTION_BACKGROUND: [f32; 4] = [0.42, 0.67, 0.98, 1.0];
+
+    {
+        #[cfg(feature = "tracy")]
+        let _span = debug_span!("build_teamy_terminal_display_state").entered();
+
+        let teamy_display = engine.display_state();
+        let visible_rows = usize::try_from(viewport.visible).unwrap_or_default();
+
+        if selection.is_none() {
+            let rows = teamy_display
+                .visible_rows
+                .iter()
+                .map(|row| TerminalDisplayRow {
+                    row: i32::try_from(row.row).unwrap_or(i32::MAX),
+                    backgrounds: Vec::new(),
+                    glyphs: row
+                        .glyphs
+                        .iter()
+                        .map(|glyph| TerminalDisplayGlyph {
+                            cell: TerminalCellPoint::new(
+                                i32::try_from(glyph.column).unwrap_or(i32::MAX),
+                                i32::try_from(glyph.row).unwrap_or(i32::MAX),
+                            ),
+                            character: glyph.character,
+                            color: TEAMY_FOREGROUND,
+                        })
+                        .collect(),
+                })
+                .collect::<Vec<_>>();
+
+            let cursor = (teamy_display.cursor.row < visible_rows).then(|| TerminalDisplayCursor {
+                cell: TerminalCellPoint::new(
+                    i32::try_from(teamy_display.cursor.column).unwrap_or(i32::MAX),
+                    i32::try_from(teamy_display.cursor.row).unwrap_or(i32::MAX),
+                ),
+                color: TEAMY_FOREGROUND,
+                style: TerminalDisplayCursorStyle::Block,
+            });
+
+            return TerminalDisplayState {
+                dirty_rows: (0..rows.len()).collect(),
+                rows,
+                cursor,
+                scrollbar: Some(TerminalDisplayScrollbar {
+                    total: viewport.total,
+                    offset: viewport.offset,
+                    visible: viewport.visible,
+                }),
+            };
+        }
+
+        let mut rows = Vec::with_capacity(visible_rows);
+        for row_index in 0..visible_rows {
+            let screen_row = usize::try_from(viewport.offset)
+                .unwrap_or_default()
+                .saturating_add(row_index);
+            let row_cells = engine.screen_row_cells(u32::try_from(screen_row).unwrap_or_default());
+            let mut display_row = TerminalDisplayRow {
+                row: i32::try_from(row_index).unwrap_or(i32::MAX),
+                backgrounds: Vec::new(),
+                glyphs: Vec::new(),
+            };
+
+            for (column_index, cell_text) in row_cells.iter().enumerate() {
+                let viewport_cell = TerminalCellPoint::new(
+                    i32::try_from(column_index).unwrap_or(i32::MAX),
+                    i32::try_from(row_index).unwrap_or(i32::MAX),
+                );
+                let selection_cell = TerminalCellPoint::new(
+                    i32::try_from(column_index).unwrap_or(i32::MAX),
+                    i32::try_from(screen_row).unwrap_or(i32::MAX),
+                );
+                let selected =
+                    selection.is_some_and(|selection| selection.contains(selection_cell));
+
+                if selected {
+                    display_row.backgrounds.push(TerminalDisplayBackground {
+                        cell: viewport_cell,
+                        color: TEAMY_SELECTION_BACKGROUND,
+                    });
+                }
+
+                for character in cell_text.chars().filter(|character| *character != ' ') {
+                    display_row.glyphs.push(TerminalDisplayGlyph {
+                        cell: viewport_cell,
+                        character,
+                        color: if selected {
+                            TEAMY_SELECTION_FOREGROUND
+                        } else {
+                            TEAMY_FOREGROUND
+                        },
+                    });
+                }
+            }
+
+            rows.push(display_row);
+        }
+
+        let cursor = (teamy_display.cursor.row < visible_rows).then(|| TerminalDisplayCursor {
+            cell: TerminalCellPoint::new(
+                i32::try_from(teamy_display.cursor.column).unwrap_or(i32::MAX),
+                i32::try_from(teamy_display.cursor.row).unwrap_or(i32::MAX),
+            ),
+            color: TEAMY_FOREGROUND,
+            style: TerminalDisplayCursorStyle::Block,
+        });
+
+        TerminalDisplayState {
+            dirty_rows: (0..rows.len()).collect(),
+            rows,
+            cursor,
+            scrollbar: Some(TerminalDisplayScrollbar {
+                total: viewport.total,
+                offset: viewport.offset,
+                visible: viewport.visible,
+            }),
+        }
+    }
+}
+
+fn visible_ghostty_cell_text_rows(
+    engine: &mut GhosttyTerminalEngine,
+    viewport: TerminalViewportMetrics,
+) -> eyre::Result<Vec<TerminalTextRow>> {
+    engine.with_snapshot(|snapshot| {
         let mut rows = RowIterator::new().wrap_err("failed to create row iterator")?;
         let mut cells = CellIterator::new().wrap_err("failed to create cell iterator")?;
         let mut text_rows = Vec::new();
 
         let mut row_iter = rows
-            .update(&snapshot)
+            .update(snapshot)
             .wrap_err("failed to update row iterator")?;
         let mut row_index = 0_i32;
         while let Some(row) = row_iter.next() {
@@ -2466,50 +2937,39 @@ impl TerminalCore {
         }
 
         Ok(text_rows)
+    })
+}
+
+fn visible_teamy_cell_text_rows(
+    engine: &TeamyTerminalEngine,
+    viewport: TerminalViewportMetrics,
+) -> Vec<TerminalTextRow> {
+    let visible_rows = usize::try_from(viewport.visible).unwrap_or_default();
+    (0..visible_rows)
+        .map(|row_index| {
+            let screen_row = usize::try_from(viewport.offset)
+                .unwrap_or_default()
+                .saturating_add(row_index);
+            TerminalTextRow {
+                row: i32::try_from(screen_row).unwrap_or(i32::MAX),
+                cells: engine.screen_row_cells(u32::try_from(screen_row).unwrap_or_default()),
+            }
+        })
+        .collect()
+}
+
+fn ghostty_screen_row_cells(
+    engine: &GhosttyTerminalEngine,
+    cols: u16,
+    row: u32,
+) -> eyre::Result<Vec<String>> {
+    let mut cells = Vec::with_capacity(usize::from(cols));
+    for column in 0..cols {
+        let grid_ref = engine.screen_grid_ref(column, row)?;
+        cells.push(read_grid_ref_text(&grid_ref)?);
     }
 
-    fn selected_cell_text_rows(
-        &self,
-        selection: TerminalSelection,
-    ) -> eyre::Result<Vec<TerminalTextRow>> {
-        let total_rows = self
-            .terminal
-            .total_rows()
-            .wrap_err("failed to query terminal total row count")?;
-        if total_rows == 0 {
-            return Ok(Vec::new());
-        }
-
-        let (start_row, end_row) = selection_row_bounds(selection);
-        let max_row = i32::try_from(total_rows.saturating_sub(1)).unwrap_or(i32::MAX);
-        let clamped_start = start_row.clamp(0, max_row);
-        let clamped_end = end_row.clamp(0, max_row);
-        let mut rows = Vec::new();
-
-        for row in clamped_start..=clamped_end {
-            rows.push(TerminalTextRow {
-                row,
-                cells: self.screen_row_cells(u32::try_from(row).unwrap_or_default())?,
-            });
-        }
-
-        Ok(rows)
-    }
-
-    fn screen_row_cells(&self, row: u32) -> eyre::Result<Vec<String>> {
-        let mut cells = Vec::with_capacity(usize::from(self.cols));
-        for column in 0..self.cols {
-            let grid_ref = self
-                .terminal
-                .grid_ref(Point::Screen(PointCoordinate { x: column, y: row }))
-                .wrap_err_with(|| {
-                    format!("failed to resolve terminal screen point at column {column}, row {row}")
-                })?;
-            cells.push(read_grid_ref_text(&grid_ref)?);
-        }
-
-        Ok(cells)
-    }
+    Ok(cells)
 }
 
 fn ordered_linear_bounds(
@@ -2523,49 +2983,59 @@ fn ordered_linear_bounds(
     }
 }
 
-fn semantic_prompt_tracking(
-    render_state: &mut RenderState<'static>,
-    terminal: &Terminal<'static, 'static>,
+fn ghostty_semantic_prompt_tracking(
+    engine: &mut GhosttyTerminalEngine,
 ) -> eyre::Result<SemanticPromptTracking> {
-    let snapshot = render_state
-        .update(terminal)
-        .wrap_err("failed to update terminal render state for semantic prompt tracking")?;
-    let cursor_row = snapshot
-        .cursor_viewport()
-        .wrap_err("failed to query terminal cursor viewport for semantic prompt tracking")?
-        .map(|cursor| cursor.y);
+    engine.with_snapshot(|snapshot| {
+        let cursor_row = snapshot
+            .cursor_viewport()
+            .wrap_err("failed to query terminal cursor viewport for semantic prompt tracking")?
+            .map(|cursor| cursor.y);
 
-    let mut rows = RowIterator::new().wrap_err("failed to create row iterator")?;
-    let mut row_iter = rows
-        .update(&snapshot)
-        .wrap_err("failed to update row iterator")?;
+        let mut rows = RowIterator::new().wrap_err("failed to create row iterator")?;
+        let mut row_iter = rows
+            .update(snapshot)
+            .wrap_err("failed to update row iterator")?;
 
-    let mut row_index = 0_u16;
-    let mut markers_observed = false;
-    let mut at_shell_prompt = false;
+        let mut row_index = 0_u16;
+        let mut markers_observed = false;
+        let mut at_shell_prompt = false;
 
-    while let Some(row) = row_iter.next() {
-        let semantic_prompt = row
-            .raw_row()
-            .wrap_err("failed to query raw terminal row for semantic prompt tracking")?
-            .semantic_prompt()
-            .wrap_err("failed to query terminal row semantic prompt state")?;
+        while let Some(row) = row_iter.next() {
+            let semantic_prompt = row
+                .raw_row()
+                .wrap_err("failed to query raw terminal row for semantic prompt tracking")?
+                .semantic_prompt()
+                .wrap_err("failed to query terminal row semantic prompt state")?;
 
-        if semantic_prompt != RowSemanticPrompt::None {
-            markers_observed = true;
-            if cursor_row == Some(row_index) {
-                at_shell_prompt = true;
+            if semantic_prompt != RowSemanticPrompt::None {
+                markers_observed = true;
+                if cursor_row == Some(row_index) {
+                    at_shell_prompt = true;
+                }
             }
+
+            row_index = row_index.saturating_add(1);
         }
 
-        row_index = row_index.saturating_add(1);
-    }
-
-    Ok(SemanticPromptTracking {
-        markers_observed,
-        at_shell_prompt,
-        input_state: PromptInputState::Inactive,
+        Ok(SemanticPromptTracking {
+            markers_observed,
+            at_shell_prompt,
+            input_state: PromptInputState::Inactive,
+        })
     })
+}
+
+fn teamy_semantic_prompt_tracking(current: SemanticPromptTracking) -> SemanticPromptTracking {
+    SemanticPromptTracking {
+        markers_observed: current.markers_observed,
+        at_shell_prompt: current.markers_observed
+            && matches!(
+                current.input_state,
+                PromptInputState::AwaitingPristine | PromptInputState::AwaitingEdited
+            ),
+        input_state: PromptInputState::Inactive,
+    }
 }
 
 fn should_close_from_echoed_ctrl_d(tracking: SemanticPromptTracking, data: &[u8]) -> bool {
@@ -2588,6 +3058,19 @@ fn should_translate_ctrl_d_key(
 ) -> bool {
     should_translate_ctrl_d_to_exit(tracking)
         && key_event.mapped_key == key::Key::D
+        && key_event.mods.contains(key::Mods::CTRL)
+}
+
+fn should_translate_ctrl_l_to_form_feed(tracking: SemanticPromptTracking) -> bool {
+    tracking.markers_observed && tracking.at_shell_prompt
+}
+
+fn should_translate_ctrl_l_key(
+    key_event: PendingWin32CharKey,
+    tracking: SemanticPromptTracking,
+) -> bool {
+    should_translate_ctrl_l_to_form_feed(tracking)
+        && key_event.mapped_key == key::Key::L
         && key_event.mods.contains(key::Mods::CTRL)
 }
 
@@ -3311,7 +3794,8 @@ mod tests {
         should_close_from_echoed_ctrl_d, should_mark_prompt_input_written_for_key,
         should_publish_terminal_display_state, should_publish_terminal_display_update,
         should_refresh_semantic_prompt_tracking, should_translate_ctrl_d_key,
-        should_translate_ctrl_d_to_exit, strip_echoed_ctrl_d, viewport_is_bottom_anchored,
+        should_translate_ctrl_d_to_exit, should_translate_ctrl_l_key,
+        should_translate_ctrl_l_to_form_feed, strip_echoed_ctrl_d, viewport_is_bottom_anchored,
     };
     use crate::app::spatial::TerminalCellPoint;
     use libghostty_vt::key;
@@ -3847,6 +4331,61 @@ mod tests {
                 at_shell_prompt: true,
                 input_state: PromptInputState::AwaitingEdited,
             }
+        ));
+    }
+
+    #[test]
+    fn ctrl_l_translation_targets_any_shell_prompt_input_state() {
+        assert!(!should_translate_ctrl_l_to_form_feed(
+            SemanticPromptTracking::default()
+        ));
+        assert!(should_translate_ctrl_l_to_form_feed(
+            SemanticPromptTracking {
+                markers_observed: true,
+                at_shell_prompt: true,
+                input_state: PromptInputState::AwaitingPristine,
+            }
+        ));
+        assert!(should_translate_ctrl_l_to_form_feed(
+            SemanticPromptTracking {
+                markers_observed: true,
+                at_shell_prompt: true,
+                input_state: PromptInputState::AwaitingEdited,
+            }
+        ));
+        assert!(!should_translate_ctrl_l_to_form_feed(
+            SemanticPromptTracking {
+                markers_observed: true,
+                at_shell_prompt: false,
+                input_state: PromptInputState::AwaitingEdited,
+            }
+        ));
+    }
+
+    #[test]
+    fn ctrl_l_key_translation_requires_ctrl_modified_l_at_shell_prompt() {
+        let tracking = SemanticPromptTracking {
+            markers_observed: true,
+            at_shell_prompt: true,
+            input_state: PromptInputState::AwaitingEdited,
+        };
+        let ctrl_l = PendingWin32CharKey {
+            vkey: 0x4C,
+            lparam: 0,
+            mapped_key: key::Key::L,
+            unshifted_codepoint: 'l',
+            mods: key::Mods::CTRL,
+        };
+        let plain_l = PendingWin32CharKey {
+            mods: key::Mods::empty(),
+            ..ctrl_l
+        };
+
+        assert!(should_translate_ctrl_l_key(ctrl_l, tracking));
+        assert!(!should_translate_ctrl_l_key(plain_l, tracking));
+        assert!(!should_translate_ctrl_l_key(
+            ctrl_l,
+            SemanticPromptTracking::default()
         ));
     }
 

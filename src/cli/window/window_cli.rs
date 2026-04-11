@@ -32,7 +32,7 @@ impl WindowArgs {
         cache_home: &crate::paths::CacheHome,
     ) -> eyre::Result<()> {
         match self.command {
-            WindowCommand::Show(_) => WindowShowArgs::invoke(app_home, cache_home),
+            WindowCommand::Show(args) => args.invoke(app_home, cache_home),
         }
     }
 }

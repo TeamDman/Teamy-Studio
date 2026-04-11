@@ -32,4 +32,7 @@ The multiline paste confirmation flow should use a native Windows dialog positio
 os[os.windows.rendering.direct3d12]
 The app should render its notebook shell through Windows-native Direct3D 12 presentation paths so panel composition and shader effects can be controlled with low latency.
 
+os[os.windows.rendering.direct3d12.offscreen-terminal-verification]
+The Direct3D 12 renderer must support rendering terminal frames to an offscreen target that can be read back for automated verification without presenting to a visible window.
+
 The intent of this document is to make Windows-specific assumptions explicit. These rules are not claims of cross-platform portability; they document the platform hooks and rendering choices that currently define the product experience.
