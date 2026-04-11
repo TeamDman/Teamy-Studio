@@ -6,8 +6,8 @@ use figue::{self as args};
 #[facet(rename_all = "kebab-case")]
 #[repr(u8)]
 pub enum WindowShowVtEngine {
-    #[default]
     Ghostty,
+    #[default]
     Teamy,
 }
 
