@@ -3,6 +3,8 @@ use facet::Facet;
 use figue::{self as args};
 use std::path::Path;
 
+use crate::cli::output::CliOutput;
+
 /// Run a headless offscreen terminal render self-test.
 // cli[impl command.surface.self-test-render-offscreen]
 #[derive(Facet, Arbitrary, Debug, PartialEq)]
@@ -22,11 +24,13 @@ impl SelfTestRenderOffscreenArgs {
         self,
         app_home: &crate::paths::AppHome,
         cache_home: &crate::paths::CacheHome,
-    ) -> eyre::Result<()> {
-        crate::app::run_render_offscreen_self_test(
-            app_home,
-            cache_home,
-            self.artifact_output.as_deref().map(Path::new),
-        )
+    ) -> eyre::Result<CliOutput> {
+        Ok(CliOutput::facet(
+            crate::app::run_render_offscreen_self_test(
+                app_home,
+                cache_home,
+                self.artifact_output.as_deref().map(Path::new),
+            )?,
+        ))
     }
 }

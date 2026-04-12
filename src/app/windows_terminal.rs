@@ -416,10 +416,22 @@ impl RuntimeTerminalEngine {
         }
     }
 
-    fn scroll_active_cursor_into_view(&mut self) {
+    fn scroll_active_cursor_into_view(&mut self) -> eyre::Result<()> {
         match self {
-            Self::Ghostty(engine) => engine.scroll_viewport(ScrollViewport::Bottom),
-            Self::Teamy(engine) => engine.scroll_active_cursor_into_view(),
+            Self::Ghostty(engine) => {
+                let viewport = engine.viewport_metrics()?;
+                let max_offset = viewport.total.saturating_sub(viewport.visible);
+                if viewport.offset < max_offset {
+                    let delta = i128::from(max_offset) - i128::from(viewport.offset);
+                    let delta = delta.clamp(isize::MIN as i128, isize::MAX as i128) as isize;
+                    engine.scroll_viewport(ScrollViewport::Delta(delta));
+                }
+                Ok(())
+            }
+            Self::Teamy(engine) => {
+                engine.scroll_active_cursor_into_view();
+                Ok(())
+            }
         }
     }
 
@@ -513,6 +525,7 @@ struct TerminalCore {
     win32_input_mode_buffer: Vec<u8>,
     semantic_prompt_buffer: Vec<u8>,
     semantic_prompt: SemanticPromptTracking,
+    pending_prompt_reanchor_after_resize: bool,
     cached_display: SharedTerminalDisplayState,
     display_cache_dirty: bool,
     performance: TerminalPerformanceSnapshot,
@@ -1446,6 +1459,8 @@ impl TerminalWorkerRunner {
             self.core.refresh_semantic_prompt_tracking()?;
         }
 
+        self.core.reanchor_prompt_after_resize_if_needed()?;
+
         self.core.refresh_child_exit_state()?;
 
         self.publish_snapshot_if_changed()?;
@@ -1647,6 +1662,7 @@ impl TerminalCore {
             win32_input_mode_buffer: Vec::new(),
             semantic_prompt_buffer: Vec::new(),
             semantic_prompt: SemanticPromptTracking::default(),
+            pending_prompt_reanchor_after_resize: false,
             cached_display: Arc::new(TerminalDisplayState::default()),
             display_cache_dirty: true,
             performance: TerminalPerformanceSnapshot::default(),
@@ -1680,6 +1696,8 @@ impl TerminalCore {
             .viewport_metrics()
             .map(viewport_is_bottom_anchored)
             .unwrap_or(false);
+        let keep_active_prompt_visible = keep_viewport_pinned_to_bottom
+            || should_keep_active_prompt_visible_on_resize(self.semantic_prompt);
         let (cols, rows) = layout.grid_size();
         if cols == self.cols && rows == self.rows {
             return Ok(());
@@ -1703,9 +1721,10 @@ impl TerminalCore {
             })
             .map_err(|error| eyre::eyre!("failed to resize PTY: {error}"))?;
 
-        if keep_viewport_pinned_to_bottom {
-            self.engine.scroll_viewport(ScrollViewport::Bottom);
+        if keep_active_prompt_visible {
+            self.engine.scroll_active_cursor_into_view()?;
         }
+        self.pending_prompt_reanchor_after_resize = keep_active_prompt_visible;
 
         self.cols = cols;
         self.rows = rows;
@@ -2399,7 +2418,7 @@ impl TerminalCore {
             return Ok(());
         }
 
-        self.engine.scroll_active_cursor_into_view();
+        self.engine.scroll_active_cursor_into_view()?;
         self.repaint.needs_repaint = true;
         self.repaint.full_repaint_pending = true;
         self.invalidate_display_cache();
@@ -2507,6 +2526,32 @@ impl TerminalCore {
         self.semantic_prompt.markers_observed =
             self.semantic_prompt.markers_observed || next.markers_observed;
         self.semantic_prompt.at_shell_prompt = next.at_shell_prompt;
+        Ok(())
+    }
+
+    fn reanchor_prompt_after_resize_if_needed(&mut self) -> eyre::Result<()> {
+        if !self.pending_prompt_reanchor_after_resize || !self.pending_output.is_empty() {
+            return Ok(());
+        }
+
+        self.pending_prompt_reanchor_after_resize = false;
+        if !should_keep_active_prompt_visible_on_resize(self.semantic_prompt) {
+            return Ok(());
+        }
+
+        self.engine.scroll_active_cursor_into_view()?;
+        self.repaint.needs_repaint = true;
+        self.repaint.full_repaint_pending = true;
+        self.invalidate_display_cache();
+
+        let ghostty_prompt_is_blank = matches!(&self.engine, RuntimeTerminalEngine::Ghostty(_))
+            && self.visible_text()?.trim().is_empty();
+        if ghostty_prompt_is_blank {
+            self.pending_prompt_reanchor_after_resize = true;
+            self.mark_prompt_input_written();
+            self.write_input(&[CTRL_L_FORM_FEED])?;
+        }
+
         Ok(())
     }
 
@@ -3822,6 +3867,14 @@ fn viewport_is_bottom_anchored(viewport: TerminalViewportMetrics) -> bool {
     viewport.offset >= viewport.total.saturating_sub(viewport.visible)
 }
 
+fn should_keep_active_prompt_visible_on_resize(tracking: SemanticPromptTracking) -> bool {
+    tracking.markers_observed
+        && matches!(
+            tracking.input_state,
+            PromptInputState::AwaitingPristine | PromptInputState::AwaitingEdited
+        )
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -3837,7 +3890,8 @@ mod tests {
         osc_terminator, partial_osc_133_prefix_len, pending_output_display_publish_interval,
         pending_output_pump_time_budget, pending_output_slice_bytes, resolve_teamy_cell_colors,
         resolve_terminal_cell_colors, should_close_from_echoed_ctrl_d,
-        should_mark_prompt_input_written_for_key, should_publish_terminal_display_state,
+        should_keep_active_prompt_visible_on_resize, should_mark_prompt_input_written_for_key,
+        should_publish_terminal_display_state,
         should_publish_terminal_display_update, should_refresh_semantic_prompt_tracking,
         should_translate_ctrl_d_key, should_translate_ctrl_d_to_exit, should_translate_ctrl_l_key,
         should_translate_ctrl_l_to_form_feed, strip_echoed_ctrl_d, viewport_is_bottom_anchored,
@@ -4247,6 +4301,38 @@ mod tests {
             visible: 24,
             scrollback: 176,
         }));
+    }
+
+    #[test]
+    fn resize_keeps_active_prompt_visible_when_markers_report_shell_input() {
+        assert!(should_keep_active_prompt_visible_on_resize(
+            SemanticPromptTracking {
+                markers_observed: true,
+                at_shell_prompt: false,
+                input_state: PromptInputState::AwaitingPristine,
+            }
+        ));
+        assert!(should_keep_active_prompt_visible_on_resize(
+            SemanticPromptTracking {
+                markers_observed: true,
+                at_shell_prompt: false,
+                input_state: PromptInputState::AwaitingEdited,
+            }
+        ));
+        assert!(!should_keep_active_prompt_visible_on_resize(
+            SemanticPromptTracking {
+                markers_observed: true,
+                at_shell_prompt: false,
+                input_state: PromptInputState::Inactive,
+            }
+        ));
+        assert!(!should_keep_active_prompt_visible_on_resize(
+            SemanticPromptTracking {
+                markers_observed: false,
+                at_shell_prompt: true,
+                input_state: PromptInputState::AwaitingPristine,
+            }
+        ));
     }
 
     // behavior[verify window.appearance.chrome]

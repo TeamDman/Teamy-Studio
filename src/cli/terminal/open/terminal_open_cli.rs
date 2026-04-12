@@ -2,6 +2,8 @@ use arbitrary::Arbitrary;
 use facet::Facet;
 use figue as args;
 
+use crate::cli::output::CliOutput;
+
 #[derive(Facet, Arbitrary, Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[facet(rename_all = "kebab-case")]
 #[repr(u8)]
@@ -80,7 +82,7 @@ impl TerminalOpenArgs {
         self,
         app_home: &crate::paths::AppHome,
         cache_home: &crate::paths::CacheHome,
-    ) -> eyre::Result<()> {
+    ) -> eyre::Result<CliOutput> {
         let _ = cache_home;
         let command_argv = self.program.map(|program| {
             let mut command_argv = Vec::with_capacity(self.args.len() + 1);
@@ -94,7 +96,8 @@ impl TerminalOpenArgs {
             self.stdin.as_deref(),
             self.title.as_deref(),
             self.vt_engine.unwrap_or_default().into(),
-        )
+        )?;
+        Ok(CliOutput::none())
     }
 }
 

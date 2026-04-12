@@ -1,9 +1,11 @@
 pub mod facet_shape;
 pub mod global_args;
+pub mod output;
 pub mod self_test;
 pub mod terminal;
 
 use crate::cli::global_args::GlobalArgs;
+use crate::cli::output::CliOutput;
 use crate::cli::self_test::SelfTestArgs;
 use crate::cli::terminal::TerminalArgs;
 use arbitrary::Arbitrary;
@@ -51,12 +53,14 @@ impl Cli {
     /// # Errors
     ///
     /// This function will return an error if the command fails.
-    pub fn invoke(self) -> eyre::Result<()> {
+    pub fn invoke(self) -> eyre::Result<CliOutput> {
         let app_home = crate::paths::APP_HOME.clone();
         let cache_home = crate::paths::CACHE_DIR.clone();
-        match self.command {
-            Some(command) => command.invoke(&app_home, &cache_home),
-            None => crate::app::run(&app_home),
+        if let Some(command) = self.command {
+            command.invoke(&app_home, &cache_home)
+        } else {
+            crate::app::run(&app_home)?;
+            Ok(CliOutput::none())
         }
     }
 }
@@ -84,7 +88,7 @@ impl Command {
         self,
         app_home: &crate::paths::AppHome,
         cache_home: &crate::paths::CacheHome,
-    ) -> eyre::Result<()> {
+    ) -> eyre::Result<CliOutput> {
         match self {
             Command::Terminal(args) => args.invoke(app_home, cache_home),
             Command::SelfTest(args) => args.invoke(app_home, cache_home),

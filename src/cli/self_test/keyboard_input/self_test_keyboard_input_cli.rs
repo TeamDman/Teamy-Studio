@@ -3,6 +3,8 @@ use facet::Facet;
 use figue::{self as args};
 use std::path::Path;
 
+use crate::cli::output::CliOutput;
+
 #[derive(Facet, Arbitrary, Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[facet(rename_all = "kebab-case")]
 #[repr(u8)]
@@ -55,14 +57,14 @@ impl SelfTestKeyboardInputArgs {
         self,
         app_home: &crate::paths::AppHome,
         cache_home: &crate::paths::CacheHome,
-    ) -> eyre::Result<()> {
+    ) -> eyre::Result<CliOutput> {
         let _ = cache_home;
-        crate::app::run_keyboard_input_self_test(
+        Ok(CliOutput::facet(crate::app::run_keyboard_input_self_test(
             app_home,
             self.inside,
             self.scenario.as_deref(),
             self.artifact_output.as_deref().map(Path::new),
             self.vt_engine.unwrap_or_default().into(),
-        )
+        )?))
     }
 }

@@ -1,5 +1,3 @@
-#![cfg(windows)]
-
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -68,11 +66,11 @@ fn terminal_replay_command_runs_headlessly_and_writes_artifact() {
 
     assert!(output.status.success(), "terminal replay failed:\n{text}");
     assert!(
-        text.contains("median_apply_ms:"),
+        text.contains("\"median_apply_ms\":"),
         "missing replay timing:\n{text}"
     );
     assert!(
-        text.contains("teamy_matches_ghostty: true"),
+        text.contains("\"teamy_matches_ghostty\": true"),
         "missing Teamy comparison result:\n{text}"
     );
     assert!(

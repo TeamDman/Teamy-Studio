@@ -1,6 +1,14 @@
 use arbitrary::Arbitrary;
 use facet::Facet;
 
+use crate::app::TerminalWindowSummary;
+use crate::cli::output::CliOutput;
+
+#[derive(Facet, Debug)]
+struct TerminalListReport {
+    windows: Vec<TerminalWindowSummary>,
+}
+
 /// Enumerate live Teamy Studio terminal windows.
 // cli[impl command.surface.terminal-list]
 // cli[impl terminal.list.enumerates-live-windows]
@@ -16,12 +24,11 @@ impl TerminalListArgs {
         self,
         app_home: &crate::paths::AppHome,
         cache_home: &crate::paths::CacheHome,
-    ) -> eyre::Result<()> {
+    ) -> eyre::Result<CliOutput> {
         let _ = app_home;
         let _ = cache_home;
-        for window in crate::app::list_terminal_windows()? {
-            println!("0x{:X}\t{}\t{}", window.hwnd, window.pid, window.title);
-        }
-        Ok(())
+        Ok(CliOutput::facet(TerminalListReport {
+            windows: crate::app::list_terminal_windows()?,
+        }))
     }
 }

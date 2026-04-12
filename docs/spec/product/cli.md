@@ -17,7 +17,16 @@ cli[command.surface.terminal-default-shell-set]
 The `terminal default-shell` command group must expose a `set` subcommand that persists a shell program plus trailing arguments.
 
 cli[command.surface.terminal-default-shell-show]
-The `terminal default-shell` command group must expose a `show` subcommand that prints the effective default shell command.
+The `terminal default-shell` command group must expose a `show` subcommand that reports the effective default shell command.
+
+cli[global.output-format]
+The CLI must support a global `--output-format text|json|csv` flag.
+
+cli[global.output-format.default-terminal]
+When `--output-format` is omitted and stdout is attached to a terminal, Teamy Studio must render command output as text.
+
+cli[global.output-format.default-redirected]
+When `--output-format` is omitted and stdout is redirected, Teamy Studio must render command output as pretty JSON.
 
 cli[command.surface.terminal-open]
 The `terminal` command group must expose an `open` subcommand that opens a new terminal window.
@@ -73,7 +82,7 @@ cli[shell.default.persisted-in-app-home]
 The persisted default shell command must be stored as a simple text file under the resolved application home directory.
 
 cli[shell.default.show-effective]
-The `terminal default-shell show` command must print the effective default shell command as a single formatted command line.
+The `terminal default-shell show` command must report the effective default shell argv and formatted command line.
 
 cli[shell.default.fallback.builtin]
 If no persisted default shell command exists, Teamy Studio must fall back to a built-in default shell command.
@@ -102,7 +111,7 @@ cli[terminal.list.enumerates-live-windows]
 The `terminal list` command must enumerate live Teamy Studio terminal windows from the operating system rather than from on-disk state.
 
 cli[terminal.list.prints-hwnd-pid-and-title]
-The `terminal list` command must print each live terminal window as `HWND`, `PID`, and title separated by tabs.
+The `terminal list` command must report each live terminal window with its `HWND`, `PID`, and title.
 
 ## Parser Model
 

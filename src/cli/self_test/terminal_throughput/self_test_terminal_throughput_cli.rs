@@ -2,6 +2,8 @@ use arbitrary::Arbitrary;
 use facet::Facet;
 use figue::{self as args};
 
+use crate::cli::output::CliOutput;
+
 /// Terminal throughput benchmark modes.
 #[derive(Facet, Arbitrary, Clone, Copy, Debug, PartialEq, Eq)]
 #[facet(rename_all = "kebab-case")]
@@ -57,13 +59,15 @@ impl SelfTestTerminalThroughputArgs {
         self,
         app_home: &crate::paths::AppHome,
         cache_home: &crate::paths::CacheHome,
-    ) -> eyre::Result<()> {
-        crate::app::run_terminal_throughput_self_test(
-            app_home,
-            cache_home,
-            self.mode.map(Into::into),
-            self.line_count.unwrap_or(10_000),
-            self.samples.unwrap_or(1).max(1),
-        )
+    ) -> eyre::Result<CliOutput> {
+        Ok(CliOutput::facet(
+            crate::app::run_terminal_throughput_self_test(
+                app_home,
+                cache_home,
+                self.mode.map(Into::into),
+                self.line_count.unwrap_or(10_000),
+                self.samples.unwrap_or(1).max(1),
+            )?,
+        ))
     }
 }

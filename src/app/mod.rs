@@ -1,28 +1,24 @@
-#[cfg(windows)]
 mod spatial;
 pub mod teamy_terminal_engine;
-#[cfg(windows)]
 mod windows_app;
-#[cfg(windows)]
 mod windows_d3d12_renderer;
-#[cfg(windows)]
 mod windows_dialogs;
-#[cfg(windows)]
 mod windows_terminal;
-#[cfg(windows)]
 mod windows_terminal_engine;
-#[cfg(windows)]
 mod windows_terminal_replay;
-#[cfg(windows)]
 mod windows_terminal_self_test;
 
 use std::path::Path;
-#[cfg(windows)]
 use std::sync::Arc;
 
-#[cfg(windows)]
 use crate::app::spatial::TerminalCellPoint;
 use crate::paths::{AppHome, CacheHome};
+use eyre::Context;
+use facet::Facet;
+
+pub use windows_app::TerminalThroughputBenchmarkResultsReport;
+pub use windows_terminal_replay::TerminalReplayReport;
+pub use windows_terminal_self_test::KeyboardInputSelfTestReport;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TerminalThroughputBenchmarkMode {
@@ -41,11 +37,20 @@ pub enum VtEngineChoice {
     Teamy,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Facet, PartialEq, Eq)]
 pub struct TerminalWindowSummary {
     pub hwnd: usize,
     pub pid: u32,
     pub title: String,
+}
+
+#[derive(Debug, Facet)]
+pub struct RenderOffscreenSelfTestReport {
+    artifact_path: Option<String>,
+    image_width: u32,
+    image_height: u32,
+    non_transparent_pixels: usize,
+    bright_pixels: usize,
 }
 
 /// Run the Teamy Studio application shell.
@@ -99,20 +104,16 @@ fn open_terminal_window_with_vt_engine(
     title: Option<&str>,
     vt_engine: VtEngineChoice,
 ) -> eyre::Result<()> {
-    #[cfg(windows)]
-    {
-        windows_app::run(app_home, command_argv, initial_stdin, title, vt_engine)
-    }
-
-    #[cfg(not(windows))]
-    {
-        let _ = app_home;
-        let _ = command_argv;
-        let _ = initial_stdin;
-        let _ = title;
-        let _ = vt_engine;
-        eyre::bail!("Teamy Studio currently only supports Windows")
-    }
+    let working_dir =
+        std::env::current_dir().wrap_err("failed to resolve the current working directory")?;
+    windows_app::run(
+        app_home,
+        &working_dir,
+        command_argv,
+        initial_stdin,
+        title,
+        vt_engine,
+    )
 }
 
 /// Enumerate live Teamy Studio terminal windows from the OS window list.
@@ -123,15 +124,7 @@ fn open_terminal_window_with_vt_engine(
 ///
 /// This function will return an error if window enumeration fails.
 pub fn list_terminal_windows() -> eyre::Result<Vec<TerminalWindowSummary>> {
-    #[cfg(windows)]
-    {
-        windows_app::list_terminal_windows()
-    }
-
-    #[cfg(not(windows))]
-    {
-        eyre::bail!("Teamy Studio currently only supports Windows")
-    }
+    windows_app::list_terminal_windows()
 }
 
 /// Run the keyboard input self-test harness.
@@ -145,21 +138,8 @@ pub fn run_keyboard_input_self_test(
     scenario: Option<&str>,
     artifact_output: Option<&Path>,
     vt_engine: VtEngineChoice,
-) -> eyre::Result<()> {
-    #[cfg(windows)]
-    {
-        windows_terminal_self_test::run(app_home, inside, scenario, artifact_output, vt_engine)
-    }
-
-    #[cfg(not(windows))]
-    {
-        let _ = app_home;
-        let _ = inside;
-        let _ = scenario;
-        let _ = artifact_output;
-        let _ = vt_engine;
-        eyre::bail!("Teamy Studio keyboard self-test currently only supports Windows")
-    }
+) -> eyre::Result<KeyboardInputSelfTestReport> {
+    windows_terminal_self_test::run(app_home, inside, scenario, artifact_output, vt_engine)
 }
 
 /// Run the terminal throughput self-test benchmark.
@@ -173,23 +153,8 @@ pub fn run_terminal_throughput_self_test(
     mode: Option<TerminalThroughputBenchmarkMode>,
     line_count: usize,
     samples: usize,
-) -> eyre::Result<()> {
-    #[cfg(windows)]
-    {
-        windows_app::run_terminal_throughput_self_test(
-            app_home, cache_home, mode, line_count, samples,
-        )
-    }
-
-    #[cfg(not(windows))]
-    {
-        let _ = app_home;
-        let _ = cache_home;
-        let _ = mode;
-        let _ = line_count;
-        let _ = samples;
-        eyre::bail!("Teamy Studio terminal throughput self-test currently only supports Windows")
-    }
+) -> eyre::Result<TerminalThroughputBenchmarkResultsReport> {
+    windows_app::run_terminal_throughput_self_test(app_home, cache_home, mode, line_count, samples)
 }
 
 /// Run a headless terminal replay self-test.
@@ -204,23 +169,8 @@ pub fn run_terminal_replay_self_test(
     fixture_path: &Path,
     artifact_output: Option<&Path>,
     samples: usize,
-) -> eyre::Result<()> {
-    #[cfg(windows)]
-    {
-        windows_terminal_replay::run_terminal_replay_self_test(
-            fixture_path,
-            artifact_output,
-            samples,
-        )
-    }
-
-    #[cfg(not(windows))]
-    {
-        let _ = fixture_path;
-        let _ = artifact_output;
-        let _ = samples;
-        eyre::bail!("Teamy Studio terminal replay self-test currently only supports Windows")
-    }
+) -> eyre::Result<TerminalReplayReport> {
+    windows_terminal_replay::run_terminal_replay_self_test(fixture_path, artifact_output, samples)
 }
 
 /// Run a headless offscreen render self-test.
@@ -235,44 +185,31 @@ pub fn run_render_offscreen_self_test(
     app_home: &AppHome,
     cache_home: &CacheHome,
     artifact_output: Option<&Path>,
-) -> eyre::Result<()> {
-    #[cfg(windows)]
-    {
-        let _ = app_home;
-        let _ = cache_home;
+) -> eyre::Result<RenderOffscreenSelfTestReport> {
+    let _ = app_home;
+    let _ = cache_home;
 
-        let frame = build_offscreen_render_self_test_frame();
+    let frame = build_offscreen_render_self_test_frame();
 
-        if let Some(output_path) = artifact_output {
-            windows_d3d12_renderer::write_render_frame_model_offscreen_png(&frame, output_path)?;
-            println!("artifact_path: {}", output_path.display());
-        }
-
-        let image = windows_d3d12_renderer::render_frame_model_offscreen_image(&frame)?;
-        let (non_transparent_pixels, bright_pixels) = summarize_offscreen_image(&image);
-        println!(
-            "image_width: {}\nimage_height: {}\nnon_transparent_pixels: {}\nbright_pixels: {}",
-            image.width(),
-            image.height(),
-            non_transparent_pixels,
-            bright_pixels,
-        );
-        if non_transparent_pixels == 0 || bright_pixels == 0 {
-            eyre::bail!("offscreen render produced an empty image")
-        }
-        Ok(())
+    if let Some(output_path) = artifact_output {
+        windows_d3d12_renderer::write_render_frame_model_offscreen_png(&frame, output_path)?;
     }
 
-    #[cfg(not(windows))]
-    {
-        let _ = app_home;
-        let _ = cache_home;
-        let _ = artifact_output;
-        eyre::bail!("headless offscreen render self-test currently only supports Windows")
+    let image = windows_d3d12_renderer::render_frame_model_offscreen_image(&frame)?;
+    let (non_transparent_pixels, bright_pixels) = summarize_offscreen_image(&image);
+    if non_transparent_pixels == 0 || bright_pixels == 0 {
+        eyre::bail!("offscreen render produced an empty image")
     }
+
+    Ok(RenderOffscreenSelfTestReport {
+        artifact_path: artifact_output.map(|path| path.display().to_string()),
+        image_width: image.width(),
+        image_height: image.height(),
+        non_transparent_pixels,
+        bright_pixels,
+    })
 }
 
-#[cfg(windows)]
 fn build_offscreen_render_self_test_frame() -> windows_d3d12_renderer::RenderFrameModel {
     let layout = windows_terminal::TerminalLayout {
         client_width: 1040,
@@ -315,7 +252,6 @@ fn build_offscreen_render_self_test_frame() -> windows_d3d12_renderer::RenderFra
     }
 }
 
-#[cfg(windows)]
 fn build_offscreen_render_row(
     row: i32,
     text: &str,
@@ -346,7 +282,6 @@ fn build_offscreen_render_row(
     }
 }
 
-#[cfg(windows)]
 fn summarize_offscreen_image(
     image: &image::ImageBuffer<image::Rgba<u8>, Vec<u8>>,
 ) -> (usize, usize) {
@@ -358,7 +293,6 @@ fn summarize_offscreen_image(
     (non_transparent_pixels, bright_pixels)
 }
 
-#[cfg(windows)]
 /// Write a PNG snapshot for a single slug glyph.
 ///
 /// # Errors
@@ -380,7 +314,6 @@ pub fn write_slug_snapshot_png(
     )
 }
 
-#[cfg(windows)]
 /// Write a PNG sheet containing multiple slug glyph snapshots plus an index file.
 ///
 /// # Errors

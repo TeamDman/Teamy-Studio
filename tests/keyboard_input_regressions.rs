@@ -89,14 +89,17 @@ fn run_default_cmd_ratatui_keyboard_self_test() -> std::process::Output {
         .expect("default cmd ratatui keyboard self-test should launch")
 }
 
-fn run_named_pwsh_keyboard_self_test(scenario: &str) -> std::process::Output {
+fn run_named_pwsh_keyboard_self_test(
+    scenario: &str,
+    vt_engine: &str,
+) -> std::process::Output {
     let app_home = TempDirGuard::new("teamy-studio-pwsh-keyboard-self-test-home");
     Command::new(env!("CARGO_BIN_EXE_teamy-studio"))
         .env("COMSPEC", "pwsh.exe")
         .env("TEAMY_STUDIO_HOME_DIR", app_home.path())
         .env("TEAMY_KEYBOARD_SELF_TEST_CASE", scenario)
         .env_remove("TEAMY_KEYBOARD_SELF_TEST_RATATUI_PATH")
-        .args(["self-test", "keyboard-input", "--vt-engine", "teamy"])
+        .args(["self-test", "keyboard-input", "--vt-engine", vt_engine])
         .output()
         .expect("named pwsh keyboard self-test should launch")
 }
@@ -163,7 +166,7 @@ fn test_issue_keyboard_input_default_cmd_ratatui_key_debug_reproduction() {
 
 #[test]
 fn test_issue_keyboard_input_teamy_ctrl_l_scrolls_back_to_caret() {
-    let output = run_named_pwsh_keyboard_self_test("pwsh-ctrl-l-redraw");
+    let output = run_named_pwsh_keyboard_self_test("pwsh-ctrl-l-redraw", "teamy");
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
@@ -175,7 +178,8 @@ fn test_issue_keyboard_input_teamy_ctrl_l_scrolls_back_to_caret() {
 
 #[test]
 fn test_issue_keyboard_input_teamy_typed_input_scrolls_back_to_caret() {
-    let output = run_named_pwsh_keyboard_self_test("pwsh-typed-input-scrolls-caret-into-view");
+    let output =
+        run_named_pwsh_keyboard_self_test("pwsh-typed-input-scrolls-caret-into-view", "teamy");
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
@@ -187,12 +191,26 @@ fn test_issue_keyboard_input_teamy_typed_input_scrolls_back_to_caret() {
 
 #[test]
 fn test_issue_keyboard_input_teamy_noprofile_resize_restores_prompt() {
-    let output = run_named_pwsh_keyboard_self_test("pwsh-noprofile-resize-restores-prompt");
+    let output =
+        run_named_pwsh_keyboard_self_test("pwsh-noprofile-resize-restores-prompt", "teamy");
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
     assert!(
         output.status.success(),
         "expected Teamy pwsh -NoProfile resize self-test to succeed\nstdout:\n{stdout}\n\nstderr:\n{stderr}"
+    );
+}
+
+#[test]
+fn test_issue_keyboard_input_ghostty_noprofile_resize_restores_prompt() {
+    let output =
+        run_named_pwsh_keyboard_self_test("pwsh-noprofile-resize-restores-prompt", "ghostty");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        output.status.success(),
+        "expected Ghostty pwsh -NoProfile resize self-test to succeed\nstdout:\n{stdout}\n\nstderr:\n{stderr}"
     );
 }

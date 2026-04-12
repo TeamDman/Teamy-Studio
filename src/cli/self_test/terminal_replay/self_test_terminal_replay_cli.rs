@@ -3,6 +3,8 @@ use facet::Facet;
 use figue::{self as args};
 use std::path::Path;
 
+use crate::cli::output::CliOutput;
+
 /// Run a headless terminal transcript replay self-test.
 // cli[impl command.surface.self-test-terminal-replay]
 #[derive(Facet, Arbitrary, Debug, PartialEq)]
@@ -30,12 +32,12 @@ impl SelfTestTerminalReplayArgs {
         self,
         app_home: &crate::paths::AppHome,
         _cache_home: &crate::paths::CacheHome,
-    ) -> eyre::Result<()> {
+    ) -> eyre::Result<CliOutput> {
         let _ = app_home;
-        crate::app::run_terminal_replay_self_test(
+        Ok(CliOutput::facet(crate::app::run_terminal_replay_self_test(
             Path::new(&self.fixture),
             self.artifact_output.as_deref().map(Path::new),
             self.samples.unwrap_or(1).max(1),
-        )
+        )?))
     }
 }

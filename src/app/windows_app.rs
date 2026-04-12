@@ -1,5 +1,6 @@
 use std::cell::RefCell;
 use std::marker::PhantomData;
+use std::path::Path;
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -19,7 +20,10 @@ use windows::Win32::Graphics::Gdi::{
     GetDeviceCaps, GetTextExtentPoint32W, HFONT, LOGFONTW, PAINTSTRUCT, ReleaseDC, SelectObject,
     VREFRESH,
 };
-use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_CONTROL, VK_LBUTTON, VK_MENU};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetKeyState, VK_ADD, VK_CONTROL, VK_LBUTTON, VK_MENU, VK_OEM_MINUS, VK_OEM_PLUS, VK_SHIFT,
+    VK_SUBTRACT,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, EnumWindows, GetClassNameW,
     GetClientRect, GetCursorPos, GetMessageW, GetSystemMetrics, GetWindowRect,
@@ -70,6 +74,10 @@ const FONT_FAMILY: &str = "CaskaydiaCove Nerd Font Mono";
 const MIN_FONT_HEIGHT: i32 = -12;
 const MAX_FONT_HEIGHT: i32 = -72;
 const FONT_ZOOM_STEP: i32 = 2;
+const WINDOW_RESIZE_STEP_COLS: i32 = 4;
+const WINDOW_RESIZE_STEP_ROWS: i32 = 2;
+const MIN_WINDOW_CLIENT_WIDTH: i32 = 320;
+const MIN_WINDOW_CLIENT_HEIGHT: i32 = 240;
 const INITIAL_WINDOW_WIDTH: i32 = 1040;
 const INITIAL_WINDOW_HEIGHT: i32 = 680;
 const DRAG_START_THRESHOLD_PX: i32 = 0;
@@ -374,6 +382,12 @@ fn alt_key_is_down() -> bool {
     (state.cast_unsigned() & 0x8000) != 0
 }
 
+fn shift_key_is_down() -> bool {
+    // Safety: querying key state for VK_SHIFT does not require additional invariants.
+    let state = unsafe { GetKeyState(i32::from(VK_SHIFT.0)) };
+    (state.cast_unsigned() & 0x8000) != 0
+}
+
 fn register_window_class(class: &WNDCLASSEXW) -> u16 {
     // Safety: `class` points to a fully initialized WNDCLASSEXW for registration.
     unsafe { RegisterClassExW(&raw const *class) }
@@ -415,22 +429,29 @@ fn dispatch_message(message: &MSG) {
 #[instrument(level = "info", skip_all, fields(has_command_argv = command_argv.is_some(), has_initial_stdin = initial_stdin.is_some(), has_title = title.is_some()))]
 pub fn run(
     app_home: &AppHome,
+    working_dir: &Path,
     command_argv: Option<&[String]>,
     initial_stdin: Option<&str>,
     title: Option<&str>,
     vt_engine: VtEngineChoice,
 ) -> eyre::Result<()> {
-    let resolved_argv = match command_argv {
+    let launch_command_argv = match command_argv {
         Some(command_argv) => command_argv.to_vec(),
         None => crate::shell_default::load_effective_argv(app_home)?,
     };
-    let command = crate::shell_default::command_builder_from_argv(&resolved_argv)?;
-    let terminal = info_span!("create_terminal_session")
-        .in_scope(|| TerminalSession::new_with_command(command, vt_engine))?;
+    let terminal = info_span!("create_terminal_session").in_scope(|| match command_argv {
+        Some(_) => {
+            let mut command =
+                crate::shell_default::command_builder_from_argv(&launch_command_argv)?;
+            command.cwd(working_dir);
+            TerminalSession::new_with_command(command, vt_engine)
+        }
+        None => TerminalSession::new(app_home, Some(working_dir), vt_engine),
+    })?;
     run_with_terminal_session(
         app_home,
         terminal,
-        resolved_argv,
+        launch_command_argv,
         initial_stdin,
         title,
         vt_engine,
@@ -629,7 +650,8 @@ struct TerminalThroughputBenchmarkScenarioResult {
 }
 
 #[derive(Debug, Facet)]
-struct TerminalThroughputBenchmarkResultsReport {
+pub struct TerminalThroughputBenchmarkResultsReport {
+    results_path: String,
     generated_at_utc: String,
     app_home: String,
     scenario_count: usize,
@@ -797,7 +819,7 @@ pub fn run_terminal_throughput_self_test(
     mode: Option<TerminalThroughputBenchmarkMode>,
     line_count: usize,
     samples: usize,
-) -> eyre::Result<()> {
+) -> eyre::Result<TerminalThroughputBenchmarkResultsReport> {
     let benchmark_plans = terminal_throughput_benchmark_plans(mode, line_count);
     let mut scenario_results = Vec::with_capacity(benchmark_plans.len());
 
@@ -805,28 +827,7 @@ pub fn run_terminal_throughput_self_test(
         let mut sample_results = Vec::with_capacity(samples);
         for sample_index in 0..samples {
             let result = run_terminal_throughput_self_test_sample(plan)?;
-            if samples > 1 {
-                println!(
-                    "scenario: {}\nsample: {}\nmeasure_command_ms: {:.3}\ngraphical_completion_ms: {:.3}\ndelta_ms: {:.3}\nratio: {:.3}\nframes_rendered: {}\nmax_pending_output_bytes: {}\navg_pending_output_bytes: {:.3}\nmax_queue_latency_ms: {:.3}\nmax_input_response_latency_ms: {:.3}\nmax_input_present_latency_ms: {:.3}\nvt_write_calls: {}\nvt_write_bytes: {}\ndisplay_publications: {}\ndirty_rows_published: {}\nterminal_closed: {}\n",
-                    terminal_throughput_mode_name(plan.mode),
-                    sample_index + 1,
-                    result.measure_command_ms,
-                    result.graphical_completion_ms,
-                    result.delta_ms(),
-                    result.ratio(),
-                    result.frames_rendered,
-                    result.performance.max_pending_output_bytes,
-                    result.performance.average_pending_output_bytes(),
-                    result.performance.max_queue_latency_ms(),
-                    result.performance.max_input_response_latency_ms(),
-                    result.performance.max_input_present_latency_ms(),
-                    result.performance.vt_write_calls,
-                    result.performance.vt_write_bytes,
-                    result.performance.display_publications,
-                    result.performance.dirty_rows_published,
-                    result.terminal_closed,
-                );
-            }
+            let _ = sample_index;
             sample_results.push(result);
         }
 
@@ -834,13 +835,10 @@ pub fn run_terminal_throughput_self_test(
             plan,
             sample_results,
         };
-        print_terminal_throughput_scenario_summary(&scenario_result)?;
         scenario_results.push(scenario_result);
     }
 
-    let results_path = write_terminal_throughput_results(app_home, cache_home, &scenario_results)?;
-    println!("results_path: {}", results_path.display());
-    Ok(())
+    write_terminal_throughput_results(app_home, cache_home, &scenario_results)
 }
 
 #[expect(
@@ -1303,6 +1301,10 @@ fn handle_char_message(
         Err(error) => return fail_and_close(hwnd, &error),
     };
 
+    if control_key_is_down() && matches!(code_unit, 43 | 45 | 61 | 95) {
+        return LRESULT(0);
+    }
+
     match with_app_state(|state| state.terminal.handle_char(code_unit, lparam.0)) {
         Ok(consumed) => {
             trace!(
@@ -1334,6 +1336,14 @@ fn handle_key_down_message(
         Err(error) => return fail_and_close(hwnd, &error),
     };
     let was_down = ((lparam.0 >> 30) & 1) != 0;
+
+    if let Some(action) = current_window_shortcut_action(virtual_key) {
+        match execute_window_shortcut(hwnd, action) {
+            Ok(true) => return LRESULT(0),
+            Ok(false) => {}
+            Err(error) => return fail_and_close(hwnd, &error),
+        }
+    }
 
     match with_app_state(|state| {
         state.terminal.handle_key_event(
@@ -1883,44 +1893,11 @@ fn terminal_throughput_benchmark_plans(
     }
 }
 
-fn print_terminal_throughput_scenario_summary(
-    scenario_result: &TerminalThroughputBenchmarkScenarioResult,
-) -> eyre::Result<()> {
-    let last_result = scenario_result.last_result()?;
-    println!(
-        "scenario: {}\nline_count: {}\nsamples: {}\nmeasure_command_ms: {:.3}\ngraphical_completion_ms: {:.3}\ndelta_ms: {:.3}\nratio: {:.3}\nframes_rendered: {}\nmax_pending_output_bytes: {}\navg_pending_output_bytes: {:.3}\nmax_queue_latency_ms: {:.3}\nmax_input_response_latency_ms: {:.3}\nmax_input_present_latency_ms: {:.3}\nvt_write_calls: {}\nvt_write_bytes: {}\ndisplay_publications: {}\ndirty_rows_published: {}\nterminal_closed: {}\n\n=== final_screen ===\n{}",
-        terminal_throughput_mode_name(scenario_result.plan.mode),
-        scenario_result.plan.line_count,
-        scenario_result.sample_results.len(),
-        scenario_result.median_measure_command_ms(),
-        scenario_result.median_graphical_completion_ms(),
-        scenario_result.median_delta_ms(),
-        scenario_result.median_ratio(),
-        scenario_result.median_frames_rendered(),
-        scenario_result.median_max_pending_output_bytes(),
-        scenario_result.median_avg_pending_output_bytes(),
-        scenario_result.median_max_queue_latency_ms(),
-        median_sample_metric(&scenario_result.sample_results, |result| {
-            result.performance.max_input_response_latency_ms()
-        }),
-        median_sample_metric(&scenario_result.sample_results, |result| {
-            result.performance.max_input_present_latency_ms()
-        }),
-        scenario_result.median_vt_write_calls(),
-        scenario_result.median_vt_write_bytes(),
-        scenario_result.median_display_publications(),
-        scenario_result.median_dirty_rows_published(),
-        last_result.terminal_closed,
-        last_result.last_screen,
-    );
-    Ok(())
-}
-
 fn write_terminal_throughput_results(
     app_home: &AppHome,
     cache_home: &CacheHome,
     scenario_results: &[TerminalThroughputBenchmarkScenarioResult],
-) -> eyre::Result<std::path::PathBuf> {
+) -> eyre::Result<TerminalThroughputBenchmarkResultsReport> {
     let results_dir = cache_home.join(TERMINAL_THROUGHPUT_RESULTS_DIR);
     std::fs::create_dir_all(&results_dir).wrap_err_with(|| {
         format!(
@@ -1934,20 +1911,27 @@ fn write_terminal_throughput_results(
         "terminal-throughput-{}.json",
         timestamp.format("%Y%m%dT%H%M%SZ")
     ));
-    let report = build_terminal_throughput_results_report(app_home, timestamp, scenario_results);
+    let report = build_terminal_throughput_results_report(
+        app_home,
+        &results_path,
+        timestamp,
+        scenario_results,
+    );
     let json = facet_json::to_string_pretty(&report)
         .wrap_err("failed to serialize terminal throughput benchmark results")?;
     std::fs::write(&results_path, json)
         .wrap_err_with(|| format!("failed to write {}", results_path.display()))?;
-    Ok(results_path)
+    Ok(report)
 }
 
 fn build_terminal_throughput_results_report(
     app_home: &AppHome,
+    results_path: &Path,
     generated_at: chrono::DateTime<Utc>,
     scenario_results: &[TerminalThroughputBenchmarkScenarioResult],
 ) -> TerminalThroughputBenchmarkResultsReport {
     TerminalThroughputBenchmarkResultsReport {
+        results_path: results_path.display().to_string(),
         generated_at_utc: generated_at.to_rfc3339(),
         app_home: app_home.display().to_string(),
         scenario_count: scenario_results.len(),
@@ -2368,28 +2352,7 @@ fn handle_mouse_wheel(hwnd: WindowHandle, wparam: WPARAM, lparam: LPARAM) -> eyr
 
         let zoom_direction = if wheel_delta > 0 { -1 } else { 1 };
         if in_terminal {
-            let next_font_height = (state.terminal_font_height + (zoom_direction * FONT_ZOOM_STEP))
-                .clamp(MAX_FONT_HEIGHT, MIN_FONT_HEIGHT);
-            if next_font_height == state.terminal_font_height {
-                return Ok(true);
-            }
-
-            let (cell_width, cell_height) = measure_terminal_cell_size(next_font_height)?;
-            debug!(
-                font_height = next_font_height,
-                const_name = "TERMINAL_FONT_HEIGHT",
-                "terminal zoom changed; use this font height for the default constant"
-            );
-            state.terminal_font_height = next_font_height;
-            state.terminal_cell_width = cell_width;
-            state.terminal_cell_height = cell_height;
-
-            let layout =
-                client_layout(hwnd, state.terminal_cell_width, state.terminal_cell_height)?;
-            state.pending_terminal_resize = None;
-            apply_terminal_resize(state, layout)?;
-            render_current_frame(state, hwnd, None)?;
-            return Ok(true);
+            return apply_terminal_zoom_step(state, hwnd, zoom_direction);
         }
 
         let next_font_height = (state.diagnostic_font_height + (zoom_direction * FONT_ZOOM_STEP))
@@ -2410,6 +2373,130 @@ fn handle_mouse_wheel(hwnd: WindowHandle, wparam: WPARAM, lparam: LPARAM) -> eyr
         render_current_frame(state, hwnd, None)?;
         Ok(true)
     })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WindowShortcutAction {
+    TerminalZoom(ShortcutStep),
+    WindowResize(ShortcutStep),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ShortcutStep {
+    Increase,
+    Decrease,
+}
+
+fn current_window_shortcut_action(virtual_key: u32) -> Option<WindowShortcutAction> {
+    window_shortcut_action(control_key_is_down(), shift_key_is_down(), virtual_key)
+}
+
+fn window_shortcut_action(
+    control_down: bool,
+    shift_down: bool,
+    virtual_key: u32,
+) -> Option<WindowShortcutAction> {
+    if !control_down {
+        return None;
+    }
+
+    let step = shortcut_step(virtual_key)?;
+
+    Some(if shift_down {
+        WindowShortcutAction::WindowResize(step)
+    } else {
+        WindowShortcutAction::TerminalZoom(step)
+    })
+}
+
+fn execute_window_shortcut(hwnd: WindowHandle, action: WindowShortcutAction) -> eyre::Result<bool> {
+    match action {
+        WindowShortcutAction::TerminalZoom(step) => with_app_state(|state| {
+            apply_terminal_zoom_step(state, hwnd, terminal_zoom_direction(step))
+        }),
+        WindowShortcutAction::WindowResize(step) => {
+            let (terminal_cell_width, terminal_cell_height) = with_app_state(|state| {
+                Ok((state.terminal_cell_width, state.terminal_cell_height))
+            })?;
+            resize_window_by_terminal_step(
+                hwnd,
+                terminal_cell_width,
+                terminal_cell_height,
+                window_resize_direction(step),
+            )?;
+            Ok(true)
+        }
+    }
+}
+
+fn shortcut_step(virtual_key: u32) -> Option<ShortcutStep> {
+    if virtual_key == u32::from(VK_OEM_PLUS.0) || virtual_key == u32::from(VK_ADD.0) {
+        return Some(ShortcutStep::Increase);
+    }
+
+    if virtual_key == u32::from(VK_OEM_MINUS.0) || virtual_key == u32::from(VK_SUBTRACT.0) {
+        return Some(ShortcutStep::Decrease);
+    }
+
+    None
+}
+
+fn terminal_zoom_direction(step: ShortcutStep) -> i32 {
+    match step {
+        ShortcutStep::Increase => -1,
+        ShortcutStep::Decrease => 1,
+    }
+}
+
+fn window_resize_direction(step: ShortcutStep) -> i32 {
+    match step {
+        ShortcutStep::Increase => 1,
+        ShortcutStep::Decrease => -1,
+    }
+}
+
+fn apply_terminal_zoom_step(
+    state: &mut AppState,
+    hwnd: WindowHandle,
+    zoom_direction: i32,
+) -> eyre::Result<bool> {
+    let next_font_height = (state.terminal_font_height + (zoom_direction * FONT_ZOOM_STEP))
+        .clamp(MAX_FONT_HEIGHT, MIN_FONT_HEIGHT);
+    if next_font_height == state.terminal_font_height {
+        return Ok(true);
+    }
+
+    let (cell_width, cell_height) = measure_terminal_cell_size(next_font_height)?;
+    debug!(
+        font_height = next_font_height,
+        const_name = "TERMINAL_FONT_HEIGHT",
+        "terminal zoom changed; use this font height for the default constant"
+    );
+    state.terminal_font_height = next_font_height;
+    state.terminal_cell_width = cell_width;
+    state.terminal_cell_height = cell_height;
+
+    let layout = client_layout(hwnd, state.terminal_cell_width, state.terminal_cell_height)?;
+    state.pending_terminal_resize = None;
+    apply_terminal_resize(state, layout)?;
+    render_current_frame(state, hwnd, None)?;
+    Ok(true)
+}
+
+fn resize_window_by_terminal_step(
+    hwnd: WindowHandle,
+    terminal_cell_width: i32,
+    terminal_cell_height: i32,
+    resize_direction: i32,
+) -> eyre::Result<()> {
+    let client_rect = hwnd.client_rect()?;
+    let width_step = (terminal_cell_width * WINDOW_RESIZE_STEP_COLS).max(1);
+    let height_step = (terminal_cell_height * WINDOW_RESIZE_STEP_ROWS).max(1);
+    let next_client_width =
+        (client_rect.width() + (resize_direction * width_step)).max(MIN_WINDOW_CLIENT_WIDTH);
+    let next_client_height =
+        (client_rect.height() + (resize_direction * height_step)).max(MIN_WINDOW_CLIENT_HEIGHT);
+    resize_window_client(hwnd, next_client_width, next_client_height)
 }
 
 fn client_layout(
@@ -3161,6 +3248,62 @@ fn wide_null_terminated(value: &str) -> Vec<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shortcut_action_requires_control() {
+        assert_eq!(
+            window_shortcut_action(false, false, u32::from(VK_OEM_PLUS.0)),
+            None
+        );
+    }
+
+    #[test]
+    fn ctrl_plus_maps_to_terminal_zoom_in() {
+        assert_eq!(
+            window_shortcut_action(true, false, u32::from(VK_OEM_PLUS.0)),
+            Some(WindowShortcutAction::TerminalZoom(ShortcutStep::Increase))
+        );
+    }
+
+    #[test]
+    fn ctrl_minus_maps_to_terminal_zoom_out() {
+        assert_eq!(
+            window_shortcut_action(true, false, u32::from(VK_OEM_MINUS.0)),
+            Some(WindowShortcutAction::TerminalZoom(ShortcutStep::Decrease))
+        );
+    }
+
+    #[test]
+    fn ctrl_shift_plus_maps_to_window_growth() {
+        assert_eq!(
+            window_shortcut_action(true, true, u32::from(VK_OEM_PLUS.0)),
+            Some(WindowShortcutAction::WindowResize(ShortcutStep::Increase))
+        );
+        assert_eq!(window_resize_direction(ShortcutStep::Increase), 1);
+    }
+
+    #[test]
+    fn ctrl_shift_minus_maps_to_window_shrink() {
+        assert_eq!(
+            window_shortcut_action(true, true, u32::from(VK_OEM_MINUS.0)),
+            Some(WindowShortcutAction::WindowResize(ShortcutStep::Decrease))
+        );
+        assert_eq!(window_resize_direction(ShortcutStep::Decrease), -1);
+    }
+
+    #[test]
+    fn terminal_zoom_direction_keeps_plus_and_minus_semantics() {
+        assert_eq!(terminal_zoom_direction(ShortcutStep::Increase), -1);
+        assert_eq!(terminal_zoom_direction(ShortcutStep::Decrease), 1);
+        assert_eq!(
+            shortcut_step(u32::from(VK_OEM_PLUS.0)),
+            Some(ShortcutStep::Increase)
+        );
+        assert_eq!(
+            shortcut_step(u32::from(VK_OEM_MINUS.0)),
+            Some(ShortcutStep::Decrease)
+        );
+    }
 
     #[test]
     fn hollow_cursor_builds_four_border_rects() {

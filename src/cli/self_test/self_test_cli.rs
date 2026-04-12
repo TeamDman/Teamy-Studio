@@ -6,6 +6,8 @@ use arbitrary::Arbitrary;
 use facet::Facet;
 use figue as args;
 
+use crate::cli::output::CliOutput;
+
 /// Self-test commands for reproducible diagnostics.
 // cli[impl command.surface.self-test]
 /// tool[impl cli.surface.self-test]
@@ -43,7 +45,7 @@ impl SelfTestArgs {
         self,
         app_home: &crate::paths::AppHome,
         cache_home: &crate::paths::CacheHome,
-    ) -> eyre::Result<()> {
+    ) -> eyre::Result<CliOutput> {
         match self.command {
             SelfTestCommand::KeyboardInput(args) => args.invoke(app_home, cache_home),
             SelfTestCommand::TerminalThroughput(args) => args.invoke(app_home, cache_home),

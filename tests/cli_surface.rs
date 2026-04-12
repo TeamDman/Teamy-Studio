@@ -1,5 +1,3 @@
-#![cfg(windows)]
-
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -74,6 +72,7 @@ fn test_version_includes_semver_and_git_revision() {
 // tool[verify cli.global.debug]
 // tool[verify cli.global.log-filter]
 // tool[verify cli.global.log-file]
+// tool[verify cli.global.output-format]
 // tool[verify cli.surface.terminal]
 // tool[verify cli.surface.self-test]
 #[test]
@@ -106,6 +105,10 @@ fn test_root_help_describes_commands_args_and_environment() {
     assert!(
         text.contains("--log-file"),
         "missing --log-file in help:\n{text}"
+    );
+    assert!(
+        text.contains("--output-format"),
+        "missing --output-format in help:\n{text}"
     );
     assert!(
         text.contains("TEAMY_STUDIO_HOME_DIR"),

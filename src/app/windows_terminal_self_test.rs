@@ -1,4 +1,5 @@
 use eyre::Context;
+use facet::Facet;
 use libghostty_vt::key;
 use std::fs;
 use std::io::{self, Write};
@@ -40,13 +41,21 @@ const POLL_INTERVAL: Duration = Duration::from_millis(20);
 const MAX_CTRL_L_RESPONSE_LATENCY_MS: f64 = 1000.0;
 const MAX_CTRL_L_PRESENT_LATENCY_MS: f64 = 1000.0;
 
+#[derive(Debug, Facet)]
+pub struct KeyboardInputSelfTestReport {
+    inside: bool,
+    scenario: Option<String>,
+    artifact_output_path: Option<String>,
+    transcript: String,
+}
+
 pub fn run(
     app_home: &AppHome,
     inside: bool,
     scenario: Option<&str>,
     artifact_output: Option<&Path>,
     vt_engine: super::VtEngineChoice,
-) -> eyre::Result<()> {
+) -> eyre::Result<KeyboardInputSelfTestReport> {
     if inside {
         run_inside()
     } else {
@@ -63,7 +72,7 @@ fn run_outside(
     scenario: Option<&str>,
     artifact_output: Option<&Path>,
     vt_engine: super::VtEngineChoice,
-) -> eyre::Result<()> {
+) -> eyre::Result<KeyboardInputSelfTestReport> {
     let scenario = scenario
         .map(std::borrow::ToOwned::to_owned)
         .or_else(|| std::env::var("TEAMY_KEYBOARD_SELF_TEST_CASE").ok());
@@ -120,7 +129,7 @@ fn run_outside(
     )
     .is_ok()
     {
-        return run_crossterm_key_probe_reproduction(&mut terminal);
+        return run_crossterm_key_probe_reproduction(&mut terminal, artifact_output);
     }
 
     if wait_for_screen(
@@ -130,7 +139,7 @@ fn run_outside(
     )
     .is_ok()
     {
-        return run_ratatui_key_debug_reproduction(&mut terminal);
+        return run_ratatui_key_debug_reproduction(&mut terminal, artifact_output);
     }
 
     if wait_for_screen(
@@ -140,7 +149,7 @@ fn run_outside(
     )
     .is_ok()
     {
-        return run_windows_key_probe_reproduction(&mut terminal);
+        return run_windows_key_probe_reproduction(&mut terminal, artifact_output);
     }
 
     let _ = terminal.take_input_trace();
@@ -188,14 +197,14 @@ fn run_outside(
         transcript: &transcript,
     })?;
 
-    emit_transcript(&transcript, artifact_output)
+    emit_transcript(None, &transcript, artifact_output)
 }
 
 fn try_run_named_scenario(
     terminal: &mut TerminalSession,
     scenario: Option<&str>,
     artifact_output: Option<&Path>,
-) -> eyre::Result<Option<()>> {
+) -> eyre::Result<Option<KeyboardInputSelfTestReport>> {
     let Some(scenario) = scenario else {
         return Ok(None);
     };
@@ -228,7 +237,7 @@ fn try_run_named_scenario(
 fn run_default_cmd_enter_reproduction(
     terminal: &mut TerminalSession,
     artifact_output: Option<&Path>,
-) -> eyre::Result<()> {
+) -> eyre::Result<KeyboardInputSelfTestReport> {
     let _ = wait_for_quiet_screen(terminal, Duration::from_millis(150), WAIT_TIMEOUT)?;
 
     type_text(terminal, "echo hi")?;
@@ -240,6 +249,7 @@ fn run_default_cmd_enter_reproduction(
     }
 
     emit_transcript(
+        Some("default-cmd-enter"),
         &format!("=== default_cmd_enter ===\n{screen}"),
         artifact_output,
     )
@@ -248,7 +258,7 @@ fn run_default_cmd_enter_reproduction(
 fn run_default_cmd_ratatui_key_debug_reproduction(
     terminal: &mut TerminalSession,
     artifact_output: Option<&Path>,
-) -> eyre::Result<()> {
+) -> eyre::Result<KeyboardInputSelfTestReport> {
     let ratatui_path = std::env::var("TEAMY_KEYBOARD_SELF_TEST_RATATUI_PATH")
         .unwrap_or_else(|_| DEFAULT_RATATUI_KEY_DEBUG_PATH.to_owned());
 
@@ -283,13 +293,17 @@ fn run_default_cmd_ratatui_key_debug_reproduction(
         "launched: {ratatui_path}\nkitty_flags: {initial_flags:?}\n\n=== after_a_release ===\n{after_a_release}\n\n=== after_ctrl_backspace_press ===\n{after_ctrl_backspace_press}\n\n=== after_ratatui_exit ===\n{after_ratatui_exit}\n\n=== final_screen ===\n{final_screen}"
     );
 
-    emit_transcript(&transcript, artifact_output)
+    emit_transcript(
+        Some("default-cmd-ratatui-key-debug"),
+        &transcript,
+        artifact_output,
+    )
 }
 
 fn run_pwsh_ctrl_d_at_prompt_reproduction(
     terminal: &mut TerminalSession,
     artifact_output: Option<&Path>,
-) -> eyre::Result<()> {
+) -> eyre::Result<KeyboardInputSelfTestReport> {
     let initial_screen = wait_for_semantic_prompt(terminal, WAIT_TIMEOUT)?;
     let _ = terminal.take_input_trace();
 
@@ -310,13 +324,17 @@ fn run_pwsh_ctrl_d_at_prompt_reproduction(
         format_chunks(&input_trace),
     );
 
-    emit_transcript(&transcript, artifact_output)
+    emit_transcript(
+        Some(PWSH_CTRL_D_AT_PROMPT_CASE),
+        &transcript,
+        artifact_output,
+    )
 }
 
 fn run_pwsh_nested_ctrl_d_reproduction(
     terminal: &mut TerminalSession,
     artifact_output: Option<&Path>,
-) -> eyre::Result<()> {
+) -> eyre::Result<KeyboardInputSelfTestReport> {
     let initial_screen = wait_for_semantic_prompt(terminal, WAIT_TIMEOUT)?;
 
     type_text(terminal, "pwsh")?;
@@ -342,13 +360,13 @@ fn run_pwsh_nested_ctrl_d_reproduction(
         "scenario: {PWSH_NESTED_CTRL_D_CASE}\n\n=== initial_screen ===\n{initial_screen}\n\n=== nested_screen ===\n{nested_screen}\n\n=== after_ctrl_d ===\n{after_ctrl_d}\n\n=== final_screen ===\n{final_screen}"
     );
 
-    emit_transcript(&transcript, artifact_output)
+    emit_transcript(Some(PWSH_NESTED_CTRL_D_CASE), &transcript, artifact_output)
 }
 
 fn run_pwsh_ctrl_d_after_typed_input_reproduction(
     terminal: &mut TerminalSession,
     artifact_output: Option<&Path>,
-) -> eyre::Result<()> {
+) -> eyre::Result<KeyboardInputSelfTestReport> {
     let initial_screen = wait_for_semantic_prompt(terminal, WAIT_TIMEOUT)?;
     let _ = terminal.take_input_trace();
 
@@ -384,13 +402,17 @@ fn run_pwsh_ctrl_d_after_typed_input_reproduction(
         format_chunks(&input_trace),
     );
 
-    emit_transcript(&transcript, artifact_output)
+    emit_transcript(
+        Some(PWSH_CTRL_D_AFTER_TYPED_INPUT_CASE),
+        &transcript,
+        artifact_output,
+    )
 }
 
 fn run_pwsh_ctrl_l_redraw_reproduction(
     terminal: &mut TerminalSession,
     artifact_output: Option<&Path>,
-) -> eyre::Result<()> {
+) -> eyre::Result<KeyboardInputSelfTestReport> {
     const CLEAR_ME_MARKER: &str = "TEAMY_CTRL_L_CLEAR_ME";
 
     let initial_screen = wait_for_pwsh_visible_prompt(terminal)?;
@@ -485,13 +507,13 @@ fn run_pwsh_ctrl_l_redraw_reproduction(
         format_chunks(&input_trace),
     );
 
-    emit_transcript(&transcript, artifact_output)
+    emit_transcript(Some(PWSH_CTRL_L_REDRAW_CASE), &transcript, artifact_output)
 }
 
 fn run_pwsh_typed_input_scrolls_caret_into_view_reproduction(
     terminal: &mut TerminalSession,
     artifact_output: Option<&Path>,
-) -> eyre::Result<()> {
+) -> eyre::Result<KeyboardInputSelfTestReport> {
     let initial_screen = wait_for_pwsh_visible_prompt(terminal)?;
     seed_pwsh_scrollback_for_input_jump(terminal)?;
     let scrolled_offset = scroll_terminal_viewport_up_for_input_jump(terminal)?;
@@ -531,13 +553,17 @@ fn run_pwsh_typed_input_scrolls_caret_into_view_reproduction(
         format_chunks(&input_trace),
     );
 
-    emit_transcript(&transcript, artifact_output)
+    emit_transcript(
+        Some(PWSH_TYPED_INPUT_SCROLLS_CARET_INTO_VIEW_CASE),
+        &transcript,
+        artifact_output,
+    )
 }
 
 fn run_pwsh_noprofile_resize_restores_prompt_reproduction(
     terminal: &mut TerminalSession,
     artifact_output: Option<&Path>,
-) -> eyre::Result<()> {
+) -> eyre::Result<KeyboardInputSelfTestReport> {
     let initial_shell_prompt = wait_for_semantic_prompt(terminal, WAIT_TIMEOUT)?;
 
     terminal.handle_paste(&format!(
@@ -546,7 +572,8 @@ fn run_pwsh_noprofile_resize_restores_prompt_reproduction(
     press_enter(terminal)?;
 
     let custom_prompt_screen =
-        wait_for_screen(terminal, RESIZE_RESTORE_PROMPT_BOTTOM_MARKER, WAIT_TIMEOUT)?;
+        wait_for_screen(terminal, RESIZE_RESTORE_PROMPT_BOTTOM_MARKER, WAIT_TIMEOUT)
+            .wrap_err("custom prompt did not become visible before resize")?;
     if !custom_prompt_screen.contains(RESIZE_RESTORE_PROMPT_TOP_MARKER) {
         eyre::bail!(
             "custom multiline prompt did not render both lines before resize\n\n=== initial_shell_prompt ===\n{initial_shell_prompt}\n\n=== custom_prompt_screen ===\n{custom_prompt_screen}"
@@ -554,8 +581,8 @@ fn run_pwsh_noprofile_resize_restores_prompt_reproduction(
     }
 
     shrink_terminal_until_one_row_visible(terminal)?;
-    let after_shrink =
-        wait_for_screen(terminal, RESIZE_RESTORE_PROMPT_BOTTOM_MARKER, WAIT_TIMEOUT)?;
+    let after_shrink = wait_for_screen(terminal, RESIZE_RESTORE_PROMPT_BOTTOM_MARKER, WAIT_TIMEOUT)
+        .wrap_err("prompt bottom line disappeared while shrinking the terminal")?;
 
     terminal.resize(TerminalLayout {
         client_width: 1600,
@@ -564,8 +591,18 @@ fn run_pwsh_noprofile_resize_restores_prompt_reproduction(
         cell_height: 16,
     })?;
 
-    let after_restore =
-        wait_for_screen(terminal, RESIZE_RESTORE_PROMPT_BOTTOM_MARKER, WAIT_TIMEOUT)?;
+    let after_restore = match wait_for_screen(terminal, RESIZE_RESTORE_PROMPT_BOTTOM_MARKER, WAIT_TIMEOUT) {
+        Ok(screen) => screen,
+        Err(error) => {
+            let viewport_after_restore = terminal.viewport_metrics().ok();
+            let screen_after_restore = collect_screen(terminal).unwrap_or_else(|screen_error| {
+                format!("<failed to collect screen after restore: {screen_error}>")
+            });
+            return Err(error.wrap_err(format!(
+                "prompt bottom line did not return after restoring terminal height\n\nviewport_after_restore: {viewport_after_restore:?}\n\n=== after_restore_screen ===\n{screen_after_restore}"
+            )));
+        }
+    };
     if !after_restore.contains(RESIZE_RESTORE_PROMPT_TOP_MARKER) {
         eyre::bail!(
             "restoring the terminal height should recover the hidden prompt line from scrollback\n\n=== initial_shell_prompt ===\n{initial_shell_prompt}\n\n=== custom_prompt_screen ===\n{custom_prompt_screen}\n\n=== after_shrink ===\n{after_shrink}\n\n=== after_restore ===\n{after_restore}"
@@ -575,7 +612,11 @@ fn run_pwsh_noprofile_resize_restores_prompt_reproduction(
     let transcript = format!(
         "scenario: {PWSH_NOPROFILE_RESIZE_RESTORES_PROMPT_CASE}\n\n=== initial_shell_prompt ===\n{initial_shell_prompt}\n\n=== custom_prompt_screen ===\n{custom_prompt_screen}\n\n=== after_shrink ===\n{after_shrink}\n\n=== after_restore ===\n{after_restore}"
     );
-    emit_transcript(&transcript, artifact_output)
+    emit_transcript(
+        Some(PWSH_NOPROFILE_RESIZE_RESTORES_PROMPT_CASE),
+        &transcript,
+        artifact_output,
+    )
 }
 
 fn seed_pwsh_scrollback_for_input_jump(terminal: &mut TerminalSession) -> eyre::Result<()> {
@@ -634,7 +675,10 @@ fn scroll_terminal_viewport_up_for_input_jump(terminal: &mut TerminalSession) ->
     Ok(target_offset)
 }
 
-fn run_ratatui_key_debug_reproduction(terminal: &mut TerminalSession) -> eyre::Result<()> {
+fn run_ratatui_key_debug_reproduction(
+    terminal: &mut TerminalSession,
+    artifact_output: Option<&Path>,
+) -> eyre::Result<KeyboardInputSelfTestReport> {
     let (initial_flags, after_a_release, after_ctrl_backspace_press) =
         exercise_ratatui_key_debug(terminal)?;
 
@@ -653,13 +697,14 @@ fn run_ratatui_key_debug_reproduction(terminal: &mut TerminalSession) -> eyre::R
         "kitty_flags: {initial_flags:?}\n\n=== after_a_release ===\n{after_a_release}\n\n=== after_ctrl_backspace_press ===\n{after_ctrl_backspace_press}\n\n=== final_screen ===\n{final_screen}"
     );
 
-    println!("{transcript}");
-    Ok(())
+    emit_transcript(None, &transcript, artifact_output)
 }
 
-fn emit_transcript(transcript: &str, artifact_output: Option<&Path>) -> eyre::Result<()> {
-    println!("{transcript}");
-
+fn emit_transcript(
+    scenario: Option<&str>,
+    transcript: &str,
+    artifact_output: Option<&Path>,
+) -> eyre::Result<KeyboardInputSelfTestReport> {
     if let Some(artifact_output) = artifact_output {
         if let Some(parent) = artifact_output.parent() {
             fs::create_dir_all(parent).wrap_err_with(|| {
@@ -678,7 +723,12 @@ fn emit_transcript(transcript: &str, artifact_output: Option<&Path>) -> eyre::Re
         })?;
     }
 
-    Ok(())
+    Ok(KeyboardInputSelfTestReport {
+        inside: false,
+        scenario: scenario.map(ToOwned::to_owned),
+        artifact_output_path: artifact_output.map(|path| path.display().to_string()),
+        transcript: transcript.to_owned(),
+    })
 }
 
 fn assert_prompt_markers_do_not_leak_to_screen(label: &str, screen: &str) -> eyre::Result<()> {
@@ -775,7 +825,10 @@ fn exercise_ratatui_key_debug(
     Ok((initial_flags, after_a_release, after_ctrl_backspace_press))
 }
 
-fn run_crossterm_key_probe_reproduction(terminal: &mut TerminalSession) -> eyre::Result<()> {
+fn run_crossterm_key_probe_reproduction(
+    terminal: &mut TerminalSession,
+    artifact_output: Option<&Path>,
+) -> eyre::Result<KeyboardInputSelfTestReport> {
     let before = collect_screen(terminal)?;
     if !before.contains(CROSSTERM_KEY_PROBE_READY) {
         eyre::bail!("crossterm_key_probe marker disappeared before reproduction\n\n{before}");
@@ -817,11 +870,13 @@ fn run_crossterm_key_probe_reproduction(terminal: &mut TerminalSession) -> eyre:
         "=== after_a_release ===\n{after_a_release}\n\n=== after_ctrl_backspace_press ===\n{after_ctrl_backspace_press}\n\n=== final_screen ===\n{final_screen}"
     );
 
-    println!("{transcript}");
-    Ok(())
+    emit_transcript(None, &transcript, artifact_output)
 }
 
-fn run_windows_key_probe_reproduction(terminal: &mut TerminalSession) -> eyre::Result<()> {
+fn run_windows_key_probe_reproduction(
+    terminal: &mut TerminalSession,
+    artifact_output: Option<&Path>,
+) -> eyre::Result<KeyboardInputSelfTestReport> {
     let before = collect_screen(terminal)?;
     if !before.contains(WINDOWS_KEY_PROBE_READY) {
         eyre::bail!("windows_key_probe marker disappeared before reproduction\n\n{before}");
@@ -834,8 +889,11 @@ fn run_windows_key_probe_reproduction(terminal: &mut TerminalSession) -> eyre::R
     if wait_for_screen(terminal, "EVENT E01", WAIT_TIMEOUT).is_err() {
         let trace = format_chunks(&terminal.take_input_trace());
         let screen = collect_screen(terminal)?;
-        println!("{WIN32_INPUT_MODE_UNSUPPORTED}\ntrace: {trace}\n\n{screen}");
-        return Ok(());
+        return emit_transcript(
+            None,
+            &format!("{WIN32_INPUT_MODE_UNSUPPORTED}\ntrace: {trace}\n\n{screen}"),
+            artifact_output,
+        );
     }
     let after_a_press = wait_for_quiet_screen(terminal, Duration::from_millis(150), WAIT_TIMEOUT)?;
     assert_probe_event_state(
@@ -899,11 +957,10 @@ fn run_windows_key_probe_reproduction(terminal: &mut TerminalSession) -> eyre::R
     let transcript = format!(
         "=== after_a_press ===\n{after_a_press}\n\n=== after_a_release ===\n{after_a_release}\n\n=== after_ctrl_backspace_press ===\n{after_ctrl_backspace_press}\n\n=== after_ctrl_backspace_release ===\n{after_ctrl_backspace_release}"
     );
-    println!("{transcript}");
-    Ok(())
+    emit_transcript(None, &transcript, artifact_output)
 }
 
-fn run_inside() -> eyre::Result<()> {
+fn run_inside() -> eyre::Result<KeyboardInputSelfTestReport> {
     // Safety: querying the standard input handle does not require additional invariants.
     let input =
         unsafe { GetStdHandle(STD_INPUT_HANDLE) }.wrap_err("failed to get console input handle")?;
@@ -945,7 +1002,12 @@ fn run_inside() -> eyre::Result<()> {
         }
     }
 
-    Ok(())
+    Ok(KeyboardInputSelfTestReport {
+        inside: true,
+        scenario: Some("inside".to_owned()),
+        artifact_output_path: None,
+        transcript: "keyboard self-test inside probe completed".to_owned(),
+    })
 }
 
 struct ConsoleModeGuard {

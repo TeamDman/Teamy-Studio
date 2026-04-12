@@ -5,6 +5,8 @@ use eyre::Result;
 use facet::Facet;
 use figue as args;
 
+use crate::cli::output::CliOutput;
+
 /// Default-shell commands.
 // cli[impl command.surface.terminal-default-shell]
 #[derive(Facet, Arbitrary, Debug, PartialEq)]
@@ -34,14 +36,12 @@ impl TerminalDefaultShellArgs {
         self,
         app_home: &crate::paths::AppHome,
         cache_home: &crate::paths::CacheHome,
-    ) -> Result<()> {
+    ) -> Result<CliOutput> {
         match self.command {
-            TerminalDefaultShellCommand::Set(args) => args.invoke(app_home, cache_home)?,
+            TerminalDefaultShellCommand::Set(args) => args.invoke(app_home, cache_home),
             TerminalDefaultShellCommand::Show(_) => {
-                TerminalDefaultShellShowArgs::invoke(app_home, cache_home)?;
+                TerminalDefaultShellShowArgs::invoke(app_home, cache_home)
             }
         }
-
-        Ok(())
     }
 }

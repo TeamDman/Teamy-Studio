@@ -1,5 +1,3 @@
-#![cfg(windows)]
-
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -62,7 +60,7 @@ fn render_offscreen_command_runs_headlessly_and_writes_png_artifact() {
 
     assert!(output.status.success(), "render-offscreen failed:\n{text}");
     assert!(
-        text.contains("image_width:"),
+        text.contains("\"image_width\":"),
         "missing image metrics:\n{text}"
     );
     assert!(artifact.exists(), "offscreen PNG artifact was not written");

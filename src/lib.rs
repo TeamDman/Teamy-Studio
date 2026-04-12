@@ -8,6 +8,7 @@ pub mod paths;
 pub mod shell_default;
 
 use crate::cli::Cli;
+use crate::cli::output::CliOutput;
 
 /// Version string combining package version and git revision.
 /// tool[impl cli.version.includes-semver]
@@ -33,16 +34,11 @@ pub fn main() -> eyre::Result<()> {
     // Install color_eyre for better error reports
     color_eyre::install()?;
 
-    #[cfg(windows)]
-    {
-        // Enable ANSI support on Windows
-        // This fails in a pipe scenario, so we ignore the error
-        let _ = teamy_windows::console::enable_ansi_support();
+    // Enable ANSI support on Windows.
+    // This fails in a pipe scenario, so we ignore the error.
+    let _ = teamy_windows::console::enable_ansi_support();
 
-        // Warn if UTF-8 is not enabled on Windows
-        #[cfg(windows)]
-        teamy_windows::string::warn_if_utf8_not_enabled();
-    };
+    teamy_windows::string::warn_if_utf8_not_enabled();
 
     // Parse command line arguments using figue
     // unwrap() is figue's intended CLI entry behavior:
@@ -65,6 +61,8 @@ pub fn main() -> eyre::Result<()> {
     logging_init::init_logging(&cli.global_args)?;
 
     // Invoke whatever command was requested
-    cli.invoke()?;
+    let output_format = cli.global_args.output_format;
+    let output: CliOutput = cli.invoke()?;
+    output.emit(output_format)?;
     Ok(())
 }

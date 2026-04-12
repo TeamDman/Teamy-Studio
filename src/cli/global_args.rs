@@ -4,10 +4,13 @@ use arbitrary::Arbitrary;
 use facet::Facet;
 use figue::{self as args};
 
+use crate::cli::output::OutputFormat;
+
 /// Global arguments that apply to all commands.
 /// tool[impl cli.global.debug]
 /// tool[impl cli.global.log-filter]
 /// tool[impl cli.global.log-file]
+/// tool[impl cli.global.output-format]
 #[derive(Facet, Arbitrary, Debug, Default, PartialEq)]
 #[facet(rename_all = "kebab-case")]
 pub struct GlobalArgs {
@@ -30,4 +33,12 @@ pub struct GlobalArgs {
     /// If omitted, no JSON log file is written.
     #[facet(args::named)]
     pub log_file: Option<String>,
+
+    /// tool[impl cli.global.output-format]
+    /// Render command output as `text`, `json`, or `csv`.
+    ///
+    /// If omitted, Teamy Studio uses `text` for interactive terminals and `json`
+    /// when stdout is redirected.
+    #[facet(args::named)]
+    pub output_format: Option<OutputFormat>,
 }

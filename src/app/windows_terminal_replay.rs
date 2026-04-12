@@ -29,8 +29,9 @@ struct TerminalReplayChunk {
 }
 
 #[derive(Debug, Facet)]
-struct TerminalReplayReport {
+pub struct TerminalReplayReport {
     fixture_path: String,
+    artifact_output_path: Option<String>,
     samples: usize,
     median_apply_ms: f64,
     median_vt_write_calls: u64,
@@ -63,7 +64,7 @@ pub fn run_terminal_replay_self_test(
     fixture_path: &Path,
     artifact_output: Option<&Path>,
     samples: usize,
-) -> eyre::Result<()> {
+) -> eyre::Result<TerminalReplayReport> {
     let fixture_text = fs::read_to_string(fixture_path)
         .wrap_err_with(|| format!("failed to read replay fixture {}", fixture_path.display()))?;
     let fixture: TerminalReplayFixture = facet_json::from_str(&fixture_text)
@@ -85,6 +86,7 @@ pub fn run_terminal_replay_self_test(
         .ok_or_else(|| eyre::eyre!("teamy terminal replay did not produce any samples"))?;
     let report = TerminalReplayReport {
         fixture_path: fixture_path.display().to_string(),
+        artifact_output_path: artifact_output.map(|path| path.display().to_string()),
         samples: sample_count,
         median_apply_ms: median_f64(&ghostty_sample_results, |sample| sample.apply_ms),
         median_vt_write_calls: median_u64(&ghostty_sample_results, |sample| sample.vt_write_calls),
@@ -124,24 +126,7 @@ pub fn run_terminal_replay_self_test(
         })?;
     }
 
-    println!(
-        "fixture: {}\nsamples: {}\nmedian_apply_ms: {:.3}\nmedian_vt_write_calls: {}\nmedian_bytes_applied: {}\nteamy_median_apply_ms: {:.3}\nteamy_median_vt_write_calls: {}\nteamy_median_bytes_applied: {}\nteamy_matches_ghostty: {}\nteamy_display_rows: {}\nteamy_display_glyphs: {}\n\n=== final_screen ===\n{}\n\n=== teamy_final_screen ===\n{}",
-        report.fixture_path,
-        report.samples,
-        report.median_apply_ms,
-        report.median_vt_write_calls,
-        report.median_bytes_applied,
-        report.teamy_median_apply_ms,
-        report.teamy_median_vt_write_calls,
-        report.teamy_median_bytes_applied,
-        report.teamy_matches_ghostty,
-        report.teamy_display_rows,
-        report.teamy_display_glyphs,
-        report.final_screen,
-        report.teamy_final_screen,
-    );
-
-    Ok(())
+    Ok(report)
 }
 
 fn run_ghostty_terminal_replay_sample(

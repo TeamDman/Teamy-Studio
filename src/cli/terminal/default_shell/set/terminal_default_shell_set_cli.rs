@@ -3,6 +3,14 @@ use eyre::Result;
 use facet::Facet;
 use figue as args;
 
+use crate::cli::output::CliOutput;
+
+#[derive(Facet, Debug)]
+struct TerminalDefaultShellSetReport {
+    config_path: String,
+    argv: Vec<String>,
+}
+
 /// Persist the default shell command.
 // cli[impl command.surface.terminal-default-shell-set]
 // cli[impl shell.default.set.double-dash-trailing-args]
@@ -27,8 +35,17 @@ impl TerminalDefaultShellSetArgs {
         self,
         app_home: &crate::paths::AppHome,
         cache_home: &crate::paths::CacheHome,
-    ) -> Result<()> {
+    ) -> Result<CliOutput> {
         let _ = cache_home;
-        crate::shell_default::save_configured_argv(app_home, self.program, self.args)
+        let mut argv = Vec::with_capacity(self.args.len() + 1);
+        argv.push(self.program.clone());
+        argv.extend(self.args.clone());
+        crate::shell_default::save_configured_argv(app_home, self.program, self.args)?;
+        Ok(CliOutput::facet(TerminalDefaultShellSetReport {
+            config_path: crate::shell_default::default_shell_path(app_home)
+                .display()
+                .to_string(),
+            argv,
+        }))
     }
 }

@@ -61,6 +61,9 @@ The CLI must accept a `--log-filter` global option.
 tool[cli.global.log-file]
 The CLI must accept a `--log-file` global option.
 
+tool[cli.global.output-format]
+The CLI must accept a global `--output-format` option.
+
 ## Logging
 
 tool[logging.stderr-output]
