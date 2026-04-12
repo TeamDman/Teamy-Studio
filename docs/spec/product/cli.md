@@ -83,8 +83,8 @@ The `terminal default-shell set` command must accept dash-prefixed shell argumen
 
 ## Terminals
 
-cli[terminal.open.program-positional]
-The `terminal open` command must require a positional program argument for the process launched in the new terminal window.
+cli[terminal.open.default-shell-when-program-omitted]
+The `terminal open` command must use the effective default shell command when no explicit program argument is supplied.
 
 cli[terminal.open.double-dash-trailing-args]
 The `terminal open` command must accept dash-prefixed terminal arguments after a `--` delimiter so they are treated as trailing program arguments rather than Teamy Studio CLI flags.

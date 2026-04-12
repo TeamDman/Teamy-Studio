@@ -78,24 +78,18 @@ pub fn run_with_vt_engine(app_home: &AppHome, vt_engine: VtEngineChoice) -> eyre
 /// This function will return an error if the platform-specific window cannot be launched.
 pub fn open_terminal_window(
     app_home: &AppHome,
-    command_argv: &[String],
+    command_argv: Option<&[String]>,
     initial_stdin: Option<&str>,
     title: Option<&str>,
     vt_engine: VtEngineChoice,
 ) -> eyre::Result<()> {
-    open_terminal_window_with_vt_engine(
-        app_home,
-        Some(command_argv),
-        initial_stdin,
-        title,
-        vt_engine,
-    )
-    .map_err(|error| {
-        error.wrap_err(format!(
-            "failed to open terminal window{}",
-            title.map_or_else(String::new, |value| format!(" `{value}`"))
-        ))
-    })
+    open_terminal_window_with_vt_engine(app_home, command_argv, initial_stdin, title, vt_engine)
+        .map_err(|error| {
+            error.wrap_err(format!(
+                "failed to open terminal window{}",
+                title.map_or_else(String::new, |value| format!(" `{value}`"))
+            ))
+        })
 }
 
 fn open_terminal_window_with_vt_engine(

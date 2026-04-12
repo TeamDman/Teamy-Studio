@@ -158,7 +158,7 @@ fn test_terminal_help_is_available() {
     );
 }
 
-// cli[verify terminal.open.program-positional]
+// cli[verify terminal.open.default-shell-when-program-omitted]
 // cli[verify terminal.open.double-dash-trailing-args]
 // cli[verify terminal.open.stdin-flag]
 // cli[verify terminal.open.title-flag]
@@ -173,8 +173,8 @@ fn test_terminal_open_help_is_available() {
         "terminal open help failed:\n{text}"
     );
     assert!(
-        text.contains("Program to launch"),
-        "missing positional program description:\n{text}"
+        text.contains("Optional program to launch"),
+        "missing optional program description:\n{text}"
     );
     assert!(text.contains("--stdin"), "missing --stdin in help:\n{text}");
     assert!(text.contains("--title"), "missing --title in help:\n{text}");

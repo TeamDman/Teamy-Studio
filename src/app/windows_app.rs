@@ -2608,7 +2608,7 @@ fn handle_left_button_up(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Result<boo
             .spawn(move || {
                 let launch_result = super::open_terminal_window(
                     &app_home,
-                    &command_argv,
+                    Some(&command_argv),
                     None,
                     chrome_title.as_deref(),
                     vt_engine,
