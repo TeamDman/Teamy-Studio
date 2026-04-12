@@ -32,8 +32,8 @@ pub enum TerminalThroughputBenchmarkMode {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum VtEngineChoice {
-    #[default]
     Ghostty,
+    #[default]
     Teamy,
 }
 
@@ -60,7 +60,7 @@ pub struct RenderOffscreenSelfTestReport {
 ///
 /// This function will return an error if the platform-specific window cannot be launched.
 pub fn run(app_home: &AppHome) -> eyre::Result<()> {
-    open_terminal_window_with_vt_engine(app_home, None, None, None, VtEngineChoice::Ghostty)
+    open_terminal_window_with_vt_engine(app_home, None, None, None, Default::default())
 }
 
 /// Run the Teamy Studio application shell with an explicit VT engine.
