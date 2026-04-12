@@ -1,7 +1,5 @@
-#[cfg(windows)]
 use std::io::Write;
 
-#[cfg(windows)]
 fn main() -> eyre::Result<()> {
     use std::io::{self};
 
@@ -55,18 +53,11 @@ fn main() -> eyre::Result<()> {
     Ok(())
 }
 
-#[cfg(not(windows))]
-fn main() -> eyre::Result<()> {
-    eyre::bail!("windows-key-probe only supports Windows")
-}
-
-#[cfg(windows)]
 struct ConsoleModeGuard {
     input: windows::Win32::Foundation::HANDLE,
     original_mode: windows::Win32::System::Console::CONSOLE_MODE,
 }
 
-#[cfg(windows)]
 impl Drop for ConsoleModeGuard {
     fn drop(&mut self) {
         print!("\x1b[?9001l");
@@ -78,7 +69,6 @@ impl Drop for ConsoleModeGuard {
     }
 }
 
-#[cfg(windows)]
 fn read_next_key_event(
     input: windows::Win32::Foundation::HANDLE,
 ) -> eyre::Result<windows::Win32::System::Console::KEY_EVENT_RECORD> {
@@ -106,12 +96,10 @@ fn read_next_key_event(
     }
 }
 
-#[cfg(windows)]
 fn should_skip_event(event: &windows::Win32::System::Console::KEY_EVENT_RECORD) -> bool {
     matches!(event.wVirtualKeyCode, 0x10..=0x12)
 }
 
-#[cfg(windows)]
 fn format_key_event(
     index: usize,
     event: &windows::Win32::System::Console::KEY_EVENT_RECORD,
@@ -141,7 +129,6 @@ fn format_key_event(
     )
 }
 
-#[cfg(windows)]
 fn flag(bits: u32, mask: u32) -> u8 {
     u8::from((bits & mask) != 0)
 }

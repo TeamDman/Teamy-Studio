@@ -1,7 +1,5 @@
-#[cfg(windows)]
 use std::io::Write;
 
-#[cfg(windows)]
 fn main() -> eyre::Result<()> {
     use crossterm::event::{self, Event};
     use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
@@ -34,15 +32,8 @@ fn main() -> eyre::Result<()> {
     Ok(())
 }
 
-#[cfg(not(windows))]
-fn main() -> eyre::Result<()> {
-    eyre::bail!("crossterm-key-probe only supports Windows")
-}
-
-#[cfg(windows)]
 struct RawModeGuard;
 
-#[cfg(windows)]
 impl Drop for RawModeGuard {
     fn drop(&mut self) {
         let _ = crossterm::terminal::disable_raw_mode();
