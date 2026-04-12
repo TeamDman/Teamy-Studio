@@ -4,7 +4,7 @@ use figue::{self as args};
 use std::path::Path;
 
 /// Run a headless terminal transcript replay self-test.
-/// cli[impl command.surface.self-test-terminal-replay]
+// cli[impl command.surface.self-test-terminal-replay]
 #[derive(Facet, Arbitrary, Debug, PartialEq)]
 #[facet(rename_all = "kebab-case")]
 pub struct SelfTestTerminalReplayArgs {
@@ -12,7 +12,7 @@ pub struct SelfTestTerminalReplayArgs {
     #[facet(args::named)]
     pub fixture: String,
 
-    /// cli[impl self-test.terminal-replay.artifact-output]
+    // cli[impl self-test.terminal-replay.artifact-output]
     /// Optional artifact output path for the replay report.
     #[facet(args::named)]
     pub artifact_output: Option<String>,

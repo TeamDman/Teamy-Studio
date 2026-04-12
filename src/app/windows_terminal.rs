@@ -34,7 +34,7 @@ use super::teamy_terminal_engine::{
 };
 use super::windows_terminal_engine::GhosttyTerminalEngine;
 
-pub const DRAG_STRIP_HEIGHT: i32 = 76;
+pub const DRAG_STRIP_HEIGHT: i32 = 52;
 pub const WINDOW_PADDING: i32 = 18;
 pub const POLL_TIMER_ID: usize = 1;
 pub const POLL_INTERVAL_MS: u32 = 16;
@@ -56,13 +56,10 @@ const TERMINAL_WORKER_IDLE_TIMEOUT: Duration = Duration::from_millis(1);
 const TERMINAL_WORKER_PUMP_TIME_BUDGET: Duration = Duration::from_millis(2);
 const TERMINAL_WORKER_MEDIUM_PUMP_TIME_BUDGET: Duration = Duration::from_millis(3);
 const TERMINAL_WORKER_BURST_PUMP_TIME_BUDGET: Duration = Duration::from_millis(4);
-const CELL_PANEL_GAP: i32 = 14;
-const SIDECAR_WIDTH: i32 = 86;
-const RESULT_PANEL_HEIGHT: i32 = 152;
-const MIN_CODE_PANEL_HEIGHT: i32 = 180;
+const PANEL_GAP: i32 = 14;
+const DIAGNOSTIC_PANEL_HEIGHT: i32 = 152;
+const MIN_TERMINAL_PANEL_HEIGHT: i32 = 180;
 const PLUS_BUTTON_SIZE: i32 = 42;
-const SIDECAR_BUTTON_SIZE: i32 = 34;
-const SIDECAR_BUTTON_GAP: i32 = 12;
 const TERMINAL_SCROLLBAR_WIDTH: i32 = 16;
 const TERMINAL_SCROLLBAR_GAP: i32 = 8;
 const WIN32_INPUT_MODE_ENABLE: &[u8] = b"\x1b[?9001h";
@@ -383,7 +380,7 @@ pub struct TerminalSession {
 
 enum RuntimeTerminalEngine {
     Ghostty(GhosttyTerminalEngine),
-    Teamy(TeamyTerminalEngine),
+    Teamy(Box<TeamyTerminalEngine>),
 }
 
 impl RuntimeTerminalEngine {
@@ -644,9 +641,12 @@ pub struct TerminalLayout {
 
 impl TerminalLayout {
     #[must_use]
-    fn has_room_for_panel_stack(self) -> bool {
+    fn has_room_for_diagnostic_panel(self) -> bool {
         self.frame_rect().height()
-            >= MIN_CODE_PANEL_HEIGHT + RESULT_PANEL_HEIGHT + PLUS_BUTTON_SIZE + (CELL_PANEL_GAP * 3)
+            >= DRAG_STRIP_HEIGHT
+                + MIN_TERMINAL_PANEL_HEIGHT
+                + DIAGNOSTIC_PANEL_HEIGHT
+                + (PANEL_GAP * 2)
     }
 
     #[must_use]
@@ -660,108 +660,81 @@ impl TerminalLayout {
     }
 
     #[must_use]
-    pub fn sidecar_rect(self) -> ClientRect {
+    pub fn title_bar_rect(self) -> ClientRect {
         let frame = self.frame_rect();
-        let code = self.code_panel_rect();
         ClientRect::new(
             frame.left(),
             frame.top(),
-            (frame.left() + SIDECAR_WIDTH).min(frame.right()),
-            code.bottom(),
+            frame.right(),
+            (frame.top() + DRAG_STRIP_HEIGHT).min(frame.bottom()),
         )
     }
 
     #[must_use]
     pub fn drag_handle_rect(self) -> ClientRect {
-        let sidecar = self.sidecar_rect();
+        self.title_bar_rect()
+    }
+
+    #[must_use]
+    pub fn title_text_rect(self) -> ClientRect {
+        let title_bar = self.title_bar_rect();
+        let plus = self.plus_button_rect();
         ClientRect::new(
-            sidecar.left(),
-            sidecar.top(),
-            sidecar.right(),
-            (sidecar.top() + DRAG_STRIP_HEIGHT).min(sidecar.bottom()),
+            title_bar.left() + 18,
+            title_bar.top(),
+            (plus.left() - 12).max(title_bar.left() + 1),
+            title_bar.bottom(),
+        )
+    }
+
+    #[must_use]
+    pub fn terminal_panel_rect(self) -> ClientRect {
+        let frame = self.frame_rect();
+        let panel_top = (self.title_bar_rect().bottom() + PANEL_GAP).min(frame.bottom());
+        let panel_bottom = if self.has_room_for_diagnostic_panel() {
+            (self.diagnostic_panel_rect().top() - PANEL_GAP).max(panel_top)
+        } else {
+            frame.bottom()
+        };
+        ClientRect::new(
+            frame.left(),
+            panel_top,
+            frame.right(),
+            panel_bottom.max(panel_top),
         )
     }
 
     #[must_use]
     pub fn code_panel_rect(self) -> ClientRect {
-        let frame = self.frame_rect();
-        let code_left = (frame.left() + SIDECAR_WIDTH + CELL_PANEL_GAP).min(frame.right());
-        let code_right = frame.right();
-        if !self.has_room_for_panel_stack() {
-            return ClientRect::new(
-                code_left,
-                frame.top(),
-                code_right,
-                frame.bottom().max(frame.top() + 1),
-            );
-        }
-
-        let plus = self.plus_button_rect();
-        let result_bottom = plus.top() - CELL_PANEL_GAP;
-        let desired_result_top = result_bottom - RESULT_PANEL_HEIGHT;
-        let minimum_code_bottom = frame.top() + MIN_CODE_PANEL_HEIGHT;
-        let code_bottom = (desired_result_top - CELL_PANEL_GAP)
-            .max(minimum_code_bottom)
-            .min(result_bottom - CELL_PANEL_GAP);
-
-        ClientRect::new(
-            code_left,
-            frame.top(),
-            code_right,
-            code_bottom.max(frame.top() + 1),
-        )
+        self.terminal_panel_rect()
     }
 
     #[must_use]
-    pub fn result_panel_rect(self) -> ClientRect {
-        let code = self.code_panel_rect();
-        if !self.has_room_for_panel_stack() {
-            return ClientRect::new(code.left(), code.bottom(), code.right(), code.bottom());
-        }
-
-        let plus = self.plus_button_rect();
-        ClientRect::new(
-            code.left(),
-            code.bottom() + CELL_PANEL_GAP,
-            code.right(),
-            plus.top() - CELL_PANEL_GAP,
-        )
-    }
-
-    #[must_use]
-    pub fn plus_button_rect(self) -> ClientRect {
+    pub fn diagnostic_panel_rect(self) -> ClientRect {
         let frame = self.frame_rect();
-        let code_left = (frame.left() + SIDECAR_WIDTH + CELL_PANEL_GAP).min(frame.right());
-        let code_right = frame.right();
-        if !self.has_room_for_panel_stack() {
-            return ClientRect::new(code_right, frame.bottom(), code_right, frame.bottom());
+        if !self.has_room_for_diagnostic_panel() {
+            return ClientRect::new(frame.left(), frame.bottom(), frame.right(), frame.bottom());
         }
 
-        let center_x = code_left + ((code_right - code_left).max(PLUS_BUTTON_SIZE) / 2);
-        let left = (center_x - (PLUS_BUTTON_SIZE / 2)).max(code_left);
         ClientRect::new(
-            left,
-            frame.bottom() - PLUS_BUTTON_SIZE,
-            (left + PLUS_BUTTON_SIZE).min(code_right),
+            frame.left(),
+            (frame.bottom() - DIAGNOSTIC_PANEL_HEIGHT).max(self.title_bar_rect().bottom()),
+            frame.right(),
             frame.bottom(),
         )
     }
 
     #[must_use]
-    pub fn sidecar_button_rect(self, index: usize) -> ClientRect {
-        let sidecar = self.sidecar_rect();
-        let top = self.drag_handle_rect().bottom()
-            + 22
-            + (i32::try_from(index).unwrap_or_default()
-                * (SIDECAR_BUTTON_SIZE + SIDECAR_BUTTON_GAP));
-        let left =
-            sidecar.left() + ((sidecar.right() - sidecar.left() - SIDECAR_BUTTON_SIZE).max(0) / 2);
-        ClientRect::new(
-            left,
-            top,
-            left + SIDECAR_BUTTON_SIZE,
-            top + SIDECAR_BUTTON_SIZE,
-        )
+    pub fn result_panel_rect(self) -> ClientRect {
+        self.diagnostic_panel_rect()
+    }
+
+    #[must_use]
+    pub fn plus_button_rect(self) -> ClientRect {
+        let title_bar = self.title_bar_rect();
+        let top = title_bar.top() + ((title_bar.height() - PLUS_BUTTON_SIZE).max(0) / 2);
+        let left = (title_bar.right() - PLUS_BUTTON_SIZE - 10).max(title_bar.left());
+        ClientRect::new(left, top, left + PLUS_BUTTON_SIZE, top + PLUS_BUTTON_SIZE)
     }
 
     #[must_use]
@@ -772,24 +745,24 @@ impl TerminalLayout {
 
     #[must_use]
     pub fn terminal_viewport_rect(self) -> ClientRect {
-        let code = self.code_panel_rect();
+        let terminal_panel = self.terminal_panel_rect();
         let scrollbar = self.terminal_scrollbar_rect();
         ClientRect::new(
-            code.left(),
-            code.top(),
-            (scrollbar.left() - TERMINAL_SCROLLBAR_GAP).max(code.left() + 1),
-            code.bottom(),
+            terminal_panel.left(),
+            terminal_panel.top(),
+            (scrollbar.left() - TERMINAL_SCROLLBAR_GAP).max(terminal_panel.left() + 1),
+            terminal_panel.bottom(),
         )
     }
 
     #[must_use]
     pub fn terminal_scrollbar_rect(self) -> ClientRect {
-        let code = self.code_panel_rect();
+        let terminal_panel = self.terminal_panel_rect();
         ClientRect::new(
-            (code.right() - TERMINAL_SCROLLBAR_WIDTH).max(code.left() + 1),
-            code.top(),
-            code.right(),
-            code.bottom(),
+            (terminal_panel.right() - TERMINAL_SCROLLBAR_WIDTH).max(terminal_panel.left() + 1),
+            terminal_panel.top(),
+            terminal_panel.right(),
+            terminal_panel.bottom(),
         )
     }
 
@@ -1596,7 +1569,7 @@ impl TerminalCore {
                         let _ = writer.flush();
                     }
                 });
-                RuntimeTerminalEngine::Teamy(engine)
+                RuntimeTerminalEngine::Teamy(Box::new(engine))
             }
         };
 
@@ -2799,10 +2772,6 @@ fn build_ghostty_display_state(
     })
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "the Teamy display helper keeps the fast no-selection path and the selection fallback together for profiling and comparison"
-)]
 fn build_teamy_display_state(
     engine: &TeamyTerminalEngine,
     selection: Option<TerminalSelection>,
@@ -3856,7 +3825,7 @@ fn viewport_is_bottom_anchored(viewport: TerminalViewportMetrics) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        MIN_CODE_PANEL_HEIGHT, PendingWin32CharKey, PromptInputState, SemanticPromptTracking,
+        MIN_TERMINAL_PANEL_HEIGHT, PendingWin32CharKey, PromptInputState, SemanticPromptTracking,
         TERMINAL_DISPLAY_BURST_PUBLISH_INTERVAL, TERMINAL_DISPLAY_MEDIUM_PUBLISH_INTERVAL,
         TERMINAL_DISPLAY_PUBLISH_INTERVAL, TERMINAL_OUTPUT_BURST_SLICE_BYTES,
         TERMINAL_OUTPUT_MEDIUM_SLICE_BYTES, TERMINAL_OUTPUT_SLICE_BYTES,
@@ -3883,7 +3852,7 @@ mod tests {
 
     // behavior[verify window.appearance.code-panel.terminal-alignment]
     #[test]
-    fn cell_layout_regions_do_not_overlap_and_leave_terminal_room() {
+    fn layout_regions_do_not_overlap_and_leave_terminal_room() {
         let layout = TerminalLayout {
             client_width: 1040,
             client_height: 680,
@@ -3891,22 +3860,24 @@ mod tests {
             cell_height: 16,
         };
 
-        let sidecar = layout.sidecar_rect();
-        let code = layout.code_panel_rect();
-        let result = layout.result_panel_rect();
+        let title = layout.title_bar_rect();
+        let terminal_panel = layout.terminal_panel_rect();
+        let diagnostic = layout.diagnostic_panel_rect();
         let plus = layout.plus_button_rect();
         let terminal = layout.terminal_viewport_rect();
         let scrollbar = layout.terminal_scrollbar_rect();
 
-        assert!(sidecar.right() <= code.left());
-        assert!(code.bottom() < result.top());
-        assert!(result.bottom() < plus.top());
-        assert_eq!(terminal.left(), code.left());
-        assert_eq!(terminal.bottom(), code.bottom());
+        assert!(title.bottom() <= terminal_panel.top());
+        assert!(terminal_panel.bottom() <= diagnostic.top());
+        assert!(plus.right() <= title.right());
+        assert!(plus.top() >= title.top());
+        assert!(plus.bottom() <= title.bottom());
+        assert_eq!(terminal.left(), terminal_panel.left());
+        assert_eq!(terminal.bottom(), terminal_panel.bottom());
         assert!(terminal.right() < scrollbar.left());
-        assert_eq!(scrollbar.right(), code.right());
-        assert_eq!(scrollbar.bottom(), code.bottom());
-        assert!(code.height() >= MIN_CODE_PANEL_HEIGHT);
+        assert_eq!(scrollbar.right(), terminal_panel.right());
+        assert_eq!(scrollbar.bottom(), terminal_panel.bottom());
+        assert!(terminal_panel.height() >= MIN_TERMINAL_PANEL_HEIGHT);
         assert!(layout.terminal_content_rect().width() <= terminal.width());
         assert!(layout.terminal_content_rect().height() <= terminal.height());
     }
@@ -3920,18 +3891,18 @@ mod tests {
             cell_height: 16,
         };
 
-        let code = layout.code_panel_rect();
-        let result = layout.result_panel_rect();
+        let terminal_panel = layout.terminal_panel_rect();
+        let diagnostic = layout.diagnostic_panel_rect();
         let plus = layout.plus_button_rect();
         let terminal = layout.terminal_viewport_rect();
         let scrollbar = layout.terminal_scrollbar_rect();
 
-        assert!(code.height() >= 1);
-        assert!(result.height() >= 0);
+        assert!(terminal_panel.height() >= 0);
+        assert!(diagnostic.height() >= 0);
         assert!(plus.height() >= 0);
         assert!(terminal.height() >= 0);
         assert!(scrollbar.height() >= 0);
-        assert!(result.top() <= result.bottom());
+        assert!(diagnostic.top() <= diagnostic.bottom());
         assert!(plus.top() <= plus.bottom());
     }
 
@@ -4289,12 +4260,12 @@ mod tests {
         };
 
         let drag = layout.drag_handle_rect();
-        let sidecar = layout.sidecar_rect();
+        let title_bar = layout.title_bar_rect();
 
-        assert!(drag.left() >= sidecar.left());
-        assert!(drag.right() <= sidecar.right());
-        assert!(drag.top() >= sidecar.top());
-        assert!(drag.bottom() <= sidecar.bottom());
+        assert!(drag.left() >= title_bar.left());
+        assert!(drag.right() <= title_bar.right());
+        assert!(drag.top() >= title_bar.top());
+        assert!(drag.bottom() <= title_bar.bottom());
     }
 
     // behavior[verify window.interaction.input.numpad-numlock-text]

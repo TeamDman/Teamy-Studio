@@ -31,6 +31,9 @@ const PWSH_CTRL_D_AFTER_TYPED_INPUT_CASE: &str = "pwsh-ctrl-d-after-typed-input"
 const PWSH_CTRL_L_REDRAW_CASE: &str = "pwsh-ctrl-l-redraw";
 const PWSH_TYPED_INPUT_SCROLLS_CARET_INTO_VIEW_CASE: &str =
     "pwsh-typed-input-scrolls-caret-into-view";
+const PWSH_NOPROFILE_RESIZE_RESTORES_PROMPT_CASE: &str = "pwsh-noprofile-resize-restores-prompt";
+const RESIZE_RESTORE_PROMPT_TOP_MARKER: &str = "TEAMY_RESIZE_TOP";
+const RESIZE_RESTORE_PROMPT_BOTTOM_MARKER: &str = "TEAMY_RESIZE_BOTTOM>";
 const WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 const PROBE_DETECTION_TIMEOUT: Duration = Duration::from_millis(250);
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
@@ -51,6 +54,10 @@ pub fn run(
     }
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "the outer keyboard self-test harness keeps scenario setup and probe detection in one place"
+)]
 fn run_outside(
     app_home: &AppHome,
     scenario: Option<&str>,
@@ -70,6 +77,14 @@ fn run_outside(
             let command = crate::shell_default::command_builder_from_argv(&[
                 "pwsh.exe".to_owned(),
                 "-NoLogo".to_owned(),
+            ])?;
+            TerminalSession::new_with_command(command, vt_engine)?
+        }
+        Some(PWSH_NOPROFILE_RESIZE_RESTORES_PROMPT_CASE) => {
+            let command = crate::shell_default::command_builder_from_argv(&[
+                "pwsh.exe".to_owned(),
+                "-NoLogo".to_owned(),
+                "-NoProfile".to_owned(),
             ])?;
             TerminalSession::new_with_command(command, vt_engine)?
         }
@@ -200,6 +215,9 @@ fn try_run_named_scenario(
         PWSH_CTRL_L_REDRAW_CASE => run_pwsh_ctrl_l_redraw_reproduction(terminal, artifact_output),
         PWSH_TYPED_INPUT_SCROLLS_CARET_INTO_VIEW_CASE => {
             run_pwsh_typed_input_scrolls_caret_into_view_reproduction(terminal, artifact_output)
+        }
+        PWSH_NOPROFILE_RESIZE_RESTORES_PROMPT_CASE => {
+            run_pwsh_noprofile_resize_restores_prompt_reproduction(terminal, artifact_output)
         }
         _ => return Ok(None),
     };
@@ -516,6 +534,50 @@ fn run_pwsh_typed_input_scrolls_caret_into_view_reproduction(
     emit_transcript(&transcript, artifact_output)
 }
 
+fn run_pwsh_noprofile_resize_restores_prompt_reproduction(
+    terminal: &mut TerminalSession,
+    artifact_output: Option<&Path>,
+) -> eyre::Result<()> {
+    let initial_shell_prompt = wait_for_semantic_prompt(terminal, WAIT_TIMEOUT)?;
+
+    terminal.handle_paste(&format!(
+        "function global:prompt {{ \"{RESIZE_RESTORE_PROMPT_TOP_MARKER}`n{RESIZE_RESTORE_PROMPT_BOTTOM_MARKER} \" }}"
+    ))?;
+    press_enter(terminal)?;
+
+    let custom_prompt_screen =
+        wait_for_screen(terminal, RESIZE_RESTORE_PROMPT_BOTTOM_MARKER, WAIT_TIMEOUT)?;
+    if !custom_prompt_screen.contains(RESIZE_RESTORE_PROMPT_TOP_MARKER) {
+        eyre::bail!(
+            "custom multiline prompt did not render both lines before resize\n\n=== initial_shell_prompt ===\n{initial_shell_prompt}\n\n=== custom_prompt_screen ===\n{custom_prompt_screen}"
+        );
+    }
+
+    shrink_terminal_until_one_row_visible(terminal)?;
+    let after_shrink =
+        wait_for_screen(terminal, RESIZE_RESTORE_PROMPT_BOTTOM_MARKER, WAIT_TIMEOUT)?;
+
+    terminal.resize(TerminalLayout {
+        client_width: 1600,
+        client_height: 900,
+        cell_width: 8,
+        cell_height: 16,
+    })?;
+
+    let after_restore =
+        wait_for_screen(terminal, RESIZE_RESTORE_PROMPT_BOTTOM_MARKER, WAIT_TIMEOUT)?;
+    if !after_restore.contains(RESIZE_RESTORE_PROMPT_TOP_MARKER) {
+        eyre::bail!(
+            "restoring the terminal height should recover the hidden prompt line from scrollback\n\n=== initial_shell_prompt ===\n{initial_shell_prompt}\n\n=== custom_prompt_screen ===\n{custom_prompt_screen}\n\n=== after_shrink ===\n{after_shrink}\n\n=== after_restore ===\n{after_restore}"
+        );
+    }
+
+    let transcript = format!(
+        "scenario: {PWSH_NOPROFILE_RESIZE_RESTORES_PROMPT_CASE}\n\n=== initial_shell_prompt ===\n{initial_shell_prompt}\n\n=== custom_prompt_screen ===\n{custom_prompt_screen}\n\n=== after_shrink ===\n{after_shrink}\n\n=== after_restore ===\n{after_restore}"
+    );
+    emit_transcript(&transcript, artifact_output)
+}
+
 fn seed_pwsh_scrollback_for_input_jump(terminal: &mut TerminalSession) -> eyre::Result<()> {
     terminal.resize(TerminalLayout {
         client_width: 1600,
@@ -526,6 +588,26 @@ fn seed_pwsh_scrollback_for_input_jump(terminal: &mut TerminalSession) -> eyre::
     let _ = wait_for_pwsh_visible_prompt(terminal)?;
 
     Ok(())
+}
+
+fn shrink_terminal_until_one_row_visible(terminal: &mut TerminalSession) -> eyre::Result<()> {
+    for client_height in [96, 88, 80, 72, 64, 56, 48] {
+        terminal.resize(TerminalLayout {
+            client_width: 1600,
+            client_height,
+            cell_width: 8,
+            cell_height: 16,
+        })?;
+        let viewport = terminal.viewport_metrics()?;
+        if viewport.visible == 1 {
+            return Ok(());
+        }
+    }
+
+    eyre::bail!(
+        "failed to shrink the terminal to a single visible row\n\nviewport: {:?}",
+        terminal.viewport_metrics()?,
+    )
 }
 
 fn wait_for_pwsh_visible_prompt(terminal: &mut TerminalSession) -> eyre::Result<String> {

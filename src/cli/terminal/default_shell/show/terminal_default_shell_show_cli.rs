@@ -3,12 +3,12 @@ use eyre::Result;
 use facet::Facet;
 
 /// Show the effective default shell command.
-/// cli[impl command.surface.shell-default-show]
-/// cli[impl shell.default.show-effective]
+// cli[impl command.surface.terminal-default-shell-show]
+// cli[impl shell.default.show-effective]
 #[derive(Facet, Arbitrary, Debug, PartialEq)]
-pub struct ShellDefaultShowArgs;
+pub struct TerminalDefaultShellShowArgs;
 
-impl ShellDefaultShowArgs {
+impl TerminalDefaultShellShowArgs {
     /// # Errors
     ///
     /// This function will return an error if the default shell cannot be loaded.

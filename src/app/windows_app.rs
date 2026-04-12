@@ -1,6 +1,5 @@
 use std::cell::RefCell;
 use std::marker::PhantomData;
-use std::path::Path;
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -22,18 +21,20 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_CONTROL, VK_LBUTTON, VK_MENU};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect, GetCursorPos,
-    GetMessageW, GetSystemMetrics, GetWindowRect, HTCAPTION, HTCLIENT, IDC_ARROW, IDC_SIZEALL,
-    KillTimer, LoadCursorW, MSG, MoveWindow, PostMessageW, PostQuitMessage, RegisterClassExW,
-    SM_CXPADDEDBORDER, SM_CXSCREEN, SM_CXSIZEFRAME, SM_CYSCREEN, SM_CYSIZEFRAME, SW_SHOW,
-    SYSTEM_METRICS_INDEX, SetCursor, SetTimer, ShowWindow, TranslateMessage, WM_CHAR, WM_CLOSE,
-    WM_DESTROY, WM_ENTERSIZEMOVE, WM_ERASEBKGND, WM_EXITSIZEMOVE, WM_KEYDOWN, WM_KEYUP,
-    WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCALCSIZE,
-    WM_NCHITTEST, WM_NCLBUTTONDOWN, WM_PAINT, WM_RBUTTONUP, WM_SETCURSOR, WM_SETFOCUS, WM_SIZE,
-    WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WNDCLASSEXW, WS_EX_APPWINDOW, WS_MAXIMIZEBOX,
-    WS_MINIMIZEBOX, WS_POPUP, WS_THICKFRAME, WS_VISIBLE,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, EnumWindows, GetClassNameW,
+    GetClientRect, GetCursorPos, GetMessageW, GetSystemMetrics, GetWindowRect,
+    GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, HTCAPTION, HTCLIENT, IDC_ARROW,
+    IDC_SIZEALL, IsWindowVisible, KillTimer, LoadCursorW, MSG, MoveWindow, PostMessageW,
+    PostQuitMessage, RegisterClassExW, SM_CXPADDEDBORDER, SM_CXSCREEN, SM_CXSIZEFRAME, SM_CYSCREEN,
+    SM_CYSIZEFRAME, SW_SHOW, SYSTEM_METRICS_INDEX, SetCursor, SetTimer, ShowWindow,
+    TranslateMessage, WM_CHAR, WM_CLOSE, WM_DESTROY, WM_ENTERSIZEMOVE, WM_ERASEBKGND,
+    WM_EXITSIZEMOVE, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCALCSIZE, WM_NCHITTEST, WM_NCLBUTTONDOWN, WM_PAINT,
+    WM_RBUTTONUP, WM_SETCURSOR, WM_SETFOCUS, WM_SIZE, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER,
+    WNDCLASSEXW, WS_EX_APPWINDOW, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP, WS_THICKFRAME,
+    WS_VISIBLE,
 };
-use windows::core::{PCWSTR, w};
+use windows::core::{BOOL, PCWSTR, w};
 
 use crate::paths::{AppHome, CacheHome};
 
@@ -52,18 +53,19 @@ use super::windows_terminal::{
     TerminalDisplayScrollbar, TerminalDisplayState, TerminalLayout, TerminalPerformanceSnapshot,
     TerminalSelection, TerminalSelectionMode, TerminalSession, keyboard_mods,
 };
-use super::{TerminalThroughputBenchmarkMode, VtEngineChoice, WorkspaceWindowState};
+use super::{TerminalThroughputBenchmarkMode, TerminalWindowSummary, VtEngineChoice};
 
 unsafe extern "system" {
     fn SetCapture(hwnd: HWND) -> HWND;
     fn ReleaseCapture() -> i32;
 }
 
+const TERMINAL_WINDOW_CLASS_NAME: &str = "TeamyStudioTerminalWindow";
 const WINDOW_CLASS_NAME: PCWSTR = w!("TeamyStudioTerminalWindow");
 const BENCHMARK_WINDOW_CLASS_NAME: PCWSTR = w!("TeamyStudioTerminalBenchmarkWindow");
 const WINDOW_TITLE: &str = "Teamy Studio Terminal";
 const TERMINAL_FONT_HEIGHT: i32 = -16;
-const OUTPUT_FONT_HEIGHT: i32 = -16;
+const DIAGNOSTIC_FONT_HEIGHT: i32 = -16;
 const FONT_FAMILY: &str = "CaskaydiaCove Nerd Font Mono";
 const MIN_FONT_HEIGHT: i32 = -12;
 const MAX_FONT_HEIGHT: i32 = -72;
@@ -91,7 +93,9 @@ thread_local! {
 struct AppState {
     app_home: AppHome,
     hwnd: Option<WindowHandle>,
-    workspace_window: Option<WorkspaceWindowState>,
+    launch_command_argv: Vec<String>,
+    chrome_title: Option<String>,
+    vt_engine: VtEngineChoice,
     pending_window_drag: Option<PendingWindowDrag>,
     terminal_selection: Option<TerminalSelection>,
     pending_terminal_selection: Option<PendingTerminalSelection>,
@@ -107,9 +111,9 @@ struct AppState {
     terminal_font_height: i32,
     terminal_cell_width: i32,
     terminal_cell_height: i32,
-    output_font_height: i32,
-    output_cell_width: i32,
-    output_cell_height: i32,
+    diagnostic_font_height: i32,
+    diagnostic_cell_width: i32,
+    diagnostic_cell_height: i32,
     terminal: TerminalSession,
     renderer: Option<RenderThreadProxy>,
 }
@@ -408,11 +412,94 @@ fn dispatch_message(message: &MSG) {
 /// # Errors
 ///
 /// This function will return an error if the window class, font, terminal session, or message loop fails.
-#[instrument(level = "info", skip_all, fields(has_working_dir = working_dir.is_some(), has_workspace_window = workspace_window.is_some()))]
+#[instrument(level = "info", skip_all, fields(has_command_argv = command_argv.is_some(), has_initial_stdin = initial_stdin.is_some(), has_title = title.is_some()))]
 pub fn run(
     app_home: &AppHome,
-    working_dir: Option<&Path>,
-    workspace_window: Option<WorkspaceWindowState>,
+    command_argv: Option<&[String]>,
+    initial_stdin: Option<&str>,
+    title: Option<&str>,
+    vt_engine: VtEngineChoice,
+) -> eyre::Result<()> {
+    let resolved_argv = match command_argv {
+        Some(command_argv) => command_argv.to_vec(),
+        None => crate::shell_default::load_effective_argv(app_home)?,
+    };
+    let command = crate::shell_default::command_builder_from_argv(&resolved_argv)?;
+    let terminal = info_span!("create_terminal_session")
+        .in_scope(|| TerminalSession::new_with_command(command, vt_engine))?;
+    run_with_terminal_session(
+        app_home,
+        terminal,
+        resolved_argv,
+        initial_stdin,
+        title,
+        vt_engine,
+    )
+}
+
+pub fn list_terminal_windows() -> eyre::Result<Vec<TerminalWindowSummary>> {
+    unsafe extern "system" fn enumerate_terminal_windows(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        // Safety: `lparam` is initialized from a live `Vec<TerminalWindowSummary>` pointer for the duration of `EnumWindows`.
+        let windows = unsafe { &mut *(lparam.0 as *mut Vec<TerminalWindowSummary>) };
+        // Safety: `hwnd` is provided by `EnumWindows` while enumerating live top-level windows.
+        if !unsafe { IsWindowVisible(hwnd) }.as_bool() {
+            return BOOL(1);
+        }
+
+        let mut class_name = [0_u16; 256];
+        // Safety: `class_name` is a valid writable buffer and `hwnd` is the live window under enumeration.
+        let class_name_len = unsafe { GetClassNameW(hwnd, &mut class_name) };
+        let class_name = String::from_utf16_lossy(
+            &class_name[..usize::try_from(class_name_len.max(0)).unwrap_or_default()],
+        );
+        if class_name != TERMINAL_WINDOW_CLASS_NAME {
+            return BOOL(1);
+        }
+
+        // Safety: querying the caption length for the enumerated window is valid.
+        let title_len = unsafe { GetWindowTextLengthW(hwnd) };
+        let mut title = vec![0_u16; usize::try_from(title_len.max(0)).unwrap_or_default() + 1];
+        // Safety: `title` is a valid writable buffer sized from the reported caption length.
+        let copied = unsafe { GetWindowTextW(hwnd, &mut title) };
+        let title =
+            String::from_utf16_lossy(&title[..usize::try_from(copied.max(0)).unwrap_or_default()]);
+
+        let mut pid = 0_u32;
+        // Safety: `pid` is a valid out-pointer for the enumerated window's owning process id.
+        let _ = unsafe { GetWindowThreadProcessId(hwnd, Some(&raw mut pid)) };
+        windows.push(TerminalWindowSummary {
+            hwnd: hwnd.0 as usize,
+            pid,
+            title,
+        });
+        BOOL(1)
+    }
+
+    let mut windows: Vec<TerminalWindowSummary> = Vec::new();
+    let windows_ptr = &raw mut windows;
+    // Safety: `windows_ptr` remains valid for the full `EnumWindows` call and the callback only appends summaries.
+    unsafe {
+        EnumWindows(
+            Some(enumerate_terminal_windows),
+            LPARAM(windows_ptr as isize),
+        )
+    }
+    .wrap_err("failed to enumerate Teamy Studio terminal windows")?;
+    windows.sort_by(|left, right| {
+        left.pid
+            .cmp(&right.pid)
+            .then_with(|| left.hwnd.cmp(&right.hwnd))
+    });
+    Ok(windows)
+}
+
+#[instrument(level = "info", skip_all, fields(argc = launch_command_argv.len(), has_initial_stdin = initial_stdin.is_some(), has_title = title.is_some()))]
+fn run_with_terminal_session(
+    app_home: &AppHome,
+    terminal: TerminalSession,
+    launch_command_argv: Vec<String>,
+    initial_stdin: Option<&str>,
+    title: Option<&str>,
     vt_engine: VtEngineChoice,
 ) -> eyre::Result<()> {
     let window_thread = WindowThread::current();
@@ -423,22 +510,22 @@ pub fn run(
         font_height = terminal_font_height,
     )
     .in_scope(|| measure_terminal_cell_size(terminal_font_height))?;
-    let output_font_height = OUTPUT_FONT_HEIGHT;
-    let (output_cell_width, output_cell_height) = info_span!(
+    let diagnostic_font_height = DIAGNOSTIC_FONT_HEIGHT;
+    let (diagnostic_cell_width, diagnostic_cell_height) = info_span!(
         "measure_terminal_cell_size",
-        kind = "output",
-        font_height = output_font_height,
+        kind = "diagnostic",
+        font_height = diagnostic_font_height,
     )
-    .in_scope(|| measure_terminal_cell_size(output_font_height))?;
+    .in_scope(|| measure_terminal_cell_size(diagnostic_font_height))?;
     let focused_render_interval_ms = measure_focused_render_interval_ms();
-    let terminal = info_span!("create_terminal_session")
-        .in_scope(|| TerminalSession::new(app_home, working_dir, vt_engine))?;
 
     APP_STATE.with(|state| {
         *state.borrow_mut() = Some(AppState {
             app_home: app_home.clone(),
             hwnd: None,
-            workspace_window,
+            launch_command_argv,
+            chrome_title: title.map(ToOwned::to_owned),
+            vt_engine,
             pending_window_drag: None,
             terminal_selection: None,
             pending_terminal_selection: None,
@@ -454,15 +541,16 @@ pub fn run(
             terminal_font_height,
             terminal_cell_width,
             terminal_cell_height,
-            output_font_height,
-            output_cell_width,
-            output_cell_height,
+            diagnostic_font_height,
+            diagnostic_cell_width,
+            diagnostic_cell_height,
             terminal,
             renderer: None,
         });
     });
 
-    let hwnd = info_span!("create_terminal_window").in_scope(|| create_window(window_thread))?;
+    let hwnd = info_span!("create_terminal_window")
+        .in_scope(|| create_window(window_thread, title.unwrap_or(WINDOW_TITLE)))?;
     let renderer = info_span!("create_d3d12_renderer_thread")
         .in_scope(|| RenderThreadProxy::new(hwnd.raw()))?;
     with_app_state(|state| {
@@ -478,6 +566,11 @@ pub fn run(
             let layout =
                 client_layout(hwnd, state.terminal_cell_width, state.terminal_cell_height)?;
             apply_terminal_resize(state, layout)?;
+            if let Some(initial_stdin) = initial_stdin.filter(|text| !text.is_empty()) {
+                state
+                    .terminal
+                    .handle_paste(&normalize_initial_stdin(initial_stdin))?;
+            }
             Ok(())
         })
     })?;
@@ -486,6 +579,14 @@ pub fn run(
 
     info!("Teamy Studio terminal window shown");
     message_loop()
+}
+
+fn normalize_initial_stdin(text: &str) -> String {
+    if text.ends_with(['\r', '\n']) {
+        text.to_owned()
+    } else {
+        format!("{text}\r")
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -757,13 +858,13 @@ fn run_terminal_throughput_self_test_sample(
         font_height = terminal_font_height,
     )
     .in_scope(|| measure_terminal_cell_size(terminal_font_height))?;
-    let output_font_height = OUTPUT_FONT_HEIGHT;
-    let (output_cell_width, output_cell_height) = info_span!(
+    let diagnostic_font_height = DIAGNOSTIC_FONT_HEIGHT;
+    let (diagnostic_cell_width, diagnostic_cell_height) = info_span!(
         "measure_terminal_cell_size",
-        kind = "output-benchmark",
-        font_height = output_font_height,
+        kind = "diagnostic-benchmark",
+        font_height = diagnostic_font_height,
     )
-    .in_scope(|| measure_terminal_cell_size(output_font_height))?;
+    .in_scope(|| measure_terminal_cell_size(diagnostic_font_height))?;
     let command = terminal_throughput_benchmark_command(plan.mode, plan.line_count)?;
     let mut terminal = info_span!("create_terminal_benchmark_session")
         .in_scope(|| TerminalSession::new_with_command(command, VtEngineChoice::Ghostty))?;
@@ -801,8 +902,8 @@ fn run_terminal_throughput_self_test_sample(
                     &mut terminal,
                     terminal_cell_width,
                     terminal_cell_height,
-                    output_cell_width,
-                    output_cell_height,
+                    diagnostic_cell_width,
+                    diagnostic_cell_height,
                     plan.mode,
                     plan.line_count,
                 )?;
@@ -814,7 +915,7 @@ fn run_terminal_throughput_self_test_sample(
                 && visual_started_at.is_some()
                 && frames_rendered >= 3
             {
-                resize_benchmark_window_client(
+                resize_window_client(
                     hwnd,
                     i32::try_from(client_width).unwrap_or(i32::MAX),
                     i32::try_from(client_height).unwrap_or(i32::MAX),
@@ -900,7 +1001,7 @@ where
 
 /// os[impl window.appearance.os-chrome-none]
 #[instrument(level = "info", skip_all)]
-fn create_window(window_thread: WindowThread) -> eyre::Result<WindowHandle> {
+fn create_window(window_thread: WindowThread, window_title: &str) -> eyre::Result<WindowHandle> {
     let instance = get_current_module().wrap_err("failed to get module handle")?;
 
     let class = WNDCLASSEXW {
@@ -923,7 +1024,7 @@ fn create_window(window_thread: WindowThread) -> eyre::Result<WindowHandle> {
     let screen_height = system_metric(SM_CYSCREEN);
     let x = (screen_width - INITIAL_WINDOW_WIDTH) / 2;
     let y = (screen_height - INITIAL_WINDOW_HEIGHT) / 2;
-    let title = wide_null_terminated(WINDOW_TITLE);
+    let title = wide_null_terminated(window_title);
 
     // Safety: all pointers and handles passed to CreateWindowExW are valid for the duration of the call.
     let hwnd = unsafe {
@@ -1406,10 +1507,10 @@ fn render_current_frame_with_options(
         let _span = debug_span!("compute_client_layout").entered();
         client_layout(hwnd, state.terminal_cell_width, state.terminal_cell_height)?
     };
-    let output_text = {
+    let diagnostic_text = {
         #[cfg(feature = "tracy")]
-        let _span = debug_span!("build_output_panel_text").entered();
-        build_output_panel_text(state, layout)?
+        let _span = debug_span!("build_diagnostic_panel_text").entered();
+        build_diagnostic_panel_text(state, layout)?
     };
     let terminal_display = {
         #[cfg(feature = "tracy")]
@@ -1440,13 +1541,10 @@ fn render_current_frame_with_options(
         let _span = debug_span!("submit_render_frame_model").entered();
         let frame = RenderFrameModel {
             layout,
-            cell_number: state
-                .workspace_window
-                .as_ref()
-                .map_or(1, |workspace_window| workspace_window.cell_number),
-            output_text,
-            output_cell_width: state.output_cell_width,
-            output_cell_height: state.output_cell_height,
+            title: state.chrome_title.clone(),
+            diagnostic_text,
+            diagnostic_cell_width: state.diagnostic_cell_width,
+            diagnostic_cell_height: state.diagnostic_cell_height,
             terminal_cell_width: state.terminal_cell_width,
             terminal_cell_height: state.terminal_cell_height,
             terminal_display,
@@ -1701,7 +1799,10 @@ fn terminal_cursor_overlay_rects(
     }
 }
 
-fn build_output_panel_text(state: &mut AppState, layout: TerminalLayout) -> eyre::Result<String> {
+fn build_diagnostic_panel_text(
+    state: &mut AppState,
+    layout: TerminalLayout,
+) -> eyre::Result<String> {
     let (cols, rows) = effective_terminal_grid_size(layout);
     let viewport = state.terminal.viewport_metrics()?;
     let display = state.terminal.cached_display_state();
@@ -1729,21 +1830,19 @@ fn build_output_panel_text(state: &mut AppState, layout: TerminalLayout) -> eyre
         },
     );
 
-    Ok(if let Some(workspace_window) = &state.workspace_window {
-        format!(
-            "workspace {}\ncell {} of {}\n{} cols x {} rows",
-            workspace_window.workspace.name,
-            workspace_window.cell_number,
-            workspace_window.workspace.cell_count,
-            cols,
-            rows
-        )
-    } else {
-        format!("standalone shell\n{cols} cols x {rows} rows")
-    } + &format!("\n{caret}"))
+    let title_line = state
+        .chrome_title
+        .as_deref()
+        .filter(|title| !title.is_empty())
+        .map_or_else(
+            || "terminal".to_owned(),
+            |title| format!("terminal {title}"),
+        );
+
+    Ok(format!("{title_line}\n{cols} cols x {rows} rows\n{caret}"))
 }
 
-fn build_terminal_throughput_benchmark_output_panel_text(
+fn build_terminal_throughput_benchmark_diagnostic_panel_text(
     terminal: &TerminalSession,
     mode: TerminalThroughputBenchmarkMode,
     line_count: usize,
@@ -1953,7 +2052,7 @@ fn terminal_throughput_sample_report(
     }
 }
 
-fn resize_benchmark_window_client(
+fn resize_window_client(
     hwnd: WindowHandle,
     client_width: i32,
     client_height: i32,
@@ -1978,7 +2077,7 @@ fn resize_benchmark_window_client(
     }
     .is_err()
     {
-        eyre::bail!("failed to resize benchmark window")
+        eyre::bail!("failed to resize window")
     }
 
     Ok(())
@@ -1994,22 +2093,22 @@ fn render_terminal_throughput_benchmark_frame(
     terminal: &mut TerminalSession,
     terminal_cell_width: i32,
     terminal_cell_height: i32,
-    output_cell_width: i32,
-    output_cell_height: i32,
+    diagnostic_cell_width: i32,
+    diagnostic_cell_height: i32,
     mode: TerminalThroughputBenchmarkMode,
     line_count: usize,
 ) -> eyre::Result<()> {
     let layout = client_layout(hwnd, terminal_cell_width, terminal_cell_height)?;
-    let output_text =
-        build_terminal_throughput_benchmark_output_panel_text(terminal, mode, line_count);
+    let diagnostic_text =
+        build_terminal_throughput_benchmark_diagnostic_panel_text(terminal, mode, line_count);
     let terminal_display = terminal.cached_display_state();
 
     renderer.render_frame_model_blocking(RenderFrameModel {
         layout,
-        cell_number: 1,
-        output_text,
-        output_cell_width,
-        output_cell_height,
+        title: Some("self-test".to_owned()),
+        diagnostic_text,
+        diagnostic_cell_width,
+        diagnostic_cell_height,
         terminal_cell_width,
         terminal_cell_height,
         terminal_display,
@@ -2293,21 +2392,21 @@ fn handle_mouse_wheel(hwnd: WindowHandle, wparam: WPARAM, lparam: LPARAM) -> eyr
             return Ok(true);
         }
 
-        let next_font_height = (state.output_font_height + (zoom_direction * FONT_ZOOM_STEP))
+        let next_font_height = (state.diagnostic_font_height + (zoom_direction * FONT_ZOOM_STEP))
             .clamp(MAX_FONT_HEIGHT, MIN_FONT_HEIGHT);
-        if next_font_height == state.output_font_height {
+        if next_font_height == state.diagnostic_font_height {
             return Ok(true);
         }
 
         let (cell_width, cell_height) = measure_terminal_cell_size(next_font_height)?;
         debug!(
             font_height = next_font_height,
-            const_name = "OUTPUT_FONT_HEIGHT",
-            "output zoom changed; use this font height for the default constant"
+            const_name = "DIAGNOSTIC_FONT_HEIGHT",
+            "diagnostic zoom changed; use this font height for the default constant"
         );
-        state.output_font_height = next_font_height;
-        state.output_cell_width = cell_width;
-        state.output_cell_height = cell_height;
+        state.diagnostic_font_height = next_font_height;
+        state.diagnostic_cell_width = cell_width;
+        state.diagnostic_cell_height = cell_height;
         render_current_frame(state, hwnd, None)?;
         Ok(true)
     })
@@ -2493,10 +2592,6 @@ fn handle_left_button_up(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Result<boo
             return Ok(true);
         }
 
-        let Some(workspace_window) = state.workspace_window.clone() else {
-            return Ok(false);
-        };
-
         let layout = client_layout(hwnd, state.terminal_cell_width, state.terminal_cell_height)?;
         let point = ClientPoint::from_lparam(lparam);
         if !layout.plus_button_rect().contains(point) {
@@ -2504,24 +2599,28 @@ fn handle_left_button_up(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Result<boo
         }
 
         let app_home = state.app_home.clone();
-        let cache_home = workspace_window.cache_home.clone();
-        let workspace_id = workspace_window.workspace.id.clone();
+        let command_argv = state.launch_command_argv.clone();
+        let chrome_title = state.chrome_title.clone();
+        let vt_engine = state.vt_engine;
 
         thread::Builder::new()
-            .name(format!(
-                "teamy-studio-cell-{}",
-                workspace_window.cell_number + 1
-            ))
+            .name("teamy-studio-terminal-plus".to_owned())
             .spawn(move || {
-                let launch_result =
-                    crate::workspace::append_workspace_cell(&cache_home, &workspace_id).and_then(
-                        |launch| super::run_workspace_launch(&app_home, &cache_home, launch),
-                    );
+                let launch_result = super::open_terminal_window(
+                    &app_home,
+                    &command_argv,
+                    None,
+                    chrome_title.as_deref(),
+                    vt_engine,
+                );
                 if let Err(error) = launch_result {
-                    error!(?error, "failed to open additional Teamy Studio cell window");
+                    error!(
+                        ?error,
+                        "failed to open additional Teamy Studio terminal window"
+                    );
                 }
             })
-            .wrap_err("failed to spawn Teamy Studio cell window thread")?;
+            .wrap_err("failed to spawn Teamy Studio terminal window thread")?;
 
         Ok(true)
     })

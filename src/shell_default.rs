@@ -19,12 +19,12 @@ const DEFAULT_SHELL_FILENAME: &str = "default-shell.txt";
 const TEAMY_PWSH_OSC133_BOOTSTRAP: &str = r#"$global:__teamy_prompt_seen = $false; if (Test-Path Function:\prompt) { $function:__teamy_original_prompt = $function:prompt }; function global:prompt { $status = if ($?) { 0 } elseif ($null -ne $LASTEXITCODE) { [int]$LASTEXITCODE } else { 1 }; if ($global:__teamy_prompt_seen) { [Console]::Out.Write("`e]133;D;$status`a") } else { $global:__teamy_prompt_seen = $true }; [Console]::Out.Write("`e]133;A`a"); $promptText = if (Test-Path Function:\__teamy_original_prompt) { & $function:__teamy_original_prompt } else { "PS $($executionContext.SessionState.Path.CurrentLocation)$('>' * ($nestedPromptLevel + 1)) " }; [Console]::Out.Write("`e]133;B`a"); $promptText }"#;
 
 #[must_use]
-/// cli[impl shell.default.persisted-in-app-home]
+// cli[impl shell.default.persisted-in-app-home]
 pub fn default_shell_path(app_home: &AppHome) -> PathBuf {
     app_home.file_path(DEFAULT_SHELL_FILENAME)
 }
 
-/// cli[impl shell.default.fallback.builtin]
+// cli[impl shell.default.fallback.builtin]
 /// os[impl shell.default.fallback.windows-comspec]
 ///
 /// # Errors
@@ -34,7 +34,7 @@ pub fn load_effective_argv(app_home: &AppHome) -> eyre::Result<Vec<String>> {
     Ok(load_configured_argv(app_home)?.unwrap_or_else(builtin_default_argv))
 }
 
-/// cli[impl shell.default.persisted-in-app-home]
+// cli[impl shell.default.persisted-in-app-home]
 ///
 /// # Errors
 ///
@@ -60,7 +60,7 @@ pub fn load_configured_argv(app_home: &AppHome) -> eyre::Result<Option<Vec<Strin
     }
 }
 
-/// cli[impl shell.default.persisted-in-app-home]
+// cli[impl shell.default.persisted-in-app-home]
 ///
 /// # Errors
 ///
@@ -239,7 +239,7 @@ fn windows_program_extensions() -> Vec<OsString> {
 }
 
 #[must_use]
-/// cli[impl shell.default.show-effective]
+// cli[impl shell.default.show-effective]
 pub fn format_command_line(argv: &[String]) -> String {
     argv.iter()
         .map(|argument| quote_windows_command_argument(argument))

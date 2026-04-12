@@ -22,8 +22,7 @@ use std::sync::Arc;
 
 #[cfg(windows)]
 use crate::app::spatial::TerminalCellPoint;
-use crate::paths::{AppHome, CacheHome, CellId};
-use crate::workspace::{WorkspaceLaunch, WorkspaceSummary};
+use crate::paths::{AppHome, CacheHome};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TerminalThroughputBenchmarkMode {
@@ -42,147 +41,101 @@ pub enum VtEngineChoice {
     Teamy,
 }
 
-#[derive(Clone, Debug)]
-pub struct WorkspaceWindowState {
-    pub cache_home: CacheHome,
-    pub workspace: WorkspaceSummary,
-    pub cell_id: CellId,
-    pub cell_number: usize,
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TerminalWindowSummary {
+    pub hwnd: usize,
+    pub pid: u32,
+    pub title: String,
 }
 
 /// Run the Teamy Studio application shell.
-/// cli[impl command.surface.core]
+// cli[impl command.surface.core]
 ///
 /// # Errors
 ///
 /// This function will return an error if the platform-specific window cannot be launched.
 pub fn run(app_home: &AppHome) -> eyre::Result<()> {
-    run_in_dir_with_vt_engine(app_home, None, None, VtEngineChoice::Ghostty)
+    open_terminal_window_with_vt_engine(app_home, None, None, None, VtEngineChoice::Ghostty)
 }
 
 /// Run the Teamy Studio application shell with an explicit VT engine.
-/// cli[impl window.show.vt-engine-flag]
 ///
 /// # Errors
 ///
 /// This function will return an error if the platform-specific window cannot be launched.
 pub fn run_with_vt_engine(app_home: &AppHome, vt_engine: VtEngineChoice) -> eyre::Result<()> {
-    run_in_dir_with_vt_engine(app_home, None, None, vt_engine)
+    open_terminal_window_with_vt_engine(app_home, None, None, None, vt_engine)
 }
 
-/// Run the Teamy Studio application shell with an explicit starting directory.
-/// behavior[impl window.appearance.shell-starts-in-workspace-cell-dir]
+/// Open a terminal window from an explicit command argv.
+// cli[impl command.surface.terminal-open]
+// cli[impl terminal.open.stdin-flag]
+// cli[impl terminal.open.title-flag]
+// cli[impl terminal.open.vt-engine-flag]
 ///
 /// # Errors
 ///
 /// This function will return an error if the platform-specific window cannot be launched.
-pub fn run_in_dir(
+pub fn open_terminal_window(
     app_home: &AppHome,
-    working_dir: Option<&Path>,
-    workspace_window: Option<WorkspaceWindowState>,
+    command_argv: &[String],
+    initial_stdin: Option<&str>,
+    title: Option<&str>,
+    vt_engine: VtEngineChoice,
 ) -> eyre::Result<()> {
-    run_in_dir_with_vt_engine(
+    open_terminal_window_with_vt_engine(
         app_home,
-        working_dir,
-        workspace_window,
-        VtEngineChoice::Ghostty,
+        Some(command_argv),
+        initial_stdin,
+        title,
+        vt_engine,
     )
+    .map_err(|error| {
+        error.wrap_err(format!(
+            "failed to open terminal window{}",
+            title.map_or_else(String::new, |value| format!(" `{value}`"))
+        ))
+    })
 }
 
-/// Run the Teamy Studio application shell with an explicit starting directory and VT engine.
-///
-/// # Errors
-///
-/// This function will return an error if the platform-specific window cannot be launched.
-pub fn run_in_dir_with_vt_engine(
+fn open_terminal_window_with_vt_engine(
     app_home: &AppHome,
-    working_dir: Option<&Path>,
-    workspace_window: Option<WorkspaceWindowState>,
+    command_argv: Option<&[String]>,
+    initial_stdin: Option<&str>,
+    title: Option<&str>,
     vt_engine: VtEngineChoice,
 ) -> eyre::Result<()> {
     #[cfg(windows)]
     {
-        windows_app::run(app_home, working_dir, workspace_window, vt_engine)
+        windows_app::run(app_home, command_argv, initial_stdin, title, vt_engine)
     }
 
     #[cfg(not(windows))]
     {
         let _ = app_home;
-        let _ = working_dir;
-        let _ = workspace_window;
+        let _ = command_argv;
+        let _ = initial_stdin;
+        let _ = title;
         let _ = vt_engine;
         eyre::bail!("Teamy Studio currently only supports Windows")
     }
 }
 
-/// Run a notebook workspace, creating a new one when no target is provided.
-/// cli[impl command.surface.core]
-/// cli[impl workspace.run.no-target-creates-workspace]
-/// cli[impl workspace.run.target-by-id-or-name]
+/// Enumerate live Teamy Studio terminal windows from the OS window list.
+// cli[impl command.surface.terminal-list]
+// cli[impl terminal.list.enumerates-live-windows]
 ///
 /// # Errors
 ///
-/// This function will return an error if the workspace cannot be resolved or the window cannot be launched.
-pub fn run_workspace(
-    app_home: &AppHome,
-    cache_home: &CacheHome,
-    target: Option<&str>,
-) -> eyre::Result<()> {
-    let launch = crate::workspace::open_workspace(cache_home, target)?;
-    run_workspace_launch(app_home, cache_home, launch)
-}
-
-/// Run a resolved workspace launch in the application window.
-///
-/// # Errors
-///
-/// This function will return an error if the application window cannot be launched.
-pub fn run_workspace_launch(
-    app_home: &AppHome,
-    cache_home: &CacheHome,
-    launch: WorkspaceLaunch,
-) -> eyre::Result<()> {
-    run_in_dir(
-        app_home,
-        Some(&launch.first_cell_dir),
-        Some(WorkspaceWindowState {
-            cache_home: cache_home.clone(),
-            workspace: launch.workspace,
-            cell_id: launch.first_cell_id,
-            cell_number: launch.cell_number,
-        }),
-    )
-}
-
-/// Run the configured default shell inline in the current console.
-/// cli[impl shell.inline.launches-configured-default]
-///
-/// # Errors
-///
-/// This function will return an error if the shell cannot be launched.
-pub fn run_inline_shell(app_home: &AppHome) -> eyre::Result<()> {
+/// This function will return an error if window enumeration fails.
+pub fn list_terminal_windows() -> eyre::Result<Vec<TerminalWindowSummary>> {
     #[cfg(windows)]
     {
-        use eyre::Context;
-        use tracing::info;
-
-        let command_argv = crate::shell_default::load_effective_argv(app_home)?;
-        let (program, args) = command_argv
-            .split_first()
-            .ok_or_else(|| eyre::eyre!("default shell command cannot be empty"))?;
-
-        info!(program, args = ?args, "starting Teamy Studio inline shell");
-        let status = std::process::Command::new(program)
-            .args(args)
-            .status()
-            .wrap_err_with(|| format!("failed to launch inline shell `{program}`"))?;
-        info!(?status, "Teamy Studio inline shell exited");
-        Ok(())
+        windows_app::list_terminal_windows()
     }
 
     #[cfg(not(windows))]
     {
-        let _ = app_home;
         eyre::bail!("Teamy Studio currently only supports Windows")
     }
 }
@@ -246,8 +199,8 @@ pub fn run_terminal_throughput_self_test(
 }
 
 /// Run a headless terminal replay self-test.
-/// cli[impl command.surface.self-test-terminal-replay]
-/// cli[impl self-test.terminal-replay.artifact-output]
+// cli[impl command.surface.self-test-terminal-replay]
+// cli[impl self-test.terminal-replay.artifact-output]
 /// tool[impl cli.surface.self-test]
 ///
 /// # Errors
@@ -277,8 +230,8 @@ pub fn run_terminal_replay_self_test(
 }
 
 /// Run a headless offscreen render self-test.
-/// cli[impl command.surface.self-test-render-offscreen]
-/// cli[impl self-test.render-offscreen.artifact-output]
+// cli[impl command.surface.self-test-render-offscreen]
+// cli[impl self-test.render-offscreen.artifact-output]
 /// tool[impl cli.surface.self-test]
 ///
 /// # Errors
@@ -353,10 +306,10 @@ fn build_offscreen_render_self_test_frame() -> windows_d3d12_renderer::RenderFra
 
     windows_d3d12_renderer::RenderFrameModel {
         layout,
-        cell_number: 7,
-        output_text: "offscreen render self-test".to_owned(),
-        output_cell_width: 8,
-        output_cell_height: 16,
+        title: Some("self-test".to_owned()),
+        diagnostic_text: "offscreen render self-test".to_owned(),
+        diagnostic_cell_width: 8,
+        diagnostic_cell_height: 16,
         terminal_cell_width: 8,
         terminal_cell_height: 16,
         terminal_display,

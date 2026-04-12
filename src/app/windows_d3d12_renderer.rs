@@ -153,12 +153,9 @@ struct CurveExtents {
 #[derive(Clone, Copy, Debug)]
 pub enum PanelEffect {
     BlueBackground = 0,
-    Sidecar = 1,
-    DragHandle = 2,
-    CodePanel = 3,
-    ResultPanel = 4,
-    PlayButton = 5,
-    StopButton = 6,
+    TitleBar = 2,
+    TerminalPanel = 3,
+    DiagnosticPanel = 4,
     PlusButton = 7,
     TerminalFill = 8,
     TerminalCursor = 9,
@@ -256,10 +253,10 @@ pub struct RendererTerminalVisualState {
 #[derive(Clone, Debug)]
 pub struct RenderFrameModel {
     pub layout: TerminalLayout,
-    pub cell_number: usize,
-    pub output_text: String,
-    pub output_cell_width: i32,
-    pub output_cell_height: i32,
+    pub title: Option<String>,
+    pub diagnostic_text: String,
+    pub diagnostic_cell_width: i32,
+    pub diagnostic_cell_height: i32,
     pub terminal_cell_width: i32,
     pub terminal_cell_height: i32,
     pub terminal_display: SharedTerminalDisplayState,
@@ -269,10 +266,10 @@ pub struct RenderFrameModel {
 impl PartialEq for RenderFrameModel {
     fn eq(&self, other: &Self) -> bool {
         self.layout == other.layout
-            && self.cell_number == other.cell_number
-            && self.output_text == other.output_text
-            && self.output_cell_width == other.output_cell_width
-            && self.output_cell_height == other.output_cell_height
+            && self.title == other.title
+            && self.diagnostic_text == other.diagnostic_text
+            && self.diagnostic_cell_width == other.diagnostic_cell_width
+            && self.diagnostic_cell_height == other.diagnostic_cell_height
             && self.terminal_cell_width == other.terminal_cell_width
             && self.terminal_cell_height == other.terminal_cell_height
             && (Arc::ptr_eq(&self.terminal_display, &other.terminal_display)
@@ -284,16 +281,16 @@ impl PartialEq for RenderFrameModel {
 #[derive(Clone, Debug)]
 struct CachedChromeScene {
     layout: TerminalLayout,
-    cell_number: usize,
+    title: Option<String>,
     scene: Arc<RenderScene>,
 }
 
 #[derive(Clone, Debug)]
-struct CachedOutputScene {
+struct CachedDiagnosticScene {
     layout: TerminalLayout,
-    output_text: String,
-    output_cell_width: i32,
-    output_cell_height: i32,
+    diagnostic_text: String,
+    diagnostic_cell_width: i32,
+    diagnostic_cell_height: i32,
     scene: Arc<RenderScene>,
 }
 
@@ -318,8 +315,8 @@ struct RenderThreadSceneCache {
     last_frame: Option<RenderFrameModel>,
     chrome: Option<CachedChromeScene>,
     chrome_vertices: Option<CachedSceneVertices>,
-    output: Option<CachedOutputScene>,
-    output_vertices: Option<CachedSceneVertices>,
+    diagnostic: Option<CachedDiagnosticScene>,
+    diagnostic_vertices: Option<CachedSceneVertices>,
     terminal: Option<CachedTerminalScene>,
     terminal_vertices: Vec<Option<CachedSceneVertices>>,
     composited_vertices: Option<CachedCompositedVertices>,
@@ -821,8 +818,11 @@ impl D3d12PanelRenderer {
             return Ok(());
         }
 
-        let (chrome_scene, chrome_reused) =
-            chrome_scene_fragment(&mut scene_cache.chrome, frame.layout, frame.cell_number);
+        let (chrome_scene, chrome_reused) = chrome_scene_fragment(
+            &mut scene_cache.chrome,
+            frame.layout,
+            frame.title.as_deref(),
+        );
         let (terminal_scenes, terminal_reused) = terminal_scene_fragments(
             &mut scene_cache.terminal,
             frame.layout,
@@ -831,12 +831,12 @@ impl D3d12PanelRenderer {
             frame.terminal_cell_width,
             frame.terminal_cell_height,
         );
-        let (output_scene, output_reused) = output_scene_fragment(
-            &mut scene_cache.output,
+        let (diagnostic_scene, diagnostic_reused) = diagnostic_scene_fragment(
+            &mut scene_cache.diagnostic,
             frame.layout,
-            &frame.output_text,
-            frame.output_cell_width,
-            frame.output_cell_height,
+            &frame.diagnostic_text,
+            frame.diagnostic_cell_width,
+            frame.diagnostic_cell_height,
         );
 
         let glyph_cache_changed = {
@@ -845,7 +845,7 @@ impl D3d12PanelRenderer {
             let mut scenes = Vec::with_capacity(terminal_scenes.len() + 2);
             scenes.push(chrome_scene.as_ref());
             scenes.extend(terminal_scenes.iter().map(Arc::as_ref));
-            scenes.push(output_scene.as_ref());
+            scenes.push(diagnostic_scene.as_ref());
             self.update_slug_curves_for_fragments(&scenes)?
         };
 
@@ -877,13 +877,13 @@ impl D3d12PanelRenderer {
             }
             vertices
         };
-        let output_vertices = {
+        let diagnostic_vertices = {
             #[cfg(feature = "tracy")]
-            let _span = debug_span!("update_output_vertices").entered();
+            let _span = debug_span!("update_diagnostic_vertices").entered();
             self.cached_fragment_vertices(
-                output_scene.as_ref(),
-                output_reused && !glyph_cache_changed,
-                &mut scene_cache.output_vertices,
+                diagnostic_scene.as_ref(),
+                diagnostic_reused && !glyph_cache_changed,
+                &mut scene_cache.diagnostic_vertices,
             )
         };
 
@@ -900,8 +900,8 @@ impl D3d12PanelRenderer {
                     .iter()
                     .map(|reused| *reused && !glyph_cache_changed),
             );
-            fragments.push(output_vertices);
-            fragment_reused.push(output_reused && !glyph_cache_changed);
+            fragments.push(diagnostic_vertices);
+            fragment_reused.push(diagnostic_reused && !glyph_cache_changed);
             self.upload_composited_fragment_vertices(
                 &fragments,
                 &fragment_reused,
@@ -1380,66 +1380,68 @@ struct TerminalScrollbarGeometry {
 fn chrome_scene_fragment(
     cached_chrome_scene: &mut Option<CachedChromeScene>,
     layout: TerminalLayout,
-    cell_number: usize,
+    title: Option<&str>,
 ) -> (Arc<RenderScene>, bool) {
     if let Some(cached) = cached_chrome_scene.as_ref()
         && cached.layout == layout
-        && cached.cell_number == cell_number
+        && cached.title.as_deref() == title
     {
         return (Arc::clone(&cached.scene), true);
     }
 
     let mut scene = build_panel_scene(layout);
-    push_centered_text(
-        &mut scene,
-        layout.drag_handle_rect().to_win32_rect(),
-        &cell_number.to_string(),
-        [0.95, 0.95, 0.98, 1.0],
-    );
+    if let Some(title) = title.filter(|title| !title.is_empty()) {
+        push_centered_text(
+            &mut scene,
+            layout.title_text_rect().to_win32_rect(),
+            title,
+            [0.95, 0.95, 0.98, 1.0],
+        );
+    }
     let scene = Arc::new(scene);
     *cached_chrome_scene = Some(CachedChromeScene {
         layout,
-        cell_number,
+        title: title.map(ToOwned::to_owned),
         scene: Arc::clone(&scene),
     });
     (scene, false)
 }
 
-fn output_scene_fragment(
-    cached_output_scene: &mut Option<CachedOutputScene>,
+fn diagnostic_scene_fragment(
+    cached_diagnostic_scene: &mut Option<CachedDiagnosticScene>,
     layout: TerminalLayout,
-    output_text: &str,
-    output_cell_width: i32,
-    output_cell_height: i32,
+    diagnostic_text: &str,
+    diagnostic_cell_width: i32,
+    diagnostic_cell_height: i32,
 ) -> (Arc<RenderScene>, bool) {
-    if let Some(cached) = cached_output_scene.as_ref()
+    if let Some(cached) = cached_diagnostic_scene.as_ref()
         && cached.layout == layout
-        && cached.output_text == output_text
-        && cached.output_cell_width == output_cell_width
-        && cached.output_cell_height == output_cell_height
+        && cached.diagnostic_text == diagnostic_text
+        && cached.diagnostic_cell_width == diagnostic_cell_width
+        && cached.diagnostic_cell_height == diagnostic_cell_height
     {
         return (Arc::clone(&cached.scene), true);
     }
 
     let mut scene = RenderScene {
         panels: Vec::new(),
-        glyphs: Vec::with_capacity(output_text.chars().count()),
+        glyphs: Vec::with_capacity(diagnostic_text.chars().count()),
         overlay_panels: Vec::new(),
     };
     push_text_block(
         &mut scene,
-        layout.result_panel_rect().inset(14).to_win32_rect(),
-        output_text,
-        output_cell_width,
-        output_cell_height,
+        layout.diagnostic_panel_rect().inset(14).to_win32_rect(),
+        diagnostic_text,
+        diagnostic_cell_width,
+        diagnostic_cell_height,
         [0.96, 0.95, 0.90, 1.0],
     );
     let scene = Arc::new(scene);
-    *cached_output_scene = Some(CachedOutputScene {
+    *cached_diagnostic_scene = Some(CachedDiagnosticScene {
         layout,
-        output_text: output_text.to_owned(),
-        output_cell_width,
-        output_cell_height,
+        diagnostic_text: diagnostic_text.to_owned(),
+        diagnostic_cell_width,
+        diagnostic_cell_height,
         scene: Arc::clone(&scene),
     });
     (scene, false)
@@ -1769,12 +1771,11 @@ fn terminal_cursor_overlay_rects(
 /// behavior[impl window.appearance.code-panel.single-surface]
 pub fn build_panel_scene(layout: TerminalLayout) -> RenderScene {
     let blue = [0.11, 0.44, 0.94, 0.5];
-    let sidecar = [0.55, 0.14, 0.14, 1.0];
-    let drag = [0.42, 0.18, 0.60, 1.0];
-    let code = [0.05, 0.06, 0.08, 1.0];
-    let result = [0.84, 0.44, 0.13, 1.0];
+    let title_bar = [0.42, 0.18, 0.60, 1.0];
+    let terminal_panel = [0.05, 0.06, 0.08, 1.0];
+    let diagnostic_panel = [0.84, 0.44, 0.13, 1.0];
     let button = [0.12, 0.13, 0.17, 1.0];
-    let mut panels = Vec::with_capacity(8);
+    let mut panels = Vec::with_capacity(5);
     panels.push(PanelRect {
         rect: RECT {
             left: 0,
@@ -1786,39 +1787,24 @@ pub fn build_panel_scene(layout: TerminalLayout) -> RenderScene {
         effect: PanelEffect::BlueBackground,
     });
     panels.push(PanelRect {
-        rect: layout.sidecar_rect().to_win32_rect(),
-        color: sidecar,
-        effect: PanelEffect::Sidecar,
+        rect: layout.title_bar_rect().to_win32_rect(),
+        color: title_bar,
+        effect: PanelEffect::TitleBar,
     });
     panels.push(PanelRect {
-        rect: layout.drag_handle_rect().to_win32_rect(),
-        color: drag,
-        effect: PanelEffect::DragHandle,
+        rect: layout.terminal_panel_rect().to_win32_rect(),
+        color: terminal_panel,
+        effect: PanelEffect::TerminalPanel,
     });
     panels.push(PanelRect {
-        rect: layout.code_panel_rect().to_win32_rect(),
-        color: code,
-        effect: PanelEffect::CodePanel,
-    });
-    panels.push(PanelRect {
-        rect: layout.result_panel_rect().to_win32_rect(),
-        color: result,
-        effect: PanelEffect::ResultPanel,
+        rect: layout.diagnostic_panel_rect().to_win32_rect(),
+        color: diagnostic_panel,
+        effect: PanelEffect::DiagnosticPanel,
     });
     panels.push(PanelRect {
         rect: layout.plus_button_rect().to_win32_rect(),
         color: button,
         effect: PanelEffect::PlusButton,
-    });
-    panels.push(PanelRect {
-        rect: layout.sidecar_button_rect(0).to_win32_rect(),
-        color: button,
-        effect: PanelEffect::PlayButton,
-    });
-    panels.push(PanelRect {
-        rect: layout.sidecar_button_rect(1).to_win32_rect(),
-        color: button,
-        effect: PanelEffect::StopButton,
     });
     RenderScene {
         panels,
@@ -2196,16 +2182,16 @@ pub fn render_frame_model_offscreen_image(
     frame: &RenderFrameModel,
 ) -> eyre::Result<ImageBuffer<Rgba<u8>, Vec<u8>>> {
     let mut chrome_cache = None;
-    let mut output_cache = None;
+    let mut diagnostic_cache = None;
     let mut terminal_cache = None;
     let (chrome_scene, _) =
-        chrome_scene_fragment(&mut chrome_cache, frame.layout, frame.cell_number);
-    let (output_scene, _) = output_scene_fragment(
-        &mut output_cache,
+        chrome_scene_fragment(&mut chrome_cache, frame.layout, frame.title.as_deref());
+    let (diagnostic_scene, _) = diagnostic_scene_fragment(
+        &mut diagnostic_cache,
         frame.layout,
-        &frame.output_text,
-        frame.output_cell_width,
-        frame.output_cell_height,
+        &frame.diagnostic_text,
+        frame.diagnostic_cell_width,
+        frame.diagnostic_cell_height,
     );
     let (terminal_fragments, _) = terminal_scene_fragments(
         &mut terminal_cache,
@@ -2230,7 +2216,7 @@ pub fn render_frame_model_offscreen_image(
 
     let mut scenes = Vec::with_capacity(2 + terminal_fragments.len());
     scenes.push(chrome_scene);
-    scenes.push(output_scene);
+    scenes.push(diagnostic_scene);
     scenes.extend(terminal_fragments);
 
     for scene in &scenes {
@@ -4199,13 +4185,13 @@ mod tests {
         };
 
         let scene = build_panel_scene(layout);
-        let code_panel_count = scene
+        let terminal_panel_count = scene
             .panels
             .iter()
-            .filter(|panel| matches!(panel.effect, PanelEffect::CodePanel))
+            .filter(|panel| matches!(panel.effect, PanelEffect::TerminalPanel))
             .count();
 
-        assert_eq!(code_panel_count, 1);
+        assert_eq!(terminal_panel_count, 1);
     }
 
     // behavior[verify window.appearance.backgrounds.blue-half-transparent]
@@ -4231,7 +4217,7 @@ mod tests {
 
     // behavior[verify window.appearance.chrome]
     #[test]
-    fn build_panel_scene_includes_drag_handle_panel() {
+    fn build_panel_scene_includes_title_bar_panel() {
         let layout = TerminalLayout {
             client_width: 1040,
             client_height: 680,
@@ -4240,13 +4226,13 @@ mod tests {
         };
 
         let scene = build_panel_scene(layout);
-        let drag_panel_count = scene
+        let title_panel_count = scene
             .panels
             .iter()
-            .filter(|panel| matches!(panel.effect, PanelEffect::DragHandle))
+            .filter(|panel| matches!(panel.effect, PanelEffect::TitleBar))
             .count();
 
-        assert_eq!(drag_panel_count, 1);
+        assert_eq!(title_panel_count, 1);
     }
 
     // behavior[verify window.appearance.backgrounds.animated-time-based]

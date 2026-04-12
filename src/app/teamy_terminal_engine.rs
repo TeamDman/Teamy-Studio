@@ -327,8 +327,25 @@ impl TeamyTerminalEngine {
 
         if rows != self.rows {
             if rows > self.rows {
-                self.visible_rows
-                    .extend((0..(rows - self.rows)).map(|_| vec![TeamyCell::blank(); self.cols]));
+                let rows_to_add = rows - self.rows;
+                let rows_to_restore = if was_bottom_anchored {
+                    rows_to_add.min(self.scrollback_rows.len())
+                } else {
+                    0
+                };
+
+                if rows_to_restore > 0 {
+                    let split_at = self.scrollback_rows.len().saturating_sub(rows_to_restore);
+                    let mut restored_rows = self.scrollback_rows.split_off(split_at);
+                    self.cursor_row = self.cursor_row.saturating_add(restored_rows.len());
+                    restored_rows.append(&mut self.visible_rows);
+                    self.visible_rows = restored_rows;
+                }
+
+                self.visible_rows.extend(
+                    (0..rows_to_add.saturating_sub(rows_to_restore))
+                        .map(|_| vec![TeamyCell::blank(); self.cols]),
+                );
             } else {
                 let rows_to_scroll = self.cursor_row.saturating_add(1).saturating_sub(rows);
                 for _ in 0..rows_to_scroll {
@@ -767,15 +784,28 @@ impl TeamyTerminalEngine {
                 0 => self.current_style = TeamyCellStyle::default(),
                 7 => self.current_style.inverse = true,
                 27 => self.current_style.inverse = false,
-                30..=37 => self.current_style.foreground = TeamyColor::Indexed((code - 30) as u8),
+                30..=37 => {
+                    self.current_style.foreground = TeamyColor::Indexed(
+                        u8::try_from(code - 30).expect("SGR color index must fit in u8"),
+                    );
+                }
                 39 => self.current_style.foreground = TeamyColor::Default,
-                40..=47 => self.current_style.background = TeamyColor::Indexed((code - 40) as u8),
+                40..=47 => {
+                    self.current_style.background = TeamyColor::Indexed(
+                        u8::try_from(code - 40).expect("SGR color index must fit in u8"),
+                    );
+                }
                 49 => self.current_style.background = TeamyColor::Default,
                 90..=97 => {
-                    self.current_style.foreground = TeamyColor::Indexed((code - 90 + 8) as u8)
+                    self.current_style.foreground = TeamyColor::Indexed(
+                        u8::try_from(code - 90 + 8).expect("bright SGR color index must fit in u8"),
+                    );
                 }
                 100..=107 => {
-                    self.current_style.background = TeamyColor::Indexed((code - 100 + 8) as u8)
+                    self.current_style.background = TeamyColor::Indexed(
+                        u8::try_from(code - 100 + 8)
+                            .expect("bright SGR color index must fit in u8"),
+                    );
                 }
                 38 => {
                     if let Some(color) = parse_extended_sgr_color(&mut fields) {
@@ -1543,24 +1573,13 @@ mod tests {
     #[test]
     fn resize_preserves_bottom_anchor_for_live_viewport() {
         let mut engine = TeamyTerminalEngine::new(6, 2, 8);
-        engine.vt_write(b"one\r\ntwo\r\nthree\r\n");
+        engine.vt_write(b"one\r\ntwo\r\nthree");
+
+        assert_eq!(engine.visible_text(), "two\nthree");
 
         engine.resize(6, 3);
 
-        let display = engine.display_state();
-        assert_eq!(display.rows, 3);
-        assert!(
-            display
-                .visible_rows
-                .iter()
-                .any(|row| { row.glyphs.iter().any(|glyph| glyph.character == 't') })
-        );
-        assert!(
-            display
-                .visible_rows
-                .iter()
-                .any(|row| { row.glyphs.iter().any(|glyph| glyph.character == 'h') })
-        );
+        assert_eq!(engine.visible_text(), "one\ntwo\nthree");
     }
 
     #[test]
@@ -1579,6 +1598,21 @@ mod tests {
         assert_eq!(after_shrink, before);
         assert_eq!(after_restore, before);
         assert_eq!(engine.visible_text(), "~\n>");
+    }
+
+    #[test]
+    fn resize_restore_recovers_multiline_prompt_rows_from_scrollback() {
+        let mut engine = TeamyTerminalEngine::new(8, 2, 16);
+        engine.vt_write(b"prompt\r\n> ");
+
+        assert_eq!(engine.visible_text(), "prompt\n>");
+
+        engine.resize(8, 1);
+        assert_eq!(engine.visible_text(), ">");
+
+        engine.resize(8, 2);
+
+        assert_eq!(engine.visible_text(), "prompt\n>");
     }
 
     #[test]

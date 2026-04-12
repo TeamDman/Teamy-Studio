@@ -7,7 +7,7 @@ use facet::Facet;
 use figue as args;
 
 /// Self-test commands for reproducible diagnostics.
-/// cli[impl command.surface.self-test]
+// cli[impl command.surface.self-test]
 /// tool[impl cli.surface.self-test]
 /// tool[impl cli.help.describes-self-test]
 #[derive(Facet, Arbitrary, Debug, PartialEq)]
@@ -21,16 +21,16 @@ pub struct SelfTestArgs {
 #[derive(Facet, Arbitrary, Debug, PartialEq)]
 #[repr(u8)]
 pub enum SelfTestCommand {
-    /// cli[impl command.surface.self-test-keyboard-input]
+    // cli[impl command.surface.self-test-keyboard-input]
     /// Run the keyboard input self-test harness.
     KeyboardInput(SelfTestKeyboardInputArgs),
-    /// cli[impl command.surface.self-test-terminal-throughput]
+    // cli[impl command.surface.self-test-terminal-throughput]
     /// Run the terminal throughput benchmark.
     TerminalThroughput(SelfTestTerminalThroughputArgs),
-    /// cli[impl command.surface.self-test-terminal-replay]
+    // cli[impl command.surface.self-test-terminal-replay]
     /// Run a headless terminal transcript replay.
     TerminalReplay(SelfTestTerminalReplayArgs),
-    /// cli[impl command.surface.self-test-render-offscreen]
+    // cli[impl command.surface.self-test-render-offscreen]
     /// Run a headless offscreen terminal render self-test.
     RenderOffscreen(SelfTestRenderOffscreenArgs),
 }

@@ -5,37 +5,25 @@ This specification covers the current Teamy Studio command surface, command-spec
 ## Command Surface
 
 cli[command.surface.core]
-Invoking `teamy-studio.exe` with no explicit command must behave like `teamy-studio.exe workspace run` with no explicit workspace target.
+Invoking `teamy-studio.exe` with no explicit command must open a terminal window using the effective default shell command.
 
-cli[command.surface.workspace]
-The CLI must expose a `workspace` command group.
+cli[command.surface.terminal]
+The CLI must expose a `terminal` command group.
 
-cli[command.surface.workspace-list]
-The `workspace` command group must expose a `list` subcommand.
+cli[command.surface.terminal-default-shell]
+The `terminal` command group must expose a `default-shell` subcommand group.
 
-cli[command.surface.workspace-show]
-The `workspace` command group must expose a `show` subcommand.
+cli[command.surface.terminal-default-shell-set]
+The `terminal default-shell` command group must expose a `set` subcommand that persists a shell program plus trailing arguments.
 
-cli[command.surface.workspace-create]
-The `workspace` command group must expose a `create` subcommand with an optional workspace name argument.
+cli[command.surface.terminal-default-shell-show]
+The `terminal default-shell` command group must expose a `show` subcommand that prints the effective default shell command.
 
-cli[command.surface.workspace-run]
-The `workspace` command group must expose a `run` subcommand with an optional workspace id-or-name target.
+cli[command.surface.terminal-open]
+The `terminal` command group must expose an `open` subcommand that opens a new terminal window.
 
-cli[command.surface.shell]
-The CLI must expose a `shell` command group.
-
-cli[shell.inline.launches-configured-default]
-Invoking `teamy-studio.exe shell` with no explicit shell subcommand must launch the effective default shell inline in the current console.
-
-cli[command.surface.shell-default]
-The `shell` command group must expose a `default` subcommand group.
-
-cli[command.surface.shell-default-set]
-The `shell default` command group must expose a `set` subcommand that persists a shell program plus trailing arguments.
-
-cli[command.surface.shell-default-show]
-The `shell default` command group must expose a `show` subcommand that prints the effective default shell command.
+cli[command.surface.terminal-list]
+The `terminal` command group must expose a `list` subcommand.
 
 cli[command.surface.self-test]
 The CLI must expose a `self-test` command group.
@@ -79,48 +67,42 @@ The headless terminal replay self-test must support writing failure artifacts so
 cli[self-test.render-offscreen.artifact-output]
 The headless offscreen render self-test must support writing image artifacts for automated verification and debugging.
 
-cli[command.surface.window]
-The CLI must expose a `window` command group.
-
-cli[command.surface.window-show]
-The `window` command group must expose a `show` subcommand that launches the main application terminal window.
-
-cli[window.show.vt-engine-flag]
-The `window show` command should support a `--vt-engine` flag so the live terminal window can be launched with either the Ghostty-backed engine or the Teamy-owned engine during the migration.
-
-## Workspaces
-
-cli[workspace.list.prints-id-name-cell-count]
-The `workspace list` command must print each workspace with its id, name, and cell count.
-
-cli[workspace.show.bails-when-missing]
-The `workspace show` command must fail when the requested workspace id or exact name does not exist.
-
-cli[workspace.show.prints-id-name-cell-count]
-The `workspace show` command must print the workspace id, name, and cell count for the resolved workspace.
-
-cli[workspace.create.name-optional]
-The `workspace create` command must accept an optional workspace display name.
-
-cli[workspace.run.no-target-creates-workspace]
-The `workspace run` command must create a new workspace when no workspace target is provided.
-
-cli[workspace.run.target-by-id-or-name]
-The `workspace run` command must resolve an existing workspace by exact id or exact name when a target is provided.
-
 ## Shell Defaults
 
 cli[shell.default.persisted-in-app-home]
 The persisted default shell command must be stored as a simple text file under the resolved application home directory.
 
 cli[shell.default.show-effective]
-The `shell default show` command must print the effective default shell command as a single formatted command line.
+The `terminal default-shell show` command must print the effective default shell command as a single formatted command line.
 
 cli[shell.default.fallback.builtin]
 If no persisted default shell command exists, Teamy Studio must fall back to a built-in default shell command.
 
 cli[shell.default.set.double-dash-trailing-args]
-The `shell default set` command must accept dash-prefixed shell arguments after a `--` delimiter so they are treated as trailing shell arguments rather than Teamy Studio CLI flags.
+The `terminal default-shell set` command must accept dash-prefixed shell arguments after a `--` delimiter so they are treated as trailing shell arguments rather than Teamy Studio CLI flags.
+
+## Terminals
+
+cli[terminal.open.program-positional]
+The `terminal open` command must require a positional program argument for the process launched in the new terminal window.
+
+cli[terminal.open.double-dash-trailing-args]
+The `terminal open` command must accept dash-prefixed terminal arguments after a `--` delimiter so they are treated as trailing program arguments rather than Teamy Studio CLI flags.
+
+cli[terminal.open.stdin-flag]
+The `terminal open` command must support `--stdin` so text can be written to the terminal after the window is shown.
+
+cli[terminal.open.title-flag]
+The `terminal open` command must support `--title` so callers can seed the terminal chrome title.
+
+cli[terminal.open.vt-engine-flag]
+The `terminal open` command must support `--vt-engine ghostty|teamy` so callers can choose the terminal backend for the new window.
+
+cli[terminal.list.enumerates-live-windows]
+The `terminal list` command must enumerate live Teamy Studio terminal windows from the operating system rather than from on-disk state.
+
+cli[terminal.list.prints-hwnd-pid-and-title]
+The `terminal list` command must print each live terminal window as `HWND`, `PID`, and title separated by tabs.
 
 ## Parser Model
 
@@ -137,18 +119,3 @@ If `TEAMY_STUDIO_HOME_DIR` is set to a non-empty value, it must take precedence 
 
 cli[path.cache.env-overrides-platform]
 If `TEAMY_STUDIO_CACHE_DIR` is set to a non-empty value, it must take precedence over the platform-derived cache directory.
-
-cli[path.cache.workspace-root-under-workspaces-dir]
-Notebook workspace state under the cache home must live beneath a `workspaces/{workspace-guid}` directory.
-
-cli[path.cache.workspace-name-file]
-The notebook workspace cache layout must store the workspace display name in `workspace_name.txt` at the workspace root.
-
-cli[path.cache.workspace-cell-order-file]
-The notebook workspace cache layout must store cell ordering in `workspace_cell_order.txt` at the workspace root.
-
-cli[path.cache.cell-artifact-layout]
-Each notebook cell cache layout must place cell artifacts beneath `cells/{cell-guid}` and expose `code.ps1`, `inputs.txt`, and `output.xml` paths in that directory.
-
-cli[path.cache.cell-transcript-numbering]
-Per-run notebook cell transcripts must use `run{n}.transcript` naming with a positive run number.

@@ -6,7 +6,6 @@ pub mod cli;
 pub mod logging_init;
 pub mod paths;
 pub mod shell_default;
-pub mod workspace;
 
 use crate::cli::Cli;
 

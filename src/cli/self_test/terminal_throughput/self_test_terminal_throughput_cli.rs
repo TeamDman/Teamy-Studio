@@ -29,21 +29,21 @@ impl From<SelfTestTerminalThroughputMode> for crate::app::TerminalThroughputBenc
 }
 
 /// Run the terminal throughput self-test benchmark.
-/// cli[impl command.surface.self-test-terminal-throughput]
+// cli[impl command.surface.self-test-terminal-throughput]
 #[derive(Facet, Arbitrary, Debug, PartialEq)]
 #[facet(rename_all = "kebab-case")]
 pub struct SelfTestTerminalThroughputArgs {
-    /// cli[impl self-test.terminal-throughput.mode-optional]
+    // cli[impl self-test.terminal-throughput.mode-optional]
     /// Optional benchmark mode to run.
     #[facet(args::positional)]
     pub mode: Option<SelfTestTerminalThroughputMode>,
 
-    /// cli[impl self-test.terminal-throughput.line-count-flag]
+    // cli[impl self-test.terminal-throughput.line-count-flag]
     /// Number of lines to emit through `Out-Host`.
     #[facet(args::named)]
     pub line_count: Option<usize>,
 
-    /// cli[impl self-test.terminal-throughput.samples-flag]
+    // cli[impl self-test.terminal-throughput.samples-flag]
     /// Number of benchmark samples to run before reporting results.
     #[facet(args::named)]
     pub samples: Option<usize>,

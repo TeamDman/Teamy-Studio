@@ -184,3 +184,15 @@ fn test_issue_keyboard_input_teamy_typed_input_scrolls_back_to_caret() {
         "expected Teamy typed-input self-test to succeed\nstdout:\n{stdout}\n\nstderr:\n{stderr}"
     );
 }
+
+#[test]
+fn test_issue_keyboard_input_teamy_noprofile_resize_restores_prompt() {
+    let output = run_named_pwsh_keyboard_self_test("pwsh-noprofile-resize-restores-prompt");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        output.status.success(),
+        "expected Teamy pwsh -NoProfile resize self-test to succeed\nstdout:\n{stdout}\n\nstderr:\n{stderr}"
+    );
+}

@@ -67,17 +67,14 @@ fn test_version_includes_semver_and_git_revision() {
 }
 
 // tool[verify cli.help.describes-behavior]
-// tool[verify cli.help.describes-workspace]
-// tool[verify cli.help.describes-shell]
+// tool[verify cli.help.describes-terminal]
 // tool[verify cli.help.describes-self-test]
 // tool[verify cli.help.describes-argv]
 // tool[verify cli.help.describes-environment]
 // tool[verify cli.global.debug]
 // tool[verify cli.global.log-filter]
 // tool[verify cli.global.log-file]
-// tool[verify cli.surface.workspace]
-// tool[verify cli.surface.window]
-// tool[verify cli.surface.shell]
+// tool[verify cli.surface.terminal]
 // tool[verify cli.surface.self-test]
 #[test]
 fn test_root_help_describes_commands_args_and_environment() {
@@ -86,20 +83,20 @@ fn test_root_help_describes_commands_args_and_environment() {
 
     assert!(output.status.success(), "help command failed:\n{text}");
     assert!(
-        text.contains("workspace"),
-        "missing workspace command in help:\n{text}"
-    );
-    assert!(
-        text.contains("window"),
-        "missing window command in help:\n{text}"
-    );
-    assert!(
-        text.contains("shell"),
-        "missing shell command in help:\n{text}"
+        text.contains("terminal"),
+        "missing terminal command in help:\n{text}"
     );
     assert!(
         text.contains("self-test"),
         "missing self-test command in help:\n{text}"
+    );
+    assert!(
+        !text.contains("\n    workspace\n"),
+        "workspace command should not appear in help:\n{text}"
+    );
+    assert!(
+        !text.contains("\n    window\n"),
+        "window command should not appear in help:\n{text}"
     );
     assert!(text.contains("--debug"), "missing --debug in help:\n{text}");
     assert!(
@@ -125,45 +122,104 @@ fn test_root_help_describes_commands_args_and_environment() {
 }
 
 // tool[verify cli.help.position-independent]
-// cli[verify command.surface.workspace]
-// cli[verify command.surface.workspace-list]
-// cli[verify command.surface.workspace-show]
-// cli[verify command.surface.workspace-create]
-// cli[verify command.surface.workspace-run]
+// cli[verify command.surface.terminal]
+// cli[verify command.surface.terminal-default-shell]
+// cli[verify command.surface.terminal-list]
+// cli[verify command.surface.terminal-open]
 #[test]
-fn test_nested_workspace_help_is_available() {
-    let output = run_teamy_studio(&["workspace", "--help"], &[]);
+fn test_terminal_help_is_available() {
+    let output = run_teamy_studio(&["terminal", "--help"], &[]);
     let text = output_text(&output);
 
-    assert!(output.status.success(), "workspace help failed:\n{text}");
+    assert!(output.status.success(), "terminal help failed:\n{text}");
+    assert!(
+        text.contains("default-shell"),
+        "missing default-shell subcommand in help:\n{text}"
+    );
     assert!(
         text.contains("list"),
         "missing list subcommand in help:\n{text}"
     );
     assert!(
-        text.contains("show"),
-        "missing show subcommand in help:\n{text}"
+        text.contains("open"),
+        "missing open subcommand in help:\n{text}"
     );
     assert!(
-        text.contains("create"),
-        "missing create subcommand in help:\n{text}"
+        !text.contains("attach"),
+        "attach subcommand should not appear in help:\n{text}"
     );
     assert!(
-        text.contains("run"),
-        "missing run subcommand in help:\n{text}"
+        !text.contains("create"),
+        "create subcommand should not appear in help:\n{text}"
+    );
+    assert!(
+        !text.contains("show-window"),
+        "show-window subcommand should not appear in help:\n{text}"
     );
 }
 
-// tool[verify cli.help.position-independent]
-// cli[verify command.surface.shell-default]
-// cli[verify command.surface.shell-default-set]
-// cli[verify command.surface.shell-default-show]
+// cli[verify terminal.open.program-positional]
+// cli[verify terminal.open.double-dash-trailing-args]
+// cli[verify terminal.open.stdin-flag]
+// cli[verify terminal.open.title-flag]
+// cli[verify terminal.open.vt-engine-flag]
 #[test]
-fn test_nested_shell_default_help_is_available() {
-    let output = run_teamy_studio(&["shell", "default", "--help"], &[]);
+fn test_terminal_open_help_is_available() {
+    let output = run_teamy_studio(&["terminal", "open", "--help"], &[]);
     let text = output_text(&output);
 
-    assert!(output.status.success(), "nested shell help failed:\n{text}");
+    assert!(
+        output.status.success(),
+        "terminal open help failed:\n{text}"
+    );
+    assert!(
+        text.contains("Program to launch"),
+        "missing positional program description:\n{text}"
+    );
+    assert!(text.contains("--stdin"), "missing --stdin in help:\n{text}");
+    assert!(text.contains("--title"), "missing --title in help:\n{text}");
+    assert!(
+        text.contains("--vt-engine"),
+        "missing --vt-engine in help:\n{text}"
+    );
+    assert!(
+        text.contains("ghostty"),
+        "missing ghostty choice in help:\n{text}"
+    );
+    assert!(
+        text.contains("teamy"),
+        "missing teamy choice in help:\n{text}"
+    );
+}
+
+// cli[verify terminal.list.enumerates-live-windows]
+// cli[verify terminal.list.prints-hwnd-pid-and-title]
+#[test]
+fn test_terminal_list_help_and_command_succeed() {
+    let help_output = run_teamy_studio(&["terminal", "list", "--help"], &[]);
+    let help_text = output_text(&help_output);
+    assert!(
+        help_output.status.success(),
+        "terminal list help failed:\n{help_text}"
+    );
+
+    let output = run_teamy_studio(&["terminal", "list"], &[]);
+    let text = output_text(&output);
+    assert!(output.status.success(), "terminal list failed:\n{text}");
+}
+
+// cli[verify command.surface.terminal-default-shell]
+// cli[verify command.surface.terminal-default-shell-set]
+// cli[verify command.surface.terminal-default-shell-show]
+#[test]
+fn test_terminal_default_shell_help_is_available() {
+    let output = run_teamy_studio(&["terminal", "default-shell", "--help"], &[]);
+    let text = output_text(&output);
+
+    assert!(
+        output.status.success(),
+        "terminal default-shell help failed:\n{text}"
+    );
     assert!(
         text.contains("set"),
         "missing set subcommand in help:\n{text}"
@@ -174,310 +230,88 @@ fn test_nested_shell_default_help_is_available() {
     );
 }
 
-// tool[verify cli.help.position-independent]
-// cli[verify command.surface.self-test-keyboard-input]
-// cli[verify self-test.keyboard-input.inside-flag]
-// cli[verify self-test.keyboard-input.artifact-output]
-// cli[verify self-test.keyboard-input.vt-engine-flag]
-#[test]
-fn test_keyboard_input_help_shows_inside_flag() {
-    let output = run_teamy_studio(&["self-test", "keyboard-input", "--help"], &[]);
-    let text = output_text(&output);
-
-    assert!(
-        output.status.success(),
-        "keyboard-input help failed:\n{text}"
-    );
-    assert!(
-        text.contains("--inside"),
-        "missing --inside in help:\n{text}"
-    );
-    assert!(
-        text.contains("--artifact-output"),
-        "missing --artifact-output in help:\n{text}"
-    );
-    assert!(
-        text.contains("--vt-engine"),
-        "missing --vt-engine in help:\n{text}"
-    );
-    assert!(
-        text.contains("ghostty"),
-        "missing ghostty choice in help:\n{text}"
-    );
-    assert!(
-        text.contains("teamy"),
-        "missing teamy choice in help:\n{text}"
-    );
-}
-
-// tool[verify cli.help.position-independent]
-// cli[verify command.surface.self-test-terminal-throughput]
-// cli[verify self-test.terminal-throughput.line-count-flag]
-// cli[verify self-test.terminal-throughput.samples-flag]
-#[test]
-fn test_terminal_throughput_help_shows_line_count_flag() {
-    let output = run_teamy_studio(&["self-test", "terminal-throughput", "--help"], &[]);
-    let text = output_text(&output);
-
-    assert!(
-        output.status.success(),
-        "terminal-throughput help failed:\n{text}"
-    );
-    assert!(
-        text.contains("--line-count"),
-        "missing --line-count in help:\n{text}"
-    );
-    assert!(
-        text.contains("--samples"),
-        "missing --samples in help:\n{text}"
-    );
-}
-
-// tool[verify cli.help.position-independent]
-// cli[verify command.surface.self-test-terminal-replay]
-// cli[verify self-test.terminal-replay.artifact-output]
-#[test]
-fn test_terminal_replay_help_shows_fixture_and_artifact_flags() {
-    let output = run_teamy_studio(&["self-test", "terminal-replay", "--help"], &[]);
-    let text = output_text(&output);
-
-    assert!(
-        output.status.success(),
-        "terminal-replay help failed:\n{text}"
-    );
-    assert!(
-        text.contains("--fixture"),
-        "missing --fixture in help:\n{text}"
-    );
-    assert!(
-        text.contains("--artifact-output"),
-        "missing --artifact-output in help:\n{text}"
-    );
-}
-
-// tool[verify cli.help.position-independent]
-// cli[verify command.surface.self-test-render-offscreen]
-// cli[verify self-test.render-offscreen.artifact-output]
-#[test]
-fn test_render_offscreen_help_shows_artifact_flag() {
-    let output = run_teamy_studio(&["self-test", "render-offscreen", "--help"], &[]);
-    let text = output_text(&output);
-
-    assert!(
-        output.status.success(),
-        "render-offscreen help failed:\n{text}"
-    );
-    assert!(
-        text.contains("--artifact-output"),
-        "missing --artifact-output in help:\n{text}"
-    );
-}
-
-// tool[verify cli.help.position-independent]
-// cli[verify command.surface.window-show]
-// cli[verify window.show.vt-engine-flag]
-#[test]
-fn test_window_show_help_shows_vt_engine_flag() {
-    let output = run_teamy_studio(&["window", "show", "--help"], &[]);
-    let text = output_text(&output);
-
-    assert!(output.status.success(), "window show help failed:\n{text}");
-    assert!(
-        text.contains("--vt-engine"),
-        "missing --vt-engine in help:\n{text}"
-    );
-    assert!(
-        text.contains("ghostty"),
-        "missing ghostty choice in help:\n{text}"
-    );
-    assert!(
-        text.contains("teamy"),
-        "missing teamy choice in help:\n{text}"
-    );
-}
-
-// cli[verify command.surface.shell-default-set]
-// cli[verify command.surface.shell-default-show]
-// cli[verify shell.default.persisted-in-app-home]
-// cli[verify shell.default.show-effective]
 // cli[verify shell.default.set.double-dash-trailing-args]
-// cli[verify path.app-home.env-overrides-platform]
+// cli[verify shell.default.show-effective]
+// cli[verify shell.default.persisted-in-app-home]
 #[test]
-fn test_shell_default_set_and_show_roundtrip_with_app_home_override() {
-    let app_home = TempDirGuard::new("teamy-studio-cli-shell-home");
-    let app_home_str = app_home.path().to_string_lossy().into_owned();
+fn test_terminal_default_shell_set_and_show_roundtrip() {
+    let app_home = TempDirGuard::new("teamy-studio-cli-app-home");
+    let app_home_value = app_home.path().to_string_lossy().into_owned();
+    let envs = [("TEAMY_STUDIO_HOME_DIR", app_home_value.as_str())];
 
     let set_output = run_teamy_studio(
-        &["shell", "default", "set", "--", "pwsh.exe", "-NoLogo"],
-        &[("TEAMY_STUDIO_HOME_DIR", &app_home_str)],
-    );
-    let set_text = output_text(&set_output);
-    assert!(
-        set_output.status.success(),
-        "shell default set failed:\n{set_text}"
-    );
-
-    let config_path = app_home.path().join("default-shell.txt");
-    assert!(config_path.exists(), "default shell file was not created");
-
-    let show_output = run_teamy_studio(
-        &["shell", "default", "show"],
-        &[("TEAMY_STUDIO_HOME_DIR", &app_home_str)],
-    );
-    let show_text = output_text(&show_output);
-    assert!(
-        show_output.status.success(),
-        "shell default show failed:\n{show_text}"
-    );
-    assert!(
-        show_text.contains("pwsh.exe -NoLogo"),
-        "unexpected show output:\n{show_text}"
-    );
-}
-
-// cli[verify shell.default.fallback.builtin]
-// os[verify shell.default.fallback.windows-comspec]
-#[test]
-fn test_shell_default_show_uses_builtin_fallback_when_unset() {
-    let app_home = TempDirGuard::new("teamy-studio-cli-shell-fallback");
-    let app_home_str = app_home.path().to_string_lossy().into_owned();
-
-    let output = run_teamy_studio(
-        &["shell", "default", "show"],
         &[
-            ("TEAMY_STUDIO_HOME_DIR", &app_home_str),
-            ("COMSPEC", "fallback-shell.exe"),
+            "terminal",
+            "default-shell",
+            "set",
+            "pwsh",
+            "--",
+            "-NoProfile",
         ],
-    );
-    let text = output_text(&output);
-
-    assert!(output.status.success(), "fallback show failed:\n{text}");
-    assert!(
-        text.contains("fallback-shell.exe /D"),
-        "unexpected fallback output:\n{text}"
-    );
-}
-
-// cli[verify shell.inline.launches-configured-default]
-// cli[verify command.surface.shell]
-#[test]
-fn test_shell_runs_configured_default_inline() {
-    let app_home = TempDirGuard::new("teamy-studio-cli-inline-shell");
-    let app_home_str = app_home.path().to_string_lossy().into_owned();
-
-    let set_output = run_teamy_studio(
-        &["shell", "default", "set", "cmd.exe", "/C", "exit", "0"],
-        &[("TEAMY_STUDIO_HOME_DIR", &app_home_str)],
+        &envs,
     );
     let set_text = output_text(&set_output);
     assert!(
         set_output.status.success(),
-        "inline shell setup failed:\n{set_text}"
+        "terminal default-shell set failed:\n{set_text}"
     );
 
-    let run_output = run_teamy_studio(&["shell"], &[("TEAMY_STUDIO_HOME_DIR", &app_home_str)]);
-    let run_text = output_text(&run_output);
-    assert!(
-        run_output.status.success(),
-        "inline shell failed:\n{run_text}"
-    );
-}
-
-// cli[verify command.surface.workspace-create]
-// cli[verify command.surface.workspace-list]
-// cli[verify command.surface.workspace-show]
-// cli[verify workspace.create.name-optional]
-// cli[verify workspace.list.prints-id-name-cell-count]
-// cli[verify workspace.show.prints-id-name-cell-count]
-// cli[verify path.cache.env-overrides-platform]
-#[test]
-fn test_workspace_create_list_and_show_roundtrip() {
-    let cache_home = TempDirGuard::new("teamy-studio-cli-workspaces");
-    let cache_home_str = cache_home.path().to_string_lossy().into_owned();
-
-    let create_output = run_teamy_studio(
-        &["workspace", "create", "alpha"],
-        &[("TEAMY_STUDIO_CACHE_DIR", &cache_home_str)],
-    );
-    let create_text = output_text(&create_output);
-    assert!(
-        create_output.status.success(),
-        "workspace create failed:\n{create_text}"
-    );
-    assert!(
-        create_text.contains("id: workspace-"),
-        "missing workspace id:\n{create_text}"
-    );
-    assert!(
-        create_text.contains("name: alpha"),
-        "missing workspace name:\n{create_text}"
-    );
-    assert!(
-        create_text.contains("cells: 1"),
-        "missing cell count:\n{create_text}"
-    );
-
-    let id_line = create_text
-        .lines()
-        .find(|line| line.starts_with("id: "))
-        .expect("workspace create output should include an id line");
-    let workspace_id = id_line.trim_start_matches("id: ").trim().to_owned();
-
-    let list_output = run_teamy_studio(
-        &["workspace", "list"],
-        &[("TEAMY_STUDIO_CACHE_DIR", &cache_home_str)],
-    );
-    let list_text = output_text(&list_output);
-    assert!(
-        list_output.status.success(),
-        "workspace list failed:\n{list_text}"
-    );
-    assert!(
-        list_text.contains(&format!("{workspace_id}\talpha\t1")),
-        "unexpected workspace list output:\n{list_text}"
-    );
-
-    let show_output = run_teamy_studio(
-        &["workspace", "show", &workspace_id],
-        &[("TEAMY_STUDIO_CACHE_DIR", &cache_home_str)],
-    );
+    let show_output = run_teamy_studio(&["terminal", "default-shell", "show"], &envs);
     let show_text = output_text(&show_output);
     assert!(
         show_output.status.success(),
-        "workspace show failed:\n{show_text}"
+        "terminal default-shell show failed:\n{show_text}"
     );
     assert!(
-        show_text.contains(&format!("id: {workspace_id}")),
-        "missing shown id:\n{show_text}"
+        show_text.contains("pwsh"),
+        "missing program in show output:\n{show_text}"
     );
     assert!(
-        show_text.contains("name: alpha"),
-        "missing shown name:\n{show_text}"
-    );
-    assert!(
-        show_text.contains("cells: 1"),
-        "missing shown cells:\n{show_text}"
+        show_text.contains("-NoProfile"),
+        "missing trailing argument in show output:\n{show_text}"
     );
 }
 
-// cli[verify workspace.show.bails-when-missing]
 #[test]
-fn test_workspace_show_fails_when_target_is_missing() {
-    let cache_home = TempDirGuard::new("teamy-studio-cli-workspace-missing");
-    let cache_home_str = cache_home.path().to_string_lossy().into_owned();
-
-    let output = run_teamy_studio(
-        &["workspace", "show", "missing-workspace"],
-        &[("TEAMY_STUDIO_CACHE_DIR", &cache_home_str)],
-    );
+fn test_shell_surface_is_removed() {
+    let output = run_teamy_studio(&["shell"], &[]);
     let text = output_text(&output);
 
     assert!(
         !output.status.success(),
-        "workspace show unexpectedly succeeded:\n{text}"
+        "shell invocation unexpectedly succeeded:\n{text}"
     );
     assert!(
-        text.contains("workspace `missing-workspace` not found"),
-        "unexpected missing-workspace error:\n{text}"
+        text.contains("unexpected argument: shell"),
+        "removed shell command should be rejected explicitly:\n{text}"
+    );
+}
+
+// cli[verify command.surface.self-test]
+// cli[verify command.surface.self-test-keyboard-input]
+// cli[verify command.surface.self-test-terminal-throughput]
+// cli[verify command.surface.self-test-terminal-replay]
+// cli[verify command.surface.self-test-render-offscreen]
+#[test]
+fn test_self_test_help_is_available() {
+    let output = run_teamy_studio(&["self-test", "--help"], &[]);
+    let text = output_text(&output);
+
+    assert!(output.status.success(), "self-test help failed:\n{text}");
+    assert!(
+        text.contains("keyboard-input"),
+        "missing keyboard-input subcommand in help:\n{text}"
+    );
+    assert!(
+        text.contains("terminal-throughput"),
+        "missing terminal-throughput subcommand in help:\n{text}"
+    );
+    assert!(
+        text.contains("terminal-replay"),
+        "missing terminal-replay subcommand in help:\n{text}"
+    );
+    assert!(
+        text.contains("render-offscreen"),
+        "missing render-offscreen subcommand in help:\n{text}"
     );
 }

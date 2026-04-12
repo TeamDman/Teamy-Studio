@@ -4,10 +4,10 @@ use facet::Facet;
 use figue as args;
 
 /// Persist the default shell command.
-/// cli[impl command.surface.shell-default-set]
-/// cli[impl shell.default.set.double-dash-trailing-args]
+// cli[impl command.surface.terminal-default-shell-set]
+// cli[impl shell.default.set.double-dash-trailing-args]
 #[derive(Facet, Arbitrary, Debug, PartialEq)]
-pub struct ShellDefaultSetArgs {
+pub struct TerminalDefaultShellSetArgs {
     /// Program to launch as the default shell.
     #[facet(args::positional)]
     pub program: String,
@@ -19,7 +19,7 @@ pub struct ShellDefaultSetArgs {
     pub args: Vec<String>,
 }
 
-impl ShellDefaultSetArgs {
+impl TerminalDefaultShellSetArgs {
     /// # Errors
     ///
     /// This function will return an error if the default shell cannot be saved.

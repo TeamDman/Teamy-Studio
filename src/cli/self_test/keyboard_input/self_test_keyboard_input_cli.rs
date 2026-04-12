@@ -22,26 +22,26 @@ impl From<SelfTestKeyboardInputVtEngine> for crate::app::VtEngineChoice {
 }
 
 /// Run the keyboard input self-test harness.
-/// cli[impl command.surface.self-test-keyboard-input]
+// cli[impl command.surface.self-test-keyboard-input]
 #[derive(Facet, Arbitrary, Debug, PartialEq)]
 #[facet(rename_all = "kebab-case")]
 pub struct SelfTestKeyboardInputArgs {
-    /// cli[impl self-test.keyboard-input.scenario-optional]
+    // cli[impl self-test.keyboard-input.scenario-optional]
     /// Optional reproduction scenario to run from the outer harness.
     #[facet(args::positional)]
     pub scenario: Option<String>,
 
-    /// cli[impl self-test.keyboard-input.inside-flag]
+    // cli[impl self-test.keyboard-input.inside-flag]
     /// Run the terminal-side probe instead of the outer harness.
     #[facet(args::named, default)]
     pub inside: bool,
 
-    /// cli[impl self-test.keyboard-input.artifact-output]
+    // cli[impl self-test.keyboard-input.artifact-output]
     /// Optional artifact output path for the captured transcript.
     #[facet(args::named)]
     pub artifact_output: Option<String>,
 
-    /// cli[impl self-test.keyboard-input.vt-engine-flag]
+    // cli[impl self-test.keyboard-input.vt-engine-flag]
     /// Select which VT engine backs the keyboard-input self-test session.
     #[facet(args::named)]
     pub vt_engine: Option<SelfTestKeyboardInputVtEngine>,

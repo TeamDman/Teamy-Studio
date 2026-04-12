@@ -1,29 +1,24 @@
 pub mod facet_shape;
 pub mod global_args;
 pub mod self_test;
-pub mod shell;
-pub mod window;
-pub mod workspace;
+pub mod terminal;
 
 use crate::cli::global_args::GlobalArgs;
 use crate::cli::self_test::SelfTestArgs;
-use crate::cli::shell::ShellArgs;
-use crate::cli::window::WindowArgs;
-use crate::cli::workspace::WorkspaceArgs;
+use crate::cli::terminal::TerminalArgs;
 use arbitrary::Arbitrary;
 use facet::Facet;
 use figue::FigueBuiltins;
 use figue::{self as args};
 
-/// Teamy Studio launches a workspace window by default and exposes workspace, shell, self-test, and window commands.
+/// Teamy Studio opens a terminal window by default and exposes terminal and self-test commands.
 /// tool[impl cli.help.describes-behavior]
-/// tool[impl cli.help.describes-workspace]
-/// tool[impl cli.help.describes-shell]
+/// tool[impl cli.help.describes-terminal]
 /// tool[impl cli.help.describes-self-test]
 /// tool[impl cli.help.describes-environment]
 /// tool[impl cli.help.describes-argv]
-/// cli[impl parser.args-consistent]
-/// cli[impl parser.roundtrip]
+// cli[impl parser.args-consistent]
+// cli[impl parser.roundtrip]
 ///
 /// Environment variables:
 /// - `TEAMY_STUDIO_HOME_DIR` overrides the resolved application home directory.
@@ -61,35 +56,27 @@ impl Cli {
         let cache_home = crate::paths::CACHE_DIR.clone();
         match self.command {
             Some(command) => command.invoke(&app_home, &cache_home),
-            None => crate::app::run_workspace(&app_home, &cache_home, None),
+            None => crate::app::run(&app_home),
         }
     }
 }
 
 /// Teamy Studio commands.
-/// tool[impl cli.surface.workspace]
-/// tool[impl cli.surface.shell]
+/// tool[impl cli.surface.terminal]
 /// tool[impl cli.surface.self-test]
-/// tool[impl cli.surface.window]
 #[derive(Facet, Arbitrary, Debug, PartialEq)]
 #[repr(u8)]
 pub enum Command {
-    /// cli[impl command.surface.workspace]
-    /// Manage notebook workspaces.
-    Workspace(WorkspaceArgs),
-    /// cli[impl command.surface.shell]
-    /// Launch or configure the default shell.
-    Shell(ShellArgs),
-    /// cli[impl command.surface.self-test]
+    // cli[impl command.surface.terminal]
+    /// Open and enumerate terminal windows.
+    Terminal(TerminalArgs),
+    // cli[impl command.surface.self-test]
     /// Run reproducible self-tests.
     SelfTest(SelfTestArgs),
-    /// cli[impl command.surface.window]
-    /// Launch window-related behaviors.
-    Window(WindowArgs),
 }
 
 impl Command {
-    /// cli[impl command.surface.core]
+    // cli[impl command.surface.core]
     /// # Errors
     ///
     /// This function will return an error if the subcommand fails.
@@ -99,10 +86,8 @@ impl Command {
         cache_home: &crate::paths::CacheHome,
     ) -> eyre::Result<()> {
         match self {
-            Command::Workspace(args) => args.invoke(app_home, cache_home),
-            Command::Shell(args) => args.invoke(app_home, cache_home),
+            Command::Terminal(args) => args.invoke(app_home, cache_home),
             Command::SelfTest(args) => args.invoke(app_home, cache_home),
-            Command::Window(args) => args.invoke(app_home, cache_home),
         }
     }
 }

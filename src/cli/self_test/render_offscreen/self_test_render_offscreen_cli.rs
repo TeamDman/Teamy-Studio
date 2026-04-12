@@ -4,11 +4,11 @@ use figue::{self as args};
 use std::path::Path;
 
 /// Run a headless offscreen terminal render self-test.
-/// cli[impl command.surface.self-test-render-offscreen]
+// cli[impl command.surface.self-test-render-offscreen]
 #[derive(Facet, Arbitrary, Debug, PartialEq)]
 #[facet(rename_all = "kebab-case")]
 pub struct SelfTestRenderOffscreenArgs {
-    /// cli[impl self-test.render-offscreen.artifact-output]
+    // cli[impl self-test.render-offscreen.artifact-output]
     /// Optional artifact output path for the rendered image or report.
     #[facet(args::named)]
     pub artifact_output: Option<String>,
