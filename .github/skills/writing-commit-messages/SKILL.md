@@ -52,7 +52,6 @@ Write commit messages that follow commit style guidelines for the project.
 
 ## Workflow
 
-- If `.jj` is present, use `jj` instead of `git` for all commands.
 - Run a diff to see what changes are present since the last commit.
 - Identify the subsystem from the changed file paths.
 - Identify any referenced issues/PRs from the diff context or
