@@ -107,6 +107,9 @@ The `terminal open` command must support `--title` so callers can seed the termi
 cli[terminal.open.vt-engine-flag]
 The `terminal open` command must support `--vt-engine ghostty|teamy` so callers can choose the terminal backend for the new window.
 
+cli[terminal.open.current-vt-engine-env]
+The `terminal open` command must set `TEAMY_STUDIO_CURRENT_TERMINAL_VT_ENGINE` in the spawned terminal process to `ghostty` or `teamy` for the selected backend.
+
 cli[terminal.list.enumerates-live-windows]
 The `terminal list` command must enumerate live Teamy Studio terminal windows from the operating system rather than from on-disk state.
 

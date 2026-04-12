@@ -814,13 +814,15 @@ impl TerminalSession {
         if let Some(working_dir) = working_dir {
             command.cwd(working_dir);
         }
+        Self::apply_terminal_spawn_environment(&mut command, vt_engine);
         Self::new_with_command(command, vt_engine)
     }
 
     pub fn new_with_command(
-        shell: CommandBuilder,
+        mut shell: CommandBuilder,
         vt_engine: VtEngineChoice,
     ) -> eyre::Result<Self> {
+        Self::apply_terminal_spawn_environment(&mut shell, vt_engine);
         let (request_tx, request_rx) = mpsc::channel();
         let (update_tx, update_rx) = mpsc::channel();
         let (startup_tx, startup_rx) = mpsc::sync_channel(1);
@@ -917,6 +919,13 @@ impl TerminalSession {
             max_input_present_latency_us: 0,
             total_input_present_latency_us: 0,
         })
+    }
+
+    fn apply_terminal_spawn_environment(command: &mut CommandBuilder, vt_engine: VtEngineChoice) {
+        command.env(
+            VtEngineChoice::CURRENT_TERMINAL_VT_ENGINE_ENV_VAR,
+            vt_engine.current_terminal_vt_engine_env_value(),
+        );
     }
 
     pub fn set_wake_window(&mut self, hwnd: HWND) {
@@ -3885,22 +3894,26 @@ mod tests {
         TERMINAL_WORKER_BURST_PUMP_TIME_BUDGET, TERMINAL_WORKER_MEDIUM_PUMP_TIME_BUDGET,
         TERMINAL_WORKER_PUMP_TIME_BUDGET, TerminalDisplayCursorStyle, TerminalDisplayGlyph,
         TerminalDisplayRow, TerminalDisplayState, TerminalLayout, TerminalSelection,
-        TerminalSelectionMode, TerminalTextRow, TerminalViewportMetrics, build_teamy_display_state,
-        dirty_terminal_row_indices, extract_selected_text, map_cursor_style, map_virtual_key,
-        osc_terminator, partial_osc_133_prefix_len, pending_output_display_publish_interval,
-        pending_output_pump_time_budget, pending_output_slice_bytes, resolve_teamy_cell_colors,
-        resolve_terminal_cell_colors, should_close_from_echoed_ctrl_d,
+        TerminalSelectionMode, TerminalSession, TerminalTextRow, TerminalViewportMetrics,
+        build_teamy_display_state, dirty_terminal_row_indices, extract_selected_text,
+        map_cursor_style, map_virtual_key, osc_terminator, partial_osc_133_prefix_len,
+        pending_output_display_publish_interval, pending_output_pump_time_budget,
+        pending_output_slice_bytes, resolve_teamy_cell_colors, resolve_terminal_cell_colors,
+        should_close_from_echoed_ctrl_d,
         should_keep_active_prompt_visible_on_resize, should_mark_prompt_input_written_for_key,
         should_publish_terminal_display_state,
         should_publish_terminal_display_update, should_refresh_semantic_prompt_tracking,
         should_translate_ctrl_d_key, should_translate_ctrl_d_to_exit, should_translate_ctrl_l_key,
         should_translate_ctrl_l_to_form_feed, strip_echoed_ctrl_d, viewport_is_bottom_anchored,
     };
+    use crate::app::VtEngineChoice;
     use crate::app::spatial::TerminalCellPoint;
     use crate::app::teamy_terminal_engine::{TeamyColor, TeamyTerminalEngine};
     use libghostty_vt::key;
     use libghostty_vt::render::Colors;
     use libghostty_vt::style::RgbColor;
+    use portable_pty::CommandBuilder;
+    use std::ffi::OsStr;
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -3958,6 +3971,30 @@ mod tests {
         assert!(scrollbar.height() >= 0);
         assert!(diagnostic.top() <= diagnostic.bottom());
         assert!(plus.top() <= plus.bottom());
+    }
+
+    // cli[verify terminal.open.current-vt-engine-env]
+    #[test]
+    fn terminal_spawn_environment_sets_current_vt_engine_env_var() {
+        let mut ghostty_command = CommandBuilder::new("cmd.exe");
+        TerminalSession::apply_terminal_spawn_environment(
+            &mut ghostty_command,
+            VtEngineChoice::Ghostty,
+        );
+        assert_eq!(
+            ghostty_command.get_env(VtEngineChoice::CURRENT_TERMINAL_VT_ENGINE_ENV_VAR),
+            Some(OsStr::new("ghostty"))
+        );
+
+        let mut teamy_command = CommandBuilder::new("cmd.exe");
+        TerminalSession::apply_terminal_spawn_environment(
+            &mut teamy_command,
+            VtEngineChoice::Teamy,
+        );
+        assert_eq!(
+            teamy_command.get_env(VtEngineChoice::CURRENT_TERMINAL_VT_ENGINE_ENV_VAR),
+            Some(OsStr::new("teamy"))
+        );
     }
 
     #[test]

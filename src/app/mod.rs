@@ -37,6 +37,19 @@ pub enum VtEngineChoice {
     Teamy,
 }
 
+impl VtEngineChoice {
+    pub const CURRENT_TERMINAL_VT_ENGINE_ENV_VAR: &str =
+        "TEAMY_STUDIO_CURRENT_TERMINAL_VT_ENGINE";
+
+    #[must_use]
+    pub const fn current_terminal_vt_engine_env_value(self) -> &'static str {
+        match self {
+            Self::Ghostty => "ghostty",
+            Self::Teamy => "teamy",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Facet, PartialEq, Eq)]
 pub struct TerminalWindowSummary {
     pub hwnd: usize,
@@ -77,6 +90,7 @@ pub fn run_with_vt_engine(app_home: &AppHome, vt_engine: VtEngineChoice) -> eyre
 // cli[impl terminal.open.stdin-flag]
 // cli[impl terminal.open.title-flag]
 // cli[impl terminal.open.vt-engine-flag]
+// cli[impl terminal.open.current-vt-engine-env]
 ///
 /// # Errors
 ///
