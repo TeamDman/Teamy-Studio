@@ -918,7 +918,7 @@ impl D3d12PanelRenderer {
         }
 
         if let Some(scene) = frame.scene.as_ref() {
-            let glyph_cache_changed = {
+            let _glyph_cache_changed = {
                 #[cfg(feature = "tracy")]
                 let _span = debug_span!("update_slug_curves").entered();
                 self.update_slug_curves_for_fragments(&[scene])?
@@ -926,11 +926,7 @@ impl D3d12PanelRenderer {
             let scene_vertices = {
                 #[cfg(feature = "tracy")]
                 let _span = debug_span!("update_scene_vertices").entered();
-                self.cached_fragment_vertices(
-                    scene,
-                    !glyph_cache_changed,
-                    &mut scene_cache.scene_vertices,
-                )
+                self.cached_fragment_vertices(scene, false, &mut scene_cache.scene_vertices)
             };
             let vertex_count = self.upload_cached_fragment_vertices(&[scene_vertices])?;
             scene_cache.last_frame = Some(frame.clone());
@@ -4627,6 +4623,20 @@ mod tests {
 
         assert!(can_reuse_cached_scene_vertices(
             true,
+            Some(&cached_vertices),
+            4,
+        ));
+    }
+
+    #[test]
+    fn cached_scene_vertices_are_not_reused_when_callers_disable_reuse() {
+        let cached_vertices = CachedSceneVertices {
+            glyph_cache_generation: 4,
+            vertices: Vec::new(),
+        };
+
+        assert!(!can_reuse_cached_scene_vertices(
+            false,
             Some(&cached_vertices),
             4,
         ));
