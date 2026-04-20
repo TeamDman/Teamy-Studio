@@ -6,6 +6,7 @@ use windows::Win32::Foundation::RECT;
 const DEFAULT_TEXT_COLOR: [f32; 4] = [0.96, 0.95, 0.90, 1.0];
 const DEFAULT_SELECTION_FOREGROUND: [f32; 4] = [0.06, 0.07, 0.09, 1.0];
 const DEFAULT_SELECTION_BACKGROUND: [f32; 4] = [0.42, 0.67, 0.98, 1.0];
+const TAB_STOP_COLUMNS: usize = 8;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct TextGridRows {
@@ -191,22 +192,21 @@ fn layout_text_grid_rows(
     let mut rows = vec![Vec::new()];
     for character in text.chars() {
         if character == '\n' {
-            if rows.len() >= max_rows {
+            if !push_text_grid_newline(&mut rows, max_rows) {
                 break;
             }
-            rows.push(Vec::new());
             continue;
         }
 
-        if rows.last().is_some_and(|row| row.len() >= cols) {
-            if rows.len() >= max_rows {
+        if character == '\t' {
+            if !push_text_grid_tab(&mut rows, cols, max_rows) {
                 break;
             }
-            rows.push(Vec::new());
+            continue;
         }
 
-        if let Some(current_row) = rows.last_mut() {
-            current_row.push(character);
+        if !push_text_grid_character(&mut rows, cols, max_rows, character) {
+            break;
         }
     }
 
@@ -215,6 +215,47 @@ fn layout_text_grid_rows(
     }
 
     TextGridRows { rows, cols }
+}
+
+fn push_text_grid_newline(rows: &mut Vec<Vec<char>>, max_rows: usize) -> bool {
+    if rows.len() >= max_rows {
+        return false;
+    }
+
+    rows.push(Vec::new());
+    true
+}
+
+fn push_text_grid_tab(rows: &mut Vec<Vec<char>>, cols: usize, max_rows: usize) -> bool {
+    let current_col = rows.last().map_or(0, Vec::len);
+    let next_tab_stop = ((current_col / TAB_STOP_COLUMNS) + 1) * TAB_STOP_COLUMNS;
+    let spaces_to_insert = next_tab_stop.saturating_sub(current_col).max(1);
+
+    for _ in 0..spaces_to_insert {
+        if !push_text_grid_character(rows, cols, max_rows, ' ') {
+            return false;
+        }
+    }
+
+    true
+}
+
+fn push_text_grid_character(
+    rows: &mut Vec<Vec<char>>,
+    cols: usize,
+    max_rows: usize,
+    character: char,
+) -> bool {
+    if rows.last().is_some_and(|row| row.len() >= cols) && !push_text_grid_newline(rows, max_rows) {
+        return false;
+    }
+
+    if let Some(current_row) = rows.last_mut() {
+        current_row.push(character);
+        return true;
+    }
+
+    false
 }
 
 fn selection_row_width(selection: Option<TerminalSelection>, row: i32, cols: usize) -> usize {
@@ -262,6 +303,49 @@ mod tests {
     }
 
     #[test]
+    fn expands_tabs_to_eight_column_stops() {
+        let rows = layout_text_grid_rows("a\tb", 96, 32, 8, 16);
+
+        assert_eq!(rows.rows.len(), 1);
+        assert_eq!(rows.rows[0].iter().collect::<String>(), "a       b");
+    }
+
+    #[test]
+    fn expands_tabs_in_scene_diagnostic_reproduction() {
+        let rows = layout_text_grid_rows(
+            "window\tTeamy Studio\nbell-source\tWindows\n\nactions\n- Terminal\tavailable\n- Storage\tavailable\n- Audio\tavailable",
+            480,
+            160,
+            8,
+            16,
+        );
+
+        assert_eq!(
+            rows.rows[0].iter().collect::<String>(),
+            "window  Teamy Studio"
+        );
+        assert_eq!(
+            rows.rows[1].iter().collect::<String>(),
+            "bell-source     Windows"
+        );
+        assert_eq!(
+            rows.rows[4].iter().collect::<String>(),
+            "- Terminal      available"
+        );
+        assert_eq!(
+            rows.rows[5].iter().collect::<String>(),
+            "- Storage       available"
+        );
+        assert_eq!(rows.rows[6].iter().collect::<String>(), "- Audio available");
+        assert!(
+            rows.rows
+                .iter()
+                .flatten()
+                .all(|character| *character != '\t')
+        );
+    }
+
+    #[test]
     fn extracts_linear_selection_across_wrapped_rows() {
         let selection = TerminalSelection::new(
             TerminalCellPoint::new(2, 0),
@@ -273,6 +357,20 @@ mod tests {
             extract_selected_text(ClientRect::new(0, 0, 32, 48), "abcdef", 8, 16, selection);
 
         assert_eq!(extracted, "cd\nef");
+    }
+
+    #[test]
+    fn extracts_tabbed_selection_as_rendered_spaces() {
+        let selection = TerminalSelection::new(
+            TerminalCellPoint::new(0, 0),
+            TerminalCellPoint::new(8, 0),
+            TerminalSelectionMode::Linear,
+        );
+
+        let extracted =
+            extract_selected_text(ClientRect::new(0, 0, 96, 16), "a\tb", 8, 16, selection);
+
+        assert_eq!(extracted, "a       b");
     }
 
     #[test]
