@@ -38,6 +38,7 @@ facet-json = "0.44.1"
 facet-pretty = "0.44.1"
 figue = { package = "teamy-figue", version = "2.0.1", features = ["arbitrary"] }
 open = "5"
+rfd = "0.15"
 crossterm = "0.29"
 fontdb = "0.23"
 libghostty-vt = { git = "https://github.com/TeamDman/libghostty-rs.git", rev = "5e5351c9dc4b800202721ce15017c929958f685d" }
@@ -58,6 +59,7 @@ features = [
 	"Win32_Graphics_Dxgi",
 	"Win32_Graphics_Dxgi_Common",
 	"Win32_Graphics_Gdi",
+	"Win32_Media_Audio",
 	"Win32_System_Com",
 	"Win32_System_Console",
 	"Win32_System_Diagnostics_Debug",

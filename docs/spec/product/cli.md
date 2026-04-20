@@ -5,7 +5,7 @@ This specification covers the current Teamy Studio command surface, command-spec
 ## Command Surface
 
 cli[command.surface.core]
-Invoking `teamy-studio.exe` with no explicit command must open a terminal window using the effective default shell command.
+Invoking `teamy-studio.exe` with no explicit command must open the launcher window.
 
 cli[command.surface.terminal]
 The CLI must expose a `terminal` command group.

@@ -674,11 +674,16 @@ pub struct TerminalLayout {
     pub client_height: i32,
     pub cell_width: i32,
     pub cell_height: i32,
+    pub diagnostic_panel_visible: bool,
 }
 
 impl TerminalLayout {
     #[must_use]
     fn has_room_for_diagnostic_panel(self) -> bool {
+        if !self.diagnostic_panel_visible {
+            return false;
+        }
+
         self.frame_rect().height()
             >= DRAG_STRIP_HEIGHT
                 + MIN_TERMINAL_PANEL_HEIGHT
@@ -715,7 +720,7 @@ impl TerminalLayout {
     #[must_use]
     pub fn title_text_rect(self) -> ClientRect {
         let title_bar = self.title_bar_rect();
-        let plus = self.plus_button_rect();
+        let plus = self.diagnostics_button_rect();
         ClientRect::new(
             title_bar.left() + 18,
             title_bar.top(),
@@ -767,11 +772,16 @@ impl TerminalLayout {
     }
 
     #[must_use]
-    pub fn plus_button_rect(self) -> ClientRect {
+    pub fn diagnostics_button_rect(self) -> ClientRect {
         let title_bar = self.title_bar_rect();
         let top = title_bar.top() + ((title_bar.height() - PLUS_BUTTON_SIZE).max(0) / 2);
         let left = (title_bar.right() - PLUS_BUTTON_SIZE - 10).max(title_bar.left());
         ClientRect::new(left, top, left + PLUS_BUTTON_SIZE, top + PLUS_BUTTON_SIZE)
+    }
+
+    #[must_use]
+    pub fn plus_button_rect(self) -> ClientRect {
+        self.diagnostics_button_rect()
     }
 
     #[must_use]
@@ -4065,6 +4075,7 @@ mod tests {
             client_height: 680,
             cell_width: 8,
             cell_height: 16,
+            diagnostic_panel_visible: true,
         };
 
         let title = layout.title_bar_rect();
@@ -4096,6 +4107,7 @@ mod tests {
             client_height: 140,
             cell_width: 8,
             cell_height: 16,
+            diagnostic_panel_visible: true,
         };
 
         let terminal_panel = layout.terminal_panel_rect();
@@ -4144,6 +4156,7 @@ mod tests {
             client_height: 680,
             cell_width: 8,
             cell_height: 16,
+            diagnostic_panel_visible: true,
         };
 
         let (visible_cols, visible_rows) = layout.visible_grid_size();
@@ -4520,6 +4533,7 @@ mod tests {
             client_height: 680,
             cell_width: 8,
             cell_height: 16,
+            diagnostic_panel_visible: true,
         };
 
         let drag = layout.drag_handle_rect();

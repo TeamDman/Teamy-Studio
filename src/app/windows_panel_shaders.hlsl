@@ -23,12 +23,14 @@ struct PsInput {
 
 Buffer<float4> CurveData : register(t0);
 Buffer<uint> BandData : register(t1);
+Buffer<uint> SpriteAtlasData : register(t2);
 
 cbuffer ParamStruct : register(b0)
 {
     float4 slug_matrix[4];
     float4 slug_viewport;
     float4 scene_time;
+    float4 sprite_atlas;
 };
 
 static const float PANEL_BORDER_WIDTH_PX = 14.0;
@@ -120,6 +122,32 @@ float icon_stop(float2 uv) {
 float icon_play(float2 uv) {
     float2 p = uv;
     return triangle_mask(p, float2(0.30, 0.22), float2(0.74, 0.50), float2(0.30, 0.78), 0.015);
+}
+
+float icon_diagnostics(float2 uv) {
+    float2 p = (uv - 0.5) * 2.0;
+    float line1 = sdBox(p - float2(0.0, -0.34), float2(0.48, 0.08));
+    float line2 = sdBox(p, float2(0.48, 0.08));
+    float line3 = sdBox(p - float2(0.0, 0.34), float2(0.48, 0.08));
+    float distance_field = min(line1, min(line2, line3));
+    return 1.0 - smoothstep(0.02, 0.08, distance_field);
+}
+
+float4 unpack_rgba8(uint packed) {
+    float r = (packed & 0xFFU) / 255.0;
+    float g = ((packed >> 8U) & 0xFFU) / 255.0;
+    float b = ((packed >> 16U) & 0xFFU) / 255.0;
+    float a = ((packed >> 24U) & 0xFFU) / 255.0;
+    return float4(r, g, b, a);
+}
+
+float4 sample_sprite_atlas(float2 uv) {
+    uint atlas_width = max((uint)sprite_atlas.x, 1U);
+    uint atlas_height = max((uint)sprite_atlas.y, 1U);
+    uint x = min((uint)round(saturate(uv.x) * (atlas_width - 1U)), atlas_width - 1U);
+    uint y = min((uint)round(saturate(uv.y) * (atlas_height - 1U)), atlas_height - 1U);
+    uint index = y * atlas_width + x;
+    return unpack_rgba8(SpriteAtlasData[index]);
 }
 
 uint CalcRootCode(float y1, float y2, float y3) {
@@ -366,10 +394,34 @@ float4 apply_button(float2 uv, float4 color, float effect) {
     } else if (effect < 6.5) {
         mask = icon_stop(uv);
     } else {
-        mask = icon_plus(uv);
+        mask = icon_diagnostics(uv);
     }
     shaded.rgb = lerp(shaded.rgb, float3(0.94, 0.95, 0.98), mask);
     return shaded;
+}
+
+float4 apply_scene_button_card(float2 uv, float4 color, float4 state) {
+    float t = PanelTime();
+    float near = state.x;
+    float hover = state.y;
+    float pressed = state.z;
+    float click = state.w;
+    float center = 1.0 - smoothstep(0.0, 0.78, distance(uv, float2(0.5, 0.44)));
+    float rim = 1.0 - smoothstep(0.18, 0.5, abs(uv.y - 0.08));
+    float sweep = 0.5 + (0.5 * sin((uv.x * 14.0) - (t * (1.2 + hover))));
+    float shimmer = 0.5 + (0.5 * sin((uv.y * 22.0) + (t * 1.8)));
+    float pulse = click * (0.5 + (0.5 * sin(((uv.x + uv.y) * 18.0) - (t * 4.2))));
+    float intensity = 0.88 + (near * 0.06) + (hover * 0.10) + (center * (0.08 + (0.07 * hover))) + (sweep * 0.05) + (shimmer * 0.03) + (pulse * 0.16) - (pressed * 0.10);
+    float3 tint = color.rgb * lerp(float3(0.86, 0.90, 0.96), float3(1.04, 1.05, 1.08), hover + (click * 0.35));
+    float top_glow = rim * (0.08 + (0.12 * hover) + (0.10 * click));
+    return float4(tint * (intensity + top_glow), color.a);
+}
+
+float4 apply_scene_body(float2 uv, float4 color) {
+    float t = PanelTime();
+    float wash = 0.92 + (0.05 * sin((uv.x * 4.0) + (t * 0.55))) + (0.04 * sin((uv.y * 7.0) - (t * 0.42)));
+    float grain = 0.98 + (0.03 * sin((uv.x * 36.0) + (uv.y * 20.0) + (t * 0.9)));
+    return float4(color.rgb * wash * grain, color.a);
 }
 
 float4 apply_terminal_scrollbar_track(float2 uv, float4 color) {
@@ -398,9 +450,14 @@ float4 apply_terminal_scrollbar_thumb(float2 uv, float4 color) {
 }
 
 float4 PSMain(PsInput input) : SV_TARGET {
-    if (input.effect > 11.5) {
+    if (input.effect > 11.5 && input.effect < 12.5) {
         float coverage = slug_coverage(input.uv, input.glyph, input.glyphData, input.banding);
         return float4(input.color.rgb, input.color.a * coverage);
+    }
+
+    if (input.effect > 12.5 && input.effect < 13.5) {
+        float4 sprite = sample_sprite_atlas(input.uv);
+        return float4(sprite.rgb * input.color.rgb, sprite.a * input.color.a);
     }
 
     if (input.effect > 7.5 && input.effect < 9.5) {
@@ -408,7 +465,11 @@ float4 PSMain(PsInput input) : SV_TARGET {
     }
 
     float4 shaded = input.color;
-    if (input.effect > 10.5) {
+    if (input.effect > 14.5) {
+        shaded = apply_scene_body(input.uv, input.color);
+    } else if (input.effect > 13.5) {
+        shaded = apply_scene_button_card(input.uv, input.color, input.glyphData);
+    } else if (input.effect > 10.5) {
         shaded = apply_terminal_scrollbar_thumb(input.uv, input.color);
     } else if (input.effect > 9.5) {
         shaded = apply_terminal_scrollbar_track(input.uv, input.color);

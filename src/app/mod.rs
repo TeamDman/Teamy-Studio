@@ -1,9 +1,11 @@
+mod cell_grid;
 mod spatial;
 pub mod teamy_terminal_engine;
 mod windows_app;
 mod windows_audio;
 mod windows_d3d12_renderer;
 mod windows_dialogs;
+mod windows_scene;
 mod windows_terminal;
 mod windows_terminal_engine;
 mod windows_terminal_replay;
@@ -73,7 +75,7 @@ pub struct RenderOffscreenSelfTestReport {
 ///
 /// This function will return an error if the platform-specific window cannot be launched.
 pub fn run(app_home: &AppHome) -> eyre::Result<()> {
-    open_terminal_window_with_vt_engine(app_home, None, None, None, Default::default())
+    windows_app::run_launcher(app_home, Default::default())
 }
 
 /// Run the Teamy Studio application shell with an explicit VT engine.
@@ -82,7 +84,7 @@ pub fn run(app_home: &AppHome) -> eyre::Result<()> {
 ///
 /// This function will return an error if the platform-specific window cannot be launched.
 pub fn run_with_vt_engine(app_home: &AppHome, vt_engine: VtEngineChoice) -> eyre::Result<()> {
-    open_terminal_window_with_vt_engine(app_home, None, None, None, vt_engine)
+    windows_app::run_launcher(app_home, vt_engine)
 }
 
 /// Open a terminal window from an explicit command argv.
@@ -230,6 +232,7 @@ fn build_offscreen_render_self_test_frame() -> windows_d3d12_renderer::RenderFra
         client_height: 680,
         cell_width: 8,
         cell_height: 16,
+        diagnostic_panel_visible: true,
     };
     let terminal_display = Arc::new(windows_terminal::TerminalDisplayState {
         rows: vec![
@@ -253,8 +256,11 @@ fn build_offscreen_render_self_test_frame() -> windows_d3d12_renderer::RenderFra
         layout,
         title: Some("self-test".to_owned()),
         diagnostic_text: "offscreen render self-test".to_owned(),
+        diagnostic_selection: None,
+        diagnostics_button_state: windows_d3d12_renderer::ButtonVisualState::default(),
         diagnostic_cell_width: 8,
         diagnostic_cell_height: 16,
+        scene: None,
         terminal_cell_width: 8,
         terminal_cell_height: 16,
         terminal_display,

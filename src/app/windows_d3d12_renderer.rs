@@ -32,7 +32,8 @@ use std::time::Instant;
 // os[impl os.windows.rendering.direct3d12]
 use eyre::Context;
 use fontdb::{Database, Family, Query, Source};
-use image::{ImageBuffer, Rgba};
+use image::imageops::{FilterType, resize};
+use image::{ImageBuffer, Rgba, RgbaImage};
 #[cfg(feature = "tracy")]
 use tracing::debug_span;
 use tracing::{info, info_span, instrument, warn};
@@ -51,16 +52,18 @@ use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObj
 use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
 use windows::core::{Error, HSTRING, Interface, Owned, PCSTR, s};
 
+use super::cell_grid;
 use super::spatial::{ClientRect, TerminalCellPoint};
 use super::windows_terminal::{
     SharedTerminalDisplayState, TerminalDisplayCursor, TerminalDisplayCursorStyle,
-    TerminalDisplayRow, TerminalDisplayScrollbar, TerminalLayout,
+    TerminalDisplayRow, TerminalDisplayScrollbar, TerminalLayout, TerminalSelection,
 };
 
 const FRAME_COUNT: usize = 2;
 const MAX_PANEL_COUNT: usize = 8_192;
 const MAX_GLYPH_COUNT: usize = 8_192;
-const MAX_VERTEX_COUNT: usize = (MAX_PANEL_COUNT + MAX_GLYPH_COUNT) * 6;
+const MAX_SPRITE_COUNT: usize = 256;
+const MAX_VERTEX_COUNT: usize = (MAX_PANEL_COUNT + MAX_GLYPH_COUNT + MAX_SPRITE_COUNT) * 6;
 const FALLBACK_GLYPH: char = '?';
 const MAX_CURVE_FLOAT4_COUNT: usize = 65_536;
 const MAX_BAND_UINT_COUNT: usize = 262_144;
@@ -68,6 +71,8 @@ const TERMINAL_FONT_FAMILY: &str = "CaskaydiaCove Nerd Font Mono";
 const SLUG_GLYPH_DILATION_PX: f32 = 0.5;
 const SLUG_BAND_SIZE_FONT_UNITS: f32 = 64.0;
 const TEAMY_D3D12_GPU_VALIDATION_ENV: &str = "TEAMY_D3D12_GPU_VALIDATION";
+const SPRITE_SLOT_SIZE: u32 = 320;
+const SPRITE_TARGET_SIZE: u32 = 256;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -90,6 +95,40 @@ struct ShaderParams {
     slug_matrix: [[f32; 4]; 4],
     slug_viewport: [f32; 4],
     scene_time: [f32; 4],
+    sprite_atlas: [f32; 4],
+}
+
+#[derive(Clone, Copy, Debug)]
+struct AtlasSprite {
+    uv_left: f32,
+    uv_top: f32,
+    uv_right: f32,
+    uv_bottom: f32,
+}
+
+#[derive(Clone, Debug)]
+struct SpriteAtlas {
+    width: u32,
+    height: u32,
+    pixels: Vec<u32>,
+    terminal: AtlasSprite,
+    storage: AtlasSprite,
+    audio: AtlasSprite,
+    windows_audio: AtlasSprite,
+    file_audio: AtlasSprite,
+}
+
+impl SpriteAtlas {
+    fn uv_rect(&self, sprite: SpriteId) -> [f32; 4] {
+        let rect = match sprite {
+            SpriteId::Terminal => self.terminal,
+            SpriteId::Storage => self.storage,
+            SpriteId::Audio => self.audio,
+            SpriteId::WindowsAudio => self.windows_audio,
+            SpriteId::FileAudio => self.file_audio,
+        };
+        [rect.uv_left, rect.uv_top, rect.uv_right, rect.uv_bottom]
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -150,38 +189,80 @@ struct CurveExtents {
     max_y: f32,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PanelEffect {
     BlueBackground = 0,
     TitleBar = 2,
     TerminalPanel = 3,
     DiagnosticPanel = 4,
-    PlusButton = 7,
+    DiagnosticsButton = 7,
     TerminalFill = 8,
     TerminalCursor = 9,
     TerminalScrollbarTrack = 10,
     TerminalScrollbarThumb = 11,
     Text = 12,
+    SpriteImage = 13,
+    SceneButtonCard = 14,
+    SceneBody = 15,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PanelRect {
     pub rect: RECT,
     pub color: [f32; 4],
     pub effect: PanelEffect,
+    pub data: [f32; 4],
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct GlyphQuad {
     pub rect: RECT,
     pub color: [f32; 4],
     pub character: char,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SpriteId {
+    Terminal,
+    Storage,
+    Audio,
+    WindowsAudio,
+    FileAudio,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SpriteQuad {
+    pub rect: RECT,
+    pub color: [f32; 4],
+    pub sprite: SpriteId,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ButtonVisualState {
+    pub hover_near: f32,
+    pub hovered: bool,
+    pub pressed: bool,
+    pub click_decay: f32,
+    pub active: bool,
+}
+
+impl ButtonVisualState {
+    #[must_use]
+    pub fn shader_data(self) -> [f32; 4] {
+        [
+            self.hover_near.clamp(0.0, 1.0),
+            if self.hovered { 1.0 } else { 0.0 },
+            if self.pressed { 1.0 } else { 0.0 },
+            self.click_decay.clamp(0.0, 1.0),
+        ]
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct RenderScene {
     pub panels: Vec<PanelRect>,
     pub glyphs: Vec<GlyphQuad>,
+    pub sprites: Vec<SpriteQuad>,
     pub overlay_panels: Vec<PanelRect>,
 }
 
@@ -210,6 +291,8 @@ pub struct D3d12PanelRenderer {
     srv_heap: ID3D12DescriptorHeap,
     curve_buffer: ID3D12Resource,
     band_buffer: ID3D12Resource,
+    _sprite_buffer: ID3D12Resource,
+    sprite_atlas: SpriteAtlas,
     font: LoadedTerminalFont,
     glyph_cache: HashMap<char, SlugGlyph>,
     cached_chars: Vec<char>,
@@ -255,8 +338,11 @@ pub struct RenderFrameModel {
     pub layout: TerminalLayout,
     pub title: Option<String>,
     pub diagnostic_text: String,
+    pub diagnostic_selection: Option<TerminalSelection>,
+    pub diagnostics_button_state: ButtonVisualState,
     pub diagnostic_cell_width: i32,
     pub diagnostic_cell_height: i32,
+    pub scene: Option<RenderScene>,
     pub terminal_cell_width: i32,
     pub terminal_cell_height: i32,
     pub terminal_display: SharedTerminalDisplayState,
@@ -267,7 +353,10 @@ impl PartialEq for RenderFrameModel {
     fn eq(&self, other: &Self) -> bool {
         self.layout == other.layout
             && self.title == other.title
+            && self.scene == other.scene
             && self.diagnostic_text == other.diagnostic_text
+            && self.diagnostic_selection == other.diagnostic_selection
+            && self.diagnostics_button_state == other.diagnostics_button_state
             && self.diagnostic_cell_width == other.diagnostic_cell_width
             && self.diagnostic_cell_height == other.diagnostic_cell_height
             && self.terminal_cell_width == other.terminal_cell_width
@@ -282,6 +371,7 @@ impl PartialEq for RenderFrameModel {
 struct CachedChromeScene {
     layout: TerminalLayout,
     title: Option<String>,
+    diagnostics_button_state: ButtonVisualState,
     scene: Arc<RenderScene>,
 }
 
@@ -289,6 +379,7 @@ struct CachedChromeScene {
 struct CachedDiagnosticScene {
     layout: TerminalLayout,
     diagnostic_text: String,
+    diagnostic_selection: Option<TerminalSelection>,
     diagnostic_cell_width: i32,
     diagnostic_cell_height: i32,
     scene: Arc<RenderScene>,
@@ -313,6 +404,7 @@ struct CachedTerminalScene {
 #[derive(Default)]
 struct RenderThreadSceneCache {
     last_frame: Option<RenderFrameModel>,
+    scene_vertices: Option<CachedSceneVertices>,
     chrome: Option<CachedChromeScene>,
     chrome_vertices: Option<CachedSceneVertices>,
     diagnostic: Option<CachedDiagnosticScene>,
@@ -566,8 +658,9 @@ impl D3d12PanelRenderer {
                 .in_scope(|| create_render_targets(&device, &swap_chain))?;
         let command_allocators = info_span!("create_command_allocators")
             .in_scope(|| create_command_allocators(&device))?;
-        let (srv_heap, curve_buffer, band_buffer) = info_span!("create_slug_buffers_and_srv")
-            .in_scope(|| create_slug_buffers_and_srv(&device))?;
+        let (srv_heap, curve_buffer, band_buffer, sprite_buffer, sprite_atlas) =
+            info_span!("create_shader_resources_and_srv")
+                .in_scope(|| create_shader_resources_and_srv(&device))?;
         let font = info_span!("load_terminal_font").in_scope(load_terminal_font)?;
         let root_signature =
             info_span!("create_root_signature").in_scope(|| create_root_signature(&device))?;
@@ -629,6 +722,8 @@ impl D3d12PanelRenderer {
             srv_heap,
             curve_buffer,
             band_buffer,
+            _sprite_buffer: sprite_buffer,
+            sprite_atlas,
             font,
             glyph_cache: HashMap::new(),
             cached_chars: Vec::new(),
@@ -818,10 +913,31 @@ impl D3d12PanelRenderer {
             return Ok(());
         }
 
+        if let Some(scene) = frame.scene.as_ref() {
+            let glyph_cache_changed = {
+                #[cfg(feature = "tracy")]
+                let _span = debug_span!("update_slug_curves").entered();
+                self.update_slug_curves_for_fragments(&[scene])?
+            };
+            let scene_vertices = {
+                #[cfg(feature = "tracy")]
+                let _span = debug_span!("update_scene_vertices").entered();
+                self.cached_fragment_vertices(
+                    scene,
+                    !glyph_cache_changed,
+                    &mut scene_cache.scene_vertices,
+                )
+            };
+            let vertex_count = self.upload_cached_fragment_vertices(&[scene_vertices])?;
+            scene_cache.last_frame = Some(frame.clone());
+            return self.execute_prepared_frame(vertex_count);
+        }
+
         let (chrome_scene, chrome_reused) = chrome_scene_fragment(
             &mut scene_cache.chrome,
             frame.layout,
             frame.title.as_deref(),
+            frame.diagnostics_button_state,
         );
         let (terminal_scenes, terminal_reused) = terminal_scene_fragments(
             &mut scene_cache.terminal,
@@ -835,6 +951,7 @@ impl D3d12PanelRenderer {
             &mut scene_cache.diagnostic,
             frame.layout,
             &frame.diagnostic_text,
+            frame.diagnostic_selection,
             frame.diagnostic_cell_width,
             frame.diagnostic_cell_height,
         );
@@ -952,15 +1069,32 @@ impl D3d12PanelRenderer {
 
     fn build_scene_vertices(&self, scene: &RenderScene) -> Vec<Vertex> {
         let mut vertices = Vec::with_capacity(
-            (scene.panels.len() + scene.glyphs.len() + scene.overlay_panels.len()) * 6,
+            (scene.panels.len()
+                + scene.sprites.len()
+                + scene.glyphs.len()
+                + scene.overlay_panels.len())
+                * 6,
         );
         for panel in &scene.panels {
-            append_rect(
+            append_rect_with_data(
                 &mut vertices,
                 panel.rect,
                 panel.color,
                 panel.effect as u32,
                 0,
+                [0.0, 0.0, 1.0, 1.0],
+                panel.data,
+            );
+        }
+        for sprite in &scene.sprites {
+            append_rect_with_data(
+                &mut vertices,
+                sprite.rect,
+                sprite.color,
+                PanelEffect::SpriteImage as u32,
+                0,
+                self.sprite_atlas.uv_rect(sprite.sprite),
+                [0.0; 4],
             );
         }
         for glyph in &scene.glyphs {
@@ -979,12 +1113,14 @@ impl D3d12PanelRenderer {
             );
         }
         for panel in &scene.overlay_panels {
-            append_rect(
+            append_rect_with_data(
                 &mut vertices,
                 panel.rect,
                 panel.color,
                 panel.effect as u32,
                 0,
+                [0.0, 0.0, 1.0, 1.0],
+                panel.data,
             );
         }
         vertices
@@ -1229,7 +1365,14 @@ impl D3d12PanelRenderer {
 
     fn update_shader_params(&self) -> eyre::Result<()> {
         let elapsed_seconds = self.animation_start.elapsed().as_secs_f32();
-        let params = build_shader_params(self.width as f32, self.height as f32, elapsed_seconds);
+        let mut params =
+            build_shader_params(self.width as f32, self.height as f32, elapsed_seconds);
+        params.sprite_atlas = [
+            self.sprite_atlas.width as f32,
+            self.sprite_atlas.height as f32,
+            0.0,
+            0.0,
+        ];
         unsafe {
             let mut mapped = std::ptr::null_mut();
             self.shader_param_buffer.Map(0, None, Some(&mut mapped))?;
@@ -1381,15 +1524,17 @@ fn chrome_scene_fragment(
     cached_chrome_scene: &mut Option<CachedChromeScene>,
     layout: TerminalLayout,
     title: Option<&str>,
+    diagnostics_button_state: ButtonVisualState,
 ) -> (Arc<RenderScene>, bool) {
     if let Some(cached) = cached_chrome_scene.as_ref()
         && cached.layout == layout
         && cached.title.as_deref() == title
+        && cached.diagnostics_button_state == diagnostics_button_state
     {
         return (Arc::clone(&cached.scene), true);
     }
 
-    let mut scene = build_panel_scene(layout);
+    let mut scene = build_panel_scene(layout, diagnostics_button_state);
     if let Some(title) = title.filter(|title| !title.is_empty()) {
         push_centered_text(
             &mut scene,
@@ -1402,6 +1547,7 @@ fn chrome_scene_fragment(
     *cached_chrome_scene = Some(CachedChromeScene {
         layout,
         title: title.map(ToOwned::to_owned),
+        diagnostics_button_state,
         scene: Arc::clone(&scene),
     });
     (scene, false)
@@ -1411,35 +1557,32 @@ fn diagnostic_scene_fragment(
     cached_diagnostic_scene: &mut Option<CachedDiagnosticScene>,
     layout: TerminalLayout,
     diagnostic_text: &str,
+    diagnostic_selection: Option<TerminalSelection>,
     diagnostic_cell_width: i32,
     diagnostic_cell_height: i32,
 ) -> (Arc<RenderScene>, bool) {
     if let Some(cached) = cached_diagnostic_scene.as_ref()
         && cached.layout == layout
         && cached.diagnostic_text == diagnostic_text
+        && cached.diagnostic_selection == diagnostic_selection
         && cached.diagnostic_cell_width == diagnostic_cell_width
         && cached.diagnostic_cell_height == diagnostic_cell_height
     {
         return (Arc::clone(&cached.scene), true);
     }
 
-    let mut scene = RenderScene {
-        panels: Vec::new(),
-        glyphs: Vec::with_capacity(diagnostic_text.chars().count()),
-        overlay_panels: Vec::new(),
-    };
-    push_text_block(
-        &mut scene,
-        layout.diagnostic_panel_rect().inset(14).to_win32_rect(),
+    let scene = cell_grid::build_text_grid_scene(
+        layout.diagnostic_panel_rect().inset(14),
         diagnostic_text,
         diagnostic_cell_width,
         diagnostic_cell_height,
-        [0.96, 0.95, 0.90, 1.0],
+        diagnostic_selection,
     );
     let scene = Arc::new(scene);
     *cached_diagnostic_scene = Some(CachedDiagnosticScene {
         layout,
         diagnostic_text: diagnostic_text.to_owned(),
+        diagnostic_selection,
         diagnostic_cell_width,
         diagnostic_cell_height,
         scene: Arc::clone(&scene),
@@ -1553,6 +1696,7 @@ fn build_terminal_row_scene(
     let mut scene = RenderScene {
         panels: Vec::with_capacity(row.backgrounds.len()),
         glyphs: Vec::with_capacity(row.glyphs.len()),
+        sprites: Vec::new(),
         overlay_panels: Vec::new(),
     };
 
@@ -1587,6 +1731,7 @@ fn build_terminal_cursor_scene(
     let mut scene = RenderScene {
         panels: Vec::new(),
         glyphs: Vec::new(),
+        sprites: Vec::new(),
         overlay_panels: Vec::with_capacity(4),
     };
     let cell_rect = terminal_cell_rect(terminal_rect, cursor.cell, cell_width, cell_height);
@@ -1610,6 +1755,7 @@ fn build_terminal_scrollbar_scene(
     let mut scene = RenderScene {
         panels: Vec::with_capacity(2),
         glyphs: Vec::new(),
+        sprites: Vec::new(),
         overlay_panels: Vec::new(),
     };
     if scrollbar_rect.width() <= 0 || scrollbar_rect.height() <= 0 {
@@ -1769,12 +1915,19 @@ fn terminal_cursor_overlay_rects(
 /// behavior[impl window.appearance.chrome]
 /// behavior[impl window.appearance.backgrounds.blue-half-transparent]
 /// behavior[impl window.appearance.code-panel.single-surface]
-pub fn build_panel_scene(layout: TerminalLayout) -> RenderScene {
+pub fn build_panel_scene(
+    layout: TerminalLayout,
+    diagnostics_button_state: ButtonVisualState,
+) -> RenderScene {
     let blue = [0.11, 0.44, 0.94, 0.5];
     let title_bar = [0.42, 0.18, 0.60, 1.0];
     let terminal_panel = [0.05, 0.06, 0.08, 1.0];
     let diagnostic_panel = [0.84, 0.44, 0.13, 1.0];
-    let button = [0.12, 0.13, 0.17, 1.0];
+    let button = if diagnostics_button_state.active {
+        [0.23, 0.48, 0.69, 1.0]
+    } else {
+        [0.12, 0.13, 0.17, 1.0]
+    };
     let mut panels = Vec::with_capacity(5);
     panels.push(PanelRect {
         rect: RECT {
@@ -1785,35 +1938,51 @@ pub fn build_panel_scene(layout: TerminalLayout) -> RenderScene {
         },
         color: blue,
         effect: PanelEffect::BlueBackground,
+        data: [0.0; 4],
     });
     panels.push(PanelRect {
         rect: layout.title_bar_rect().to_win32_rect(),
         color: title_bar,
         effect: PanelEffect::TitleBar,
+        data: [0.0; 4],
     });
     panels.push(PanelRect {
         rect: layout.terminal_panel_rect().to_win32_rect(),
         color: terminal_panel,
         effect: PanelEffect::TerminalPanel,
+        data: [0.0; 4],
     });
     panels.push(PanelRect {
         rect: layout.diagnostic_panel_rect().to_win32_rect(),
         color: diagnostic_panel,
         effect: PanelEffect::DiagnosticPanel,
+        data: [0.0; 4],
     });
     panels.push(PanelRect {
-        rect: layout.plus_button_rect().to_win32_rect(),
+        rect: layout.diagnostics_button_rect().to_win32_rect(),
         color: button,
-        effect: PanelEffect::PlusButton,
+        effect: PanelEffect::DiagnosticsButton,
+        data: diagnostics_button_state.shader_data(),
     });
     RenderScene {
         panels,
         glyphs: Vec::with_capacity(2_048),
+        sprites: Vec::new(),
         overlay_panels: Vec::with_capacity(16),
     }
 }
 
 pub fn push_panel(scene: &mut RenderScene, rect: RECT, color: [f32; 4], effect: PanelEffect) {
+    push_panel_with_data(scene, rect, color, effect, [0.0; 4]);
+}
+
+pub fn push_panel_with_data(
+    scene: &mut RenderScene,
+    rect: RECT,
+    color: [f32; 4],
+    effect: PanelEffect,
+    data: [f32; 4],
+) {
     if scene.panels.len() + scene.overlay_panels.len() >= MAX_PANEL_COUNT {
         return;
     }
@@ -1822,6 +1991,7 @@ pub fn push_panel(scene: &mut RenderScene, rect: RECT, color: [f32; 4], effect: 
         rect,
         color,
         effect,
+        data,
     });
 }
 
@@ -1839,6 +2009,15 @@ pub fn push_overlay_panel(
         rect,
         color,
         effect,
+        data: [0.0; 4],
+    });
+}
+
+pub fn push_sprite(scene: &mut RenderScene, rect: RECT, color: [f32; 4], sprite: SpriteId) {
+    scene.sprites.push(SpriteQuad {
+        rect,
+        color,
+        sprite,
     });
 }
 
@@ -2181,15 +2360,45 @@ pub fn write_render_frame_model_offscreen_png(
 pub fn render_frame_model_offscreen_image(
     frame: &RenderFrameModel,
 ) -> eyre::Result<ImageBuffer<Rgba<u8>, Vec<u8>>> {
+    if let Some(scene) = frame.scene.as_ref() {
+        let width = u32::try_from(frame.layout.client_width.max(1)).unwrap_or(1);
+        let height = u32::try_from(frame.layout.client_height.max(1)).unwrap_or(1);
+        let mut image = ImageBuffer::<Rgba<u8>, Vec<u8>>::new(width, height);
+        for pixel in image.pixels_mut() {
+            *pixel = Rgba([0, 0, 0, 0]);
+        }
+
+        let font = load_terminal_font()?;
+        let face = Face::parse(&font.font_bytes, font.face_index)
+            .wrap_err("failed to parse terminal font for offscreen render")?;
+        let mut glyph_cache: HashMap<char, (Vec<QuadraticCurve>, Vec<u32>, SlugGlyph)> =
+            HashMap::new();
+        let sprite_atlas = build_sprite_atlas()?;
+        blend_scene_into_image(
+            &mut image,
+            scene,
+            &font,
+            &face,
+            &mut glyph_cache,
+            &sprite_atlas,
+        )?;
+        return Ok(image);
+    }
+
     let mut chrome_cache = None;
     let mut diagnostic_cache = None;
     let mut terminal_cache = None;
-    let (chrome_scene, _) =
-        chrome_scene_fragment(&mut chrome_cache, frame.layout, frame.title.as_deref());
+    let (chrome_scene, _) = chrome_scene_fragment(
+        &mut chrome_cache,
+        frame.layout,
+        frame.title.as_deref(),
+        frame.diagnostics_button_state,
+    );
     let (diagnostic_scene, _) = diagnostic_scene_fragment(
         &mut diagnostic_cache,
         frame.layout,
         &frame.diagnostic_text,
+        frame.diagnostic_selection,
         frame.diagnostic_cell_width,
         frame.diagnostic_cell_height,
     );
@@ -2213,6 +2422,7 @@ pub fn render_frame_model_offscreen_image(
     let face = Face::parse(&font.font_bytes, font.face_index)
         .wrap_err("failed to parse terminal font for offscreen render")?;
     let mut glyph_cache: HashMap<char, (Vec<QuadraticCurve>, Vec<u32>, SlugGlyph)> = HashMap::new();
+    let sprite_atlas = build_sprite_atlas()?;
 
     let mut scenes = Vec::with_capacity(2 + terminal_fragments.len());
     scenes.push(chrome_scene);
@@ -2220,7 +2430,14 @@ pub fn render_frame_model_offscreen_image(
     scenes.extend(terminal_fragments);
 
     for scene in &scenes {
-        blend_scene_into_image(&mut image, scene, &font, &face, &mut glyph_cache)?;
+        blend_scene_into_image(
+            &mut image,
+            scene,
+            &font,
+            &face,
+            &mut glyph_cache,
+            &sprite_atlas,
+        )?;
     }
 
     Ok(image)
@@ -2259,9 +2476,20 @@ fn blend_scene_into_image(
     font: &LoadedTerminalFont,
     face: &Face<'_>,
     glyph_cache: &mut HashMap<char, (Vec<QuadraticCurve>, Vec<u32>, SlugGlyph)>,
+    sprite_atlas: &SpriteAtlas,
 ) -> eyre::Result<()> {
     for panel in &scene.panels {
         blend_rect_into_image(image, panel.rect, panel.color);
+    }
+
+    for sprite in &scene.sprites {
+        blend_sprite_into_image(
+            image,
+            sprite.rect,
+            sprite.color,
+            sprite_atlas.uv_rect(sprite.sprite),
+            sprite_atlas,
+        );
     }
     for glyph in &scene.glyphs {
         let (curves, band_data, slug) = if let Some(cached) = glyph_cache.get(&glyph.character) {
@@ -2301,6 +2529,55 @@ fn blend_rect_into_image(image: &mut ImageBuffer<Rgba<u8>, Vec<u8>>, rect: RECT,
             blend_pixel(image, x as u32, y as u32, color, 1.0);
         }
     }
+}
+
+fn blend_sprite_into_image(
+    image: &mut ImageBuffer<Rgba<u8>, Vec<u8>>,
+    rect: RECT,
+    color: [f32; 4],
+    uv_rect: [f32; 4],
+    sprite_atlas: &SpriteAtlas,
+) {
+    let width = i32::try_from(image.width()).unwrap_or(i32::MAX);
+    let height = i32::try_from(image.height()).unwrap_or(i32::MAX);
+    let left = rect.left.clamp(0, width);
+    let top = rect.top.clamp(0, height);
+    let right = rect.right.clamp(left, width);
+    let bottom = rect.bottom.clamp(top, height);
+    let target_width = (right - left).max(1) as f32;
+    let target_height = (bottom - top).max(1) as f32;
+
+    for y in top..bottom {
+        for x in left..right {
+            let u = (x - left) as f32 / target_width;
+            let v = (y - top) as f32 / target_height;
+            let atlas_u = uv_rect[0] + ((uv_rect[2] - uv_rect[0]) * u);
+            let atlas_v = uv_rect[1] + ((uv_rect[3] - uv_rect[1]) * v);
+            let sprite = sample_sprite_atlas_color(sprite_atlas, atlas_u, atlas_v);
+            let sprite_color = [
+                (f32::from(sprite[0]) / 255.0) * color[0],
+                (f32::from(sprite[1]) / 255.0) * color[1],
+                (f32::from(sprite[2]) / 255.0) * color[2],
+                (f32::from(sprite[3]) / 255.0) * color[3],
+            ];
+            blend_pixel(image, x as u32, y as u32, sprite_color, 1.0);
+        }
+    }
+}
+
+fn sample_sprite_atlas_color(sprite_atlas: &SpriteAtlas, u: f32, v: f32) -> [u8; 4] {
+    let width = sprite_atlas.width.max(1);
+    let height = sprite_atlas.height.max(1);
+    let x = (u.clamp(0.0, 1.0) * (width - 1) as f32).round() as u32;
+    let y = (v.clamp(0.0, 1.0) * (height - 1) as f32).round() as u32;
+    let index = usize::try_from((y * width) + x).unwrap_or_default();
+    let packed = sprite_atlas.pixels.get(index).copied().unwrap_or_default();
+    [
+        (packed & 0xFF) as u8,
+        ((packed >> 8) & 0xFF) as u8,
+        ((packed >> 16) & 0xFF) as u8,
+        ((packed >> 24) & 0xFF) as u8,
+    ]
 }
 
 fn blend_glyph_into_image(
@@ -3287,7 +3564,7 @@ fn create_empty_rtv_heap(device: &ID3D12Device) -> eyre::Result<ID3D12Descriptor
 fn create_root_signature(device: &ID3D12Device) -> eyre::Result<ID3D12RootSignature> {
     let descriptor_ranges = [D3D12_DESCRIPTOR_RANGE {
         RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
-        NumDescriptors: 2,
+        NumDescriptors: 3,
         BaseShaderRegister: 0,
         RegisterSpace: 0,
         OffsetInDescriptorsFromTableStart: D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND,
@@ -3564,6 +3841,7 @@ fn build_shader_params(width: f32, height: f32, elapsed_seconds: f32) -> ShaderP
         ],
         slug_viewport: [safe_width, safe_height, 0.0, 0.0],
         scene_time: [elapsed_seconds, 0.0, 0.0, 0.0],
+        sprite_atlas: [1.0, 1.0, 0.0, 0.0],
     }
 }
 
@@ -3641,13 +3919,194 @@ fn create_shader_param_buffer(device: &ID3D12Device) -> eyre::Result<ID3D12Resou
     Ok(shader_param_buffer.expect("shader parameter buffer should be initialized"))
 }
 
-fn create_slug_buffers_and_srv(
+fn build_sprite_atlas() -> eyre::Result<SpriteAtlas> {
+    let width = SPRITE_SLOT_SIZE * 3;
+    let height = SPRITE_SLOT_SIZE * 2;
+    let mut atlas = RgbaImage::new(width, height);
+
+    let terminal = blit_sprite_into_slot(
+        &mut atlas,
+        0,
+        decode_embedded_sprite(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/resources/main.png"
+        )))?,
+    );
+    let storage = blit_sprite_into_slot(
+        &mut atlas,
+        1,
+        decode_embedded_sprite(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/resources/storage.png"
+        )))?,
+    );
+    let audio = blit_sprite_into_slot(&mut atlas, 2, generate_audio_sprite());
+    let windows_audio = blit_sprite_into_slot(&mut atlas, 3, generate_windows_audio_sprite());
+    let file_audio = blit_sprite_into_slot(&mut atlas, 4, generate_file_audio_sprite());
+
+    Ok(SpriteAtlas {
+        width,
+        height,
+        pixels: atlas.pixels().map(|pixel| pack_rgba8(pixel.0)).collect(),
+        terminal,
+        storage,
+        audio,
+        windows_audio,
+        file_audio,
+    })
+}
+
+fn decode_embedded_sprite(bytes: &[u8]) -> eyre::Result<RgbaImage> {
+    image::load_from_memory(bytes)
+        .wrap_err("failed to decode embedded sprite")
+        .map(|image| image.to_rgba8())
+}
+
+fn blit_sprite_into_slot(atlas: &mut RgbaImage, slot_index: u32, sprite: RgbaImage) -> AtlasSprite {
+    let slot_x = (slot_index % 3) * SPRITE_SLOT_SIZE;
+    let slot_y = (slot_index / 3) * SPRITE_SLOT_SIZE;
+    let fitted = fit_sprite_to_target(&sprite, SPRITE_TARGET_SIZE);
+    let sprite_x = slot_x + ((SPRITE_SLOT_SIZE - fitted.width()) / 2);
+    let sprite_y = slot_y + ((SPRITE_SLOT_SIZE - fitted.height()) / 2);
+
+    for (y, row) in fitted.rows().enumerate() {
+        for (x, pixel) in row.enumerate() {
+            atlas.put_pixel(
+                sprite_x + u32::try_from(x).unwrap_or_default(),
+                sprite_y + u32::try_from(y).unwrap_or_default(),
+                *pixel,
+            );
+        }
+    }
+
+    AtlasSprite {
+        uv_left: sprite_x as f32 / atlas.width() as f32,
+        uv_top: sprite_y as f32 / atlas.height() as f32,
+        uv_right: (sprite_x + fitted.width()) as f32 / atlas.width() as f32,
+        uv_bottom: (sprite_y + fitted.height()) as f32 / atlas.height() as f32,
+    }
+}
+
+fn fit_sprite_to_target(sprite: &RgbaImage, target_size: u32) -> RgbaImage {
+    let width = sprite.width().max(1);
+    let height = sprite.height().max(1);
+    let scale = (target_size as f32 / width as f32).min(target_size as f32 / height as f32);
+    let target_width = ((width as f32 * scale).round() as u32).max(1);
+    let target_height = ((height as f32 * scale).round() as u32).max(1);
+    resize(sprite, target_width, target_height, FilterType::Lanczos3)
+}
+
+fn generate_audio_sprite() -> RgbaImage {
+    let mut image = RgbaImage::new(SPRITE_TARGET_SIZE, SPRITE_TARGET_SIZE);
+    fill_circle(&mut image, 88.0, 176.0, 36.0, [245, 199, 96, 255]);
+    fill_circle(&mut image, 158.0, 160.0, 34.0, [245, 199, 96, 255]);
+    fill_rect(&mut image, 150, 64, 182, 168, [245, 199, 96, 255]);
+    fill_rect(&mut image, 178, 64, 210, 104, [245, 199, 96, 255]);
+    stroke_ring(&mut image, 168.0, 136.0, 66.0, 8.0, [92, 206, 255, 220]);
+    stroke_ring(&mut image, 168.0, 136.0, 92.0, 8.0, [92, 206, 255, 180]);
+    image
+}
+
+fn generate_windows_audio_sprite() -> RgbaImage {
+    let mut image = RgbaImage::new(SPRITE_TARGET_SIZE, SPRITE_TARGET_SIZE);
+    fill_rect(&mut image, 36, 42, 118, 124, [97, 195, 255, 255]);
+    fill_rect(&mut image, 132, 36, 220, 124, [97, 195, 255, 255]);
+    fill_rect(&mut image, 36, 138, 118, 220, [36, 119, 252, 255]);
+    fill_rect(&mut image, 132, 132, 220, 220, [36, 119, 252, 255]);
+    fill_rect(&mut image, 94, 76, 116, 220, [8, 20, 36, 230]);
+    fill_rect(&mut image, 36, 118, 220, 140, [8, 20, 36, 230]);
+    image
+}
+
+fn generate_file_audio_sprite() -> RgbaImage {
+    let mut image = RgbaImage::new(SPRITE_TARGET_SIZE, SPRITE_TARGET_SIZE);
+    fill_rect(&mut image, 56, 28, 196, 224, [242, 244, 250, 255]);
+    fill_rect(&mut image, 164, 28, 220, 84, [201, 220, 255, 255]);
+    fill_rect(&mut image, 92, 88, 176, 104, [113, 149, 220, 255]);
+    fill_rect(&mut image, 92, 122, 184, 138, [113, 149, 220, 255]);
+    fill_rect(&mut image, 92, 156, 160, 172, [113, 149, 220, 255]);
+    image
+}
+
+fn fill_rect(image: &mut RgbaImage, left: u32, top: u32, right: u32, bottom: u32, color: [u8; 4]) {
+    for y in top.min(image.height())..bottom.min(image.height()) {
+        for x in left.min(image.width())..right.min(image.width()) {
+            image.put_pixel(x, y, Rgba(color));
+        }
+    }
+}
+
+fn fill_circle(image: &mut RgbaImage, center_x: f32, center_y: f32, radius: f32, color: [u8; 4]) {
+    let left = (center_x - radius).floor().max(0.0) as u32;
+    let top = (center_y - radius).floor().max(0.0) as u32;
+    let right = (center_x + radius).ceil().min(image.width() as f32) as u32;
+    let bottom = (center_y + radius).ceil().min(image.height() as f32) as u32;
+    let radius_sq = radius * radius;
+
+    for y in top..bottom {
+        for x in left..right {
+            let dx = x as f32 + 0.5 - center_x;
+            let dy = y as f32 + 0.5 - center_y;
+            if (dx * dx) + (dy * dy) <= radius_sq {
+                image.put_pixel(x, y, Rgba(color));
+            }
+        }
+    }
+}
+
+fn stroke_ring(
+    image: &mut RgbaImage,
+    center_x: f32,
+    center_y: f32,
+    radius: f32,
+    thickness: f32,
+    color: [u8; 4],
+) {
+    let left = (center_x - radius - thickness).floor().max(0.0) as u32;
+    let top = (center_y - radius - thickness).floor().max(0.0) as u32;
+    let right = (center_x + radius + thickness)
+        .ceil()
+        .min(image.width() as f32) as u32;
+    let bottom = (center_y + radius + thickness)
+        .ceil()
+        .min(image.height() as f32) as u32;
+    let outer_sq = (radius + thickness) * (radius + thickness);
+    let inner_sq = (radius - thickness).max(0.0) * (radius - thickness).max(0.0);
+
+    for y in top..bottom {
+        for x in left..right {
+            let dx = x as f32 + 0.5 - center_x;
+            let dy = y as f32 + 0.5 - center_y;
+            let distance_sq = (dx * dx) + (dy * dy);
+            if distance_sq <= outer_sq && distance_sq >= inner_sq {
+                image.put_pixel(x, y, Rgba(color));
+            }
+        }
+    }
+}
+
+fn pack_rgba8(color: [u8; 4]) -> u32 {
+    u32::from(color[0])
+        | (u32::from(color[1]) << 8)
+        | (u32::from(color[2]) << 16)
+        | (u32::from(color[3]) << 24)
+}
+
+fn create_shader_resources_and_srv(
     device: &ID3D12Device,
-) -> eyre::Result<(ID3D12DescriptorHeap, ID3D12Resource, ID3D12Resource)> {
+) -> eyre::Result<(
+    ID3D12DescriptorHeap,
+    ID3D12Resource,
+    ID3D12Resource,
+    ID3D12Resource,
+    SpriteAtlas,
+)> {
     let curve_data = vec![[0.0_f32; 4]; MAX_CURVE_FLOAT4_COUNT];
     let byte_len = (curve_data.len() * std::mem::size_of::<[f32; 4]>()) as u64;
     let band_data = vec![0_u32; MAX_BAND_UINT_COUNT];
     let band_byte_len = (band_data.len() * std::mem::size_of::<u32>()) as u64;
+    let sprite_atlas = build_sprite_atlas()?;
+    let sprite_byte_len = (sprite_atlas.pixels.len() * std::mem::size_of::<u32>()) as u64;
 
     let mut curve_buffer = None;
     unsafe {
@@ -3705,6 +4164,35 @@ fn create_slug_buffers_and_srv(
     };
     let band_buffer: ID3D12Resource = band_buffer.expect("band buffer should be initialized");
 
+    let mut sprite_buffer = None;
+    unsafe {
+        device.CreateCommittedResource(
+            &D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_UPLOAD,
+                ..Default::default()
+            },
+            D3D12_HEAP_FLAG_NONE,
+            &D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: sprite_byte_len,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                ..Default::default()
+            },
+            D3D12_RESOURCE_STATE_GENERIC_READ,
+            None,
+            &mut sprite_buffer,
+        )?
+    };
+    let sprite_buffer: ID3D12Resource =
+        sprite_buffer.expect("sprite atlas buffer should be initialized");
+
     unsafe {
         let mut mapped = std::ptr::null_mut();
         curve_buffer.Map(0, None, Some(&mut mapped))?;
@@ -3719,12 +4207,21 @@ fn create_slug_buffers_and_srv(
         band_buffer.Map(0, None, Some(&mut band_mapped))?;
         std::ptr::copy_nonoverlapping(band_data.as_ptr(), band_mapped as *mut u32, band_data.len());
         band_buffer.Unmap(0, None);
+
+        let mut sprite_mapped = std::ptr::null_mut();
+        sprite_buffer.Map(0, None, Some(&mut sprite_mapped))?;
+        std::ptr::copy_nonoverlapping(
+            sprite_atlas.pixels.as_ptr(),
+            sprite_mapped as *mut u32,
+            sprite_atlas.pixels.len(),
+        );
+        sprite_buffer.Unmap(0, None);
     }
 
     let srv_heap: ID3D12DescriptorHeap = unsafe {
         device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
             Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-            NumDescriptors: 2,
+            NumDescriptors: 3,
             Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
             ..Default::default()
         })?
@@ -3761,6 +4258,20 @@ fn create_slug_buffers_and_srv(
         },
     };
 
+    let sprite_desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+        Format: DXGI_FORMAT_R32_UINT,
+        ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+        Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+        Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+            Buffer: D3D12_BUFFER_SRV {
+                FirstElement: 0,
+                NumElements: u32::try_from(sprite_atlas.pixels.len()).unwrap_or(u32::MAX),
+                StructureByteStride: 0,
+                Flags: D3D12_BUFFER_SRV_FLAG_NONE,
+            },
+        },
+    };
+
     unsafe {
         let heap_start = srv_heap.GetCPUDescriptorHandleForHeapStart();
         device.CreateShaderResourceView(&curve_buffer, Some(&curve_desc), heap_start);
@@ -3771,9 +4282,22 @@ fn create_slug_buffers_and_srv(
                 ptr: heap_start.ptr + descriptor_size,
             },
         );
+        device.CreateShaderResourceView(
+            &sprite_buffer,
+            Some(&sprite_desc),
+            D3D12_CPU_DESCRIPTOR_HANDLE {
+                ptr: heap_start.ptr + (descriptor_size * 2),
+            },
+        );
     }
 
-    Ok((srv_heap, curve_buffer, band_buffer))
+    Ok((
+        srv_heap,
+        curve_buffer,
+        band_buffer,
+        sprite_buffer,
+        sprite_atlas,
+    ))
 }
 
 fn append_text_rect(
@@ -3878,6 +4402,26 @@ fn append_rect(
     effect: u32,
     glyph_index: u32,
 ) {
+    append_rect_with_data(
+        vertices,
+        rect,
+        color,
+        effect,
+        glyph_index,
+        [0.0, 0.0, 1.0, 1.0],
+        [0.0; 4],
+    );
+}
+
+fn append_rect_with_data(
+    vertices: &mut Vec<Vertex>,
+    rect: RECT,
+    color: [f32; 4],
+    effect: u32,
+    glyph_index: u32,
+    uv_rect: [f32; 4],
+    data: [f32; 4],
+) {
     if vertices.len() + 6 > MAX_VERTEX_COUNT {
         return;
     }
@@ -3888,14 +4432,15 @@ fn append_rect(
     let bottom = rect.bottom as f32;
     let effect = effect as f32;
     let glyph = glyph_index as f32;
+    let [uv_left, uv_top, uv_right, uv_bottom] = uv_rect;
 
     let top_left = Vertex {
         position: [left, top, 0.0],
         color,
-        uv: [0.0, 0.0],
+        uv: [uv_left, uv_top],
         effect,
         glyph,
-        glyph_data: [0.0; 4],
+        glyph_data: data,
         banding: [0.0; 4],
         normal: [0.0; 2],
         jacobian: [0.0; 4],
@@ -3904,10 +4449,10 @@ fn append_rect(
     let top_right = Vertex {
         position: [right, top, 0.0],
         color,
-        uv: [1.0, 0.0],
+        uv: [uv_right, uv_top],
         effect,
         glyph,
-        glyph_data: [0.0; 4],
+        glyph_data: data,
         banding: [0.0; 4],
         normal: [0.0; 2],
         jacobian: [0.0; 4],
@@ -3916,10 +4461,10 @@ fn append_rect(
     let bottom_right = Vertex {
         position: [right, bottom, 0.0],
         color,
-        uv: [1.0, 1.0],
+        uv: [uv_right, uv_bottom],
         effect,
         glyph,
-        glyph_data: [0.0; 4],
+        glyph_data: data,
         banding: [0.0; 4],
         normal: [0.0; 2],
         jacobian: [0.0; 4],
@@ -3928,10 +4473,10 @@ fn append_rect(
     let bottom_left = Vertex {
         position: [left, bottom, 0.0],
         color,
-        uv: [0.0, 1.0],
+        uv: [uv_left, uv_bottom],
         effect,
         glyph,
-        glyph_data: [0.0; 4],
+        glyph_data: data,
         banding: [0.0; 4],
         normal: [0.0; 2],
         jacobian: [0.0; 4],
@@ -3986,8 +4531,8 @@ fn issue_transition_barrier(
 #[cfg(test)]
 mod tests {
     use super::{
-        CachedSceneVertices, FALLBACK_GLYPH, PanelEffect, RenderScene, Vertex, append_rect,
-        append_slug_band_data, build_panel_scene, build_shader_params,
+        ButtonVisualState, CachedSceneVertices, FALLBACK_GLYPH, PanelEffect, RenderScene,
+        Vertex, append_rect, append_slug_band_data, build_panel_scene, build_shader_params,
         can_reuse_cached_scene_vertices, collect_scene_chars, cpu_slug_coverage,
         cpu_slug_coverage_all_curves, dirty_fragment_ranges, extract_glyph_curves,
         fragment_ranges_match, fragment_vertex_ranges, load_terminal_font, push_centered_text,
@@ -4007,6 +4552,7 @@ mod tests {
         let mut scene = RenderScene {
             panels: Vec::new(),
             glyphs: Vec::new(),
+            sprites: Vec::new(),
             overlay_panels: Vec::new(),
         };
         push_text_block(
@@ -4031,6 +4577,7 @@ mod tests {
         let mut scene = RenderScene {
             panels: Vec::new(),
             glyphs: Vec::new(),
+            sprites: Vec::new(),
             overlay_panels: Vec::new(),
         };
         push_centered_text(
@@ -4182,9 +4729,10 @@ mod tests {
             client_height: 680,
             cell_width: 8,
             cell_height: 16,
+            diagnostic_panel_visible: true,
         };
 
-        let scene = build_panel_scene(layout);
+        let scene = build_panel_scene(layout, ButtonVisualState::default());
         let terminal_panel_count = scene
             .panels
             .iter()
@@ -4203,9 +4751,10 @@ mod tests {
             client_height: 680,
             cell_width: 8,
             cell_height: 16,
+            diagnostic_panel_visible: true,
         };
 
-        let scene = build_panel_scene(layout);
+        let scene = build_panel_scene(layout, ButtonVisualState::default());
         let blue_panel = scene
             .panels
             .iter()
@@ -4223,9 +4772,10 @@ mod tests {
             client_height: 680,
             cell_width: 8,
             cell_height: 16,
+            diagnostic_panel_visible: true,
         };
 
-        let scene = build_panel_scene(layout);
+        let scene = build_panel_scene(layout, ButtonVisualState::default());
         let title_panel_count = scene
             .panels
             .iter()
@@ -4248,6 +4798,7 @@ mod tests {
         let mut scene = RenderScene {
             panels: Vec::new(),
             glyphs: Vec::new(),
+            sprites: Vec::new(),
             overlay_panels: Vec::new(),
         };
         push_glyph(
@@ -4285,6 +4836,7 @@ mod tests {
         let mut scene = RenderScene {
             panels: Vec::new(),
             glyphs: Vec::new(),
+            sprites: Vec::new(),
             overlay_panels: Vec::new(),
         };
 

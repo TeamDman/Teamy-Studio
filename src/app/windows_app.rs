@@ -11,6 +11,7 @@ use tracing::trace;
 use chrono::Utc;
 use eyre::Context;
 use facet::Facet;
+use rfd::{FileDialog, MessageButtons, MessageDialog, MessageLevel};
 use teamy_windows::clipboard::{read_clipboard, write_clipboard};
 use teamy_windows::module::get_current_module;
 use tracing::{debug, error, info, info_span, instrument};
@@ -49,16 +50,22 @@ use windows::core::{BOOL, PCWSTR, w};
 
 use crate::paths::{AppHome, CacheHome};
 
+use super::cell_grid;
 use super::spatial::{
     ClientPoint, ClientRect, ScreenPoint, ScreenRect, ScreenToClientTransform, TerminalCellPoint,
     classify_resize_border_hit, drag_threshold_exceeded,
 };
+use super::windows_audio::{
+    BellSource, current_bell_source, current_bell_source_label, initialize_bell_source,
+    ring_terminal_bell, set_bell_source,
+};
 use super::windows_d3d12_renderer::{
-    RenderFrameModel, RenderThreadProxy, RendererTerminalVisualState,
+    ButtonVisualState, RenderFrameModel, RenderThreadProxy, RendererTerminalVisualState,
 };
 use super::windows_dialogs::{
     PasteConfirmationChoice, paste_confirmation_required, show_multiline_paste_confirmation_dialog,
 };
+use super::windows_scene::{self, ClickState, SceneAction, SceneWindowKind};
 use super::windows_terminal::{
     POLL_INTERVAL_MS, POLL_TIMER_ID, TERMINAL_WORKER_WAKE_MESSAGE, TerminalChromeState,
     TerminalDisplayCursorStyle, TerminalDisplayScrollbar, TerminalDisplayState, TerminalLayout,
@@ -74,6 +81,7 @@ unsafe extern "system" {
 
 const TERMINAL_WINDOW_CLASS_NAME: &str = "TeamyStudioTerminalWindow";
 const WINDOW_CLASS_NAME: PCWSTR = w!("TeamyStudioTerminalWindow");
+const SCENE_WINDOW_CLASS_NAME: PCWSTR = w!("TeamyStudioSceneWindow");
 const BENCHMARK_WINDOW_CLASS_NAME: PCWSTR = w!("TeamyStudioTerminalBenchmarkWindow");
 const WINDOW_TITLE: &str = "Teamy Studio Terminal";
 const TERMINAL_FONT_HEIGHT: i32 = -16;
@@ -104,18 +112,23 @@ const TERMINAL_THROUGHPUT_RESULTS_DIR: &str = "self-test/terminal-throughput";
 
 thread_local! {
     static APP_STATE: RefCell<Option<AppState>> = const { RefCell::new(None) };
+    static SCENE_APP_STATE: RefCell<Option<SceneAppState>> = const { RefCell::new(None) };
 }
 
 struct AppState {
-    app_home: AppHome,
     hwnd: Option<WindowHandle>,
-    launch_command_argv: Vec<String>,
     launch_title: Option<String>,
     terminal_chrome: TerminalChromeState,
     last_applied_window_title: String,
     taskbar_progress: TaskbarProgressController,
-    vt_engine: VtEngineChoice,
+    pointer_position: Option<ClientPoint>,
     pending_window_drag: Option<PendingWindowDrag>,
+    diagnostic_panel_visible: bool,
+    diagnostic_selection: Option<TerminalSelection>,
+    pending_diagnostic_selection: Option<PendingTerminalSelection>,
+    diagnostic_selection_drag_point: Option<ClientPoint>,
+    diagnostics_button_pressed: bool,
+    diagnostics_button_last_clicked_at: Option<Instant>,
     terminal_selection: Option<TerminalSelection>,
     pending_terminal_selection: Option<PendingTerminalSelection>,
     terminal_selection_drag_point: Option<ClientPoint>,
@@ -134,6 +147,35 @@ struct AppState {
     diagnostic_cell_width: i32,
     diagnostic_cell_height: i32,
     terminal: TerminalSession,
+    renderer: Option<RenderThreadProxy>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ScenePressedTarget {
+    DiagnosticsButton,
+    Action(SceneAction),
+}
+
+struct SceneAppState {
+    app_home: AppHome,
+    hwnd: Option<WindowHandle>,
+    scene_kind: SceneWindowKind,
+    vt_engine: VtEngineChoice,
+    pointer_position: Option<ClientPoint>,
+    pressed_target: Option<ScenePressedTarget>,
+    last_clicked_action: Option<ClickState<SceneAction>>,
+    diagnostics_button_last_clicked_at: Option<Instant>,
+    diagnostics_visible: bool,
+    diagnostic_selection: Option<TerminalSelection>,
+    pending_diagnostic_selection: Option<PendingTerminalSelection>,
+    diagnostic_selection_drag_point: Option<ClientPoint>,
+    in_move_size_loop: bool,
+    window_focused: bool,
+    focused_render_interval_ms: u32,
+    terminal_cell_width: i32,
+    terminal_cell_height: i32,
+    diagnostic_cell_width: i32,
+    diagnostic_cell_height: i32,
     renderer: Option<RenderThreadProxy>,
 }
 
@@ -393,9 +435,23 @@ struct TerminalScrollbarGeometry {
 
 #[derive(Debug, PartialEq, Eq)]
 enum RightClickTerminalPreparation {
+    CopyDiagnostic(String),
     NotTerminal,
     CopySelection(String),
     QueryClipboard,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SceneActionDisposition {
+    KeepOpen,
+    CloseWindow,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SceneMouseUpAction {
+    NotHandled,
+    RenderOnly,
+    Invoke(SceneAction),
 }
 
 impl PendingDragAction {
@@ -510,6 +566,7 @@ pub fn run(
     title: Option<&str>,
     vt_engine: VtEngineChoice,
 ) -> eyre::Result<()> {
+    initialize_bell_source(app_home)?;
     let launch_command_argv = match command_argv {
         Some(command_argv) => command_argv.to_vec(),
         None => crate::shell_default::load_effective_argv(app_home)?,
@@ -524,13 +581,16 @@ pub fn run(
         None => TerminalSession::new(app_home, Some(working_dir), vt_engine),
     })?;
     run_with_terminal_session(
-        app_home,
         terminal,
         launch_command_argv,
         initial_stdin,
         title,
-        vt_engine,
     )
+}
+
+pub fn run_launcher(app_home: &AppHome, vt_engine: VtEngineChoice) -> eyre::Result<()> {
+    initialize_bell_source(app_home)?;
+    run_scene_window(app_home, SceneWindowKind::Launcher, vt_engine)
 }
 
 pub fn list_terminal_windows() -> eyre::Result<Vec<TerminalWindowSummary>> {
@@ -591,12 +651,10 @@ pub fn list_terminal_windows() -> eyre::Result<Vec<TerminalWindowSummary>> {
 
 #[instrument(level = "info", skip_all, fields(argc = launch_command_argv.len(), has_initial_stdin = initial_stdin.is_some(), has_title = title.is_some()))]
 fn run_with_terminal_session(
-    app_home: &AppHome,
     terminal: TerminalSession,
     launch_command_argv: Vec<String>,
     initial_stdin: Option<&str>,
     title: Option<&str>,
-    vt_engine: VtEngineChoice,
 ) -> eyre::Result<()> {
     let window_thread = WindowThread::current();
     let terminal_font_height = TERMINAL_FONT_HEIGHT;
@@ -617,15 +675,19 @@ fn run_with_terminal_session(
 
     APP_STATE.with(|state| {
         *state.borrow_mut() = Some(AppState {
-            app_home: app_home.clone(),
             hwnd: None,
-            launch_command_argv,
             launch_title: title.map(ToOwned::to_owned),
             terminal_chrome: TerminalChromeState::default(),
             last_applied_window_title: title.unwrap_or(WINDOW_TITLE).to_owned(),
             taskbar_progress: TaskbarProgressController::default(),
-            vt_engine,
+            pointer_position: None,
             pending_window_drag: None,
+            diagnostic_panel_visible: true,
+            diagnostic_selection: None,
+            pending_diagnostic_selection: None,
+            diagnostic_selection_drag_point: None,
+            diagnostics_button_pressed: false,
+            diagnostics_button_last_clicked_at: None,
             terminal_selection: None,
             pending_terminal_selection: None,
             terminal_selection_drag_point: None,
@@ -677,6 +739,55 @@ fn run_with_terminal_session(
     with_app_state(|state| render_current_frame(state, hwnd, None))?;
 
     info!("Teamy Studio terminal window shown");
+    message_loop()
+}
+
+fn run_scene_window(
+    app_home: &AppHome,
+    scene_kind: SceneWindowKind,
+    vt_engine: VtEngineChoice,
+) -> eyre::Result<()> {
+    let window_thread = WindowThread::current();
+    let focused_render_interval_ms = measure_focused_render_interval_ms();
+    let (terminal_cell_width, terminal_cell_height) = measure_terminal_cell_size(TERMINAL_FONT_HEIGHT)?;
+    let (diagnostic_cell_width, diagnostic_cell_height) =
+        measure_terminal_cell_size(DIAGNOSTIC_FONT_HEIGHT)?;
+
+    SCENE_APP_STATE.with(|state| {
+        *state.borrow_mut() = Some(SceneAppState {
+            app_home: app_home.clone(),
+            hwnd: None,
+            scene_kind,
+            vt_engine,
+            pointer_position: None,
+            pressed_target: None,
+            last_clicked_action: None,
+            diagnostics_button_last_clicked_at: None,
+            diagnostics_visible: false,
+            diagnostic_selection: None,
+            pending_diagnostic_selection: None,
+            diagnostic_selection_drag_point: None,
+            in_move_size_loop: false,
+            window_focused: false,
+            focused_render_interval_ms,
+            terminal_cell_width,
+            terminal_cell_height,
+            diagnostic_cell_width,
+            diagnostic_cell_height,
+            renderer: None,
+        });
+    });
+
+    let hwnd = create_scene_window(window_thread, scene_kind.title())?;
+    let renderer = RenderThreadProxy::new(hwnd.raw())?;
+    with_scene_app_state(|state| {
+        state.hwnd = Some(hwnd);
+        state.renderer = Some(renderer);
+        Ok(())
+    })?;
+
+    hwnd.show();
+    with_scene_app_state(|state| render_scene_window_frame(state, hwnd, None, false))?;
     message_loop()
 }
 
@@ -1176,6 +1287,52 @@ fn create_window(window_thread: WindowThread, window_title: &str) -> eyre::Resul
 }
 
 #[instrument(level = "info", skip_all)]
+fn create_scene_window(window_thread: WindowThread, window_title: &str) -> eyre::Result<WindowHandle> {
+    let instance = get_current_module().wrap_err("failed to get module handle")?;
+
+    let class = WNDCLASSEXW {
+        cbSize: u32::try_from(std::mem::size_of::<WNDCLASSEXW>())
+            .expect("WNDCLASSEXW size must fit in u32"),
+        hInstance: instance.into(),
+        lpszClassName: SCENE_WINDOW_CLASS_NAME,
+        lpfnWndProc: Some(scene_window_proc),
+        hCursor: load_cursor(IDC_ARROW),
+        ..Default::default()
+    };
+    let atom = register_window_class(&class);
+    if atom == 0 {
+        debug!("scene window class already registered or registration deferred");
+    }
+
+    let screen_width = system_metric(SM_CXSCREEN);
+    let screen_height = system_metric(SM_CYSCREEN);
+    let x = (screen_width - INITIAL_WINDOW_WIDTH) / 2;
+    let y = (screen_height - INITIAL_WINDOW_HEIGHT) / 2;
+    let title = wide_null_terminated(window_title);
+
+    // Safety: all pointers and handles passed to CreateWindowExW are valid for the duration of the call.
+    let hwnd = unsafe {
+        CreateWindowExW(
+            WS_EX_APPWINDOW,
+            SCENE_WINDOW_CLASS_NAME,
+            PCWSTR(title.as_ptr()),
+            WS_POPUP | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_VISIBLE,
+            x,
+            y,
+            INITIAL_WINDOW_WIDTH,
+            INITIAL_WINDOW_HEIGHT,
+            None,
+            None,
+            Some(instance.into()),
+            None,
+        )
+    }
+    .wrap_err("failed to create scene window")?;
+
+    Ok(WindowHandle::new(window_thread, hwnd))
+}
+
+#[instrument(level = "info", skip_all)]
 fn create_benchmark_window(window_thread: WindowThread) -> eyre::Result<WindowHandle> {
     let instance = get_current_module().wrap_err("failed to get module handle")?;
 
@@ -1300,6 +1457,387 @@ extern "system" fn window_proc(
         WM_DESTROY => handle_destroy_message(hwnd),
         _ => def_window_proc(hwnd, message, wparam, lparam),
     }
+}
+
+extern "system" fn scene_window_proc(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    let hwnd = WindowHandle::new(WindowThread::current(), hwnd);
+    match message {
+        WM_NCCALCSIZE => LRESULT(0),
+        WM_SETFOCUS => handle_scene_focus_changed(hwnd, true),
+        WM_KILLFOCUS => handle_scene_focus_changed(hwnd, false),
+        WM_ENTERSIZEMOVE => handle_scene_enter_size_move(hwnd),
+        WM_EXITSIZEMOVE => handle_scene_exit_size_move(hwnd),
+        WM_SIZE => handle_scene_size(hwnd),
+        WM_TIMER if wparam.0 == FOCUSED_RENDER_TIMER_ID => handle_scene_focused_render_timer(hwnd),
+        WM_LBUTTONDOWN => handle_bool_message(hwnd, message, wparam, lparam, |hwnd| {
+            handle_scene_left_button_down(hwnd, lparam)
+        }),
+        WM_MOUSEMOVE => handle_bool_message(hwnd, message, wparam, lparam, |hwnd| {
+            handle_scene_mouse_move(hwnd, wparam, lparam)
+        }),
+        WM_PAINT => match acknowledge_paint(hwnd) {
+            Ok(()) => LRESULT(0),
+            Err(error) => fail_and_close(hwnd, &error),
+        },
+        WM_LBUTTONUP => handle_bool_message(hwnd, message, wparam, lparam, |hwnd| {
+            handle_scene_left_button_up(hwnd, lparam)
+        }),
+        WM_RBUTTONUP => handle_bool_message(hwnd, message, wparam, lparam, |hwnd| {
+            handle_scene_right_button_up(hwnd, lparam)
+        }),
+        WM_SETCURSOR => match handle_scene_set_cursor(hwnd, lparam) {
+            Ok(true) => LRESULT(1),
+            Ok(false) => def_window_proc(hwnd, message, wparam, lparam),
+            Err(error) => fail_and_close(hwnd, &error),
+        },
+        WM_NCHITTEST => handle_non_client_hit_test(hwnd, lparam),
+        WM_ERASEBKGND => LRESULT(1),
+        WM_DESTROY => handle_scene_destroy_message(hwnd),
+        _ => def_window_proc(hwnd, message, wparam, lparam),
+    }
+}
+
+fn handle_scene_enter_size_move(hwnd: WindowHandle) -> LRESULT {
+    match with_scene_app_state(|state| {
+        state.in_move_size_loop = true;
+        render_scene_window_frame(state, hwnd, None, false)?;
+        Ok(())
+    }) {
+        Ok(()) => LRESULT(0),
+        Err(error) => fail_and_close(hwnd, &error),
+    }
+}
+
+fn handle_scene_exit_size_move(hwnd: WindowHandle) -> LRESULT {
+    match with_scene_app_state(|state| {
+        state.in_move_size_loop = false;
+        render_scene_window_frame(state, hwnd, None, false)?;
+        Ok(())
+    }) {
+        Ok(()) => LRESULT(0),
+        Err(error) => fail_and_close(hwnd, &error),
+    }
+}
+
+fn handle_scene_size(hwnd: WindowHandle) -> LRESULT {
+    match with_scene_app_state(|state| {
+        let layout = client_layout(hwnd, state.terminal_cell_width, state.terminal_cell_height)?;
+        render_scene_window_frame(
+            state,
+            hwnd,
+            Some((
+                layout.client_width.cast_unsigned(),
+                layout.client_height.cast_unsigned(),
+            )),
+            false,
+        )?;
+        Ok(())
+    }) {
+        Ok(()) => LRESULT(0),
+        Err(error) => fail_and_close(hwnd, &error),
+    }
+}
+
+fn handle_scene_focused_render_timer(hwnd: WindowHandle) -> LRESULT {
+    match with_scene_app_state(|state| {
+        if !state.window_focused {
+            return Ok(());
+        }
+
+        render_scene_window_frame(state, hwnd, None, true)?;
+        Ok(())
+    }) {
+        Ok(()) => LRESULT(0),
+        Err(error) => fail_and_close(hwnd, &error),
+    }
+}
+
+fn handle_scene_focus_changed(hwnd: WindowHandle, focused: bool) -> LRESULT {
+    match with_scene_app_state(|state| {
+        state.window_focused = focused;
+        if focused {
+            hwnd.set_focused_render_timer(state.focused_render_interval_ms)?;
+            render_scene_window_frame(state, hwnd, None, true)?;
+        } else {
+            hwnd.clear_focused_render_timer();
+        }
+        Ok(())
+    }) {
+        Ok(()) => LRESULT(0),
+        Err(error) => fail_and_close(hwnd, &error),
+    }
+}
+
+fn handle_scene_destroy_message(hwnd: WindowHandle) -> LRESULT {
+    SCENE_APP_STATE.with(|state| {
+        let _ = state.borrow_mut().take();
+    });
+    hwnd.post_quit_message();
+    LRESULT(0)
+}
+
+fn handle_scene_left_button_down(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Result<bool> {
+    let point = ClientPoint::from_lparam(lparam);
+    let selection_mode = if alt_key_is_down() {
+        TerminalSelectionMode::Block
+    } else {
+        TerminalSelectionMode::Linear
+    };
+
+    with_scene_app_state(|state| {
+        state.pointer_position = Some(point);
+        state.pressed_target = None;
+        state.diagnostic_selection_drag_point = None;
+        let layout = client_layout(hwnd, state.terminal_cell_width, state.terminal_cell_height)?;
+
+        if layout.diagnostics_button_rect().contains(point) {
+            state.pending_diagnostic_selection = None;
+            state.pressed_target = Some(ScenePressedTarget::DiagnosticsButton);
+            render_scene_window_frame(state, hwnd, None, false)?;
+            return Ok(true);
+        }
+
+        if state.diagnostics_visible
+            && let Some(cell) = scene_diagnostic_cell_from_client_point(
+                layout,
+                point,
+                state.diagnostic_cell_width,
+                state.diagnostic_cell_height,
+                false,
+            )
+        {
+            state.diagnostic_selection = None;
+            state.pending_diagnostic_selection = Some(PendingTerminalSelection {
+                origin: point,
+                anchor: cell,
+                mode: selection_mode,
+            });
+            state.diagnostic_selection_drag_point = Some(point);
+            render_scene_window_frame(state, hwnd, None, false)?;
+            return Ok(true);
+        }
+
+        if let Some(action) = scene_action_at_point(state.scene_kind, layout, point) {
+            state.pending_diagnostic_selection = None;
+            state.pressed_target = Some(ScenePressedTarget::Action(action));
+            render_scene_window_frame(state, hwnd, None, false)?;
+            return Ok(true);
+        }
+
+        if scene_drag_handle_contains(layout, point) {
+            state.diagnostic_selection = None;
+            state.pending_diagnostic_selection = None;
+            begin_system_window_drag(hwnd, point)?;
+            return Ok(true);
+        }
+
+        state.diagnostic_selection = None;
+        Ok(false)
+    })
+}
+
+fn handle_scene_left_button_up(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Result<bool> {
+    let point = ClientPoint::from_lparam(lparam);
+
+    let action = with_scene_app_state(|state| {
+        state.pointer_position = Some(point);
+        let layout = client_layout(hwnd, state.terminal_cell_width, state.terminal_cell_height)?;
+
+        if let Some(ScenePressedTarget::DiagnosticsButton) = state.pressed_target.take() {
+            if layout.diagnostics_button_rect().contains(point) {
+                state.diagnostics_visible = !state.diagnostics_visible;
+                state.diagnostics_button_last_clicked_at = Some(Instant::now());
+                state.pending_diagnostic_selection = None;
+                state.diagnostic_selection_drag_point = None;
+                if !state.diagnostics_visible {
+                    state.diagnostic_selection = None;
+                }
+            }
+            return Ok(SceneMouseUpAction::RenderOnly);
+        }
+
+        if let Some(pending_selection) = state.pending_diagnostic_selection.take() {
+            state.diagnostic_selection_drag_point = None;
+            let cell = scene_diagnostic_cell_from_client_point(
+                layout,
+                point,
+                state.diagnostic_cell_width,
+                state.diagnostic_cell_height,
+                true,
+            );
+            if let Some(selection) =
+                complete_pending_terminal_selection(pending_selection, point, cell)
+            {
+                state.diagnostic_selection = Some(selection);
+            }
+            return Ok(SceneMouseUpAction::RenderOnly);
+        }
+
+        if let Some(ScenePressedTarget::Action(action)) = state.pressed_target.take() {
+            if scene_action_at_point(state.scene_kind, layout, point) == Some(action) {
+                state.last_clicked_action = Some(ClickState {
+                    action,
+                    clicked_at: Instant::now(),
+                });
+                return Ok(SceneMouseUpAction::Invoke(action));
+            }
+
+            return Ok(SceneMouseUpAction::RenderOnly);
+        }
+
+        Ok(SceneMouseUpAction::NotHandled)
+    })?;
+
+    match action {
+        SceneMouseUpAction::NotHandled => Ok(false),
+        SceneMouseUpAction::RenderOnly => {
+            with_scene_app_state(|state| render_scene_window_frame(state, hwnd, None, false))?;
+            Ok(true)
+        }
+        SceneMouseUpAction::Invoke(action) => {
+            let (app_home, vt_engine) =
+                with_scene_app_state(|state| Ok((state.app_home.clone(), state.vt_engine)))?;
+            let disposition = perform_scene_action(&app_home, vt_engine, action)?;
+            with_scene_app_state(|state| render_scene_window_frame(state, hwnd, None, false))?;
+            if disposition == SceneActionDisposition::CloseWindow {
+                hwnd.post_close();
+            }
+            Ok(true)
+        }
+    }
+}
+
+fn handle_scene_mouse_move(hwnd: WindowHandle, wparam: WPARAM, lparam: LPARAM) -> eyre::Result<bool> {
+    let point = ClientPoint::from_lparam(lparam);
+    let previous_pointer = with_scene_app_state(|state| {
+        let previous = state.pointer_position;
+        state.pointer_position = Some(point);
+        Ok(previous)
+    })?;
+
+    let diagnostic_selection_result = with_scene_app_state(|state| {
+        let Some(pending_selection) = state.pending_diagnostic_selection else {
+            return Ok(None);
+        };
+
+        state.diagnostic_selection_drag_point = Some(point);
+
+        let action = if (wparam.0 & 0x0001) == 0 {
+            update_pending_terminal_selection_action(pending_selection, point, false, None)
+        } else if point == pending_selection.origin {
+            update_pending_terminal_selection_action(pending_selection, point, true, None)
+        } else {
+            let layout = client_layout(hwnd, state.terminal_cell_width, state.terminal_cell_height)?;
+            let cell = scene_diagnostic_cell_from_client_point(
+                layout,
+                point,
+                state.diagnostic_cell_width,
+                state.diagnostic_cell_height,
+                true,
+            );
+            update_pending_terminal_selection_action(pending_selection, point, true, cell)
+        };
+
+        match action {
+            PendingTerminalSelectionAction::KeepPending => Ok(Some(true)),
+            PendingTerminalSelectionAction::ClearPending => {
+                state.pending_diagnostic_selection = None;
+                state.diagnostic_selection_drag_point = None;
+                Ok(Some(state.diagnostic_selection.is_some()))
+            }
+            PendingTerminalSelectionAction::Update(selection) => {
+                state.diagnostic_selection = Some(selection);
+                Ok(Some(true))
+            }
+        }
+    })?;
+
+    if let Some(consumed) = diagnostic_selection_result {
+        if consumed {
+            with_scene_app_state(|state| render_scene_window_frame(state, hwnd, None, false))?;
+        }
+        return Ok(consumed);
+    }
+
+    let should_render = with_scene_app_state(|state| {
+        let layout = client_layout(hwnd, state.terminal_cell_width, state.terminal_cell_height)?;
+        Ok(scene_interactive_region_contains(state, layout, previous_pointer)
+            || scene_interactive_region_contains(state, layout, Some(point)))
+    })?;
+
+    if should_render {
+        with_scene_app_state(|state| render_scene_window_frame(state, hwnd, None, false))?;
+        return Ok(true);
+    }
+
+    Ok(false)
+}
+
+fn handle_scene_right_button_up(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Result<bool> {
+    let point = ClientPoint::from_lparam(lparam);
+
+    let copy_text = with_scene_app_state(|state| {
+        if !state.diagnostics_visible {
+            return Ok(None);
+        }
+
+        let layout = client_layout(hwnd, state.terminal_cell_width, state.terminal_cell_height)?;
+        if !scene_diagnostic_text_rect(layout).contains(point) {
+            return Ok(None);
+        }
+
+        let diagnostic_text = build_scene_diagnostic_text(state);
+        let text = if let Some(selection) = state.diagnostic_selection.take() {
+            cell_grid::extract_selected_text(
+                scene_diagnostic_text_rect(layout),
+                &diagnostic_text,
+                state.diagnostic_cell_width,
+                state.diagnostic_cell_height,
+                selection,
+            )
+        } else {
+            diagnostic_text
+        };
+        Ok(Some(text))
+    })?;
+
+    let Some(copy_text) = copy_text else {
+        return Ok(false);
+    };
+
+    if !copy_text.is_empty()
+        && let Err(error) = write_clipboard(&copy_text)
+    {
+        error!(?error, "failed to copy scene diagnostics text to the clipboard");
+    }
+    with_scene_app_state(|state| render_scene_window_frame(state, hwnd, None, false))?;
+    Ok(true)
+}
+
+fn handle_scene_set_cursor(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Result<bool> {
+    if !should_override_drag_cursor(with_scene_app_state(|state| Ok(state.in_move_size_loop))?) {
+        return Ok(false);
+    }
+
+    let hit_test_code = u32::from(low_word_u16(lparam.0));
+    if hit_test_code != HTCAPTION && hit_test_code != HTCLIENT {
+        return Ok(false);
+    }
+
+    let point = cursor_client_point(hwnd)?;
+    if !scene_hit_test_drag_handle_point(hwnd, point)? {
+        return Ok(false);
+    }
+
+    let move_cursor = load_cursor(IDC_SIZEALL);
+    // Safety: setting the cursor for the current WM_SETCURSOR handling path is valid.
+    unsafe { SetCursor(Some(move_cursor)) };
+    Ok(true)
 }
 
 fn handle_enter_size_move(hwnd: WindowHandle) -> LRESULT {
@@ -1655,6 +2193,7 @@ fn render_current_frame_with_options(
         let _span = debug_span!("compute_client_layout").entered();
         client_layout(hwnd, state.terminal_cell_width, state.terminal_cell_height)?
     };
+    let diagnostics_button_state = terminal_diagnostics_button_state(state, layout);
     let diagnostic_text = {
         #[cfg(feature = "tracy")]
         let _span = debug_span!("build_diagnostic_panel_text").entered();
@@ -1692,8 +2231,14 @@ fn render_current_frame_with_options(
             title: resolved_visible_title(state.launch_title.as_deref(), &state.terminal_chrome)
                 .map(ToOwned::to_owned),
             diagnostic_text,
+            diagnostic_selection: state
+                .diagnostic_panel_visible
+                .then_some(state.diagnostic_selection)
+                .flatten(),
+            diagnostics_button_state,
             diagnostic_cell_width: state.diagnostic_cell_width,
             diagnostic_cell_height: state.diagnostic_cell_height,
+            scene: None,
             terminal_cell_width: state.terminal_cell_width,
             terminal_cell_height: state.terminal_cell_height,
             terminal_display,
@@ -1711,6 +2256,250 @@ fn render_current_frame_with_options(
     };
     state.terminal.note_frame_presented();
     Ok(())
+}
+
+fn terminal_diagnostics_button_state(
+    state: &AppState,
+    layout: TerminalLayout,
+) -> ButtonVisualState {
+    windows_scene::compute_button_visual_state(
+        layout.diagnostics_button_rect(),
+        state.pointer_position,
+        state.diagnostics_button_pressed,
+        state.diagnostics_button_last_clicked_at,
+        state.diagnostic_panel_visible,
+        Instant::now(),
+    )
+}
+
+fn render_scene_window_frame(
+    state: &mut SceneAppState,
+    hwnd: WindowHandle,
+    resize: Option<(u32, u32)>,
+    force_redraw: bool,
+) -> eyre::Result<()> {
+    if let Some((width, height)) = resize
+        && let Some(renderer) = state.renderer.as_mut()
+    {
+        renderer.resize(width, height)?;
+    }
+
+    let layout = client_layout(hwnd, state.terminal_cell_width, state.terminal_cell_height)?;
+    let diagnostics_button_state = windows_scene::compute_button_visual_state(
+        layout.diagnostics_button_rect(),
+        state.pointer_position,
+        state.pressed_target == Some(ScenePressedTarget::DiagnosticsButton),
+        state.diagnostics_button_last_clicked_at,
+        state.diagnostics_visible,
+        Instant::now(),
+    );
+    let scene = if state.diagnostics_visible {
+        windows_scene::build_scene_diagnostic_render_scene(
+            layout,
+            state.scene_kind,
+            diagnostics_button_state,
+            &build_scene_diagnostic_text(state),
+            state.diagnostic_selection,
+            state.diagnostic_cell_width,
+            state.diagnostic_cell_height,
+        )
+    } else {
+        windows_scene::build_scene_render_scene(
+            layout,
+            state.scene_kind,
+            diagnostics_button_state,
+            &scene_button_visual_states(state, layout),
+        )
+    };
+
+    let Some(renderer) = state.renderer.as_mut() else {
+        return Ok(());
+    };
+
+    let frame = RenderFrameModel {
+        layout,
+        title: Some(state.scene_kind.title().to_owned()),
+        diagnostic_text: String::new(),
+        diagnostic_selection: None,
+        diagnostics_button_state,
+        diagnostic_cell_width: state.diagnostic_cell_width,
+        diagnostic_cell_height: state.diagnostic_cell_height,
+        scene: Some(scene),
+        terminal_cell_width: state.terminal_cell_width,
+        terminal_cell_height: state.terminal_cell_height,
+        terminal_display: Arc::new(TerminalDisplayState::default()),
+        terminal_visual_state: RendererTerminalVisualState::default(),
+    };
+
+    if force_redraw {
+        renderer.render_frame_model_force_redraw(frame)?;
+    } else {
+        renderer.render_frame_model(frame)?;
+    }
+
+    Ok(())
+}
+
+fn scene_button_visual_states(
+    state: &SceneAppState,
+    layout: TerminalLayout,
+) -> Vec<(SceneAction, ButtonVisualState)> {
+    let now = Instant::now();
+    let specs = windows_scene::scene_button_specs(state.scene_kind);
+    let button_layouts = windows_scene::layout_scene_buttons(layout.terminal_panel_rect(), specs.len());
+
+    specs
+        .iter()
+        .zip(button_layouts)
+        .map(|(spec, button_layout)| {
+            let pressed = state.pressed_target == Some(ScenePressedTarget::Action(spec.action));
+            let last_clicked = state
+                .last_clicked_action
+                .filter(|click| click.action == spec.action)
+                .map(|click| click.clicked_at);
+            let active = scene_action_active(spec.action);
+            (
+                spec.action,
+                windows_scene::compute_button_visual_state(
+                    button_layout.card_rect,
+                    state.pointer_position,
+                    pressed,
+                    last_clicked,
+                    active,
+                    now,
+                ),
+            )
+        })
+        .collect()
+}
+
+fn build_scene_diagnostic_text(state: &SceneAppState) -> String {
+    let mut lines = vec![
+        format!("window\t{}", state.scene_kind.title()),
+        format!("bell-source\t{}", current_bell_source_label()),
+    ];
+
+    if let BellSource::File(path) = current_bell_source() {
+        lines.push(format!("bell-file\t{}", path.display()));
+    }
+
+    lines.push(String::new());
+    lines.push("actions".to_owned());
+    for spec in windows_scene::scene_button_specs(state.scene_kind) {
+        let status = if scene_action_active(spec.action) {
+            "active"
+        } else {
+            "available"
+        };
+        lines.push(format!("- {}\t{}", spec.label, status));
+    }
+
+    lines.join("\n")
+}
+
+fn scene_action_active(action: SceneAction) -> bool {
+    match (action, current_bell_source()) {
+        (SceneAction::SelectWindowsBell, BellSource::Windows) => true,
+        (SceneAction::SelectFileBell, BellSource::File(_)) => true,
+        _ => false,
+    }
+}
+
+fn scene_action_at_point(
+    scene_kind: SceneWindowKind,
+    layout: TerminalLayout,
+    point: ClientPoint,
+) -> Option<SceneAction> {
+    let specs = windows_scene::scene_button_specs(scene_kind);
+    let button_layouts = windows_scene::layout_scene_buttons(layout.terminal_panel_rect(), specs.len());
+    specs.iter().zip(button_layouts).find_map(|(spec, button_layout)| {
+        (button_layout.card_rect.contains(point) || button_layout.label_rect.contains(point))
+            .then_some(spec.action)
+    })
+}
+
+fn scene_drag_handle_contains(layout: TerminalLayout, point: ClientPoint) -> bool {
+    layout.drag_handle_rect().contains(point) && !layout.diagnostics_button_rect().contains(point)
+}
+
+fn scene_interactive_region_contains(
+    state: &SceneAppState,
+    layout: TerminalLayout,
+    point: Option<ClientPoint>,
+) -> bool {
+    point.is_some_and(|point| {
+        scene_drag_handle_contains(layout, point)
+            || layout.diagnostics_button_rect().contains(point)
+            || (state.diagnostics_visible && scene_diagnostic_text_rect(layout).contains(point))
+            || (!state.diagnostics_visible
+                && scene_action_at_point(state.scene_kind, layout, point).is_some())
+    })
+}
+
+fn perform_scene_action(
+    app_home: &AppHome,
+    vt_engine: VtEngineChoice,
+    action: SceneAction,
+) -> eyre::Result<SceneActionDisposition> {
+    match action {
+        SceneAction::OpenTerminal => {
+            let app_home = app_home.clone();
+            thread::Builder::new()
+                .name("teamy-studio-launcher-terminal".to_owned())
+                .spawn(move || {
+                    if let Err(error) = super::open_terminal_window(
+                        &app_home,
+                        None,
+                        None,
+                        None,
+                        vt_engine,
+                    ) {
+                        error!(?error, "failed to open Teamy Studio terminal window");
+                    }
+                })
+                .wrap_err("failed to spawn Teamy Studio terminal window thread")?;
+            Ok(SceneActionDisposition::KeepOpen)
+        }
+        SceneAction::OpenStorage => {
+            let _ = MessageDialog::new()
+                .set_level(MessageLevel::Info)
+                .set_title("Storage")
+                .set_description("Storage is not implemented yet.")
+                .set_buttons(MessageButtons::Ok)
+                .show();
+            Ok(SceneActionDisposition::KeepOpen)
+        }
+        SceneAction::OpenAudioPicker => {
+            let app_home = app_home.clone();
+            thread::Builder::new()
+                .name("teamy-studio-audio-picker".to_owned())
+                .spawn(move || {
+                    if let Err(error) = run_scene_window(&app_home, SceneWindowKind::AudioPicker, vt_engine) {
+                        error!(?error, "failed to open audio picker window");
+                    }
+                })
+                .wrap_err("failed to spawn Teamy Studio audio picker thread")?;
+            Ok(SceneActionDisposition::KeepOpen)
+        }
+        SceneAction::SelectWindowsBell => {
+            set_bell_source(app_home, BellSource::Windows)?;
+            ring_terminal_bell();
+            Ok(SceneActionDisposition::CloseWindow)
+        }
+        SceneAction::SelectFileBell => {
+            let Some(path) = FileDialog::new()
+                .add_filter("Wave Audio", &["wav"])
+                .set_title("Pick Bell File")
+                .pick_file()
+            else {
+                return Ok(SceneActionDisposition::KeepOpen);
+            };
+
+            set_bell_source(app_home, BellSource::File(path))?;
+            ring_terminal_bell();
+            Ok(SceneActionDisposition::CloseWindow)
+        }
+    }
 }
 
 fn measure_focused_render_interval_ms() -> u32 {
@@ -2228,8 +3017,11 @@ fn render_terminal_throughput_benchmark_frame(
         layout,
         title: Some("self-test".to_owned()),
         diagnostic_text,
+        diagnostic_selection: None,
+        diagnostics_button_state: ButtonVisualState::default(),
         diagnostic_cell_width,
         diagnostic_cell_height,
+        scene: None,
         terminal_cell_width,
         terminal_cell_height,
         terminal_display,
@@ -2647,6 +3439,16 @@ fn client_layout(
         client_height: rect.height(),
         cell_width,
         cell_height,
+        diagnostic_panel_visible: diagnostic_panel_visibility_for_current_window(),
+    })
+}
+
+fn diagnostic_panel_visibility_for_current_window() -> bool {
+    APP_STATE.with(|state| {
+        state.borrow()
+            .as_ref()
+            .map(|state| state.diagnostic_panel_visible)
+            .unwrap_or(false)
     })
 }
 
@@ -2776,10 +3578,22 @@ fn with_app_state<T>(f: impl FnOnce(&mut AppState) -> eyre::Result<T>) -> eyre::
     })
 }
 
+fn with_scene_app_state<T>(f: impl FnOnce(&mut SceneAppState) -> eyre::Result<T>) -> eyre::Result<T> {
+    SCENE_APP_STATE.with(|state| {
+        let mut borrowed = state.borrow_mut();
+        let app_state = borrowed
+            .as_mut()
+            .ok_or_else(|| eyre::eyre!("scene application state was not initialized"))?;
+        f(app_state)
+    })
+}
+
 fn handle_left_button_up(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Result<bool> {
     with_app_state(|state| {
+        let point = ClientPoint::from_lparam(lparam);
+        state.pointer_position = Some(point);
+
         if state.terminal_scrollbar_drag.take().is_some() {
-            let point = ClientPoint::from_lparam(lparam);
             let layout =
                 client_layout(hwnd, state.terminal_cell_width, state.terminal_cell_height)?;
             state.terminal_scrollbar_hovered_part =
@@ -2795,7 +3609,47 @@ fn handle_left_button_up(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Result<boo
             return Ok(true);
         }
 
+        if state.diagnostics_button_pressed {
+            state.diagnostics_button_pressed = false;
+            let layout =
+                client_layout(hwnd, state.terminal_cell_width, state.terminal_cell_height)?;
+            if layout.diagnostics_button_rect().contains(point) {
+                state.diagnostic_panel_visible = !state.diagnostic_panel_visible;
+                state.diagnostics_button_last_clicked_at = Some(Instant::now());
+                state.pending_diagnostic_selection = None;
+                state.diagnostic_selection_drag_point = None;
+                if !state.diagnostic_panel_visible {
+                    state.diagnostic_selection = None;
+                }
+                render_current_frame(state, hwnd, None)?;
+                return Ok(true);
+            }
+
+            render_current_frame(state, hwnd, None)?;
+            return Ok(true);
+        }
+
         if state.pending_window_drag.take().is_some() {
+            return Ok(true);
+        }
+
+        if let Some(pending_selection) = state.pending_diagnostic_selection.take() {
+            state.diagnostic_selection_drag_point = None;
+            let layout =
+                client_layout(hwnd, state.terminal_cell_width, state.terminal_cell_height)?;
+            let cell = diagnostic_panel_cell_from_client_point(
+                layout,
+                point,
+                state.diagnostic_cell_width,
+                state.diagnostic_cell_height,
+                true,
+            );
+            if let Some(selection) =
+                complete_pending_terminal_selection(pending_selection, point, cell)
+            {
+                state.diagnostic_selection = Some(selection);
+            }
+            render_current_frame(state, hwnd, None)?;
             return Ok(true);
         }
 
@@ -2816,37 +3670,7 @@ fn handle_left_button_up(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Result<boo
             return Ok(true);
         }
 
-        let layout = client_layout(hwnd, state.terminal_cell_width, state.terminal_cell_height)?;
-        let point = ClientPoint::from_lparam(lparam);
-        if !layout.plus_button_rect().contains(point) {
-            return Ok(false);
-        }
-
-        let app_home = state.app_home.clone();
-        let command_argv = state.launch_command_argv.clone();
-        let launch_title = state.launch_title.clone();
-        let vt_engine = state.vt_engine;
-
-        thread::Builder::new()
-            .name("teamy-studio-terminal-plus".to_owned())
-            .spawn(move || {
-                let launch_result = super::open_terminal_window(
-                    &app_home,
-                    Some(&command_argv),
-                    None,
-                    launch_title.as_deref(),
-                    vt_engine,
-                );
-                if let Err(error) = launch_result {
-                    error!(
-                        ?error,
-                        "failed to open additional Teamy Studio terminal window"
-                    );
-                }
-            })
-            .wrap_err("failed to spawn Teamy Studio terminal window thread")?;
-
-        Ok(true)
+        Ok(false)
     })
 }
 
@@ -2864,12 +3688,56 @@ fn handle_left_button_down(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Result<b
     };
 
     with_app_state(|state| {
+        state.pointer_position = Some(point);
         state.pending_window_drag = None;
         state.terminal_selection_drag_point = None;
-        if !in_drag_handle {
-            let layout =
-                client_layout(hwnd, state.terminal_cell_width, state.terminal_cell_height)?;
+        state.diagnostic_selection_drag_point = None;
+        state.diagnostics_button_pressed = false;
+
+        let layout = client_layout(hwnd, state.terminal_cell_width, state.terminal_cell_height)?;
+        if layout.diagnostics_button_rect().contains(point) {
             state.pending_terminal_selection = None;
+            state.pending_diagnostic_selection = None;
+            state.terminal_scrollbar_hovered_part = None;
+            if state.terminal_scrollbar_drag.take().is_some() {
+                hwnd.release_mouse_capture();
+            }
+            state.diagnostics_button_pressed = true;
+            render_current_frame(state, hwnd, None)?;
+            return Ok(true);
+        }
+
+        state.pending_diagnostic_selection = None;
+        if state.diagnostic_panel_visible
+            && let Some(cell) = diagnostic_panel_cell_from_client_point(
+                layout,
+                point,
+                state.diagnostic_cell_width,
+                state.diagnostic_cell_height,
+                false,
+            )
+        {
+            state.terminal_selection = None;
+            state.pending_terminal_selection = None;
+            state.terminal_selection_drag_point = None;
+            state.terminal_scrollbar_hovered_part = None;
+            if state.terminal_scrollbar_drag.take().is_some() {
+                hwnd.release_mouse_capture();
+            }
+            state.diagnostic_selection = None;
+            state.pending_diagnostic_selection = Some(PendingTerminalSelection {
+                origin: point,
+                anchor: cell,
+                mode: selection_mode,
+            });
+            state.diagnostic_selection_drag_point = Some(point);
+            render_current_frame(state, hwnd, None)?;
+            return Ok(true);
+        }
+
+        if !in_drag_handle {
+            state.pending_terminal_selection = None;
+            state.diagnostic_selection = None;
 
             if let Some(scrollbar) = current_terminal_scrollbar(state)? {
                 let scrollbar_rect = layout.terminal_scrollbar_rect().inset(4);
@@ -2922,6 +3790,9 @@ fn handle_left_button_down(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Result<b
         state.terminal_selection = None;
         state.pending_terminal_selection = None;
         state.terminal_selection_drag_point = None;
+    state.diagnostic_selection = None;
+    state.pending_diagnostic_selection = None;
+    state.diagnostic_selection_drag_point = None;
         state.terminal_scrollbar_hovered_part = None;
         state.terminal_scrollbar_drag = None;
         begin_system_window_drag(hwnd, point)?;
@@ -2931,6 +3802,57 @@ fn handle_left_button_down(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Result<b
 
 fn handle_mouse_move(hwnd: WindowHandle, wparam: WPARAM, lparam: LPARAM) -> eyre::Result<bool> {
     let point = ClientPoint::from_lparam(lparam);
+
+    let previous_pointer = with_app_state(|state| {
+        let previous = state.pointer_position;
+        state.pointer_position = Some(point);
+        Ok(previous)
+    })?;
+
+    let diagnostic_selection_result = with_app_state(|state| {
+        let Some(pending_selection) = state.pending_diagnostic_selection else {
+            return Ok(None);
+        };
+
+        state.diagnostic_selection_drag_point = Some(point);
+
+        let action = if (wparam.0 & 0x0001) == 0 {
+            update_pending_terminal_selection_action(pending_selection, point, false, None)
+        } else if point == pending_selection.origin {
+            update_pending_terminal_selection_action(pending_selection, point, true, None)
+        } else {
+            let layout =
+                client_layout(hwnd, state.terminal_cell_width, state.terminal_cell_height)?;
+            let cell = diagnostic_panel_cell_from_client_point(
+                layout,
+                point,
+                state.diagnostic_cell_width,
+                state.diagnostic_cell_height,
+                true,
+            );
+            update_pending_terminal_selection_action(pending_selection, point, true, cell)
+        };
+
+        match action {
+            PendingTerminalSelectionAction::KeepPending => Ok(Some(true)),
+            PendingTerminalSelectionAction::ClearPending => {
+                state.pending_diagnostic_selection = None;
+                state.diagnostic_selection_drag_point = None;
+                Ok(Some(state.diagnostic_selection.is_some()))
+            }
+            PendingTerminalSelectionAction::Update(selection) => {
+                state.diagnostic_selection = Some(selection);
+                Ok(Some(true))
+            }
+        }
+    })?;
+
+    if let Some(consumed) = diagnostic_selection_result {
+        if consumed {
+            with_app_state(|state| render_current_frame(state, hwnd, None))?;
+        }
+        return Ok(consumed);
+    }
 
     let selection_result = with_app_state(|state| {
         let Some(pending_selection) = state.pending_terminal_selection else {
@@ -3002,7 +3924,19 @@ fn handle_mouse_move(hwnd: WindowHandle, wparam: WPARAM, lparam: LPARAM) -> eyre
     })?;
 
     match action {
-        PendingDragAction::NotHandled => Ok(false),
+        PendingDragAction::NotHandled => {
+            let should_render = with_app_state(|state| {
+                let layout =
+                    client_layout(hwnd, state.terminal_cell_width, state.terminal_cell_height)?;
+                Ok(terminal_interactive_region_contains(state, layout, previous_pointer)
+                    || terminal_interactive_region_contains(state, layout, Some(point)))
+            })?;
+            if should_render {
+                with_app_state(|state| render_current_frame(state, hwnd, None))?;
+                return Ok(true);
+            }
+            Ok(false)
+        }
         PendingDragAction::Consumed => Ok(true),
         PendingDragAction::StartSystemDrag => {
             begin_system_window_drag(hwnd, point)
@@ -3072,6 +4006,28 @@ fn handle_right_button_up(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Result<bo
 
     let preparation = with_app_state(|state| {
         let layout = client_layout(hwnd, state.terminal_cell_width, state.terminal_cell_height)?;
+        if state.diagnostic_panel_visible
+            && diagnostic_panel_text_rect(layout).contains(point)
+        {
+            state.pending_diagnostic_selection = None;
+            state.diagnostic_selection_drag_point = None;
+            if let Some(selection) = state.diagnostic_selection.take() {
+                return Ok(RightClickTerminalPreparation::CopyDiagnostic(
+                    cell_grid::extract_selected_text(
+                        diagnostic_panel_text_rect(layout),
+                        &build_diagnostic_panel_text(state, layout)?,
+                        state.diagnostic_cell_width,
+                        state.diagnostic_cell_height,
+                        selection,
+                    ),
+                ));
+            }
+
+            return Ok(RightClickTerminalPreparation::CopyDiagnostic(
+                build_diagnostic_panel_text(state, layout)?,
+            ));
+        }
+
         if !terminal_render_rect(layout).contains(point) {
             return Ok(RightClickTerminalPreparation::NotTerminal);
         }
@@ -3092,6 +4048,14 @@ fn handle_right_button_up(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Result<bo
     })?;
 
     match preparation {
+        RightClickTerminalPreparation::CopyDiagnostic(selected_text) => {
+            if !selected_text.is_empty()
+                && let Err(error) = write_clipboard(&selected_text)
+            {
+                error!(?error, "failed to copy diagnostics text to the clipboard");
+            }
+            Ok(true)
+        }
         RightClickTerminalPreparation::NotTerminal => Ok(false),
         RightClickTerminalPreparation::CopySelection(selected_text) => {
             if !selected_text.is_empty()
@@ -3216,7 +4180,67 @@ fn complete_pending_terminal_selection(
 fn hit_test_drag_handle_point(hwnd: WindowHandle, point: ClientPoint) -> eyre::Result<bool> {
     with_app_state(|state| {
         let layout = client_layout(hwnd, state.terminal_cell_width, state.terminal_cell_height)?;
-        Ok(layout.drag_handle_rect().contains(point))
+        Ok(layout.drag_handle_rect().contains(point)
+            && !layout.diagnostics_button_rect().contains(point))
+    })
+}
+
+fn scene_hit_test_drag_handle_point(hwnd: WindowHandle, point: ClientPoint) -> eyre::Result<bool> {
+    with_scene_app_state(|state| {
+        let layout = client_layout(hwnd, state.terminal_cell_width, state.terminal_cell_height)?;
+        Ok(scene_drag_handle_contains(layout, point))
+    })
+}
+
+fn diagnostic_panel_text_rect(layout: TerminalLayout) -> ClientRect {
+    layout.diagnostic_panel_rect().inset(14)
+}
+
+fn scene_diagnostic_text_rect(layout: TerminalLayout) -> ClientRect {
+    layout.terminal_panel_rect().inset(20)
+}
+
+fn diagnostic_panel_cell_from_client_point(
+    layout: TerminalLayout,
+    point: ClientPoint,
+    cell_width: i32,
+    cell_height: i32,
+    clamp_to_bounds: bool,
+) -> Option<TerminalCellPoint> {
+    cell_grid::cell_from_client_point(
+        diagnostic_panel_text_rect(layout),
+        point,
+        cell_width,
+        cell_height,
+        clamp_to_bounds,
+    )
+}
+
+fn scene_diagnostic_cell_from_client_point(
+    layout: TerminalLayout,
+    point: ClientPoint,
+    cell_width: i32,
+    cell_height: i32,
+    clamp_to_bounds: bool,
+) -> Option<TerminalCellPoint> {
+    cell_grid::cell_from_client_point(
+        scene_diagnostic_text_rect(layout),
+        point,
+        cell_width,
+        cell_height,
+        clamp_to_bounds,
+    )
+}
+
+fn terminal_interactive_region_contains(
+    state: &AppState,
+    layout: TerminalLayout,
+    point: Option<ClientPoint>,
+) -> bool {
+    point.is_some_and(|point| {
+        layout.title_bar_rect().contains(point)
+            || layout.diagnostics_button_rect().contains(point)
+            || (state.diagnostic_panel_visible && diagnostic_panel_text_rect(layout).contains(point))
     })
 }
 
@@ -3537,6 +4561,7 @@ mod tests {
             client_height: 40,
             cell_width: 8,
             cell_height: 16,
+            diagnostic_panel_visible: true,
         };
         let display = Arc::new(TerminalDisplayState {
             rows: vec![crate::app::windows_terminal::TerminalDisplayRow::default()],
@@ -3562,12 +4587,14 @@ mod tests {
             client_height: 680,
             cell_width: 8,
             cell_height: 16,
+            diagnostic_panel_visible: true,
         };
         let next = TerminalLayout {
             client_width: 980,
             client_height: 540,
             cell_width: 8,
             cell_height: 16,
+            diagnostic_panel_visible: true,
         };
 
         assert!(should_defer_terminal_resize_during_move_size(
@@ -3583,12 +4610,14 @@ mod tests {
             client_height: 680,
             cell_width: 8,
             cell_height: 16,
+            diagnostic_panel_visible: true,
         };
         let next = TerminalLayout {
             client_width: 320,
             client_height: 40,
             cell_width: 8,
             cell_height: 16,
+            diagnostic_panel_visible: true,
         };
 
         assert!(!should_defer_terminal_resize_during_move_size(
@@ -3604,12 +4633,14 @@ mod tests {
             client_height: 40,
             cell_width: 8,
             cell_height: 16,
+            diagnostic_panel_visible: true,
         };
         let next = TerminalLayout {
             client_width: 1040,
             client_height: 680,
             cell_width: 8,
             cell_height: 16,
+            diagnostic_panel_visible: true,
         };
 
         assert!(!should_defer_terminal_resize_during_move_size(

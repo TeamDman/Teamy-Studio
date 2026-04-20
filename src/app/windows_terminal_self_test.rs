@@ -114,6 +114,7 @@ fn run_outside(
         client_height: 900,
         cell_width: 8,
         cell_height: 16,
+        diagnostic_panel_visible: true,
     })?;
 
     if let Some(result) =
@@ -589,6 +590,7 @@ fn run_pwsh_noprofile_resize_restores_prompt_reproduction(
         client_height: 900,
         cell_width: 8,
         cell_height: 16,
+        diagnostic_panel_visible: true,
     })?;
 
     let after_restore = match wait_for_screen(
@@ -629,6 +631,7 @@ fn seed_pwsh_scrollback_for_input_jump(terminal: &mut TerminalSession) -> eyre::
         client_height: 240,
         cell_width: 8,
         cell_height: 16,
+        diagnostic_panel_visible: true,
     })?;
     let _ = wait_for_pwsh_visible_prompt(terminal)?;
 
@@ -642,6 +645,7 @@ fn shrink_terminal_until_one_row_visible(terminal: &mut TerminalSession) -> eyre
             client_height,
             cell_width: 8,
             cell_height: 16,
+            diagnostic_panel_visible: true,
         })?;
         let viewport = terminal.viewport_metrics()?;
         if viewport.visible == 1 {

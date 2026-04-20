@@ -2,11 +2,6 @@
 
 This specification covers the Teamy Studio application model that users experience after launching the app: the window, the notebook panels inside it, and the interactions that make the UI feel immediate.
 
-## Workspace Windows
-
-behavior[workspace.plus-button.appends-cell]
-Clicking the plus button in a workspace cell window must append a new cell to that workspace and open the new cell in its own window.
-
 ## Window Startup
 
 behavior[window.startup.centered]
