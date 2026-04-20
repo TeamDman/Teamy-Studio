@@ -1660,8 +1660,9 @@ fn handle_scene_left_button_up(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Resu
     let action = with_scene_app_state(|state| {
         state.pointer_position = Some(point);
         let layout = client_layout(hwnd, state.terminal_cell_width, state.terminal_cell_height)?;
+        let pressed_target = state.pressed_target.take();
 
-        if let Some(ScenePressedTarget::DiagnosticsButton) = state.pressed_target.take() {
+        if let Some(ScenePressedTarget::DiagnosticsButton) = pressed_target {
             if layout.diagnostics_button_rect().contains(point) {
                 state.diagnostics_visible = !state.diagnostics_visible;
                 state.diagnostics_button_last_clicked_at = Some(Instant::now());
@@ -1691,19 +1692,19 @@ fn handle_scene_left_button_up(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Resu
             return Ok(SceneMouseUpAction::RenderOnly);
         }
 
-        if let Some(ScenePressedTarget::Action(action)) = state.pressed_target.take() {
-            if scene_action_at_point(state.scene_kind, layout, point) == Some(action) {
-                state.last_clicked_action = Some(ClickState {
-                    action,
-                    clicked_at: Instant::now(),
-                });
-                return Ok(SceneMouseUpAction::Invoke(action));
-            }
-
-            return Ok(SceneMouseUpAction::RenderOnly);
+        let action = scene_mouse_up_action_for_pressed_action(
+            pressed_target,
+            scene_action_at_point(state.scene_kind, layout, point),
+        );
+        if let SceneMouseUpAction::Invoke(action) = action {
+            debug!(?action, "invoking scene action");
+            state.last_clicked_action = Some(ClickState {
+                action,
+                clicked_at: Instant::now(),
+            });
         }
 
-        Ok(SceneMouseUpAction::NotHandled)
+        Ok(action)
     })?;
 
     match action {
@@ -1722,6 +1723,19 @@ fn handle_scene_left_button_up(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Resu
             }
             Ok(true)
         }
+    }
+}
+
+fn scene_mouse_up_action_for_pressed_action(
+    pressed_target: Option<ScenePressedTarget>,
+    action_at_point: Option<SceneAction>,
+) -> SceneMouseUpAction {
+    match pressed_target {
+        Some(ScenePressedTarget::Action(action)) if action_at_point == Some(action) => {
+            SceneMouseUpAction::Invoke(action)
+        }
+        Some(ScenePressedTarget::Action(_)) => SceneMouseUpAction::RenderOnly,
+        _ => SceneMouseUpAction::NotHandled,
     }
 }
 
@@ -4951,6 +4965,28 @@ mod tests {
             Some(RightClickTerminalAction::ConfirmPaste)
         );
         assert_eq!(right_click_terminal_action(false, ""), None);
+    }
+
+    #[test]
+    fn scene_mouse_up_action_invokes_matching_pressed_action() {
+        assert_eq!(
+            scene_mouse_up_action_for_pressed_action(
+                Some(ScenePressedTarget::Action(SceneAction::OpenTerminal)),
+                Some(SceneAction::OpenTerminal),
+            ),
+            SceneMouseUpAction::Invoke(SceneAction::OpenTerminal)
+        );
+    }
+
+    #[test]
+    fn scene_mouse_up_action_keeps_nonmatching_pressed_action_render_only() {
+        assert_eq!(
+            scene_mouse_up_action_for_pressed_action(
+                Some(ScenePressedTarget::Action(SceneAction::OpenTerminal)),
+                Some(SceneAction::OpenAudioPicker),
+            ),
+            SceneMouseUpAction::RenderOnly
+        );
     }
 
     // behavior[verify window.appearance.chrome.runtime-terminal-title]
