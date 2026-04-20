@@ -493,18 +493,19 @@ enum SceneActionDisposition {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SceneMouseUpAction {
+enum ScenePointerAction {
     NotHandled,
+    Handled,
     RenderOnly,
     Invoke(SceneAction),
     WindowChrome(WindowChromeButton),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum WindowChromeMouseUpAction {
+enum WindowChromePointerAction {
     NotHandled,
+    Handled,
     RenderOnly,
-    ToggleDiagnostics,
     Execute(WindowChromeButton),
 }
 
@@ -1642,7 +1643,7 @@ fn handle_scene_left_button_down(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Re
         TerminalSelectionMode::Linear
     };
 
-    with_scene_app_state(|state| {
+    let action = with_scene_app_state(|state| {
         state.pointer_position = Some(point);
         state.pressed_target = None;
         state.diagnostic_selection_drag_point = None;
@@ -1652,8 +1653,11 @@ fn handle_scene_left_button_down(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Re
             state.pending_diagnostic_selection = None;
             state.pressed_target = Some(ScenePressedTarget::ChromeButton(button));
             hwnd.capture_mouse();
-            render_scene_window_frame(state, hwnd, None, false)?;
-            return Ok(true);
+            if button == WindowChromeButton::Diagnostics {
+                scene_toggle_diagnostics_panel(state);
+                return Ok(ScenePointerAction::RenderOnly);
+            }
+            return Ok(ScenePointerAction::WindowChrome(button));
         }
 
         if state.diagnostics_visible
@@ -1673,28 +1677,53 @@ fn handle_scene_left_button_down(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Re
             });
             state.diagnostic_selection_drag_point = Some(point);
             hwnd.capture_mouse();
-            render_scene_window_frame(state, hwnd, None, false)?;
-            return Ok(true);
+            return Ok(ScenePointerAction::RenderOnly);
         }
 
         if let Some(action) = scene_action_at_point(state.scene_kind, layout, point) {
             state.pending_diagnostic_selection = None;
             state.pressed_target = Some(ScenePressedTarget::Action(action));
             hwnd.capture_mouse();
-            render_scene_window_frame(state, hwnd, None, false)?;
-            return Ok(true);
+            state.last_clicked_action = Some(ClickState {
+                action,
+                clicked_at: Instant::now(),
+            });
+            return Ok(ScenePointerAction::Invoke(action));
         }
 
         if scene_drag_handle_contains(layout, point) {
             state.diagnostic_selection = None;
             state.pending_diagnostic_selection = None;
             begin_system_window_drag(hwnd, point)?;
-            return Ok(true);
+            return Ok(ScenePointerAction::Handled);
         }
 
         state.diagnostic_selection = None;
-        Ok(false)
-    })
+        Ok(ScenePointerAction::NotHandled)
+    })?;
+
+    match action {
+        ScenePointerAction::NotHandled => Ok(false),
+        ScenePointerAction::Handled => Ok(true),
+        ScenePointerAction::RenderOnly => {
+            with_scene_app_state(|state| render_scene_window_frame(state, hwnd, None, false))?;
+            Ok(true)
+        }
+        ScenePointerAction::WindowChrome(button) => {
+            execute_window_chrome_button(hwnd, button);
+            Ok(true)
+        }
+        ScenePointerAction::Invoke(action) => {
+            let (app_home, vt_engine) =
+                with_scene_app_state(|state| Ok((state.app_home.clone(), state.vt_engine)))?;
+            let disposition = perform_scene_action(&app_home, vt_engine, action)?;
+            with_scene_app_state(|state| render_scene_window_frame(state, hwnd, None, false))?;
+            if disposition == SceneActionDisposition::CloseWindow {
+                hwnd.post_close();
+            }
+            Ok(true)
+        }
+    }
 }
 
 fn handle_scene_left_button_up(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Result<bool> {
@@ -1708,27 +1737,11 @@ fn handle_scene_left_button_up(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Resu
 
     let action = with_scene_app_state(|state| {
         state.pointer_position = Some(point);
-        let layout = scene_client_layout(hwnd, state)?;
         let pressed_target = state.pressed_target.take();
-
-        if let Some(ScenePressedTarget::ChromeButton(button)) = pressed_target {
-            match window_chrome_mouse_up_action(
-                Some(button),
-                window_chrome_button_at_point(layout, point),
-            ) {
-                WindowChromeMouseUpAction::ToggleDiagnostics => {
-                    scene_toggle_diagnostics_panel(state);
-                }
-                WindowChromeMouseUpAction::Execute(button) => {
-                    return Ok(SceneMouseUpAction::WindowChrome(button));
-                }
-                WindowChromeMouseUpAction::RenderOnly | WindowChromeMouseUpAction::NotHandled => {}
-            }
-            return Ok(SceneMouseUpAction::RenderOnly);
-        }
 
         if let Some(pending_selection) = state.pending_diagnostic_selection.take() {
             state.diagnostic_selection_drag_point = None;
+            let layout = scene_client_layout(hwnd, state)?;
             let cell = scene_diagnostic_cell_from_client_point(
                 layout,
                 point,
@@ -1741,35 +1754,28 @@ fn handle_scene_left_button_up(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Resu
             {
                 state.diagnostic_selection = Some(selection);
             }
-            return Ok(SceneMouseUpAction::RenderOnly);
+            return Ok(ScenePointerAction::RenderOnly);
         }
 
-        let action = scene_mouse_up_action_for_pressed_action(
-            pressed_target,
-            scene_action_at_point(state.scene_kind, layout, point),
-        );
-        if let SceneMouseUpAction::Invoke(action) = action {
-            debug!(?action, "invoking scene action");
-            state.last_clicked_action = Some(ClickState {
-                action,
-                clicked_at: Instant::now(),
-            });
+        if pressed_target.is_some() {
+            return Ok(ScenePointerAction::RenderOnly);
         }
 
-        Ok(action)
+        Ok(ScenePointerAction::NotHandled)
     })?;
 
     match action {
-        SceneMouseUpAction::NotHandled => Ok(false),
-        SceneMouseUpAction::RenderOnly => {
+        ScenePointerAction::NotHandled => Ok(false),
+        ScenePointerAction::Handled => Ok(true),
+        ScenePointerAction::RenderOnly => {
             with_scene_app_state(|state| render_scene_window_frame(state, hwnd, None, false))?;
             Ok(true)
         }
-        SceneMouseUpAction::WindowChrome(button) => {
+        ScenePointerAction::WindowChrome(button) => {
             execute_window_chrome_button(hwnd, button);
             Ok(true)
         }
-        SceneMouseUpAction::Invoke(action) => {
+        ScenePointerAction::Invoke(action) => {
             let (app_home, vt_engine) =
                 with_scene_app_state(|state| Ok((state.app_home.clone(), state.vt_engine)))?;
             let disposition = perform_scene_action(&app_home, vt_engine, action)?;
@@ -1779,37 +1785,6 @@ fn handle_scene_left_button_up(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Resu
             }
             Ok(true)
         }
-    }
-}
-
-fn scene_mouse_up_action_for_pressed_action(
-    pressed_target: Option<ScenePressedTarget>,
-    action_at_point: Option<SceneAction>,
-) -> SceneMouseUpAction {
-    match pressed_target {
-        Some(ScenePressedTarget::Action(action)) if action_at_point == Some(action) => {
-            SceneMouseUpAction::Invoke(action)
-        }
-        Some(ScenePressedTarget::Action(_)) => SceneMouseUpAction::RenderOnly,
-        _ => SceneMouseUpAction::NotHandled,
-    }
-}
-
-fn window_chrome_mouse_up_action(
-    pressed_button: Option<WindowChromeButton>,
-    button_at_point: Option<WindowChromeButton>,
-) -> WindowChromeMouseUpAction {
-    match pressed_button {
-        Some(WindowChromeButton::Diagnostics)
-            if button_at_point == Some(WindowChromeButton::Diagnostics) =>
-        {
-            WindowChromeMouseUpAction::ToggleDiagnostics
-        }
-        Some(button) if button_at_point == Some(button) => {
-            WindowChromeMouseUpAction::Execute(button)
-        }
-        Some(_) => WindowChromeMouseUpAction::RenderOnly,
-        None => WindowChromeMouseUpAction::NotHandled,
     }
 }
 
@@ -1927,6 +1902,25 @@ fn handle_scene_right_button_up(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Res
     }
     with_scene_app_state(|state| render_scene_window_frame(state, hwnd, None, false))?;
     Ok(true)
+}
+
+#[cfg(test)]
+fn scene_mouse_down_action(action_at_point: Option<SceneAction>) -> ScenePointerAction {
+    match action_at_point {
+        Some(action) => ScenePointerAction::Invoke(action),
+        None => ScenePointerAction::NotHandled,
+    }
+}
+
+#[cfg(test)]
+fn window_chrome_mouse_down_action(
+    button_at_point: Option<WindowChromeButton>,
+) -> WindowChromePointerAction {
+    match button_at_point {
+        Some(WindowChromeButton::Diagnostics) => WindowChromePointerAction::RenderOnly,
+        Some(button) => WindowChromePointerAction::Execute(button),
+        None => WindowChromePointerAction::NotHandled,
+    }
 }
 
 fn handle_scene_set_cursor(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Result<bool> {
@@ -3872,6 +3866,13 @@ fn with_scene_app_state<T>(
 }
 
 fn handle_left_button_up(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Result<bool> {
+    let should_release_capture = with_app_state(|state| {
+        Ok(state.pressed_chrome_button.is_some() || state.terminal_scrollbar_drag.is_some())
+    })?;
+    if should_release_capture {
+        hwnd.release_mouse_capture();
+    }
+
     let action = with_app_state(|state| {
         let point = ClientPoint::from_lparam(lparam);
         state.pointer_position = Some(point);
@@ -3886,24 +3887,15 @@ fn handle_left_button_up(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Result<boo
                         point,
                     )
                 });
-            hwnd.release_mouse_capture();
-            return Ok(WindowChromeMouseUpAction::RenderOnly);
+            return Ok(WindowChromePointerAction::RenderOnly);
         }
 
-        if let Some(button) = state.pressed_chrome_button.take() {
-            let layout = terminal_client_layout(hwnd, state)?;
-            let action = window_chrome_mouse_up_action(
-                Some(button),
-                window_chrome_button_at_point(layout, point),
-            );
-            if action == WindowChromeMouseUpAction::ToggleDiagnostics {
-                terminal_toggle_diagnostics_panel(state, hwnd)?;
-            }
-            return Ok(action);
+        if state.pressed_chrome_button.take().is_some() {
+            return Ok(WindowChromePointerAction::RenderOnly);
         }
 
         if state.pending_window_drag.take().is_some() {
-            return Ok(WindowChromeMouseUpAction::RenderOnly);
+            return Ok(WindowChromePointerAction::RenderOnly);
         }
 
         if let Some(pending_selection) = state.pending_diagnostic_selection.take() {
@@ -3921,7 +3913,7 @@ fn handle_left_button_up(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Result<boo
             {
                 state.diagnostic_selection = Some(selection);
             }
-            return Ok(WindowChromeMouseUpAction::RenderOnly);
+            return Ok(WindowChromePointerAction::RenderOnly);
         }
 
         if let Some(pending_selection) = state.pending_terminal_selection.take() {
@@ -3936,19 +3928,20 @@ fn handle_left_button_up(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Result<boo
             {
                 state.terminal_selection = Some(selection);
             }
-            return Ok(WindowChromeMouseUpAction::RenderOnly);
+            return Ok(WindowChromePointerAction::RenderOnly);
         }
 
-        Ok(WindowChromeMouseUpAction::NotHandled)
+        Ok(WindowChromePointerAction::NotHandled)
     })?;
 
     match action {
-        WindowChromeMouseUpAction::NotHandled => Ok(false),
-        WindowChromeMouseUpAction::RenderOnly | WindowChromeMouseUpAction::ToggleDiagnostics => {
+        WindowChromePointerAction::NotHandled => Ok(false),
+        WindowChromePointerAction::Handled => Ok(true),
+        WindowChromePointerAction::RenderOnly => {
             with_app_state(|state| render_current_frame(state, hwnd, None))?;
             Ok(true)
         }
-        WindowChromeMouseUpAction::Execute(button) => {
+        WindowChromePointerAction::Execute(button) => {
             execute_window_chrome_button(hwnd, button);
             Ok(true)
         }
@@ -3972,7 +3965,7 @@ fn handle_left_button_down(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Result<b
         TerminalSelectionMode::Linear
     };
 
-    with_app_state(|state| {
+    let action = with_app_state(|state| {
         state.pointer_position = Some(point);
         state.pending_window_drag = None;
         state.terminal_selection_drag_point = None;
@@ -3988,8 +3981,12 @@ fn handle_left_button_down(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Result<b
                 hwnd.release_mouse_capture();
             }
             state.pressed_chrome_button = Some(button);
-            render_current_frame(state, hwnd, None)?;
-            return Ok(true);
+            hwnd.capture_mouse();
+            if button == WindowChromeButton::Diagnostics {
+                terminal_toggle_diagnostics_panel(state, hwnd)?;
+                return Ok(WindowChromePointerAction::RenderOnly);
+            }
+            return Ok(WindowChromePointerAction::Execute(button));
         }
 
         state.pending_diagnostic_selection = None;
@@ -4016,8 +4013,7 @@ fn handle_left_button_down(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Result<b
                 mode: selection_mode,
             });
             state.diagnostic_selection_drag_point = Some(point);
-            render_current_frame(state, hwnd, None)?;
-            return Ok(true);
+            return Ok(WindowChromePointerAction::RenderOnly);
         }
 
         if !in_drag_handle {
@@ -4029,7 +4025,7 @@ fn handle_left_button_down(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Result<b
                 if let Some(part) = terminal_scrollbar_hit_test(scrollbar_rect, scrollbar, point) {
                     let Some(geometry) = terminal_scrollbar_geometry(scrollbar_rect, scrollbar)
                     else {
-                        return Ok(false);
+                        return Ok(WindowChromePointerAction::NotHandled);
                     };
                     let point_y = point.to_win32_point()?.y;
                     let grab_offset_y = match part {
@@ -4050,8 +4046,7 @@ fn handle_left_button_down(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Result<b
                     state.terminal_scrollbar_drag = Some(TerminalScrollbarDrag { grab_offset_y });
                     state.terminal.scroll_viewport_to_offset(target_offset)?;
                     hwnd.capture_mouse();
-                    render_current_frame(state, hwnd, None)?;
-                    return Ok(true);
+                    return Ok(WindowChromePointerAction::RenderOnly);
                 }
             }
 
@@ -4065,11 +4060,10 @@ fn handle_left_button_down(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Result<b
                     mode: selection_mode,
                 });
                 state.terminal_selection_drag_point = Some(point);
-                render_current_frame(state, hwnd, None)?;
-                return Ok(true);
+                return Ok(WindowChromePointerAction::RenderOnly);
             }
 
-            return Ok(false);
+            return Ok(WindowChromePointerAction::NotHandled);
         }
 
         state.terminal_selection = None;
@@ -4081,8 +4075,21 @@ fn handle_left_button_down(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Result<b
         state.terminal_scrollbar_hovered_part = None;
         state.terminal_scrollbar_drag = None;
         begin_system_window_drag(hwnd, point)?;
-        Ok(true)
-    })
+        Ok(WindowChromePointerAction::Handled)
+    })?;
+
+    match action {
+        WindowChromePointerAction::NotHandled => Ok(false),
+        WindowChromePointerAction::Handled => Ok(true),
+        WindowChromePointerAction::RenderOnly => {
+            with_app_state(|state| render_current_frame(state, hwnd, None))?;
+            Ok(true)
+        }
+        WindowChromePointerAction::Execute(button) => {
+            execute_window_chrome_button(hwnd, button);
+            Ok(true)
+        }
+    }
 }
 
 #[expect(
@@ -5210,57 +5217,42 @@ mod tests {
     }
 
     #[test]
-    fn scene_mouse_up_action_invokes_matching_pressed_action() {
+    fn scene_mouse_down_action_invokes_hit_action() {
         assert_eq!(
-            scene_mouse_up_action_for_pressed_action(
-                Some(ScenePressedTarget::Action(SceneAction::OpenTerminal)),
-                Some(SceneAction::OpenTerminal),
-            ),
-            SceneMouseUpAction::Invoke(SceneAction::OpenTerminal)
+            scene_mouse_down_action(Some(SceneAction::OpenTerminal),),
+            ScenePointerAction::Invoke(SceneAction::OpenTerminal)
         );
     }
 
     #[test]
-    fn scene_mouse_up_action_keeps_nonmatching_pressed_action_render_only() {
+    fn scene_mouse_down_action_ignores_empty_hit_target() {
         assert_eq!(
-            scene_mouse_up_action_for_pressed_action(
-                Some(ScenePressedTarget::Action(SceneAction::OpenTerminal)),
-                Some(SceneAction::OpenAudioPicker),
-            ),
-            SceneMouseUpAction::RenderOnly
+            scene_mouse_down_action(None),
+            ScenePointerAction::NotHandled
         );
     }
 
     #[test]
-    fn window_chrome_mouse_up_action_toggles_matching_diagnostics_button() {
+    fn window_chrome_mouse_down_action_handles_diagnostics_on_press() {
         assert_eq!(
-            window_chrome_mouse_up_action(
-                Some(WindowChromeButton::Diagnostics),
-                Some(WindowChromeButton::Diagnostics),
-            ),
-            WindowChromeMouseUpAction::ToggleDiagnostics
+            window_chrome_mouse_down_action(Some(WindowChromeButton::Diagnostics),),
+            WindowChromePointerAction::RenderOnly
         );
     }
 
     #[test]
-    fn window_chrome_mouse_up_action_executes_matching_minimize_button() {
+    fn window_chrome_mouse_down_action_executes_minimize_on_press() {
         assert_eq!(
-            window_chrome_mouse_up_action(
-                Some(WindowChromeButton::Minimize),
-                Some(WindowChromeButton::Minimize),
-            ),
-            WindowChromeMouseUpAction::Execute(WindowChromeButton::Minimize)
+            window_chrome_mouse_down_action(Some(WindowChromeButton::Minimize),),
+            WindowChromePointerAction::Execute(WindowChromeButton::Minimize)
         );
     }
 
     #[test]
-    fn window_chrome_mouse_up_action_keeps_nonmatching_button_render_only() {
+    fn window_chrome_mouse_down_action_ignores_empty_hit_target() {
         assert_eq!(
-            window_chrome_mouse_up_action(
-                Some(WindowChromeButton::Close),
-                Some(WindowChromeButton::Minimize),
-            ),
-            WindowChromeMouseUpAction::RenderOnly
+            window_chrome_mouse_down_action(None),
+            WindowChromePointerAction::NotHandled
         );
     }
 

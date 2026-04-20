@@ -2823,6 +2823,9 @@ fn build_ghostty_display_state(
 
                 if !graphemes.is_empty() {
                     for character in graphemes {
+                        if !should_render_terminal_glyph(character) {
+                            continue;
+                        }
                         display_row.glyphs.push(TerminalDisplayGlyph {
                             cell: viewport_cell,
                             character,
@@ -2862,6 +2865,10 @@ fn build_ghostty_display_state(
 
         Ok(display)
     })
+}
+
+fn should_render_terminal_glyph(character: char) -> bool {
+    character != ' ' && !character.is_control()
 }
 
 fn build_teamy_display_state(
@@ -2925,7 +2932,7 @@ fn build_teamy_display_state(
                     });
                 }
 
-                if cell.character != ' ' {
+                if should_render_terminal_glyph(cell.character) {
                     display_row.glyphs.push(TerminalDisplayGlyph {
                         cell: viewport_cell,
                         character: cell.character,
@@ -4064,20 +4071,21 @@ mod tests {
         TerminalDisplayGlyph, TerminalDisplayRow, TerminalDisplayState, TerminalLayout,
         TerminalProgressState, TerminalSelection, TerminalSelectionMode, TerminalSession,
         TerminalTextRow, TerminalViewportMetrics, apply_observed_osc_payload,
-        build_teamy_display_state, dirty_terminal_row_indices, extract_selected_text,
-        map_cursor_style, map_virtual_key, observe_osc_sequences, osc_terminator,
-        parse_osc_9_4_progress, partial_osc_prefix_len, pending_output_display_publish_interval,
-        pending_output_pump_time_budget, pending_output_slice_bytes, resolve_teamy_cell_colors,
-        resolve_terminal_cell_colors, should_close_from_echoed_ctrl_d,
-        should_keep_active_prompt_visible_on_resize, should_mark_prompt_input_written_for_key,
-        should_publish_terminal_display_state, should_publish_terminal_display_update,
-        should_refresh_semantic_prompt_tracking, should_translate_ctrl_d_key,
-        should_translate_ctrl_d_to_exit, should_translate_ctrl_l_key,
+        build_ghostty_display_state, build_teamy_display_state, dirty_terminal_row_indices,
+        extract_selected_text, map_cursor_style, map_virtual_key, observe_osc_sequences,
+        osc_terminator, parse_osc_9_4_progress, partial_osc_prefix_len,
+        pending_output_display_publish_interval, pending_output_pump_time_budget,
+        pending_output_slice_bytes, resolve_teamy_cell_colors, resolve_terminal_cell_colors,
+        should_close_from_echoed_ctrl_d, should_keep_active_prompt_visible_on_resize,
+        should_mark_prompt_input_written_for_key, should_publish_terminal_display_state,
+        should_publish_terminal_display_update, should_refresh_semantic_prompt_tracking,
+        should_translate_ctrl_d_key, should_translate_ctrl_d_to_exit, should_translate_ctrl_l_key,
         should_translate_ctrl_l_to_form_feed, strip_echoed_ctrl_d, viewport_is_bottom_anchored,
     };
     use crate::app::VtEngineChoice;
     use crate::app::spatial::TerminalCellPoint;
     use crate::app::teamy_terminal_engine::{TeamyColor, TeamyTerminalEngine};
+    use libghostty_vt::TerminalOptions;
     use libghostty_vt::key;
     use libghostty_vt::render::Colors;
     use libghostty_vt::style::RgbColor;
@@ -4085,6 +4093,8 @@ mod tests {
     use std::ffi::OsStr;
     use std::sync::Arc;
     use std::time::Duration;
+
+    use super::GhosttyTerminalEngine;
 
     // behavior[verify window.appearance.code-panel.terminal-alignment]
     #[test]
@@ -4277,6 +4287,41 @@ mod tests {
             glyph.cell == TerminalCellPoint::new(1, 0)
                 && glyph.color == [4.0 / 255.0, 5.0 / 255.0, 6.0 / 255.0, 1.0]
         }));
+    }
+
+    #[test]
+    fn ghostty_display_state_skips_tab_glyphs_and_keeps_tab_stop_alignment() -> eyre::Result<()> {
+        let mut engine = GhosttyTerminalEngine::new(TerminalOptions {
+            cols: 12,
+            rows: 2,
+            max_scrollback: 64,
+        })?;
+        engine.vt_write(b"a\tb");
+
+        let display = build_ghostty_display_state(
+            &mut engine,
+            None,
+            false,
+            None,
+            TerminalViewportMetrics {
+                total: 2,
+                offset: 0,
+                visible: 2,
+                scrollback: 0,
+            },
+        )?;
+
+        assert_eq!(
+            display.rows[0]
+                .glyphs
+                .iter()
+                .map(|glyph| glyph.character)
+                .collect::<Vec<_>>(),
+            vec!['a', 'b']
+        );
+        assert_eq!(display.rows[0].glyphs[0].cell, TerminalCellPoint::new(0, 0));
+        assert_eq!(display.rows[0].glyphs[1].cell, TerminalCellPoint::new(8, 0));
+        Ok(())
     }
 
     #[test]
