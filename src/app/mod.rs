@@ -75,7 +75,7 @@ pub struct RenderOffscreenSelfTestReport {
 ///
 /// This function will return an error if the platform-specific window cannot be launched.
 pub fn run(app_home: &AppHome) -> eyre::Result<()> {
-    windows_app::run_launcher(app_home, Default::default())
+    windows_app::run_launcher(app_home, VtEngineChoice::default())
 }
 
 /// Run the Teamy Studio application shell with an explicit VT engine.

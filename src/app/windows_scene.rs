@@ -8,11 +8,16 @@ use super::windows_d3d12_renderer::{
 };
 use super::windows_terminal::TerminalLayout;
 
-const BUTTON_SIZE: i32 = 300;
-const BUTTON_GAP: i32 = 48;
-const BUTTON_LABEL_GAP: i32 = 18;
-const BUTTON_LABEL_HEIGHT: i32 = 42;
-const BUTTON_PROXIMITY_RADIUS_PX: f32 = 96.0;
+const MAX_BUTTON_SIZE: i32 = 300;
+const MIN_BUTTON_GAP: i32 = 12;
+const MAX_BUTTON_GAP: i32 = 48;
+const MIN_BUTTON_LABEL_GAP: i32 = 8;
+const MAX_BUTTON_LABEL_GAP: i32 = 18;
+const MIN_BUTTON_LABEL_HEIGHT: i32 = 20;
+const MAX_BUTTON_LABEL_HEIGHT: i32 = 42;
+const MIN_BUTTON_SPRITE_INSET: i32 = 12;
+const MAX_BUTTON_SPRITE_INSET: i32 = 24;
+const BUTTON_PROXIMITY_RADIUS_PX: f64 = 96.0;
 const CLICK_DECAY_DURATION: Duration = Duration::from_millis(220);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -48,11 +53,37 @@ pub struct SceneButtonSpec {
     pub color: [f32; 4],
 }
 
+#[expect(
+    clippy::struct_field_names,
+    reason = "these rect names reflect the rendered regions and hit targets"
+)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SceneButtonLayout {
     pub card_rect: ClientRect,
     pub sprite_rect: ClientRect,
     pub label_rect: ClientRect,
+}
+
+impl SceneButtonLayout {
+    #[must_use]
+    pub fn hit_rect(self) -> ClientRect {
+        ClientRect::new(
+            self.card_rect.left().min(self.label_rect.left()),
+            self.card_rect.top().min(self.label_rect.top()),
+            self.card_rect.right().max(self.label_rect.right()),
+            self.card_rect.bottom().max(self.label_rect.bottom()),
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SceneButtonGridMetrics {
+    columns: usize,
+    button_size: i32,
+    button_gap: i32,
+    label_gap: i32,
+    label_height: i32,
+    sprite_inset: i32,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -188,17 +219,15 @@ pub fn layout_scene_buttons(body_rect: ClientRect, count: usize) -> Vec<SceneBut
         return Vec::new();
     }
 
-    let max_columns = (body_rect.width() + BUTTON_GAP) / (BUTTON_SIZE + BUTTON_GAP);
-    let columns = usize::try_from(max_columns.max(1))
-        .unwrap_or(1)
-        .min(count)
-        .max(1);
+    let metrics = scene_button_grid_metrics(body_rect, count);
+    let columns = metrics.columns;
     let rows = count.div_ceil(columns);
-    let total_width = i32::try_from(columns).unwrap_or(1) * BUTTON_SIZE
-        + (i32::try_from(columns).unwrap_or(1) - 1).max(0) * BUTTON_GAP;
-    let row_height = BUTTON_SIZE + BUTTON_LABEL_GAP + BUTTON_LABEL_HEIGHT;
-    let total_height = i32::try_from(rows).unwrap_or(1) * row_height
-        + (i32::try_from(rows).unwrap_or(1) - 1).max(0) * BUTTON_GAP;
+    let columns_i32 = i32::try_from(columns).unwrap_or(1).max(1);
+    let rows_i32 = i32::try_from(rows).unwrap_or(1).max(1);
+    let total_width =
+        columns_i32 * metrics.button_size + (columns_i32 - 1).max(0) * metrics.button_gap;
+    let row_height = metrics.button_size + metrics.label_gap + metrics.label_height;
+    let total_height = rows_i32 * row_height + (rows_i32 - 1).max(0) * metrics.button_gap;
     let start_x = body_rect.left() + ((body_rect.width() - total_width).max(0) / 2);
     let start_y = body_rect.top() + ((body_rect.height() - total_height).max(0) / 2);
 
@@ -206,22 +235,78 @@ pub fn layout_scene_buttons(body_rect: ClientRect, count: usize) -> Vec<SceneBut
     for index in 0..count {
         let column = i32::try_from(index % columns).unwrap_or_default();
         let row = i32::try_from(index / columns).unwrap_or_default();
-        let left = start_x + column * (BUTTON_SIZE + BUTTON_GAP);
-        let top = start_y + row * (row_height + BUTTON_GAP);
-        let card_rect = ClientRect::new(left, top, left + BUTTON_SIZE, top + BUTTON_SIZE);
+        let left = start_x + column * (metrics.button_size + metrics.button_gap);
+        let top = start_y + row * (row_height + metrics.button_gap);
+        let card_rect = ClientRect::new(
+            left,
+            top,
+            left + metrics.button_size,
+            top + metrics.button_size,
+        );
         layouts.push(SceneButtonLayout {
-            sprite_rect: card_rect.inset(20),
+            sprite_rect: card_rect.inset(metrics.sprite_inset),
             label_rect: ClientRect::new(
                 card_rect.left(),
-                card_rect.bottom() + BUTTON_LABEL_GAP,
+                card_rect.bottom() + metrics.label_gap,
                 card_rect.right(),
-                card_rect.bottom() + BUTTON_LABEL_GAP + BUTTON_LABEL_HEIGHT,
+                card_rect.bottom() + metrics.label_gap + metrics.label_height,
             ),
             card_rect,
         });
     }
 
     layouts
+}
+
+fn scene_button_grid_metrics(body_rect: ClientRect, count: usize) -> SceneButtonGridMetrics {
+    let mut best_metrics = scene_button_grid_candidate(body_rect, count, 1);
+    for columns in 2..=count {
+        let candidate = scene_button_grid_candidate(body_rect, count, columns);
+        if candidate.button_size > best_metrics.button_size
+            || (candidate.button_size == best_metrics.button_size
+                && candidate.columns > best_metrics.columns)
+        {
+            best_metrics = candidate;
+        }
+    }
+
+    best_metrics
+}
+
+fn scene_button_grid_candidate(
+    body_rect: ClientRect,
+    count: usize,
+    columns: usize,
+) -> SceneButtonGridMetrics {
+    let rows = count.div_ceil(columns);
+    let columns_i32 = i32::try_from(columns).unwrap_or(1).max(1);
+    let rows_i32 = i32::try_from(rows).unwrap_or(1).max(1);
+    let button_gap =
+        (body_rect.width().min(body_rect.height()) / 20).clamp(MIN_BUTTON_GAP, MAX_BUTTON_GAP);
+    let width_budget = body_rect.width() - ((columns_i32 - 1).max(0) * button_gap);
+    let height_budget = body_rect.height() - ((rows_i32 - 1).max(0) * button_gap);
+    let provisional_button_size = (width_budget / columns_i32)
+        .min(height_budget / rows_i32)
+        .clamp(1, MAX_BUTTON_SIZE);
+    let label_gap =
+        (provisional_button_size / 18).clamp(MIN_BUTTON_LABEL_GAP, MAX_BUTTON_LABEL_GAP);
+    let label_height =
+        (provisional_button_size / 7).clamp(MIN_BUTTON_LABEL_HEIGHT, MAX_BUTTON_LABEL_HEIGHT);
+    let height_budget = body_rect.height()
+        - ((rows_i32 - 1).max(0) * button_gap)
+        - (rows_i32 * (label_gap + label_height));
+    let button_size = (width_budget / columns_i32)
+        .min(height_budget / rows_i32)
+        .clamp(1, MAX_BUTTON_SIZE);
+
+    SceneButtonGridMetrics {
+        columns,
+        button_size,
+        button_gap,
+        label_gap,
+        label_height,
+        sprite_inset: (button_size / 12).clamp(MIN_BUTTON_SPRITE_INSET, MAX_BUTTON_SPRITE_INSET),
+    }
 }
 
 #[must_use]
@@ -304,27 +389,30 @@ fn build_scene_shell(
     scene
 }
 
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "the hover proximity is normalized into the 0..=1 range before conversion"
+)]
 fn proximity_to_rect(rect: ClientRect, pointer: ClientPoint) -> f32 {
-    let point = match pointer.to_win32_point() {
-        Ok(point) => point,
-        Err(_) => return 0.0,
+    let Ok(point) = pointer.to_win32_point() else {
+        return 0.0;
     };
     let dx = if point.x < rect.left() {
-        (rect.left() - point.x) as f32
+        f64::from(rect.left() - point.x)
     } else if point.x > rect.right() {
-        (point.x - rect.right()) as f32
+        f64::from(point.x - rect.right())
     } else {
         0.0
     };
     let dy = if point.y < rect.top() {
-        (rect.top() - point.y) as f32
+        f64::from(rect.top() - point.y)
     } else if point.y > rect.bottom() {
-        (point.y - rect.bottom()) as f32
+        f64::from(point.y - rect.bottom())
     } else {
         0.0
     };
     let distance = (dx * dx + dy * dy).sqrt();
-    (1.0 - (distance / BUTTON_PROXIMITY_RADIUS_PX)).clamp(0.0, 1.0)
+    (1.0 - (distance / BUTTON_PROXIMITY_RADIUS_PX)).clamp(0.0, 1.0) as f32
 }
 
 #[cfg(test)]
@@ -338,6 +426,31 @@ mod tests {
         assert_eq!(layouts.len(), 3);
         assert!(layouts[0].card_rect.left() < layouts[1].card_rect.left());
         assert_eq!(layouts[0].card_rect.top(), layouts[1].card_rect.top());
+    }
+
+    #[test]
+    fn scene_button_layouts_shrink_to_fit_small_windows() {
+        let body_rect = ClientRect::new(0, 0, 560, 340);
+        let layouts = layout_scene_buttons(body_rect, 3);
+
+        assert_eq!(layouts.len(), 3);
+        assert!(layouts[0].card_rect.width() < MAX_BUTTON_SIZE);
+        for layout in layouts {
+            assert!(layout.card_rect.left() >= body_rect.left());
+            assert!(layout.card_rect.right() <= body_rect.right());
+            assert!(layout.label_rect.bottom() <= body_rect.bottom());
+        }
+    }
+
+    #[test]
+    fn scene_button_hit_rect_covers_card_and_label() {
+        let layout = SceneButtonLayout {
+            card_rect: ClientRect::new(10, 20, 110, 120),
+            sprite_rect: ClientRect::new(20, 30, 100, 110),
+            label_rect: ClientRect::new(10, 130, 110, 160),
+        };
+
+        assert_eq!(layout.hit_rect(), ClientRect::new(10, 20, 110, 160));
     }
 
     #[test]

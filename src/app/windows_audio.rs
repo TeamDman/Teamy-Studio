@@ -67,10 +67,10 @@ pub fn current_bell_source() -> BellSource {
 pub fn current_bell_source_label() -> String {
     match current_bell_source() {
         BellSource::Windows => "Windows".to_owned(),
-        BellSource::File(path) => path
-            .file_name()
-            .map(|name| name.to_string_lossy().to_string())
-            .unwrap_or_else(|| path.display().to_string()),
+        BellSource::File(path) => path.file_name().map_or_else(
+            || path.display().to_string(),
+            |name| name.to_string_lossy().to_string(),
+        ),
     }
 }
 
@@ -209,7 +209,10 @@ mod tests {
     fn bell_source_config_roundtrips_file_source() {
         let source = BellSource::File(PathBuf::from("C:/bell.wav"));
 
-        assert_eq!(parse_bell_source_config(&bell_source_config_text(&source)), source);
+        assert_eq!(
+            parse_bell_source_config(&bell_source_config_text(&source)),
+            source
+        );
     }
 
     #[test]

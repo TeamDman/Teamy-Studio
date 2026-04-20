@@ -36,15 +36,15 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, EnumWindows, GetClassNameW,
     GetClientRect, GetCursorPos, GetMessageW, GetSystemMetrics, GetWindowRect,
     GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, HTCAPTION, HTCLIENT, IDC_ARROW,
-    IDC_SIZEALL, IsWindowVisible, KillTimer, LoadCursorW, MSG, MoveWindow, PostMessageW,
-    PostQuitMessage, RegisterClassExW, SM_CXPADDEDBORDER, SM_CXSCREEN, SM_CXSIZEFRAME, SM_CYSCREEN,
-    SM_CYSIZEFRAME, SW_SHOW, SYSTEM_METRICS_INDEX, SetCursor, SetTimer, SetWindowTextW, ShowWindow,
-    TranslateMessage, WM_CHAR, WM_CLOSE, WM_DESTROY, WM_ENTERSIZEMOVE, WM_ERASEBKGND,
-    WM_EXITSIZEMOVE, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP,
-    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCALCSIZE, WM_NCHITTEST, WM_NCLBUTTONDOWN, WM_PAINT,
-    WM_RBUTTONUP, WM_SETCURSOR, WM_SETFOCUS, WM_SIZE, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER,
-    WNDCLASSEXW, WS_EX_APPWINDOW, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP, WS_THICKFRAME,
-    WS_VISIBLE,
+    IDC_HAND, IDC_IBEAM, IDC_SIZEALL, IsWindowVisible, KillTimer, LoadCursorW, MSG, MoveWindow,
+    PostMessageW, PostQuitMessage, RegisterClassExW, SM_CXPADDEDBORDER, SM_CXSCREEN,
+    SM_CXSIZEFRAME, SM_CYSCREEN, SM_CYSIZEFRAME, SW_SHOW, SYSTEM_METRICS_INDEX, SetCursor,
+    SetTimer, SetWindowTextW, ShowWindow, TranslateMessage, WM_CHAR, WM_CLOSE, WM_DESTROY,
+    WM_ENTERSIZEMOVE, WM_ERASEBKGND, WM_EXITSIZEMOVE, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCALCSIZE, WM_NCHITTEST,
+    WM_NCLBUTTONDOWN, WM_PAINT, WM_RBUTTONUP, WM_SETCURSOR, WM_SETFOCUS, WM_SIZE, WM_SYSKEYDOWN,
+    WM_SYSKEYUP, WM_TIMER, WNDCLASSEXW, WS_EX_APPWINDOW, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP,
+    WS_THICKFRAME, WS_VISIBLE,
 };
 use windows::core::{BOOL, PCWSTR, w};
 
@@ -106,7 +106,7 @@ const TERMINAL_THROUGHPUT_BENCHMARK_START_MARKER: &str = "__TEAMY_TERMINAL_THROU
 const TERMINAL_THROUGHPUT_BENCHMARK_DONE_MARKER: &str = "__TEAMY_TERMINAL_THROUGHPUT_DONE__";
 const TERMINAL_THROUGHPUT_BENCHMARK_MEASURE_PREFIX: &str =
     "__TEAMY_TERMINAL_THROUGHPUT_MEASURE_MS=";
-const TERMINAL_THROUGHPUT_BENCHMARK_TIMEOUT: Duration = Duration::from_secs(60);
+const TERMINAL_THROUGHPUT_BENCHMARK_TIMEOUT: Duration = Duration::from_mins(1);
 const TERMINAL_THROUGHPUT_BENCHMARK_POLL_INTERVAL: Duration = Duration::from_millis(1);
 const TERMINAL_THROUGHPUT_RESULTS_DIR: &str = "self-test/terminal-throughput";
 
@@ -115,6 +115,10 @@ thread_local! {
     static SCENE_APP_STATE: RefCell<Option<SceneAppState>> = const { RefCell::new(None) };
 }
 
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "window interaction state is tracked independently for input routing"
+)]
 struct AppState {
     hwnd: Option<WindowHandle>,
     launch_title: Option<String>,
@@ -580,12 +584,7 @@ pub fn run(
         }
         None => TerminalSession::new(app_home, Some(working_dir), vt_engine),
     })?;
-    run_with_terminal_session(
-        terminal,
-        launch_command_argv,
-        initial_stdin,
-        title,
-    )
+    run_with_terminal_session(terminal, launch_command_argv.len(), initial_stdin, title)
 }
 
 pub fn run_launcher(app_home: &AppHome, vt_engine: VtEngineChoice) -> eyre::Result<()> {
@@ -649,13 +648,14 @@ pub fn list_terminal_windows() -> eyre::Result<Vec<TerminalWindowSummary>> {
     Ok(windows)
 }
 
-#[instrument(level = "info", skip_all, fields(argc = launch_command_argv.len(), has_initial_stdin = initial_stdin.is_some(), has_title = title.is_some()))]
+#[instrument(level = "info", skip_all, fields(argc = launch_command_argc, has_initial_stdin = initial_stdin.is_some(), has_title = title.is_some()))]
 fn run_with_terminal_session(
     terminal: TerminalSession,
-    launch_command_argv: Vec<String>,
+    launch_command_argc: usize,
     initial_stdin: Option<&str>,
     title: Option<&str>,
 ) -> eyre::Result<()> {
+    let _ = launch_command_argc;
     let window_thread = WindowThread::current();
     let terminal_font_height = TERMINAL_FONT_HEIGHT;
     let (terminal_cell_width, terminal_cell_height) = info_span!(
@@ -749,7 +749,8 @@ fn run_scene_window(
 ) -> eyre::Result<()> {
     let window_thread = WindowThread::current();
     let focused_render_interval_ms = measure_focused_render_interval_ms();
-    let (terminal_cell_width, terminal_cell_height) = measure_terminal_cell_size(TERMINAL_FONT_HEIGHT)?;
+    let (terminal_cell_width, terminal_cell_height) =
+        measure_terminal_cell_size(TERMINAL_FONT_HEIGHT)?;
     let (diagnostic_cell_width, diagnostic_cell_height) =
         measure_terminal_cell_size(DIAGNOSTIC_FONT_HEIGHT)?;
 
@@ -1287,7 +1288,10 @@ fn create_window(window_thread: WindowThread, window_title: &str) -> eyre::Resul
 }
 
 #[instrument(level = "info", skip_all)]
-fn create_scene_window(window_thread: WindowThread, window_title: &str) -> eyre::Result<WindowHandle> {
+fn create_scene_window(
+    window_thread: WindowThread,
+    window_title: &str,
+) -> eyre::Result<WindowHandle> {
     let instance = get_current_module().wrap_err("failed to get module handle")?;
 
     let class = WNDCLASSEXW {
@@ -1598,6 +1602,7 @@ fn handle_scene_left_button_down(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Re
         if layout.diagnostics_button_rect().contains(point) {
             state.pending_diagnostic_selection = None;
             state.pressed_target = Some(ScenePressedTarget::DiagnosticsButton);
+            hwnd.capture_mouse();
             render_scene_window_frame(state, hwnd, None, false)?;
             return Ok(true);
         }
@@ -1618,6 +1623,7 @@ fn handle_scene_left_button_down(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Re
                 mode: selection_mode,
             });
             state.diagnostic_selection_drag_point = Some(point);
+            hwnd.capture_mouse();
             render_scene_window_frame(state, hwnd, None, false)?;
             return Ok(true);
         }
@@ -1625,6 +1631,7 @@ fn handle_scene_left_button_down(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Re
         if let Some(action) = scene_action_at_point(state.scene_kind, layout, point) {
             state.pending_diagnostic_selection = None;
             state.pressed_target = Some(ScenePressedTarget::Action(action));
+            hwnd.capture_mouse();
             render_scene_window_frame(state, hwnd, None, false)?;
             return Ok(true);
         }
@@ -1643,6 +1650,12 @@ fn handle_scene_left_button_down(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Re
 
 fn handle_scene_left_button_up(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Result<bool> {
     let point = ClientPoint::from_lparam(lparam);
+    let should_release_capture = with_scene_app_state(|state| {
+        Ok(state.pressed_target.is_some() || state.pending_diagnostic_selection.is_some())
+    })?;
+    if should_release_capture {
+        hwnd.release_mouse_capture();
+    }
 
     let action = with_scene_app_state(|state| {
         state.pointer_position = Some(point);
@@ -1712,7 +1725,11 @@ fn handle_scene_left_button_up(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Resu
     }
 }
 
-fn handle_scene_mouse_move(hwnd: WindowHandle, wparam: WPARAM, lparam: LPARAM) -> eyre::Result<bool> {
+fn handle_scene_mouse_move(
+    hwnd: WindowHandle,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> eyre::Result<bool> {
     let point = ClientPoint::from_lparam(lparam);
     let previous_pointer = with_scene_app_state(|state| {
         let previous = state.pointer_position;
@@ -1732,7 +1749,8 @@ fn handle_scene_mouse_move(hwnd: WindowHandle, wparam: WPARAM, lparam: LPARAM) -
         } else if point == pending_selection.origin {
             update_pending_terminal_selection_action(pending_selection, point, true, None)
         } else {
-            let layout = client_layout(hwnd, state.terminal_cell_width, state.terminal_cell_height)?;
+            let layout =
+                client_layout(hwnd, state.terminal_cell_width, state.terminal_cell_height)?;
             let cell = scene_diagnostic_cell_from_client_point(
                 layout,
                 point,
@@ -1766,8 +1784,10 @@ fn handle_scene_mouse_move(hwnd: WindowHandle, wparam: WPARAM, lparam: LPARAM) -
 
     let should_render = with_scene_app_state(|state| {
         let layout = client_layout(hwnd, state.terminal_cell_width, state.terminal_cell_height)?;
-        Ok(scene_interactive_region_contains(state, layout, previous_pointer)
-            || scene_interactive_region_contains(state, layout, Some(point)))
+        Ok(
+            scene_interactive_region_contains(state, layout, previous_pointer)
+                || scene_interactive_region_contains(state, layout, Some(point)),
+        )
     })?;
 
     if should_render {
@@ -1813,31 +1833,33 @@ fn handle_scene_right_button_up(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Res
     if !copy_text.is_empty()
         && let Err(error) = write_clipboard(&copy_text)
     {
-        error!(?error, "failed to copy scene diagnostics text to the clipboard");
+        error!(
+            ?error,
+            "failed to copy scene diagnostics text to the clipboard"
+        );
     }
     with_scene_app_state(|state| render_scene_window_frame(state, hwnd, None, false))?;
     Ok(true)
 }
 
 fn handle_scene_set_cursor(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Result<bool> {
-    if !should_override_drag_cursor(with_scene_app_state(|state| Ok(state.in_move_size_loop))?) {
-        return Ok(false);
-    }
-
     let hit_test_code = u32::from(low_word_u16(lparam.0));
     if hit_test_code != HTCAPTION && hit_test_code != HTCLIENT {
         return Ok(false);
     }
 
     let point = cursor_client_point(hwnd)?;
-    if !scene_hit_test_drag_handle_point(hwnd, point)? {
-        return Ok(false);
+    let cursor = with_scene_app_state(|state| {
+        let layout = client_layout(hwnd, state.terminal_cell_width, state.terminal_cell_height)?;
+        Ok(scene_cursor_for_point(state, layout, point))
+    })?;
+
+    if let Some(cursor) = cursor {
+        set_system_cursor(cursor);
+        return Ok(true);
     }
 
-    let move_cursor = load_cursor(IDC_SIZEALL);
-    // Safety: setting the cursor for the current WM_SETCURSOR handling path is valid.
-    unsafe { SetCursor(Some(move_cursor)) };
-    Ok(true)
+    Ok(false)
 }
 
 fn handle_enter_size_move(hwnd: WindowHandle) -> LRESULT {
@@ -2346,7 +2368,8 @@ fn scene_button_visual_states(
 ) -> Vec<(SceneAction, ButtonVisualState)> {
     let now = Instant::now();
     let specs = windows_scene::scene_button_specs(state.scene_kind);
-    let button_layouts = windows_scene::layout_scene_buttons(layout.terminal_panel_rect(), specs.len());
+    let button_layouts =
+        windows_scene::layout_scene_buttons(layout.terminal_panel_rect(), specs.len());
 
     specs
         .iter()
@@ -2361,7 +2384,7 @@ fn scene_button_visual_states(
             (
                 spec.action,
                 windows_scene::compute_button_visual_state(
-                    button_layout.card_rect,
+                    button_layout.hit_rect(),
                     state.pointer_position,
                     pressed,
                     last_clicked,
@@ -2398,11 +2421,11 @@ fn build_scene_diagnostic_text(state: &SceneAppState) -> String {
 }
 
 fn scene_action_active(action: SceneAction) -> bool {
-    match (action, current_bell_source()) {
-        (SceneAction::SelectWindowsBell, BellSource::Windows) => true,
-        (SceneAction::SelectFileBell, BellSource::File(_)) => true,
-        _ => false,
-    }
+    matches!(
+        (action, current_bell_source()),
+        (SceneAction::SelectWindowsBell, BellSource::Windows)
+            | (SceneAction::SelectFileBell, BellSource::File(_))
+    )
 }
 
 fn scene_action_at_point(
@@ -2411,11 +2434,21 @@ fn scene_action_at_point(
     point: ClientPoint,
 ) -> Option<SceneAction> {
     let specs = windows_scene::scene_button_specs(scene_kind);
-    let button_layouts = windows_scene::layout_scene_buttons(layout.terminal_panel_rect(), specs.len());
-    specs.iter().zip(button_layouts).find_map(|(spec, button_layout)| {
-        (button_layout.card_rect.contains(point) || button_layout.label_rect.contains(point))
-            .then_some(spec.action)
-    })
+    let button_layouts =
+        windows_scene::layout_scene_buttons(layout.terminal_panel_rect(), specs.len());
+    specs
+        .iter()
+        .zip(button_layouts)
+        .find_map(|(spec, button_layout)| {
+            button_layout
+                .hit_rect()
+                .contains(point)
+                .then_some(spec.action)
+        })
+}
+
+fn terminal_drag_handle_contains(layout: TerminalLayout, point: ClientPoint) -> bool {
+    layout.drag_handle_rect().contains(point) && !layout.diagnostics_button_rect().contains(point)
 }
 
 fn scene_drag_handle_contains(layout: TerminalLayout, point: ClientPoint) -> bool {
@@ -2447,13 +2480,9 @@ fn perform_scene_action(
             thread::Builder::new()
                 .name("teamy-studio-launcher-terminal".to_owned())
                 .spawn(move || {
-                    if let Err(error) = super::open_terminal_window(
-                        &app_home,
-                        None,
-                        None,
-                        None,
-                        vt_engine,
-                    ) {
+                    if let Err(error) =
+                        super::open_terminal_window(&app_home, None, None, None, vt_engine)
+                    {
                         error!(?error, "failed to open Teamy Studio terminal window");
                     }
                 })
@@ -2474,7 +2503,9 @@ fn perform_scene_action(
             thread::Builder::new()
                 .name("teamy-studio-audio-picker".to_owned())
                 .spawn(move || {
-                    if let Err(error) = run_scene_window(&app_home, SceneWindowKind::AudioPicker, vt_engine) {
+                    if let Err(error) =
+                        run_scene_window(&app_home, SceneWindowKind::AudioPicker, vt_engine)
+                    {
                         error!(?error, "failed to open audio picker window");
                     }
                 })
@@ -3445,10 +3476,10 @@ fn client_layout(
 
 fn diagnostic_panel_visibility_for_current_window() -> bool {
     APP_STATE.with(|state| {
-        state.borrow()
+        state
+            .borrow()
             .as_ref()
-            .map(|state| state.diagnostic_panel_visible)
-            .unwrap_or(false)
+            .is_some_and(|state| state.diagnostic_panel_visible)
     })
 }
 
@@ -3578,7 +3609,9 @@ fn with_app_state<T>(f: impl FnOnce(&mut AppState) -> eyre::Result<T>) -> eyre::
     })
 }
 
-fn with_scene_app_state<T>(f: impl FnOnce(&mut SceneAppState) -> eyre::Result<T>) -> eyre::Result<T> {
+fn with_scene_app_state<T>(
+    f: impl FnOnce(&mut SceneAppState) -> eyre::Result<T>,
+) -> eyre::Result<T> {
     SCENE_APP_STATE.with(|state| {
         let mut borrowed = state.borrow_mut();
         let app_state = borrowed
@@ -3678,6 +3711,10 @@ fn handle_left_button_up(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Result<boo
 /// behavior[impl window.interaction.selection.linear]
 /// behavior[impl window.interaction.selection.block-alt-drag]
 /// behavior[impl window.interaction.selection.click-dismiss]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the terminal pointer down path coordinates several mutually exclusive interaction modes"
+)]
 fn handle_left_button_down(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Result<bool> {
     let point = ClientPoint::from_lparam(lparam);
     let in_drag_handle = hit_test_drag_handle_point(hwnd, point)?;
@@ -3790,9 +3827,9 @@ fn handle_left_button_down(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Result<b
         state.terminal_selection = None;
         state.pending_terminal_selection = None;
         state.terminal_selection_drag_point = None;
-    state.diagnostic_selection = None;
-    state.pending_diagnostic_selection = None;
-    state.diagnostic_selection_drag_point = None;
+        state.diagnostic_selection = None;
+        state.pending_diagnostic_selection = None;
+        state.diagnostic_selection_drag_point = None;
         state.terminal_scrollbar_hovered_part = None;
         state.terminal_scrollbar_drag = None;
         begin_system_window_drag(hwnd, point)?;
@@ -3800,6 +3837,10 @@ fn handle_left_button_down(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Result<b
     })
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "pointer move handling merges selection, scrollbar, drag, and hover state updates"
+)]
 fn handle_mouse_move(hwnd: WindowHandle, wparam: WPARAM, lparam: LPARAM) -> eyre::Result<bool> {
     let point = ClientPoint::from_lparam(lparam);
 
@@ -3928,8 +3969,10 @@ fn handle_mouse_move(hwnd: WindowHandle, wparam: WPARAM, lparam: LPARAM) -> eyre
             let should_render = with_app_state(|state| {
                 let layout =
                     client_layout(hwnd, state.terminal_cell_width, state.terminal_cell_height)?;
-                Ok(terminal_interactive_region_contains(state, layout, previous_pointer)
-                    || terminal_interactive_region_contains(state, layout, Some(point)))
+                Ok(
+                    terminal_interactive_region_contains(state, layout, previous_pointer)
+                        || terminal_interactive_region_contains(state, layout, Some(point)),
+                )
             })?;
             if should_render {
                 with_app_state(|state| render_current_frame(state, hwnd, None))?;
@@ -4006,9 +4049,7 @@ fn handle_right_button_up(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Result<bo
 
     let preparation = with_app_state(|state| {
         let layout = client_layout(hwnd, state.terminal_cell_width, state.terminal_cell_height)?;
-        if state.diagnostic_panel_visible
-            && diagnostic_panel_text_rect(layout).contains(point)
-        {
+        if state.diagnostic_panel_visible && diagnostic_panel_text_rect(layout).contains(point) {
             state.pending_diagnostic_selection = None;
             state.diagnostic_selection_drag_point = None;
             if let Some(selection) = state.diagnostic_selection.take() {
@@ -4180,15 +4221,7 @@ fn complete_pending_terminal_selection(
 fn hit_test_drag_handle_point(hwnd: WindowHandle, point: ClientPoint) -> eyre::Result<bool> {
     with_app_state(|state| {
         let layout = client_layout(hwnd, state.terminal_cell_width, state.terminal_cell_height)?;
-        Ok(layout.drag_handle_rect().contains(point)
-            && !layout.diagnostics_button_rect().contains(point))
-    })
-}
-
-fn scene_hit_test_drag_handle_point(hwnd: WindowHandle, point: ClientPoint) -> eyre::Result<bool> {
-    with_scene_app_state(|state| {
-        let layout = client_layout(hwnd, state.terminal_cell_width, state.terminal_cell_height)?;
-        Ok(scene_drag_handle_contains(layout, point))
+        Ok(terminal_drag_handle_contains(layout, point))
     })
 }
 
@@ -4240,7 +4273,8 @@ fn terminal_interactive_region_contains(
     point.is_some_and(|point| {
         layout.title_bar_rect().contains(point)
             || layout.diagnostics_button_rect().contains(point)
-            || (state.diagnostic_panel_visible && diagnostic_panel_text_rect(layout).contains(point))
+            || (state.diagnostic_panel_visible
+                && diagnostic_panel_text_rect(layout).contains(point))
     })
 }
 
@@ -4286,24 +4320,23 @@ fn client_to_screen_point(
 
 /// behavior[impl window.appearance.drag-cursor]
 fn handle_set_cursor(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Result<bool> {
-    if !should_override_drag_cursor(with_app_state(|state| Ok(state.in_move_size_loop))?) {
-        return Ok(false);
-    }
-
     let hit_test_code = u32::from(low_word_u16(lparam.0));
     if hit_test_code != HTCAPTION && hit_test_code != HTCLIENT {
         return Ok(false);
     }
 
     let point = cursor_client_point(hwnd)?;
-    if !hit_test_drag_handle_point(hwnd, point)? {
-        return Ok(false);
+    let cursor = with_app_state(|state| {
+        let layout = client_layout(hwnd, state.terminal_cell_width, state.terminal_cell_height)?;
+        Ok(terminal_cursor_for_point(state, layout, point))
+    })?;
+
+    if let Some(cursor) = cursor {
+        set_system_cursor(cursor);
+        return Ok(true);
     }
 
-    let move_cursor = load_cursor(IDC_SIZEALL);
-    // Safety: setting the cursor for the current WM_SETCURSOR handling path is valid.
-    unsafe { SetCursor(Some(move_cursor)) };
-    Ok(true)
+    Ok(false)
 }
 
 fn hit_test_resize_border(hwnd: WindowHandle, point: ClientPoint) -> eyre::Result<Option<LRESULT>> {
@@ -4328,6 +4361,62 @@ fn fail_and_close(hwnd: WindowHandle, error: &eyre::Error) -> LRESULT {
     tracing::error!(?error, "terminal window failed");
     hwnd.destroy();
     LRESULT(0)
+}
+
+fn set_system_cursor(cursor: PCWSTR) {
+    let cursor = load_cursor(cursor);
+    // Safety: setting the cursor for the current WM_SETCURSOR handling path is valid.
+    unsafe { SetCursor(Some(cursor)) };
+}
+
+fn terminal_cursor_for_point(
+    state: &AppState,
+    layout: TerminalLayout,
+    point: ClientPoint,
+) -> Option<PCWSTR> {
+    if layout.diagnostics_button_rect().contains(point) {
+        return Some(IDC_HAND);
+    }
+
+    if state.diagnostic_panel_visible && diagnostic_panel_text_rect(layout).contains(point) {
+        return Some(IDC_IBEAM);
+    }
+
+    if should_override_drag_cursor(state.in_move_size_loop)
+        && terminal_drag_handle_contains(layout, point)
+    {
+        return Some(IDC_SIZEALL);
+    }
+
+    None
+}
+
+fn scene_cursor_for_point(
+    state: &SceneAppState,
+    layout: TerminalLayout,
+    point: ClientPoint,
+) -> Option<PCWSTR> {
+    if layout.diagnostics_button_rect().contains(point) {
+        return Some(IDC_HAND);
+    }
+
+    if state.diagnostics_visible && scene_diagnostic_text_rect(layout).contains(point) {
+        return Some(IDC_IBEAM);
+    }
+
+    if !state.diagnostics_visible
+        && scene_action_at_point(state.scene_kind, layout, point).is_some()
+    {
+        return Some(IDC_HAND);
+    }
+
+    if should_override_drag_cursor(state.in_move_size_loop)
+        && scene_drag_handle_contains(layout, point)
+    {
+        return Some(IDC_SIZEALL);
+    }
+
+    None
 }
 
 fn auto_scroll_pending_terminal_selection(

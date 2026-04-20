@@ -780,11 +780,6 @@ impl TerminalLayout {
     }
 
     #[must_use]
-    pub fn plus_button_rect(self) -> ClientRect {
-        self.diagnostics_button_rect()
-    }
-
-    #[must_use]
     /// behavior[impl window.appearance.code-panel.terminal-alignment]
     pub fn terminal_rect(self) -> ClientRect {
         self.terminal_content_rect()
@@ -1777,8 +1772,7 @@ impl TerminalCore {
     pub fn resize(&mut self, layout: TerminalLayout) -> eyre::Result<()> {
         let keep_viewport_pinned_to_bottom = self
             .viewport_metrics()
-            .map(viewport_is_bottom_anchored)
-            .unwrap_or(false);
+            .is_ok_and(viewport_is_bottom_anchored);
         let keep_active_prompt_visible = keep_viewport_pinned_to_bottom
             || should_keep_active_prompt_visible_on_resize(self.semantic_prompt);
         let (cols, rows) = layout.grid_size();
@@ -4081,7 +4075,7 @@ mod tests {
         let title = layout.title_bar_rect();
         let terminal_panel = layout.terminal_panel_rect();
         let diagnostic = layout.diagnostic_panel_rect();
-        let plus = layout.plus_button_rect();
+        let plus = layout.diagnostics_button_rect();
         let terminal = layout.terminal_viewport_rect();
         let scrollbar = layout.terminal_scrollbar_rect();
 
@@ -4112,7 +4106,7 @@ mod tests {
 
         let terminal_panel = layout.terminal_panel_rect();
         let diagnostic = layout.diagnostic_panel_rect();
-        let plus = layout.plus_button_rect();
+        let plus = layout.diagnostics_button_rect();
         let terminal = layout.terminal_viewport_rect();
         let scrollbar = layout.terminal_scrollbar_rect();
 

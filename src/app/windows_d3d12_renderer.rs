@@ -98,6 +98,10 @@ struct ShaderParams {
     sprite_atlas: [f32; 4],
 }
 
+#[expect(
+    clippy::struct_field_names,
+    reason = "uv coordinates map directly to shader inputs"
+)]
 #[derive(Clone, Copy, Debug)]
 struct AtlasSprite {
     uv_left: f32,
@@ -3927,7 +3931,7 @@ fn build_sprite_atlas() -> eyre::Result<SpriteAtlas> {
     let terminal = blit_sprite_into_slot(
         &mut atlas,
         0,
-        decode_embedded_sprite(include_bytes!(concat!(
+        &decode_embedded_sprite(include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/resources/main.png"
         )))?,
@@ -3935,14 +3939,14 @@ fn build_sprite_atlas() -> eyre::Result<SpriteAtlas> {
     let storage = blit_sprite_into_slot(
         &mut atlas,
         1,
-        decode_embedded_sprite(include_bytes!(concat!(
+        &decode_embedded_sprite(include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/resources/storage.png"
         )))?,
     );
-    let audio = blit_sprite_into_slot(&mut atlas, 2, generate_audio_sprite());
-    let windows_audio = blit_sprite_into_slot(&mut atlas, 3, generate_windows_audio_sprite());
-    let file_audio = blit_sprite_into_slot(&mut atlas, 4, generate_file_audio_sprite());
+    let audio = blit_sprite_into_slot(&mut atlas, 2, &generate_audio_sprite());
+    let windows_audio = blit_sprite_into_slot(&mut atlas, 3, &generate_windows_audio_sprite());
+    let file_audio = blit_sprite_into_slot(&mut atlas, 4, &generate_file_audio_sprite());
 
     Ok(SpriteAtlas {
         width,
@@ -3962,10 +3966,14 @@ fn decode_embedded_sprite(bytes: &[u8]) -> eyre::Result<RgbaImage> {
         .map(|image| image.to_rgba8())
 }
 
-fn blit_sprite_into_slot(atlas: &mut RgbaImage, slot_index: u32, sprite: RgbaImage) -> AtlasSprite {
+fn blit_sprite_into_slot(
+    atlas: &mut RgbaImage,
+    slot_index: u32,
+    sprite: &RgbaImage,
+) -> AtlasSprite {
     let slot_x = (slot_index % 3) * SPRITE_SLOT_SIZE;
     let slot_y = (slot_index / 3) * SPRITE_SLOT_SIZE;
-    let fitted = fit_sprite_to_target(&sprite, SPRITE_TARGET_SIZE);
+    let fitted = fit_sprite_to_target(sprite, SPRITE_TARGET_SIZE);
     let sprite_x = slot_x + ((SPRITE_SLOT_SIZE - fitted.width()) / 2);
     let sprite_y = slot_y + ((SPRITE_SLOT_SIZE - fitted.height()) / 2);
 
@@ -4395,6 +4403,7 @@ fn append_text_rect(
     ]);
 }
 
+#[cfg(test)]
 fn append_rect(
     vertices: &mut Vec<Vertex>,
     rect: RECT,
@@ -4531,8 +4540,8 @@ fn issue_transition_barrier(
 #[cfg(test)]
 mod tests {
     use super::{
-        ButtonVisualState, CachedSceneVertices, FALLBACK_GLYPH, PanelEffect, RenderScene,
-        Vertex, append_rect, append_slug_band_data, build_panel_scene, build_shader_params,
+        ButtonVisualState, CachedSceneVertices, FALLBACK_GLYPH, PanelEffect, RenderScene, Vertex,
+        append_rect, append_slug_band_data, build_panel_scene, build_shader_params,
         can_reuse_cached_scene_vertices, collect_scene_chars, cpu_slug_coverage,
         cpu_slug_coverage_all_curves, dirty_fragment_ranges, extract_glyph_curves,
         fragment_ranges_match, fragment_vertex_ranges, load_terminal_font, push_centered_text,

@@ -32,6 +32,10 @@ pub fn build_text_grid_scene(
     )
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "palette inputs are passed explicitly at call sites"
+)]
 pub fn build_text_grid_scene_with_palette(
     text_rect: ClientRect,
     text: &str,

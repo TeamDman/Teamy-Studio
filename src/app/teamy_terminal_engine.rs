@@ -510,6 +510,10 @@ impl TeamyTerminalEngine {
         }
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "stateful escape-sequence parsing is easier to audit in one pass"
+    )]
     fn process_text(&mut self, text: &str) {
         let () = {
             #[cfg(feature = "tracy")]
