@@ -724,8 +724,7 @@ fn run_with_terminal_session(
         hwnd.show();
 
         with_app_state(|state| {
-            let layout =
-                client_layout(hwnd, state.terminal_cell_width, state.terminal_cell_height)?;
+            let layout = terminal_client_layout(hwnd, state)?;
             apply_terminal_resize(state, layout)?;
             if let Some(initial_stdin) = initial_stdin.filter(|text| !text.is_empty()) {
                 state
@@ -1112,7 +1111,7 @@ fn run_terminal_throughput_self_test_sample(
 
     let benchmark_result = (|| -> eyre::Result<TerminalThroughputBenchmarkSampleResult> {
         terminal.set_wake_window(hwnd.raw());
-        let layout = client_layout(hwnd, terminal_cell_width, terminal_cell_height)?;
+        let layout = client_layout(hwnd, terminal_cell_width, terminal_cell_height, true)?;
         terminal.resize(layout)?;
 
         let benchmark_started_at = Instant::now();
@@ -1157,7 +1156,7 @@ fn run_terminal_throughput_self_test_sample(
                     i32::try_from(client_width).unwrap_or(i32::MAX),
                     i32::try_from(client_height).unwrap_or(i32::MAX),
                 )?;
-                let layout = client_layout(hwnd, terminal_cell_width, terminal_cell_height)?;
+                let layout = client_layout(hwnd, terminal_cell_width, terminal_cell_height, true)?;
                 renderer.resize(client_width, client_height)?;
                 terminal.resize(layout)?;
                 resize_performed = true;
@@ -1530,7 +1529,7 @@ fn handle_scene_exit_size_move(hwnd: WindowHandle) -> LRESULT {
 
 fn handle_scene_size(hwnd: WindowHandle) -> LRESULT {
     match with_scene_app_state(|state| {
-        let layout = client_layout(hwnd, state.terminal_cell_width, state.terminal_cell_height)?;
+        let layout = scene_client_layout(hwnd, state)?;
         render_scene_window_frame(
             state,
             hwnd,
@@ -1597,7 +1596,7 @@ fn handle_scene_left_button_down(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Re
         state.pointer_position = Some(point);
         state.pressed_target = None;
         state.diagnostic_selection_drag_point = None;
-        let layout = client_layout(hwnd, state.terminal_cell_width, state.terminal_cell_height)?;
+        let layout = scene_client_layout(hwnd, state)?;
 
         if layout.diagnostics_button_rect().contains(point) {
             state.pending_diagnostic_selection = None;
@@ -1659,7 +1658,7 @@ fn handle_scene_left_button_up(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Resu
 
     let action = with_scene_app_state(|state| {
         state.pointer_position = Some(point);
-        let layout = client_layout(hwnd, state.terminal_cell_width, state.terminal_cell_height)?;
+        let layout = scene_client_layout(hwnd, state)?;
         let pressed_target = state.pressed_target.take();
 
         if let Some(ScenePressedTarget::DiagnosticsButton) = pressed_target {
@@ -1763,8 +1762,7 @@ fn handle_scene_mouse_move(
         } else if point == pending_selection.origin {
             update_pending_terminal_selection_action(pending_selection, point, true, None)
         } else {
-            let layout =
-                client_layout(hwnd, state.terminal_cell_width, state.terminal_cell_height)?;
+            let layout = scene_client_layout(hwnd, state)?;
             let cell = scene_diagnostic_cell_from_client_point(
                 layout,
                 point,
@@ -1797,7 +1795,7 @@ fn handle_scene_mouse_move(
     }
 
     let should_render = with_scene_app_state(|state| {
-        let layout = client_layout(hwnd, state.terminal_cell_width, state.terminal_cell_height)?;
+        let layout = scene_client_layout(hwnd, state)?;
         Ok(
             scene_interactive_region_contains(state, layout, previous_pointer)
                 || scene_interactive_region_contains(state, layout, Some(point)),
@@ -1820,7 +1818,7 @@ fn handle_scene_right_button_up(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Res
             return Ok(None);
         }
 
-        let layout = client_layout(hwnd, state.terminal_cell_width, state.terminal_cell_height)?;
+        let layout = scene_client_layout(hwnd, state)?;
         if !scene_diagnostic_text_rect(layout).contains(point) {
             return Ok(None);
         }
@@ -1864,7 +1862,7 @@ fn handle_scene_set_cursor(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Result<b
 
     let point = cursor_client_point(hwnd)?;
     let cursor = with_scene_app_state(|state| {
-        let layout = client_layout(hwnd, state.terminal_cell_width, state.terminal_cell_height)?;
+        let layout = scene_client_layout(hwnd, state)?;
         Ok(scene_cursor_for_point(state, layout, point))
     })?;
 
@@ -1901,7 +1899,7 @@ fn handle_exit_size_move(hwnd: WindowHandle) -> LRESULT {
 
 fn handle_size(hwnd: WindowHandle) -> LRESULT {
     match with_app_state(|state| {
-        let layout = client_layout(hwnd, state.terminal_cell_width, state.terminal_cell_height)?;
+        let layout = terminal_client_layout(hwnd, state)?;
         if state.in_move_size_loop
             && should_defer_terminal_resize_during_move_size(state.terminal_layout, layout)
         {
@@ -2227,7 +2225,7 @@ fn render_current_frame_with_options(
     let layout = {
         #[cfg(feature = "tracy")]
         let _span = debug_span!("compute_client_layout").entered();
-        client_layout(hwnd, state.terminal_cell_width, state.terminal_cell_height)?
+        terminal_client_layout(hwnd, state)?
     };
     let diagnostics_button_state = terminal_diagnostics_button_state(state, layout);
     let diagnostic_text = {
@@ -2320,7 +2318,7 @@ fn render_scene_window_frame(
         renderer.resize(width, height)?;
     }
 
-    let layout = client_layout(hwnd, state.terminal_cell_width, state.terminal_cell_height)?;
+    let layout = scene_client_layout(hwnd, state)?;
     let diagnostics_button_state = windows_scene::compute_button_visual_state(
         layout.diagnostics_button_rect(),
         state.pointer_position,
@@ -3053,7 +3051,7 @@ fn render_terminal_throughput_benchmark_frame(
     mode: TerminalThroughputBenchmarkMode,
     line_count: usize,
 ) -> eyre::Result<()> {
-    let layout = client_layout(hwnd, terminal_cell_width, terminal_cell_height)?;
+    let layout = client_layout(hwnd, terminal_cell_width, terminal_cell_height, true)?;
     let diagnostic_text =
         build_terminal_throughput_benchmark_diagnostic_panel_text(terminal, mode, line_count);
     let terminal_display = terminal.cached_display_state();
@@ -3286,8 +3284,7 @@ fn handle_mouse_wheel(hwnd: WindowHandle, wparam: WPARAM, lparam: LPARAM) -> eyr
     let ctrl_down = control_key_is_down();
     if !ctrl_down {
         return with_app_state(|state| {
-            let layout =
-                client_layout(hwnd, state.terminal_cell_width, state.terminal_cell_height)?;
+            let layout = terminal_client_layout(hwnd, state)?;
             let point = screen_to_client_point(hwnd, lparam)?;
             if !layout.code_panel_rect().contains(point) {
                 return Ok(false);
@@ -3311,7 +3308,7 @@ fn handle_mouse_wheel(hwnd: WindowHandle, wparam: WPARAM, lparam: LPARAM) -> eyr
     }
 
     with_app_state(|state| {
-        let layout = client_layout(hwnd, state.terminal_cell_width, state.terminal_cell_height)?;
+        let layout = terminal_client_layout(hwnd, state)?;
         let point = screen_to_client_point(hwnd, lparam)?;
         let in_terminal = layout.terminal_rect().contains(point);
         let in_output = layout.result_panel_rect().contains(point);
@@ -3450,7 +3447,7 @@ fn apply_terminal_zoom_step(
     state.terminal_cell_width = cell_width;
     state.terminal_cell_height = cell_height;
 
-    let layout = client_layout(hwnd, state.terminal_cell_width, state.terminal_cell_height)?;
+    let layout = terminal_client_layout(hwnd, state)?;
     state.pending_terminal_resize = None;
     apply_terminal_resize(state, layout)?;
     render_current_frame(state, hwnd, None)?;
@@ -3473,28 +3470,52 @@ fn resize_window_by_terminal_step(
     resize_window_client(hwnd, next_client_width, next_client_height)
 }
 
-fn client_layout(
-    hwnd: WindowHandle,
+fn build_client_layout(
+    rect: ClientRect,
     cell_width: i32,
     cell_height: i32,
-) -> eyre::Result<TerminalLayout> {
-    let rect = hwnd.client_rect()?;
-    Ok(TerminalLayout {
+    diagnostic_panel_visible: bool,
+) -> TerminalLayout {
+    TerminalLayout {
         client_width: rect.width(),
         client_height: rect.height(),
         cell_width,
         cell_height,
-        diagnostic_panel_visible: diagnostic_panel_visibility_for_current_window(),
-    })
+        diagnostic_panel_visible,
+    }
 }
 
-fn diagnostic_panel_visibility_for_current_window() -> bool {
-    APP_STATE.with(|state| {
-        state
-            .borrow()
-            .as_ref()
-            .is_some_and(|state| state.diagnostic_panel_visible)
-    })
+fn client_layout(
+    hwnd: WindowHandle,
+    cell_width: i32,
+    cell_height: i32,
+    diagnostic_panel_visible: bool,
+) -> eyre::Result<TerminalLayout> {
+    let rect = hwnd.client_rect()?;
+    Ok(build_client_layout(
+        rect,
+        cell_width,
+        cell_height,
+        diagnostic_panel_visible,
+    ))
+}
+
+fn terminal_client_layout(hwnd: WindowHandle, state: &AppState) -> eyre::Result<TerminalLayout> {
+    client_layout(
+        hwnd,
+        state.terminal_cell_width,
+        state.terminal_cell_height,
+        state.diagnostic_panel_visible,
+    )
+}
+
+fn scene_client_layout(hwnd: WindowHandle, state: &SceneAppState) -> eyre::Result<TerminalLayout> {
+    client_layout(
+        hwnd,
+        state.terminal_cell_width,
+        state.terminal_cell_height,
+        false,
+    )
 }
 
 fn effective_terminal_grid_size(layout: TerminalLayout) -> (u16, u16) {
@@ -3641,8 +3662,7 @@ fn handle_left_button_up(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Result<boo
         state.pointer_position = Some(point);
 
         if state.terminal_scrollbar_drag.take().is_some() {
-            let layout =
-                client_layout(hwnd, state.terminal_cell_width, state.terminal_cell_height)?;
+            let layout = terminal_client_layout(hwnd, state)?;
             state.terminal_scrollbar_hovered_part =
                 current_terminal_scrollbar(state)?.and_then(|scrollbar| {
                     terminal_scrollbar_hit_test(
@@ -3658,8 +3678,7 @@ fn handle_left_button_up(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Result<boo
 
         if state.diagnostics_button_pressed {
             state.diagnostics_button_pressed = false;
-            let layout =
-                client_layout(hwnd, state.terminal_cell_width, state.terminal_cell_height)?;
+            let layout = terminal_client_layout(hwnd, state)?;
             if layout.diagnostics_button_rect().contains(point) {
                 state.diagnostic_panel_visible = !state.diagnostic_panel_visible;
                 state.diagnostics_button_last_clicked_at = Some(Instant::now());
@@ -3682,8 +3701,7 @@ fn handle_left_button_up(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Result<boo
 
         if let Some(pending_selection) = state.pending_diagnostic_selection.take() {
             state.diagnostic_selection_drag_point = None;
-            let layout =
-                client_layout(hwnd, state.terminal_cell_width, state.terminal_cell_height)?;
+            let layout = terminal_client_layout(hwnd, state)?;
             let cell = diagnostic_panel_cell_from_client_point(
                 layout,
                 point,
@@ -3702,8 +3720,7 @@ fn handle_left_button_up(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Result<boo
 
         if let Some(pending_selection) = state.pending_terminal_selection.take() {
             state.terminal_selection_drag_point = None;
-            let layout =
-                client_layout(hwnd, state.terminal_cell_width, state.terminal_cell_height)?;
+            let layout = terminal_client_layout(hwnd, state)?;
             let point = ClientPoint::from_lparam(lparam);
             let cell = terminal_cell_from_client_point(layout, point, true)
                 .map(|cell| state.terminal.viewport_to_screen_cell(cell))
@@ -3745,7 +3762,7 @@ fn handle_left_button_down(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Result<b
         state.diagnostic_selection_drag_point = None;
         state.diagnostics_button_pressed = false;
 
-        let layout = client_layout(hwnd, state.terminal_cell_width, state.terminal_cell_height)?;
+        let layout = terminal_client_layout(hwnd, state)?;
         if layout.diagnostics_button_rect().contains(point) {
             state.pending_terminal_selection = None;
             state.pending_diagnostic_selection = None;
@@ -3876,8 +3893,7 @@ fn handle_mouse_move(hwnd: WindowHandle, wparam: WPARAM, lparam: LPARAM) -> eyre
         } else if point == pending_selection.origin {
             update_pending_terminal_selection_action(pending_selection, point, true, None)
         } else {
-            let layout =
-                client_layout(hwnd, state.terminal_cell_width, state.terminal_cell_height)?;
+            let layout = terminal_client_layout(hwnd, state)?;
             let cell = diagnostic_panel_cell_from_client_point(
                 layout,
                 point,
@@ -3921,8 +3937,7 @@ fn handle_mouse_move(hwnd: WindowHandle, wparam: WPARAM, lparam: LPARAM) -> eyre
         } else if point == pending_selection.origin {
             update_pending_terminal_selection_action(pending_selection, point, true, None)
         } else {
-            let layout =
-                client_layout(hwnd, state.terminal_cell_width, state.terminal_cell_height)?;
+            let layout = terminal_client_layout(hwnd, state)?;
             let cell = terminal_cell_from_client_point(layout, point, true)
                 .map(|cell| state.terminal.viewport_to_screen_cell(cell))
                 .transpose()?;
@@ -3981,8 +3996,7 @@ fn handle_mouse_move(hwnd: WindowHandle, wparam: WPARAM, lparam: LPARAM) -> eyre
     match action {
         PendingDragAction::NotHandled => {
             let should_render = with_app_state(|state| {
-                let layout =
-                    client_layout(hwnd, state.terminal_cell_width, state.terminal_cell_height)?;
+                let layout = terminal_client_layout(hwnd, state)?;
                 Ok(
                     terminal_interactive_region_contains(state, layout, previous_pointer)
                         || terminal_interactive_region_contains(state, layout, Some(point)),
@@ -4008,7 +4022,7 @@ fn handle_terminal_scrollbar_mouse_move(
     hwnd: WindowHandle,
     point: ClientPoint,
 ) -> eyre::Result<Option<bool>> {
-    let layout = client_layout(hwnd, state.terminal_cell_width, state.terminal_cell_height)?;
+    let layout = terminal_client_layout(hwnd, state)?;
     let scrollbar_rect = layout.terminal_scrollbar_rect().inset(4);
     let scrollbar = current_terminal_scrollbar(state)?;
 
@@ -4062,7 +4076,7 @@ fn handle_right_button_up(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Result<bo
     let point = ClientPoint::from_lparam(lparam);
 
     let preparation = with_app_state(|state| {
-        let layout = client_layout(hwnd, state.terminal_cell_width, state.terminal_cell_height)?;
+        let layout = terminal_client_layout(hwnd, state)?;
         if state.diagnostic_panel_visible && diagnostic_panel_text_rect(layout).contains(point) {
             state.pending_diagnostic_selection = None;
             state.diagnostic_selection_drag_point = None;
@@ -4234,7 +4248,7 @@ fn complete_pending_terminal_selection(
 
 fn hit_test_drag_handle_point(hwnd: WindowHandle, point: ClientPoint) -> eyre::Result<bool> {
     with_app_state(|state| {
-        let layout = client_layout(hwnd, state.terminal_cell_width, state.terminal_cell_height)?;
+        let layout = terminal_client_layout(hwnd, state)?;
         Ok(terminal_drag_handle_contains(layout, point))
     })
 }
@@ -4341,7 +4355,7 @@ fn handle_set_cursor(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Result<bool> {
 
     let point = cursor_client_point(hwnd)?;
     let cursor = with_app_state(|state| {
-        let layout = client_layout(hwnd, state.terminal_cell_width, state.terminal_cell_height)?;
+        let layout = terminal_client_layout(hwnd, state)?;
         Ok(terminal_cursor_for_point(state, layout, point))
     })?;
 
@@ -4451,7 +4465,7 @@ fn auto_scroll_pending_terminal_selection(
         return Ok(false);
     };
 
-    let layout = client_layout(hwnd, state.terminal_cell_width, state.terminal_cell_height)?;
+    let layout = terminal_client_layout(hwnd, state)?;
     let scroll_delta =
         terminal_selection_autoscroll_delta(layout, point, state.terminal_cell_height)?;
     if scroll_delta == 0 {
@@ -4681,6 +4695,17 @@ mod tests {
 
         assert!(clipped.rows.is_empty());
         assert_eq!(clipped.scrollbar.expect("scrollbar preserved").visible, 0,);
+    }
+
+    #[test]
+    fn build_client_layout_respects_explicit_diagnostic_visibility() {
+        let rect = ClientRect::new(0, 0, 800, 600);
+        let hidden = build_client_layout(rect, 8, 16, false);
+        let visible = build_client_layout(rect, 8, 16, true);
+
+        assert_eq!(hidden.diagnostic_panel_rect().height(), 0);
+        assert!(visible.diagnostic_panel_rect().height() > 0);
+        assert!(hidden.terminal_panel_rect().bottom() > visible.terminal_panel_rect().bottom());
     }
 
     #[test]
