@@ -1,5 +1,6 @@
 mod spatial;
 pub mod teamy_terminal_engine;
+mod vt_types;
 mod windows_app;
 mod windows_d3d12_renderer;
 mod windows_dialogs;
@@ -38,8 +39,7 @@ pub enum VtEngineChoice {
 }
 
 impl VtEngineChoice {
-    pub const CURRENT_TERMINAL_VT_ENGINE_ENV_VAR: &str =
-        "TEAMY_STUDIO_CURRENT_TERMINAL_VT_ENGINE";
+    pub const CURRENT_TERMINAL_VT_ENGINE_ENV_VAR: &str = "TEAMY_STUDIO_CURRENT_TERMINAL_VT_ENGINE";
 
     #[must_use]
     pub const fn current_terminal_vt_engine_env_value(self) -> &'static str {
@@ -73,7 +73,7 @@ pub struct RenderOffscreenSelfTestReport {
 ///
 /// This function will return an error if the platform-specific window cannot be launched.
 pub fn run(app_home: &AppHome) -> eyre::Result<()> {
-    open_terminal_window_with_vt_engine(app_home, None, None, None, Default::default())
+    open_terminal_window_with_vt_engine(app_home, None, None, None, VtEngineChoice::default())
 }
 
 /// Run the Teamy Studio application shell with an explicit VT engine.

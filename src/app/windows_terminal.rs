@@ -9,12 +9,6 @@ use tracing::debug_span;
 use tracing::trace;
 
 use eyre::Context;
-use libghostty_vt::TerminalOptions;
-use libghostty_vt::key;
-use libghostty_vt::render::{CellIterator, CursorVisualStyle, Dirty, RowIterator};
-use libghostty_vt::screen::RowSemanticPrompt;
-use libghostty_vt::style::RgbColor;
-use libghostty_vt::terminal::ScrollViewport;
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use tracing::{debug, error, info, info_span, instrument};
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
@@ -32,7 +26,17 @@ use super::spatial::{ClientRect, TerminalCellPoint};
 use super::teamy_terminal_engine::{
     TeamyColor, TeamyCursorStyle, TeamyTerminalEngine, TeamyViewportMetrics,
 };
+use super::vt_types::{ScrollViewport, key};
 use super::windows_terminal_engine::GhosttyTerminalEngine;
+
+#[cfg(feature = "ghostty")]
+use libghostty_vt::TerminalOptions;
+#[cfg(feature = "ghostty")]
+use libghostty_vt::render::{CellIterator, CursorVisualStyle, Dirty, RowIterator};
+#[cfg(feature = "ghostty")]
+use libghostty_vt::screen::RowSemanticPrompt;
+#[cfg(feature = "ghostty")]
+use libghostty_vt::style::RgbColor;
 
 pub const DRAG_STRIP_HEIGHT: i32 = 52;
 pub const WINDOW_PADDING: i32 = 18;
@@ -218,6 +222,13 @@ pub enum TerminalDisplayCursorStyle {
     Bar,
     Block,
     Underline,
+    #[cfg_attr(
+        not(feature = "ghostty"),
+        expect(
+            dead_code,
+            reason = "Ghostty-only cursor styling is unavailable without the feature"
+        )
+    )]
     BlockHollow,
 }
 
@@ -379,6 +390,13 @@ pub struct TerminalSession {
 }
 
 enum RuntimeTerminalEngine {
+    #[cfg_attr(
+        not(feature = "ghostty"),
+        expect(
+            dead_code,
+            reason = "the Ghostty runtime variant is only constructed when the feature is enabled"
+        )
+    )]
     Ghostty(GhosttyTerminalEngine),
     Teamy(Box<TeamyTerminalEngine>),
 }
@@ -505,6 +523,60 @@ impl RuntimeTerminalEngine {
             Self::Teamy(_) => Ok(()),
         }
     }
+}
+
+#[cfg(feature = "ghostty")]
+fn create_runtime_terminal_engine(
+    vt_engine: VtEngineChoice,
+    writer: &Arc<Mutex<PtyWriter>>,
+) -> eyre::Result<RuntimeTerminalEngine> {
+    Ok(match vt_engine {
+        VtEngineChoice::Ghostty => {
+            let writer_for_effect = Arc::clone(writer);
+            let mut engine = info_span!("create_libghostty_terminal").in_scope(|| {
+                GhosttyTerminalEngine::new(TerminalOptions {
+                    cols: DEFAULT_COLS,
+                    rows: DEFAULT_ROWS,
+                    max_scrollback: MAX_SCROLLBACK,
+                })
+            })?;
+            engine.on_pty_write(move |_terminal, data| {
+                if let Ok(mut writer) = writer_for_effect.lock() {
+                    let _ = writer.write_all(data);
+                    let _ = writer.flush();
+                }
+            })?;
+            RuntimeTerminalEngine::Ghostty(engine)
+        }
+        VtEngineChoice::Teamy => create_teamy_runtime_terminal_engine(writer),
+    })
+}
+
+#[cfg(not(feature = "ghostty"))]
+fn create_runtime_terminal_engine(
+    vt_engine: VtEngineChoice,
+    writer: &Arc<Mutex<PtyWriter>>,
+) -> eyre::Result<RuntimeTerminalEngine> {
+    match vt_engine {
+        VtEngineChoice::Ghostty => {
+            eyre::bail!(
+                "Ghostty VT engine requires building Teamy Studio with `--features ghostty`"
+            )
+        }
+        VtEngineChoice::Teamy => Ok(create_teamy_runtime_terminal_engine(writer)),
+    }
+}
+
+fn create_teamy_runtime_terminal_engine(writer: &Arc<Mutex<PtyWriter>>) -> RuntimeTerminalEngine {
+    let writer_for_effect = Arc::clone(writer);
+    let mut engine = TeamyTerminalEngine::new(DEFAULT_COLS, DEFAULT_ROWS, MAX_SCROLLBACK);
+    engine.on_pty_write(move |data| {
+        if let Ok(mut writer) = writer_for_effect.lock() {
+            let _ = writer.write_all(data);
+            let _ = writer.flush();
+        }
+    });
+    RuntimeTerminalEngine::Teamy(Box::new(engine))
 }
 
 struct TerminalCore {
@@ -1534,10 +1606,6 @@ impl TerminalWorkerRunner {
 }
 
 impl TerminalCore {
-    #[expect(
-        clippy::too_many_lines,
-        reason = "PTY setup, libghostty initialization, and reader-thread wiring are kept together for clarity"
-    )]
     #[instrument(level = "info", skip_all)]
     pub fn new_with_command(
         shell: CommandBuilder,
@@ -1565,37 +1633,7 @@ impl TerminalCore {
             Arc::new(Mutex::new(pair.master.take_writer().map_err(|error| {
                 eyre::eyre!("failed to open PTY writer: {error}")
             })?));
-        let engine = match vt_engine {
-            VtEngineChoice::Ghostty => {
-                let writer_for_effect = Arc::clone(&writer);
-                let mut engine = info_span!("create_libghostty_terminal").in_scope(|| {
-                    GhosttyTerminalEngine::new(TerminalOptions {
-                        cols: DEFAULT_COLS,
-                        rows: DEFAULT_ROWS,
-                        max_scrollback: MAX_SCROLLBACK,
-                    })
-                })?;
-                engine.on_pty_write(move |_terminal, data| {
-                    if let Ok(mut writer) = writer_for_effect.lock() {
-                        let _ = writer.write_all(data);
-                        let _ = writer.flush();
-                    }
-                })?;
-                RuntimeTerminalEngine::Ghostty(engine)
-            }
-            VtEngineChoice::Teamy => {
-                let writer_for_effect = Arc::clone(&writer);
-                let mut engine =
-                    TeamyTerminalEngine::new(DEFAULT_COLS, DEFAULT_ROWS, MAX_SCROLLBACK);
-                engine.on_pty_write(move |data| {
-                    if let Ok(mut writer) = writer_for_effect.lock() {
-                        let _ = writer.write_all(data);
-                        let _ = writer.flush();
-                    }
-                });
-                RuntimeTerminalEngine::Teamy(Box::new(engine))
-            }
-        };
+        let engine = create_runtime_terminal_engine(vt_engine, &writer)?;
 
         info!(
             program = shell.get_argv().first().map_or_else(
@@ -2680,6 +2718,7 @@ impl TerminalCore {
     clippy::too_many_lines,
     reason = "incremental row extraction keeps the Ghostty render-state walk and dirty-row policy together"
 )]
+#[cfg(feature = "ghostty")]
 fn build_ghostty_display_state(
     engine: &mut GhosttyTerminalEngine,
     selection: Option<TerminalSelection>,
@@ -2824,6 +2863,24 @@ fn build_ghostty_display_state(
 
         Ok(display)
     })
+}
+
+#[cfg(not(feature = "ghostty"))]
+fn build_ghostty_display_state(
+    engine: &mut GhosttyTerminalEngine,
+    selection: Option<TerminalSelection>,
+    selection_active: bool,
+    previous_display: Option<&TerminalDisplayState>,
+    viewport: TerminalViewportMetrics,
+) -> eyre::Result<TerminalDisplayState> {
+    let _ = (
+        engine,
+        selection,
+        selection_active,
+        previous_display,
+        viewport,
+    );
+    eyre::bail!("Ghostty VT engine requires building Teamy Studio with `--features ghostty`")
 }
 
 fn build_teamy_display_state(
@@ -2994,6 +3051,7 @@ fn xterm_palette_color(index: u8) -> [f32; 4] {
     ]
 }
 
+#[cfg(feature = "ghostty")]
 fn visible_ghostty_cell_text_rows(
     engine: &mut GhosttyTerminalEngine,
     viewport: TerminalViewportMetrics,
@@ -3031,6 +3089,15 @@ fn visible_ghostty_cell_text_rows(
     })
 }
 
+#[cfg(not(feature = "ghostty"))]
+fn visible_ghostty_cell_text_rows(
+    engine: &mut GhosttyTerminalEngine,
+    viewport: TerminalViewportMetrics,
+) -> eyre::Result<Vec<TerminalTextRow>> {
+    let _ = (engine, viewport);
+    eyre::bail!("Ghostty VT engine requires building Teamy Studio with `--features ghostty`")
+}
+
 fn visible_teamy_cell_text_rows(
     engine: &TeamyTerminalEngine,
     viewport: TerminalViewportMetrics,
@@ -3049,6 +3116,7 @@ fn visible_teamy_cell_text_rows(
         .collect()
 }
 
+#[cfg(feature = "ghostty")]
 fn ghostty_screen_row_cells(
     engine: &GhosttyTerminalEngine,
     cols: u16,
@@ -3063,6 +3131,16 @@ fn ghostty_screen_row_cells(
     Ok(cells)
 }
 
+#[cfg(not(feature = "ghostty"))]
+fn ghostty_screen_row_cells(
+    engine: &GhosttyTerminalEngine,
+    cols: u16,
+    row: u32,
+) -> eyre::Result<Vec<String>> {
+    let _ = (engine, cols, row);
+    eyre::bail!("Ghostty VT engine requires building Teamy Studio with `--features ghostty`")
+}
+
 fn ordered_linear_bounds(
     anchor: TerminalCellPoint,
     focus: TerminalCellPoint,
@@ -3074,6 +3152,7 @@ fn ordered_linear_bounds(
     }
 }
 
+#[cfg(feature = "ghostty")]
 fn ghostty_semantic_prompt_tracking(
     engine: &mut GhosttyTerminalEngine,
 ) -> eyre::Result<SemanticPromptTracking> {
@@ -3115,6 +3194,14 @@ fn ghostty_semantic_prompt_tracking(
             input_state: PromptInputState::Inactive,
         })
     })
+}
+
+#[cfg(not(feature = "ghostty"))]
+fn ghostty_semantic_prompt_tracking(
+    engine: &mut GhosttyTerminalEngine,
+) -> eyre::Result<SemanticPromptTracking> {
+    let _ = engine;
+    eyre::bail!("Ghostty VT engine requires building Teamy Studio with `--features ghostty`")
 }
 
 fn teamy_semantic_prompt_tracking(current: SemanticPromptTracking) -> SemanticPromptTracking {
@@ -3275,6 +3362,7 @@ fn extract_selected_text(rows: &[TerminalTextRow], selection: TerminalSelection)
     selected_rows.join("\n")
 }
 
+#[cfg(feature = "ghostty")]
 fn read_grid_ref_text(grid_ref: &libghostty_vt::screen::GridRef<'_>) -> eyre::Result<String> {
     let mut small = ['\0'; 8];
     match grid_ref.graphemes(&mut small) {
@@ -3295,6 +3383,7 @@ fn read_grid_ref_text(grid_ref: &libghostty_vt::screen::GridRef<'_>) -> eyre::Re
     }
 }
 
+#[cfg(feature = "ghostty")]
 fn rgb_to_rgba(color: RgbColor) -> [f32; 4] {
     [
         f32::from(color.r) / 255.0,
@@ -3305,6 +3394,7 @@ fn rgb_to_rgba(color: RgbColor) -> [f32; 4] {
 }
 
 /// behavior[impl window.appearance.terminal.selection.inverse]
+#[cfg(feature = "ghostty")]
 fn resolve_terminal_cell_colors(
     colors: &libghostty_vt::render::Colors,
     foreground: Option<RgbColor>,
@@ -3327,6 +3417,7 @@ fn resolve_terminal_cell_colors(
 }
 
 /// behavior[impl window.appearance.terminal.cursor.visible]
+#[cfg(feature = "ghostty")]
 fn build_terminal_cursor(
     snapshot: &libghostty_vt::render::Snapshot<'_, '_>,
     colors: &libghostty_vt::render::Colors,
@@ -3360,6 +3451,7 @@ fn build_terminal_cursor(
     }))
 }
 
+#[cfg(feature = "ghostty")]
 fn map_cursor_style(style: CursorVisualStyle) -> TerminalDisplayCursorStyle {
     match style {
         CursorVisualStyle::Bar => TerminalDisplayCursorStyle::Bar,
@@ -3775,19 +3867,75 @@ fn normalize_cursor_visibility_mode_sequence(data: &[u8]) -> Cow<'_, [u8]> {
     }
 }
 
+#[cfg(feature = "ghostty")]
 fn legacy_special_key_bytes(mapped_key: key::Key, mods: key::Mods) -> Option<Vec<u8>> {
-    let mut key_event = key::Event::new().ok()?;
-    let mut encoder = key::Encoder::new().ok()?;
+    let mut key_event = libghostty_vt::key::Event::new().ok()?;
+    let mut encoder = libghostty_vt::key::Encoder::new().ok()?;
     let mut response = Vec::with_capacity(16);
     key_event
-        .set_action(key::Action::Press)
-        .set_key(mapped_key)
-        .set_mods(mods)
-        .set_consumed_mods(key::Mods::empty())
+        .set_action(libghostty_vt::key::Action::Press)
+        .set_key(mapped_key.into())
+        .set_mods(mods.into())
+        .set_consumed_mods(libghostty_vt::key::Mods::empty())
         .set_unshifted_codepoint('\0')
         .set_utf8::<String>(None);
     encoder.encode_to_vec(&key_event, &mut response).ok()?;
     Some(response)
+}
+
+#[cfg(not(feature = "ghostty"))]
+fn legacy_special_key_bytes(mapped_key: key::Key, mods: key::Mods) -> Option<Vec<u8>> {
+    let modifier_parameter = legacy_csi_modifier_parameter(mods);
+    match mapped_key {
+        key::Key::Tab if mods.contains(key::Mods::SHIFT) => Some(b"\x1b[Z".to_vec()),
+        key::Key::Tab => Some(b"\t".to_vec()),
+        key::Key::Enter => Some(b"\r".to_vec()),
+        key::Key::Escape => Some(b"\x1b".to_vec()),
+        key::Key::Backspace => Some(b"\x7f".to_vec()),
+        key::Key::ArrowUp => Some(legacy_csi_sequence("A", modifier_parameter)),
+        key::Key::ArrowDown => Some(legacy_csi_sequence("B", modifier_parameter)),
+        key::Key::ArrowRight => Some(legacy_csi_sequence("C", modifier_parameter)),
+        key::Key::ArrowLeft => Some(legacy_csi_sequence("D", modifier_parameter)),
+        key::Key::Home => Some(legacy_csi_sequence("H", modifier_parameter)),
+        key::Key::End => Some(legacy_csi_sequence("F", modifier_parameter)),
+        key::Key::Insert => Some(legacy_tilde_sequence(2, modifier_parameter)),
+        key::Key::Delete => Some(legacy_tilde_sequence(3, modifier_parameter)),
+        key::Key::PageUp => Some(legacy_tilde_sequence(5, modifier_parameter)),
+        key::Key::PageDown => Some(legacy_tilde_sequence(6, modifier_parameter)),
+        _ => None,
+    }
+}
+
+#[cfg(not(feature = "ghostty"))]
+fn legacy_csi_modifier_parameter(mods: key::Mods) -> Option<u8> {
+    let mut value = 1_u8;
+    if mods.contains(key::Mods::SHIFT) {
+        value = value.saturating_add(1);
+    }
+    if mods.contains(key::Mods::ALT) {
+        value = value.saturating_add(2);
+    }
+    if mods.contains(key::Mods::CTRL) {
+        value = value.saturating_add(4);
+    }
+
+    (value > 1).then_some(value)
+}
+
+#[cfg(not(feature = "ghostty"))]
+fn legacy_csi_sequence(final_byte: &str, modifier_parameter: Option<u8>) -> Vec<u8> {
+    match modifier_parameter {
+        Some(parameter) => format!("\x1b[1;{parameter}{final_byte}").into_bytes(),
+        None => format!("\x1b[{final_byte}").into_bytes(),
+    }
+}
+
+#[cfg(not(feature = "ghostty"))]
+fn legacy_tilde_sequence(code: u8, modifier_parameter: Option<u8>) -> Vec<u8> {
+    match modifier_parameter {
+        Some(parameter) => format!("\x1b[{code};{parameter}~").into_bytes(),
+        None => format!("\x1b[{code}~").into_bytes(),
+    }
 }
 
 fn should_publish_terminal_display_state(
@@ -3892,25 +4040,27 @@ mod tests {
         TERMINAL_DISPLAY_PUBLISH_INTERVAL, TERMINAL_OUTPUT_BURST_SLICE_BYTES,
         TERMINAL_OUTPUT_MEDIUM_SLICE_BYTES, TERMINAL_OUTPUT_SLICE_BYTES,
         TERMINAL_WORKER_BURST_PUMP_TIME_BUDGET, TERMINAL_WORKER_MEDIUM_PUMP_TIME_BUDGET,
-        TERMINAL_WORKER_PUMP_TIME_BUDGET, TerminalDisplayCursorStyle, TerminalDisplayGlyph,
-        TerminalDisplayRow, TerminalDisplayState, TerminalLayout, TerminalSelection,
-        TerminalSelectionMode, TerminalSession, TerminalTextRow, TerminalViewportMetrics,
-        build_teamy_display_state, dirty_terminal_row_indices, extract_selected_text,
-        map_cursor_style, map_virtual_key, osc_terminator, partial_osc_133_prefix_len,
-        pending_output_display_publish_interval, pending_output_pump_time_budget,
-        pending_output_slice_bytes, resolve_teamy_cell_colors, resolve_terminal_cell_colors,
-        should_close_from_echoed_ctrl_d,
-        should_keep_active_prompt_visible_on_resize, should_mark_prompt_input_written_for_key,
-        should_publish_terminal_display_state,
+        TERMINAL_WORKER_PUMP_TIME_BUDGET, TerminalDisplayGlyph, TerminalDisplayRow,
+        TerminalDisplayState, TerminalLayout, TerminalSelection, TerminalSelectionMode,
+        TerminalSession, TerminalTextRow, TerminalViewportMetrics, build_teamy_display_state,
+        dirty_terminal_row_indices, extract_selected_text, map_virtual_key, osc_terminator,
+        partial_osc_133_prefix_len, pending_output_display_publish_interval,
+        pending_output_pump_time_budget, pending_output_slice_bytes, resolve_teamy_cell_colors,
+        should_close_from_echoed_ctrl_d, should_keep_active_prompt_visible_on_resize,
+        should_mark_prompt_input_written_for_key, should_publish_terminal_display_state,
         should_publish_terminal_display_update, should_refresh_semantic_prompt_tracking,
         should_translate_ctrl_d_key, should_translate_ctrl_d_to_exit, should_translate_ctrl_l_key,
         should_translate_ctrl_l_to_form_feed, strip_echoed_ctrl_d, viewport_is_bottom_anchored,
     };
+    #[cfg(feature = "ghostty")]
+    use super::{TerminalDisplayCursorStyle, map_cursor_style, resolve_terminal_cell_colors};
     use crate::app::VtEngineChoice;
     use crate::app::spatial::TerminalCellPoint;
     use crate::app::teamy_terminal_engine::{TeamyColor, TeamyTerminalEngine};
-    use libghostty_vt::key;
+    use crate::app::vt_types::key;
+    #[cfg(feature = "ghostty")]
     use libghostty_vt::render::Colors;
+    #[cfg(feature = "ghostty")]
     use libghostty_vt::style::RgbColor;
     use portable_pty::CommandBuilder;
     use std::ffi::OsStr;
@@ -4014,6 +4164,7 @@ mod tests {
     }
 
     // behavior[verify window.appearance.terminal.selection.inverse]
+    #[cfg(feature = "ghostty")]
     #[test]
     fn inverse_cells_swap_colors_and_force_background() {
         let colors = Colors {
@@ -4157,6 +4308,7 @@ mod tests {
         assert_eq!(dirty_terminal_row_indices(&previous, &next), vec![1]);
     }
 
+    #[cfg(feature = "ghostty")]
     #[test]
     fn cursor_style_mapping_matches_ghostty_values() {
         assert_eq!(

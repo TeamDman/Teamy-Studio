@@ -5,13 +5,22 @@ use std::path::Path;
 
 use crate::cli::output::CliOutput;
 
-#[derive(Facet, Arbitrary, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Facet, Arbitrary, Clone, Copy, Debug, PartialEq, Eq)]
 #[facet(rename_all = "kebab-case")]
 #[repr(u8)]
 pub enum SelfTestKeyboardInputVtEngine {
-    #[default]
     Ghostty,
     Teamy,
+}
+
+impl Default for SelfTestKeyboardInputVtEngine {
+    fn default() -> Self {
+        if cfg!(feature = "ghostty") {
+            Self::Ghostty
+        } else {
+            Self::Teamy
+        }
+    }
 }
 
 impl From<SelfTestKeyboardInputVtEngine> for crate::app::VtEngineChoice {

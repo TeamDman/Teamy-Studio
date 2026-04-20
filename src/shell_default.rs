@@ -142,12 +142,14 @@ fn is_pwsh_program(program: &str) -> bool {
         })
 }
 
-    fn is_cmd_program(program: &str) -> bool {
-        Path::new(program)
+fn is_cmd_program(program: &str) -> bool {
+    Path::new(program)
         .file_name()
         .and_then(|name| name.to_str())
-        .is_some_and(|name| name.eq_ignore_ascii_case("cmd") || name.eq_ignore_ascii_case("cmd.exe"))
-    }
+        .is_some_and(|name| {
+            name.eq_ignore_ascii_case("cmd") || name.eq_ignore_ascii_case("cmd.exe")
+        })
+}
 
 fn is_interactive_pwsh_launch(args: &[String]) -> bool {
     !args.iter().any(|argument| {

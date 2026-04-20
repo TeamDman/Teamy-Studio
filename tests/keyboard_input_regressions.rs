@@ -89,10 +89,7 @@ fn run_default_cmd_ratatui_keyboard_self_test() -> std::process::Output {
         .expect("default cmd ratatui keyboard self-test should launch")
 }
 
-fn run_named_pwsh_keyboard_self_test(
-    scenario: &str,
-    vt_engine: &str,
-) -> std::process::Output {
+fn run_named_pwsh_keyboard_self_test(scenario: &str, vt_engine: &str) -> std::process::Output {
     let app_home = TempDirGuard::new("teamy-studio-pwsh-keyboard-self-test-home");
     Command::new(env!("CARGO_BIN_EXE_teamy-studio"))
         .env("COMSPEC", "pwsh.exe")
@@ -202,6 +199,7 @@ fn test_issue_keyboard_input_teamy_noprofile_resize_restores_prompt() {
     );
 }
 
+#[cfg(feature = "ghostty")]
 #[test]
 fn test_issue_keyboard_input_ghostty_noprofile_resize_restores_prompt() {
     let output =

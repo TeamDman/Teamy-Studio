@@ -4,15 +4,18 @@ use std::time::Instant;
 
 use eyre::Context;
 use facet::Facet;
-use libghostty_vt::TerminalOptions;
-use libghostty_vt::render::{CellIterator, RowIterator};
 
 use crate::app::teamy_terminal_engine::{
-    TeamyCursorStyle, TeamyDisplayCursor, TeamyDisplayState, TeamyTerminalEngine,
-    TeamyTraceSnapshot,
+    TeamyDisplayState, TeamyTerminalEngine, TeamyTraceSnapshot,
 };
 
+#[cfg(feature = "ghostty")]
 use super::windows_terminal_engine::GhosttyTerminalEngine;
+
+#[cfg(feature = "ghostty")]
+use libghostty_vt::TerminalOptions;
+#[cfg(feature = "ghostty")]
+use libghostty_vt::render::{CellIterator, RowIterator};
 
 #[derive(Debug, Facet)]
 struct TerminalReplayFixture {
@@ -129,6 +132,7 @@ pub fn run_terminal_replay_self_test(
     Ok(report)
 }
 
+#[cfg(feature = "ghostty")]
 fn run_ghostty_terminal_replay_sample(
     fixture: &TerminalReplayFixture,
 ) -> eyre::Result<TerminalReplaySample> {
@@ -160,20 +164,21 @@ fn run_ghostty_terminal_replay_sample(
         final_screen,
         display_rows: 0,
         display_glyphs: 0,
-        display: TeamyDisplayState {
-            cols: usize::from(fixture.cols.max(1)),
-            rows: usize::from(fixture.rows.max(1)),
-            visible_rows: Vec::new(),
-            cursor: TeamyDisplayCursor {
-                row: 0,
-                column: 0,
-                style: TeamyCursorStyle::Block,
-            },
-            cursor_visible: true,
-            total_rows: 0,
-        },
+        display: TeamyTerminalEngine::new(fixture.cols, fixture.rows, fixture.max_scrollback)
+            .display_state(),
         trace: TeamyTraceSnapshot { events: Vec::new() },
     })
+}
+
+#[cfg(not(feature = "ghostty"))]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "the Teamy-only fallback keeps the same signature as the Ghostty-backed implementation"
+)]
+fn run_ghostty_terminal_replay_sample(
+    fixture: &TerminalReplayFixture,
+) -> eyre::Result<TerminalReplaySample> {
+    Ok(run_teamy_terminal_replay_sample(fixture))
 }
 
 fn run_teamy_terminal_replay_sample(fixture: &TerminalReplayFixture) -> TerminalReplaySample {
@@ -237,6 +242,7 @@ fn teamy_visible_text_from_display(display: &TeamyDisplayState) -> String {
     lines.join("\n")
 }
 
+#[cfg(feature = "ghostty")]
 fn visible_text(engine: &mut GhosttyTerminalEngine) -> eyre::Result<String> {
     engine.with_snapshot(|snapshot| {
         let mut rows = RowIterator::new().wrap_err("failed to create row iterator")?;
@@ -305,12 +311,9 @@ mod tests {
     use eyre::WrapErr;
 
     use super::{
-        GhosttyTerminalEngine, TerminalReplayChunk, TerminalReplayFixture,
-        run_ghostty_terminal_replay_sample, run_teamy_terminal_replay_sample,
-        teamy_visible_text_from_display, visible_text,
+        TerminalReplayChunk, TerminalReplayFixture, run_ghostty_terminal_replay_sample,
+        run_teamy_terminal_replay_sample, teamy_visible_text_from_display,
     };
-    use libghostty_vt::TerminalOptions;
-
     fn fixture_from_file(name: &str) -> eyre::Result<TerminalReplayFixture> {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("tests")
@@ -323,21 +326,6 @@ mod tests {
         facet_json::from_str(&text)
             .map_err(eyre::Report::from)
             .wrap_err_with(|| format!("failed to parse replay fixture {}", path.display()))
-    }
-
-    fn ghostty_visible_text(fixture: &TerminalReplayFixture) -> eyre::Result<String> {
-        let mut engine = GhosttyTerminalEngine::new(TerminalOptions {
-            cols: fixture.cols,
-            rows: fixture.rows,
-            max_scrollback: fixture.max_scrollback,
-        })?;
-        for chunk in &fixture.chunks {
-            let repeat = chunk.repeat.unwrap_or(1).max(1);
-            for _ in 0..repeat {
-                engine.vt_write(chunk.text.as_bytes());
-            }
-        }
-        visible_text(&mut engine)
     }
 
     #[test]
@@ -450,7 +438,7 @@ mod tests {
 
         assert_eq!(
             run_teamy_terminal_replay_sample(&fixture).final_screen,
-            ghostty_visible_text(&fixture)?
+            run_ghostty_terminal_replay_sample(&fixture)?.final_screen
         );
         Ok(())
     }
@@ -469,7 +457,7 @@ mod tests {
 
         assert_eq!(
             run_teamy_terminal_replay_sample(&fixture).final_screen,
-            ghostty_visible_text(&fixture)?
+            run_ghostty_terminal_replay_sample(&fixture)?.final_screen
         );
         Ok(())
     }
@@ -488,7 +476,7 @@ mod tests {
 
         assert_eq!(
             run_teamy_terminal_replay_sample(&fixture).final_screen,
-            ghostty_visible_text(&fixture)?
+            run_ghostty_terminal_replay_sample(&fixture)?.final_screen
         );
         Ok(())
     }
@@ -507,7 +495,7 @@ mod tests {
 
         assert_eq!(
             run_teamy_terminal_replay_sample(&fixture).final_screen,
-            ghostty_visible_text(&fixture)?
+            run_ghostty_terminal_replay_sample(&fixture)?.final_screen
         );
         Ok(())
     }
@@ -526,7 +514,7 @@ mod tests {
 
         assert_eq!(
             run_teamy_terminal_replay_sample(&fixture).final_screen,
-            ghostty_visible_text(&fixture)?
+            run_ghostty_terminal_replay_sample(&fixture)?.final_screen
         );
         Ok(())
     }
@@ -551,7 +539,7 @@ mod tests {
         ] {
             let fixture = fixture_from_file(fixture_name)?;
             let teamy = run_teamy_terminal_replay_sample(&fixture).final_screen;
-            let ghostty = ghostty_visible_text(&fixture)?;
+            let ghostty = run_ghostty_terminal_replay_sample(&fixture)?.final_screen;
             assert_eq!(teamy, ghostty, "fixture mismatch for {fixture_name}");
         }
 

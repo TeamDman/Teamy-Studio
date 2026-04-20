@@ -1,9 +1,19 @@
+#[cfg(feature = "ghostty")]
 use eyre::Context;
-use libghostty_vt::key;
+
+use super::vt_types::{ScrollViewport, key};
+
+#[cfg(feature = "ghostty")]
+use libghostty_vt::key as ghostty_key;
+#[cfg(feature = "ghostty")]
 use libghostty_vt::render::RenderState;
+#[cfg(feature = "ghostty")]
 use libghostty_vt::render::Snapshot;
+#[cfg(feature = "ghostty")]
 use libghostty_vt::screen::GridRef;
-use libghostty_vt::terminal::{Point, PointCoordinate, ScrollViewport};
+#[cfg(feature = "ghostty")]
+use libghostty_vt::terminal::{Point, PointCoordinate};
+#[cfg(feature = "ghostty")]
 use libghostty_vt::{Terminal, TerminalOptions};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -14,20 +24,22 @@ pub struct GhosttyViewportMetrics {
     pub scrollback: usize,
 }
 
+#[cfg(feature = "ghostty")]
 pub struct GhosttyTerminalEngine {
     terminal: Terminal<'static, 'static>,
     render_state: RenderState<'static>,
-    key_encoder: key::Encoder<'static>,
-    key_event: key::Event<'static>,
+    key_encoder: ghostty_key::Encoder<'static>,
+    key_event: ghostty_key::Event<'static>,
 }
 
+#[cfg(feature = "ghostty")]
 impl GhosttyTerminalEngine {
     pub fn new(options: TerminalOptions) -> eyre::Result<Self> {
         Ok(Self {
             terminal: Terminal::new(options).wrap_err("failed to create libghostty terminal")?,
             render_state: RenderState::new().wrap_err("failed to create render state")?,
-            key_encoder: key::Encoder::new().wrap_err("failed to create key encoder")?,
-            key_event: key::Event::new().wrap_err("failed to create key event")?,
+            key_encoder: ghostty_key::Encoder::new().wrap_err("failed to create key encoder")?,
+            key_event: ghostty_key::Event::new().wrap_err("failed to create key event")?,
         })
     }
 
@@ -58,12 +70,13 @@ impl GhosttyTerminalEngine {
     }
 
     pub fn scroll_viewport(&mut self, viewport: ScrollViewport) {
-        self.terminal.scroll_viewport(viewport);
+        self.terminal.scroll_viewport(viewport.into());
     }
 
     pub fn kitty_keyboard_flags(&self) -> eyre::Result<key::KittyKeyFlags> {
         self.terminal
             .kitty_keyboard_flags()
+            .map(Into::into)
             .wrap_err("failed to query kitty keyboard flags")
     }
 
@@ -120,10 +133,10 @@ impl GhosttyTerminalEngine {
         response: &mut Vec<u8>,
     ) -> eyre::Result<()> {
         self.key_event
-            .set_action(action)
-            .set_key(mapped_key)
-            .set_mods(mods)
-            .set_consumed_mods(consumed_mods)
+            .set_action(action.into())
+            .set_key(mapped_key.into())
+            .set_mods(mods.into())
+            .set_consumed_mods(consumed_mods.into())
             .set_unshifted_codepoint(unshifted_codepoint)
             .set_utf8::<String>(None);
 
@@ -131,5 +144,67 @@ impl GhosttyTerminalEngine {
             .set_options_from_terminal(&self.terminal)
             .encode_to_vec(&self.key_event, response)
             .wrap_err("failed to encode special key event")
+    }
+}
+
+#[cfg(not(feature = "ghostty"))]
+#[derive(Debug, Default)]
+pub struct GhosttyTerminalEngine;
+
+#[cfg(not(feature = "ghostty"))]
+impl GhosttyTerminalEngine {
+    pub fn resize(
+        &mut self,
+        cols: u16,
+        rows: u16,
+        cell_width: u32,
+        cell_height: u32,
+    ) -> eyre::Result<()> {
+        let _ = (self, cols, rows, cell_width, cell_height);
+        eyre::bail!("Ghostty VT engine requires the `ghostty` cargo feature")
+    }
+
+    pub fn vt_write(&mut self, bytes: &[u8]) {
+        let _ = (self, bytes);
+    }
+
+    pub fn scroll_viewport(&mut self, viewport: ScrollViewport) {
+        let _ = (self, viewport);
+    }
+
+    pub fn kitty_keyboard_flags(&self) -> eyre::Result<key::KittyKeyFlags> {
+        let _ = self;
+        eyre::bail!("Ghostty VT engine requires the `ghostty` cargo feature")
+    }
+
+    pub fn viewport_metrics(&self) -> eyre::Result<GhosttyViewportMetrics> {
+        let _ = self;
+        eyre::bail!("Ghostty VT engine requires the `ghostty` cargo feature")
+    }
+
+    pub fn total_rows(&self) -> eyre::Result<usize> {
+        let _ = self;
+        eyre::bail!("Ghostty VT engine requires the `ghostty` cargo feature")
+    }
+
+    pub fn encode_key_event(
+        &mut self,
+        action: key::Action,
+        mapped_key: key::Key,
+        mods: key::Mods,
+        consumed_mods: key::Mods,
+        unshifted_codepoint: char,
+        response: &mut Vec<u8>,
+    ) -> eyre::Result<()> {
+        let _ = (
+            self,
+            action,
+            mapped_key,
+            mods,
+            consumed_mods,
+            unshifted_codepoint,
+            response,
+        );
+        eyre::bail!("Ghostty VT engine requires the `ghostty` cargo feature")
     }
 }

@@ -13,7 +13,15 @@ function Invoke-Step {
 	}
 }
 
-function Get-NonTracyTestFeatureArgs {
+function Test-GhosttyChecksEnabled {
+	if ($env:TEAMY_ENABLE_GHOSTTY_CHECKS -eq '1') {
+		return $true
+	}
+
+	return $null -ne (Get-Command zig -ErrorAction SilentlyContinue)
+}
+
+function Get-StandardFeatureArgs {
 	# tool[impl tests.exclude-tracy-feature]
 	# tool[impl tests.avoid-tracy-firewall-prompt]
 	$metadata = cargo metadata --no-deps --format-version 1 | ConvertFrom-Json
@@ -29,7 +37,12 @@ function Get-NonTracyTestFeatureArgs {
 		throw "Could not determine root package from cargo metadata"
 	}
 
-	$features = @($pkg.features.PSObject.Properties.Name | Where-Object { $_ -notin @("default", "tracy") })
+	$excludedFeatures = @("default", "tracy")
+	if (-not (Test-GhosttyChecksEnabled)) {
+		$excludedFeatures += "ghostty"
+	}
+
+	$features = @($pkg.features.PSObject.Properties.Name | Where-Object { $_ -notin $excludedFeatures })
 	if ($features.Count -gt 0) {
 		return @("--features", ($features -join ","))
 	}
@@ -37,22 +50,22 @@ function Get-NonTracyTestFeatureArgs {
 	return @()
 }
 
+$standardFeatureArgs = Get-StandardFeatureArgs
+
 Invoke-Step -Label "format check" -Action {
 	cargo fmt --all
 }
 
 Invoke-Step -Label "clippy lint check" -Action {
-	# cargo clippy --all-targets --all-features -- -D warnings
-	cargo clippy --all-features -- -D warnings
+	cargo clippy @standardFeatureArgs -- -D warnings
 }
 
 Invoke-Step -Label "build" -Action {
-	cargo build --all-features --quiet
+	cargo build @standardFeatureArgs --quiet
 }
 
 Invoke-Step -Label "tests" -Action {
-	$featuresArg = Get-NonTracyTestFeatureArgs
-	cargo test @featuresArg --quiet
+	cargo test @standardFeatureArgs --quiet
 }
 
 Invoke-Step -Label "tracey validation" -Action {
