@@ -27,6 +27,9 @@ The launched terminal window must still resize from its edges and corners using 
 os[window.interaction.clipboard.multiline-paste-confirmation.native-dialog]
 The multiline paste confirmation flow should use a native Windows dialog positioned relative to the Teamy Studio window rather than a custom in-client prompt.
 
+os[window.taskbar.progress.osc-9-4]
+When the terminal emits supported `OSC 9;4` progress sequences, the Teamy Studio window must mirror that state into native Windows taskbar progress.
+
 ## Windows Implementation Direction
 
 os[os.windows.rendering.direct3d12]

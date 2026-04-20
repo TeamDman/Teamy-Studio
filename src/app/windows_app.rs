@@ -20,9 +20,16 @@ use windows::Win32::Graphics::Gdi::{
     GetDeviceCaps, GetTextExtentPoint32W, HFONT, LOGFONTW, PAINTSTRUCT, ReleaseDC, SelectObject,
     VREFRESH,
 };
+use windows::Win32::System::Com::{
+    CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
+};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, VK_ADD, VK_CONTROL, VK_LBUTTON, VK_MENU, VK_OEM_MINUS, VK_OEM_PLUS, VK_SHIFT,
     VK_SUBTRACT,
+};
+use windows::Win32::UI::Shell::{
+    ITaskbarList3, TBPF_ERROR, TBPF_INDETERMINATE, TBPF_NOPROGRESS, TBPF_NORMAL, TBPF_PAUSED,
+    TBPFLAG, TaskbarList,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, EnumWindows, GetClassNameW,
@@ -30,7 +37,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, HTCAPTION, HTCLIENT, IDC_ARROW,
     IDC_SIZEALL, IsWindowVisible, KillTimer, LoadCursorW, MSG, MoveWindow, PostMessageW,
     PostQuitMessage, RegisterClassExW, SM_CXPADDEDBORDER, SM_CXSCREEN, SM_CXSIZEFRAME, SM_CYSCREEN,
-    SM_CYSIZEFRAME, SW_SHOW, SYSTEM_METRICS_INDEX, SetCursor, SetTimer, ShowWindow,
+    SM_CYSIZEFRAME, SW_SHOW, SYSTEM_METRICS_INDEX, SetCursor, SetTimer, SetWindowTextW, ShowWindow,
     TranslateMessage, WM_CHAR, WM_CLOSE, WM_DESTROY, WM_ENTERSIZEMOVE, WM_ERASEBKGND,
     WM_EXITSIZEMOVE, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP,
     WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCALCSIZE, WM_NCHITTEST, WM_NCLBUTTONDOWN, WM_PAINT,
@@ -53,9 +60,10 @@ use super::windows_dialogs::{
     PasteConfirmationChoice, paste_confirmation_required, show_multiline_paste_confirmation_dialog,
 };
 use super::windows_terminal::{
-    POLL_INTERVAL_MS, POLL_TIMER_ID, TERMINAL_WORKER_WAKE_MESSAGE, TerminalDisplayCursorStyle,
-    TerminalDisplayScrollbar, TerminalDisplayState, TerminalLayout, TerminalPerformanceSnapshot,
-    TerminalSelection, TerminalSelectionMode, TerminalSession, keyboard_mods,
+    POLL_INTERVAL_MS, POLL_TIMER_ID, TERMINAL_WORKER_WAKE_MESSAGE, TerminalChromeState,
+    TerminalDisplayCursorStyle, TerminalDisplayScrollbar, TerminalDisplayState, TerminalLayout,
+    TerminalPerformanceSnapshot, TerminalProgressState, TerminalSelection, TerminalSelectionMode,
+    TerminalSession, keyboard_mods,
 };
 use super::{TerminalThroughputBenchmarkMode, TerminalWindowSummary, VtEngineChoice};
 
@@ -102,7 +110,10 @@ struct AppState {
     app_home: AppHome,
     hwnd: Option<WindowHandle>,
     launch_command_argv: Vec<String>,
-    chrome_title: Option<String>,
+    launch_title: Option<String>,
+    terminal_chrome: TerminalChromeState,
+    last_applied_window_title: String,
+    taskbar_progress: TaskbarProgressController,
     vt_engine: VtEngineChoice,
     pending_window_drag: Option<PendingWindowDrag>,
     terminal_selection: Option<TerminalSelection>,
@@ -186,6 +197,14 @@ impl WindowHandle {
         let _ = unsafe { PostMessageW(Some(self.hwnd), WM_CLOSE, WPARAM(0), LPARAM(0)) };
     }
 
+    fn set_title(self, title: &str) -> eyre::Result<()> {
+        self.window_thread.assert_window_thread();
+        let title = wide_null_terminated(title);
+        // Safety: `title` is a valid null-terminated UTF-16 buffer for the duration of the call.
+        unsafe { SetWindowTextW(self.hwnd, PCWSTR(title.as_ptr())) }
+            .wrap_err("failed to update window title")
+    }
+
     fn client_rect(self) -> eyre::Result<ClientRect> {
         self.window_thread.assert_window_thread();
         let mut rect = RECT::default();
@@ -253,6 +272,62 @@ impl WindowHandle {
         // Safety: releasing mouse capture after pointer interaction completes is valid.
         unsafe {
             let _ = ReleaseCapture();
+        }
+    }
+}
+
+#[derive(Default)]
+struct TaskbarProgressController {
+    taskbar: Option<ITaskbarList3>,
+    initialization_attempted: bool,
+    last_applied_progress: Option<TerminalProgressState>,
+}
+
+impl TaskbarProgressController {
+    fn apply(&mut self, hwnd: WindowHandle, progress: TerminalProgressState) -> eyre::Result<()> {
+        if self.last_applied_progress == Some(progress) {
+            return Ok(());
+        }
+
+        self.ensure_initialized();
+        let Some(taskbar) = self.taskbar.as_ref() else {
+            self.last_applied_progress = Some(progress);
+            return Ok(());
+        };
+
+        // Safety: the taskbar COM object is initialized on the UI thread and the HWND belongs to this live top-level window.
+        unsafe { taskbar.SetProgressState(hwnd.raw(), taskbar_progress_flag(progress)) }
+            .wrap_err("failed to update taskbar progress state")?;
+        if let Some(value) = taskbar_progress_value(progress) {
+            // Safety: the taskbar COM object is initialized on the UI thread and the HWND belongs to this live top-level window.
+            unsafe { taskbar.SetProgressValue(hwnd.raw(), value, 100) }
+                .wrap_err("failed to update taskbar progress value")?;
+        }
+        self.last_applied_progress = Some(progress);
+        Ok(())
+    }
+
+    fn clear(&mut self, hwnd: WindowHandle) -> eyre::Result<()> {
+        self.apply(hwnd, TerminalProgressState::Hidden)
+    }
+
+    fn ensure_initialized(&mut self) {
+        if self.initialization_attempted {
+            return;
+        }
+
+        self.initialization_attempted = true;
+        // Safety: initializing COM for the UI thread before creating the taskbar COM object is required by the Win32 API.
+        let _ = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+        // Safety: the TaskbarList class object is created on the UI thread and retained for later taskbar updates.
+        let taskbar_result: windows::core::Result<ITaskbarList3> =
+            unsafe { CoCreateInstance(&TaskbarList, None, CLSCTX_INPROC_SERVER) };
+        let Ok(taskbar) = taskbar_result else {
+            return;
+        };
+        // Safety: the taskbar COM object has just been created on the UI thread and must be initialized before use.
+        if unsafe { taskbar.HrInit() }.is_ok() {
+            self.taskbar = Some(taskbar);
         }
     }
 }
@@ -545,7 +620,10 @@ fn run_with_terminal_session(
             app_home: app_home.clone(),
             hwnd: None,
             launch_command_argv,
-            chrome_title: title.map(ToOwned::to_owned),
+            launch_title: title.map(ToOwned::to_owned),
+            terminal_chrome: TerminalChromeState::default(),
+            last_applied_window_title: title.unwrap_or(WINDOW_TITLE).to_owned(),
+            taskbar_progress: TaskbarProgressController::default(),
             vt_engine,
             pending_window_drag: None,
             terminal_selection: None,
@@ -607,6 +685,55 @@ fn normalize_initial_stdin(text: &str) -> String {
         text.to_owned()
     } else {
         format!("{text}\r")
+    }
+}
+
+fn resolved_visible_title<'a>(
+    launch_title: Option<&'a str>,
+    chrome_state: &'a TerminalChromeState,
+) -> Option<&'a str> {
+    chrome_state.runtime_title.as_deref().or(launch_title)
+}
+
+fn resolved_window_caption<'a>(
+    launch_title: Option<&'a str>,
+    chrome_state: &'a TerminalChromeState,
+) -> &'a str {
+    resolved_visible_title(launch_title, chrome_state).unwrap_or(WINDOW_TITLE)
+}
+
+// behavior[impl window.appearance.chrome.runtime-terminal-title]
+fn sync_window_chrome(state: &mut AppState, hwnd: WindowHandle) -> eyre::Result<()> {
+    state.terminal_chrome = state.terminal.chrome_state();
+
+    let caption = resolved_window_caption(state.launch_title.as_deref(), &state.terminal_chrome);
+    if state.last_applied_window_title != caption {
+        hwnd.set_title(caption)?;
+        state.last_applied_window_title = caption.to_owned();
+    }
+
+    state
+        .taskbar_progress
+        .apply(hwnd, state.terminal_chrome.progress)
+}
+
+// os[impl window.taskbar.progress.osc-9-4]
+fn taskbar_progress_flag(progress: TerminalProgressState) -> TBPFLAG {
+    match progress {
+        TerminalProgressState::Hidden => TBPF_NOPROGRESS,
+        TerminalProgressState::Normal(_) => TBPF_NORMAL,
+        TerminalProgressState::Error(_) => TBPF_ERROR,
+        TerminalProgressState::Indeterminate => TBPF_INDETERMINATE,
+        TerminalProgressState::Warning(_) => TBPF_PAUSED,
+    }
+}
+
+fn taskbar_progress_value(progress: TerminalProgressState) -> Option<u64> {
+    match progress {
+        TerminalProgressState::Normal(value)
+        | TerminalProgressState::Error(value)
+        | TerminalProgressState::Warning(value) => Some(u64::from(value)),
+        TerminalProgressState::Hidden | TerminalProgressState::Indeterminate => None,
     }
 }
 
@@ -1448,7 +1575,16 @@ fn handle_non_client_hit_test(hwnd: WindowHandle, lparam: LPARAM) -> LRESULT {
 
 fn handle_destroy_message(hwnd: WindowHandle) -> LRESULT {
     APP_STATE.with(|state| {
-        let _ = state.borrow_mut().take();
+        let mut state = state.borrow_mut();
+        if let Some(app_state) = state.as_mut()
+            && let Err(error) = app_state.taskbar_progress.clear(hwnd)
+        {
+            error!(
+                ?error,
+                "failed to clear taskbar progress during window shutdown"
+            );
+        }
+        let _ = state.take();
     });
     hwnd.post_quit_message();
     LRESULT(0)
@@ -1506,6 +1642,8 @@ fn render_current_frame_with_options(
     resize: Option<(u32, u32)>,
     force_redraw: bool,
 ) -> eyre::Result<()> {
+    sync_window_chrome(state, hwnd)?;
+
     if let Some((width, height)) = resize
         && let Some(renderer) = state.renderer.as_mut()
     {
@@ -1551,7 +1689,8 @@ fn render_current_frame_with_options(
         let _span = debug_span!("submit_render_frame_model").entered();
         let frame = RenderFrameModel {
             layout,
-            title: state.chrome_title.clone(),
+            title: resolved_visible_title(state.launch_title.as_deref(), &state.terminal_chrome)
+                .map(ToOwned::to_owned),
             diagnostic_text,
             diagnostic_cell_width: state.diagnostic_cell_width,
             diagnostic_cell_height: state.diagnostic_cell_height,
@@ -1840,9 +1979,7 @@ fn build_diagnostic_panel_text(
         },
     );
 
-    let title_line = state
-        .chrome_title
-        .as_deref()
+    let title_line = resolved_visible_title(state.launch_title.as_deref(), &state.terminal_chrome)
         .filter(|title| !title.is_empty())
         .map_or_else(
             || "terminal".to_owned(),
@@ -2687,7 +2824,7 @@ fn handle_left_button_up(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Result<boo
 
         let app_home = state.app_home.clone();
         let command_argv = state.launch_command_argv.clone();
-        let chrome_title = state.chrome_title.clone();
+        let launch_title = state.launch_title.clone();
         let vt_engine = state.vt_engine;
 
         thread::Builder::new()
@@ -2697,7 +2834,7 @@ fn handle_left_button_up(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Result<boo
                     &app_home,
                     Some(&command_argv),
                     None,
-                    chrome_title.as_deref(),
+                    launch_title.as_deref(),
                     vt_engine,
                 );
                 if let Err(error) = launch_result {
@@ -3694,6 +3831,91 @@ mod tests {
             Some(RightClickTerminalAction::ConfirmPaste)
         );
         assert_eq!(right_click_terminal_action(false, ""), None);
+    }
+
+    // behavior[verify window.appearance.chrome.runtime-terminal-title]
+    #[test]
+    fn resolved_visible_title_prefers_runtime_title_over_launch_seed() {
+        let chrome = TerminalChromeState {
+            runtime_title: Some("pwsh.exe".to_owned()),
+            progress: TerminalProgressState::Hidden,
+        };
+
+        assert_eq!(
+            resolved_visible_title(Some("seed"), &chrome),
+            Some("pwsh.exe")
+        );
+    }
+
+    // behavior[verify window.appearance.chrome.runtime-terminal-title]
+    #[test]
+    fn resolved_visible_title_falls_back_to_launch_seed_before_runtime_title_arrives() {
+        let chrome = TerminalChromeState::default();
+
+        assert_eq!(resolved_visible_title(Some("seed"), &chrome), Some("seed"));
+    }
+
+    #[test]
+    fn resolved_window_caption_falls_back_to_default_caption_when_no_title_exists() {
+        let chrome = TerminalChromeState::default();
+
+        assert_eq!(resolved_window_caption(None, &chrome), WINDOW_TITLE);
+    }
+
+    #[test]
+    fn resolved_window_caption_keeps_explicit_empty_runtime_title() {
+        let chrome = TerminalChromeState {
+            runtime_title: Some(String::new()),
+            progress: TerminalProgressState::Hidden,
+        };
+
+        assert_eq!(resolved_window_caption(Some("seed"), &chrome), "");
+    }
+
+    // os[verify window.taskbar.progress.osc-9-4]
+    #[test]
+    fn taskbar_progress_flag_matches_supported_osc_progress_states() {
+        assert_eq!(
+            taskbar_progress_flag(TerminalProgressState::Hidden),
+            TBPF_NOPROGRESS
+        );
+        assert_eq!(
+            taskbar_progress_flag(TerminalProgressState::Normal(10)),
+            TBPF_NORMAL
+        );
+        assert_eq!(
+            taskbar_progress_flag(TerminalProgressState::Error(10)),
+            TBPF_ERROR
+        );
+        assert_eq!(
+            taskbar_progress_flag(TerminalProgressState::Indeterminate),
+            TBPF_INDETERMINATE
+        );
+        assert_eq!(
+            taskbar_progress_flag(TerminalProgressState::Warning(10)),
+            TBPF_PAUSED
+        );
+    }
+
+    #[test]
+    fn taskbar_progress_value_is_only_reported_for_percentage_states() {
+        assert_eq!(taskbar_progress_value(TerminalProgressState::Hidden), None);
+        assert_eq!(
+            taskbar_progress_value(TerminalProgressState::Indeterminate),
+            None
+        );
+        assert_eq!(
+            taskbar_progress_value(TerminalProgressState::Normal(42)),
+            Some(42)
+        );
+        assert_eq!(
+            taskbar_progress_value(TerminalProgressState::Error(17)),
+            Some(17)
+        );
+        assert_eq!(
+            taskbar_progress_value(TerminalProgressState::Warning(88)),
+            Some(88)
+        );
     }
 }
 

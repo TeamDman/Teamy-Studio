@@ -67,7 +67,7 @@ const WIN32_INPUT_MODE_DISABLE: &[u8] = b"\x1b[?9001l";
 const CTRL_D_EOF: u8 = 0x04;
 const CTRL_L_FORM_FEED: u8 = 0x0C;
 const CTRL_D_EXIT_COMMAND: &[u8] = b"exit\r";
-const OSC_133_PREFIX: &[u8] = b"\x1b]133;";
+const OSC_PREFIX: &[u8] = b"\x1b]";
 
 type PtyWriter = Box<dyn Write + Send>;
 
@@ -363,11 +363,28 @@ struct SemanticPromptTracking {
     input_state: PromptInputState,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TerminalProgressState {
+    #[default]
+    Hidden,
+    Normal(u8),
+    Error(u8),
+    Indeterminate,
+    Warning(u8),
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TerminalChromeState {
+    pub runtime_title: Option<String>,
+    pub progress: TerminalProgressState,
+}
+
 pub struct TerminalSession {
     worker_tx: mpsc::Sender<TerminalWorkerRequest>,
     pending_updates: Arc<Mutex<PendingTerminalWorkerUpdates>>,
     wake_window: Arc<Mutex<Option<isize>>>,
     snapshot: TerminalSnapshot,
+    chrome_state: TerminalChromeState,
     worker_queued_output: bool,
     repaint_requested: bool,
     cached_display: SharedTerminalDisplayState,
@@ -523,8 +540,9 @@ struct TerminalCore {
     suppressed_chars: VecDeque<SuppressedChar>,
     win32_input: Win32InputState,
     win32_input_mode_buffer: Vec<u8>,
-    semantic_prompt_buffer: Vec<u8>,
+    osc_observer_buffer: Vec<u8>,
     semantic_prompt: SemanticPromptTracking,
+    chrome_state: TerminalChromeState,
     pending_prompt_reanchor_after_resize: bool,
     cached_display: SharedTerminalDisplayState,
     display_cache_dirty: bool,
@@ -572,6 +590,7 @@ enum TerminalWorkerCommand {
 #[derive(Clone, Debug, PartialEq)]
 enum TerminalWorkerUpdate {
     Snapshot(TerminalSnapshot),
+    ChromeState(TerminalChromeState),
     DisplayState(SharedTerminalDisplayState),
     PtyOutputQueued,
     RepaintRequested,
@@ -585,6 +604,7 @@ enum TerminalWorkerUpdate {
 #[derive(Debug, Default)]
 struct PendingTerminalWorkerUpdates {
     latest_snapshot: Option<TerminalSnapshot>,
+    latest_chrome: Option<TerminalChromeState>,
     latest_display: Option<SharedTerminalDisplayState>,
     queued_output: bool,
     child_exited: bool,
@@ -597,6 +617,9 @@ impl PendingTerminalWorkerUpdates {
         match update {
             TerminalWorkerUpdate::Snapshot(snapshot) => {
                 self.latest_snapshot = Some(snapshot);
+            }
+            TerminalWorkerUpdate::ChromeState(chrome_state) => {
+                self.latest_chrome = Some(chrome_state);
             }
             TerminalWorkerUpdate::DisplayState(display) => {
                 self.latest_display = Some(display);
@@ -910,6 +933,7 @@ impl TerminalSession {
             pending_updates,
             wake_window,
             snapshot,
+            chrome_state: TerminalChromeState::default(),
             worker_queued_output: false,
             repaint_requested: false,
             cached_display: Arc::new(TerminalDisplayState::default()),
@@ -944,6 +968,11 @@ impl TerminalSession {
 
     pub fn has_pending_output(&self) -> bool {
         self.snapshot.pending_output_bytes > 0
+    }
+
+    pub fn chrome_state(&mut self) -> TerminalChromeState {
+        self.drain_worker_updates();
+        self.chrome_state.clone()
     }
 
     pub fn cached_display_state(&mut self) -> SharedTerminalDisplayState {
@@ -1235,6 +1264,9 @@ impl TerminalSession {
         if let Some(snapshot) = pending_updates.latest_snapshot.take() {
             self.snapshot = snapshot;
         }
+        if let Some(chrome_state) = pending_updates.latest_chrome.take() {
+            self.chrome_state = chrome_state;
+        }
         if let Some(display) = pending_updates.latest_display.take() {
             self.cached_display = display;
             if let Some(started_at) = self.pending_input_present_starts.pop_front() {
@@ -1273,6 +1305,7 @@ struct TerminalWorkerRunner {
     request_rx: mpsc::Receiver<TerminalWorkerRequest>,
     update_tx: mpsc::Sender<TerminalWorkerUpdate>,
     last_snapshot: TerminalSnapshot,
+    last_chrome_state: TerminalChromeState,
     last_display_publish_at: Instant,
     last_published_display: Option<SharedTerminalDisplayState>,
 }
@@ -1284,11 +1317,13 @@ impl TerminalWorkerRunner {
         update_tx: mpsc::Sender<TerminalWorkerUpdate>,
     ) -> Self {
         let last_snapshot = core.snapshot();
+        let last_chrome_state = core.chrome_state();
         Self {
             core,
             request_rx,
             update_tx,
             last_snapshot,
+            last_chrome_state,
             last_display_publish_at: Instant::now(),
             last_published_display: None,
         }
@@ -1298,6 +1333,9 @@ impl TerminalWorkerRunner {
         let _ = self
             .update_tx
             .send(TerminalWorkerUpdate::Snapshot(self.last_snapshot));
+        let _ = self.update_tx.send(TerminalWorkerUpdate::ChromeState(
+            self.last_chrome_state.clone(),
+        ));
         if let Err(error) = self.publish_display_state_if_due() {
             error!(
                 ?error,
@@ -1402,6 +1440,7 @@ impl TerminalWorkerRunner {
         };
 
         self.publish_snapshot_if_changed()?;
+        self.publish_chrome_state_if_changed()?;
         let response = TerminalWorkerResponse {
             snapshot: self.last_snapshot,
             payload,
@@ -1441,10 +1480,12 @@ impl TerminalWorkerRunner {
                         self.core.refresh_semantic_prompt_tracking()?;
                     }
                     self.publish_snapshot_if_changed()?;
+                    self.publish_chrome_state_if_changed()?;
                     self.publish_display_state_if_due()?;
                 }
                 self.handle_request(request)?;
                 self.publish_snapshot_if_changed()?;
+                self.publish_chrome_state_if_changed()?;
                 self.publish_display_state_if_due()?;
                 return Ok(());
             }
@@ -1473,6 +1514,7 @@ impl TerminalWorkerRunner {
         self.core.refresh_child_exit_state()?;
 
         self.publish_snapshot_if_changed()?;
+        self.publish_chrome_state_if_changed()?;
         self.publish_display_state_if_due()?;
         if self.last_snapshot.closed {
             let _ = self.update_tx.send(TerminalWorkerUpdate::ChildExited);
@@ -1529,6 +1571,20 @@ impl TerminalWorkerRunner {
                     eyre::eyre!("failed to publish terminal worker snapshot: {error}")
                 })?;
         }
+        Ok(())
+    }
+
+    fn publish_chrome_state_if_changed(&mut self) -> eyre::Result<()> {
+        let chrome_state = self.core.chrome_state();
+        if chrome_state == self.last_chrome_state {
+            return Ok(());
+        }
+
+        self.last_chrome_state = chrome_state.clone();
+        self.update_tx
+            .send(TerminalWorkerUpdate::ChromeState(chrome_state))
+            .map_err(|error| eyre::eyre!("failed to publish terminal chrome state: {error}"))?;
+        let _ = self.update_tx.send(TerminalWorkerUpdate::RepaintRequested);
         Ok(())
     }
 }
@@ -1669,8 +1725,9 @@ impl TerminalCore {
             suppressed_chars: VecDeque::new(),
             win32_input: Win32InputState::default(),
             win32_input_mode_buffer: Vec::new(),
-            semantic_prompt_buffer: Vec::new(),
+            osc_observer_buffer: Vec::new(),
             semantic_prompt: SemanticPromptTracking::default(),
+            chrome_state: TerminalChromeState::default(),
             pending_prompt_reanchor_after_resize: false,
             cached_display: Arc::new(TerminalDisplayState::default()),
             display_cache_dirty: true,
@@ -1693,6 +1750,10 @@ impl TerminalCore {
         let mut snapshot = self.performance;
         snapshot.pending_output_bytes = self.pending_output.len();
         snapshot
+    }
+
+    fn chrome_state(&self) -> TerminalChromeState {
+        self.chrome_state.clone()
     }
 
     pub fn has_pending_output(&self) -> bool {
@@ -1923,8 +1984,8 @@ impl TerminalCore {
             let _span = debug_span!("process_terminal_output_chunk").entered();
             let () = {
                 #[cfg(feature = "tracy")]
-                let _span = debug_span!("observe_semantic_prompt_sequences").entered();
-                self.observe_semantic_prompt_sequences(&slice);
+                let _span = debug_span!("observe_terminal_osc_sequences").entered();
+                self.observe_terminal_osc_sequences(&slice);
             };
             let () = {
                 #[cfg(feature = "tracy")]
@@ -2573,65 +2634,10 @@ impl TerminalCore {
         }
     }
 
-    fn observe_semantic_prompt_sequences(&mut self, data: &[u8]) {
-        let mut combined = std::mem::take(&mut self.semantic_prompt_buffer);
-        combined.extend_from_slice(data);
-
-        let mut index = 0;
-        while index < combined.len() {
-            let Some(relative_start) = combined[index..]
-                .windows(OSC_133_PREFIX.len())
-                .position(|window| window == OSC_133_PREFIX)
-            else {
-                break;
-            };
-
-            let start = index + relative_start;
-            let payload_start = start + OSC_133_PREFIX.len();
-            let Some((payload_end, terminator_len)) = osc_terminator(&combined[payload_start..])
-            else {
-                self.semantic_prompt_buffer
-                    .extend_from_slice(&combined[start..]);
-                return;
-            };
-
-            let payload = &combined[payload_start..payload_start + payload_end];
-            self.apply_semantic_prompt_payload(payload);
-            index = payload_start + payload_end + terminator_len;
-        }
-
-        if index < combined.len() {
-            let trailing = &combined[index..];
-            if let Some(partial_len) = partial_osc_133_prefix_len(trailing) {
-                self.semantic_prompt_buffer
-                    .extend_from_slice(&trailing[trailing.len() - partial_len..]);
-            }
-        }
-    }
-
-    fn apply_semantic_prompt_payload(&mut self, payload: &[u8]) {
-        let Some(action) = payload.first().copied() else {
-            return;
-        };
-
-        match action {
-            b'B' | b'I' => {
-                self.semantic_prompt.markers_observed = true;
-                self.semantic_prompt.input_state = PromptInputState::AwaitingPristine;
-                debug!(
-                    action = %char::from(action),
-                    "detected OSC 133 shell awaiting-input marker"
-                );
-            }
-            b'A' | b'C' | b'D' | b'N' | b'P' => {
-                self.semantic_prompt.markers_observed = true;
-                self.semantic_prompt.input_state = PromptInputState::Inactive;
-            }
-            b'L' => {
-                self.semantic_prompt.markers_observed = true;
-            }
-            _ => {}
-        }
+    fn observe_terminal_osc_sequences(&mut self, data: &[u8]) {
+        observe_osc_sequences(&mut self.osc_observer_buffer, data, |payload| {
+            apply_observed_osc_payload(payload, &mut self.semantic_prompt, &mut self.chrome_state);
+        });
     }
 
     fn visible_cell_text_rows(&mut self) -> eyre::Result<Vec<TerminalTextRow>> {
@@ -3199,20 +3205,150 @@ fn strip_echoed_ctrl_d(data: &[u8]) -> Cow<'_, [u8]> {
 }
 
 fn osc_terminator(data: &[u8]) -> Option<(usize, usize)> {
-    if let Some(index) = data.iter().position(|byte| *byte == b'\x07') {
-        return Some((index, 1));
+    let mut terminator = data
+        .iter()
+        .position(|byte| *byte == b'\x07')
+        .map(|index| (index, 1));
+
+    if let Some(index) = data.iter().position(|byte| *byte == 0x9C)
+        && terminator.is_none_or(|(current_index, _)| index < current_index)
+    {
+        terminator = Some((index, 1));
     }
 
-    data.windows(2)
-        .position(|window| window == b"\x1b\\")
-        .map(|index| (index, 2))
+    if let Some(index) = data.windows(2).position(|window| window == b"\x1b\\")
+        && terminator.is_none_or(|(current_index, _)| index < current_index)
+    {
+        terminator = Some((index, 2));
+    }
+
+    terminator
 }
 
-fn partial_osc_133_prefix_len(data: &[u8]) -> Option<usize> {
-    let max_len = data.len().min(OSC_133_PREFIX.len().saturating_sub(1));
+fn observe_osc_sequences<F>(buffer: &mut Vec<u8>, data: &[u8], mut on_payload: F)
+where
+    F: FnMut(&[u8]),
+{
+    let mut combined = std::mem::take(buffer);
+    combined.extend_from_slice(data);
+
+    let mut index = 0;
+    while index < combined.len() {
+        let Some(relative_start) = combined[index..]
+            .windows(OSC_PREFIX.len())
+            .position(|window| window == OSC_PREFIX)
+        else {
+            break;
+        };
+
+        let start = index + relative_start;
+        let payload_start = start + OSC_PREFIX.len();
+        let Some((payload_end, terminator_len)) = osc_terminator(&combined[payload_start..]) else {
+            buffer.extend_from_slice(&combined[start..]);
+            return;
+        };
+
+        on_payload(&combined[payload_start..payload_start + payload_end]);
+        index = payload_start + payload_end + terminator_len;
+    }
+
+    if index < combined.len() {
+        let trailing = &combined[index..];
+        if let Some(partial_len) = partial_osc_prefix_len(trailing) {
+            buffer.extend_from_slice(&trailing[trailing.len() - partial_len..]);
+        }
+    }
+}
+
+fn split_osc_command_and_body(payload: &[u8]) -> Option<(&[u8], &[u8])> {
+    let delimiter = payload.iter().position(|byte| *byte == b';')?;
+    Some((&payload[..delimiter], &payload[delimiter + 1..]))
+}
+
+fn apply_observed_osc_payload(
+    payload: &[u8],
+    semantic_prompt: &mut SemanticPromptTracking,
+    chrome_state: &mut TerminalChromeState,
+) {
+    let Some((command, body)) = split_osc_command_and_body(payload) else {
+        return;
+    };
+
+    match command {
+        b"0" | b"2" => {
+            chrome_state.runtime_title = Some(String::from_utf8_lossy(body).into_owned());
+        }
+        b"9" => {
+            if let Some(progress) = parse_osc_9_4_progress(body) {
+                chrome_state.progress = progress;
+            }
+        }
+        b"133" => apply_semantic_prompt_payload(body, semantic_prompt),
+        _ => {}
+    }
+}
+
+fn apply_semantic_prompt_payload(payload: &[u8], semantic_prompt: &mut SemanticPromptTracking) {
+    let Some(action) = payload.first().copied() else {
+        return;
+    };
+
+    match action {
+        b'B' | b'I' => {
+            semantic_prompt.markers_observed = true;
+            semantic_prompt.input_state = PromptInputState::AwaitingPristine;
+            debug!(
+                action = %char::from(action),
+                "detected OSC 133 shell awaiting-input marker"
+            );
+        }
+        b'A' | b'C' | b'D' | b'N' | b'P' => {
+            semantic_prompt.markers_observed = true;
+            semantic_prompt.input_state = PromptInputState::Inactive;
+        }
+        b'L' => {
+            semantic_prompt.markers_observed = true;
+        }
+        _ => {}
+    }
+}
+
+fn parse_osc_9_4_progress(payload: &[u8]) -> Option<TerminalProgressState> {
+    let mut fields = payload.split(|byte| *byte == b';');
+    if fields.next()? != b"4" {
+        return None;
+    }
+
+    match parse_osc_field_u8(fields.next()?)? {
+        0 => Some(TerminalProgressState::Hidden),
+        1 => Some(TerminalProgressState::Normal(parse_osc_progress_value(
+            fields.next()?,
+        )?)),
+        2 => Some(TerminalProgressState::Error(parse_osc_progress_value(
+            fields.next()?,
+        )?)),
+        3 => Some(TerminalProgressState::Indeterminate),
+        4 => Some(TerminalProgressState::Warning(parse_osc_progress_value(
+            fields.next()?,
+        )?)),
+        _ => None,
+    }
+}
+
+fn parse_osc_field_u8(field: &[u8]) -> Option<u8> {
+    std::str::from_utf8(field).ok()?.parse::<u8>().ok()
+}
+
+fn parse_osc_progress_value(field: &[u8]) -> Option<u8> {
+    let value = std::str::from_utf8(field).ok()?.parse::<u16>().ok()?;
+    Some(u8::try_from(value.min(100)).unwrap_or(100))
+}
+
+fn partial_osc_prefix_len(data: &[u8]) -> Option<usize> {
+    let max_len = data.len().min(OSC_PREFIX.len().saturating_sub(1));
     (1..=max_len)
         .rev()
-        .find(|len| OSC_133_PREFIX.starts_with(&data[data.len() - len..]))
+        .find(|len| OSC_PREFIX.starts_with(&data[data.len() - len..]))
 }
 
 fn ordered_block_bounds(
@@ -3892,18 +4028,19 @@ mod tests {
         TERMINAL_DISPLAY_PUBLISH_INTERVAL, TERMINAL_OUTPUT_BURST_SLICE_BYTES,
         TERMINAL_OUTPUT_MEDIUM_SLICE_BYTES, TERMINAL_OUTPUT_SLICE_BYTES,
         TERMINAL_WORKER_BURST_PUMP_TIME_BUDGET, TERMINAL_WORKER_MEDIUM_PUMP_TIME_BUDGET,
-        TERMINAL_WORKER_PUMP_TIME_BUDGET, TerminalDisplayCursorStyle, TerminalDisplayGlyph,
-        TerminalDisplayRow, TerminalDisplayState, TerminalLayout, TerminalSelection,
-        TerminalSelectionMode, TerminalSession, TerminalTextRow, TerminalViewportMetrics,
+        TERMINAL_WORKER_PUMP_TIME_BUDGET, TerminalChromeState, TerminalDisplayCursorStyle,
+        TerminalDisplayGlyph, TerminalDisplayRow, TerminalDisplayState, TerminalLayout,
+        TerminalProgressState, TerminalSelection, TerminalSelectionMode, TerminalSession,
+        TerminalTextRow, TerminalViewportMetrics, apply_observed_osc_payload,
         build_teamy_display_state, dirty_terminal_row_indices, extract_selected_text,
-        map_cursor_style, map_virtual_key, osc_terminator, partial_osc_133_prefix_len,
-        pending_output_display_publish_interval, pending_output_pump_time_budget,
-        pending_output_slice_bytes, resolve_teamy_cell_colors, resolve_terminal_cell_colors,
-        should_close_from_echoed_ctrl_d,
+        map_cursor_style, map_virtual_key, observe_osc_sequences, osc_terminator,
+        parse_osc_9_4_progress, partial_osc_prefix_len, pending_output_display_publish_interval,
+        pending_output_pump_time_budget, pending_output_slice_bytes, resolve_teamy_cell_colors,
+        resolve_terminal_cell_colors, should_close_from_echoed_ctrl_d,
         should_keep_active_prompt_visible_on_resize, should_mark_prompt_input_written_for_key,
-        should_publish_terminal_display_state,
-        should_publish_terminal_display_update, should_refresh_semantic_prompt_tracking,
-        should_translate_ctrl_d_key, should_translate_ctrl_d_to_exit, should_translate_ctrl_l_key,
+        should_publish_terminal_display_state, should_publish_terminal_display_update,
+        should_refresh_semantic_prompt_tracking, should_translate_ctrl_d_key,
+        should_translate_ctrl_d_to_exit, should_translate_ctrl_l_key,
         should_translate_ctrl_l_to_form_feed, strip_echoed_ctrl_d, viewport_is_bottom_anchored,
     };
     use crate::app::VtEngineChoice;
@@ -4641,16 +4778,138 @@ mod tests {
     }
 
     #[test]
-    fn osc_terminator_accepts_bel_and_st() {
+    fn osc_terminator_accepts_bel_st_and_c1_st() {
         assert_eq!(osc_terminator(b"B\x07rest"), Some((1, 1)));
+        assert_eq!(osc_terminator(b"B\x9crest"), Some((1, 1)));
         assert_eq!(osc_terminator(b"B\x1b\\rest"), Some((1, 2)));
         assert_eq!(osc_terminator(b"B"), None);
     }
 
     #[test]
-    fn partial_osc_133_prefix_len_tracks_split_prefixes() {
-        assert_eq!(partial_osc_133_prefix_len(b"abc\x1b]13"), Some(4));
-        assert_eq!(partial_osc_133_prefix_len(b"plain"), None);
+    fn osc_terminator_prefers_the_earliest_supported_string_terminator() {
+        assert_eq!(osc_terminator(b"B\x9crest\x07"), Some((1, 1)));
+        assert_eq!(osc_terminator(b"B\x1b\\rest\x07"), Some((1, 2)));
+    }
+
+    #[test]
+    fn partial_osc_prefix_len_tracks_split_prefixes() {
+        assert_eq!(partial_osc_prefix_len(b"abc\x1b"), Some(1));
+        assert_eq!(partial_osc_prefix_len(b"plain"), None);
+    }
+
+    #[test]
+    fn observe_osc_sequences_buffers_split_title_payloads_until_terminated() {
+        let mut buffer = Vec::new();
+        let mut payloads = Vec::new();
+
+        observe_osc_sequences(&mut buffer, b"\x1b]0;Teamy", |payload| {
+            payloads.push(payload.to_vec());
+        });
+        assert_eq!(buffer, b"\x1b]0;Teamy");
+        assert!(payloads.is_empty());
+
+        observe_osc_sequences(&mut buffer, b" Studio\x1b\\tail", |payload| {
+            payloads.push(payload.to_vec());
+        });
+
+        assert_eq!(payloads, vec![b"0;Teamy Studio".to_vec()]);
+        assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn observe_osc_sequences_treats_c1_st_as_a_title_terminator() {
+        let mut buffer = Vec::new();
+        let mut payloads = Vec::new();
+
+        observe_osc_sequences(&mut buffer, b"\x1b]2;a\x9c\x1b]133;D;0\x07", |payload| {
+            payloads.push(payload.to_vec());
+        });
+
+        assert_eq!(payloads, vec![b"2;a".to_vec(), b"133;D;0".to_vec()]);
+        assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn observed_osc_payload_c1_st_title_does_not_absorb_following_prompt_marker() {
+        let mut tracking = SemanticPromptTracking::default();
+        let mut chrome = TerminalChromeState::default();
+
+        for payload in [b"2;a".as_slice(), b"133;D;0".as_slice()] {
+            apply_observed_osc_payload(payload, &mut tracking, &mut chrome);
+        }
+
+        assert_eq!(chrome.runtime_title.as_deref(), Some("a"));
+        assert!(tracking.markers_observed);
+        assert_eq!(tracking.input_state, PromptInputState::Inactive);
+    }
+
+    #[test]
+    fn observed_osc_title_payload_updates_runtime_title() {
+        let mut tracking = SemanticPromptTracking::default();
+        let mut chrome = TerminalChromeState::default();
+
+        apply_observed_osc_payload(b"2;pwsh.exe", &mut tracking, &mut chrome);
+
+        assert_eq!(chrome.runtime_title.as_deref(), Some("pwsh.exe"));
+    }
+
+    #[test]
+    fn observed_osc_title_payload_preserves_empty_runtime_title() {
+        let mut tracking = SemanticPromptTracking::default();
+        let mut chrome = TerminalChromeState::default();
+
+        apply_observed_osc_payload(b"0;", &mut tracking, &mut chrome);
+
+        assert_eq!(chrome.runtime_title.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn observed_osc_payload_keeps_semantic_prompt_tracking() {
+        let mut tracking = SemanticPromptTracking::default();
+        let mut chrome = TerminalChromeState::default();
+
+        apply_observed_osc_payload(b"133;B", &mut tracking, &mut chrome);
+
+        assert!(tracking.markers_observed);
+        assert_eq!(tracking.input_state, PromptInputState::AwaitingPristine);
+        assert_eq!(chrome, TerminalChromeState::default());
+    }
+
+    #[test]
+    fn parse_osc_9_4_progress_supports_all_documented_states() {
+        assert_eq!(
+            parse_osc_9_4_progress(b"4;0"),
+            Some(TerminalProgressState::Hidden)
+        );
+        assert_eq!(
+            parse_osc_9_4_progress(b"4;1;42"),
+            Some(TerminalProgressState::Normal(42))
+        );
+        assert_eq!(
+            parse_osc_9_4_progress(b"4;2;90"),
+            Some(TerminalProgressState::Error(90))
+        );
+        assert_eq!(
+            parse_osc_9_4_progress(b"4;3"),
+            Some(TerminalProgressState::Indeterminate)
+        );
+        assert_eq!(
+            parse_osc_9_4_progress(b"4;4;64"),
+            Some(TerminalProgressState::Warning(64))
+        );
+    }
+
+    #[test]
+    fn parse_osc_9_4_progress_clamps_values_to_the_supported_range() {
+        assert_eq!(
+            parse_osc_9_4_progress(b"4;1;137"),
+            Some(TerminalProgressState::Normal(100))
+        );
+    }
+
+    #[test]
+    fn parse_osc_9_4_progress_ignores_other_osc_9_subcommands() {
+        assert_eq!(parse_osc_9_4_progress(b"1;1;50"), None);
     }
 
     // behavior[verify window.interaction.selection.linear]

@@ -32,6 +32,9 @@ When a workspace is launched, the PTY-backed shell must start in that workspace'
 behavior[window.appearance.chrome]
 The launched terminal window must render a visible accent strip above the terminal grid.
 
+behavior[window.appearance.chrome.runtime-terminal-title]
+When the terminal emits `OSC 0` or `OSC 2`, the purple accent strip must update to show the runtime terminal title.
+
 behavior[window.appearance.drag-cursor]
 Hovering the pointer over the purple drag strip must show a move-style drag affordance instead of the default arrow cursor.
 
@@ -73,6 +76,12 @@ The Teamy-owned terminal engine must honor CSI delete-character sequences so in-
 
 behavior[window.appearance.terminal.csi-cursor-right]
 The Teamy-owned terminal engine must honor CSI cursor-right sequences so prompt redraws can move forward within the current row before writing replacement text.
+
+behavior[window.appearance.terminal.osc-title-not-visible]
+Supported OSC title sequences must not render as visible terminal text.
+
+behavior[window.appearance.terminal.osc-progress-not-visible]
+Supported OSC progress sequences must not render as visible terminal text.
 
 behavior[window.appearance.terminal.scrollbar.shader]
 The terminal area must render a visible scrollbar track and thumb using the panel shader pipeline rather than native window chrome.

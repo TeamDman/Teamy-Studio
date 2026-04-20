@@ -38,8 +38,7 @@ pub enum VtEngineChoice {
 }
 
 impl VtEngineChoice {
-    pub const CURRENT_TERMINAL_VT_ENGINE_ENV_VAR: &str =
-        "TEAMY_STUDIO_CURRENT_TERMINAL_VT_ENGINE";
+    pub const CURRENT_TERMINAL_VT_ENGINE_ENV_VAR: &str = "TEAMY_STUDIO_CURRENT_TERMINAL_VT_ENGINE";
 
     #[must_use]
     pub const fn current_terminal_vt_engine_env_value(self) -> &'static str {

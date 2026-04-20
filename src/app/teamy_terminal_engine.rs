@@ -604,6 +604,8 @@ impl TeamyTerminalEngine {
         };
     }
 
+    // behavior[impl window.appearance.terminal.osc-title-not-visible]
+    // behavior[impl window.appearance.terminal.osc-progress-not-visible]
     fn apply_osc(&mut self, payload: &str) {
         self.record_event("osc", Some(payload.to_owned()), None, None);
     }
@@ -1336,6 +1338,7 @@ mod tests {
         assert_eq!(engine.visible_text(), "133;D;0133;A133;B~");
     }
 
+    // behavior[verify window.interaction.input.semantic-prompt-aware-shell-integration]
     #[test]
     fn osc_133_prompt_markers_do_not_render_into_visible_text() {
         let mut engine = TeamyTerminalEngine::new(32, 3, 8);
@@ -1344,10 +1347,20 @@ mod tests {
         assert_eq!(engine.visible_text(), "~");
     }
 
+    // behavior[verify window.appearance.terminal.osc-title-not-visible]
     #[test]
     fn osc_title_sequence_does_not_render_into_visible_text() {
         let mut engine = TeamyTerminalEngine::new(32, 3, 8);
         engine.vt_write(b"\x1b]0;C:\\Program Files\\PowerShell\\7\\pwsh.EXE\x07~");
+
+        assert_eq!(engine.visible_text(), "~");
+    }
+
+    // behavior[verify window.appearance.terminal.osc-progress-not-visible]
+    #[test]
+    fn osc_progress_sequence_does_not_render_into_visible_text() {
+        let mut engine = TeamyTerminalEngine::new(32, 3, 8);
+        engine.vt_write(b"\x1b]9;4;1;42\x07~");
 
         assert_eq!(engine.visible_text(), "~");
     }
