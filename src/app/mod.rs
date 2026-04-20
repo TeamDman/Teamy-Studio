@@ -1,6 +1,7 @@
 mod spatial;
 pub mod teamy_terminal_engine;
 mod windows_app;
+mod windows_audio;
 mod windows_d3d12_renderer;
 mod windows_dialogs;
 mod windows_terminal;

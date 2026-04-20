@@ -32,6 +32,7 @@ use super::spatial::{ClientRect, TerminalCellPoint};
 use super::teamy_terminal_engine::{
     TeamyColor, TeamyCursorStyle, TeamyTerminalEngine, TeamyViewportMetrics,
 };
+use super::windows_audio::ring_terminal_bell;
 use super::windows_terminal_engine::GhosttyTerminalEngine;
 
 pub const DRAG_STRIP_HEIGHT: i32 = 52;
@@ -1637,6 +1638,7 @@ impl TerminalCore {
                         let _ = writer.flush();
                     }
                 })?;
+                engine.on_bell(ring_terminal_bell)?;
                 RuntimeTerminalEngine::Ghostty(engine)
             }
             VtEngineChoice::Teamy => {
@@ -1649,6 +1651,7 @@ impl TerminalCore {
                         let _ = writer.flush();
                     }
                 });
+                engine.on_bell(ring_terminal_bell);
                 RuntimeTerminalEngine::Teamy(Box::new(engine))
             }
         };

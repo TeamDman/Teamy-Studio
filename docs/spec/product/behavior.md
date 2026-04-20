@@ -121,6 +121,9 @@ When Ctrl+D is pressed while the cursor is at a shell prompt, Teamy Studio must 
 behavior[window.interaction.input.numpad-numlock-text]
 When NumLock is enabled, numpad digit and operator keys must be forwarded as their text characters rather than being dropped.
 
+behavior[window.interaction.output.bell.audible]
+When the terminal emits a standalone BEL control character, Teamy Studio must trigger an audible bell.
+
 behavior[window.interaction.selection.linear]
 Dragging with the left mouse button across the terminal area must create a text selection that wraps along terminal rows.
 

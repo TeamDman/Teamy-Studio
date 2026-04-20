@@ -5,6 +5,7 @@ use std::borrow::Cow;
 use tracing::debug_span;
 use tracing::warn;
 
+type BellEffect = Box<dyn FnMut() + Send>;
 type PtyWriteEffect = Box<dyn FnMut(&[u8]) + Send>;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -178,6 +179,7 @@ pub struct TeamyTerminalEngine {
     escape_state: EscapeState,
     trace_events: Vec<TeamyTraceEvent>,
     warned_unsupported_csi: Vec<(String, String, char)>,
+    bell_effect: Option<BellEffect>,
     pty_write_effect: Option<PtyWriteEffect>,
 }
 
@@ -204,8 +206,16 @@ impl TeamyTerminalEngine {
             escape_state: EscapeState::Ground,
             trace_events: Vec::new(),
             warned_unsupported_csi: Vec::new(),
+            bell_effect: None,
             pty_write_effect: None,
         }
+    }
+
+    pub fn on_bell<F>(&mut self, effect: F)
+    where
+        F: FnMut() + Send + 'static,
+    {
+        self.bell_effect = Some(Box::new(effect));
     }
 
     pub fn on_pty_write<F>(&mut self, effect: F)
@@ -511,6 +521,12 @@ impl TeamyTerminalEngine {
                         '\u{1b}' => {
                             self.record_event("escape", None, None, None);
                             self.escape_state = EscapeState::Escape;
+                        }
+                        '\u{07}' => {
+                            self.record_event("bell", None, None, None);
+                            if let Some(effect) = self.bell_effect.as_mut() {
+                                effect();
+                            }
                         }
                         '\r' => {
                             self.record_event("carriage-return", None, None, None);
@@ -1192,9 +1208,19 @@ fn csi_likely_requires_terminal_response(parameters: &str, final_byte: char) -> 
 #[cfg(test)]
 mod tests {
     use libghostty_vt::terminal::ScrollViewport;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
     use super::{TeamyColor, TeamyCursorStyle, TeamyTerminalEngine};
+
+    fn capture_bells(engine: &mut TeamyTerminalEngine) -> Arc<AtomicUsize> {
+        let bells = Arc::new(AtomicUsize::new(0));
+        let bells_for_effect = Arc::clone(&bells);
+        engine.on_bell(move || {
+            bells_for_effect.fetch_add(1, Ordering::Relaxed);
+        });
+        bells
+    }
 
     fn capture_pty_writes(engine: &mut TeamyTerminalEngine) -> Arc<Mutex<Vec<Vec<u8>>>> {
         let writes = Arc::new(Mutex::new(Vec::new()));
@@ -1336,6 +1362,27 @@ mod tests {
         engine.vt_write(b"133;D;0133;A133;B~");
 
         assert_eq!(engine.visible_text(), "133;D;0133;A133;B~");
+    }
+
+    // behavior[verify window.interaction.output.bell.audible]
+    #[test]
+    fn standalone_bel_triggers_the_bell_effect_once() {
+        let mut engine = TeamyTerminalEngine::new(32, 3, 8);
+        let bells = capture_bells(&mut engine);
+
+        engine.vt_write(b"\x07");
+
+        assert_eq!(bells.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn osc_bel_terminator_does_not_trigger_the_bell_effect() {
+        let mut engine = TeamyTerminalEngine::new(32, 3, 8);
+        let bells = capture_bells(&mut engine);
+
+        engine.vt_write(b"\x1b]0;pwsh.exe\x07");
+
+        assert_eq!(bells.load(Ordering::Relaxed), 0);
     }
 
     // behavior[verify window.interaction.input.semantic-prompt-aware-shell-integration]

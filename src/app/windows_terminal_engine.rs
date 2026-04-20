@@ -41,6 +41,19 @@ impl GhosttyTerminalEngine {
             .wrap_err("failed to register PTY write effect")
     }
 
+    pub fn on_bell<F>(&mut self, effect: F) -> eyre::Result<()>
+    where
+        F: FnMut() + Send + 'static,
+    {
+        let mut effect = effect;
+        self.terminal
+            .on_bell(move |_terminal| {
+                effect();
+            })
+            .map(|_| ())
+            .wrap_err("failed to register terminal bell effect")
+    }
+
     pub fn resize(
         &mut self,
         cols: u16,
@@ -131,5 +144,54 @@ impl GhosttyTerminalEngine {
             .set_options_from_terminal(&self.terminal)
             .encode_to_vec(&self.key_event, response)
             .wrap_err("failed to encode special key event")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use libghostty_vt::TerminalOptions;
+
+    use super::GhosttyTerminalEngine;
+
+    // behavior[verify window.interaction.output.bell.audible]
+    #[test]
+    fn standalone_bel_triggers_the_ghostty_bell_callback() -> eyre::Result<()> {
+        let mut engine = GhosttyTerminalEngine::new(TerminalOptions {
+            cols: 8,
+            rows: 2,
+            max_scrollback: 64,
+        })?;
+        let bells = Arc::new(AtomicUsize::new(0));
+        let bells_for_effect = Arc::clone(&bells);
+        engine.on_bell(move || {
+            bells_for_effect.fetch_add(1, Ordering::Relaxed);
+        })?;
+
+        engine.vt_write(b"\x07");
+
+        assert_eq!(bells.load(Ordering::Relaxed), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn osc_bel_terminator_does_not_trigger_the_ghostty_bell_callback() -> eyre::Result<()> {
+        let mut engine = GhosttyTerminalEngine::new(TerminalOptions {
+            cols: 8,
+            rows: 2,
+            max_scrollback: 64,
+        })?;
+        let bells = Arc::new(AtomicUsize::new(0));
+        let bells_for_effect = Arc::clone(&bells);
+        engine.on_bell(move || {
+            bells_for_effect.fetch_add(1, Ordering::Relaxed);
+        })?;
+
+        engine.vt_write(b"\x1b]0;pwsh.exe\x07");
+
+        assert_eq!(bells.load(Ordering::Relaxed), 0);
+        Ok(())
     }
 }
