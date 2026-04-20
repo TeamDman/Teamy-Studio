@@ -257,7 +257,7 @@ fn build_offscreen_render_self_test_frame() -> windows_d3d12_renderer::RenderFra
         title: Some("self-test".to_owned()),
         diagnostic_text: "offscreen render self-test".to_owned(),
         diagnostic_selection: None,
-        diagnostics_button_state: windows_d3d12_renderer::ButtonVisualState::default(),
+        window_chrome_buttons_state: windows_d3d12_renderer::WindowChromeButtonsState::default(),
         diagnostic_cell_width: 8,
         diagnostic_cell_height: 16,
         scene: None,

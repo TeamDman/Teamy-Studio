@@ -37,6 +37,16 @@ function Get-NonTracyTestFeatureArgs {
 	return @()
 }
 
+function Stop-TeamyStudioProcessIfRunning {
+	$running = Get-Process -Name 'teamy-studio' -ErrorAction SilentlyContinue
+	if ($null -eq $running) {
+		return
+	}
+
+	Write-Host -ForegroundColor DarkYellow 'Stopping running teamy-studio.exe so build outputs can be replaced...'
+	taskkill /F /IM teamy-studio.exe | Out-Null
+}
+
 Invoke-Step -Label "format check" -Action {
 	cargo fmt --all
 }
@@ -47,10 +57,12 @@ Invoke-Step -Label "clippy lint check" -Action {
 }
 
 Invoke-Step -Label "build" -Action {
+	Stop-TeamyStudioProcessIfRunning
 	cargo build --all-features --quiet
 }
 
 Invoke-Step -Label "tests" -Action {
+	Stop-TeamyStudioProcessIfRunning
 	$featuresArg = Get-NonTracyTestFeatureArgs
 	cargo test @featuresArg --quiet
 }

@@ -61,6 +61,7 @@ const PANEL_GAP: i32 = 14;
 const DIAGNOSTIC_PANEL_HEIGHT: i32 = 152;
 const MIN_TERMINAL_PANEL_HEIGHT: i32 = 180;
 const PLUS_BUTTON_SIZE: i32 = 42;
+const TITLE_BUTTON_GAP: i32 = 6;
 const TERMINAL_SCROLLBAR_WIDTH: i32 = 16;
 const TERMINAL_SCROLLBAR_GAP: i32 = 8;
 const WIN32_INPUT_MODE_ENABLE: &[u8] = b"\x1b[?9001h";
@@ -772,11 +773,23 @@ impl TerminalLayout {
     }
 
     #[must_use]
+    pub fn minimize_button_rect(self) -> ClientRect {
+        self.title_bar_button_rect(2)
+    }
+
+    #[must_use]
+    pub fn maximize_restore_button_rect(self) -> ClientRect {
+        self.title_bar_button_rect(1)
+    }
+
+    #[must_use]
+    pub fn close_button_rect(self) -> ClientRect {
+        self.title_bar_button_rect(0)
+    }
+
+    #[must_use]
     pub fn diagnostics_button_rect(self) -> ClientRect {
-        let title_bar = self.title_bar_rect();
-        let top = title_bar.top() + ((title_bar.height() - PLUS_BUTTON_SIZE).max(0) / 2);
-        let left = (title_bar.right() - PLUS_BUTTON_SIZE - 10).max(title_bar.left());
-        ClientRect::new(left, top, left + PLUS_BUTTON_SIZE, top + PLUS_BUTTON_SIZE)
+        self.title_bar_button_rect(3)
     }
 
     #[must_use]
@@ -830,6 +843,18 @@ impl TerminalLayout {
             u16::try_from(cols).unwrap_or(u16::MAX),
             u16::try_from(rows).unwrap_or(u16::MAX),
         )
+    }
+
+    #[must_use]
+    fn title_bar_button_rect(self, slot_from_right: i32) -> ClientRect {
+        let title_bar = self.title_bar_rect();
+        let top = title_bar.top() + ((title_bar.height() - PLUS_BUTTON_SIZE).max(0) / 2);
+        let right_padding = 10;
+        let stride = PLUS_BUTTON_SIZE + TITLE_BUTTON_GAP;
+        let left =
+            (title_bar.right() - right_padding - PLUS_BUTTON_SIZE - (slot_from_right * stride))
+                .max(title_bar.left());
+        ClientRect::new(left, top, left + PLUS_BUTTON_SIZE, top + PLUS_BUTTON_SIZE)
     }
 }
 
@@ -4075,15 +4100,23 @@ mod tests {
         let title = layout.title_bar_rect();
         let terminal_panel = layout.terminal_panel_rect();
         let diagnostic = layout.diagnostic_panel_rect();
-        let plus = layout.diagnostics_button_rect();
+        let details = layout.diagnostics_button_rect();
+        let minimize = layout.minimize_button_rect();
+        let maximize = layout.maximize_restore_button_rect();
+        let close = layout.close_button_rect();
         let terminal = layout.terminal_viewport_rect();
         let scrollbar = layout.terminal_scrollbar_rect();
 
         assert!(title.bottom() <= terminal_panel.top());
         assert!(terminal_panel.bottom() <= diagnostic.top());
-        assert!(plus.right() <= title.right());
-        assert!(plus.top() >= title.top());
-        assert!(plus.bottom() <= title.bottom());
+        assert!(details.left() < minimize.left());
+        assert!(minimize.left() < maximize.left());
+        assert!(maximize.left() < close.left());
+        assert!(close.right() <= title.right());
+        for button in [details, minimize, maximize, close] {
+            assert!(button.top() >= title.top());
+            assert!(button.bottom() <= title.bottom());
+        }
         assert_eq!(terminal.left(), terminal_panel.left());
         assert_eq!(terminal.bottom(), terminal_panel.bottom());
         assert!(terminal.right() < scrollbar.left());
@@ -4106,17 +4139,26 @@ mod tests {
 
         let terminal_panel = layout.terminal_panel_rect();
         let diagnostic = layout.diagnostic_panel_rect();
-        let plus = layout.diagnostics_button_rect();
+        let details = layout.diagnostics_button_rect();
+        let minimize = layout.minimize_button_rect();
+        let maximize = layout.maximize_restore_button_rect();
+        let close = layout.close_button_rect();
         let terminal = layout.terminal_viewport_rect();
         let scrollbar = layout.terminal_scrollbar_rect();
 
         assert!(terminal_panel.height() >= 0);
         assert!(diagnostic.height() >= 0);
-        assert!(plus.height() >= 0);
+        assert!(details.height() >= 0);
+        assert!(minimize.height() >= 0);
+        assert!(maximize.height() >= 0);
+        assert!(close.height() >= 0);
         assert!(terminal.height() >= 0);
         assert!(scrollbar.height() >= 0);
         assert!(diagnostic.top() <= diagnostic.bottom());
-        assert!(plus.top() <= plus.bottom());
+        assert!(details.top() <= details.bottom());
+        assert!(minimize.top() <= minimize.bottom());
+        assert!(maximize.top() <= maximize.bottom());
+        assert!(close.top() <= close.bottom());
     }
 
     // cli[verify terminal.open.current-vt-engine-env]

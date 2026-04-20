@@ -3,8 +3,8 @@ use std::time::{Duration, Instant};
 use super::cell_grid;
 use super::spatial::{ClientPoint, ClientRect};
 use super::windows_d3d12_renderer::{
-    ButtonVisualState, PanelEffect, RenderScene, SpriteId, push_centered_text, push_panel,
-    push_panel_with_data, push_sprite,
+    ButtonVisualState, PanelEffect, RenderScene, SpriteId, WindowChromeButtonsState,
+    push_centered_text, push_panel, push_panel_with_data, push_sprite, push_window_chrome_buttons,
 };
 use super::windows_terminal::TerminalLayout;
 
@@ -99,10 +99,10 @@ where
 pub fn build_scene_render_scene(
     layout: TerminalLayout,
     scene_kind: SceneWindowKind,
-    diagnostics_button_state: ButtonVisualState,
+    window_chrome_buttons_state: WindowChromeButtonsState,
     button_states: &[(SceneAction, ButtonVisualState)],
 ) -> RenderScene {
-    let mut scene = build_scene_shell(layout, scene_kind, diagnostics_button_state);
+    let mut scene = build_scene_shell(layout, scene_kind, window_chrome_buttons_state);
 
     let specs = scene_button_specs(scene_kind);
     let button_layouts = layout_scene_buttons(layout.terminal_panel_rect(), specs.len());
@@ -191,13 +191,13 @@ pub fn scene_button_specs(scene_kind: SceneWindowKind) -> &'static [SceneButtonS
 pub fn build_scene_diagnostic_render_scene(
     layout: TerminalLayout,
     scene_kind: SceneWindowKind,
-    diagnostics_button_state: ButtonVisualState,
+    window_chrome_buttons_state: WindowChromeButtonsState,
     diagnostic_text: &str,
     selection: Option<super::windows_terminal::TerminalSelection>,
     cell_width: i32,
     cell_height: i32,
 ) -> RenderScene {
-    let mut scene = build_scene_shell(layout, scene_kind, diagnostics_button_state);
+    let mut scene = build_scene_shell(layout, scene_kind, window_chrome_buttons_state);
     let body_rect = layout.terminal_panel_rect().inset(20);
     let diagnostic_scene = cell_grid::build_text_grid_scene(
         body_rect,
@@ -341,7 +341,7 @@ pub fn compute_button_visual_state(
 fn build_scene_shell(
     layout: TerminalLayout,
     scene_kind: SceneWindowKind,
-    diagnostics_button_state: ButtonVisualState,
+    window_chrome_buttons_state: WindowChromeButtonsState,
 ) -> RenderScene {
     let mut scene = RenderScene {
         panels: Vec::new(),
@@ -368,17 +368,7 @@ fn build_scene_shell(
         [0.09, 0.10, 0.12, 0.96],
         PanelEffect::SceneBody,
     );
-    push_panel_with_data(
-        &mut scene,
-        layout.diagnostics_button_rect().to_win32_rect(),
-        if diagnostics_button_state.active {
-            [0.23, 0.48, 0.69, 1.0]
-        } else {
-            [0.12, 0.13, 0.17, 1.0]
-        },
-        PanelEffect::DiagnosticsButton,
-        diagnostics_button_state.shader_data(),
-    );
+    push_window_chrome_buttons(&mut scene, layout, window_chrome_buttons_state);
     push_centered_text(
         &mut scene,
         layout.title_text_rect().to_win32_rect(),

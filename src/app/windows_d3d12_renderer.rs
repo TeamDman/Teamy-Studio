@@ -18,7 +18,6 @@
     clippy::undocumented_unsafe_blocks,
     clippy::unnecessary_cast,
     clippy::unused_self,
-    clippy::vec_init_then_push,
     clippy::wildcard_imports
 )]
 use std::collections::{BTreeSet, HashMap};
@@ -199,7 +198,6 @@ pub enum PanelEffect {
     TitleBar = 2,
     TerminalPanel = 3,
     DiagnosticPanel = 4,
-    DiagnosticsButton = 7,
     TerminalFill = 8,
     TerminalCursor = 9,
     TerminalScrollbarTrack = 10,
@@ -208,6 +206,11 @@ pub enum PanelEffect {
     SpriteImage = 13,
     SceneButtonCard = 14,
     SceneBody = 15,
+    WindowChromeDiagnostics = 16,
+    WindowChromeMinimize = 17,
+    WindowChromeMaximize = 18,
+    WindowChromeRestore = 19,
+    WindowChromeClose = 20,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -337,13 +340,22 @@ pub struct RendererTerminalVisualState {
     pub thumb_grabbed: bool,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct WindowChromeButtonsState {
+    pub diagnostics: ButtonVisualState,
+    pub minimize: ButtonVisualState,
+    pub maximize_restore: ButtonVisualState,
+    pub close: ButtonVisualState,
+    pub maximized: bool,
+}
+
 #[derive(Clone, Debug)]
 pub struct RenderFrameModel {
     pub layout: TerminalLayout,
     pub title: Option<String>,
     pub diagnostic_text: String,
     pub diagnostic_selection: Option<TerminalSelection>,
-    pub diagnostics_button_state: ButtonVisualState,
+    pub window_chrome_buttons_state: WindowChromeButtonsState,
     pub diagnostic_cell_width: i32,
     pub diagnostic_cell_height: i32,
     pub scene: Option<RenderScene>,
@@ -360,7 +372,7 @@ impl PartialEq for RenderFrameModel {
             && self.scene == other.scene
             && self.diagnostic_text == other.diagnostic_text
             && self.diagnostic_selection == other.diagnostic_selection
-            && self.diagnostics_button_state == other.diagnostics_button_state
+            && self.window_chrome_buttons_state == other.window_chrome_buttons_state
             && self.diagnostic_cell_width == other.diagnostic_cell_width
             && self.diagnostic_cell_height == other.diagnostic_cell_height
             && self.terminal_cell_width == other.terminal_cell_width
@@ -375,7 +387,7 @@ impl PartialEq for RenderFrameModel {
 struct CachedChromeScene {
     layout: TerminalLayout,
     title: Option<String>,
-    diagnostics_button_state: ButtonVisualState,
+    window_chrome_buttons_state: WindowChromeButtonsState,
     scene: Arc<RenderScene>,
 }
 
@@ -937,7 +949,7 @@ impl D3d12PanelRenderer {
             &mut scene_cache.chrome,
             frame.layout,
             frame.title.as_deref(),
-            frame.diagnostics_button_state,
+            frame.window_chrome_buttons_state,
         );
         let (terminal_scenes, terminal_reused) = terminal_scene_fragments(
             &mut scene_cache.terminal,
@@ -1524,17 +1536,17 @@ fn chrome_scene_fragment(
     cached_chrome_scene: &mut Option<CachedChromeScene>,
     layout: TerminalLayout,
     title: Option<&str>,
-    diagnostics_button_state: ButtonVisualState,
+    window_chrome_buttons_state: WindowChromeButtonsState,
 ) -> (Arc<RenderScene>, bool) {
     if let Some(cached) = cached_chrome_scene.as_ref()
         && cached.layout == layout
         && cached.title.as_deref() == title
-        && cached.diagnostics_button_state == diagnostics_button_state
+        && cached.window_chrome_buttons_state == window_chrome_buttons_state
     {
         return (Arc::clone(&cached.scene), true);
     }
 
-    let mut scene = build_panel_scene(layout, diagnostics_button_state);
+    let mut scene = build_panel_scene(layout, window_chrome_buttons_state);
     if let Some(title) = title.filter(|title| !title.is_empty()) {
         push_centered_text(
             &mut scene,
@@ -1547,7 +1559,7 @@ fn chrome_scene_fragment(
     *cached_chrome_scene = Some(CachedChromeScene {
         layout,
         title: title.map(ToOwned::to_owned),
-        diagnostics_button_state,
+        window_chrome_buttons_state,
         scene: Arc::clone(&scene),
     });
     (scene, false)
@@ -1917,58 +1929,111 @@ fn terminal_cursor_overlay_rects(
 /// behavior[impl window.appearance.code-panel.single-surface]
 pub fn build_panel_scene(
     layout: TerminalLayout,
-    diagnostics_button_state: ButtonVisualState,
+    window_chrome_buttons_state: WindowChromeButtonsState,
 ) -> RenderScene {
     let blue = [0.11, 0.44, 0.94, 0.5];
     let title_bar = [0.42, 0.18, 0.60, 1.0];
     let terminal_panel = [0.05, 0.06, 0.08, 1.0];
     let diagnostic_panel = [0.84, 0.44, 0.13, 1.0];
-    let button = if diagnostics_button_state.active {
-        [0.23, 0.48, 0.69, 1.0]
-    } else {
-        [0.12, 0.13, 0.17, 1.0]
+    let mut scene = RenderScene {
+        panels: Vec::with_capacity(8),
+        glyphs: Vec::with_capacity(2_048),
+        sprites: Vec::new(),
+        overlay_panels: Vec::with_capacity(16),
     };
-    let mut panels = Vec::with_capacity(5);
-    panels.push(PanelRect {
-        rect: RECT {
+    push_panel(
+        &mut scene,
+        RECT {
             left: 0,
             top: 0,
             right: layout.client_width,
             bottom: layout.client_height,
         },
-        color: blue,
-        effect: PanelEffect::BlueBackground,
-        data: [0.0; 4],
-    });
-    panels.push(PanelRect {
-        rect: layout.title_bar_rect().to_win32_rect(),
-        color: title_bar,
-        effect: PanelEffect::TitleBar,
-        data: [0.0; 4],
-    });
-    panels.push(PanelRect {
-        rect: layout.terminal_panel_rect().to_win32_rect(),
-        color: terminal_panel,
-        effect: PanelEffect::TerminalPanel,
-        data: [0.0; 4],
-    });
-    panels.push(PanelRect {
-        rect: layout.diagnostic_panel_rect().to_win32_rect(),
-        color: diagnostic_panel,
-        effect: PanelEffect::DiagnosticPanel,
-        data: [0.0; 4],
-    });
-    panels.push(PanelRect {
-        rect: layout.diagnostics_button_rect().to_win32_rect(),
-        color: button,
-        effect: PanelEffect::DiagnosticsButton,
-        data: diagnostics_button_state.shader_data(),
-    });
-    RenderScene {
-        panels,
-        glyphs: Vec::with_capacity(2_048),
-        sprites: Vec::new(),
-        overlay_panels: Vec::with_capacity(16),
+        blue,
+        PanelEffect::BlueBackground,
+    );
+    push_panel(
+        &mut scene,
+        layout.title_bar_rect().to_win32_rect(),
+        title_bar,
+        PanelEffect::TitleBar,
+    );
+    push_panel(
+        &mut scene,
+        layout.terminal_panel_rect().to_win32_rect(),
+        terminal_panel,
+        PanelEffect::TerminalPanel,
+    );
+    push_panel(
+        &mut scene,
+        layout.diagnostic_panel_rect().to_win32_rect(),
+        diagnostic_panel,
+        PanelEffect::DiagnosticPanel,
+    );
+    push_window_chrome_buttons(&mut scene, layout, window_chrome_buttons_state);
+    scene
+}
+
+pub fn push_window_chrome_buttons(
+    scene: &mut RenderScene,
+    layout: TerminalLayout,
+    window_chrome_buttons_state: WindowChromeButtonsState,
+) {
+    let buttons = [
+        (
+            layout.diagnostics_button_rect().to_win32_rect(),
+            window_chrome_button_color(
+                window_chrome_buttons_state.diagnostics,
+                window_chrome_buttons_state.diagnostics.active,
+                false,
+            ),
+            window_chrome_buttons_state.diagnostics,
+            PanelEffect::WindowChromeDiagnostics,
+        ),
+        (
+            layout.minimize_button_rect().to_win32_rect(),
+            window_chrome_button_color(window_chrome_buttons_state.minimize, false, false),
+            window_chrome_buttons_state.minimize,
+            PanelEffect::WindowChromeMinimize,
+        ),
+        (
+            layout.maximize_restore_button_rect().to_win32_rect(),
+            window_chrome_button_color(
+                window_chrome_buttons_state.maximize_restore,
+                window_chrome_buttons_state.maximized,
+                false,
+            ),
+            window_chrome_buttons_state.maximize_restore,
+            if window_chrome_buttons_state.maximized {
+                PanelEffect::WindowChromeRestore
+            } else {
+                PanelEffect::WindowChromeMaximize
+            },
+        ),
+        (
+            layout.close_button_rect().to_win32_rect(),
+            window_chrome_button_color(window_chrome_buttons_state.close, false, true),
+            window_chrome_buttons_state.close,
+            PanelEffect::WindowChromeClose,
+        ),
+    ];
+
+    for (rect, color, state, effect) in buttons {
+        push_panel_with_data(scene, rect, color, effect, state.shader_data());
+    }
+}
+
+fn window_chrome_button_color(
+    _state: ButtonVisualState,
+    active: bool,
+    destructive: bool,
+) -> [f32; 4] {
+    if destructive {
+        [0.34, 0.12, 0.15, 1.0]
+    } else if active {
+        [0.23, 0.48, 0.69, 1.0]
+    } else {
+        [0.12, 0.13, 0.17, 1.0]
     }
 }
 
@@ -2392,7 +2457,7 @@ pub fn render_frame_model_offscreen_image(
         &mut chrome_cache,
         frame.layout,
         frame.title.as_deref(),
-        frame.diagnostics_button_state,
+        frame.window_chrome_buttons_state,
     );
     let (diagnostic_scene, _) = diagnostic_scene_fragment(
         &mut diagnostic_cache,
@@ -4536,12 +4601,12 @@ fn issue_transition_barrier(
 #[cfg(test)]
 mod tests {
     use super::{
-        ButtonVisualState, CachedSceneVertices, FALLBACK_GLYPH, PanelEffect, RenderScene, Vertex,
-        append_rect, append_slug_band_data, build_panel_scene, build_shader_params,
-        can_reuse_cached_scene_vertices, collect_scene_chars, cpu_slug_coverage,
-        cpu_slug_coverage_all_curves, dirty_fragment_ranges, extract_glyph_curves,
-        fragment_ranges_match, fragment_vertex_ranges, load_terminal_font, push_centered_text,
-        push_glyph, push_overlay_panel, push_panel, push_text_block,
+        CachedSceneVertices, FALLBACK_GLYPH, PanelEffect, RenderScene, Vertex,
+        WindowChromeButtonsState, append_rect, append_slug_band_data, build_panel_scene,
+        build_shader_params, can_reuse_cached_scene_vertices, collect_scene_chars,
+        cpu_slug_coverage, cpu_slug_coverage_all_curves, dirty_fragment_ranges,
+        extract_glyph_curves, fragment_ranges_match, fragment_vertex_ranges, load_terminal_font,
+        push_centered_text, push_glyph, push_overlay_panel, push_panel, push_text_block,
         render_snapshot_glyph_into_image, terminal_scrollbar_geometry,
     };
     use crate::app::spatial::ClientRect;
@@ -4751,7 +4816,7 @@ mod tests {
             diagnostic_panel_visible: true,
         };
 
-        let scene = build_panel_scene(layout, ButtonVisualState::default());
+        let scene = build_panel_scene(layout, WindowChromeButtonsState::default());
         let terminal_panel_count = scene
             .panels
             .iter()
@@ -4773,7 +4838,7 @@ mod tests {
             diagnostic_panel_visible: true,
         };
 
-        let scene = build_panel_scene(layout, ButtonVisualState::default());
+        let scene = build_panel_scene(layout, WindowChromeButtonsState::default());
         let blue_panel = scene
             .panels
             .iter()
@@ -4794,7 +4859,7 @@ mod tests {
             diagnostic_panel_visible: true,
         };
 
-        let scene = build_panel_scene(layout, ButtonVisualState::default());
+        let scene = build_panel_scene(layout, WindowChromeButtonsState::default());
         let title_panel_count = scene
             .panels
             .iter()
@@ -4802,6 +4867,83 @@ mod tests {
             .count();
 
         assert_eq!(title_panel_count, 1);
+    }
+
+    #[test]
+    fn build_panel_scene_assigns_shader_chrome_effects_without_glyph_icons() {
+        let layout = TerminalLayout {
+            client_width: 1040,
+            client_height: 680,
+            cell_width: 8,
+            cell_height: 16,
+            diagnostic_panel_visible: true,
+        };
+
+        let scene = build_panel_scene(layout, WindowChromeButtonsState::default());
+        let diagnostics_button_count = scene
+            .panels
+            .iter()
+            .filter(|panel| matches!(panel.effect, PanelEffect::WindowChromeDiagnostics))
+            .count();
+        let minimize_button_count = scene
+            .panels
+            .iter()
+            .filter(|panel| matches!(panel.effect, PanelEffect::WindowChromeMinimize))
+            .count();
+        let maximize_button_count = scene
+            .panels
+            .iter()
+            .filter(|panel| matches!(panel.effect, PanelEffect::WindowChromeMaximize))
+            .count();
+        let restore_button_count = scene
+            .panels
+            .iter()
+            .filter(|panel| matches!(panel.effect, PanelEffect::WindowChromeRestore))
+            .count();
+        let close_button_count = scene
+            .panels
+            .iter()
+            .filter(|panel| matches!(panel.effect, PanelEffect::WindowChromeClose))
+            .count();
+
+        assert_eq!(diagnostics_button_count, 1);
+        assert_eq!(minimize_button_count, 1);
+        assert_eq!(maximize_button_count, 1);
+        assert_eq!(restore_button_count, 0);
+        assert_eq!(close_button_count, 1);
+        assert!(scene.glyphs.is_empty());
+    }
+
+    #[test]
+    fn build_panel_scene_uses_restore_effect_when_window_is_maximized() {
+        let layout = TerminalLayout {
+            client_width: 1040,
+            client_height: 680,
+            cell_width: 8,
+            cell_height: 16,
+            diagnostic_panel_visible: true,
+        };
+
+        let scene = build_panel_scene(
+            layout,
+            WindowChromeButtonsState {
+                maximized: true,
+                ..WindowChromeButtonsState::default()
+            },
+        );
+        let maximize_button_count = scene
+            .panels
+            .iter()
+            .filter(|panel| matches!(panel.effect, PanelEffect::WindowChromeMaximize))
+            .count();
+        let restore_button_count = scene
+            .panels
+            .iter()
+            .filter(|panel| matches!(panel.effect, PanelEffect::WindowChromeRestore))
+            .count();
+
+        assert_eq!(maximize_button_count, 0);
+        assert_eq!(restore_button_count, 1);
     }
 
     // behavior[verify window.appearance.backgrounds.animated-time-based]

@@ -36,15 +36,15 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, EnumWindows, GetClassNameW,
     GetClientRect, GetCursorPos, GetMessageW, GetSystemMetrics, GetWindowRect,
     GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, HTCAPTION, HTCLIENT, IDC_ARROW,
-    IDC_HAND, IDC_IBEAM, IDC_SIZEALL, IsWindowVisible, KillTimer, LoadCursorW, MSG, MoveWindow,
-    PostMessageW, PostQuitMessage, RegisterClassExW, SM_CXPADDEDBORDER, SM_CXSCREEN,
-    SM_CXSIZEFRAME, SM_CYSCREEN, SM_CYSIZEFRAME, SW_SHOW, SYSTEM_METRICS_INDEX, SetCursor,
-    SetTimer, SetWindowTextW, ShowWindow, TranslateMessage, WM_CHAR, WM_CLOSE, WM_DESTROY,
-    WM_ENTERSIZEMOVE, WM_ERASEBKGND, WM_EXITSIZEMOVE, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCALCSIZE, WM_NCHITTEST,
-    WM_NCLBUTTONDOWN, WM_PAINT, WM_RBUTTONUP, WM_SETCURSOR, WM_SETFOCUS, WM_SIZE, WM_SYSKEYDOWN,
-    WM_SYSKEYUP, WM_TIMER, WNDCLASSEXW, WS_EX_APPWINDOW, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP,
-    WS_THICKFRAME, WS_VISIBLE,
+    IDC_HAND, IDC_IBEAM, IDC_SIZEALL, IsWindowVisible, IsZoomed, KillTimer, LoadCursorW, MSG,
+    MoveWindow, PostMessageW, PostQuitMessage, RegisterClassExW, SM_CXPADDEDBORDER, SM_CXSCREEN,
+    SM_CXSIZEFRAME, SM_CYSCREEN, SM_CYSIZEFRAME, SW_MAXIMIZE, SW_MINIMIZE, SW_RESTORE, SW_SHOW,
+    SYSTEM_METRICS_INDEX, SetCursor, SetTimer, SetWindowTextW, ShowWindow, TranslateMessage,
+    WM_CHAR, WM_CLOSE, WM_DESTROY, WM_ENTERSIZEMOVE, WM_ERASEBKGND, WM_EXITSIZEMOVE, WM_KEYDOWN,
+    WM_KEYUP, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
+    WM_NCCALCSIZE, WM_NCHITTEST, WM_NCLBUTTONDOWN, WM_PAINT, WM_RBUTTONUP, WM_SETCURSOR,
+    WM_SETFOCUS, WM_SIZE, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WNDCLASSEXW, WS_EX_APPWINDOW,
+    WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP, WS_THICKFRAME, WS_VISIBLE,
 };
 use windows::core::{BOOL, PCWSTR, w};
 
@@ -61,6 +61,7 @@ use super::windows_audio::{
 };
 use super::windows_d3d12_renderer::{
     ButtonVisualState, RenderFrameModel, RenderThreadProxy, RendererTerminalVisualState,
+    WindowChromeButtonsState,
 };
 use super::windows_dialogs::{
     PasteConfirmationChoice, paste_confirmation_required, show_multiline_paste_confirmation_dialog,
@@ -131,7 +132,7 @@ struct AppState {
     diagnostic_selection: Option<TerminalSelection>,
     pending_diagnostic_selection: Option<PendingTerminalSelection>,
     diagnostic_selection_drag_point: Option<ClientPoint>,
-    diagnostics_button_pressed: bool,
+    pressed_chrome_button: Option<WindowChromeButton>,
     diagnostics_button_last_clicked_at: Option<Instant>,
     terminal_selection: Option<TerminalSelection>,
     pending_terminal_selection: Option<PendingTerminalSelection>,
@@ -155,8 +156,16 @@ struct AppState {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WindowChromeButton {
+    Diagnostics,
+    Minimize,
+    MaximizeRestore,
+    Close,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ScenePressedTarget {
-    DiagnosticsButton,
+    ChromeButton(WindowChromeButton),
     Action(SceneAction),
 }
 
@@ -229,6 +238,38 @@ impl WindowHandle {
         self.window_thread.assert_window_thread();
         // Safety: `self.hwnd` is a live top-level window owned by this process on `self.window_thread`.
         let _ = unsafe { ShowWindow(self.hwnd, SW_SHOW) };
+    }
+
+    fn minimize(self) {
+        self.window_thread.assert_window_thread();
+        // Safety: `self.hwnd` is a live top-level window owned by this process on `self.window_thread`.
+        let _ = unsafe { ShowWindow(self.hwnd, SW_MINIMIZE) };
+    }
+
+    fn maximize(self) {
+        self.window_thread.assert_window_thread();
+        // Safety: `self.hwnd` is a live top-level window owned by this process on `self.window_thread`.
+        let _ = unsafe { ShowWindow(self.hwnd, SW_MAXIMIZE) };
+    }
+
+    fn restore(self) {
+        self.window_thread.assert_window_thread();
+        // Safety: `self.hwnd` is a live top-level window owned by this process on `self.window_thread`.
+        let _ = unsafe { ShowWindow(self.hwnd, SW_RESTORE) };
+    }
+
+    fn is_zoomed(self) -> bool {
+        self.window_thread.assert_window_thread();
+        // Safety: querying the zoomed state of a live top-level window is valid.
+        unsafe { IsZoomed(self.hwnd).as_bool() }
+    }
+
+    fn toggle_maximize_restore(self) {
+        if self.is_zoomed() {
+            self.restore();
+        } else {
+            self.maximize();
+        }
     }
 
     fn destroy(self) {
@@ -456,6 +497,15 @@ enum SceneMouseUpAction {
     NotHandled,
     RenderOnly,
     Invoke(SceneAction),
+    WindowChrome(WindowChromeButton),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WindowChromeMouseUpAction {
+    NotHandled,
+    RenderOnly,
+    ToggleDiagnostics,
+    Execute(WindowChromeButton),
 }
 
 impl PendingDragAction {
@@ -686,7 +736,7 @@ fn run_with_terminal_session(
             diagnostic_selection: None,
             pending_diagnostic_selection: None,
             diagnostic_selection_drag_point: None,
-            diagnostics_button_pressed: false,
+            pressed_chrome_button: None,
             diagnostics_button_last_clicked_at: None,
             terminal_selection: None,
             pending_terminal_selection: None,
@@ -1598,9 +1648,9 @@ fn handle_scene_left_button_down(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Re
         state.diagnostic_selection_drag_point = None;
         let layout = scene_client_layout(hwnd, state)?;
 
-        if layout.diagnostics_button_rect().contains(point) {
+        if let Some(button) = window_chrome_button_at_point(layout, point) {
             state.pending_diagnostic_selection = None;
-            state.pressed_target = Some(ScenePressedTarget::DiagnosticsButton);
+            state.pressed_target = Some(ScenePressedTarget::ChromeButton(button));
             hwnd.capture_mouse();
             render_scene_window_frame(state, hwnd, None, false)?;
             return Ok(true);
@@ -1661,15 +1711,18 @@ fn handle_scene_left_button_up(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Resu
         let layout = scene_client_layout(hwnd, state)?;
         let pressed_target = state.pressed_target.take();
 
-        if let Some(ScenePressedTarget::DiagnosticsButton) = pressed_target {
-            if layout.diagnostics_button_rect().contains(point) {
-                state.diagnostics_visible = !state.diagnostics_visible;
-                state.diagnostics_button_last_clicked_at = Some(Instant::now());
-                state.pending_diagnostic_selection = None;
-                state.diagnostic_selection_drag_point = None;
-                if !state.diagnostics_visible {
-                    state.diagnostic_selection = None;
+        if let Some(ScenePressedTarget::ChromeButton(button)) = pressed_target {
+            match window_chrome_mouse_up_action(
+                Some(button),
+                window_chrome_button_at_point(layout, point),
+            ) {
+                WindowChromeMouseUpAction::ToggleDiagnostics => {
+                    scene_toggle_diagnostics_panel(state);
                 }
+                WindowChromeMouseUpAction::Execute(button) => {
+                    return Ok(SceneMouseUpAction::WindowChrome(button));
+                }
+                WindowChromeMouseUpAction::RenderOnly | WindowChromeMouseUpAction::NotHandled => {}
             }
             return Ok(SceneMouseUpAction::RenderOnly);
         }
@@ -1712,6 +1765,10 @@ fn handle_scene_left_button_up(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Resu
             with_scene_app_state(|state| render_scene_window_frame(state, hwnd, None, false))?;
             Ok(true)
         }
+        SceneMouseUpAction::WindowChrome(button) => {
+            execute_window_chrome_button(hwnd, button);
+            Ok(true)
+        }
         SceneMouseUpAction::Invoke(action) => {
             let (app_home, vt_engine) =
                 with_scene_app_state(|state| Ok((state.app_home.clone(), state.vt_engine)))?;
@@ -1735,6 +1792,24 @@ fn scene_mouse_up_action_for_pressed_action(
         }
         Some(ScenePressedTarget::Action(_)) => SceneMouseUpAction::RenderOnly,
         _ => SceneMouseUpAction::NotHandled,
+    }
+}
+
+fn window_chrome_mouse_up_action(
+    pressed_button: Option<WindowChromeButton>,
+    button_at_point: Option<WindowChromeButton>,
+) -> WindowChromeMouseUpAction {
+    match pressed_button {
+        Some(WindowChromeButton::Diagnostics)
+            if button_at_point == Some(WindowChromeButton::Diagnostics) =>
+        {
+            WindowChromeMouseUpAction::ToggleDiagnostics
+        }
+        Some(button) if button_at_point == Some(button) => {
+            WindowChromeMouseUpAction::Execute(button)
+        }
+        Some(_) => WindowChromeMouseUpAction::RenderOnly,
+        None => WindowChromeMouseUpAction::NotHandled,
     }
 }
 
@@ -2227,7 +2302,7 @@ fn render_current_frame_with_options(
         let _span = debug_span!("compute_client_layout").entered();
         terminal_client_layout(hwnd, state)?
     };
-    let diagnostics_button_state = terminal_diagnostics_button_state(state, layout);
+    let window_chrome_buttons_state = terminal_window_chrome_buttons_state(state, hwnd, layout);
     let diagnostic_text = {
         #[cfg(feature = "tracy")]
         let _span = debug_span!("build_diagnostic_panel_text").entered();
@@ -2269,7 +2344,7 @@ fn render_current_frame_with_options(
                 .diagnostic_panel_visible
                 .then_some(state.diagnostic_selection)
                 .flatten(),
-            diagnostics_button_state,
+            window_chrome_buttons_state,
             diagnostic_cell_width: state.diagnostic_cell_width,
             diagnostic_cell_height: state.diagnostic_cell_height,
             scene: None,
@@ -2292,16 +2367,105 @@ fn render_current_frame_with_options(
     Ok(())
 }
 
-fn terminal_diagnostics_button_state(
+fn terminal_window_chrome_buttons_state(
     state: &AppState,
+    hwnd: WindowHandle,
     layout: TerminalLayout,
+) -> WindowChromeButtonsState {
+    WindowChromeButtonsState {
+        diagnostics: window_chrome_button_visual_state(
+            layout.diagnostics_button_rect(),
+            state.pointer_position,
+            state.pressed_chrome_button == Some(WindowChromeButton::Diagnostics),
+            state.diagnostics_button_last_clicked_at,
+            state.diagnostic_panel_visible,
+        ),
+        minimize: window_chrome_button_visual_state(
+            layout.minimize_button_rect(),
+            state.pointer_position,
+            state.pressed_chrome_button == Some(WindowChromeButton::Minimize),
+            None,
+            false,
+        ),
+        maximize_restore: window_chrome_button_visual_state(
+            layout.maximize_restore_button_rect(),
+            state.pointer_position,
+            state.pressed_chrome_button == Some(WindowChromeButton::MaximizeRestore),
+            None,
+            hwnd.is_zoomed(),
+        ),
+        close: window_chrome_button_visual_state(
+            layout.close_button_rect(),
+            state.pointer_position,
+            state.pressed_chrome_button == Some(WindowChromeButton::Close),
+            None,
+            false,
+        ),
+        maximized: hwnd.is_zoomed(),
+    }
+}
+
+fn scene_window_chrome_buttons_state(
+    state: &SceneAppState,
+    hwnd: WindowHandle,
+    layout: TerminalLayout,
+) -> WindowChromeButtonsState {
+    WindowChromeButtonsState {
+        diagnostics: window_chrome_button_visual_state(
+            layout.diagnostics_button_rect(),
+            state.pointer_position,
+            state.pressed_target
+                == Some(ScenePressedTarget::ChromeButton(
+                    WindowChromeButton::Diagnostics,
+                )),
+            state.diagnostics_button_last_clicked_at,
+            state.diagnostics_visible,
+        ),
+        minimize: window_chrome_button_visual_state(
+            layout.minimize_button_rect(),
+            state.pointer_position,
+            state.pressed_target
+                == Some(ScenePressedTarget::ChromeButton(
+                    WindowChromeButton::Minimize,
+                )),
+            None,
+            false,
+        ),
+        maximize_restore: window_chrome_button_visual_state(
+            layout.maximize_restore_button_rect(),
+            state.pointer_position,
+            state.pressed_target
+                == Some(ScenePressedTarget::ChromeButton(
+                    WindowChromeButton::MaximizeRestore,
+                )),
+            None,
+            hwnd.is_zoomed(),
+        ),
+        close: window_chrome_button_visual_state(
+            layout.close_button_rect(),
+            state.pointer_position,
+            state.pressed_target
+                == Some(ScenePressedTarget::ChromeButton(WindowChromeButton::Close)),
+            None,
+            false,
+        ),
+        maximized: hwnd.is_zoomed(),
+    }
+}
+
+fn window_chrome_button_visual_state(
+    rect: ClientRect,
+    pointer_position: Option<ClientPoint>,
+    pressed: bool,
+    last_clicked_at: Option<Instant>,
+    active: bool,
 ) -> ButtonVisualState {
     windows_scene::compute_button_visual_state(
-        layout.diagnostics_button_rect(),
-        state.pointer_position,
-        state.diagnostics_button_pressed,
-        state.diagnostics_button_last_clicked_at,
-        state.diagnostic_panel_visible,
+        rect,
+        pointer_position,
+        pressed,
+        last_clicked_at,
+        active,
         Instant::now(),
     )
 }
@@ -2319,19 +2483,12 @@ fn render_scene_window_frame(
     }
 
     let layout = scene_client_layout(hwnd, state)?;
-    let diagnostics_button_state = windows_scene::compute_button_visual_state(
-        layout.diagnostics_button_rect(),
-        state.pointer_position,
-        state.pressed_target == Some(ScenePressedTarget::DiagnosticsButton),
-        state.diagnostics_button_last_clicked_at,
-        state.diagnostics_visible,
-        Instant::now(),
-    );
+    let window_chrome_buttons_state = scene_window_chrome_buttons_state(state, hwnd, layout);
     let scene = if state.diagnostics_visible {
         windows_scene::build_scene_diagnostic_render_scene(
             layout,
             state.scene_kind,
-            diagnostics_button_state,
+            window_chrome_buttons_state,
             &build_scene_diagnostic_text(state),
             state.diagnostic_selection,
             state.diagnostic_cell_width,
@@ -2341,7 +2498,7 @@ fn render_scene_window_frame(
         windows_scene::build_scene_render_scene(
             layout,
             state.scene_kind,
-            diagnostics_button_state,
+            window_chrome_buttons_state,
             &scene_button_visual_states(state, layout),
         )
     };
@@ -2355,7 +2512,7 @@ fn render_scene_window_frame(
         title: Some(state.scene_kind.title().to_owned()),
         diagnostic_text: String::new(),
         diagnostic_selection: None,
-        diagnostics_button_state,
+        window_chrome_buttons_state,
         diagnostic_cell_width: state.diagnostic_cell_width,
         diagnostic_cell_height: state.diagnostic_cell_height,
         scene: Some(scene),
@@ -2459,12 +2616,70 @@ fn scene_action_at_point(
         })
 }
 
+fn window_chrome_button_rect(layout: TerminalLayout, button: WindowChromeButton) -> ClientRect {
+    match button {
+        WindowChromeButton::Diagnostics => layout.diagnostics_button_rect(),
+        WindowChromeButton::Minimize => layout.minimize_button_rect(),
+        WindowChromeButton::MaximizeRestore => layout.maximize_restore_button_rect(),
+        WindowChromeButton::Close => layout.close_button_rect(),
+    }
+}
+
+fn window_chrome_button_at_point(
+    layout: TerminalLayout,
+    point: ClientPoint,
+) -> Option<WindowChromeButton> {
+    [
+        WindowChromeButton::Diagnostics,
+        WindowChromeButton::Minimize,
+        WindowChromeButton::MaximizeRestore,
+        WindowChromeButton::Close,
+    ]
+    .into_iter()
+    .find(|button| window_chrome_button_rect(layout, *button).contains(point))
+}
+
+fn terminal_toggle_diagnostics_panel(state: &mut AppState, hwnd: WindowHandle) -> eyre::Result<()> {
+    state.diagnostic_panel_visible = !state.diagnostic_panel_visible;
+    state.diagnostics_button_last_clicked_at = Some(Instant::now());
+    state.pending_diagnostic_selection = None;
+    state.diagnostic_selection_drag_point = None;
+    if !state.diagnostic_panel_visible {
+        state.diagnostic_selection = None;
+    }
+    let layout = terminal_client_layout(hwnd, state)?;
+    state.pending_terminal_resize = None;
+    let _ = apply_terminal_resize(state, layout)?;
+    Ok(())
+}
+
+fn scene_toggle_diagnostics_panel(state: &mut SceneAppState) {
+    state.diagnostics_visible = !state.diagnostics_visible;
+    state.diagnostics_button_last_clicked_at = Some(Instant::now());
+    state.pending_diagnostic_selection = None;
+    state.diagnostic_selection_drag_point = None;
+    if !state.diagnostics_visible {
+        state.diagnostic_selection = None;
+    }
+}
+
+fn execute_window_chrome_button(hwnd: WindowHandle, button: WindowChromeButton) {
+    match button {
+        WindowChromeButton::Diagnostics => {}
+        WindowChromeButton::Minimize => hwnd.minimize(),
+        WindowChromeButton::MaximizeRestore => hwnd.toggle_maximize_restore(),
+        WindowChromeButton::Close => hwnd.post_close(),
+    }
+}
+
 fn terminal_drag_handle_contains(layout: TerminalLayout, point: ClientPoint) -> bool {
-    layout.drag_handle_rect().contains(point) && !layout.diagnostics_button_rect().contains(point)
+    layout.drag_handle_rect().contains(point)
+        && window_chrome_button_at_point(layout, point).is_none()
 }
 
 fn scene_drag_handle_contains(layout: TerminalLayout, point: ClientPoint) -> bool {
-    layout.drag_handle_rect().contains(point) && !layout.diagnostics_button_rect().contains(point)
+    layout.drag_handle_rect().contains(point)
+        && window_chrome_button_at_point(layout, point).is_none()
 }
 
 fn scene_interactive_region_contains(
@@ -2474,7 +2689,7 @@ fn scene_interactive_region_contains(
 ) -> bool {
     point.is_some_and(|point| {
         scene_drag_handle_contains(layout, point)
-            || layout.diagnostics_button_rect().contains(point)
+            || window_chrome_button_at_point(layout, point).is_some()
             || (state.diagnostics_visible && scene_diagnostic_text_rect(layout).contains(point))
             || (!state.diagnostics_visible
                 && scene_action_at_point(state.scene_kind, layout, point).is_some())
@@ -3061,7 +3276,7 @@ fn render_terminal_throughput_benchmark_frame(
         title: Some("self-test".to_owned()),
         diagnostic_text,
         diagnostic_selection: None,
-        diagnostics_button_state: ButtonVisualState::default(),
+        window_chrome_buttons_state: WindowChromeButtonsState::default(),
         diagnostic_cell_width,
         diagnostic_cell_height,
         scene: None,
@@ -3657,7 +3872,7 @@ fn with_scene_app_state<T>(
 }
 
 fn handle_left_button_up(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Result<bool> {
-    with_app_state(|state| {
+    let action = with_app_state(|state| {
         let point = ClientPoint::from_lparam(lparam);
         state.pointer_position = Some(point);
 
@@ -3672,31 +3887,23 @@ fn handle_left_button_up(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Result<boo
                     )
                 });
             hwnd.release_mouse_capture();
-            render_current_frame(state, hwnd, None)?;
-            return Ok(true);
+            return Ok(WindowChromeMouseUpAction::RenderOnly);
         }
 
-        if state.diagnostics_button_pressed {
-            state.diagnostics_button_pressed = false;
+        if let Some(button) = state.pressed_chrome_button.take() {
             let layout = terminal_client_layout(hwnd, state)?;
-            if layout.diagnostics_button_rect().contains(point) {
-                state.diagnostic_panel_visible = !state.diagnostic_panel_visible;
-                state.diagnostics_button_last_clicked_at = Some(Instant::now());
-                state.pending_diagnostic_selection = None;
-                state.diagnostic_selection_drag_point = None;
-                if !state.diagnostic_panel_visible {
-                    state.diagnostic_selection = None;
-                }
-                render_current_frame(state, hwnd, None)?;
-                return Ok(true);
+            let action = window_chrome_mouse_up_action(
+                Some(button),
+                window_chrome_button_at_point(layout, point),
+            );
+            if action == WindowChromeMouseUpAction::ToggleDiagnostics {
+                terminal_toggle_diagnostics_panel(state, hwnd)?;
             }
-
-            render_current_frame(state, hwnd, None)?;
-            return Ok(true);
+            return Ok(action);
         }
 
         if state.pending_window_drag.take().is_some() {
-            return Ok(true);
+            return Ok(WindowChromeMouseUpAction::RenderOnly);
         }
 
         if let Some(pending_selection) = state.pending_diagnostic_selection.take() {
@@ -3714,8 +3921,7 @@ fn handle_left_button_up(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Result<boo
             {
                 state.diagnostic_selection = Some(selection);
             }
-            render_current_frame(state, hwnd, None)?;
-            return Ok(true);
+            return Ok(WindowChromeMouseUpAction::RenderOnly);
         }
 
         if let Some(pending_selection) = state.pending_terminal_selection.take() {
@@ -3730,12 +3936,23 @@ fn handle_left_button_up(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Result<boo
             {
                 state.terminal_selection = Some(selection);
             }
-            render_current_frame(state, hwnd, None)?;
-            return Ok(true);
+            return Ok(WindowChromeMouseUpAction::RenderOnly);
         }
 
-        Ok(false)
-    })
+        Ok(WindowChromeMouseUpAction::NotHandled)
+    })?;
+
+    match action {
+        WindowChromeMouseUpAction::NotHandled => Ok(false),
+        WindowChromeMouseUpAction::RenderOnly | WindowChromeMouseUpAction::ToggleDiagnostics => {
+            with_app_state(|state| render_current_frame(state, hwnd, None))?;
+            Ok(true)
+        }
+        WindowChromeMouseUpAction::Execute(button) => {
+            execute_window_chrome_button(hwnd, button);
+            Ok(true)
+        }
+    }
 }
 
 /// behavior[impl window.interaction.drag]
@@ -3760,17 +3977,17 @@ fn handle_left_button_down(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Result<b
         state.pending_window_drag = None;
         state.terminal_selection_drag_point = None;
         state.diagnostic_selection_drag_point = None;
-        state.diagnostics_button_pressed = false;
+        state.pressed_chrome_button = None;
 
         let layout = terminal_client_layout(hwnd, state)?;
-        if layout.diagnostics_button_rect().contains(point) {
+        if let Some(button) = window_chrome_button_at_point(layout, point) {
             state.pending_terminal_selection = None;
             state.pending_diagnostic_selection = None;
             state.terminal_scrollbar_hovered_part = None;
             if state.terminal_scrollbar_drag.take().is_some() {
                 hwnd.release_mouse_capture();
             }
-            state.diagnostics_button_pressed = true;
+            state.pressed_chrome_button = Some(button);
             render_current_frame(state, hwnd, None)?;
             return Ok(true);
         }
@@ -4300,7 +4517,7 @@ fn terminal_interactive_region_contains(
 ) -> bool {
     point.is_some_and(|point| {
         layout.title_bar_rect().contains(point)
-            || layout.diagnostics_button_rect().contains(point)
+            || window_chrome_button_at_point(layout, point).is_some()
             || (state.diagnostic_panel_visible
                 && diagnostic_panel_text_rect(layout).contains(point))
     })
@@ -4402,7 +4619,7 @@ fn terminal_cursor_for_point(
     layout: TerminalLayout,
     point: ClientPoint,
 ) -> Option<PCWSTR> {
-    if layout.diagnostics_button_rect().contains(point) {
+    if window_chrome_button_at_point(layout, point).is_some() {
         return Some(IDC_HAND);
     }
 
@@ -4424,7 +4641,7 @@ fn scene_cursor_for_point(
     layout: TerminalLayout,
     point: ClientPoint,
 ) -> Option<PCWSTR> {
-    if layout.diagnostics_button_rect().contains(point) {
+    if window_chrome_button_at_point(layout, point).is_some() {
         return Some(IDC_HAND);
     }
 
@@ -5011,6 +5228,39 @@ mod tests {
                 Some(SceneAction::OpenAudioPicker),
             ),
             SceneMouseUpAction::RenderOnly
+        );
+    }
+
+    #[test]
+    fn window_chrome_mouse_up_action_toggles_matching_diagnostics_button() {
+        assert_eq!(
+            window_chrome_mouse_up_action(
+                Some(WindowChromeButton::Diagnostics),
+                Some(WindowChromeButton::Diagnostics),
+            ),
+            WindowChromeMouseUpAction::ToggleDiagnostics
+        );
+    }
+
+    #[test]
+    fn window_chrome_mouse_up_action_executes_matching_minimize_button() {
+        assert_eq!(
+            window_chrome_mouse_up_action(
+                Some(WindowChromeButton::Minimize),
+                Some(WindowChromeButton::Minimize),
+            ),
+            WindowChromeMouseUpAction::Execute(WindowChromeButton::Minimize)
+        );
+    }
+
+    #[test]
+    fn window_chrome_mouse_up_action_keeps_nonmatching_button_render_only() {
+        assert_eq!(
+            window_chrome_mouse_up_action(
+                Some(WindowChromeButton::Close),
+                Some(WindowChromeButton::Minimize),
+            ),
+            WindowChromeMouseUpAction::RenderOnly
         );
     }
 

@@ -133,6 +133,67 @@ float icon_diagnostics(float2 uv) {
     return 1.0 - smoothstep(0.02, 0.08, distance_field);
 }
 
+float box_fill_mask(float2 uv, float2 center, float2 halfExtents) {
+    float distance_field = sdBox(uv - center, halfExtents);
+    return 1.0 - smoothstep(0.0, 0.02, distance_field);
+}
+
+float box_outline_mask(float2 uv, float2 center, float2 halfExtents, float thickness) {
+    float outer = box_fill_mask(uv, center, halfExtents);
+    float2 innerHalfExtents = max(halfExtents - thickness.xx, 0.01.xx);
+    float inner = box_fill_mask(uv, center, innerHalfExtents);
+    return saturate(outer - inner);
+}
+
+float line_segment_mask(float2 uv, float2 a, float2 b, float thickness) {
+    float distance_field = segment_distance(uv, a, b);
+    return 1.0 - smoothstep(thickness, thickness + 0.02, distance_field);
+}
+
+float icon_minimize(float2 uv) {
+    return box_fill_mask(uv, float2(0.5, 0.64), float2(0.22, 0.04));
+}
+
+float icon_maximize(float2 uv) {
+    return box_outline_mask(uv, float2(0.5, 0.52), float2(0.20, 0.20), 0.05);
+}
+
+float icon_restore(float2 uv) {
+    float2 halfExtents = float2(0.16, 0.16);
+    float2 backCenter = float2(0.44, 0.42);
+    float2 frontCenter = float2(0.58, 0.56);
+    float front = box_outline_mask(uv, frontCenter, halfExtents, 0.045);
+    float frontCover = box_fill_mask(uv, frontCenter, halfExtents + 0.03.xx);
+    float back = box_outline_mask(uv, backCenter, halfExtents, 0.045) * (1.0 - frontCover);
+    return saturate(front + back);
+}
+
+float icon_close(float2 uv) {
+    float line1 = line_segment_mask(uv, float2(0.30, 0.30), float2(0.70, 0.70), 0.045);
+    float line2 = line_segment_mask(uv, float2(0.70, 0.30), float2(0.30, 0.70), 0.045);
+    return max(line1, line2);
+}
+
+float chrome_icon_mask(float2 uv, float effect) {
+    if (effect < 16.5) {
+        return icon_diagnostics(uv);
+    }
+
+    if (effect < 17.5) {
+        return icon_minimize(uv);
+    }
+
+    if (effect < 18.5) {
+        return icon_maximize(uv);
+    }
+
+    if (effect < 19.5) {
+        return icon_restore(uv);
+    }
+
+    return icon_close(uv);
+}
+
 float4 unpack_rgba8(uint packed) {
     float r = (packed & 0xFFU) / 255.0;
     float g = ((packed >> 8U) & 0xFFU) / 255.0;
@@ -417,6 +478,25 @@ float4 apply_scene_button_card(float2 uv, float4 color, float4 state) {
     return float4(tint * (intensity + top_glow), color.a);
 }
 
+float4 apply_window_chrome_button(float2 uv, float4 color, float4 state, float effect) {
+    float t = PanelTime();
+    float near = state.x;
+    float hover = state.y;
+    float pressed = state.z;
+    float click = state.w;
+    float center = 1.0 - smoothstep(0.0, 0.80, distance(uv, float2(0.5, 0.46)));
+    float rim = 1.0 - smoothstep(0.18, 0.5, abs(uv.y - 0.08));
+    float sheen = 0.5 + (0.5 * sin((uv.x * 10.0) + (uv.y * 8.0) - (t * (0.7 + hover))));
+    float intensity = 0.88 + (near * 0.04) + (hover * 0.08) + (center * (0.06 + (0.05 * hover))) + (click * 0.10) + (sheen * 0.03) - (pressed * 0.08);
+    float3 tint = color.rgb * lerp(float3(0.90, 0.92, 0.98), float3(1.02, 1.04, 1.08), hover + (click * 0.30));
+    float top_glow = rim * (0.04 + (0.08 * hover) + (0.06 * click));
+    float3 shaded = tint * (intensity + top_glow);
+    float iconMask = chrome_icon_mask(uv, effect);
+    float3 iconColor = float3(0.95, 0.96, 0.99) * (0.94 + (0.08 * hover) + (0.06 * click));
+    shaded = lerp(shaded, iconColor, iconMask);
+    return float4(shaded, color.a);
+}
+
 float4 apply_scene_body(float2 uv, float4 color) {
     float t = PanelTime();
     float wash = 0.92 + (0.05 * sin((uv.x * 4.0) + (t * 0.55))) + (0.04 * sin((uv.y * 7.0) - (t * 0.42)));
@@ -465,7 +545,9 @@ float4 PSMain(PsInput input) : SV_TARGET {
     }
 
     float4 shaded = input.color;
-    if (input.effect > 14.5) {
+    if (input.effect > 15.5) {
+        shaded = apply_window_chrome_button(input.uv, input.color, input.glyphData, input.effect);
+    } else if (input.effect > 14.5) {
         shaded = apply_scene_body(input.uv, input.color);
     } else if (input.effect > 13.5) {
         shaded = apply_scene_button_card(input.uv, input.color, input.glyphData);
