@@ -49,10 +49,13 @@ impl Drop for TempDirGuard {
 fn render_offscreen_command_runs_headlessly_and_writes_png_artifact() {
     let output_dir = TempDirGuard::new("teamy-studio-render-offscreen");
     let artifact = output_dir.path().join("offscreen-render.png");
+    let scene_artifact = output_dir.path().join("offscreen-render-scene.txt");
 
     let output = run_teamy_studio(&[
         "self-test",
         "render-offscreen",
+        "--fixture",
+        "basic-terminal-frame",
         "--artifact-output",
         artifact.to_string_lossy().as_ref(),
     ]);
@@ -63,16 +66,35 @@ fn render_offscreen_command_runs_headlessly_and_writes_png_artifact() {
         text.contains("\"image_width\":"),
         "missing image metrics:\n{text}"
     );
+    assert!(
+        text.contains("\"matched_expected\": true"),
+        "render fixture did not report an expected-image match:\n{text}"
+    );
+    assert!(
+        text.contains("\"matched_scene_snapshot\": true"),
+        "render fixture did not report a scene-snapshot match:\n{text}"
+    );
     assert!(artifact.exists(), "offscreen PNG artifact was not written");
+    assert!(
+        scene_artifact.exists(),
+        "offscreen scene snapshot artifact was not written"
+    );
 
     let image = image::open(&artifact)
         .expect("offscreen artifact should be readable")
         .into_rgba8();
+    let scene_snapshot = std::fs::read_to_string(&scene_artifact)
+        .expect("offscreen scene snapshot artifact should be readable");
+
     assert!(image.pixels().any(|pixel| pixel[3] > 0));
     assert!(
         image
             .pixels()
             .any(|pixel| { u16::from(pixel[0]) + u16::from(pixel[1]) + u16::from(pixel[2]) > 64 }),
         "offscreen image should contain visible content"
+    );
+    assert!(
+        scene_snapshot.contains("fragment_count="),
+        "scene snapshot should include fragment metadata"
     );
 }

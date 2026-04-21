@@ -1,4 +1,5 @@
 mod cell_grid;
+mod render_verification;
 mod spatial;
 pub mod teamy_terminal_engine;
 mod windows_app;
@@ -12,13 +13,12 @@ mod windows_terminal_replay;
 mod windows_terminal_self_test;
 
 use std::path::Path;
-use std::sync::Arc;
 
-use crate::app::spatial::TerminalCellPoint;
 use crate::paths::{AppHome, CacheHome};
 use eyre::Context;
 use facet::Facet;
 
+pub use render_verification::{RenderOffscreenFixtureListReport, RenderOffscreenSelfTestReport};
 pub use windows_app::TerminalThroughputBenchmarkResultsReport;
 pub use windows_terminal_replay::TerminalReplayReport;
 pub use windows_terminal_self_test::KeyboardInputSelfTestReport;
@@ -57,15 +57,6 @@ pub struct TerminalWindowSummary {
     pub hwnd: usize,
     pub pid: u32,
     pub title: String,
-}
-
-#[derive(Debug, Facet)]
-pub struct RenderOffscreenSelfTestReport {
-    artifact_path: Option<String>,
-    image_width: u32,
-    image_height: u32,
-    non_transparent_pixels: usize,
-    bright_pixels: usize,
 }
 
 /// Run the Teamy Studio application shell.
@@ -192,6 +183,8 @@ pub fn run_terminal_replay_self_test(
 /// Run a headless offscreen render self-test.
 // cli[impl command.surface.self-test-render-offscreen]
 // cli[impl self-test.render-offscreen.artifact-output]
+// cli[impl self-test.render-offscreen.fixture-flag]
+// cli[impl self-test.render-offscreen.update-expected-flag]
 /// tool[impl cli.surface.self-test]
 ///
 /// # Errors
@@ -200,117 +193,34 @@ pub fn run_terminal_replay_self_test(
 pub fn run_render_offscreen_self_test(
     app_home: &AppHome,
     cache_home: &CacheHome,
+    fixture: Option<&str>,
     artifact_output: Option<&Path>,
+    update_expected: bool,
 ) -> eyre::Result<RenderOffscreenSelfTestReport> {
     let _ = app_home;
     let _ = cache_home;
 
-    let frame = build_offscreen_render_self_test_frame();
-
-    if let Some(output_path) = artifact_output {
-        windows_d3d12_renderer::write_render_frame_model_offscreen_png(&frame, output_path)?;
-    }
-
-    let image = windows_d3d12_renderer::render_frame_model_offscreen_image(&frame)?;
-    let (non_transparent_pixels, bright_pixels) = summarize_offscreen_image(&image);
-    if non_transparent_pixels == 0 || bright_pixels == 0 {
-        eyre::bail!("offscreen render produced an empty image")
-    }
-
-    Ok(RenderOffscreenSelfTestReport {
-        artifact_path: artifact_output.map(|path| path.display().to_string()),
-        image_width: image.width(),
-        image_height: image.height(),
-        non_transparent_pixels,
-        bright_pixels,
-    })
+    render_verification::run_render_offscreen_fixture(fixture, artifact_output, update_expected)
 }
 
-fn build_offscreen_render_self_test_frame() -> windows_d3d12_renderer::RenderFrameModel {
-    let layout = windows_terminal::TerminalLayout {
-        client_width: 1040,
-        client_height: 680,
-        cell_width: 8,
-        cell_height: 16,
-        diagnostic_panel_visible: true,
-    };
-    let terminal_display = Arc::new(windows_terminal::TerminalDisplayState {
-        rows: vec![
-            build_offscreen_render_row(0, "echo offscreen", [0.92, 0.94, 0.98, 1.0], true),
-            build_offscreen_render_row(1, "headless renderer", [0.96, 0.90, 0.70, 1.0], false),
-        ],
-        dirty_rows: vec![0, 1],
-        cursor: Some(windows_terminal::TerminalDisplayCursor {
-            cell: TerminalCellPoint::new(8, 1),
-            color: [0.96, 0.45, 1.0, 1.0],
-            style: windows_terminal::TerminalDisplayCursorStyle::Block,
-        }),
-        scrollbar: Some(windows_terminal::TerminalDisplayScrollbar {
-            total: 100,
-            offset: 40,
-            visible: 24,
-        }),
-    });
-
-    windows_d3d12_renderer::RenderFrameModel {
-        layout,
-        title: Some("self-test".to_owned()),
-        diagnostic_text: "offscreen render self-test".to_owned(),
-        diagnostic_selection: None,
-        window_chrome_buttons_state: windows_d3d12_renderer::WindowChromeButtonsState::default(),
-        diagnostic_cell_width: 8,
-        diagnostic_cell_height: 16,
-        scene: None,
-        terminal_cell_width: 8,
-        terminal_cell_height: 16,
-        terminal_display,
-        terminal_visual_state: windows_d3d12_renderer::RendererTerminalVisualState {
-            track_hovered: true,
-            thumb_hovered: true,
-            thumb_grabbed: false,
-        },
-    }
+/// cli[impl self-test.render-offscreen.list-fixtures-flag]
+#[must_use]
+pub fn list_render_offscreen_self_test_fixtures() -> RenderOffscreenFixtureListReport {
+    render_verification::list_render_offscreen_fixtures()
 }
 
-fn build_offscreen_render_row(
-    row: i32,
-    text: &str,
-    color: [f32; 4],
-    include_background: bool,
-) -> windows_terminal::TerminalDisplayRow {
-    windows_terminal::TerminalDisplayRow {
-        row,
-        backgrounds: if include_background {
-            vec![windows_terminal::TerminalDisplayBackground {
-                cell: TerminalCellPoint::new(0, row),
-                color: [0.18, 0.18, 0.24, 1.0],
-            }]
-        } else {
-            Vec::new()
-        },
-        glyphs: text
-            .chars()
-            .enumerate()
-            .map(
-                |(column, character)| windows_terminal::TerminalDisplayGlyph {
-                    cell: TerminalCellPoint::new(i32::try_from(column).unwrap_or_default(), row),
-                    character,
-                    color,
-                },
-            )
-            .collect(),
-    }
-}
-
-fn summarize_offscreen_image(
-    image: &image::ImageBuffer<image::Rgba<u8>, Vec<u8>>,
-) -> (usize, usize) {
-    let non_transparent_pixels = image.pixels().filter(|pixel| pixel[3] > 0).count();
-    let bright_pixels = image
-        .pixels()
-        .filter(|pixel| u16::from(pixel[0]) + u16::from(pixel[1]) + u16::from(pixel[2]) > 64)
-        .count();
-    (non_transparent_pixels, bright_pixels)
+/// os[impl os.windows.rendering.direct3d12.offscreen-terminal-verification]
+///
+/// # Errors
+///
+/// This function will return an error if the selected offscreen render fixture fails to render,
+/// does not match its expected image, or cannot write requested artifacts.
+pub fn run_render_offscreen_verification_fixture(
+    fixture: Option<&str>,
+    artifact_output: Option<&Path>,
+    update_expected: bool,
+) -> eyre::Result<RenderOffscreenSelfTestReport> {
+    render_verification::run_render_offscreen_fixture(fixture, artifact_output, update_expected)
 }
 
 /// Write a PNG snapshot for a single slug glyph.

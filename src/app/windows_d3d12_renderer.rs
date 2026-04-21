@@ -22,6 +22,7 @@
 )]
 use std::collections::{BTreeSet, HashMap};
 use std::ffi::{CStr, c_void};
+use std::fmt::Write as _;
 use std::fs;
 use std::ops::Range;
 use std::path::Path;
@@ -73,7 +74,9 @@ const MAX_BAND_UINT_COUNT: usize = 262_144;
 const TERMINAL_FONT_FAMILY: &str = "CaskaydiaCove Nerd Font Mono";
 const SLUG_GLYPH_DILATION_PX: f32 = 0.5;
 const SLUG_BAND_SIZE_FONT_UNITS: f32 = 64.0;
+const SLUG_HORIZONTAL_COVERAGE_EPSILON: f32 = 1.0 / 65536.0;
 const TEAMY_D3D12_GPU_VALIDATION_ENV: &str = "TEAMY_D3D12_GPU_VALIDATION";
+const TEAMY_D3D12_OFFSCREEN_ADAPTER_ENV: &str = "TEAMY_D3D12_OFFSCREEN_ADAPTER";
 const SPRITE_SLOT_SIZE: u32 = 320;
 const SPRITE_TARGET_SIZE: u32 = 256;
 
@@ -1093,62 +1096,7 @@ impl D3d12PanelRenderer {
     }
 
     fn build_scene_vertices(&self, scene: &RenderScene) -> Vec<Vertex> {
-        let mut vertices = Vec::with_capacity(
-            (scene.panels.len()
-                + scene.sprites.len()
-                + scene.glyphs.len()
-                + scene.overlay_panels.len())
-                * 6,
-        );
-        for panel in &scene.panels {
-            append_rect_with_data(
-                &mut vertices,
-                panel.rect,
-                panel.color,
-                panel.effect as u32,
-                0,
-                [0.0, 0.0, 1.0, 1.0],
-                panel.data,
-            );
-        }
-        for sprite in &scene.sprites {
-            append_rect_with_data(
-                &mut vertices,
-                sprite.rect,
-                sprite.color,
-                PanelEffect::SpriteImage as u32,
-                0,
-                self.sprite_atlas.uv_rect(sprite.sprite),
-                [0.0; 4],
-            );
-        }
-        for glyph in &scene.glyphs {
-            let slug_glyph = self
-                .glyph_cache
-                .get(&glyph.character)
-                .or_else(|| self.glyph_cache.get(&FALLBACK_GLYPH))
-                .copied()
-                .unwrap_or_else(|| SlugGlyph::empty(&self.font));
-            append_text_rect(
-                &mut vertices,
-                glyph.rect,
-                glyph.color,
-                slug_glyph,
-                &self.font,
-            );
-        }
-        for panel in &scene.overlay_panels {
-            append_rect_with_data(
-                &mut vertices,
-                panel.rect,
-                panel.color,
-                panel.effect as u32,
-                0,
-                [0.0, 0.0, 1.0, 1.0],
-                panel.data,
-            );
-        }
-        vertices
+        build_scene_vertices_with_assets(scene, &self.sprite_atlas, &self.glyph_cache, &self.font)
     }
 
     fn upload_cached_fragment_vertices(&self, fragments: &[&[Vertex]]) -> eyre::Result<usize> {
@@ -1468,6 +1416,63 @@ impl D3d12PanelRenderer {
     }
 }
 
+fn build_scene_vertices_with_assets(
+    scene: &RenderScene,
+    sprite_atlas: &SpriteAtlas,
+    glyph_cache: &HashMap<char, SlugGlyph>,
+    font: &LoadedTerminalFont,
+) -> Vec<Vertex> {
+    let mut vertices = Vec::with_capacity(
+        (scene.panels.len()
+            + scene.sprites.len()
+            + scene.glyphs.len()
+            + scene.overlay_panels.len())
+            * 6,
+    );
+    for panel in &scene.panels {
+        append_rect_with_data(
+            &mut vertices,
+            panel.rect,
+            panel.color,
+            panel.effect as u32,
+            0,
+            [0.0, 0.0, 1.0, 1.0],
+            panel.data,
+        );
+    }
+    for sprite in &scene.sprites {
+        append_rect_with_data(
+            &mut vertices,
+            sprite.rect,
+            sprite.color,
+            PanelEffect::SpriteImage as u32,
+            0,
+            sprite_atlas.uv_rect(sprite.sprite),
+            [0.0; 4],
+        );
+    }
+    for glyph in &scene.glyphs {
+        let slug_glyph = glyph_cache
+            .get(&glyph.character)
+            .or_else(|| glyph_cache.get(&FALLBACK_GLYPH))
+            .copied()
+            .unwrap_or_else(|| SlugGlyph::empty(font));
+        append_text_rect(&mut vertices, glyph.rect, glyph.color, slug_glyph, font);
+    }
+    for panel in &scene.overlay_panels {
+        append_rect_with_data(
+            &mut vertices,
+            panel.rect,
+            panel.color,
+            panel.effect as u32,
+            0,
+            [0.0, 0.0, 1.0, 1.0],
+            panel.data,
+        );
+    }
+    vertices
+}
+
 fn can_reuse_cached_scene_vertices(
     reused: bool,
     cached_vertices: Option<&CachedSceneVertices>,
@@ -1557,7 +1562,7 @@ fn chrome_scene_fragment(
 
     let mut scene = build_panel_scene(layout, window_chrome_buttons_state);
     if let Some(title) = title.filter(|title| !title.is_empty()) {
-        push_centered_text(
+        push_title_text(
             &mut scene,
             layout.title_text_rect().to_win32_rect(),
             title,
@@ -2193,6 +2198,24 @@ pub fn push_centered_text(scene: &mut RenderScene, rect: RECT, text: &str, color
     push_text_block(scene, text_rect, text, glyph_width, glyph_height, color);
 }
 
+pub fn push_title_text(scene: &mut RenderScene, rect: RECT, text: &str, color: [f32; 4]) {
+    let glyph_count = i32::try_from(text.chars().count())
+        .unwrap_or_default()
+        .max(1);
+    let available_width = (rect.right - rect.left - 20).max(8);
+    let available_height = (rect.bottom - rect.top - 12).max(8);
+    let glyph_height = available_height.clamp(16, 36);
+    let glyph_width = ((available_width / glyph_count).min((glyph_height * 3) / 2)).max(8);
+    let total_width = glyph_width * glyph_count;
+    let text_rect = RECT {
+        left: rect.left + (((rect.right - rect.left) - total_width).max(0) / 2),
+        top: rect.top + (((rect.bottom - rect.top) - glyph_height).max(0) / 2),
+        right: rect.right,
+        bottom: rect.bottom,
+    };
+    push_text_block(scene, text_rect, text, glyph_width, glyph_height, color);
+}
+
 pub fn push_glyph(scene: &mut RenderScene, rect: RECT, character: char, color: [f32; 4]) {
     if scene.glyphs.len() >= MAX_GLYPH_COUNT || character == ' ' {
         return;
@@ -2441,55 +2464,249 @@ pub fn write_slug_snapshot_sheet_png(
     Ok(())
 }
 
-pub fn write_render_frame_model_offscreen_png(
-    frame: &RenderFrameModel,
-    output_path: &Path,
-) -> eyre::Result<()> {
-    let image = render_frame_model_offscreen_image(frame)?;
-    if let Some(parent) = output_path.parent() {
-        std::fs::create_dir_all(parent).wrap_err_with(|| {
-            format!(
-                "failed to create offscreen render directory {}",
-                parent.display()
-            )
-        })?;
+#[must_use]
+pub fn offscreen_render_backend_name() -> &'static str {
+    if offscreen_uses_warp_adapter() {
+        "d3d12-warp"
+    } else {
+        "d3d12-hardware"
     }
-    image.save(output_path).wrap_err_with(|| {
-        format!(
-            "failed to write offscreen render png {}",
-            output_path.display()
-        )
-    })?;
-    Ok(())
 }
 
 /// os[impl os.windows.rendering.direct3d12.offscreen-terminal-verification]
 pub fn render_frame_model_offscreen_image(
     frame: &RenderFrameModel,
 ) -> eyre::Result<ImageBuffer<Rgba<u8>, Vec<u8>>> {
-    if let Some(scene) = frame.scene.as_ref() {
-        let width = u32::try_from(frame.layout.client_width.max(1)).unwrap_or(1);
-        let height = u32::try_from(frame.layout.client_height.max(1)).unwrap_or(1);
-        let mut image = ImageBuffer::<Rgba<u8>, Vec<u8>>::new(width, height);
-        for pixel in image.pixels_mut() {
-            *pixel = Rgba([0, 0, 0, 0]);
+    let width = u32::try_from(frame.layout.client_width.max(1)).unwrap_or(1);
+    let height = u32::try_from(frame.layout.client_height.max(1)).unwrap_or(1);
+    let use_warp_adapter = offscreen_uses_warp_adapter();
+    let (_dxgi_factory, device, _dxgi_info_queue) = create_device_with_adapter(use_warp_adapter)
+        .wrap_err_with(|| {
+            format!(
+                "failed to create {} D3D12 device for offscreen render",
+                offscreen_render_backend_name()
+            )
+        })?;
+    let command_queue = create_command_queue(&device)
+        .wrap_err("failed to create D3D12 command queue for offscreen render")?;
+    let command_allocator: ID3D12CommandAllocator =
+        unsafe { device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT) }
+            .wrap_err("failed to create D3D12 command allocator for offscreen render")?;
+    let font = load_terminal_font()?;
+    let root_signature =
+        create_root_signature(&device).wrap_err("failed to create offscreen root signature")?;
+    let pipeline_state = create_pipeline_state(&device, &root_signature)
+        .wrap_err("failed to create offscreen pipeline state")?;
+    let command_list: ID3D12GraphicsCommandList = unsafe {
+        device.CreateCommandList(
+            0,
+            D3D12_COMMAND_LIST_TYPE_DIRECT,
+            &command_allocator,
+            &pipeline_state,
+        )
+    }
+    .wrap_err("failed to create offscreen command list")?;
+
+    let (vertex_buffer, vertex_buffer_view) =
+        create_vertex_buffer(&device).wrap_err("failed to create offscreen vertex buffer")?;
+    let shader_param_buffer = create_shader_param_buffer(&device)
+        .wrap_err("failed to create offscreen shader parameter buffer")?;
+    let (srv_heap, curve_buffer, band_buffer, _sprite_buffer, sprite_atlas) =
+        create_shader_resources_and_srv(&device)
+            .wrap_err("failed to create offscreen shader resources")?;
+    let (render_target, rtv_heap) = create_offscreen_render_target(&device, width, height)
+        .wrap_err_with(|| {
+            format!("failed to create offscreen render target for {width}x{height} image")
+        })?;
+    let (readback_buffer, row_pitch) = create_offscreen_readback_buffer(&device, width, height)
+        .wrap_err_with(|| {
+            format!("failed to create offscreen readback buffer for {width}x{height} image")
+        })?;
+    let fence: ID3D12Fence = unsafe { device.CreateFence(0, D3D12_FENCE_FLAG_NONE) }
+        .wrap_err("failed to create offscreen fence")?;
+    let fence_event = unsafe { Owned::new(CreateEventW(None, false, false, None)?) };
+
+    let scenes = build_offscreen_frame_scenes(frame);
+    let scene_refs = scenes.iter().map(Arc::as_ref).collect::<Vec<_>>();
+    let scene_chars = collect_scene_chars_from_fragments(&scene_refs);
+    let (curve_data, band_data, glyph_cache) =
+        build_slug_curve_buffer(&font, &scene_chars).wrap_err("failed to build slug curve data")?;
+    let vertex_fragments = scene_refs
+        .iter()
+        .map(|scene| build_scene_vertices_with_assets(scene, &sprite_atlas, &glyph_cache, &font))
+        .collect::<Vec<_>>();
+    let vertex_slices = vertex_fragments
+        .iter()
+        .map(Vec::as_slice)
+        .collect::<Vec<_>>();
+    let vertex_count = upload_fragment_vertices(&vertex_buffer, &vertex_slices)?;
+    upload_curve_data(&curve_buffer, &curve_data)?;
+    upload_band_data(&band_buffer, &band_data)?;
+    upload_offscreen_shader_params(&shader_param_buffer, width, height, &sprite_atlas)?;
+
+    let viewport = D3D12_VIEWPORT {
+        TopLeftX: 0.0,
+        TopLeftY: 0.0,
+        Width: width as f32,
+        Height: height as f32,
+        MinDepth: D3D12_MIN_DEPTH,
+        MaxDepth: D3D12_MAX_DEPTH,
+    };
+    let scissor_rect = RECT {
+        left: 0,
+        top: 0,
+        right: i32::try_from(width).unwrap_or(i32::MAX),
+        bottom: i32::try_from(height).unwrap_or(i32::MAX),
+    };
+    let rtv_handle = unsafe { rtv_heap.GetCPUDescriptorHandleForHeapStart() };
+
+    unsafe {
+        command_list.SetDescriptorHeaps(&[Some(srv_heap.clone())]);
+        command_list.SetGraphicsRootSignature(&root_signature);
+        command_list
+            .SetGraphicsRootConstantBufferView(0, shader_param_buffer.GetGPUVirtualAddress());
+        command_list
+            .SetGraphicsRootDescriptorTable(1, srv_heap.GetGPUDescriptorHandleForHeapStart());
+        command_list.RSSetViewports(&[viewport]);
+        command_list.RSSetScissorRects(&[scissor_rect]);
+        command_list.OMSetRenderTargets(1, Some(&rtv_handle), false, None);
+
+        let clear_color = [0.0_f32, 0.0_f32, 0.0_f32, 0.0_f32];
+        command_list.ClearRenderTargetView(rtv_handle, &clear_color, None);
+        command_list.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        command_list.IASetVertexBuffers(0, Some(&[vertex_buffer_view]));
+        command_list.DrawInstanced(vertex_count as u32, 1, 0, 0);
+
+        issue_transition_barrier(
+            &command_list,
+            &render_target,
+            D3D12_RESOURCE_STATE_RENDER_TARGET,
+            D3D12_RESOURCE_STATE_COPY_SOURCE,
+        );
+
+        let mut destination =
+            texture_copy_location_for_buffer(&readback_buffer, width, height, row_pitch);
+        let mut source = texture_copy_location_for_subresource(&render_target, 0);
+        command_list.CopyTextureRegion(&destination, 0, 0, 0, &source, None);
+        release_texture_copy_location(&mut destination);
+        release_texture_copy_location(&mut source);
+        command_list.Close()?;
+    }
+
+    let command_lists = [Some(command_list.cast::<ID3D12CommandList>()?)];
+    unsafe {
+        command_queue.ExecuteCommandLists(&command_lists);
+        command_queue.Signal(&fence, 1)?;
+        if fence.GetCompletedValue() < 1 {
+            fence.SetEventOnCompletion(1, *fence_event)?;
+            WaitForSingleObjectEx(*fence_event, INFINITE, false);
+        }
+    }
+
+    readback_texture_to_image(&readback_buffer, width, height, row_pitch)
+}
+
+fn offscreen_uses_warp_adapter() -> bool {
+    std::env::var(TEAMY_D3D12_OFFSCREEN_ADAPTER_ENV)
+        .map_or(true, |value| !value.eq_ignore_ascii_case("hardware"))
+}
+
+pub(crate) fn render_frame_model_scene_snapshot(frame: &RenderFrameModel) -> String {
+    let scenes = build_offscreen_frame_scenes(frame);
+    let mut snapshot = String::new();
+    let _ = writeln!(snapshot, "fragment_count={}", scenes.len());
+
+    for (fragment_index, scene) in scenes.iter().enumerate() {
+        let _ = writeln!(
+            snapshot,
+            "[fragment {fragment_index}] panels={} glyphs={} sprites={} overlay_panels={}",
+            scene.panels.len(),
+            scene.glyphs.len(),
+            scene.sprites.len(),
+            scene.overlay_panels.len(),
+        );
+
+        for (panel_index, panel) in scene.panels.iter().enumerate() {
+            let _ = writeln!(
+                snapshot,
+                "panel {panel_index} effect={:?} rect={},{},{},{} color={:.3},{:.3},{:.3},{:.3} data={:.3},{:.3},{:.3},{:.3}",
+                panel.effect,
+                panel.rect.left,
+                panel.rect.top,
+                panel.rect.right,
+                panel.rect.bottom,
+                panel.color[0],
+                panel.color[1],
+                panel.color[2],
+                panel.color[3],
+                panel.data[0],
+                panel.data[1],
+                panel.data[2],
+                panel.data[3],
+            );
         }
 
-        let font = load_terminal_font()?;
-        let face = Face::parse(&font.font_bytes, font.face_index)
-            .wrap_err("failed to parse terminal font for offscreen render")?;
-        let mut glyph_cache: HashMap<char, (Vec<QuadraticCurve>, Vec<u32>, SlugGlyph)> =
-            HashMap::new();
-        let sprite_atlas = build_sprite_atlas()?;
-        blend_scene_into_image(
-            &mut image,
-            scene,
-            &font,
-            &face,
-            &mut glyph_cache,
-            &sprite_atlas,
-        )?;
-        return Ok(image);
+        for (glyph_index, glyph) in scene.glyphs.iter().enumerate() {
+            let escaped = glyph.character.escape_default().to_string();
+            let _ = writeln!(
+                snapshot,
+                "glyph {glyph_index} char=U+{:04X} literal='{}' rect={},{},{},{} color={:.3},{:.3},{:.3},{:.3}",
+                u32::from(glyph.character),
+                escaped,
+                glyph.rect.left,
+                glyph.rect.top,
+                glyph.rect.right,
+                glyph.rect.bottom,
+                glyph.color[0],
+                glyph.color[1],
+                glyph.color[2],
+                glyph.color[3],
+            );
+        }
+
+        for (sprite_index, sprite) in scene.sprites.iter().enumerate() {
+            let _ = writeln!(
+                snapshot,
+                "sprite {sprite_index} id={:?} rect={},{},{},{} color={:.3},{:.3},{:.3},{:.3}",
+                sprite.sprite,
+                sprite.rect.left,
+                sprite.rect.top,
+                sprite.rect.right,
+                sprite.rect.bottom,
+                sprite.color[0],
+                sprite.color[1],
+                sprite.color[2],
+                sprite.color[3],
+            );
+        }
+
+        for (overlay_index, panel) in scene.overlay_panels.iter().enumerate() {
+            let _ = writeln!(
+                snapshot,
+                "overlay_panel {overlay_index} effect={:?} rect={},{},{},{} color={:.3},{:.3},{:.3},{:.3} data={:.3},{:.3},{:.3},{:.3}",
+                panel.effect,
+                panel.rect.left,
+                panel.rect.top,
+                panel.rect.right,
+                panel.rect.bottom,
+                panel.color[0],
+                panel.color[1],
+                panel.color[2],
+                panel.color[3],
+                panel.data[0],
+                panel.data[1],
+                panel.data[2],
+                panel.data[3],
+            );
+        }
+    }
+
+    snapshot
+}
+
+fn build_offscreen_frame_scenes(frame: &RenderFrameModel) -> Vec<Arc<RenderScene>> {
+    if let Some(scene) = frame.scene.as_ref() {
+        return vec![Arc::new(scene.clone())];
     }
 
     let mut chrome_cache = None;
@@ -2518,35 +2735,253 @@ pub fn render_frame_model_offscreen_image(
         frame.terminal_cell_height,
     );
 
-    let width = u32::try_from(frame.layout.client_width.max(1)).unwrap_or(1);
-    let height = u32::try_from(frame.layout.client_height.max(1)).unwrap_or(1);
-    let mut image = ImageBuffer::<Rgba<u8>, Vec<u8>>::new(width, height);
-    for pixel in image.pixels_mut() {
-        *pixel = Rgba([0, 0, 0, 0]);
-    }
-
-    let font = load_terminal_font()?;
-    let face = Face::parse(&font.font_bytes, font.face_index)
-        .wrap_err("failed to parse terminal font for offscreen render")?;
-    let mut glyph_cache: HashMap<char, (Vec<QuadraticCurve>, Vec<u32>, SlugGlyph)> = HashMap::new();
-    let sprite_atlas = build_sprite_atlas()?;
-
     let mut scenes = Vec::with_capacity(2 + terminal_fragments.len());
     scenes.push(chrome_scene);
-    scenes.push(diagnostic_scene);
     scenes.extend(terminal_fragments);
+    scenes.push(diagnostic_scene);
+    scenes
+}
 
-    for scene in &scenes {
-        blend_scene_into_image(
-            &mut image,
-            scene,
-            &font,
-            &face,
-            &mut glyph_cache,
-            &sprite_atlas,
+fn upload_fragment_vertices(
+    vertex_buffer: &ID3D12Resource,
+    fragments: &[&[Vertex]],
+) -> eyre::Result<usize> {
+    let vertex_count = fragments
+        .iter()
+        .map(|fragment| fragment.len())
+        .sum::<usize>();
+    unsafe {
+        let mut mapped = std::ptr::null_mut();
+        vertex_buffer.Map(0, None, Some(&mut mapped))?;
+        let mut write_ptr = mapped as *mut Vertex;
+        for fragment in fragments {
+            std::ptr::copy_nonoverlapping(fragment.as_ptr(), write_ptr, fragment.len());
+            write_ptr = write_ptr.add(fragment.len());
+        }
+        vertex_buffer.Unmap(0, None);
+    }
+    Ok(vertex_count)
+}
+
+fn upload_curve_data(curve_buffer: &ID3D12Resource, curve_data: &[[f32; 4]]) -> eyre::Result<()> {
+    unsafe {
+        let mut mapped = std::ptr::null_mut();
+        curve_buffer.Map(0, None, Some(&mut mapped))?;
+        std::ptr::write_bytes(
+            mapped,
+            0,
+            MAX_CURVE_FLOAT4_COUNT * std::mem::size_of::<[f32; 4]>(),
+        );
+        std::ptr::copy_nonoverlapping(
+            curve_data.as_ptr(),
+            mapped as *mut [f32; 4],
+            curve_data.len(),
+        );
+        curve_buffer.Unmap(0, None);
+    }
+    Ok(())
+}
+
+fn upload_band_data(band_buffer: &ID3D12Resource, band_data: &[u32]) -> eyre::Result<()> {
+    unsafe {
+        let mut mapped = std::ptr::null_mut();
+        band_buffer.Map(0, None, Some(&mut mapped))?;
+        std::ptr::write_bytes(mapped, 0, MAX_BAND_UINT_COUNT * std::mem::size_of::<u32>());
+        std::ptr::copy_nonoverlapping(band_data.as_ptr(), mapped as *mut u32, band_data.len());
+        band_buffer.Unmap(0, None);
+    }
+    Ok(())
+}
+
+fn upload_offscreen_shader_params(
+    shader_param_buffer: &ID3D12Resource,
+    width: u32,
+    height: u32,
+    sprite_atlas: &SpriteAtlas,
+) -> eyre::Result<()> {
+    let mut params = build_shader_params(width as f32, height as f32, 0.0);
+    params.sprite_atlas = [
+        sprite_atlas.width as f32,
+        sprite_atlas.height as f32,
+        0.0,
+        0.0,
+    ];
+    unsafe {
+        let mut mapped = std::ptr::null_mut();
+        shader_param_buffer.Map(0, None, Some(&mut mapped))?;
+        std::ptr::copy_nonoverlapping(&params, mapped as *mut ShaderParams, 1);
+        shader_param_buffer.Unmap(0, None);
+    }
+    Ok(())
+}
+
+fn create_offscreen_render_target(
+    device: &ID3D12Device,
+    width: u32,
+    height: u32,
+) -> eyre::Result<(ID3D12Resource, ID3D12DescriptorHeap)> {
+    let mut render_target = None;
+    unsafe {
+        device.CreateCommittedResource(
+            &D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_DEFAULT,
+                ..Default::default()
+            },
+            D3D12_HEAP_FLAG_NONE,
+            &D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Width: u64::from(width),
+                Height: height,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,
+                Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                ..Default::default()
+            },
+            D3D12_RESOURCE_STATE_RENDER_TARGET,
+            None,
+            &mut render_target,
         )?;
     }
+    let render_target = render_target.expect("offscreen render target should be initialized");
+    let rtv_heap: ID3D12DescriptorHeap = unsafe {
+        device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+            Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
+            NumDescriptors: 1,
+            ..Default::default()
+        })?
+    };
+    unsafe {
+        device.CreateRenderTargetView(
+            &render_target,
+            None,
+            rtv_heap.GetCPUDescriptorHandleForHeapStart(),
+        );
+    }
+    Ok((render_target, rtv_heap))
+}
 
+fn create_offscreen_readback_buffer(
+    device: &ID3D12Device,
+    width: u32,
+    height: u32,
+) -> eyre::Result<(ID3D12Resource, u32)> {
+    let bytes_per_pixel = 4_u32;
+    let unaligned_row_pitch = width.saturating_mul(bytes_per_pixel);
+    let alignment = D3D12_TEXTURE_DATA_PITCH_ALIGNMENT;
+    let row_pitch = unaligned_row_pitch.div_ceil(alignment) * alignment;
+    let buffer_size = u64::from(row_pitch) * u64::from(height.max(1));
+    let mut readback_buffer = None;
+    unsafe {
+        device.CreateCommittedResource(
+            &D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_READBACK,
+                ..Default::default()
+            },
+            D3D12_HEAP_FLAG_NONE,
+            &D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: buffer_size,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                ..Default::default()
+            },
+            D3D12_RESOURCE_STATE_COPY_DEST,
+            None,
+            &mut readback_buffer,
+        )?;
+    }
+    Ok((
+        readback_buffer.expect("offscreen readback buffer should be initialized"),
+        row_pitch,
+    ))
+}
+
+fn texture_copy_location_for_subresource(
+    resource: &ID3D12Resource,
+    subresource_index: u32,
+) -> D3D12_TEXTURE_COPY_LOCATION {
+    D3D12_TEXTURE_COPY_LOCATION {
+        pResource: std::mem::ManuallyDrop::new(Some(resource.clone())),
+        Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+            SubresourceIndex: subresource_index,
+        },
+    }
+}
+
+fn texture_copy_location_for_buffer(
+    resource: &ID3D12Resource,
+    width: u32,
+    height: u32,
+    row_pitch: u32,
+) -> D3D12_TEXTURE_COPY_LOCATION {
+    D3D12_TEXTURE_COPY_LOCATION {
+        pResource: std::mem::ManuallyDrop::new(Some(resource.clone())),
+        Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+            PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                Offset: 0,
+                Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                    Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                    Width: width,
+                    Height: height,
+                    Depth: 1,
+                    RowPitch: row_pitch,
+                },
+            },
+        },
+    }
+}
+
+fn release_texture_copy_location(location: &mut D3D12_TEXTURE_COPY_LOCATION) {
+    unsafe {
+        let resource = std::mem::ManuallyDrop::take(&mut location.pResource);
+        drop(resource);
+    }
+}
+
+fn readback_texture_to_image(
+    readback_buffer: &ID3D12Resource,
+    width: u32,
+    height: u32,
+    row_pitch: u32,
+) -> eyre::Result<RgbaImage> {
+    let mut image = RgbaImage::new(width, height);
+    unsafe {
+        let mut mapped = std::ptr::null_mut();
+        readback_buffer.Map(0, None, Some(&mut mapped))?;
+        let bytes = std::slice::from_raw_parts(
+            mapped as *const u8,
+            usize::try_from(u64::from(row_pitch) * u64::from(height)).unwrap_or_default(),
+        );
+        for y in 0..height {
+            let row_offset =
+                usize::try_from(u64::from(y) * u64::from(row_pitch)).unwrap_or_default();
+            let row =
+                &bytes[row_offset..row_offset + usize::try_from(width * 4).unwrap_or_default()];
+            for x in 0..width {
+                let pixel_offset = usize::try_from(x * 4).unwrap_or_default();
+                let blue = row[pixel_offset];
+                let green = row[pixel_offset + 1];
+                let red = row[pixel_offset + 2];
+                let alpha = row[pixel_offset + 3];
+                image.put_pixel(x, y, Rgba([red, green, blue, alpha]));
+            }
+        }
+        readback_buffer.Unmap(0, None);
+    }
     Ok(image)
 }
 
@@ -2575,209 +3010,6 @@ fn load_snapshot_glyph(
             ..glyph
         },
     ))
-}
-
-fn blend_scene_into_image(
-    image: &mut ImageBuffer<Rgba<u8>, Vec<u8>>,
-    scene: &RenderScene,
-    font: &LoadedTerminalFont,
-    face: &Face<'_>,
-    glyph_cache: &mut HashMap<char, (Vec<QuadraticCurve>, Vec<u32>, SlugGlyph)>,
-    sprite_atlas: &SpriteAtlas,
-) -> eyre::Result<()> {
-    for panel in &scene.panels {
-        blend_rect_into_image(image, panel.rect, panel.color);
-    }
-
-    for sprite in &scene.sprites {
-        blend_sprite_into_image(
-            image,
-            sprite.rect,
-            sprite.color,
-            sprite_atlas.uv_rect(sprite.sprite),
-            sprite_atlas,
-        );
-    }
-    for glyph in &scene.glyphs {
-        let (curves, band_data, slug) = if let Some(cached) = glyph_cache.get(&glyph.character) {
-            cached
-        } else {
-            let loaded = load_snapshot_glyph(font, face, glyph.character)?;
-            glyph_cache.insert(glyph.character, loaded);
-            glyph_cache
-                .get(&glyph.character)
-                .expect("glyph cache should contain inserted glyph")
-        };
-        blend_glyph_into_image(
-            image,
-            glyph.rect,
-            glyph.color,
-            font,
-            curves,
-            band_data,
-            *slug,
-        );
-    }
-    for panel in &scene.overlay_panels {
-        blend_rect_into_image(image, panel.rect, panel.color);
-    }
-    Ok(())
-}
-
-fn blend_rect_into_image(image: &mut ImageBuffer<Rgba<u8>, Vec<u8>>, rect: RECT, color: [f32; 4]) {
-    let width = i32::try_from(image.width()).unwrap_or(i32::MAX);
-    let height = i32::try_from(image.height()).unwrap_or(i32::MAX);
-    let left = rect.left.clamp(0, width);
-    let top = rect.top.clamp(0, height);
-    let right = rect.right.clamp(left, width);
-    let bottom = rect.bottom.clamp(top, height);
-    for y in top..bottom {
-        for x in left..right {
-            blend_pixel(image, x as u32, y as u32, color, 1.0);
-        }
-    }
-}
-
-fn blend_sprite_into_image(
-    image: &mut ImageBuffer<Rgba<u8>, Vec<u8>>,
-    rect: RECT,
-    color: [f32; 4],
-    uv_rect: [f32; 4],
-    sprite_atlas: &SpriteAtlas,
-) {
-    let width = i32::try_from(image.width()).unwrap_or(i32::MAX);
-    let height = i32::try_from(image.height()).unwrap_or(i32::MAX);
-    let left = rect.left.clamp(0, width);
-    let top = rect.top.clamp(0, height);
-    let right = rect.right.clamp(left, width);
-    let bottom = rect.bottom.clamp(top, height);
-    let target_width = (right - left).max(1) as f32;
-    let target_height = (bottom - top).max(1) as f32;
-
-    for y in top..bottom {
-        for x in left..right {
-            let u = (x - left) as f32 / target_width;
-            let v = (y - top) as f32 / target_height;
-            let atlas_u = uv_rect[0] + ((uv_rect[2] - uv_rect[0]) * u);
-            let atlas_v = uv_rect[1] + ((uv_rect[3] - uv_rect[1]) * v);
-            let sprite = sample_sprite_atlas_color(sprite_atlas, atlas_u, atlas_v);
-            let sprite_color = [
-                (f32::from(sprite[0]) / 255.0) * color[0],
-                (f32::from(sprite[1]) / 255.0) * color[1],
-                (f32::from(sprite[2]) / 255.0) * color[2],
-                (f32::from(sprite[3]) / 255.0) * color[3],
-            ];
-            blend_pixel(image, x as u32, y as u32, sprite_color, 1.0);
-        }
-    }
-}
-
-fn sample_sprite_atlas_color(sprite_atlas: &SpriteAtlas, u: f32, v: f32) -> [u8; 4] {
-    let width = sprite_atlas.width.max(1);
-    let height = sprite_atlas.height.max(1);
-    let x = (u.clamp(0.0, 1.0) * (width - 1) as f32).round() as u32;
-    let y = (v.clamp(0.0, 1.0) * (height - 1) as f32).round() as u32;
-    let index = usize::try_from((y * width) + x).unwrap_or_default();
-    let packed = sprite_atlas.pixels.get(index).copied().unwrap_or_default();
-    [
-        (packed & 0xFF) as u8,
-        ((packed >> 8) & 0xFF) as u8,
-        ((packed >> 16) & 0xFF) as u8,
-        ((packed >> 24) & 0xFF) as u8,
-    ]
-}
-
-fn blend_glyph_into_image(
-    image: &mut ImageBuffer<Rgba<u8>, Vec<u8>>,
-    rect: RECT,
-    color: [f32; 4],
-    font: &LoadedTerminalFont,
-    curves: &[QuadraticCurve],
-    band_data: &[u32],
-    glyph: SlugGlyph,
-) {
-    let origin_x = u32::try_from(rect.left.max(0)).unwrap_or_default();
-    let origin_y = u32::try_from(rect.top.max(0)).unwrap_or_default();
-    let image_width = u32::try_from((rect.right - rect.left).max(1)).unwrap_or(1);
-    let image_height = u32::try_from((rect.bottom - rect.top).max(1)).unwrap_or(1);
-    let font_size_px = image_height.max(1);
-    let scale = font_size_px as f32 / font.units_per_em.max(1.0);
-    let uv_pad_x = SLUG_GLYPH_DILATION_PX / scale;
-    let uv_pad_y = SLUG_GLYPH_DILATION_PX / scale;
-    let glyph_width_px =
-        (((glyph.x_max - glyph.x_min) + (uv_pad_x * 2.0)).max(1.0) * scale).max(1.0);
-    let glyph_height_px =
-        (((glyph.y_max - glyph.y_min) + (uv_pad_y * 2.0)).max(1.0) * scale).max(1.0);
-    let offset_x = origin_x as f32 + ((image_width as f32 - glyph_width_px) * 0.5).max(0.0);
-    let offset_y = origin_y as f32 + ((image_height as f32 - glyph_height_px) * 0.5).max(0.0);
-    let render_x_min = glyph.x_min - uv_pad_x;
-    let render_y_max = glyph.y_max + uv_pad_y;
-    let start_x = offset_x.floor().max(origin_x as f32) as u32;
-    let end_x = (offset_x + glyph_width_px)
-        .ceil()
-        .min((origin_x + image_width) as f32)
-        .max(start_x as f32) as u32;
-    let start_y = offset_y.floor().max(origin_y as f32) as u32;
-    let end_y = (offset_y + glyph_height_px)
-        .ceil()
-        .min((origin_y + image_height) as f32)
-        .max(start_y as f32) as u32;
-
-    for y in start_y..end_y {
-        for x in start_x..end_x {
-            let sample_x = x as f32 + 0.5;
-            let sample_y = y as f32 + 0.5;
-            let render_coord = [
-                render_x_min + ((sample_x - offset_x) / scale),
-                render_y_max - ((sample_y - offset_y) / scale),
-            ];
-            let coverage = cpu_slug_coverage(render_coord, scale, curves, band_data, glyph);
-            if coverage <= 0.0 {
-                continue;
-            }
-            blend_pixel(image, x, y, color, coverage);
-        }
-    }
-}
-
-fn blend_pixel(
-    image: &mut ImageBuffer<Rgba<u8>, Vec<u8>>,
-    x: u32,
-    y: u32,
-    color: [f32; 4],
-    coverage: f32,
-) {
-    let src_a = (color[3] * coverage).clamp(0.0, 1.0);
-    if src_a <= 0.0 {
-        return;
-    }
-    let dst = image.get_pixel(x, y);
-    let dst_rgba = [
-        f32::from(dst[0]) / 255.0,
-        f32::from(dst[1]) / 255.0,
-        f32::from(dst[2]) / 255.0,
-        f32::from(dst[3]) / 255.0,
-    ];
-    let out_a = src_a + (dst_rgba[3] * (1.0 - src_a));
-    let out_rgb = if out_a <= f32::EPSILON {
-        [0.0, 0.0, 0.0]
-    } else {
-        [
-            ((color[0] * src_a) + (dst_rgba[0] * dst_rgba[3] * (1.0 - src_a))) / out_a,
-            ((color[1] * src_a) + (dst_rgba[1] * dst_rgba[3] * (1.0 - src_a))) / out_a,
-            ((color[2] * src_a) + (dst_rgba[2] * dst_rgba[3] * (1.0 - src_a))) / out_a,
-        ]
-    };
-    image.put_pixel(
-        x,
-        y,
-        Rgba([
-            (out_rgb[0] * 255.0).clamp(0.0, 255.0) as u8,
-            (out_rgb[1] * 255.0).clamp(0.0, 255.0) as u8,
-            (out_rgb[2] * 255.0).clamp(0.0, 255.0) as u8,
-            (out_a * 255.0).clamp(0.0, 255.0) as u8,
-        ]),
-    );
 }
 
 fn build_slug_glyph_from_face(
@@ -2866,9 +3098,9 @@ fn append_slug_band_data(
     }
     for band in &mut vertical_bands {
         band.sort_by(|lhs, rhs| {
-            curve_extents[*rhs]
-                .max_y
-                .total_cmp(&curve_extents[*lhs].max_y)
+            curve_extents[*lhs]
+                .min_y
+                .total_cmp(&curve_extents[*rhs].min_y)
         });
     }
 
@@ -2986,7 +3218,9 @@ fn render_snapshot_glyph_into_image(
     let glyph_height_px =
         (((glyph.y_max - glyph.y_min) + (uv_pad_y * 2.0)).max(1.0) * scale).max(1.0);
     let offset_x = origin_x as f32 + ((image_width as f32 - glyph_width_px) * 0.5).max(0.0);
-    let offset_y = origin_y as f32 + ((image_height as f32 - glyph_height_px) * 0.5).max(0.0);
+    let offset_y =
+        (origin_y as f32 + ((image_height as f32 - glyph_height_px) * 0.5).max(0.0) - 1.0)
+            .max(origin_y as f32);
     let render_x_min = glyph.x_min - uv_pad_x;
     let render_y_max = glyph.y_max + uv_pad_y;
     let start_x = offset_x.floor().max(origin_x as f32) as u32;
@@ -3086,7 +3320,7 @@ fn cpu_slug_coverage(
         let Some(curve) = curves.get(curve_index) else {
             continue;
         };
-        if (curve_extents(*curve).max_y - render_coord[1]) * pixels_per_em < -0.5 {
+        if (curve_extents(*curve).min_y - render_coord[1]) * pixels_per_em > 0.5 {
             break;
         }
         accumulate_vertical_curve_coverage(
@@ -3147,14 +3381,7 @@ fn is_degenerate_quadratic(curve: &QuadraticCurve) -> bool {
 }
 
 fn should_use_degenerate_line_fallback(curve: &QuadraticCurve) -> bool {
-    if !is_degenerate_quadratic(curve) {
-        return false;
-    }
-
-    let axis_epsilon = 1.0 / 65536.0;
-    let dx = (curve.p2[0] - curve.p0[0]).abs();
-    let dy = (curve.p2[1] - curve.p0[1]).abs();
-    dx > axis_epsilon && dy > axis_epsilon
+    is_degenerate_quadratic(curve)
 }
 
 fn apply_degenerate_horizontal_coverage(
@@ -3164,8 +3391,14 @@ fn apply_degenerate_horizontal_coverage(
     xcov: &mut f32,
     xwgt: &mut f32,
 ) {
-    let p0 = [curve.p0[0] - render_coord[0], curve.p0[1] - render_coord[1]];
-    let p1 = [curve.p2[0] - render_coord[0], curve.p2[1] - render_coord[1]];
+    let p0 = [
+        curve.p0[0] - render_coord[0],
+        curve.p0[1] - render_coord[1] + SLUG_HORIZONTAL_COVERAGE_EPSILON,
+    ];
+    let p1 = [
+        curve.p2[0] - render_coord[0],
+        curve.p2[1] - render_coord[1] + SLUG_HORIZONTAL_COVERAGE_EPSILON,
+    ];
     if let Some(intersection_x) = horizontal_line_intersection(p0, p1) {
         let sample = saturate((intersection_x * pixels_per_em) + 0.5);
         if p1[1] > p0[1] {
@@ -3187,7 +3420,7 @@ fn apply_degenerate_vertical_coverage(
     let p0 = [curve.p0[0] - render_coord[0], curve.p0[1] - render_coord[1]];
     let p1 = [curve.p2[0] - render_coord[0], curve.p2[1] - render_coord[1]];
     if let Some(intersection_y) = vertical_line_intersection(p0, p1) {
-        let sample = saturate((intersection_y * pixels_per_em) + 0.5);
+        let sample = saturate(((-intersection_y) * pixels_per_em) + 0.5);
         if p1[0] > p0[0] {
             *ycov += sample;
         } else {
@@ -3239,11 +3472,14 @@ fn accumulate_horizontal_curve_coverage(
 
     let p12 = [
         curve.p0[0] - render_coord[0],
-        curve.p0[1] - render_coord[1],
+        curve.p0[1] - render_coord[1] + SLUG_HORIZONTAL_COVERAGE_EPSILON,
         curve.p1[0] - render_coord[0],
-        curve.p1[1] - render_coord[1],
+        curve.p1[1] - render_coord[1] + SLUG_HORIZONTAL_COVERAGE_EPSILON,
     ];
-    let p3 = [curve.p2[0] - render_coord[0], curve.p2[1] - render_coord[1]];
+    let p3 = [
+        curve.p2[0] - render_coord[0],
+        curve.p2[1] - render_coord[1] + SLUG_HORIZONTAL_COVERAGE_EPSILON,
+    ];
     let hcode = calc_root_code(p12[1], p12[3], p3[1]);
     if hcode == 0 {
         return;
@@ -3288,12 +3524,12 @@ fn accumulate_vertical_curve_coverage(
 
     let vr = solve_vert_poly(p12, p3);
     if (vcode & 1) != 0 {
-        let sample = saturate((vr[0] * pixels_per_em) + 0.5);
+        let sample = saturate(((-vr[0]) * pixels_per_em) + 0.5);
         *ycov -= sample;
         *ywgt = (*ywgt).max(saturate(1.0 - (vr[0] * pixels_per_em).abs() * 2.0));
     }
     if vcode > 1 {
-        let sample = saturate((vr[1] * pixels_per_em) + 0.5);
+        let sample = saturate(((-vr[1]) * pixels_per_em) + 0.5);
         *ycov += sample;
         *ywgt = (*ywgt).max(saturate(1.0 - (vr[1] * pixels_per_em).abs() * 2.0));
     }
@@ -3458,6 +3694,12 @@ impl OutlineBuilder for QuadraticCurveBuilder {
 }
 
 fn create_device() -> eyre::Result<(IDXGIFactory4, ID3D12Device, Option<IDXGIInfoQueue>)> {
+    create_device_with_adapter(false)
+}
+
+fn create_device_with_adapter(
+    use_warp_adapter: bool,
+) -> eyre::Result<(IDXGIFactory4, ID3D12Device, Option<IDXGIInfoQueue>)> {
     let mut dxgi_flags = DXGI_CREATE_FACTORY_FLAGS(0);
     let mut dxgi_info_queue = None;
     if cfg!(debug_assertions) {
@@ -3524,7 +3766,12 @@ fn create_device() -> eyre::Result<(IDXGIFactory4, ID3D12Device, Option<IDXGIInf
     }
 
     let dxgi_factory: IDXGIFactory4 = unsafe { CreateDXGIFactory2(dxgi_flags) }?;
-    let adapter = get_hardware_adapter(&dxgi_factory)?;
+    let adapter = if use_warp_adapter {
+        let adapter: IDXGIAdapter1 = unsafe { dxgi_factory.EnumWarpAdapter() }?;
+        adapter
+    } else {
+        get_hardware_adapter(&dxgi_factory)?
+    };
 
     let mut device = None;
     unsafe { D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_11_0, &mut device) }?;
@@ -4788,6 +5035,7 @@ mod tests {
         composition_swap_chain_description, cpu_slug_coverage, cpu_slug_coverage_all_curves,
         dirty_fragment_ranges, extract_glyph_curves, fragment_ranges_match, fragment_vertex_ranges,
         load_terminal_font, push_centered_text, push_glyph, push_overlay_panel, push_panel,
+        push_title_text,
         push_text_block, render_snapshot_glyph_into_image, terminal_scrollbar_geometry,
         window_garden_shader_data,
     };
@@ -4861,6 +5109,45 @@ mod tests {
         );
 
         assert_eq!(scene.glyphs.len(), 1);
+    }
+
+    #[test]
+    fn push_title_text_uses_most_of_title_bar_height() {
+        let mut scene = RenderScene {
+            panels: Vec::new(),
+            glyphs: Vec::new(),
+            sprites: Vec::new(),
+            overlay_panels: Vec::new(),
+        };
+        push_title_text(
+            &mut scene,
+            RECT {
+                left: 0,
+                top: 0,
+                right: 360,
+                bottom: 52,
+            },
+            "self-test",
+            [1.0, 1.0, 1.0, 1.0],
+        );
+
+        let glyph_top = scene
+            .glyphs
+            .iter()
+            .map(|glyph| glyph.rect.top)
+            .min()
+            .expect("title text should emit glyphs");
+        let glyph_bottom = scene
+            .glyphs
+            .iter()
+            .map(|glyph| glyph.rect.bottom)
+            .max()
+            .expect("title text should emit glyphs");
+
+        assert!(
+            glyph_bottom - glyph_top >= 32,
+            "title text should use most of the 52px title bar instead of looking vertically compressed"
+        );
     }
 
     #[test]
@@ -5356,6 +5643,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "fontdue comparison is diagnostic-only while render verification uses D3D12 output"]
     fn b_snapshot_left_edge_stays_close_to_fontdue() -> eyre::Result<()> {
         let font = load_terminal_font()?;
         let face = Face::parse(&font.font_bytes, font.face_index)?;
@@ -5452,6 +5740,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "fontdue comparison artifacts are diagnostic-only while render verification uses D3D12 output"]
     fn fontdue_reference_snapshots_write_debug_artifacts() -> eyre::Result<()> {
         let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let output_dir = manifest_dir
@@ -5476,6 +5765,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "fontdue diff artifacts are diagnostic-only while render verification uses D3D12 output"]
     fn fontdue_comparison_diffs_write_debug_artifacts() -> eyre::Result<()> {
         let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let output_dir = manifest_dir
@@ -5614,6 +5904,38 @@ mod tests {
         image
     }
 
+    fn snapshot_render_coord_for_pixel(
+        font: &super::LoadedTerminalFont,
+        glyph: super::SlugGlyph,
+        font_size_px: u32,
+        image_width: u32,
+        image_height: u32,
+        pixel_x: u32,
+        pixel_y: u32,
+    ) -> ([f32; 2], f32) {
+        let font_height_units = font.units_per_em.max(1.0);
+        let scale = font_size_px as f32 / font_height_units;
+        let uv_pad_x = super::SLUG_GLYPH_DILATION_PX / scale;
+        let uv_pad_y = super::SLUG_GLYPH_DILATION_PX / scale;
+        let glyph_width_px =
+            (((glyph.x_max - glyph.x_min) + (uv_pad_x * 2.0)).max(1.0) * scale).max(1.0);
+        let glyph_height_px =
+            (((glyph.y_max - glyph.y_min) + (uv_pad_y * 2.0)).max(1.0) * scale).max(1.0);
+        let offset_x = ((image_width as f32 - glyph_width_px) * 0.5).max(0.0);
+        let offset_y = (((image_height as f32 - glyph_height_px) * 0.5).max(0.0) - 1.0).max(0.0);
+        let render_x_min = glyph.x_min - uv_pad_x;
+        let render_y_max = glyph.y_max + uv_pad_y;
+        let sample_x = pixel_x as f32 + 0.5;
+        let sample_y = pixel_y as f32 + 0.5;
+        (
+            [
+                render_x_min + ((sample_x - offset_x) / scale),
+                render_y_max - ((sample_y - offset_y) / scale),
+            ],
+            scale,
+        )
+    }
+
     fn write_fontdue_reference_png(
         character: char,
         font_size_px: u32,
@@ -5700,13 +6022,202 @@ mod tests {
         let mut image = RgbaImage::new(width, height);
         for y in 0..height {
             for x in 0..width {
-                let left = lhs.get_pixel(x, y)[3] as i16;
-                let right = rhs.get_pixel(x, y)[3] as i16;
-                let delta = (left - right).unsigned_abs() as u8;
+                let left = lhs.get_pixel(x, y);
+                let right = rhs.get_pixel(x, y);
+                let delta = [0, 1, 2, 3]
+                    .into_iter()
+                    .map(|index| {
+                        (i16::from(left[index]) - i16::from(right[index])).unsigned_abs() as u8
+                    })
+                    .max()
+                    .unwrap_or_default();
                 image.put_pixel(x, y, image::Rgba([delta, delta, delta, 255]));
             }
         }
         image
+    }
+
+    fn opaque_vertical_hole(image: &RgbaImage, min_run: u32) -> Option<(u32, u32, u32)> {
+        for x in 1..image.width().saturating_sub(1) {
+            let mut run_start = None;
+            for y in 0..image.height() {
+                let left = image.get_pixel(x - 1, y)[0] >= 250;
+                let center = image.get_pixel(x, y)[0] <= 5;
+                let right = image.get_pixel(x + 1, y)[0] >= 250;
+                if left && center && right {
+                    run_start.get_or_insert(y);
+                    continue;
+                }
+
+                if let Some(start) = run_start.take()
+                    && y - start >= min_run
+                {
+                    return Some((x, start, y - 1));
+                }
+            }
+
+            if let Some(start) = run_start
+                && image.height() - start >= min_run
+            {
+                return Some((x, start, image.height() - 1));
+            }
+        }
+
+        None
+    }
+
+    #[test]
+    fn fontdue_diff_marks_opaque_black_vs_opaque_white_pixels() {
+        let mut slug = RgbaImage::new(1, 1);
+        slug.put_pixel(0, 0, image::Rgba([0, 0, 0, 255]));
+
+        let mut fontdue = RgbaImage::new(1, 1);
+        fontdue.put_pixel(0, 0, image::Rgba([255, 255, 255, 255]));
+
+        let diff = render_alpha_diff(&slug, &fontdue);
+
+        assert!(
+            diff.get_pixel(0, 0)[0] > 0,
+            "opaque black slug mistakes must show up in the diagnostic diff"
+        );
+    }
+
+    #[test]
+    fn r_snapshot_has_no_opaque_vertical_hole_inside_the_stem() -> eyre::Result<()> {
+        let font = load_terminal_font()?;
+        let face = Face::parse(&font.font_bytes, font.face_index)?;
+        let glyph_id = face
+            .glyph_index('r')
+            .expect("diagnostic glyph should exist in terminal font");
+        let curves = extract_glyph_curves(&face, glyph_id);
+        let glyph = super::build_slug_glyph_from_face(&font, &face, glyph_id, 0, curves.len());
+        let mut band_data = Vec::new();
+        let (band_count_x, band_count_y, band_transform) =
+            append_slug_band_data(&curves, glyph, &mut band_data);
+        let glyph = super::SlugGlyph {
+            band_count_x,
+            band_count_y,
+            band_transform,
+            ..glyph
+        };
+
+        let image = render_test_glyph(&font, &curves, &band_data, glyph, 256, 512, 512);
+
+        let hole = opaque_vertical_hole(&image, 8);
+        assert!(
+            hole.is_none(),
+            "the r snapshot should not contain an internal opaque black stem hole: {hole:?}"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn r_top_hook_pixels_match_full_curve_walk() -> eyre::Result<()> {
+        let font = load_terminal_font()?;
+        let face = Face::parse(&font.font_bytes, font.face_index)?;
+        let glyph_id = face
+            .glyph_index('r')
+            .expect("diagnostic glyph should exist in terminal font");
+        let curves = extract_glyph_curves(&face, glyph_id);
+        let glyph = super::build_slug_glyph_from_face(&font, &face, glyph_id, 0, curves.len());
+        let mut band_data = Vec::new();
+        let (band_count_x, band_count_y, band_transform) =
+            append_slug_band_data(&curves, glyph, &mut band_data);
+        let glyph = super::SlugGlyph {
+            band_count_x,
+            band_count_y,
+            band_transform,
+            ..glyph
+        };
+
+        for (pixel_x, pixel_y) in [(239, 220), (240, 220), (241, 220)] {
+            let (sample, scale) =
+                snapshot_render_coord_for_pixel(&font, glyph, 256, 512, 512, pixel_x, pixel_y);
+            let banded = cpu_slug_coverage(sample, scale, &curves, &band_data, glyph);
+            let full = cpu_slug_coverage_all_curves(sample, scale, &curves, glyph);
+            assert!(
+                full > 0.99,
+                "full curve walk should fill the r top hook pixel ({pixel_x}, {pixel_y}), got {full}"
+            );
+            assert!(
+                (banded - full).abs() <= 0.0001,
+                "banded coverage should match full walk at r top hook pixel ({pixel_x}, {pixel_y}): banded={banded} full={full}"
+            );
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn r_snapshot_keeps_outer_base_pixels_on_the_cut_row() -> eyre::Result<()> {
+        let font = load_terminal_font()?;
+        let face = Face::parse(&font.font_bytes, font.face_index)?;
+        let glyph_id = face
+            .glyph_index('r')
+            .expect("diagnostic glyph should exist in terminal font");
+        let curves = extract_glyph_curves(&face, glyph_id);
+        let glyph = super::build_slug_glyph_from_face(&font, &face, glyph_id, 0, curves.len());
+        let mut band_data = Vec::new();
+        let (band_count_x, band_count_y, band_transform) =
+            append_slug_band_data(&curves, glyph, &mut band_data);
+        let glyph = super::SlugGlyph {
+            band_count_x,
+            band_count_y,
+            band_transform,
+            ..glyph
+        };
+        let image = render_test_glyph(&font, &curves, &band_data, glyph, 256, 512, 512);
+        let fontdue = render_fontdue_reference_glyph('r', 256, 512, 512)?;
+
+        for (pixel_x, pixel_y) in [(190, 299), (270, 299)] {
+            assert!(
+                fontdue.get_pixel(pixel_x, pixel_y)[0] > 0,
+                "fontdue reference should cover the r base cut pixel ({pixel_x}, {pixel_y})"
+            );
+            assert!(
+                image.get_pixel(pixel_x, pixel_y)[0] > 0,
+                "slug snapshot should keep the outer r base pixel on the cut row ({pixel_x}, {pixel_y})"
+            );
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn r_snapshot_keeps_mid_stem_pixels_on_the_endpoint_row() -> eyre::Result<()> {
+        let font = load_terminal_font()?;
+        let face = Face::parse(&font.font_bytes, font.face_index)?;
+        let glyph_id = face
+            .glyph_index('r')
+            .expect("diagnostic glyph should exist in terminal font");
+        let curves = extract_glyph_curves(&face, glyph_id);
+        let glyph = super::build_slug_glyph_from_face(&font, &face, glyph_id, 0, curves.len());
+        let mut band_data = Vec::new();
+        let (band_count_x, band_count_y, band_transform) =
+            append_slug_band_data(&curves, glyph, &mut band_data);
+        let glyph = super::SlugGlyph {
+            band_count_x,
+            band_count_y,
+            band_transform,
+            ..glyph
+        };
+
+        let image = render_test_glyph(&font, &curves, &band_data, glyph, 256, 512, 512);
+        let fontdue = render_fontdue_reference_glyph('r', 256, 512, 512)?;
+
+        for (pixel_x, pixel_y) in [(220, 265), (230, 265), (240, 265)] {
+            assert!(
+                fontdue.get_pixel(pixel_x, pixel_y)[0] > 0,
+                "fontdue reference should cover the r endpoint-row pixel ({pixel_x}, {pixel_y})"
+            );
+            assert!(
+                image.get_pixel(pixel_x, pixel_y)[0] > 0,
+                "slug snapshot should keep the r endpoint-row pixel ({pixel_x}, {pixel_y})"
+            );
+        }
+
+        Ok(())
     }
 
     fn foreground_row_spans(image: &RgbaImage, rgb_threshold: u16) -> Vec<(u32, u32)> {

@@ -4,8 +4,8 @@ use super::cell_grid;
 use super::spatial::{ClientPoint, ClientRect};
 use super::windows_d3d12_renderer::{
     ButtonVisualState, PanelEffect, RenderScene, SpriteId, WindowChromeButtonsState,
-    push_centered_text, push_panel, push_panel_with_data, push_sprite, push_window_chrome_buttons,
-    push_window_garden_frame,
+    push_centered_text, push_panel, push_panel_with_data, push_sprite, push_title_text,
+    push_window_chrome_buttons, push_window_garden_frame,
 };
 use super::windows_terminal::TerminalLayout;
 
@@ -378,7 +378,7 @@ fn build_scene_shell(
         PanelEffect::SceneBody,
     );
     push_window_chrome_buttons(&mut scene, layout, window_chrome_buttons_state);
-    push_centered_text(
+    push_title_text(
         &mut scene,
         layout.title_text_rect().to_win32_rect(),
         scene_kind.title(),

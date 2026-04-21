@@ -76,6 +76,15 @@ The headless terminal replay self-test must support writing failure artifacts so
 cli[self-test.render-offscreen.artifact-output]
 The headless offscreen render self-test must support writing image artifacts for automated verification and debugging.
 
+cli[self-test.render-offscreen.fixture-flag]
+The headless offscreen render self-test must support selecting a named built-in render fixture.
+
+cli[self-test.render-offscreen.list-fixtures-flag]
+The headless offscreen render self-test must support listing the available built-in render fixtures without executing one.
+
+cli[self-test.render-offscreen.update-expected-flag]
+The headless offscreen render self-test must support updating the expected image used for deterministic render verification.
+
 ## Shell Defaults
 
 cli[shell.default.persisted-in-app-home]

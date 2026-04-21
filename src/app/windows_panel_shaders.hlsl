@@ -138,18 +138,15 @@ float CalcCoverage(float xcov, float ycov, float xwgt, float ywgt) {
     return saturate(max(abs(xcov * xwgt + ycov * ywgt) / max(xwgt + ywgt, 1.0 / 65536.0), min(abs(xcov), abs(ycov))));
 }
 
+static const float SLUG_HORIZONTAL_COVERAGE_EPSILON = 1.0 / 65536.0;
+
 bool IsDegenerateQuadratic(float4 p12, float2 p3) {
     float2 a = p12.xy - p12.zw * 2.0 + p3;
     return all(abs(a) <= float2(1.0 / 1024.0, 1.0 / 1024.0));
 }
 
 bool ShouldUseDegenerateLineFallback(float4 p12, float2 p3) {
-    if (!IsDegenerateQuadratic(p12, p3)) {
-        return false;
-    }
-
-    float2 delta = abs(p3 - p12.xy);
-    return all(delta > float2(1.0 / 65536.0, 1.0 / 65536.0));
+    return IsDegenerateQuadratic(p12, p3);
 }
 
 bool CrossesZeroHalfOpen(float a, float b) {
@@ -163,6 +160,8 @@ void ApplyDegenerateHorizontalCoverage(
     inout float xcov,
     inout float xwgt
 ) {
+    p0.y += SLUG_HORIZONTAL_COVERAGE_EPSILON;
+    p1.y += SLUG_HORIZONTAL_COVERAGE_EPSILON;
     float dy = p1.y - p0.y;
     if (CrossesZeroHalfOpen(p0.y, p1.y) && abs(dy) > (1.0 / 65536.0)) {
         float t = -p0.y / dy;
@@ -184,7 +183,7 @@ void ApplyDegenerateVerticalCoverage(
     if (CrossesZeroHalfOpen(p0.x, p1.x) && abs(dx) > (1.0 / 65536.0)) {
         float t = -p0.x / dx;
         float yr = (p0.y + (p1.y - p0.y) * t) * pixelsPerEm;
-        float sample = saturate(yr + 0.5);
+        float sample = saturate(-yr + 0.5);
         ycov += (p1.x > p0.x) ? sample : -sample;
         ywgt = max(ywgt, saturate(1.0 - abs(yr) * 2.0));
     }
@@ -224,6 +223,9 @@ float slug_coverage(float2 renderCoord, float bandStartFloat, float4 glyphData, 
         int baseIndex = curveStart + (curveIndex * 2);
         float4 p12 = CurveData[baseIndex] - float4(renderCoord, renderCoord);
         float2 p3 = CurveData[baseIndex + 1].xy - renderCoord;
+        p12.y += SLUG_HORIZONTAL_COVERAGE_EPSILON;
+        p12.w += SLUG_HORIZONTAL_COVERAGE_EPSILON;
+        p3.y += SLUG_HORIZONTAL_COVERAGE_EPSILON;
 
         if (max(max(p12.x, p12.z), p3.x) * pixelsPerEm.x < -0.5) {
             break;
@@ -259,7 +261,7 @@ float slug_coverage(float2 renderCoord, float bandStartFloat, float4 glyphData, 
         float4 p12 = CurveData[baseIndex] - float4(renderCoord, renderCoord);
         float2 p3 = CurveData[baseIndex + 1].xy - renderCoord;
 
-        if (max(max(p12.y, p12.w), p3.y) * pixelsPerEm.y < -0.5) {
+        if (min(min(p12.y, p12.w), p3.y) * pixelsPerEm.y > 0.5) {
             break;
         }
 
@@ -272,11 +274,11 @@ float slug_coverage(float2 renderCoord, float bandStartFloat, float4 glyphData, 
         if (vcode != 0U) {
             float2 vr = SolveVertPoly(p12, p3) * pixelsPerEm.y;
             if ((vcode & 1U) != 0U) {
-                ycov -= saturate(vr.x + 0.5);
+                ycov -= saturate(-vr.x + 0.5);
                 ywgt = max(ywgt, saturate(1.0 - abs(vr.x) * 2.0));
             }
             if (vcode > 1U) {
-                ycov += saturate(vr.y + 0.5);
+                ycov += saturate(-vr.y + 0.5);
                 ywgt = max(ywgt, saturate(1.0 - abs(vr.y) * 2.0));
             }
         }
