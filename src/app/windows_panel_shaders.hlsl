@@ -39,6 +39,10 @@ float PanelTime() {
 
 #include "windows_chrome_shaders.hlsl"
 
+float4 premultiply_alpha(float4 color) {
+    return float4(color.rgb * color.a, color.a);
+}
+
 float2 SlugDilate(float2 position, float2 texcoord, float2 normal, float4 jacobian, out float2 sampleCoord) {
     float2 n = normalize(normal);
     float s = dot(slug_matrix[3].xy, position) + slug_matrix[3].w;
@@ -380,16 +384,16 @@ float4 apply_terminal_scrollbar_thumb(float2 uv, float4 color) {
 float4 PSMain(PsInput input) : SV_TARGET {
     if (input.effect > 11.5 && input.effect < 12.5) {
         float coverage = slug_coverage(input.uv, input.glyph, input.glyphData, input.banding);
-        return float4(input.color.rgb, input.color.a * coverage);
+        return premultiply_alpha(float4(input.color.rgb, input.color.a * coverage));
     }
 
     if (input.effect > 12.5 && input.effect < 13.5) {
         float4 sprite = sample_sprite_atlas(input.uv);
-        return float4(sprite.rgb * input.color.rgb, sprite.a * input.color.a);
+        return premultiply_alpha(float4(sprite.rgb * input.color.rgb, sprite.a * input.color.a));
     }
 
     if (input.effect > 7.5 && input.effect < 9.5) {
-        return input.color;
+        return premultiply_alpha(input.color);
     }
 
     float4 shaded = input.color;
@@ -417,5 +421,5 @@ float4 PSMain(PsInput input) : SV_TARGET {
         shaded = apply_button(input.uv, input.color, input.effect);
     }
 
-    return shaded;
+    return premultiply_alpha(shaded);
 }

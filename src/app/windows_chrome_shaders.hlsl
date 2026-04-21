@@ -1,9 +1,11 @@
 // windowing[impl garden-band.feathered]
 
-static const float GARDEN_RIM_WIDTH_PX = 6.0;
-static const float GARDEN_RING_OFFSET_PX = 10.0;
-static const float GARDEN_RING_WIDTH_PX = 7.5;
-static const float GARDEN_OUTER_FEATHER_PX = 12.0;
+static const float GARDEN_INNER_SOFTEN_PX = 2.5;
+static const float GARDEN_RIM_OUTER_PX = 8.0;
+static const float GARDEN_RING_OFFSET_PX = 11.5;
+static const float GARDEN_RING_WIDTH_PX = 9.5;
+static const float GARDEN_OUTER_FEATHER_PX = 14.0;
+static const float GARDEN_CORNER_SOFTEN_PX = 10.0;
 
 float sdBox(float2 p, float2 b) {
     float2 d = abs(p) - b;
@@ -171,6 +173,17 @@ float inner_rect_signed_distance_px(float2 uv, float4 contentBounds) {
     return signedDistanceUv / uv_per_pixel;
 }
 
+float2 inner_rect_outside_distance_px(float2 uv, float4 contentBounds) {
+    float2 center = (contentBounds.xy + contentBounds.zw) * 0.5;
+    float2 halfExtents = max((contentBounds.zw - contentBounds.xy) * 0.5, 0.001.xx);
+    float2 uv_per_pixel = float2(
+        max(abs(ddx(uv.x)) + abs(ddy(uv.x)), 1.0 / 65536.0),
+        max(abs(ddx(uv.y)) + abs(ddy(uv.y)), 1.0 / 65536.0)
+    );
+    float2 outside_uv = max(abs(uv - center) - halfExtents, 0.0.xx);
+    return outside_uv / uv_per_pixel;
+}
+
 float4 apply_garden_frame(float2 uv, float4 color, float4 contentBounds) {
     float innerDistancePx = inner_rect_signed_distance_px(uv, contentBounds);
     if (innerDistancePx < 0.0) {
@@ -183,17 +196,20 @@ float4 apply_garden_frame(float2 uv, float4 color, float4 contentBounds) {
     float2 flowUv = uv * 7.0 + float2(t * 0.07, -t * 0.05);
     float contour = fbm2d(flowUv + innerDistancePx * 0.03.xx);
     float ribbon = 0.5 + (0.5 * sin((innerDistancePx * 0.26) - (t * 2.1) + (contour * 6.2)));
-    float shimmer = 0.5 + (0.5 * sin(((uv.x + uv.y) * 30.0) + (t * 3.0) + (contour * 4.5)));
-    float rim = 1.0 - smoothstep(0.0, GARDEN_RIM_WIDTH_PX, innerDistancePx);
+    float innerTransition = smoothstep(0.0, GARDEN_INNER_SOFTEN_PX, innerDistancePx);
+    float rim = innerTransition * (1.0 - smoothstep(GARDEN_INNER_SOFTEN_PX, GARDEN_RIM_OUTER_PX, innerDistancePx));
     float halo = exp(-abs(innerDistancePx - GARDEN_RING_OFFSET_PX) / GARDEN_RING_WIDTH_PX);
-    float alpha = saturate((rim * 0.68) + (halo * (0.34 + (0.18 * ribbon))) + (shimmer * 0.05));
-    alpha *= outerFeather * color.a;
+    float2 outsideDistancePx = inner_rect_outside_distance_px(uv, contentBounds);
+    float cornerBlend = smoothstep(0.0, GARDEN_CORNER_SOFTEN_PX, min(outsideDistancePx.x, outsideDistancePx.y));
+    float alpha = saturate((rim * 0.20) + (halo * (0.16 + (0.08 * ribbon))) + (contour * 0.04));
+    alpha *= outerFeather * lerp(1.0, 0.82, cornerBlend) * color.a;
 
-    float3 cool = lerp(color.rgb * float3(0.86, 0.92, 1.04), float3(0.34, 0.72, 1.00), contour);
+    float3 cool = lerp(color.rgb * float3(0.76, 0.84, 0.96), float3(0.34, 0.68, 0.94), contour);
     float3 warm = float3(1.00, 0.61, 0.43);
-    float3 glow = lerp(cool, warm, saturate((halo * 0.55) + (ribbon * 0.12)));
-    glow += float3(0.97, 0.99, 1.00) * (rim * 0.24 + shimmer * 0.04);
-    glow += warm * (halo * 0.14 * ribbon);
+    float3 glow = lerp(cool, warm, saturate((halo * 0.34) + (ribbon * 0.06)));
+    glow += color.rgb * (rim * 0.05);
+    glow += warm * (halo * 0.05 * ribbon);
+    glow *= lerp(1.0, 0.88, cornerBlend);
 
     return float4(glow, alpha);
 }
