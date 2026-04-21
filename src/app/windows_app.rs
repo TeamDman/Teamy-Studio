@@ -40,11 +40,12 @@ use windows::Win32::UI::WindowsAndMessaging::{
     MoveWindow, PostMessageW, PostQuitMessage, RegisterClassExW, SM_CXPADDEDBORDER, SM_CXSCREEN,
     SM_CXSIZEFRAME, SM_CYSCREEN, SM_CYSIZEFRAME, SW_MAXIMIZE, SW_MINIMIZE, SW_RESTORE, SW_SHOW,
     SYSTEM_METRICS_INDEX, SetCursor, SetTimer, SetWindowTextW, ShowWindow, TranslateMessage,
-    WM_CHAR, WM_CLOSE, WM_DESTROY, WM_ENTERSIZEMOVE, WM_ERASEBKGND, WM_EXITSIZEMOVE, WM_KEYDOWN,
-    WM_KEYUP, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
-    WM_NCCALCSIZE, WM_NCHITTEST, WM_NCLBUTTONDOWN, WM_PAINT, WM_RBUTTONUP, WM_SETCURSOR,
-    WM_SETFOCUS, WM_SIZE, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WNDCLASSEXW, WS_EX_APPWINDOW,
-    WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP, WS_THICKFRAME, WS_VISIBLE,
+    WINDOW_EX_STYLE, WINDOW_STYLE, WM_CHAR, WM_CLOSE, WM_DESTROY, WM_ENTERSIZEMOVE, WM_ERASEBKGND,
+    WM_EXITSIZEMOVE, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCALCSIZE, WM_NCHITTEST, WM_NCLBUTTONDOWN, WM_PAINT,
+    WM_RBUTTONUP, WM_SETCURSOR, WM_SETFOCUS, WM_SIZE, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER,
+    WNDCLASSEXW, WS_EX_APPWINDOW, WS_EX_NOREDIRECTIONBITMAP, WS_MAXIMIZEBOX, WS_MINIMIZEBOX,
+    WS_POPUP, WS_THICKFRAME, WS_VISIBLE,
 };
 use windows::core::{BOOL, PCWSTR, w};
 
@@ -1316,10 +1317,10 @@ fn create_window(window_thread: WindowThread, window_title: &str) -> eyre::Resul
     // Safety: all pointers and handles passed to CreateWindowExW are valid for the duration of the call.
     let hwnd = unsafe {
         CreateWindowExW(
-            WS_EX_APPWINDOW,
+            custom_window_ex_style(),
             WINDOW_CLASS_NAME,
             PCWSTR(title.as_ptr()),
-            WS_POPUP | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_VISIBLE,
+            visible_custom_window_style(),
             x,
             y,
             INITIAL_WINDOW_WIDTH,
@@ -1335,6 +1336,18 @@ fn create_window(window_thread: WindowThread, window_title: &str) -> eyre::Resul
     let window = WindowHandle::new(window_thread, hwnd);
     window.set_poll_timer()?;
     Ok(window)
+}
+
+fn custom_window_ex_style() -> WINDOW_EX_STYLE {
+    WS_EX_APPWINDOW | WS_EX_NOREDIRECTIONBITMAP
+}
+
+fn visible_custom_window_style() -> WINDOW_STYLE {
+    base_custom_window_style() | WS_VISIBLE
+}
+
+fn base_custom_window_style() -> WINDOW_STYLE {
+    WS_POPUP | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX
 }
 
 #[instrument(level = "info", skip_all)]
@@ -1367,10 +1380,10 @@ fn create_scene_window(
     // Safety: all pointers and handles passed to CreateWindowExW are valid for the duration of the call.
     let hwnd = unsafe {
         CreateWindowExW(
-            WS_EX_APPWINDOW,
+            custom_window_ex_style(),
             SCENE_WINDOW_CLASS_NAME,
             PCWSTR(title.as_ptr()),
-            WS_POPUP | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_VISIBLE,
+            visible_custom_window_style(),
             x,
             y,
             INITIAL_WINDOW_WIDTH,
@@ -1408,10 +1421,10 @@ fn create_benchmark_window(window_thread: WindowThread) -> eyre::Result<WindowHa
     // Safety: all pointers and handles passed to CreateWindowExW are valid for the duration of the call.
     let hwnd = unsafe {
         CreateWindowExW(
-            WS_EX_APPWINDOW,
+            custom_window_ex_style(),
             BENCHMARK_WINDOW_CLASS_NAME,
             PCWSTR(title.as_ptr()),
-            WS_POPUP | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX,
+            base_custom_window_style(),
             0,
             0,
             INITIAL_WINDOW_WIDTH,
@@ -4921,6 +4934,7 @@ mod tests {
         assert_eq!(clipped.scrollbar.expect("scrollbar preserved").visible, 0,);
     }
 
+    // windowing[verify diagnostics.terminal.bottom-panel-toggle]
     #[test]
     fn build_client_layout_respects_explicit_diagnostic_visibility() {
         let rect = ClientRect::new(0, 0, 800, 600);
@@ -5185,6 +5199,14 @@ mod tests {
     fn timer_render_path_stays_active_only_during_move_size() {
         assert!(!should_render_from_poll_timer(false));
         assert!(should_render_from_poll_timer(true));
+    }
+
+    #[test]
+    fn custom_windows_disable_redirection_bitmap_for_transparent_composition() {
+        assert_eq!(
+            custom_window_ex_style(),
+            WS_EX_APPWINDOW | WS_EX_NOREDIRECTIONBITMAP,
+        );
     }
 
     // behavior[verify window.appearance.terminal.cursor.legible-block]

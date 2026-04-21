@@ -5,6 +5,7 @@ use super::spatial::{ClientPoint, ClientRect};
 use super::windows_d3d12_renderer::{
     ButtonVisualState, PanelEffect, RenderScene, SpriteId, WindowChromeButtonsState,
     push_centered_text, push_panel, push_panel_with_data, push_sprite, push_window_chrome_buttons,
+    push_window_garden_frame,
 };
 use super::windows_terminal::TerminalLayout;
 
@@ -96,6 +97,7 @@ where
 }
 
 #[must_use]
+/// windowing[impl launcher.buttons.large-image-cards]
 pub fn build_scene_render_scene(
     layout: TerminalLayout,
     scene_kind: SceneWindowKind,
@@ -148,6 +150,11 @@ pub fn build_scene_render_scene(
 }
 
 #[must_use]
+// windowing[impl launcher.buttons.terminal]
+// windowing[impl launcher.buttons.storage-placeholder]
+// windowing[impl launcher.buttons.audio-picker]
+// windowing[impl audio-picker.buttons.windows]
+// windowing[impl audio-picker.buttons.file]
 pub fn scene_button_specs(scene_kind: SceneWindowKind) -> &'static [SceneButtonSpec] {
     match scene_kind {
         SceneWindowKind::Launcher => &[
@@ -188,6 +195,7 @@ pub fn scene_button_specs(scene_kind: SceneWindowKind) -> &'static [SceneButtonS
 }
 
 #[must_use]
+/// windowing[impl diagnostics.scene-window.replaces-body]
 pub fn build_scene_diagnostic_render_scene(
     layout: TerminalLayout,
     scene_kind: SceneWindowKind,
@@ -352,10 +360,11 @@ fn build_scene_shell(
 
     push_panel(
         &mut scene,
-        ClientRect::new(0, 0, layout.client_width, layout.client_height).to_win32_rect(),
+        layout.content_frame_rect().to_win32_rect(),
         [0.11, 0.44, 0.94, 0.5],
         PanelEffect::BlueBackground,
     );
+    push_window_garden_frame(&mut scene, layout);
     push_panel(
         &mut scene,
         layout.title_bar_rect().to_win32_rect(),
@@ -407,7 +416,19 @@ fn proximity_to_rect(rect: ClientRect, pointer: ClientPoint) -> f32 {
 
 #[cfg(test)]
 mod tests {
+    use crate::app::windows_d3d12_renderer::window_garden_shader_data;
+
     use super::*;
+
+    fn sample_layout() -> TerminalLayout {
+        TerminalLayout {
+            client_width: 1040,
+            client_height: 680,
+            cell_width: 8,
+            cell_height: 16,
+            diagnostic_panel_visible: true,
+        }
+    }
 
     #[test]
     fn scene_button_layouts_center_buttons_in_the_body() {
@@ -467,5 +488,124 @@ mod tests {
         );
 
         assert_eq!(expired.click_decay, 0.0);
+    }
+
+    // windowing[verify launcher.buttons.terminal]
+    // windowing[verify launcher.buttons.storage-placeholder]
+    // windowing[verify launcher.buttons.audio-picker]
+    #[test]
+    fn launcher_scene_specs_expose_primary_actions() {
+        let specs = scene_button_specs(SceneWindowKind::Launcher);
+
+        assert!(
+            specs
+                .iter()
+                .any(|spec| spec.action == SceneAction::OpenTerminal)
+        );
+        assert!(
+            specs
+                .iter()
+                .any(|spec| spec.action == SceneAction::OpenStorage)
+        );
+        assert!(
+            specs
+                .iter()
+                .any(|spec| spec.action == SceneAction::OpenAudioPicker)
+        );
+    }
+
+    // windowing[verify audio-picker.buttons.windows]
+    // windowing[verify audio-picker.buttons.file]
+    #[test]
+    fn audio_picker_scene_specs_expose_audio_sources() {
+        let specs = scene_button_specs(SceneWindowKind::AudioPicker);
+
+        assert!(
+            specs
+                .iter()
+                .any(|spec| spec.action == SceneAction::SelectWindowsBell)
+        );
+        assert!(
+            specs
+                .iter()
+                .any(|spec| spec.action == SceneAction::SelectFileBell)
+        );
+    }
+
+    // windowing[verify launcher.buttons.large-image-cards]
+    #[test]
+    fn launcher_scene_uses_card_panels_for_primary_actions() {
+        let scene = build_scene_render_scene(
+            sample_layout(),
+            SceneWindowKind::Launcher,
+            WindowChromeButtonsState::default(),
+            &[],
+        );
+        let card_count = scene
+            .panels
+            .iter()
+            .filter(|panel| matches!(panel.effect, PanelEffect::SceneButtonCard))
+            .count();
+
+        assert_eq!(card_count, 3);
+        assert_eq!(scene.sprites.len(), 3);
+    }
+
+    // windowing[verify garden-band.shared]
+    #[test]
+    fn scene_shell_uses_shared_garden_frame_surface() {
+        let layout = sample_layout();
+        let scene = build_scene_shell(
+            layout,
+            SceneWindowKind::Launcher,
+            WindowChromeButtonsState::default(),
+        );
+        let garden_panel = scene
+            .panels
+            .iter()
+            .find(|panel| matches!(panel.effect, PanelEffect::GardenFrame))
+            .expect("scene shell should include a garden frame panel");
+
+        assert_eq!(garden_panel.rect, layout.full_client_rect().to_win32_rect());
+        assert_eq!(garden_panel.data, window_garden_shader_data(layout));
+    }
+
+    #[test]
+    fn scene_shell_limits_blue_background_to_content_frame() {
+        let layout = sample_layout();
+        let scene = build_scene_shell(
+            layout,
+            SceneWindowKind::Launcher,
+            WindowChromeButtonsState::default(),
+        );
+        let blue_panel = scene
+            .panels
+            .iter()
+            .find(|panel| matches!(panel.effect, PanelEffect::BlueBackground))
+            .expect("scene shell should include a blue background panel");
+
+        assert_eq!(blue_panel.rect, layout.content_frame_rect().to_win32_rect());
+    }
+
+    // windowing[verify diagnostics.scene-window.replaces-body]
+    #[test]
+    fn scene_diagnostic_render_scene_replaces_cards_with_text_grid_body() {
+        let scene = build_scene_diagnostic_render_scene(
+            sample_layout(),
+            SceneWindowKind::Launcher,
+            WindowChromeButtonsState::default(),
+            "launcher diagnostic text",
+            None,
+            8,
+            16,
+        );
+        let card_count = scene
+            .panels
+            .iter()
+            .filter(|panel| matches!(panel.effect, PanelEffect::SceneButtonCard))
+            .count();
+
+        assert_eq!(card_count, 0);
+        assert!(!scene.glyphs.is_empty());
     }
 }

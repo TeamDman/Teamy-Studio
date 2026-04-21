@@ -21,6 +21,8 @@
     clippy::wildcard_imports
 )]
 use std::collections::{BTreeSet, HashMap};
+use std::ffi::{CStr, c_void};
+use std::fs;
 use std::ops::Range;
 use std::path::Path;
 use std::path::PathBuf;
@@ -42,9 +44,11 @@ use windows::Win32::Graphics::Direct3D::Fxc::{
     D3DCOMPILE_DEBUG, D3DCOMPILE_SKIP_OPTIMIZATION, D3DCompileFromFile,
 };
 use windows::Win32::Graphics::Direct3D::{
-    D3D_FEATURE_LEVEL_11_0, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST, ID3DBlob,
+    D3D_FEATURE_LEVEL_11_0, D3D_INCLUDE_TYPE, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST, ID3DBlob,
+    ID3DInclude, ID3DInclude_Impl,
 };
 use windows::Win32::Graphics::Direct3D12::*;
+use windows::Win32::Graphics::DirectComposition::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
 use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObjectEx};
@@ -195,6 +199,7 @@ struct CurveExtents {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PanelEffect {
     BlueBackground = 0,
+    GardenFrame = 1,
     TitleBar = 2,
     TerminalPanel = 3,
     DiagnosticPanel = 4,
@@ -278,6 +283,9 @@ pub struct D3d12PanelRenderer {
     _dxgi_factory: IDXGIFactory4,
     dxgi_info_queue: Option<IDXGIInfoQueue>,
     device: ID3D12Device,
+    _dcomp_device: IDCompositionDevice,
+    _dcomp_target: IDCompositionTarget,
+    _dcomp_visual: IDCompositionVisual,
     command_queue: ID3D12CommandQueue,
     swap_chain: IDXGISwapChain3,
     render_targets: [Option<ID3D12Resource>; FRAME_COUNT],
@@ -663,8 +671,10 @@ impl D3d12PanelRenderer {
         let (width, height) =
             info_span!("query_renderer_client_size").in_scope(|| client_size(hwnd))?;
         let swap_chain = info_span!("create_swap_chain", width, height)
-            .in_scope(|| create_swap_chain(&dxgi_factory, &command_queue, hwnd, width, height))?;
+            .in_scope(|| create_swap_chain(&dxgi_factory, &command_queue, width, height))?;
         unsafe { dxgi_factory.MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER)? };
+        let (dcomp_device, dcomp_target, dcomp_visual) = info_span!("attach_swap_chain_to_window")
+            .in_scope(|| attach_swap_chain_to_window(hwnd, &swap_chain))?;
         unsafe { swap_chain.SetMaximumFrameLatency(1)? };
         let frame_latency_waitable_object =
             unsafe { Owned::new(swap_chain.GetFrameLatencyWaitableObject()) };
@@ -718,6 +728,9 @@ impl D3d12PanelRenderer {
             _dxgi_factory: dxgi_factory,
             dxgi_info_queue,
             device,
+            _dcomp_device: dcomp_device,
+            _dcomp_target: dcomp_target,
+            _dcomp_visual: dcomp_visual,
             command_queue,
             swap_chain,
             render_targets: render_targets.map(Some),
@@ -1234,7 +1247,7 @@ impl D3d12PanelRenderer {
         {
             #[cfg(feature = "tracy")]
             let _span = debug_span!("wait_for_frame_sync").entered();
-            self.wait_for_frame_latency()?;
+            self.wait_for_frame_latency();
         }
         let frame_index = unsafe { self.swap_chain.GetCurrentBackBufferIndex() as usize };
         {
@@ -1394,18 +1407,14 @@ impl D3d12PanelRenderer {
         Ok(())
     }
 
-    fn wait_for_frame_latency(&self) -> eyre::Result<()> {
+    fn wait_for_frame_latency(&self) {
         if self.frame_latency_waitable_object.0.is_null() {
-            return Err(eyre::eyre!(
-                "swap chain did not provide a frame latency waitable object"
-            ));
+            return;
         }
 
         unsafe {
             WaitForSingleObjectEx(*self.frame_latency_waitable_object, INFINITE, false);
         }
-
-        Ok(())
     }
 
     #[expect(
@@ -1927,30 +1936,34 @@ fn terminal_cursor_overlay_rects(
 /// behavior[impl window.appearance.chrome]
 /// behavior[impl window.appearance.backgrounds.blue-half-transparent]
 /// behavior[impl window.appearance.code-panel.single-surface]
+/// windowing[impl garden-band.shared]
 pub fn build_panel_scene(
     layout: TerminalLayout,
     window_chrome_buttons_state: WindowChromeButtonsState,
 ) -> RenderScene {
     let blue = [0.11, 0.44, 0.94, 0.5];
+    let garden = [0.78, 0.88, 0.98, 1.0];
     let title_bar = [0.42, 0.18, 0.60, 1.0];
     let terminal_panel = [0.05, 0.06, 0.08, 1.0];
     let diagnostic_panel = [0.84, 0.44, 0.13, 1.0];
     let mut scene = RenderScene {
-        panels: Vec::with_capacity(8),
+        panels: Vec::with_capacity(10),
         glyphs: Vec::with_capacity(2_048),
         sprites: Vec::new(),
         overlay_panels: Vec::with_capacity(16),
     };
     push_panel(
         &mut scene,
-        RECT {
-            left: 0,
-            top: 0,
-            right: layout.client_width,
-            bottom: layout.client_height,
-        },
+        layout.content_frame_rect().to_win32_rect(),
         blue,
         PanelEffect::BlueBackground,
+    );
+    push_panel_with_data(
+        &mut scene,
+        layout.garden_rect().to_win32_rect(),
+        garden,
+        PanelEffect::GardenFrame,
+        window_garden_shader_data(layout),
     );
     push_panel(
         &mut scene,
@@ -1974,6 +1987,35 @@ pub fn build_panel_scene(
     scene
 }
 
+#[must_use]
+fn normalized_rect_within_parent(parent: ClientRect, child: ClientRect) -> [f32; 4] {
+    let width = parent.width().max(1) as f32;
+    let height = parent.height().max(1) as f32;
+    [
+        ((child.left() - parent.left()) as f32 / width).clamp(0.0, 1.0),
+        ((child.top() - parent.top()) as f32 / height).clamp(0.0, 1.0),
+        ((child.right() - parent.left()) as f32 / width).clamp(0.0, 1.0),
+        ((child.bottom() - parent.top()) as f32 / height).clamp(0.0, 1.0),
+    ]
+}
+
+#[must_use]
+pub fn window_garden_shader_data(layout: TerminalLayout) -> [f32; 4] {
+    normalized_rect_within_parent(layout.garden_rect(), layout.content_frame_rect())
+}
+
+/// windowing[impl garden-band.outward]
+pub fn push_window_garden_frame(scene: &mut RenderScene, layout: TerminalLayout) {
+    push_panel_with_data(
+        scene,
+        layout.garden_rect().to_win32_rect(),
+        [0.78, 0.88, 0.98, 1.0],
+        PanelEffect::GardenFrame,
+        window_garden_shader_data(layout),
+    );
+}
+
+/// windowing[impl diagnostics.toggle.shared-titlebar-button]
 pub fn push_window_chrome_buttons(
     scene: &mut RenderScene,
     layout: TerminalLayout,
@@ -3556,11 +3598,18 @@ fn create_closed_command_list(
 fn create_swap_chain(
     factory: &IDXGIFactory4,
     command_queue: &ID3D12CommandQueue,
-    hwnd: HWND,
     width: u32,
     height: u32,
 ) -> eyre::Result<IDXGISwapChain3> {
-    let description = DXGI_SWAP_CHAIN_DESC1 {
+    let factory: IDXGIFactory2 = factory.cast()?;
+    let description = composition_swap_chain_description(width, height);
+    let swap_chain: IDXGISwapChain1 =
+        unsafe { factory.CreateSwapChainForComposition(command_queue, &description, None)? };
+    Ok(swap_chain.cast()?)
+}
+
+fn composition_swap_chain_description(width: u32, height: u32) -> DXGI_SWAP_CHAIN_DESC1 {
+    DXGI_SWAP_CHAIN_DESC1 {
         Width: width,
         Height: height,
         Format: DXGI_FORMAT_B8G8R8A8_UNORM,
@@ -3572,14 +3621,32 @@ fn create_swap_chain(
         BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
         BufferCount: FRAME_COUNT as u32,
         Scaling: DXGI_SCALING_STRETCH,
-        SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
-        AlphaMode: DXGI_ALPHA_MODE_IGNORE,
+        SwapEffect: DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL,
+        AlphaMode: DXGI_ALPHA_MODE_PREMULTIPLIED,
         Flags: DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT.0 as u32,
-    };
+    }
+}
 
-    let swap_chain: IDXGISwapChain1 =
-        unsafe { factory.CreateSwapChainForHwnd(command_queue, hwnd, &description, None, None)? };
-    Ok(swap_chain.cast()?)
+fn attach_swap_chain_to_window(
+    hwnd: HWND,
+    swap_chain: &IDXGISwapChain3,
+) -> eyre::Result<(
+    IDCompositionDevice,
+    IDCompositionTarget,
+    IDCompositionVisual,
+)> {
+    let dcomp_device: IDCompositionDevice =
+        unsafe { DCompositionCreateDevice::<_, IDCompositionDevice>(None::<&IDXGIDevice>) }?;
+    let dcomp_target = unsafe { dcomp_device.CreateTargetForHwnd(hwnd, true) }?;
+    let dcomp_visual = unsafe { dcomp_device.CreateVisual() }?;
+
+    unsafe {
+        dcomp_visual.SetContent(swap_chain)?;
+        dcomp_target.SetRoot(&dcomp_visual)?;
+        dcomp_device.Commit()?;
+    }
+
+    Ok((dcomp_device, dcomp_target, dcomp_visual))
 }
 
 fn client_size(hwnd: HWND) -> eyre::Result<(u32, u32)> {
@@ -3698,19 +3765,8 @@ fn create_pipeline_state(
     };
 
     let shader_path = shader_path();
-    let shader_path_hstring: HSTRING = shader_path.to_string_lossy().as_ref().into();
-    let vertex_shader = compile_shader(
-        &shader_path_hstring,
-        s!("VSMain"),
-        s!("vs_5_0"),
-        compile_flags,
-    )?;
-    let pixel_shader = compile_shader(
-        &shader_path_hstring,
-        s!("PSMain"),
-        s!("ps_5_0"),
-        compile_flags,
-    )?;
+    let vertex_shader = compile_shader(&shader_path, s!("VSMain"), s!("vs_5_0"), compile_flags)?;
+    let pixel_shader = compile_shader(&shader_path, s!("PSMain"), s!("ps_5_0"), compile_flags)?;
 
     let input_layout = [
         D3D12_INPUT_ELEMENT_DESC {
@@ -3841,19 +3897,144 @@ fn create_pipeline_state(
     Ok(unsafe { device.CreateGraphicsPipelineState(&description) }?)
 }
 
+#[derive(Debug)]
+struct IncludedShaderSource {
+    _bytes: Box<[u8]>,
+    path: PathBuf,
+}
+
+#[derive(Debug)]
+struct ShaderIncludeHandler {
+    root_directory: PathBuf,
+    sources: Mutex<HashMap<usize, IncludedShaderSource>>,
+}
+
+impl ShaderIncludeHandler {
+    fn new(root_directory: PathBuf) -> Self {
+        Self {
+            root_directory,
+            sources: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn resolve_parent_directory(&self, parent_data: *const c_void) -> PathBuf {
+        if parent_data.is_null() {
+            return self.root_directory.clone();
+        }
+
+        self.sources
+            .lock()
+            .expect("shader include cache should not be poisoned")
+            .get(&(parent_data as usize))
+            .and_then(|source| source.path.parent().map(Path::to_path_buf))
+            .unwrap_or_else(|| self.root_directory.clone())
+    }
+
+    fn resolve_include_path(&self, file_name: &str, parent_data: *const c_void) -> PathBuf {
+        self.resolve_parent_directory(parent_data).join(file_name)
+    }
+}
+
+impl ID3DInclude_Impl for ShaderIncludeHandler {
+    fn Open(
+        &self,
+        _includetype: D3D_INCLUDE_TYPE,
+        pfilename: &PCSTR,
+        pparentdata: *const c_void,
+        ppdata: *mut *mut c_void,
+        pbytes: *mut u32,
+    ) -> windows::core::Result<()> {
+        if ppdata.is_null() || pbytes.is_null() {
+            return Err(shader_include_error(
+                "shader include output pointers were unexpectedly null",
+            ));
+        }
+
+        let file_name = shader_include_file_name(pfilename)?;
+        let include_path = self.resolve_include_path(file_name, pparentdata);
+        let bytes = fs::read(&include_path).map_err(|error| {
+            shader_include_error(format!(
+                "failed to read shader include `{}`: {error}",
+                include_path.display()
+            ))
+        })?;
+        let byte_len = u32::try_from(bytes.len()).map_err(|_conversion_error| {
+            shader_include_error(format!(
+                "shader include `{}` exceeded the D3D compiler size limit",
+                include_path.display()
+            ))
+        })?;
+        let bytes = bytes.into_boxed_slice();
+        let pointer = bytes.as_ptr() as *mut c_void;
+
+        self.sources
+            .lock()
+            .expect("shader include cache should not be poisoned")
+            .insert(
+                pointer as usize,
+                IncludedShaderSource {
+                    _bytes: bytes,
+                    path: include_path,
+                },
+            );
+
+        unsafe {
+            *ppdata = pointer;
+            *pbytes = byte_len;
+        }
+
+        Ok(())
+    }
+
+    fn Close(&self, pdata: *const c_void) -> windows::core::Result<()> {
+        if pdata.is_null() {
+            return Ok(());
+        }
+
+        self.sources
+            .lock()
+            .expect("shader include cache should not be poisoned")
+            .remove(&(pdata as usize));
+        Ok(())
+    }
+}
+
+fn shader_include_file_name(file_name: &PCSTR) -> windows::core::Result<&str> {
+    if file_name.0.is_null() {
+        return Err(shader_include_error(
+            "shader include file name pointer was unexpectedly null",
+        ));
+    }
+
+    unsafe { CStr::from_ptr(file_name.0 as *const i8) }
+        .to_str()
+        .map_err(|error| shader_include_error(format!("invalid shader include file name: {error}")))
+}
+
+fn shader_include_error(message: impl Into<String>) -> Error {
+    Error::new(E_FAIL, message.into())
+}
+
 fn compile_shader(
-    path: &HSTRING,
+    path: &Path,
     entry_point: PCSTR,
     target: PCSTR,
     flags: u32,
 ) -> eyre::Result<ID3DBlob> {
     let mut shader = None;
     let mut error = None;
+    let path_wide: HSTRING = path.to_string_lossy().as_ref().into();
+    let include_handler = ShaderIncludeHandler::new(
+        path.parent()
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf(),
+    );
+    let include = ID3DInclude::new(&include_handler);
     unsafe {
         D3DCompileFromFile(
-            path,
+            &path_wide,
             None,
-            None,
+            &*include,
             entry_point,
             target,
             flags,
@@ -4604,10 +4785,11 @@ mod tests {
         CachedSceneVertices, FALLBACK_GLYPH, PanelEffect, RenderScene, Vertex,
         WindowChromeButtonsState, append_rect, append_slug_band_data, build_panel_scene,
         build_shader_params, can_reuse_cached_scene_vertices, collect_scene_chars,
-        cpu_slug_coverage, cpu_slug_coverage_all_curves, dirty_fragment_ranges,
-        extract_glyph_curves, fragment_ranges_match, fragment_vertex_ranges, load_terminal_font,
-        push_centered_text, push_glyph, push_overlay_panel, push_panel, push_text_block,
-        render_snapshot_glyph_into_image, terminal_scrollbar_geometry,
+        composition_swap_chain_description, cpu_slug_coverage, cpu_slug_coverage_all_curves,
+        dirty_fragment_ranges, extract_glyph_curves, fragment_ranges_match, fragment_vertex_ranges,
+        load_terminal_font, push_centered_text, push_glyph, push_overlay_panel, push_panel,
+        push_text_block, render_snapshot_glyph_into_image, terminal_scrollbar_geometry,
+        window_garden_shader_data,
     };
     use crate::app::spatial::ClientRect;
     use crate::app::windows_terminal::TerminalDisplayScrollbar;
@@ -4616,6 +4798,10 @@ mod tests {
     use image::RgbaImage;
     use ttf_parser::{Face, OutlineBuilder};
     use windows::Win32::Foundation::RECT;
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_ALPHA_MODE_PREMULTIPLIED;
+    use windows::Win32::Graphics::Dxgi::{
+        DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT, DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL,
+    };
 
     #[test]
     fn push_text_block_emits_visible_glyphs() {
@@ -4640,6 +4826,18 @@ mod tests {
         );
 
         assert_eq!(scene.glyphs.len(), 2);
+    }
+
+    #[test]
+    fn composition_swap_chain_uses_premultiplied_alpha() {
+        let description = composition_swap_chain_description(1280, 720);
+
+        assert_eq!(description.AlphaMode, DXGI_ALPHA_MODE_PREMULTIPLIED);
+        assert_eq!(description.SwapEffect, DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL);
+        assert_eq!(
+            description.Flags,
+            DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT.0 as u32,
+        );
     }
 
     #[test]
@@ -4846,6 +5044,58 @@ mod tests {
             .expect("blue background panel should exist");
 
         assert_eq!(blue_panel.color[3], 0.5);
+    }
+
+    #[test]
+    fn build_panel_scene_limits_blue_background_to_content_frame() {
+        let layout = TerminalLayout {
+            client_width: 1040,
+            client_height: 680,
+            cell_width: 8,
+            cell_height: 16,
+            diagnostic_panel_visible: true,
+        };
+
+        let scene = build_panel_scene(layout, WindowChromeButtonsState::default());
+        let blue_panel = scene
+            .panels
+            .iter()
+            .find(|panel| matches!(panel.effect, PanelEffect::BlueBackground))
+            .expect("blue background panel should exist");
+
+        assert_eq!(blue_panel.rect, layout.content_frame_rect().to_win32_rect());
+    }
+
+    // windowing[verify garden-band.outward]
+    #[test]
+    fn build_panel_scene_emits_a_dedicated_garden_frame_surface() {
+        let layout = TerminalLayout {
+            client_width: 1040,
+            client_height: 680,
+            cell_width: 8,
+            cell_height: 16,
+            diagnostic_panel_visible: true,
+        };
+
+        let scene = build_panel_scene(layout, WindowChromeButtonsState::default());
+        let garden_index = scene
+            .panels
+            .iter()
+            .position(|panel| matches!(panel.effect, PanelEffect::GardenFrame))
+            .expect("garden frame panel should exist");
+        let title_index = scene
+            .panels
+            .iter()
+            .position(|panel| matches!(panel.effect, PanelEffect::TitleBar))
+            .expect("title bar panel should exist");
+        let garden_panel = &scene.panels[garden_index];
+        let expected_shader_data = window_garden_shader_data(layout);
+
+        assert_eq!(garden_panel.rect, layout.full_client_rect().to_win32_rect());
+        assert!(garden_index < title_index);
+        for (actual, expected) in garden_panel.data.iter().zip(expected_shader_data.iter()) {
+            assert!((actual - expected).abs() < 0.0001);
+        }
     }
 
     // behavior[verify window.appearance.chrome]

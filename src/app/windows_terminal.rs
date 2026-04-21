@@ -685,7 +685,7 @@ impl TerminalLayout {
             return false;
         }
 
-        self.frame_rect().height()
+        self.content_frame_rect().height()
             >= DRAG_STRIP_HEIGHT
                 + MIN_TERMINAL_PANEL_HEIGHT
                 + DIAGNOSTIC_PANEL_HEIGHT
@@ -693,18 +693,29 @@ impl TerminalLayout {
     }
 
     #[must_use]
-    pub fn frame_rect(self) -> ClientRect {
-        ClientRect::new(
-            WINDOW_PADDING,
-            WINDOW_PADDING,
-            (self.client_width - WINDOW_PADDING).max(WINDOW_PADDING),
-            (self.client_height - WINDOW_PADDING).max(WINDOW_PADDING),
-        )
+    pub fn full_client_rect(self) -> ClientRect {
+        ClientRect::new(0, 0, self.client_width.max(0), self.client_height.max(0))
+    }
+
+    #[must_use]
+    pub const fn garden_band_thickness() -> i32 {
+        WINDOW_PADDING
+    }
+
+    #[must_use]
+    /// windowing[impl garden-band.shared]
+    pub fn content_frame_rect(self) -> ClientRect {
+        self.full_client_rect().inset(Self::garden_band_thickness())
+    }
+
+    #[must_use]
+    pub fn garden_rect(self) -> ClientRect {
+        self.full_client_rect()
     }
 
     #[must_use]
     pub fn title_bar_rect(self) -> ClientRect {
-        let frame = self.frame_rect();
+        let frame = self.content_frame_rect();
         ClientRect::new(
             frame.left(),
             frame.top(),
@@ -731,8 +742,9 @@ impl TerminalLayout {
     }
 
     #[must_use]
+    /// windowing[impl diagnostics.terminal.bottom-panel-toggle]
     pub fn terminal_panel_rect(self) -> ClientRect {
-        let frame = self.frame_rect();
+        let frame = self.content_frame_rect();
         let panel_top = (self.title_bar_rect().bottom() + PANEL_GAP).min(frame.bottom());
         let panel_bottom = if self.has_room_for_diagnostic_panel() {
             (self.diagnostic_panel_rect().top() - PANEL_GAP).max(panel_top)
@@ -753,8 +765,9 @@ impl TerminalLayout {
     }
 
     #[must_use]
+    /// windowing[impl diagnostics.terminal.bottom-panel-toggle]
     pub fn diagnostic_panel_rect(self) -> ClientRect {
-        let frame = self.frame_rect();
+        let frame = self.content_frame_rect();
         if !self.has_room_for_diagnostic_panel() {
             return ClientRect::new(frame.left(), frame.bottom(), frame.right(), frame.bottom());
         }
@@ -788,6 +801,7 @@ impl TerminalLayout {
     }
 
     #[must_use]
+    /// windowing[impl diagnostics.toggle.shared-titlebar-button]
     pub fn diagnostics_button_rect(self) -> ClientRect {
         self.title_bar_button_rect(3)
     }
@@ -4070,7 +4084,7 @@ mod tests {
         TERMINAL_WORKER_PUMP_TIME_BUDGET, TerminalChromeState, TerminalDisplayCursorStyle,
         TerminalDisplayGlyph, TerminalDisplayRow, TerminalDisplayState, TerminalLayout,
         TerminalProgressState, TerminalSelection, TerminalSelectionMode, TerminalSession,
-        TerminalTextRow, TerminalViewportMetrics, apply_observed_osc_payload,
+        TerminalTextRow, TerminalViewportMetrics, WINDOW_PADDING, apply_observed_osc_payload,
         build_ghostty_display_state, build_teamy_display_state, dirty_terminal_row_indices,
         extract_selected_text, map_cursor_style, map_virtual_key, observe_osc_sequences,
         osc_terminator, parse_osc_9_4_progress, partial_osc_prefix_len,
@@ -4097,6 +4111,8 @@ mod tests {
     use super::GhosttyTerminalEngine;
 
     // behavior[verify window.appearance.code-panel.terminal-alignment]
+    // windowing[verify garden-band.shared]
+    // windowing[verify diagnostics.toggle.shared-titlebar-button]
     #[test]
     fn layout_regions_do_not_overlap_and_leave_terminal_room() {
         let layout = TerminalLayout {
@@ -4107,6 +4123,8 @@ mod tests {
             diagnostic_panel_visible: true,
         };
 
+        let full = layout.full_client_rect();
+        let content = layout.content_frame_rect();
         let title = layout.title_bar_rect();
         let terminal_panel = layout.terminal_panel_rect();
         let diagnostic = layout.diagnostic_panel_rect();
@@ -4117,12 +4135,22 @@ mod tests {
         let terminal = layout.terminal_viewport_rect();
         let scrollbar = layout.terminal_scrollbar_rect();
 
+        assert_eq!(content.left() - full.left(), WINDOW_PADDING);
+        assert_eq!(content.top() - full.top(), WINDOW_PADDING);
+        assert_eq!(full.right() - content.right(), WINDOW_PADDING);
+        assert_eq!(full.bottom() - content.bottom(), WINDOW_PADDING);
         assert!(title.bottom() <= terminal_panel.top());
         assert!(terminal_panel.bottom() <= diagnostic.top());
         assert!(details.left() < minimize.left());
         assert!(minimize.left() < maximize.left());
         assert!(maximize.left() < close.left());
         assert!(close.right() <= title.right());
+        for rect in [title, terminal_panel, diagnostic] {
+            assert!(rect.left() >= content.left());
+            assert!(rect.top() >= content.top());
+            assert!(rect.right() <= content.right());
+            assert!(rect.bottom() <= content.bottom());
+        }
         for button in [details, minimize, maximize, close] {
             assert!(button.top() >= title.top());
             assert!(button.bottom() <= title.bottom());

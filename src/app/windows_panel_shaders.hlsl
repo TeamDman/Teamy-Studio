@@ -33,12 +33,11 @@ cbuffer ParamStruct : register(b0)
     float4 sprite_atlas;
 };
 
-static const float PANEL_BORDER_WIDTH_PX = 14.0;
-static const float PANEL_BORDER_HIGHLIGHT = 0.78;
-
 float PanelTime() {
     return scene_time.x;
 }
+
+#include "windows_chrome_shaders.hlsl"
 
 float2 SlugDilate(float2 position, float2 texcoord, float2 normal, float4 jacobian, out float2 sampleCoord) {
     float2 n = normalize(normal);
@@ -78,120 +77,6 @@ PsInput VSMain(VsInput input) {
     output.glyphData = input.glyphData;
     output.banding = input.banding;
     return output;
-}
-
-float sdBox(float2 p, float2 b) {
-    float2 d = abs(p) - b;
-    return length(max(d, 0.0)) + min(max(d.x, d.y), 0.0);
-}
-
-float cross2d(float2 a, float2 b) {
-    return (a.x * b.y) - (a.y * b.x);
-}
-
-float segment_distance(float2 p, float2 a, float2 b) {
-    float2 pa = p - a;
-    float2 ba = b - a;
-    float h = saturate(dot(pa, ba) / dot(ba, ba));
-    return length(pa - (ba * h));
-}
-
-float triangle_mask(float2 p, float2 a, float2 b, float2 c, float thickness) {
-    float s0 = cross2d(b - a, p - a);
-    float s1 = cross2d(c - b, p - b);
-    float s2 = cross2d(a - c, p - c);
-    bool inside = ((s0 >= 0.0) && (s1 >= 0.0) && (s2 >= 0.0)) || ((s0 <= 0.0) && (s1 <= 0.0) && (s2 <= 0.0));
-    float distance_to_edge = min(segment_distance(p, a, b), min(segment_distance(p, b, c), segment_distance(p, c, a)));
-    return inside ? 1.0 - smoothstep(thickness, thickness + 0.02, distance_to_edge) : 0.0;
-}
-
-float icon_plus(float2 uv) {
-    float2 p = (uv - 0.5) * 2.0;
-    float vertical = sdBox(p, float2(0.12, 0.42));
-    float horizontal = sdBox(p, float2(0.42, 0.12));
-    float distance_field = min(vertical, horizontal);
-    return 1.0 - smoothstep(0.02, 0.08, distance_field);
-}
-
-float icon_stop(float2 uv) {
-    float2 p = (uv - 0.5) * 2.0;
-    float distance_field = sdBox(p, float2(0.34, 0.34));
-    return 1.0 - smoothstep(0.02, 0.08, distance_field);
-}
-
-float icon_play(float2 uv) {
-    float2 p = uv;
-    return triangle_mask(p, float2(0.30, 0.22), float2(0.74, 0.50), float2(0.30, 0.78), 0.015);
-}
-
-float icon_diagnostics(float2 uv) {
-    float2 p = (uv - 0.5) * 2.0;
-    float line1 = sdBox(p - float2(0.0, -0.34), float2(0.48, 0.08));
-    float line2 = sdBox(p, float2(0.48, 0.08));
-    float line3 = sdBox(p - float2(0.0, 0.34), float2(0.48, 0.08));
-    float distance_field = min(line1, min(line2, line3));
-    return 1.0 - smoothstep(0.02, 0.08, distance_field);
-}
-
-float box_fill_mask(float2 uv, float2 center, float2 halfExtents) {
-    float distance_field = sdBox(uv - center, halfExtents);
-    return 1.0 - smoothstep(0.0, 0.02, distance_field);
-}
-
-float box_outline_mask(float2 uv, float2 center, float2 halfExtents, float thickness) {
-    float outer = box_fill_mask(uv, center, halfExtents);
-    float2 innerHalfExtents = max(halfExtents - thickness.xx, 0.01.xx);
-    float inner = box_fill_mask(uv, center, innerHalfExtents);
-    return saturate(outer - inner);
-}
-
-float line_segment_mask(float2 uv, float2 a, float2 b, float thickness) {
-    float distance_field = segment_distance(uv, a, b);
-    return 1.0 - smoothstep(thickness, thickness + 0.02, distance_field);
-}
-
-float icon_minimize(float2 uv) {
-    return box_fill_mask(uv, float2(0.5, 0.64), float2(0.22, 0.04));
-}
-
-float icon_maximize(float2 uv) {
-    return box_outline_mask(uv, float2(0.5, 0.52), float2(0.20, 0.20), 0.05);
-}
-
-float icon_restore(float2 uv) {
-    float2 halfExtents = float2(0.16, 0.16);
-    float2 backCenter = float2(0.44, 0.42);
-    float2 frontCenter = float2(0.58, 0.56);
-    float front = box_outline_mask(uv, frontCenter, halfExtents, 0.045);
-    float frontCover = box_fill_mask(uv, frontCenter, halfExtents + 0.03.xx);
-    float back = box_outline_mask(uv, backCenter, halfExtents, 0.045) * (1.0 - frontCover);
-    return saturate(front + back);
-}
-
-float icon_close(float2 uv) {
-    float line1 = line_segment_mask(uv, float2(0.30, 0.30), float2(0.70, 0.70), 0.045);
-    float line2 = line_segment_mask(uv, float2(0.70, 0.30), float2(0.30, 0.70), 0.045);
-    return max(line1, line2);
-}
-
-float chrome_icon_mask(float2 uv, float effect) {
-    if (effect < 16.5) {
-        return icon_diagnostics(uv);
-    }
-
-    if (effect < 17.5) {
-        return icon_minimize(uv);
-    }
-
-    if (effect < 18.5) {
-        return icon_maximize(uv);
-    }
-
-    if (effect < 19.5) {
-        return icon_restore(uv);
-    }
-
-    return icon_close(uv);
 }
 
 float4 unpack_rgba8(uint packed) {
@@ -396,16 +281,6 @@ float slug_coverage(float2 renderCoord, float bandStartFloat, float4 glyphData, 
     return CalcCoverage(xcov, ycov, xwgt, ywgt);
 }
 
-float border_mask(float2 uv) {
-    float uv_per_pixel_x = max(abs(ddx(uv.x)) + abs(ddy(uv.x)), 1.0 / 65536.0);
-    float uv_per_pixel_y = max(abs(ddx(uv.y)) + abs(ddy(uv.y)), 1.0 / 65536.0);
-    float edge_px = min(
-        min(uv.x / uv_per_pixel_x, (1.0 - uv.x) / uv_per_pixel_x),
-        min(uv.y / uv_per_pixel_y, (1.0 - uv.y) / uv_per_pixel_y)
-    );
-    return smoothstep(0.0, PANEL_BORDER_WIDTH_PX, edge_px);
-}
-
 float4 apply_blue_background(float2 uv, float4 color) {
     float t = PanelTime();
     float drift = sin((uv.x * 6.5) + (uv.y * 4.2) - (t * 0.45));
@@ -413,14 +288,6 @@ float4 apply_blue_background(float2 uv, float4 color) {
     float horizon = smoothstep(0.08, 0.96, uv.y);
     float glow = 0.9 + (0.12 * drift * horizon) + (0.05 * ripple);
     return float4(color.rgb * glow, 0.5);
-}
-
-float4 apply_sidecar(float2 uv, float4 color) {
-    float t = PanelTime();
-    float bands = 0.9 + (0.06 * sin((uv.y * 34.0) - (t * 0.7)));
-    float embers = 0.96 + (0.05 * sin((uv.x * 5.0) + (uv.y * 11.0) + (t * 0.45)));
-    bands *= embers;
-    return float4(color.rgb * bands, color.a);
 }
 
 float4 apply_drag(float2 uv, float4 color) {
@@ -476,25 +343,6 @@ float4 apply_scene_button_card(float2 uv, float4 color, float4 state) {
     float3 tint = color.rgb * lerp(float3(0.86, 0.90, 0.96), float3(1.04, 1.05, 1.08), hover + (click * 0.35));
     float top_glow = rim * (0.08 + (0.12 * hover) + (0.10 * click));
     return float4(tint * (intensity + top_glow), color.a);
-}
-
-float4 apply_window_chrome_button(float2 uv, float4 color, float4 state, float effect) {
-    float t = PanelTime();
-    float near = state.x;
-    float hover = state.y;
-    float pressed = state.z;
-    float click = state.w;
-    float center = 1.0 - smoothstep(0.0, 0.80, distance(uv, float2(0.5, 0.46)));
-    float rim = 1.0 - smoothstep(0.18, 0.5, abs(uv.y - 0.08));
-    float sheen = 0.5 + (0.5 * sin((uv.x * 10.0) + (uv.y * 8.0) - (t * (0.7 + hover))));
-    float intensity = 0.88 + (near * 0.04) + (hover * 0.08) + (center * (0.06 + (0.05 * hover))) + (click * 0.10) + (sheen * 0.03) - (pressed * 0.08);
-    float3 tint = color.rgb * lerp(float3(0.90, 0.92, 0.98), float3(1.02, 1.04, 1.08), hover + (click * 0.30));
-    float top_glow = rim * (0.04 + (0.08 * hover) + (0.06 * click));
-    float3 shaded = tint * (intensity + top_glow);
-    float iconMask = chrome_icon_mask(uv, effect);
-    float3 iconColor = float3(0.95, 0.96, 0.99) * (0.94 + (0.08 * hover) + (0.06 * click));
-    shaded = lerp(shaded, iconColor, iconMask);
-    return float4(shaded, color.a);
 }
 
 float4 apply_scene_body(float2 uv, float4 color) {
@@ -558,7 +406,7 @@ float4 PSMain(PsInput input) : SV_TARGET {
     } else if (input.effect < 0.5) {
         shaded = apply_blue_background(input.uv, input.color);
     } else if (input.effect < 1.5) {
-        shaded = apply_sidecar(input.uv, input.color);
+        shaded = apply_garden_frame(input.uv, input.color, input.glyphData);
     } else if (input.effect < 2.5) {
         shaded = apply_drag(input.uv, input.color);
     } else if (input.effect < 3.5) {
@@ -569,8 +417,5 @@ float4 PSMain(PsInput input) : SV_TARGET {
         shaded = apply_button(input.uv, input.color, input.effect);
     }
 
-    float mask = border_mask(input.uv);
-    float edge = (1.0 - mask) * PANEL_BORDER_HIGHLIGHT;
-    float3 border = lerp(shaded.rgb, float3(0.95, 0.95, 0.98), edge);
-    return float4(border, shaded.a);
+    return shaded;
 }

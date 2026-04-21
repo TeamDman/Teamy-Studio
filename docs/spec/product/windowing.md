@@ -46,3 +46,14 @@ When diagnostics mode is disabled for a terminal window, the bottom diagnostics 
 
 windowing[diagnostics.text.selection-and-copy]
 Diagnostics text in terminal and non-terminal windows must support mouse selection and clipboard copy.
+
+## Garden Frame
+
+windowing[garden-band.shared]
+Terminal, launcher, and auxiliary picker windows must reserve a shared decorative garden band around the content frame.
+
+windowing[garden-band.outward]
+The custom border treatment must render in the garden band outside the content frame instead of overlapping terminal or scene content.
+
+windowing[garden-band.feathered]
+The garden band's outer edge must feather away instead of ending on a hard opaque border.
