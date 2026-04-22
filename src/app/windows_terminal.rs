@@ -4132,20 +4132,24 @@ mod tests {
         TERMINAL_DISPLAY_PUBLISH_INTERVAL, TERMINAL_OUTPUT_BURST_SLICE_BYTES,
         TERMINAL_OUTPUT_MEDIUM_SLICE_BYTES, TERMINAL_OUTPUT_SLICE_BYTES,
         TERMINAL_WORKER_BURST_PUMP_TIME_BUDGET, TERMINAL_WORKER_MEDIUM_PUMP_TIME_BUDGET,
-        TERMINAL_WORKER_PUMP_TIME_BUDGET, TerminalChromeState, TerminalDisplayCursorStyle,
+        TERMINAL_WORKER_PUMP_TIME_BUDGET, TerminalChromeState,
         TerminalDisplayGlyph, TerminalDisplayRow, TerminalDisplayState, TerminalLayout,
         TerminalProgressState, TerminalSelection, TerminalSelectionMode, TerminalSession,
         TerminalTextRow, TerminalViewportMetrics, WINDOW_PADDING, apply_observed_osc_payload,
-        build_ghostty_display_state, build_teamy_display_state, dirty_terminal_row_indices,
-        extract_selected_text, map_cursor_style, map_virtual_key, observe_osc_sequences,
-        osc_terminator, parse_osc_9_4_progress, partial_osc_prefix_len,
-        pending_output_display_publish_interval, pending_output_pump_time_budget,
-        pending_output_slice_bytes, resolve_teamy_cell_colors, resolve_terminal_cell_colors,
+        build_teamy_display_state, dirty_terminal_row_indices, extract_selected_text,
+        map_virtual_key, observe_osc_sequences, osc_terminator, parse_osc_9_4_progress,
+        partial_osc_prefix_len, pending_output_display_publish_interval,
+        pending_output_pump_time_budget, pending_output_slice_bytes, resolve_teamy_cell_colors,
         should_close_from_echoed_ctrl_d, should_keep_active_prompt_visible_on_resize,
         should_mark_prompt_input_written_for_key, should_publish_terminal_display_state,
         should_publish_terminal_display_update, should_refresh_semantic_prompt_tracking,
         should_translate_ctrl_d_key, should_translate_ctrl_d_to_exit, should_translate_ctrl_l_key,
         should_translate_ctrl_l_to_form_feed, strip_echoed_ctrl_d, viewport_is_bottom_anchored,
+    };
+    #[cfg(feature = "ghostty")]
+    use super::{
+        TerminalDisplayCursorStyle, build_ghostty_display_state, map_cursor_style,
+        resolve_terminal_cell_colors,
     };
     use crate::app::VtEngineChoice;
     use crate::app::spatial::TerminalCellPoint;

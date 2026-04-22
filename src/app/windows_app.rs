@@ -1659,6 +1659,7 @@ fn handle_scene_focus_changed(hwnd: WindowHandle, focused: bool) -> LRESULT {
             render_scene_window_frame(state, hwnd, None, true)?;
         } else {
             hwnd.clear_focused_render_timer();
+            render_scene_window_frame(state, hwnd, None, true)?;
         }
         Ok(())
     }) {
@@ -2080,6 +2081,7 @@ fn handle_focus_changed(hwnd: WindowHandle, focused: bool) -> LRESULT {
             render_current_frame_with_options(state, hwnd, None, true)?;
         } else {
             hwnd.clear_focused_render_timer();
+            render_current_frame_with_options(state, hwnd, None, true)?;
         }
         Ok(())
     }) {
@@ -2446,6 +2448,7 @@ fn terminal_window_chrome_buttons_state(
             false,
         ),
         maximized: hwnd.is_zoomed(),
+        focused: state.window_focused,
     }
 }
 
@@ -2494,6 +2497,7 @@ fn scene_window_chrome_buttons_state(
             false,
         ),
         maximized: hwnd.is_zoomed(),
+        focused: state.window_focused,
     }
 }
 

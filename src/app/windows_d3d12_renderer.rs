@@ -38,6 +38,8 @@ use image::imageops::{FilterType, resize};
 use image::{ImageBuffer, Rgba, RgbaImage};
 #[cfg(feature = "tracy")]
 use tracing::debug_span;
+use windows::core::BOOL;
+use windows::Win32::Graphics::Dwm::DwmGetColorizationColor;
 use tracing::{info, info_span, instrument, warn};
 use ttf_parser::{Face, GlyphId, OutlineBuilder};
 use windows::Win32::Foundation::{E_FAIL, HANDLE, HWND, RECT, TRUE};
@@ -358,6 +360,7 @@ pub struct WindowChromeButtonsState {
     pub maximize_restore: ButtonVisualState,
     pub close: ButtonVisualState,
     pub maximized: bool,
+    pub focused: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -1946,9 +1949,9 @@ pub fn build_panel_scene(
     layout: TerminalLayout,
     window_chrome_buttons_state: WindowChromeButtonsState,
 ) -> RenderScene {
-    let blue = [0.11, 0.44, 0.94, 0.5];
+    let blue = preferred_background_color();
     let garden = [0.78, 0.88, 0.98, 1.0];
-    let title_bar = [0.42, 0.18, 0.60, 1.0];
+    let title_bar = preferred_title_bar_color(window_chrome_buttons_state.focused);
     let terminal_panel = [0.05, 0.06, 0.08, 1.0];
     let diagnostic_panel = [0.84, 0.44, 0.13, 1.0];
     let mut scene = RenderScene {
@@ -1990,6 +1993,47 @@ pub fn build_panel_scene(
     );
     push_window_chrome_buttons(&mut scene, layout, window_chrome_buttons_state);
     scene
+}
+
+#[must_use]
+pub fn preferred_background_color() -> [f32; 4] {
+    preferred_background_color_from_dwm().unwrap_or([0.11, 0.44, 0.94, 0.5])
+}
+
+#[must_use]
+pub fn preferred_title_bar_color(focused: bool) -> [f32; 4] {
+    if focused {
+        preferred_background_color_with_alpha(1.0).unwrap_or([0.11, 0.44, 0.94, 1.0])
+    } else {
+        [43.0 / 255.0, 43.0 / 255.0, 43.0 / 255.0, 1.0]
+    }
+}
+
+fn preferred_background_color_from_dwm() -> Option<[f32; 4]> {
+    preferred_background_color_with_alpha(0.5)
+}
+
+fn preferred_background_color_with_alpha(alpha: f32) -> Option<[f32; 4]> {
+    let mut colorization = 0_u32;
+    let mut opaque_blend = BOOL(0);
+
+    // Safety: DwmGetColorizationColor writes to the provided out parameters.
+    unsafe { DwmGetColorizationColor(&mut colorization, &mut opaque_blend) }.ok()?;
+
+    Some(colorization_color_to_rgba(colorization, alpha))
+}
+
+fn colorization_color_to_rgba(colorization: u32, alpha: f32) -> [f32; 4] {
+    let red = ((colorization >> 16) & 0xFF) as u8;
+    let green = ((colorization >> 8) & 0xFF) as u8;
+    let blue = (colorization & 0xFF) as u8;
+
+    [
+        f32::from(red) / 255.0,
+        f32::from(green) / 255.0,
+        f32::from(blue) / 255.0,
+        alpha,
+    ]
 }
 
 #[must_use]
@@ -5033,10 +5077,11 @@ mod tests {
         WindowChromeButtonsState, append_rect, append_slug_band_data, build_panel_scene,
         build_shader_params, can_reuse_cached_scene_vertices, collect_scene_chars,
         composition_swap_chain_description, cpu_slug_coverage, cpu_slug_coverage_all_curves,
-        dirty_fragment_ranges, extract_glyph_curves, fragment_ranges_match, fragment_vertex_ranges,
-        load_terminal_font, push_centered_text, push_glyph, push_overlay_panel, push_panel,
-        push_text_block, push_title_text, render_snapshot_glyph_into_image,
-        terminal_scrollbar_geometry, window_garden_shader_data,
+        dirty_fragment_ranges, extract_glyph_curves, fragment_ranges_match,
+        fragment_vertex_ranges, load_terminal_font, preferred_title_bar_color,
+        push_centered_text, push_glyph, push_overlay_panel, push_panel, push_text_block,
+        push_title_text, render_snapshot_glyph_into_image, terminal_scrollbar_geometry,
+        window_garden_shader_data,
     };
     use crate::app::spatial::ClientRect;
     use crate::app::windows_terminal::TerminalDisplayScrollbar;
@@ -5403,6 +5448,52 @@ mod tests {
             .count();
 
         assert_eq!(title_panel_count, 1);
+    }
+
+    #[test]
+    fn build_panel_scene_uses_accent_color_for_focused_title_bar() {
+        let layout = TerminalLayout {
+            client_width: 1040,
+            client_height: 680,
+            cell_width: 8,
+            cell_height: 16,
+            diagnostic_panel_visible: true,
+        };
+
+        let scene = build_panel_scene(
+            layout,
+            WindowChromeButtonsState {
+                focused: true,
+                ..WindowChromeButtonsState::default()
+            },
+        );
+        let title_panel = scene
+            .panels
+            .iter()
+            .find(|panel| matches!(panel.effect, PanelEffect::TitleBar))
+            .expect("title bar panel should exist");
+
+        assert_eq!(title_panel.color, preferred_title_bar_color(true));
+    }
+
+    #[test]
+    fn build_panel_scene_uses_unfocused_title_bar_color_when_inactive() {
+        let layout = TerminalLayout {
+            client_width: 1040,
+            client_height: 680,
+            cell_width: 8,
+            cell_height: 16,
+            diagnostic_panel_visible: true,
+        };
+
+        let scene = build_panel_scene(layout, WindowChromeButtonsState::default());
+        let title_panel = scene
+            .panels
+            .iter()
+            .find(|panel| matches!(panel.effect, PanelEffect::TitleBar))
+            .expect("title bar panel should exist");
+
+        assert_eq!(title_panel.color, preferred_title_bar_color(false));
     }
 
     #[test]

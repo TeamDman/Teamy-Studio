@@ -4,8 +4,9 @@ use super::cell_grid;
 use super::spatial::{ClientPoint, ClientRect};
 use super::windows_d3d12_renderer::{
     ButtonVisualState, PanelEffect, RenderScene, SpriteId, WindowChromeButtonsState,
-    push_centered_text, push_panel, push_panel_with_data, push_sprite, push_title_text,
-    push_window_chrome_buttons, push_window_garden_frame,
+    preferred_background_color, preferred_title_bar_color, push_centered_text, push_panel,
+    push_panel_with_data, push_sprite, push_title_text, push_window_chrome_buttons,
+    push_window_garden_frame,
 };
 use super::windows_terminal::TerminalLayout;
 
@@ -372,14 +373,14 @@ fn build_scene_shell(
     push_panel(
         &mut scene,
         layout.content_frame_rect().to_win32_rect(),
-        [0.11, 0.44, 0.94, 0.5],
+        preferred_background_color(),
         PanelEffect::BlueBackground,
     );
     push_window_garden_frame(&mut scene, layout);
     push_panel(
         &mut scene,
         layout.title_bar_rect().to_win32_rect(),
-        [0.42, 0.18, 0.60, 1.0],
+        preferred_title_bar_color(window_chrome_buttons_state.focused),
         PanelEffect::TitleBar,
     );
     push_panel(
