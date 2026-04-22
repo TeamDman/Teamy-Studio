@@ -24,6 +24,7 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
 };
+use windows::Win32::UI::HiDpi::{GetDpiForSystem, GetDpiForWindow};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, VK_ADD, VK_CONTROL, VK_LBUTTON, VK_MENU, VK_OEM_MINUS, VK_OEM_PLUS, VK_SHIFT,
     VK_SUBTRACT,
@@ -40,12 +41,12 @@ use windows::Win32::UI::WindowsAndMessaging::{
     MoveWindow, PostMessageW, PostQuitMessage, RegisterClassExW, SM_CXPADDEDBORDER, SM_CXSCREEN,
     SM_CXSIZEFRAME, SM_CYSCREEN, SM_CYSIZEFRAME, SW_MAXIMIZE, SW_MINIMIZE, SW_RESTORE, SW_SHOW,
     SYSTEM_METRICS_INDEX, SetCursor, SetTimer, SetWindowTextW, ShowWindow, TranslateMessage,
-    WINDOW_EX_STYLE, WINDOW_STYLE, WM_CHAR, WM_CLOSE, WM_DESTROY, WM_ENTERSIZEMOVE, WM_ERASEBKGND,
-    WM_EXITSIZEMOVE, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP,
-    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCALCSIZE, WM_NCHITTEST, WM_NCLBUTTONDOWN, WM_PAINT,
-    WM_RBUTTONUP, WM_SETCURSOR, WM_SETFOCUS, WM_SIZE, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER,
-    WNDCLASSEXW, WS_EX_APPWINDOW, WS_EX_NOREDIRECTIONBITMAP, WS_MAXIMIZEBOX, WS_MINIMIZEBOX,
-    WS_POPUP, WS_THICKFRAME, WS_VISIBLE,
+    WINDOW_EX_STYLE, WINDOW_STYLE, WM_CHAR, WM_CLOSE, WM_DESTROY, WM_DPICHANGED, WM_ENTERSIZEMOVE,
+    WM_ERASEBKGND, WM_EXITSIZEMOVE, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS, WM_LBUTTONDOWN,
+    WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCALCSIZE, WM_NCHITTEST, WM_NCLBUTTONDOWN,
+    WM_PAINT, WM_RBUTTONUP, WM_SETCURSOR, WM_SETFOCUS, WM_SIZE, WM_SYSKEYDOWN, WM_SYSKEYUP,
+    WM_TIMER, WNDCLASSEXW, WS_EX_APPWINDOW, WS_EX_NOREDIRECTIONBITMAP, WS_MAXIMIZEBOX,
+    WS_MINIMIZEBOX, WS_POPUP, WS_THICKFRAME, WS_VISIBLE,
 };
 use windows::core::{BOOL, PCWSTR, w};
 
@@ -104,6 +105,7 @@ const MOUSE_WHEEL_DELTA: i16 = 120;
 const TERMINAL_WHEEL_SCROLL_LINES: isize = 3;
 const SELECTION_AUTO_SCROLL_MAX_LINES: isize = 12;
 const FOCUSED_RENDER_TIMER_ID: usize = 2;
+const USER_DEFAULT_SCREEN_DPI: u32 = 96;
 const TERMINAL_THROUGHPUT_BENCHMARK_START_MARKER: &str = "__TEAMY_TERMINAL_THROUGHPUT_START__";
 const TERMINAL_THROUGHPUT_BENCHMARK_DONE_MARKER: &str = "__TEAMY_TERMINAL_THROUGHPUT_DONE__";
 const TERMINAL_THROUGHPUT_BENCHMARK_MEASURE_PREFIX: &str =
@@ -123,6 +125,7 @@ thread_local! {
 )]
 struct AppState {
     hwnd: Option<WindowHandle>,
+    dpi: u32,
     launch_title: Option<String>,
     terminal_chrome: TerminalChromeState,
     last_applied_window_title: String,
@@ -173,6 +176,7 @@ enum ScenePressedTarget {
 struct SceneAppState {
     app_home: AppHome,
     hwnd: Option<WindowHandle>,
+    dpi: u32,
     scene_kind: SceneWindowKind,
     vt_engine: VtEngineChoice,
     pointer_position: Option<ClientPoint>,
@@ -709,14 +713,15 @@ fn run_with_terminal_session(
 ) -> eyre::Result<()> {
     let _ = launch_command_argc;
     let window_thread = WindowThread::current();
-    let terminal_font_height = TERMINAL_FONT_HEIGHT;
+    let dpi = system_dpi();
+    let terminal_font_height = scaled_font_height(TERMINAL_FONT_HEIGHT, dpi);
     let (terminal_cell_width, terminal_cell_height) = info_span!(
         "measure_terminal_cell_size",
         kind = "terminal",
         font_height = terminal_font_height,
     )
     .in_scope(|| measure_terminal_cell_size(terminal_font_height))?;
-    let diagnostic_font_height = DIAGNOSTIC_FONT_HEIGHT;
+    let diagnostic_font_height = scaled_font_height(DIAGNOSTIC_FONT_HEIGHT, dpi);
     let (diagnostic_cell_width, diagnostic_cell_height) = info_span!(
         "measure_terminal_cell_size",
         kind = "diagnostic",
@@ -728,6 +733,7 @@ fn run_with_terminal_session(
     APP_STATE.with(|state| {
         *state.borrow_mut() = Some(AppState {
             hwnd: None,
+            dpi,
             launch_title: title.map(ToOwned::to_owned),
             terminal_chrome: TerminalChromeState::default(),
             last_applied_window_title: title.unwrap_or(WINDOW_TITLE).to_owned(),
@@ -799,16 +805,18 @@ fn run_scene_window(
     vt_engine: VtEngineChoice,
 ) -> eyre::Result<()> {
     let window_thread = WindowThread::current();
+    let dpi = system_dpi();
     let focused_render_interval_ms = measure_focused_render_interval_ms();
     let (terminal_cell_width, terminal_cell_height) =
-        measure_terminal_cell_size(TERMINAL_FONT_HEIGHT)?;
+        measure_terminal_cell_size(scaled_font_height(TERMINAL_FONT_HEIGHT, dpi))?;
     let (diagnostic_cell_width, diagnostic_cell_height) =
-        measure_terminal_cell_size(DIAGNOSTIC_FONT_HEIGHT)?;
+        measure_terminal_cell_size(scaled_font_height(DIAGNOSTIC_FONT_HEIGHT, dpi))?;
 
     SCENE_APP_STATE.with(|state| {
         *state.borrow_mut() = Some(SceneAppState {
             app_home: app_home.clone(),
             hwnd: None,
+            dpi,
             scene_kind,
             vt_engine,
             pointer_position: None,
@@ -1139,14 +1147,15 @@ fn run_terminal_throughput_self_test_sample(
     plan: TerminalThroughputBenchmarkPlan,
 ) -> eyre::Result<TerminalThroughputBenchmarkSampleResult> {
     let window_thread = WindowThread::current();
-    let terminal_font_height = TERMINAL_FONT_HEIGHT;
+    let dpi = system_dpi();
+    let terminal_font_height = scaled_font_height(TERMINAL_FONT_HEIGHT, dpi);
     let (terminal_cell_width, terminal_cell_height) = info_span!(
         "measure_terminal_cell_size",
         kind = "terminal-benchmark",
         font_height = terminal_font_height,
     )
     .in_scope(|| measure_terminal_cell_size(terminal_font_height))?;
-    let diagnostic_font_height = DIAGNOSTIC_FONT_HEIGHT;
+    let diagnostic_font_height = scaled_font_height(DIAGNOSTIC_FONT_HEIGHT, dpi);
     let (diagnostic_cell_width, diagnostic_cell_height) = info_span!(
         "measure_terminal_cell_size",
         kind = "diagnostic-benchmark",
@@ -1310,8 +1319,10 @@ fn create_window(window_thread: WindowThread, window_title: &str) -> eyre::Resul
 
     let screen_width = system_metric(SM_CXSCREEN);
     let screen_height = system_metric(SM_CYSCREEN);
-    let x = (screen_width - INITIAL_WINDOW_WIDTH) / 2;
-    let y = (screen_height - INITIAL_WINDOW_HEIGHT) / 2;
+    let initial_window_width = scaled_window_dimension(INITIAL_WINDOW_WIDTH, system_dpi());
+    let initial_window_height = scaled_window_dimension(INITIAL_WINDOW_HEIGHT, system_dpi());
+    let x = (screen_width - initial_window_width) / 2;
+    let y = (screen_height - initial_window_height) / 2;
     let title = wide_null_terminated(window_title);
 
     // Safety: all pointers and handles passed to CreateWindowExW are valid for the duration of the call.
@@ -1323,8 +1334,8 @@ fn create_window(window_thread: WindowThread, window_title: &str) -> eyre::Resul
             visible_custom_window_style(),
             x,
             y,
-            INITIAL_WINDOW_WIDTH,
-            INITIAL_WINDOW_HEIGHT,
+            initial_window_width,
+            initial_window_height,
             None,
             None,
             Some(instance.into()),
@@ -1373,8 +1384,10 @@ fn create_scene_window(
 
     let screen_width = system_metric(SM_CXSCREEN);
     let screen_height = system_metric(SM_CYSCREEN);
-    let x = (screen_width - INITIAL_WINDOW_WIDTH) / 2;
-    let y = (screen_height - INITIAL_WINDOW_HEIGHT) / 2;
+    let initial_window_width = scaled_window_dimension(INITIAL_WINDOW_WIDTH, system_dpi());
+    let initial_window_height = scaled_window_dimension(INITIAL_WINDOW_HEIGHT, system_dpi());
+    let x = (screen_width - initial_window_width) / 2;
+    let y = (screen_height - initial_window_height) / 2;
     let title = wide_null_terminated(window_title);
 
     // Safety: all pointers and handles passed to CreateWindowExW are valid for the duration of the call.
@@ -1386,8 +1399,8 @@ fn create_scene_window(
             visible_custom_window_style(),
             x,
             y,
-            INITIAL_WINDOW_WIDTH,
-            INITIAL_WINDOW_HEIGHT,
+            initial_window_width,
+            initial_window_height,
             None,
             None,
             Some(instance.into()),
@@ -1418,6 +1431,8 @@ fn create_benchmark_window(window_thread: WindowThread) -> eyre::Result<WindowHa
     }
 
     let title = wide_null_terminated(WINDOW_TITLE);
+    let initial_window_width = scaled_window_dimension(INITIAL_WINDOW_WIDTH, system_dpi());
+    let initial_window_height = scaled_window_dimension(INITIAL_WINDOW_HEIGHT, system_dpi());
     // Safety: all pointers and handles passed to CreateWindowExW are valid for the duration of the call.
     let hwnd = unsafe {
         CreateWindowExW(
@@ -1427,8 +1442,8 @@ fn create_benchmark_window(window_thread: WindowThread) -> eyre::Result<WindowHa
             base_custom_window_style(),
             0,
             0,
-            INITIAL_WINDOW_WIDTH,
-            INITIAL_WINDOW_HEIGHT,
+            initial_window_width,
+            initial_window_height,
             None,
             None,
             Some(instance.into()),
@@ -1488,6 +1503,7 @@ extern "system" fn window_proc(
         WM_KILLFOCUS => handle_focus_changed(hwnd, false),
         WM_ENTERSIZEMOVE => handle_enter_size_move(hwnd),
         WM_EXITSIZEMOVE => handle_exit_size_move(hwnd),
+        WM_DPICHANGED => handle_dpi_changed(hwnd, lparam),
         WM_SIZE => handle_size(hwnd),
         TERMINAL_WORKER_WAKE_MESSAGE => handle_terminal_worker_wake(hwnd),
         WM_TIMER if wparam.0 == POLL_TIMER_ID => handle_timer(hwnd),
@@ -1539,6 +1555,7 @@ extern "system" fn scene_window_proc(
         WM_KILLFOCUS => handle_scene_focus_changed(hwnd, false),
         WM_ENTERSIZEMOVE => handle_scene_enter_size_move(hwnd),
         WM_EXITSIZEMOVE => handle_scene_exit_size_move(hwnd),
+        WM_DPICHANGED => handle_scene_dpi_changed(hwnd, lparam),
         WM_SIZE => handle_scene_size(hwnd),
         WM_TIMER if wparam.0 == FOCUSED_RENDER_TIMER_ID => handle_scene_focused_render_timer(hwnd),
         WM_LBUTTONDOWN => handle_bool_message(hwnd, message, wparam, lparam, |hwnd| {
@@ -1605,6 +1622,16 @@ fn handle_scene_size(hwnd: WindowHandle) -> LRESULT {
         )?;
         Ok(())
     }) {
+        Ok(()) => LRESULT(0),
+        Err(error) => fail_and_close(hwnd, &error),
+    }
+}
+
+fn handle_scene_dpi_changed(hwnd: WindowHandle, lparam: LPARAM) -> LRESULT {
+    let result = with_scene_app_state(|state| apply_scene_dpi(state, window_dpi(hwnd)))
+        .and_then(|()| apply_suggested_dpi_rect(hwnd, lparam));
+
+    match result {
         Ok(()) => LRESULT(0),
         Err(error) => fail_and_close(hwnd, &error),
     }
@@ -2000,6 +2027,16 @@ fn handle_size(hwnd: WindowHandle) -> LRESULT {
         )?;
         Ok(())
     }) {
+        Ok(()) => LRESULT(0),
+        Err(error) => fail_and_close(hwnd, &error),
+    }
+}
+
+fn handle_dpi_changed(hwnd: WindowHandle, lparam: LPARAM) -> LRESULT {
+    let result = with_app_state(|state| apply_app_dpi(state, window_dpi(hwnd)))
+        .and_then(|()| apply_suggested_dpi_rect(hwnd, lparam));
+
+    match result {
         Ok(()) => LRESULT(0),
         Err(error) => fail_and_close(hwnd, &error),
     }
@@ -2506,6 +2543,7 @@ fn render_scene_window_frame(
             layout,
             state.scene_kind,
             window_chrome_buttons_state,
+            scaled_scene_button_size(state.dpi),
             &scene_button_visual_states(state, layout),
         )
     };
@@ -2544,8 +2582,11 @@ fn scene_button_visual_states(
 ) -> Vec<(SceneAction, ButtonVisualState)> {
     let now = Instant::now();
     let specs = windows_scene::scene_button_specs(state.scene_kind);
-    let button_layouts =
-        windows_scene::layout_scene_buttons(layout.terminal_panel_rect(), specs.len());
+    let button_layouts = windows_scene::layout_scene_buttons(
+        layout.terminal_panel_rect(),
+        specs.len(),
+        scaled_scene_button_size(state.dpi),
+    );
 
     specs
         .iter()
@@ -2610,8 +2651,11 @@ fn scene_action_at_point(
     point: ClientPoint,
 ) -> Option<SceneAction> {
     let specs = windows_scene::scene_button_specs(scene_kind);
-    let button_layouts =
-        windows_scene::layout_scene_buttons(layout.terminal_panel_rect(), specs.len());
+    let button_layouts = windows_scene::layout_scene_buttons(
+        layout.terminal_panel_rect(),
+        specs.len(),
+        scaled_scene_button_size(system_dpi()),
+    );
     specs
         .iter()
         .zip(button_layouts)
@@ -3453,6 +3497,120 @@ fn parse_terminal_throughput_measure_command_ms(screen: &str) -> eyre::Result<f6
     eyre::bail!(
         "terminal throughput benchmark output did not include `{TERMINAL_THROUGHPUT_BENCHMARK_MEASURE_PREFIX}`\n\n=== screen ===\n{screen}"
     )
+}
+
+fn system_dpi() -> u32 {
+    // Safety: querying the system DPI does not require additional preconditions.
+    let dpi = unsafe { GetDpiForSystem() };
+    if dpi == 0 {
+        USER_DEFAULT_SCREEN_DPI
+    } else {
+        dpi
+    }
+}
+
+fn window_dpi(hwnd: WindowHandle) -> u32 {
+    // Safety: the window handle is live while processing its window message.
+    let dpi = unsafe { GetDpiForWindow(hwnd.raw()) };
+    if dpi == 0 { system_dpi() } else { dpi }
+}
+
+fn scaled_font_height(base_font_height: i32, dpi: u32) -> i32 {
+    scale_for_dpi(base_font_height, dpi).clamp(MAX_FONT_HEIGHT, MIN_FONT_HEIGHT)
+}
+
+fn scaled_window_dimension(base_dimension: i32, dpi: u32) -> i32 {
+    scale_for_dpi(base_dimension, dpi).max(1)
+}
+
+fn scaled_scene_button_size(dpi: u32) -> i32 {
+    scaled_window_dimension(windows_scene::DEFAULT_MAX_BUTTON_SIZE, dpi)
+}
+
+fn scale_for_dpi(value: i32, dpi: u32) -> i32 {
+    if dpi == USER_DEFAULT_SCREEN_DPI {
+        return value;
+    }
+
+    let sign = value.signum();
+    let magnitude = i64::from(value.abs());
+    let scaled = ((magnitude * i64::from(dpi)) + i64::from(USER_DEFAULT_SCREEN_DPI / 2))
+        / i64::from(USER_DEFAULT_SCREEN_DPI);
+    let scaled = i32::try_from(scaled).unwrap_or(i32::MAX);
+    sign.saturating_mul(scaled)
+}
+
+fn apply_app_dpi(state: &mut AppState, dpi: u32) -> eyre::Result<()> {
+    if state.dpi == dpi {
+        return Ok(());
+    }
+
+    let terminal_font_height = scaled_font_height(TERMINAL_FONT_HEIGHT, dpi);
+    let (terminal_cell_width, terminal_cell_height) =
+        measure_terminal_cell_size(terminal_font_height)?;
+    let diagnostic_font_height = scaled_font_height(DIAGNOSTIC_FONT_HEIGHT, dpi);
+    let (diagnostic_cell_width, diagnostic_cell_height) =
+        measure_terminal_cell_size(diagnostic_font_height)?;
+
+    state.dpi = dpi;
+    state.terminal_font_height = terminal_font_height;
+    state.terminal_cell_width = terminal_cell_width;
+    state.terminal_cell_height = terminal_cell_height;
+    state.diagnostic_font_height = diagnostic_font_height;
+    state.diagnostic_cell_width = diagnostic_cell_width;
+    state.diagnostic_cell_height = diagnostic_cell_height;
+    Ok(())
+}
+
+fn apply_scene_dpi(state: &mut SceneAppState, dpi: u32) -> eyre::Result<()> {
+    if state.dpi == dpi {
+        return Ok(());
+    }
+
+    let (terminal_cell_width, terminal_cell_height) =
+        measure_terminal_cell_size(scaled_font_height(TERMINAL_FONT_HEIGHT, dpi))?;
+    let (diagnostic_cell_width, diagnostic_cell_height) =
+        measure_terminal_cell_size(scaled_font_height(DIAGNOSTIC_FONT_HEIGHT, dpi))?;
+
+    state.dpi = dpi;
+    state.terminal_cell_width = terminal_cell_width;
+    state.terminal_cell_height = terminal_cell_height;
+    state.diagnostic_cell_width = diagnostic_cell_width;
+    state.diagnostic_cell_height = diagnostic_cell_height;
+    Ok(())
+}
+
+fn apply_suggested_dpi_rect(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Result<()> {
+    let suggested_rect = dpi_changed_suggested_rect(lparam)?;
+    let width = suggested_rect.right - suggested_rect.left;
+    let height = suggested_rect.bottom - suggested_rect.top;
+
+    // Safety: the system-provided suggested bounds come from WM_DPICHANGED for this live top-level window.
+    if unsafe {
+        MoveWindow(
+            hwnd.raw(),
+            suggested_rect.left,
+            suggested_rect.top,
+            width,
+            height,
+            true,
+        )
+    }
+    .is_err()
+    {
+        eyre::bail!("failed to apply WM_DPICHANGED suggested bounds")
+    }
+
+    Ok(())
+}
+
+fn dpi_changed_suggested_rect(lparam: LPARAM) -> eyre::Result<RECT> {
+    if lparam.0 == 0 {
+        eyre::bail!("WM_DPICHANGED did not provide a suggested window rectangle")
+    }
+
+    // Safety: WM_DPICHANGED guarantees that lParam points to a RECT valid for the duration of message processing.
+    Ok(unsafe { *(lparam.0 as *const RECT) })
 }
 
 fn measure_terminal_cell_size(font_height: i32) -> eyre::Result<(i32, i32)> {
@@ -5207,6 +5365,17 @@ mod tests {
             custom_window_ex_style(),
             WS_EX_APPWINDOW | WS_EX_NOREDIRECTIONBITMAP,
         );
+    }
+
+    #[test]
+    fn dpi_scaling_keeps_default_dpi_values_unchanged() {
+        assert_eq!(scale_for_dpi(1040, USER_DEFAULT_SCREEN_DPI), 1040);
+        assert_eq!(scale_for_dpi(-16, USER_DEFAULT_SCREEN_DPI), -16);
+    }
+
+    #[test]
+    fn dpi_scaling_scales_negative_font_heights_by_magnitude() {
+        assert_eq!(scale_for_dpi(-16, 192), -32);
     }
 
     // behavior[verify window.appearance.terminal.cursor.legible-block]

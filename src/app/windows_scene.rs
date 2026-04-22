@@ -9,7 +9,7 @@ use super::windows_d3d12_renderer::{
 };
 use super::windows_terminal::TerminalLayout;
 
-const MAX_BUTTON_SIZE: i32 = 300;
+pub const DEFAULT_MAX_BUTTON_SIZE: i32 = 300;
 const MIN_BUTTON_GAP: i32 = 12;
 const MAX_BUTTON_GAP: i32 = 48;
 const MIN_BUTTON_LABEL_GAP: i32 = 8;
@@ -102,12 +102,14 @@ pub fn build_scene_render_scene(
     layout: TerminalLayout,
     scene_kind: SceneWindowKind,
     window_chrome_buttons_state: WindowChromeButtonsState,
+    max_button_size: i32,
     button_states: &[(SceneAction, ButtonVisualState)],
 ) -> RenderScene {
     let mut scene = build_scene_shell(layout, scene_kind, window_chrome_buttons_state);
 
     let specs = scene_button_specs(scene_kind);
-    let button_layouts = layout_scene_buttons(layout.terminal_panel_rect(), specs.len());
+    let button_layouts =
+        layout_scene_buttons(layout.terminal_panel_rect(), specs.len(), max_button_size);
     for (index, spec) in specs.iter().enumerate() {
         let button_layout = button_layouts[index];
         let visual_state = button_states
@@ -222,12 +224,16 @@ pub fn build_scene_diagnostic_render_scene(
 }
 
 #[must_use]
-pub fn layout_scene_buttons(body_rect: ClientRect, count: usize) -> Vec<SceneButtonLayout> {
+pub fn layout_scene_buttons(
+    body_rect: ClientRect,
+    count: usize,
+    max_button_size: i32,
+) -> Vec<SceneButtonLayout> {
     if count == 0 {
         return Vec::new();
     }
 
-    let metrics = scene_button_grid_metrics(body_rect, count);
+    let metrics = scene_button_grid_metrics(body_rect, count, max_button_size.max(1));
     let columns = metrics.columns;
     let rows = count.div_ceil(columns);
     let columns_i32 = i32::try_from(columns).unwrap_or(1).max(1);
@@ -266,10 +272,14 @@ pub fn layout_scene_buttons(body_rect: ClientRect, count: usize) -> Vec<SceneBut
     layouts
 }
 
-fn scene_button_grid_metrics(body_rect: ClientRect, count: usize) -> SceneButtonGridMetrics {
-    let mut best_metrics = scene_button_grid_candidate(body_rect, count, 1);
+fn scene_button_grid_metrics(
+    body_rect: ClientRect,
+    count: usize,
+    max_button_size: i32,
+) -> SceneButtonGridMetrics {
+    let mut best_metrics = scene_button_grid_candidate(body_rect, count, 1, max_button_size);
     for columns in 2..=count {
-        let candidate = scene_button_grid_candidate(body_rect, count, columns);
+        let candidate = scene_button_grid_candidate(body_rect, count, columns, max_button_size);
         if candidate.button_size > best_metrics.button_size
             || (candidate.button_size == best_metrics.button_size
                 && candidate.columns > best_metrics.columns)
@@ -285,6 +295,7 @@ fn scene_button_grid_candidate(
     body_rect: ClientRect,
     count: usize,
     columns: usize,
+    max_button_size: i32,
 ) -> SceneButtonGridMetrics {
     let rows = count.div_ceil(columns);
     let columns_i32 = i32::try_from(columns).unwrap_or(1).max(1);
@@ -295,7 +306,7 @@ fn scene_button_grid_candidate(
     let height_budget = body_rect.height() - ((rows_i32 - 1).max(0) * button_gap);
     let provisional_button_size = (width_budget / columns_i32)
         .min(height_budget / rows_i32)
-        .clamp(1, MAX_BUTTON_SIZE);
+        .clamp(1, max_button_size);
     let label_gap =
         (provisional_button_size / 18).clamp(MIN_BUTTON_LABEL_GAP, MAX_BUTTON_LABEL_GAP);
     let label_height =
@@ -305,7 +316,7 @@ fn scene_button_grid_candidate(
         - (rows_i32 * (label_gap + label_height));
     let button_size = (width_budget / columns_i32)
         .min(height_budget / rows_i32)
-        .clamp(1, MAX_BUTTON_SIZE);
+        .clamp(1, max_button_size);
 
     SceneButtonGridMetrics {
         columns,
@@ -432,7 +443,8 @@ mod tests {
 
     #[test]
     fn scene_button_layouts_center_buttons_in_the_body() {
-        let layouts = layout_scene_buttons(ClientRect::new(0, 0, 1100, 720), 3);
+        let layouts =
+            layout_scene_buttons(ClientRect::new(0, 0, 1100, 720), 3, DEFAULT_MAX_BUTTON_SIZE);
 
         assert_eq!(layouts.len(), 3);
         assert!(layouts[0].card_rect.left() < layouts[1].card_rect.left());
@@ -442,15 +454,25 @@ mod tests {
     #[test]
     fn scene_button_layouts_shrink_to_fit_small_windows() {
         let body_rect = ClientRect::new(0, 0, 560, 340);
-        let layouts = layout_scene_buttons(body_rect, 3);
+        let layouts = layout_scene_buttons(body_rect, 3, DEFAULT_MAX_BUTTON_SIZE);
 
         assert_eq!(layouts.len(), 3);
-        assert!(layouts[0].card_rect.width() < MAX_BUTTON_SIZE);
+        assert!(layouts[0].card_rect.width() < DEFAULT_MAX_BUTTON_SIZE);
         for layout in layouts {
             assert!(layout.card_rect.left() >= body_rect.left());
             assert!(layout.card_rect.right() <= body_rect.right());
             assert!(layout.label_rect.bottom() <= body_rect.bottom());
         }
+    }
+
+    #[test]
+    fn scene_button_layouts_respect_larger_scaled_maximum_sizes() {
+        let body_rect = ClientRect::new(0, 0, 2200, 1400);
+        let layouts = layout_scene_buttons(body_rect, 3, DEFAULT_MAX_BUTTON_SIZE * 2);
+
+        assert_eq!(layouts.len(), 3);
+        assert!(layouts[0].card_rect.width() > DEFAULT_MAX_BUTTON_SIZE);
+        assert!(layouts[0].card_rect.width() <= DEFAULT_MAX_BUTTON_SIZE * 2);
     }
 
     #[test]
@@ -539,6 +561,7 @@ mod tests {
             sample_layout(),
             SceneWindowKind::Launcher,
             WindowChromeButtonsState::default(),
+            DEFAULT_MAX_BUTTON_SIZE,
             &[],
         );
         let card_count = scene
