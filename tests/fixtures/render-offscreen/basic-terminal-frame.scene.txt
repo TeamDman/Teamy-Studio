@@ -1,8 +1,8 @@
 fragment_count=6
 [fragment 0] panels=9 glyphs=9 sprites=0 overlay_panels=0
-panel 0 effect=BlueBackground rect=18,18,1022,662 color=0.110,0.440,0.940,0.500 data=0.000,0.000,0.000,0.000
+panel 0 effect=BlueBackground rect=18,18,1022,662 color=0.165,0.647,0.408,0.500 data=0.000,0.000,0.000,0.000
 panel 1 effect=GardenFrame rect=0,0,1040,680 color=0.780,0.880,0.980,1.000 data=0.017,0.026,0.983,0.974
-panel 2 effect=TitleBar rect=18,18,1022,70 color=0.420,0.180,0.600,1.000 data=0.000,0.000,0.000,0.000
+panel 2 effect=TitleBar rect=18,18,1022,70 color=0.169,0.169,0.169,1.000 data=0.000,0.000,0.000,0.000
 panel 3 effect=TerminalPanel rect=18,84,1022,496 color=0.050,0.060,0.080,1.000 data=0.000,0.000,0.000,0.000
 panel 4 effect=DiagnosticPanel rect=18,510,1022,662 color=0.840,0.440,0.130,1.000 data=0.000,0.000,0.000,0.000
 panel 5 effect=WindowChromeDiagnostics rect=826,23,868,65 color=0.120,0.130,0.170,1.000 data=0.000,0.000,0.000,0.000

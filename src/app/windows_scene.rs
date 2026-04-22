@@ -51,6 +51,7 @@ pub enum SceneAction {
 pub struct SceneButtonSpec {
     pub action: SceneAction,
     pub label: &'static str,
+    pub tooltip: &'static str,
     pub sprite: SpriteId,
     pub color: [f32; 4],
 }
@@ -164,18 +165,21 @@ pub fn scene_button_specs(scene_kind: SceneWindowKind) -> &'static [SceneButtonS
             SceneButtonSpec {
                 action: SceneAction::OpenTerminal,
                 label: "Terminal",
+                tooltip: "Open terminal",
                 sprite: SpriteId::Terminal,
                 color: [0.18, 0.25, 0.35, 1.0],
             },
             SceneButtonSpec {
                 action: SceneAction::OpenStorage,
                 label: "Storage",
+                tooltip: "Storage is not implemented yet",
                 sprite: SpriteId::Storage,
                 color: [0.30, 0.21, 0.14, 1.0],
             },
             SceneButtonSpec {
                 action: SceneAction::OpenAudioPicker,
                 label: "Audio",
+                tooltip: "Choose audio source",
                 sprite: SpriteId::Audio,
                 color: [0.25, 0.21, 0.11, 1.0],
             },
@@ -184,12 +188,14 @@ pub fn scene_button_specs(scene_kind: SceneWindowKind) -> &'static [SceneButtonS
             SceneButtonSpec {
                 action: SceneAction::SelectWindowsBell,
                 label: "Windows",
+                tooltip: "Use Windows notification sound",
                 sprite: SpriteId::WindowsAudio,
                 color: [0.14, 0.24, 0.35, 1.0],
             },
             SceneButtonSpec {
                 action: SceneAction::SelectFileBell,
                 label: "Pick File",
+                tooltip: "Choose custom audio file",
                 sprite: SpriteId::FileAudio,
                 color: [0.23, 0.19, 0.30, 1.0],
             },

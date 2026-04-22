@@ -38,8 +38,6 @@ use image::imageops::{FilterType, resize};
 use image::{ImageBuffer, Rgba, RgbaImage};
 #[cfg(feature = "tracy")]
 use tracing::debug_span;
-use windows::core::BOOL;
-use windows::Win32::Graphics::Dwm::DwmGetColorizationColor;
 use tracing::{info, info_span, instrument, warn};
 use ttf_parser::{Face, GlyphId, OutlineBuilder};
 use windows::Win32::Foundation::{E_FAIL, HANDLE, HWND, RECT, TRUE};
@@ -52,10 +50,12 @@ use windows::Win32::Graphics::Direct3D::{
 };
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::DirectComposition::*;
+use windows::Win32::Graphics::Dwm::DwmGetColorizationColor;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
 use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObjectEx};
 use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
+use windows::core::BOOL;
 use windows::core::{Error, HSTRING, Interface, Owned, PCSTR, s};
 
 use super::cell_grid;
@@ -1942,7 +1942,9 @@ fn terminal_cursor_overlay_rects(
 }
 
 /// behavior[impl window.appearance.chrome]
-/// behavior[impl window.appearance.backgrounds.blue-half-transparent]
+/// behavior[impl window.appearance.backgrounds.system-accent-half-transparent]
+/// behavior[impl window.appearance.chrome.active-window-accent]
+/// behavior[impl window.appearance.chrome.inactive-window-muted]
 /// behavior[impl window.appearance.code-panel.single-surface]
 /// windowing[impl garden-band.shared]
 pub fn build_panel_scene(
@@ -5077,11 +5079,10 @@ mod tests {
         WindowChromeButtonsState, append_rect, append_slug_band_data, build_panel_scene,
         build_shader_params, can_reuse_cached_scene_vertices, collect_scene_chars,
         composition_swap_chain_description, cpu_slug_coverage, cpu_slug_coverage_all_curves,
-        dirty_fragment_ranges, extract_glyph_curves, fragment_ranges_match,
-        fragment_vertex_ranges, load_terminal_font, preferred_title_bar_color,
-        push_centered_text, push_glyph, push_overlay_panel, push_panel, push_text_block,
-        push_title_text, render_snapshot_glyph_into_image, terminal_scrollbar_geometry,
-        window_garden_shader_data,
+        dirty_fragment_ranges, extract_glyph_curves, fragment_ranges_match, fragment_vertex_ranges,
+        load_terminal_font, preferred_title_bar_color, push_centered_text, push_glyph,
+        push_overlay_panel, push_panel, push_text_block, push_title_text,
+        render_snapshot_glyph_into_image, terminal_scrollbar_geometry, window_garden_shader_data,
     };
     use crate::app::spatial::ClientRect;
     use crate::app::windows_terminal::TerminalDisplayScrollbar;
@@ -5355,7 +5356,7 @@ mod tests {
         assert_eq!(terminal_panel_count, 1);
     }
 
-    // behavior[verify window.appearance.backgrounds.blue-half-transparent]
+    // behavior[verify window.appearance.backgrounds.system-accent-half-transparent]
     // os[verify os.windows.rendering.direct3d12]
     #[test]
     fn build_panel_scene_keeps_blue_background_half_transparent() {

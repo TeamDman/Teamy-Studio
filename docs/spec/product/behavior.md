@@ -28,10 +28,28 @@ behavior[window.appearance.chrome]
 The launched terminal window must render a visible accent strip above the terminal grid.
 
 behavior[window.appearance.chrome.runtime-terminal-title]
-When the terminal emits `OSC 0` or `OSC 2`, the purple accent strip must update to show the runtime terminal title.
+When the terminal emits `OSC 0` or `OSC 2`, the accent title strip must update to show the runtime terminal title.
+
+behavior[window.appearance.chrome.active-window-accent]
+Focused custom title bars must render with the current OS accent color.
+
+behavior[window.appearance.chrome.inactive-window-muted]
+Unfocused custom title bars must render with a muted inactive title color instead of the active accent.
+
+behavior[window.appearance.chrome.tooltips.popover]
+Shared custom chrome buttons must show hover popover tooltips in terminal, launcher, and auxiliary picker windows.
+
+behavior[window.appearance.scene-buttons.tooltips.popover]
+Launcher and auxiliary picker action buttons must show hover popover tooltips instead of in-client panel overlays.
+
+behavior[window.appearance.chrome.tooltips.cursor-clear]
+Chrome-button tooltips must prefer placement above the hovered button and choose a placement whose area does not intersect the pointer cursor region when such a placement exists within the visible monitor bounds.
+
+behavior[window.appearance.chrome.tooltips.monitor-clamped]
+Native hover popover tooltips for custom controls must remain within the visible monitor bounds instead of escaping past the top edge when the window is maximized.
 
 behavior[window.appearance.drag-cursor]
-Hovering the pointer over the purple drag strip must show a move-style drag affordance instead of the default arrow cursor.
+Hovering the pointer over the accent drag strip must show a move-style drag affordance instead of the default arrow cursor.
 
 behavior[window.appearance.panel-borders.absolute-pixels]
 Panel edge highlights must use absolute pixel thickness rather than proportional UV scaling so the border treatment stays visually consistent across large and small panels.
@@ -39,8 +57,8 @@ Panel edge highlights must use absolute pixel thickness rather than proportional
 behavior[window.appearance.backgrounds.animated-time-based]
 Shader-driven panel backgrounds must animate from elapsed time rather than frame count so the motion reads the same at different refresh rates.
 
-behavior[window.appearance.backgrounds.blue-half-transparent]
-The blue background panel must render at 50% alpha beneath the opaque notebook panels.
+behavior[window.appearance.backgrounds.system-accent-half-transparent]
+The background panel beneath the opaque notebook panels must render the OS accent color at 50% alpha.
 
 behavior[window.appearance.code-panel.single-surface]
 The code area must read as a single panel surface rather than an outer code panel containing a second nested framed terminal panel.

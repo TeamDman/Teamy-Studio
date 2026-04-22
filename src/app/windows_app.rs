@@ -18,11 +18,15 @@ use tracing::{debug, error, info, info_span, instrument};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, CLEARTYPE_QUALITY, CreateFontIndirectW, DeleteObject, EndPaint, GetDC,
-    GetDeviceCaps, GetTextExtentPoint32W, HFONT, LOGFONTW, PAINTSTRUCT, ReleaseDC, SelectObject,
-    VREFRESH,
+    GetDeviceCaps, GetMonitorInfoW, GetTextExtentPoint32W, HFONT, LOGFONTW, MONITOR_FROM_FLAGS,
+    MONITORINFO, MonitorFromWindow, PAINTSTRUCT, ReleaseDC, SelectObject, VREFRESH,
 };
 use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
+};
+use windows::Win32::UI::Controls::{
+    TOOLTIPS_CLASSW, TTF_ABSOLUTE, TTF_TRACK, TTM_ADDTOOLW, TTM_SETMAXTIPWIDTH, TTM_TRACKACTIVATE,
+    TTM_TRACKPOSITION, TTM_UPDATETIPTEXTW, TTS_ALWAYSTIP, TTS_NOPREFIX, TTTOOLINFOW,
 };
 use windows::Win32::UI::HiDpi::{GetDpiForSystem, GetDpiForWindow};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -40,15 +44,15 @@ use windows::Win32::UI::WindowsAndMessaging::{
     IDC_HAND, IDC_IBEAM, IDC_SIZEALL, IsWindowVisible, IsZoomed, KillTimer, LoadCursorW, MSG,
     MoveWindow, PostMessageW, PostQuitMessage, RegisterClassExW, SM_CXPADDEDBORDER, SM_CXSCREEN,
     SM_CXSIZEFRAME, SM_CYSCREEN, SM_CYSIZEFRAME, SW_MAXIMIZE, SW_MINIMIZE, SW_RESTORE, SW_SHOW,
-    SYSTEM_METRICS_INDEX, SetCursor, SetTimer, SetWindowTextW, ShowWindow, TranslateMessage,
-    WINDOW_EX_STYLE, WINDOW_STYLE, WM_CHAR, WM_CLOSE, WM_DESTROY, WM_DPICHANGED, WM_ENTERSIZEMOVE,
-    WM_ERASEBKGND, WM_EXITSIZEMOVE, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS, WM_LBUTTONDOWN,
-    WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCALCSIZE, WM_NCHITTEST, WM_NCLBUTTONDOWN,
-    WM_PAINT, WM_RBUTTONUP, WM_SETCURSOR, WM_SETFOCUS, WM_SIZE, WM_SYSKEYDOWN, WM_SYSKEYUP,
-    WM_TIMER, WNDCLASSEXW, WS_EX_APPWINDOW, WS_EX_NOREDIRECTIONBITMAP, WS_MAXIMIZEBOX,
-    WS_MINIMIZEBOX, WS_POPUP, WS_THICKFRAME, WS_VISIBLE,
+    SYSTEM_METRICS_INDEX, SendMessageW, SetCursor, SetTimer, SetWindowTextW, ShowWindow,
+    TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CHAR, WM_CLOSE, WM_DESTROY, WM_DPICHANGED,
+    WM_ENTERSIZEMOVE, WM_ERASEBKGND, WM_EXITSIZEMOVE, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCALCSIZE, WM_NCHITTEST,
+    WM_NCLBUTTONDOWN, WM_PAINT, WM_RBUTTONUP, WM_SETCURSOR, WM_SETFOCUS, WM_SIZE, WM_SYSKEYDOWN,
+    WM_SYSKEYUP, WM_TIMER, WNDCLASSEXW, WS_EX_APPWINDOW, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOPMOST,
+    WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP, WS_THICKFRAME, WS_VISIBLE,
 };
-use windows::core::{BOOL, PCWSTR, w};
+use windows::core::{BOOL, PCWSTR, PWSTR, w};
 
 use crate::paths::{AppHome, CacheHome};
 
@@ -155,6 +159,7 @@ struct AppState {
     diagnostic_font_height: i32,
     diagnostic_cell_width: i32,
     diagnostic_cell_height: i32,
+    chrome_tooltip: ChromeTooltipController,
     terminal: TerminalSession,
     renderer: Option<RenderThreadProxy>,
 }
@@ -194,7 +199,150 @@ struct SceneAppState {
     terminal_cell_height: i32,
     diagnostic_cell_width: i32,
     diagnostic_cell_height: i32,
+    chrome_tooltip: ChromeTooltipController,
     renderer: Option<RenderThreadProxy>,
+}
+
+#[derive(Debug, Default)]
+struct ChromeTooltipController {
+    hwnd: Option<HWND>,
+    text: Vec<u16>,
+    visible: bool,
+}
+
+impl ChromeTooltipController {
+    fn create(owner: WindowHandle) -> eyre::Result<Self> {
+        owner.window_thread.assert_window_thread();
+        let instance = get_current_module().wrap_err("failed to get module handle for tooltip")?;
+        // Safety: this creates a topmost tooltip control owned by the current UI-thread window.
+        let hwnd = unsafe {
+            CreateWindowExW(
+                WS_EX_TOPMOST,
+                TOOLTIPS_CLASSW,
+                PCWSTR::null(),
+                WINDOW_STYLE(WS_POPUP.0 | TTS_ALWAYSTIP | TTS_NOPREFIX),
+                0,
+                0,
+                0,
+                0,
+                Some(owner.raw()),
+                None,
+                Some(instance.into()),
+                None,
+            )
+        }
+        .wrap_err("failed to create native chrome tooltip window")?;
+
+        let mut controller = Self {
+            hwnd: Some(hwnd),
+            text: wide_null_terminated(""),
+            visible: false,
+        };
+        let tool = controller.tool_info(owner.raw());
+        let tool_ptr: *const TTTOOLINFOW = &raw const tool;
+        // Safety: the tooltip control reads the provided tool descriptor for this message call only.
+        unsafe {
+            let _ = SendMessageW(
+                hwnd,
+                TTM_ADDTOOLW,
+                Some(WPARAM(0)),
+                Some(LPARAM(tool_ptr as isize)),
+            );
+        }
+        // Safety: sending this configuration message to a live tooltip control is valid.
+        unsafe {
+            let _ = SendMessageW(hwnd, TTM_SETMAXTIPWIDTH, Some(WPARAM(0)), Some(LPARAM(320)));
+        }
+        Ok(controller)
+    }
+
+    fn show_at(
+        &mut self,
+        owner: WindowHandle,
+        text: &str,
+        position: ScreenPoint,
+    ) -> eyre::Result<()> {
+        let Some(hwnd) = self.hwnd else {
+            return Ok(());
+        };
+
+        self.text = wide_null_terminated(text);
+        let tool = self.tool_info(owner.raw());
+        let tool_ptr: *const TTTOOLINFOW = &raw const tool;
+        // Safety: the tooltip control reads the provided tool descriptor for this message call only.
+        unsafe {
+            let _ = SendMessageW(
+                hwnd,
+                TTM_UPDATETIPTEXTW,
+                Some(WPARAM(0)),
+                Some(LPARAM(tool_ptr as isize)),
+            );
+        }
+        // Safety: sending a screen-space track position to a live tooltip control is valid.
+        unsafe {
+            let _ = SendMessageW(
+                hwnd,
+                TTM_TRACKPOSITION,
+                Some(WPARAM(0)),
+                Some(LPARAM(position.pack_lparam()?)),
+            );
+        }
+        // Safety: activating tracking mode on a live tooltip control with a valid tool descriptor is valid.
+        unsafe {
+            let _ = SendMessageW(
+                hwnd,
+                TTM_TRACKACTIVATE,
+                Some(WPARAM(1)),
+                Some(LPARAM(tool_ptr as isize)),
+            );
+        }
+        self.visible = true;
+        Ok(())
+    }
+
+    fn hide(&mut self, owner: WindowHandle) {
+        if !self.visible {
+            return;
+        }
+        let Some(hwnd) = self.hwnd else {
+            return;
+        };
+
+        let tool = self.tool_info(owner.raw());
+        let tool_ptr: *const TTTOOLINFOW = &raw const tool;
+        // Safety: deactivating tracking mode on a live tooltip control with a valid tool descriptor is valid.
+        unsafe {
+            let _ = SendMessageW(
+                hwnd,
+                TTM_TRACKACTIVATE,
+                Some(WPARAM(0)),
+                Some(LPARAM(tool_ptr as isize)),
+            );
+        }
+        self.visible = false;
+    }
+
+    fn destroy(&mut self) {
+        if let Some(hwnd) = self.hwnd.take() {
+            // Safety: this destroys the tooltip control owned by the current window before teardown.
+            unsafe {
+                let _ = DestroyWindow(hwnd);
+            }
+        }
+        self.visible = false;
+    }
+
+    fn tool_info(&mut self, owner: HWND) -> TTTOOLINFOW {
+        TTTOOLINFOW {
+            cbSize: u32::try_from(std::mem::size_of::<TTTOOLINFOW>())
+                .expect("TTTOOLINFOW size must fit in u32"),
+            uFlags: TTF_TRACK | TTF_ABSOLUTE,
+            hwnd: owner,
+            uId: 1,
+            lpszText: PWSTR(self.text.as_mut_ptr()),
+            ..Default::default()
+        }
+    }
 }
 
 // convention[impl convention.invariants.encode-in-types]
@@ -763,6 +911,7 @@ fn run_with_terminal_session(
             diagnostic_font_height,
             diagnostic_cell_width,
             diagnostic_cell_height,
+            chrome_tooltip: ChromeTooltipController::default(),
             terminal,
             renderer: None,
         });
@@ -772,9 +921,11 @@ fn run_with_terminal_session(
         .in_scope(|| create_window(window_thread, title.unwrap_or(WINDOW_TITLE)))?;
     let renderer = info_span!("create_d3d12_renderer_thread")
         .in_scope(|| RenderThreadProxy::new(hwnd.raw()))?;
+    let chrome_tooltip = ChromeTooltipController::create(hwnd)?;
     with_app_state(|state| {
         state.hwnd = Some(hwnd);
         state.terminal.set_wake_window(hwnd.raw());
+        state.chrome_tooltip = chrome_tooltip;
         state.renderer = Some(renderer);
         Ok(())
     })?;
@@ -834,14 +985,17 @@ fn run_scene_window(
             terminal_cell_height,
             diagnostic_cell_width,
             diagnostic_cell_height,
+            chrome_tooltip: ChromeTooltipController::default(),
             renderer: None,
         });
     });
 
     let hwnd = create_scene_window(window_thread, scene_kind.title())?;
     let renderer = RenderThreadProxy::new(hwnd.raw())?;
+    let chrome_tooltip = ChromeTooltipController::create(hwnd)?;
     with_scene_app_state(|state| {
         state.hwnd = Some(hwnd);
+        state.chrome_tooltip = chrome_tooltip;
         state.renderer = Some(renderer);
         Ok(())
     })?;
@@ -1659,6 +1813,7 @@ fn handle_scene_focus_changed(hwnd: WindowHandle, focused: bool) -> LRESULT {
             render_scene_window_frame(state, hwnd, None, true)?;
         } else {
             hwnd.clear_focused_render_timer();
+            state.chrome_tooltip.hide(hwnd);
             render_scene_window_frame(state, hwnd, None, true)?;
         }
         Ok(())
@@ -1670,6 +1825,9 @@ fn handle_scene_focus_changed(hwnd: WindowHandle, focused: bool) -> LRESULT {
 
 fn handle_scene_destroy_message(hwnd: WindowHandle) -> LRESULT {
     SCENE_APP_STATE.with(|state| {
+        if let Some(state) = state.borrow_mut().as_mut() {
+            state.chrome_tooltip.destroy();
+        }
         let _ = state.borrow_mut().take();
     });
     hwnd.post_quit_message();
@@ -1686,6 +1844,7 @@ fn handle_scene_left_button_down(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Re
 
     let action = with_scene_app_state(|state| {
         state.pointer_position = Some(point);
+        state.chrome_tooltip.hide(hwnd);
         state.pressed_target = None;
         state.diagnostic_selection_drag_point = None;
         let layout = scene_client_layout(hwnd, state)?;
@@ -1838,6 +1997,7 @@ fn handle_scene_mouse_move(
     let previous_pointer = with_scene_app_state(|state| {
         let previous = state.pointer_position;
         state.pointer_position = Some(point);
+        update_scene_chrome_tooltip(state, hwnd, point)?;
         Ok(previous)
     })?;
 
@@ -2081,6 +2241,7 @@ fn handle_focus_changed(hwnd: WindowHandle, focused: bool) -> LRESULT {
             render_current_frame_with_options(state, hwnd, None, true)?;
         } else {
             hwnd.clear_focused_render_timer();
+            state.chrome_tooltip.hide(hwnd);
             render_current_frame_with_options(state, hwnd, None, true)?;
         }
         Ok(())
@@ -4051,6 +4212,7 @@ fn handle_left_button_up(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Result<boo
     let action = with_app_state(|state| {
         let point = ClientPoint::from_lparam(lparam);
         state.pointer_position = Some(point);
+        state.chrome_tooltip.hide(hwnd);
 
         if state.terminal_scrollbar_drag.take().is_some() {
             let layout = terminal_client_layout(hwnd, state)?;
@@ -4277,6 +4439,7 @@ fn handle_mouse_move(hwnd: WindowHandle, wparam: WPARAM, lparam: LPARAM) -> eyre
     let previous_pointer = with_app_state(|state| {
         let previous = state.pointer_position;
         state.pointer_position = Some(point);
+        update_terminal_chrome_tooltip(state, hwnd, point)?;
         Ok(previous)
     })?;
 
@@ -4922,6 +5085,299 @@ fn wide_null_terminated(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
+fn update_terminal_chrome_tooltip(
+    state: &mut AppState,
+    hwnd: WindowHandle,
+    point: ClientPoint,
+) -> eyre::Result<()> {
+    let layout = terminal_client_layout(hwnd, state)?;
+    if update_window_chrome_tooltip(
+        &mut state.chrome_tooltip,
+        hwnd,
+        layout,
+        point,
+        state.diagnostic_panel_visible,
+        hwnd.is_zoomed(),
+    )? {
+        return Ok(());
+    }
+
+    state.chrome_tooltip.hide(hwnd);
+    Ok(())
+}
+
+fn update_scene_chrome_tooltip(
+    state: &mut SceneAppState,
+    hwnd: WindowHandle,
+    point: ClientPoint,
+) -> eyre::Result<()> {
+    let layout = scene_client_layout(hwnd, state)?;
+    if update_window_chrome_tooltip(
+        &mut state.chrome_tooltip,
+        hwnd,
+        layout,
+        point,
+        state.diagnostics_visible,
+        hwnd.is_zoomed(),
+    )? {
+        return Ok(());
+    }
+
+    if let Some((tooltip_text, anchor_rect)) = scene_action_tooltip(state, layout, point) {
+        let anchor_rect = client_rect_to_screen_rect(hwnd, anchor_rect)?;
+        let cursor_rect = pointer_cursor_screen_rect(hwnd, point)?;
+        let monitor_bounds = monitor_work_rect(hwnd)?;
+        let tooltip_origin = tooltip_origin(anchor_rect, cursor_rect, monitor_bounds, tooltip_text);
+        state
+            .chrome_tooltip
+            .show_at(hwnd, tooltip_text, tooltip_origin)?;
+        return Ok(());
+    }
+
+    state.chrome_tooltip.hide(hwnd);
+    Ok(())
+}
+
+// behavior[impl window.appearance.chrome.tooltips.popover]
+// behavior[impl window.appearance.chrome.tooltips.cursor-clear]
+// behavior[impl window.appearance.chrome.tooltips.monitor-clamped]
+fn update_window_chrome_tooltip(
+    tooltip: &mut ChromeTooltipController,
+    hwnd: WindowHandle,
+    layout: TerminalLayout,
+    point: ClientPoint,
+    diagnostics_active: bool,
+    maximized: bool,
+) -> eyre::Result<bool> {
+    let Some(button) = window_chrome_button_at_point(layout, point) else {
+        return Ok(false);
+    };
+
+    let tooltip_text = window_chrome_button_tooltip_text(button, diagnostics_active, maximized);
+    let anchor_rect = client_rect_to_screen_rect(hwnd, window_chrome_button_rect(layout, button))?;
+    let cursor_rect = pointer_cursor_screen_rect(hwnd, point)?;
+    let monitor_bounds = monitor_work_rect(hwnd)?;
+    let tooltip_origin = tooltip_origin(anchor_rect, cursor_rect, monitor_bounds, tooltip_text);
+    tooltip.show_at(hwnd, tooltip_text, tooltip_origin)?;
+    Ok(true)
+}
+
+// behavior[impl window.appearance.scene-buttons.tooltips.popover]
+fn scene_action_tooltip(
+    state: &SceneAppState,
+    layout: TerminalLayout,
+    point: ClientPoint,
+) -> Option<(&'static str, ClientRect)> {
+    if state.diagnostics_visible {
+        return None;
+    }
+
+    let specs = windows_scene::scene_button_specs(state.scene_kind);
+    let button_layouts = windows_scene::layout_scene_buttons(
+        layout.terminal_panel_rect(),
+        specs.len(),
+        scaled_scene_button_size(state.dpi),
+    );
+
+    specs
+        .iter()
+        .zip(button_layouts)
+        .find_map(|(spec, button_layout)| {
+            button_layout
+                .hit_rect()
+                .contains(point)
+                .then_some((spec.tooltip, button_layout.hit_rect()))
+        })
+}
+
+fn window_chrome_button_tooltip_text(
+    button: WindowChromeButton,
+    diagnostics_active: bool,
+    maximized: bool,
+) -> &'static str {
+    match button {
+        WindowChromeButton::Diagnostics => {
+            if diagnostics_active {
+                "Hide diagnostics"
+            } else {
+                "Show diagnostics"
+            }
+        }
+        WindowChromeButton::Minimize => "Minimize window",
+        WindowChromeButton::MaximizeRestore => {
+            if maximized {
+                "Restore window"
+            } else {
+                "Maximize window"
+            }
+        }
+        WindowChromeButton::Close => "Close window",
+    }
+}
+
+fn client_rect_to_screen_rect(hwnd: WindowHandle, rect: ClientRect) -> eyre::Result<ScreenRect> {
+    let top_left = client_to_screen_point(hwnd, ClientPoint::new(rect.left(), rect.top()))?;
+    let bottom_right = client_to_screen_point(hwnd, ClientPoint::new(rect.right(), rect.bottom()))?;
+    let top_left = top_left.to_win32_point()?;
+    let bottom_right = bottom_right.to_win32_point()?;
+    Ok(ScreenRect::new(
+        top_left.x,
+        top_left.y,
+        bottom_right.x,
+        bottom_right.y,
+    ))
+}
+
+fn pointer_cursor_screen_rect(hwnd: WindowHandle, point: ClientPoint) -> eyre::Result<ScreenRect> {
+    const CURSOR_WIDTH: i32 = 24;
+    const CURSOR_HEIGHT: i32 = 24;
+    let point = client_to_screen_point(hwnd, point)?.to_win32_point()?;
+    Ok(ScreenRect::new(
+        point.x,
+        point.y,
+        point.x + CURSOR_WIDTH,
+        point.y + CURSOR_HEIGHT,
+    ))
+}
+
+fn monitor_work_rect(hwnd: WindowHandle) -> eyre::Result<ScreenRect> {
+    // Safety: querying the nearest monitor for a live top-level window is valid.
+    let monitor = unsafe { MonitorFromWindow(hwnd.raw(), MONITOR_FROM_FLAGS(2)) };
+    if monitor.0.is_null() {
+        eyre::bail!("failed to resolve monitor for tooltip placement")
+    }
+
+    let mut info = MONITORINFO {
+        cbSize: u32::try_from(std::mem::size_of::<MONITORINFO>())
+            .expect("MONITORINFO size must fit in u32"),
+        ..Default::default()
+    };
+    // Safety: `info` is a valid out pointer for monitor metadata returned for the resolved monitor handle.
+    if !unsafe { GetMonitorInfoW(monitor, &raw mut info) }.as_bool() {
+        eyre::bail!("failed to query monitor bounds for tooltip placement")
+    }
+
+    Ok(ScreenRect::from_win32_rect(info.rcWork))
+}
+
+fn tooltip_origin(
+    anchor_rect: ScreenRect,
+    cursor_rect: ScreenRect,
+    bounds: ScreenRect,
+    text: &str,
+) -> ScreenPoint {
+    let (tooltip_width, tooltip_height) = chrome_tooltip_size(text, bounds);
+    let margin = 6;
+    let gap = 10;
+    let min_left = bounds.left() + margin;
+    let max_left = (bounds.right() - margin - tooltip_width).max(min_left);
+    let min_top = bounds.top() + margin;
+    let max_top = (bounds.bottom() - margin - tooltip_height).max(min_top);
+    let above_top = anchor_rect.top() - gap - tooltip_height;
+    let below_top = anchor_rect.bottom() + gap;
+    let preferred_left = anchor_rect.left() + ((anchor_rect.width() - tooltip_width) / 2);
+    let preferred_top = if above_top >= min_top {
+        above_top
+    } else {
+        below_top
+    };
+    let ideal = ScreenPoint::new(
+        preferred_left.clamp(min_left, max_left),
+        preferred_top.clamp(min_top, max_top),
+    );
+
+    let mut candidates = vec![ideal];
+    let horizontal_targets = [
+        preferred_left,
+        cursor_rect.left() - gap - tooltip_width,
+        cursor_rect.right() + gap,
+        anchor_rect.left() - gap - tooltip_width,
+        anchor_rect.right() + gap,
+        min_left,
+        max_left,
+    ];
+    let vertical_targets = [above_top, below_top, min_top, max_top];
+
+    for left in horizontal_targets {
+        for top in vertical_targets {
+            candidates.push(ScreenPoint::new(
+                left.clamp(min_left, max_left),
+                top.clamp(min_top, max_top),
+            ));
+        }
+    }
+
+    let best = candidates
+        .into_iter()
+        .map(|origin| {
+            let origin = origin
+                .to_win32_point()
+                .expect("candidate tooltip point should stay integral");
+            let rect = ScreenRect::new(
+                origin.x,
+                origin.y,
+                origin.x + tooltip_width,
+                origin.y + tooltip_height,
+            );
+            let intersects_cursor = rects_intersect(rect, cursor_rect);
+            let overlaps_anchor = rects_intersect(rect, anchor_rect);
+            let edge_penalty = distance_to_monitor_edge(rect, bounds);
+            let anchor_distance = manhattan_distance_to_anchor(rect, anchor_rect);
+            let cursor_penalty = if intersects_cursor { 1_000_000 } else { 0 };
+            let anchor_penalty = if overlaps_anchor { 100_000 } else { 0 };
+            let above_bonus = if rect.bottom() <= anchor_rect.top() {
+                0
+            } else {
+                10_000
+            };
+            (
+                cursor_penalty + anchor_penalty + above_bonus - edge_penalty + anchor_distance,
+                rect,
+            )
+        })
+        .min_by_key(|(score, _)| *score)
+        .expect("candidate tooltip placements should not be empty");
+
+    ScreenPoint::new(best.1.left(), best.1.top())
+}
+
+fn distance_to_monitor_edge(rect: ScreenRect, bounds: ScreenRect) -> i32 {
+    let left = (rect.left() - bounds.left()).abs();
+    let right = (bounds.right() - rect.right()).abs();
+    let top = (rect.top() - bounds.top()).abs();
+    let bottom = (bounds.bottom() - rect.bottom()).abs();
+    left.min(right).min(top).min(bottom)
+}
+
+fn manhattan_distance_to_anchor(rect: ScreenRect, anchor: ScreenRect) -> i32 {
+    let rect_center_x = rect.left() + (rect.width() / 2);
+    let rect_center_y = rect.top() + (rect.height() / 2);
+    let anchor_center_x = anchor.left() + (anchor.width() / 2);
+    let anchor_center_y = anchor.top() + (anchor.height() / 2);
+    (rect_center_x - anchor_center_x).abs() + (rect_center_y - anchor_center_y).abs()
+}
+
+fn chrome_tooltip_size(text: &str, bounds: ScreenRect) -> (i32, i32) {
+    let glyph_width = 8;
+    let glyph_height = 16;
+    let horizontal_padding = 12;
+    let vertical_padding = 8;
+    let margin = 6;
+    let text_width = glyph_width
+        * i32::try_from(text.chars().count())
+            .unwrap_or_default()
+            .max(1);
+    let width = (text_width + (horizontal_padding * 2))
+        .min((bounds.width() - (margin * 2)).max(glyph_width + (horizontal_padding * 2)))
+        .max(glyph_width + (horizontal_padding * 2));
+    let height = glyph_height + (vertical_padding * 2);
+    (width, height)
+}
+
+fn rects_intersect(a: ScreenRect, b: ScreenRect) -> bool {
+    a.left() < b.right() && a.right() > b.left() && a.top() < b.bottom() && a.bottom() > b.top()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4966,6 +5422,109 @@ mod tests {
             Some(WindowShortcutAction::WindowResize(ShortcutStep::Decrease))
         );
         assert_eq!(window_resize_direction(ShortcutStep::Decrease), -1);
+    }
+
+    // behavior[verify window.appearance.chrome.tooltips.cursor-clear]
+    #[test]
+    fn tooltip_origin_prefers_above_when_cursor_is_clear() {
+        let anchor = ScreenRect::new(500, 300, 542, 342);
+        let cursor = ScreenRect::new(510, 342, 534, 366);
+        let bounds = ScreenRect::new(0, 0, 1920, 1080);
+
+        let origin = tooltip_origin(anchor, cursor, bounds, "Close window")
+            .to_win32_point()
+            .expect("tooltip origin should convert to screen pixels");
+
+        assert!(origin.y < anchor.top());
+    }
+
+    // behavior[verify window.appearance.chrome.tooltips.cursor-clear]
+    #[test]
+    fn tooltip_origin_avoids_cursor_aabb_when_above_intersects() {
+        let anchor = ScreenRect::new(500, 300, 542, 342);
+        let cursor = ScreenRect::new(480, 250, 620, 330);
+        let bounds = ScreenRect::new(0, 0, 1920, 1080);
+
+        let origin = tooltip_origin(anchor, cursor, bounds, "Close window")
+            .to_win32_point()
+            .expect("tooltip origin should convert to screen pixels");
+        let (width, height) = chrome_tooltip_size("Close window", bounds);
+        let tooltip = ScreenRect::new(origin.x, origin.y, origin.x + width, origin.y + height);
+
+        assert!(!rects_intersect(tooltip, cursor));
+        assert!(!rects_intersect(tooltip, anchor));
+        assert!(tooltip.left() >= bounds.left());
+        assert!(tooltip.right() <= bounds.right());
+        assert!(tooltip.top() >= bounds.top());
+        assert!(tooltip.bottom() <= bounds.bottom());
+    }
+
+    // behavior[verify window.appearance.chrome.tooltips.monitor-clamped]
+    #[test]
+    fn tooltip_origin_falls_below_when_above_would_escape_monitor_bounds() {
+        let anchor = ScreenRect::new(1800, 10, 1842, 52);
+        let cursor = ScreenRect::new(1804, 52, 1828, 76);
+        let bounds = ScreenRect::new(0, 0, 1920, 1080);
+
+        let origin = tooltip_origin(anchor, cursor, bounds, "Close window")
+            .to_win32_point()
+            .expect("tooltip origin should convert to screen pixels");
+        let (width, height) = chrome_tooltip_size("Close window", bounds);
+
+        assert!(origin.y >= anchor.bottom());
+        assert!(origin.x + width <= bounds.right());
+        assert!(origin.y + height <= bounds.bottom());
+    }
+
+    #[test]
+    fn scene_action_tooltip_uses_hovered_button_hit_rect_and_text() {
+        let state = SceneAppState {
+            app_home: AppHome(std::path::PathBuf::from(".")),
+            hwnd: None,
+            dpi: USER_DEFAULT_SCREEN_DPI,
+            scene_kind: SceneWindowKind::Launcher,
+            vt_engine: VtEngineChoice::default(),
+            pointer_position: None,
+            pressed_target: None,
+            last_clicked_action: None,
+            diagnostics_button_last_clicked_at: None,
+            diagnostics_visible: false,
+            diagnostic_selection: None,
+            pending_diagnostic_selection: None,
+            diagnostic_selection_drag_point: None,
+            in_move_size_loop: false,
+            window_focused: false,
+            focused_render_interval_ms: 16,
+            terminal_cell_width: 8,
+            terminal_cell_height: 16,
+            diagnostic_cell_width: 8,
+            diagnostic_cell_height: 16,
+            chrome_tooltip: ChromeTooltipController::default(),
+            renderer: None,
+        };
+        let layout = TerminalLayout {
+            client_width: 1040,
+            client_height: 680,
+            cell_width: 8,
+            cell_height: 16,
+            diagnostic_panel_visible: false,
+        };
+        let specs = windows_scene::scene_button_specs(SceneWindowKind::Launcher);
+        let button_layouts = windows_scene::layout_scene_buttons(
+            layout.terminal_panel_rect(),
+            specs.len(),
+            scaled_scene_button_size(state.dpi),
+        );
+        let hover_point = ClientPoint::new(
+            button_layouts[0].hit_rect().left() + 1,
+            button_layouts[0].hit_rect().top() + 1,
+        );
+
+        let tooltip = scene_action_tooltip(&state, layout, hover_point)
+            .expect("hovered scene button should expose native tooltip metadata");
+
+        assert_eq!(tooltip.0, "Open terminal");
+        assert_eq!(tooltip.1, button_layouts[0].hit_rect());
     }
 
     #[test]
