@@ -3218,9 +3218,9 @@ fn render_snapshot_glyph_into_image(
     let glyph_height_px =
         (((glyph.y_max - glyph.y_min) + (uv_pad_y * 2.0)).max(1.0) * scale).max(1.0);
     let offset_x = origin_x as f32 + ((image_width as f32 - glyph_width_px) * 0.5).max(0.0);
-    let offset_y =
-        (origin_y as f32 + ((image_height as f32 - glyph_height_px) * 0.5).max(0.0) - 1.0)
-            .max(origin_y as f32);
+    let offset_y = (origin_y as f32 + ((image_height as f32 - glyph_height_px) * 0.5).max(0.0)
+        - 1.0)
+        .max(origin_y as f32);
     let render_x_min = glyph.x_min - uv_pad_x;
     let render_y_max = glyph.y_max + uv_pad_y;
     let start_x = offset_x.floor().max(origin_x as f32) as u32;
@@ -5035,9 +5035,8 @@ mod tests {
         composition_swap_chain_description, cpu_slug_coverage, cpu_slug_coverage_all_curves,
         dirty_fragment_ranges, extract_glyph_curves, fragment_ranges_match, fragment_vertex_ranges,
         load_terminal_font, push_centered_text, push_glyph, push_overlay_panel, push_panel,
-        push_title_text,
-        push_text_block, render_snapshot_glyph_into_image, terminal_scrollbar_geometry,
-        window_garden_shader_data,
+        push_text_block, push_title_text, render_snapshot_glyph_into_image,
+        terminal_scrollbar_geometry, window_garden_shader_data,
     };
     use crate::app::spatial::ClientRect;
     use crate::app::windows_terminal::TerminalDisplayScrollbar;
