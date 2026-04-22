@@ -10,8 +10,8 @@ use crate::cli::output::CliOutput;
 #[repr(u8)]
 pub enum SelfTestKeyboardInputVtEngine {
     #[default]
-    Ghostty,
     Teamy,
+    Ghostty,
 }
 
 impl From<SelfTestKeyboardInputVtEngine> for crate::app::VtEngineChoice {

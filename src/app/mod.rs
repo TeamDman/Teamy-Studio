@@ -2,12 +2,14 @@ mod cell_grid;
 mod render_verification;
 mod spatial;
 pub mod teamy_terminal_engine;
+mod vt_types;
 mod windows_app;
 mod windows_audio;
 mod windows_d3d12_renderer;
 mod windows_dialogs;
 mod windows_scene;
 mod windows_terminal;
+#[cfg(feature = "ghostty")]
 mod windows_terminal_engine;
 mod windows_terminal_replay;
 mod windows_terminal_self_test;

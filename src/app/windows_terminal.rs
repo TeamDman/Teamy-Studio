@@ -9,12 +9,14 @@ use tracing::debug_span;
 use tracing::trace;
 
 use eyre::Context;
+#[cfg(feature = "ghostty")]
 use libghostty_vt::TerminalOptions;
-use libghostty_vt::key;
+#[cfg(feature = "ghostty")]
 use libghostty_vt::render::{CellIterator, CursorVisualStyle, Dirty, RowIterator};
+#[cfg(feature = "ghostty")]
 use libghostty_vt::screen::RowSemanticPrompt;
+#[cfg(feature = "ghostty")]
 use libghostty_vt::style::RgbColor;
-use libghostty_vt::terminal::ScrollViewport;
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use tracing::{debug, error, info, info_span, instrument};
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
@@ -32,7 +34,9 @@ use super::spatial::{ClientRect, TerminalCellPoint};
 use super::teamy_terminal_engine::{
     TeamyColor, TeamyCursorStyle, TeamyTerminalEngine, TeamyViewportMetrics,
 };
+use super::vt_types::{ScrollViewport, key};
 use super::windows_audio::ring_terminal_bell;
+#[cfg(feature = "ghostty")]
 use super::windows_terminal_engine::GhosttyTerminalEngine;
 
 pub const DRAG_STRIP_HEIGHT: i32 = 52;
@@ -398,6 +402,7 @@ pub struct TerminalSession {
 }
 
 enum RuntimeTerminalEngine {
+    #[cfg(feature = "ghostty")]
     Ghostty(GhosttyTerminalEngine),
     Teamy(Box<TeamyTerminalEngine>),
 }
@@ -405,6 +410,7 @@ enum RuntimeTerminalEngine {
 impl RuntimeTerminalEngine {
     fn vt_write(&mut self, bytes: &[u8]) {
         match self {
+            #[cfg(feature = "ghostty")]
             Self::Ghostty(engine) => engine.vt_write(bytes),
             Self::Teamy(engine) => engine.vt_write(bytes),
         }
@@ -418,6 +424,7 @@ impl RuntimeTerminalEngine {
         cell_height: u32,
     ) -> eyre::Result<()> {
         match self {
+            #[cfg(feature = "ghostty")]
             Self::Ghostty(engine) => engine.resize(cols, rows, cell_width, cell_height),
             Self::Teamy(engine) => {
                 let _ = cell_width;
@@ -430,6 +437,7 @@ impl RuntimeTerminalEngine {
 
     fn scroll_viewport(&mut self, viewport: ScrollViewport) {
         match self {
+            #[cfg(feature = "ghostty")]
             Self::Ghostty(engine) => engine.scroll_viewport(viewport),
             Self::Teamy(engine) => engine.scroll_viewport(viewport),
         }
@@ -437,6 +445,7 @@ impl RuntimeTerminalEngine {
 
     fn scroll_active_cursor_into_view(&mut self) -> eyre::Result<()> {
         match self {
+            #[cfg(feature = "ghostty")]
             Self::Ghostty(engine) => {
                 let viewport = engine.viewport_metrics()?;
                 let max_offset = viewport.total.saturating_sub(viewport.visible);
@@ -456,6 +465,7 @@ impl RuntimeTerminalEngine {
 
     fn kitty_keyboard_flags(&self) -> eyre::Result<key::KittyKeyFlags> {
         match self {
+            #[cfg(feature = "ghostty")]
             Self::Ghostty(engine) => engine.kitty_keyboard_flags(),
             Self::Teamy(_) => Ok(key::KittyKeyFlags::empty()),
         }
@@ -463,6 +473,7 @@ impl RuntimeTerminalEngine {
 
     fn viewport_metrics(&self) -> eyre::Result<TerminalViewportMetrics> {
         match self {
+            #[cfg(feature = "ghostty")]
             Self::Ghostty(engine) => {
                 let viewport = engine.viewport_metrics()?;
                 Ok(TerminalViewportMetrics {
@@ -491,6 +502,7 @@ impl RuntimeTerminalEngine {
 
     fn total_rows(&self) -> eyre::Result<usize> {
         match self {
+            #[cfg(feature = "ghostty")]
             Self::Ghostty(engine) => engine.total_rows(),
             Self::Teamy(engine) => Ok(engine.total_rows()),
         }
@@ -498,6 +510,7 @@ impl RuntimeTerminalEngine {
 
     fn screen_row_cells(&self, row: u32, cols: u16) -> eyre::Result<Vec<String>> {
         match self {
+            #[cfg(feature = "ghostty")]
             Self::Ghostty(engine) => ghostty_screen_row_cells(engine, cols, row),
             Self::Teamy(engine) => Ok(engine.screen_row_cells(row)),
         }
@@ -513,6 +526,7 @@ impl RuntimeTerminalEngine {
         response: &mut Vec<u8>,
     ) -> eyre::Result<()> {
         match self {
+            #[cfg(feature = "ghostty")]
             Self::Ghostty(engine) => engine.encode_key_event(
                 action,
                 mapped_key,
@@ -1668,22 +1682,32 @@ impl TerminalCore {
             })?));
         let engine = match vt_engine {
             VtEngineChoice::Ghostty => {
-                let writer_for_effect = Arc::clone(&writer);
-                let mut engine = info_span!("create_libghostty_terminal").in_scope(|| {
-                    GhosttyTerminalEngine::new(TerminalOptions {
-                        cols: DEFAULT_COLS,
-                        rows: DEFAULT_ROWS,
-                        max_scrollback: MAX_SCROLLBACK,
-                    })
-                })?;
-                engine.on_pty_write(move |_terminal, data| {
-                    if let Ok(mut writer) = writer_for_effect.lock() {
-                        let _ = writer.write_all(data);
-                        let _ = writer.flush();
-                    }
-                })?;
-                engine.on_bell(ring_terminal_bell)?;
-                RuntimeTerminalEngine::Ghostty(engine)
+                #[cfg(not(feature = "ghostty"))]
+                {
+                    eyre::bail!(
+                        "Ghostty VT engine is not available in this build; rebuild with `--features ghostty`"
+                    )
+                }
+
+                #[cfg(feature = "ghostty")]
+                {
+                    let writer_for_effect = Arc::clone(&writer);
+                    let mut engine = info_span!("create_libghostty_terminal").in_scope(|| {
+                        GhosttyTerminalEngine::new(TerminalOptions {
+                            cols: DEFAULT_COLS,
+                            rows: DEFAULT_ROWS,
+                            max_scrollback: MAX_SCROLLBACK,
+                        })
+                    })?;
+                    engine.on_pty_write(move |_terminal, data| {
+                        if let Ok(mut writer) = writer_for_effect.lock() {
+                            let _ = writer.write_all(data);
+                            let _ = writer.flush();
+                        }
+                    })?;
+                    engine.on_bell(ring_terminal_bell)?;
+                    RuntimeTerminalEngine::Ghostty(engine)
+                }
             }
             VtEngineChoice::Teamy => {
                 let writer_for_effect = Arc::clone(&writer);
@@ -2480,6 +2504,7 @@ impl TerminalCore {
         let previous_display = (!selection_active).then(|| Arc::clone(&self.cached_display));
 
         match &mut self.engine {
+            #[cfg(feature = "ghostty")]
             RuntimeTerminalEngine::Ghostty(engine) => build_ghostty_display_state(
                 engine,
                 selection,
@@ -2627,6 +2652,7 @@ impl TerminalCore {
 
     fn refresh_semantic_prompt_tracking(&mut self) -> eyre::Result<()> {
         let next = match &mut self.engine {
+            #[cfg(feature = "ghostty")]
             RuntimeTerminalEngine::Ghostty(engine) => ghostty_semantic_prompt_tracking(engine)?,
             RuntimeTerminalEngine::Teamy(_) => teamy_semantic_prompt_tracking(self.semantic_prompt),
         };
@@ -2660,8 +2686,11 @@ impl TerminalCore {
         self.repaint.full_repaint_pending = true;
         self.invalidate_display_cache();
 
+        #[cfg(feature = "ghostty")]
         let ghostty_prompt_is_blank = matches!(&self.engine, RuntimeTerminalEngine::Ghostty(_))
             && self.visible_text()?.trim().is_empty();
+        #[cfg(not(feature = "ghostty"))]
+        let ghostty_prompt_is_blank = false;
         if ghostty_prompt_is_blank {
             self.pending_prompt_reanchor_after_resize = true;
             self.mark_prompt_input_written();
@@ -2689,6 +2718,7 @@ impl TerminalCore {
     fn visible_cell_text_rows(&mut self) -> eyre::Result<Vec<TerminalTextRow>> {
         let viewport = self.viewport_metrics()?;
         match &mut self.engine {
+            #[cfg(feature = "ghostty")]
             RuntimeTerminalEngine::Ghostty(engine) => {
                 visible_ghostty_cell_text_rows(engine, viewport)
             }
@@ -2732,6 +2762,7 @@ impl TerminalCore {
     clippy::too_many_lines,
     reason = "incremental row extraction keeps the Ghostty render-state walk and dirty-row policy together"
 )]
+#[cfg(feature = "ghostty")]
 fn build_ghostty_display_state(
     engine: &mut GhosttyTerminalEngine,
     selection: Option<TerminalSelection>,
@@ -3053,6 +3084,7 @@ fn xterm_palette_color(index: u8) -> [f32; 4] {
     ]
 }
 
+#[cfg(feature = "ghostty")]
 fn visible_ghostty_cell_text_rows(
     engine: &mut GhosttyTerminalEngine,
     viewport: TerminalViewportMetrics,
@@ -3108,6 +3140,7 @@ fn visible_teamy_cell_text_rows(
         .collect()
 }
 
+#[cfg(feature = "ghostty")]
 fn ghostty_screen_row_cells(
     engine: &GhosttyTerminalEngine,
     cols: u16,
@@ -3133,6 +3166,7 @@ fn ordered_linear_bounds(
     }
 }
 
+#[cfg(feature = "ghostty")]
 fn ghostty_semantic_prompt_tracking(
     engine: &mut GhosttyTerminalEngine,
 ) -> eyre::Result<SemanticPromptTracking> {
@@ -3464,6 +3498,7 @@ fn extract_selected_text(rows: &[TerminalTextRow], selection: TerminalSelection)
     selected_rows.join("\n")
 }
 
+#[cfg(feature = "ghostty")]
 fn read_grid_ref_text(grid_ref: &libghostty_vt::screen::GridRef<'_>) -> eyre::Result<String> {
     let mut small = ['\0'; 8];
     match grid_ref.graphemes(&mut small) {
@@ -3484,6 +3519,7 @@ fn read_grid_ref_text(grid_ref: &libghostty_vt::screen::GridRef<'_>) -> eyre::Re
     }
 }
 
+#[cfg(feature = "ghostty")]
 fn rgb_to_rgba(color: RgbColor) -> [f32; 4] {
     [
         f32::from(color.r) / 255.0,
@@ -3494,6 +3530,7 @@ fn rgb_to_rgba(color: RgbColor) -> [f32; 4] {
 }
 
 /// behavior[impl window.appearance.terminal.selection.inverse]
+#[cfg(feature = "ghostty")]
 fn resolve_terminal_cell_colors(
     colors: &libghostty_vt::render::Colors,
     foreground: Option<RgbColor>,
@@ -3516,6 +3553,7 @@ fn resolve_terminal_cell_colors(
 }
 
 /// behavior[impl window.appearance.terminal.cursor.visible]
+#[cfg(feature = "ghostty")]
 fn build_terminal_cursor(
     snapshot: &libghostty_vt::render::Snapshot<'_, '_>,
     colors: &libghostty_vt::render::Colors,
@@ -3549,6 +3587,7 @@ fn build_terminal_cursor(
     }))
 }
 
+#[cfg(feature = "ghostty")]
 fn map_cursor_style(style: CursorVisualStyle) -> TerminalDisplayCursorStyle {
     match style {
         CursorVisualStyle::Bar => TerminalDisplayCursorStyle::Bar,
@@ -3965,18 +4004,30 @@ fn normalize_cursor_visibility_mode_sequence(data: &[u8]) -> Cow<'_, [u8]> {
 }
 
 fn legacy_special_key_bytes(mapped_key: key::Key, mods: key::Mods) -> Option<Vec<u8>> {
-    let mut key_event = key::Event::new().ok()?;
-    let mut encoder = key::Encoder::new().ok()?;
-    let mut response = Vec::with_capacity(16);
-    key_event
-        .set_action(key::Action::Press)
-        .set_key(mapped_key)
-        .set_mods(mods)
-        .set_consumed_mods(key::Mods::empty())
-        .set_unshifted_codepoint('\0')
-        .set_utf8::<String>(None);
-    encoder.encode_to_vec(&key_event, &mut response).ok()?;
-    Some(response)
+    #[cfg(not(feature = "ghostty"))]
+    {
+        let _ = mapped_key;
+        let _ = mods;
+        return None;
+    }
+
+    #[cfg(feature = "ghostty")]
+    {
+        use libghostty_vt::key as ghostty_key;
+
+        let mut key_event = ghostty_key::Event::new().ok()?;
+        let mut encoder = ghostty_key::Encoder::new().ok()?;
+        let mut response = Vec::with_capacity(16);
+        key_event
+            .set_action(ghostty_key::Action::Press)
+            .set_key(mapped_key.into())
+            .set_mods(mods.into())
+            .set_consumed_mods(key::Mods::empty().into())
+            .set_unshifted_codepoint('\0')
+            .set_utf8::<String>(None);
+        encoder.encode_to_vec(&key_event, &mut response).ok()?;
+        Some(response)
+    }
 }
 
 fn should_publish_terminal_display_state(
@@ -4099,16 +4150,20 @@ mod tests {
     use crate::app::VtEngineChoice;
     use crate::app::spatial::TerminalCellPoint;
     use crate::app::teamy_terminal_engine::{TeamyColor, TeamyTerminalEngine};
-    use libghostty_vt::TerminalOptions;
-    use libghostty_vt::key;
-    use libghostty_vt::render::Colors;
-    use libghostty_vt::style::RgbColor;
     use portable_pty::CommandBuilder;
     use std::ffi::OsStr;
     use std::sync::Arc;
     use std::time::Duration;
 
+    #[cfg(feature = "ghostty")]
     use super::GhosttyTerminalEngine;
+    use super::key;
+    #[cfg(feature = "ghostty")]
+    use libghostty_vt::TerminalOptions;
+    #[cfg(feature = "ghostty")]
+    use libghostty_vt::render::Colors;
+    #[cfg(feature = "ghostty")]
+    use libghostty_vt::style::RgbColor;
 
     // behavior[verify window.appearance.code-panel.terminal-alignment]
     // windowing[verify garden-band.shared]
@@ -4241,6 +4296,7 @@ mod tests {
     }
 
     // behavior[verify window.appearance.terminal.selection.inverse]
+    #[cfg(feature = "ghostty")]
     #[test]
     fn inverse_cells_swap_colors_and_force_background() {
         let colors = Colors {
@@ -4318,6 +4374,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "ghostty")]
     fn ghostty_display_state_skips_tab_glyphs_and_keeps_tab_stop_alignment() -> eyre::Result<()> {
         let mut engine = GhosttyTerminalEngine::new(TerminalOptions {
             cols: 12,
@@ -4420,6 +4477,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "ghostty")]
     fn cursor_style_mapping_matches_ghostty_values() {
         assert_eq!(
             map_cursor_style(libghostty_vt::render::CursorVisualStyle::Bar),

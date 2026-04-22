@@ -1,10 +1,12 @@
 use eyre::Context;
-use libghostty_vt::key;
+use libghostty_vt::key as ghostty_key;
 use libghostty_vt::render::RenderState;
 use libghostty_vt::render::Snapshot;
 use libghostty_vt::screen::GridRef;
-use libghostty_vt::terminal::{Point, PointCoordinate, ScrollViewport};
+use libghostty_vt::terminal::{Point, PointCoordinate};
 use libghostty_vt::{Terminal, TerminalOptions};
+
+use super::vt_types::{ScrollViewport, key};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GhosttyViewportMetrics {
@@ -17,8 +19,8 @@ pub struct GhosttyViewportMetrics {
 pub struct GhosttyTerminalEngine {
     terminal: Terminal<'static, 'static>,
     render_state: RenderState<'static>,
-    key_encoder: key::Encoder<'static>,
-    key_event: key::Event<'static>,
+    key_encoder: ghostty_key::Encoder<'static>,
+    key_event: ghostty_key::Event<'static>,
 }
 
 impl GhosttyTerminalEngine {
@@ -26,8 +28,8 @@ impl GhosttyTerminalEngine {
         Ok(Self {
             terminal: Terminal::new(options).wrap_err("failed to create libghostty terminal")?,
             render_state: RenderState::new().wrap_err("failed to create render state")?,
-            key_encoder: key::Encoder::new().wrap_err("failed to create key encoder")?,
-            key_event: key::Event::new().wrap_err("failed to create key event")?,
+            key_encoder: ghostty_key::Encoder::new().wrap_err("failed to create key encoder")?,
+            key_event: ghostty_key::Event::new().wrap_err("failed to create key event")?,
         })
     }
 
@@ -71,12 +73,13 @@ impl GhosttyTerminalEngine {
     }
 
     pub fn scroll_viewport(&mut self, viewport: ScrollViewport) {
-        self.terminal.scroll_viewport(viewport);
+        self.terminal.scroll_viewport(viewport.into());
     }
 
     pub fn kitty_keyboard_flags(&self) -> eyre::Result<key::KittyKeyFlags> {
         self.terminal
             .kitty_keyboard_flags()
+            .map(Into::into)
             .wrap_err("failed to query kitty keyboard flags")
     }
 
@@ -133,10 +136,10 @@ impl GhosttyTerminalEngine {
         response: &mut Vec<u8>,
     ) -> eyre::Result<()> {
         self.key_event
-            .set_action(action)
-            .set_key(mapped_key)
-            .set_mods(mods)
-            .set_consumed_mods(consumed_mods)
+            .set_action(action.into())
+            .set_key(mapped_key.into())
+            .set_mods(mods.into())
+            .set_consumed_mods(consumed_mods.into())
             .set_unshifted_codepoint(unshifted_codepoint)
             .set_utf8::<String>(None);
 

@@ -1,6 +1,5 @@
 use eyre::Context;
 use facet::Facet;
-use libghostty_vt::key;
 use std::fs;
 use std::io::{self, Write};
 use std::path::Path;
@@ -15,6 +14,7 @@ use windows::Win32::System::Console::{
 
 use crate::paths::AppHome;
 
+use super::vt_types::key;
 use super::windows_terminal::{TerminalLayout, TerminalSession};
 
 const SELF_TEST_READY: &str = "KEYBOARD_SELF_TEST_READY";

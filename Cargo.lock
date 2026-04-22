@@ -3071,7 +3071,6 @@ dependencies = [
  "fontdue",
  "image",
  "libghostty-vt",
- "libghostty-vt-sys",
  "open",
  "portable-pty",
  "rfd",

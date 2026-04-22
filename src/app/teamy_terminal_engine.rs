@@ -1,9 +1,10 @@
 use facet::Facet;
-use libghostty_vt::terminal::ScrollViewport;
 use std::borrow::Cow;
 #[cfg(feature = "tracy")]
 use tracing::debug_span;
 use tracing::warn;
+
+use super::vt_types::ScrollViewport;
 
 type BellEffect = Box<dyn FnMut() + Send>;
 type PtyWriteEffect = Box<dyn FnMut(&[u8]) + Send>;
@@ -1211,7 +1212,7 @@ fn csi_likely_requires_terminal_response(parameters: &str, final_byte: char) -> 
 
 #[cfg(test)]
 mod tests {
-    use libghostty_vt::terminal::ScrollViewport;
+    use crate::app::vt_types::ScrollViewport;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 

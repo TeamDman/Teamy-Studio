@@ -4,7 +4,9 @@ use std::time::Instant;
 
 use eyre::Context;
 use facet::Facet;
+#[cfg(feature = "ghostty")]
 use libghostty_vt::TerminalOptions;
+#[cfg(feature = "ghostty")]
 use libghostty_vt::render::{CellIterator, RowIterator};
 
 use crate::app::teamy_terminal_engine::{
@@ -12,6 +14,7 @@ use crate::app::teamy_terminal_engine::{
     TeamyTraceSnapshot,
 };
 
+#[cfg(feature = "ghostty")]
 use super::windows_terminal_engine::GhosttyTerminalEngine;
 
 #[derive(Debug, Facet)]
@@ -65,70 +68,89 @@ pub fn run_terminal_replay_self_test(
     artifact_output: Option<&Path>,
     samples: usize,
 ) -> eyre::Result<TerminalReplayReport> {
-    let fixture_text = fs::read_to_string(fixture_path)
-        .wrap_err_with(|| format!("failed to read replay fixture {}", fixture_path.display()))?;
-    let fixture: TerminalReplayFixture = facet_json::from_str(&fixture_text)
-        .wrap_err_with(|| format!("failed to parse replay fixture {}", fixture_path.display()))?;
-
-    let sample_count = samples.max(1);
-    let mut ghostty_sample_results = Vec::with_capacity(sample_count);
-    let mut teamy_sample_results = Vec::with_capacity(sample_count);
-    for _ in 0..sample_count {
-        ghostty_sample_results.push(run_ghostty_terminal_replay_sample(&fixture)?);
-        teamy_sample_results.push(run_teamy_terminal_replay_sample(&fixture));
+    #[cfg(not(feature = "ghostty"))]
+    {
+        let _ = fixture_path;
+        let _ = artifact_output;
+        let _ = samples;
+        eyre::bail!("terminal replay self-test requires the `ghostty` feature")
     }
 
-    let final_sample = ghostty_sample_results
-        .last()
-        .ok_or_else(|| eyre::eyre!("terminal replay did not produce any samples"))?;
-    let final_teamy_sample = teamy_sample_results
-        .last()
-        .ok_or_else(|| eyre::eyre!("teamy terminal replay did not produce any samples"))?;
-    let report = TerminalReplayReport {
-        fixture_path: fixture_path.display().to_string(),
-        artifact_output_path: artifact_output.map(|path| path.display().to_string()),
-        samples: sample_count,
-        median_apply_ms: median_f64(&ghostty_sample_results, |sample| sample.apply_ms),
-        median_vt_write_calls: median_u64(&ghostty_sample_results, |sample| sample.vt_write_calls),
-        median_bytes_applied: median_u64(&ghostty_sample_results, |sample| sample.bytes_applied),
-        final_screen: final_sample.final_screen.clone(),
-        teamy_median_apply_ms: median_f64(&teamy_sample_results, |sample| sample.apply_ms),
-        teamy_median_vt_write_calls: median_u64(&teamy_sample_results, |sample| {
-            sample.vt_write_calls
-        }),
-        teamy_median_bytes_applied: median_u64(&teamy_sample_results, |sample| {
-            sample.bytes_applied
-        }),
-        teamy_final_screen: final_teamy_sample.final_screen.clone(),
-        teamy_matches_ghostty: final_teamy_sample.final_screen == final_sample.final_screen,
-        teamy_display_rows: final_teamy_sample.display_rows,
-        teamy_display_glyphs: final_teamy_sample.display_glyphs,
-        teamy_display: final_teamy_sample.display.clone(),
-        teamy_trace: final_teamy_sample.trace.clone(),
-    };
+    #[cfg(feature = "ghostty")]
+    {
+        let fixture_text = fs::read_to_string(fixture_path).wrap_err_with(|| {
+            format!("failed to read replay fixture {}", fixture_path.display())
+        })?;
+        let fixture: TerminalReplayFixture =
+            facet_json::from_str(&fixture_text).wrap_err_with(|| {
+                format!("failed to parse replay fixture {}", fixture_path.display())
+            })?;
 
-    if let Some(artifact_output) = artifact_output {
-        if let Some(parent) = artifact_output.parent() {
-            fs::create_dir_all(parent).wrap_err_with(|| {
+        let sample_count = samples.max(1);
+        let mut ghostty_sample_results = Vec::with_capacity(sample_count);
+        let mut teamy_sample_results = Vec::with_capacity(sample_count);
+        for _ in 0..sample_count {
+            ghostty_sample_results.push(run_ghostty_terminal_replay_sample(&fixture)?);
+            teamy_sample_results.push(run_teamy_terminal_replay_sample(&fixture));
+        }
+
+        let final_sample = ghostty_sample_results
+            .last()
+            .ok_or_else(|| eyre::eyre!("terminal replay did not produce any samples"))?;
+        let final_teamy_sample = teamy_sample_results
+            .last()
+            .ok_or_else(|| eyre::eyre!("teamy terminal replay did not produce any samples"))?;
+        let report = TerminalReplayReport {
+            fixture_path: fixture_path.display().to_string(),
+            artifact_output_path: artifact_output.map(|path| path.display().to_string()),
+            samples: sample_count,
+            median_apply_ms: median_f64(&ghostty_sample_results, |sample| sample.apply_ms),
+            median_vt_write_calls: median_u64(&ghostty_sample_results, |sample| {
+                sample.vt_write_calls
+            }),
+            median_bytes_applied: median_u64(&ghostty_sample_results, |sample| {
+                sample.bytes_applied
+            }),
+            final_screen: final_sample.final_screen.clone(),
+            teamy_median_apply_ms: median_f64(&teamy_sample_results, |sample| sample.apply_ms),
+            teamy_median_vt_write_calls: median_u64(&teamy_sample_results, |sample| {
+                sample.vt_write_calls
+            }),
+            teamy_median_bytes_applied: median_u64(&teamy_sample_results, |sample| {
+                sample.bytes_applied
+            }),
+            teamy_final_screen: final_teamy_sample.final_screen.clone(),
+            teamy_matches_ghostty: final_teamy_sample.final_screen == final_sample.final_screen,
+            teamy_display_rows: final_teamy_sample.display_rows,
+            teamy_display_glyphs: final_teamy_sample.display_glyphs,
+            teamy_display: final_teamy_sample.display.clone(),
+            teamy_trace: final_teamy_sample.trace.clone(),
+        };
+
+        if let Some(artifact_output) = artifact_output {
+            if let Some(parent) = artifact_output.parent() {
+                fs::create_dir_all(parent).wrap_err_with(|| {
+                    format!(
+                        "failed to create replay artifact directory {}",
+                        parent.display()
+                    )
+                })?;
+            }
+            let json = facet_json::to_string_pretty(&report)
+                .wrap_err("failed to serialize terminal replay report")?;
+            fs::write(artifact_output, json).wrap_err_with(|| {
                 format!(
-                    "failed to create replay artifact directory {}",
-                    parent.display()
+                    "failed to write terminal replay artifact {}",
+                    artifact_output.display()
                 )
             })?;
         }
-        let json = facet_json::to_string_pretty(&report)
-            .wrap_err("failed to serialize terminal replay report")?;
-        fs::write(artifact_output, json).wrap_err_with(|| {
-            format!(
-                "failed to write terminal replay artifact {}",
-                artifact_output.display()
-            )
-        })?;
-    }
 
-    Ok(report)
+        Ok(report)
+    }
 }
 
+#[cfg(feature = "ghostty")]
 fn run_ghostty_terminal_replay_sample(
     fixture: &TerminalReplayFixture,
 ) -> eyre::Result<TerminalReplaySample> {
@@ -237,6 +259,7 @@ fn teamy_visible_text_from_display(display: &TeamyDisplayState) -> String {
     lines.join("\n")
 }
 
+#[cfg(feature = "ghostty")]
 fn visible_text(engine: &mut GhosttyTerminalEngine) -> eyre::Result<String> {
     engine.with_snapshot(|snapshot| {
         let mut rows = RowIterator::new().wrap_err("failed to create row iterator")?;
@@ -296,7 +319,7 @@ fn median_u64<T>(samples: &[T], selector: impl Fn(&T) -> u64) -> u64 {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "ghostty"))]
 mod tests {
     use std::fs;
     use std::path::PathBuf;

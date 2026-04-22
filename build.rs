@@ -6,7 +6,9 @@ use std::process::Command;
 fn main() {
     add_exe_resources();
     add_git_revision();
-    stage_ghostty_binaries();
+    if env::var_os("CARGO_FEATURE_GHOSTTY").is_some() {
+        stage_ghostty_binaries();
+    }
     stage_openconsole_binaries();
 }
 
