@@ -1,4 +1,3 @@
-use teamy_windows::string::EasyPCWSTR;
 use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::Controls::{
     TASKDIALOG_BUTTON, TASKDIALOG_COMMON_BUTTON_FLAGS, TASKDIALOG_FLAGS, TASKDIALOGCONFIG,
@@ -8,6 +7,8 @@ use windows::Win32::UI::Controls::{
 use windows::Win32::UI::WindowsAndMessaging::{
     IDOK, MB_ICONWARNING, MB_OKCANCEL, MESSAGEBOX_STYLE, MessageBoxW,
 };
+
+use crate::win32_support::string::EasyPCWSTR;
 
 const BTN_PASTE_ANYWAY: i32 = 100;
 const BTN_CANCEL: i32 = 101;

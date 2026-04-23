@@ -45,15 +45,17 @@ libghostty-vt = { git = "https://github.com/TeamDman/libghostty-rs.git", rev = "
 portable-pty = "0.9"
 ratatui = { version = "0.30.0", default-features = false, features = ["crossterm"] }
 sguaba = { version = "0.10.3", default-features = false, features = ["std"] }
-teamy-windows = "0.11.1"
 ttf-parser = "0.25"
 uom = { version = "0.38.0", default-features = false, features = ["autoconvert", "f64", "si", "std"] }
+widestring = "1.2"
 
 [dependencies.windows]
 version = "0.62.2"
 default-features = false
 features = [
+	"std",
 	"Win32_Foundation",
+	"Win32_Globalization",
 	"Win32_Graphics_Direct3D",
 	"Win32_Graphics_Direct3D_Fxc",
 	"Win32_Graphics_Direct3D12",
@@ -65,7 +67,12 @@ features = [
 	"Win32_Media_Audio",
 	"Win32_System_Com",
 	"Win32_System_Console",
+	"Win32_System_DataExchange",
 	"Win32_System_Diagnostics_Debug",
+	"Win32_System_LibraryLoader",
+	"Win32_System_Memory",
+	"Win32_System_Ole",
+	"Win32_Security",
 	"Win32_System_Threading",
 	"Win32_UI_Controls",
 	"Win32_UI_HiDpi",

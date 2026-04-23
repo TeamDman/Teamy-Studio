@@ -6,6 +6,7 @@ pub mod cli;
 pub mod logging_init;
 pub mod paths;
 pub mod shell_default;
+pub mod win32_support;
 
 use crate::cli::Cli;
 use crate::cli::output::CliOutput;
@@ -36,9 +37,9 @@ pub fn main() -> eyre::Result<()> {
 
     // Enable ANSI support on Windows.
     // This fails in a pipe scenario, so we ignore the error.
-    let _ = teamy_windows::console::enable_ansi_support();
+    let _ = win32_support::console::enable_ansi_support();
 
-    teamy_windows::string::warn_if_utf8_not_enabled();
+    win32_support::string::warn_if_utf8_not_enabled();
 
     // Parse command line arguments using figue
     // unwrap() is figue's intended CLI entry behavior:

@@ -1,15 +1,14 @@
 use std::fs;
-use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::paths::AppHome;
+use crate::win32_support::string::EasyPCWSTR;
 use eyre::Context;
 use windows::Win32::Media::Audio::{PlaySoundW, SND_ASYNC, SND_FILENAME, SND_NODEFAULT};
 use windows::Win32::System::Diagnostics::Debug::MessageBeep;
 use windows::Win32::UI::WindowsAndMessaging::MB_OK;
-use windows::core::PCWSTR;
 
 const MINIMUM_BELL_INTERVAL: Duration = Duration::from_millis(100);
 const BELL_SOURCE_FILENAME: &str = "bell-source.txt";
@@ -100,15 +99,15 @@ fn ring_audio_file(path: &Path) {
         return;
     }
 
-    let wide_path: Vec<u16> = path
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect();
+    let Ok(wide_path) = path.easy_pcwstr() else {
+        ring_windows_bell();
+        return;
+    };
+
     // Safety: the UTF-16 path is null-terminated and valid for the duration of the call.
     let result = unsafe {
         PlaySoundW(
-            PCWSTR(wide_path.as_ptr()),
+            wide_path.as_ref(),
             None,
             SND_ASYNC | SND_FILENAME | SND_NODEFAULT,
         )

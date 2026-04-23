@@ -12,8 +12,6 @@ use chrono::Utc;
 use eyre::Context;
 use facet::Facet;
 use rfd::{FileDialog, MessageButtons, MessageDialog, MessageLevel};
-use teamy_windows::clipboard::{read_clipboard, write_clipboard};
-use teamy_windows::module::get_current_module;
 use tracing::{debug, error, info, info_span, instrument};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
 use windows::Win32::Graphics::Gdi::{
@@ -55,6 +53,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::core::{BOOL, PCWSTR, PWSTR, w};
 
 use crate::paths::{AppHome, CacheHome};
+use crate::win32_support::clipboard::{read_clipboard, write_clipboard};
+use crate::win32_support::module::get_current_module;
+use crate::win32_support::string::EasyPCWSTR;
 
 use super::cell_grid;
 use super::spatial::{
@@ -612,9 +613,9 @@ impl WindowHandle {
 
     fn set_title(self, title: &str) -> eyre::Result<()> {
         self.window_thread.assert_window_thread();
-        let title = wide_null_terminated(title);
+        let title = title.easy_pcwstr()?;
         // Safety: `title` is a valid null-terminated UTF-16 buffer for the duration of the call.
-        unsafe { SetWindowTextW(self.hwnd, PCWSTR(title.as_ptr())) }
+        unsafe { SetWindowTextW(self.hwnd, title.as_ref()) }
             .wrap_err("failed to update window title")
     }
 
@@ -1651,14 +1652,14 @@ fn create_window(window_thread: WindowThread, window_title: &str) -> eyre::Resul
     let initial_window_height = scaled_window_dimension(INITIAL_WINDOW_HEIGHT, system_dpi());
     let x = (screen_width - initial_window_width) / 2;
     let y = (screen_height - initial_window_height) / 2;
-    let title = wide_null_terminated(window_title);
+    let title = window_title.easy_pcwstr()?;
 
     // Safety: all pointers and handles passed to CreateWindowExW are valid for the duration of the call.
     let hwnd = unsafe {
         CreateWindowExW(
             custom_window_ex_style(),
             WINDOW_CLASS_NAME,
-            PCWSTR(title.as_ptr()),
+            title.as_ref(),
             visible_custom_window_style(),
             x,
             y,
@@ -1716,14 +1717,14 @@ fn create_scene_window(
     let initial_window_height = scaled_window_dimension(INITIAL_WINDOW_HEIGHT, system_dpi());
     let x = (screen_width - initial_window_width) / 2;
     let y = (screen_height - initial_window_height) / 2;
-    let title = wide_null_terminated(window_title);
+    let title = window_title.easy_pcwstr()?;
 
     // Safety: all pointers and handles passed to CreateWindowExW are valid for the duration of the call.
     let hwnd = unsafe {
         CreateWindowExW(
             custom_window_ex_style(),
             SCENE_WINDOW_CLASS_NAME,
-            PCWSTR(title.as_ptr()),
+            title.as_ref(),
             visible_custom_window_style(),
             x,
             y,
@@ -1758,7 +1759,7 @@ fn create_benchmark_window(window_thread: WindowThread) -> eyre::Result<WindowHa
         debug!("benchmark window class already registered or registration deferred");
     }
 
-    let title = wide_null_terminated(WINDOW_TITLE);
+    let title = WINDOW_TITLE.easy_pcwstr()?;
     let initial_window_width = scaled_window_dimension(INITIAL_WINDOW_WIDTH, system_dpi());
     let initial_window_height = scaled_window_dimension(INITIAL_WINDOW_HEIGHT, system_dpi());
     // Safety: all pointers and handles passed to CreateWindowExW are valid for the duration of the call.
@@ -1766,7 +1767,7 @@ fn create_benchmark_window(window_thread: WindowThread) -> eyre::Result<WindowHa
         CreateWindowExW(
             custom_window_ex_style(),
             BENCHMARK_WINDOW_CLASS_NAME,
-            PCWSTR(title.as_ptr()),
+            title.as_ref(),
             base_custom_window_style(),
             0,
             0,
