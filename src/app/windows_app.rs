@@ -61,10 +61,12 @@ use super::spatial::{
     ClientPoint, ClientRect, ScreenPoint, ScreenRect, ScreenToClientTransform, TerminalCellPoint,
     classify_resize_border_hit, drag_threshold_exceeded,
 };
+use super::vt_types::key;
 use super::windows_audio::{
     BellSource, current_bell_source, current_bell_source_label, initialize_bell_source,
     ring_terminal_bell, set_bell_source,
 };
+use super::windows_cursor_info::{CursorInfoConfig, CursorInfoVirtualSession};
 use super::windows_d3d12_renderer::{
     ButtonVisualState, RenderFrameModel, RenderThreadProxy, RendererTerminalVisualState,
     WindowChromeButtonsState,
@@ -160,8 +162,179 @@ struct AppState {
     diagnostic_cell_width: i32,
     diagnostic_cell_height: i32,
     chrome_tooltip: ChromeTooltipController,
-    terminal: TerminalSession,
+    terminal: HostedTerminalSession,
     renderer: Option<RenderThreadProxy>,
+}
+
+enum HostedTerminalSession {
+    Pty(TerminalSession),
+    CursorInfoVirtual(Box<CursorInfoVirtualSession>),
+}
+
+impl HostedTerminalSession {
+    fn new_cursor_info_virtual(config: CursorInfoConfig) -> eyre::Result<Self> {
+        Ok(Self::CursorInfoVirtual(Box::new(
+            CursorInfoVirtualSession::new(config)?,
+        )))
+    }
+
+    fn set_wake_window(&mut self, hwnd: HWND) {
+        if let Self::Pty(terminal) = self {
+            terminal.set_wake_window(hwnd);
+        }
+    }
+
+    fn has_pending_output(&self) -> bool {
+        match self {
+            Self::Pty(terminal) => terminal.has_pending_output(),
+            Self::CursorInfoVirtual(_) => false,
+        }
+    }
+
+    fn chrome_state(&mut self) -> TerminalChromeState {
+        match self {
+            Self::Pty(terminal) => terminal.chrome_state(),
+            Self::CursorInfoVirtual(_) => TerminalChromeState::default(),
+        }
+    }
+
+    fn cached_display_state(&mut self) -> Arc<TerminalDisplayState> {
+        match self {
+            Self::Pty(terminal) => terminal.cached_display_state(),
+            Self::CursorInfoVirtual(terminal) => terminal.cached_display_state(),
+        }
+    }
+
+    fn take_repaint_requested(&mut self) -> bool {
+        match self {
+            Self::Pty(terminal) => terminal.take_repaint_requested(),
+            Self::CursorInfoVirtual(terminal) => terminal.take_repaint_requested(),
+        }
+    }
+
+    fn resize(&mut self, layout: TerminalLayout) -> eyre::Result<()> {
+        match self {
+            Self::Pty(terminal) => terminal.resize(layout),
+            Self::CursorInfoVirtual(terminal) => {
+                terminal.resize(layout);
+                Ok(())
+            }
+        }
+    }
+
+    fn pump(&mut self) -> eyre::Result<super::windows_terminal::PumpResult> {
+        match self {
+            Self::Pty(terminal) => terminal.pump(),
+            Self::CursorInfoVirtual(terminal) => Ok(terminal.pump()),
+        }
+    }
+
+    fn poll_pty_output(&mut self) -> eyre::Result<super::windows_terminal::PollPtyOutputResult> {
+        match self {
+            Self::Pty(terminal) => terminal.poll_pty_output(),
+            Self::CursorInfoVirtual(terminal) => terminal.poll_output(),
+        }
+    }
+
+    fn handle_char(&mut self, code_unit: u32, lparam: isize) -> eyre::Result<bool> {
+        let _ = lparam;
+        Ok(match self {
+            Self::Pty(terminal) => terminal.handle_char(code_unit, lparam)?,
+            Self::CursorInfoVirtual(terminal) => terminal.handle_char(code_unit),
+        })
+    }
+
+    fn handle_key_event(
+        &mut self,
+        vkey: u32,
+        lparam: isize,
+        was_down: bool,
+        is_release: bool,
+        mods: key::Mods,
+    ) -> eyre::Result<bool> {
+        let _ = (lparam, was_down, mods);
+        Ok(match self {
+            Self::Pty(terminal) => {
+                terminal.handle_key_event(vkey, lparam, was_down, is_release, mods)?
+            }
+            Self::CursorInfoVirtual(terminal) => terminal.handle_key_event(vkey, is_release),
+        })
+    }
+
+    fn handle_paste(&mut self, text: &str) -> eyre::Result<()> {
+        match self {
+            Self::Pty(terminal) => terminal.handle_paste(text),
+            Self::CursorInfoVirtual(_) => Ok(()),
+        }
+    }
+
+    fn note_frame_presented(&mut self) {
+        if let Self::Pty(terminal) = self {
+            terminal.note_frame_presented();
+        }
+    }
+
+    fn selected_text(&mut self, selection: TerminalSelection) -> eyre::Result<String> {
+        match self {
+            Self::Pty(terminal) => terminal.selected_text(selection),
+            Self::CursorInfoVirtual(terminal) => Ok(terminal.visible_text()),
+        }
+    }
+
+    fn viewport_metrics(&self) -> eyre::Result<super::windows_terminal::TerminalViewportMetrics> {
+        match self {
+            Self::Pty(terminal) => terminal.viewport_metrics(),
+            Self::CursorInfoVirtual(terminal) => Ok(terminal.viewport_metrics()),
+        }
+    }
+
+    fn viewport_to_screen_cell(&self, cell: TerminalCellPoint) -> eyre::Result<TerminalCellPoint> {
+        match self {
+            Self::Pty(terminal) => terminal.viewport_to_screen_cell(cell),
+            Self::CursorInfoVirtual(_) => Ok(cell),
+        }
+    }
+
+    fn scroll_viewport_by(&mut self, delta: isize) {
+        if let Self::Pty(terminal) = self {
+            terminal.scroll_viewport_by(delta);
+        }
+    }
+
+    fn scroll_viewport_to_offset(&mut self, offset: u64) -> eyre::Result<()> {
+        match self {
+            Self::Pty(terminal) => terminal.scroll_viewport_to_offset(offset),
+            Self::CursorInfoVirtual(_) => Ok(()),
+        }
+    }
+
+    fn mouse_reporting_enabled(&self) -> bool {
+        match self {
+            Self::Pty(terminal) => terminal.mouse_reporting_enabled(),
+            Self::CursorInfoVirtual(_) => true,
+        }
+    }
+
+    fn send_mouse_wheel(&mut self, cell: TerminalCellPoint, scroll_up: bool) -> eyre::Result<bool> {
+        let _ = cell;
+        Ok(match self {
+            Self::Pty(terminal) => terminal.send_mouse_wheel(cell, scroll_up)?,
+            Self::CursorInfoVirtual(terminal) => terminal.handle_mouse_wheel(scroll_up),
+        })
+    }
+
+    fn visible_display_state_with_selection(
+        &mut self,
+        selection: Option<TerminalSelection>,
+    ) -> eyre::Result<TerminalDisplayState> {
+        let _ = selection;
+        match self {
+            Self::Pty(terminal) => terminal.visible_display_state_with_selection(selection),
+            Self::CursorInfoVirtual(terminal) => {
+                Ok(terminal.cached_display_state().as_ref().clone())
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -784,9 +957,10 @@ pub fn run(
             let mut command =
                 crate::shell_default::command_builder_from_argv(&launch_command_argv)?;
             command.cwd(working_dir);
-            TerminalSession::new_with_command(command, vt_engine)
+            TerminalSession::new_with_command(command, vt_engine).map(HostedTerminalSession::Pty)
         }
-        None => TerminalSession::new(app_home, Some(working_dir), vt_engine),
+        None => TerminalSession::new(app_home, Some(working_dir), vt_engine)
+            .map(HostedTerminalSession::Pty),
     })?;
     run_with_terminal_session(terminal, launch_command_argv.len(), initial_stdin, title)
 }
@@ -854,7 +1028,7 @@ pub fn list_terminal_windows() -> eyre::Result<Vec<TerminalWindowSummary>> {
 
 #[instrument(level = "info", skip_all, fields(argc = launch_command_argc, has_initial_stdin = initial_stdin.is_some(), has_title = title.is_some()))]
 fn run_with_terminal_session(
-    terminal: TerminalSession,
+    terminal: HostedTerminalSession,
     launch_command_argc: usize,
     initial_stdin: Option<&str>,
     title: Option<&str>,
@@ -2286,7 +2460,13 @@ fn handle_char_message(
         return LRESULT(0);
     }
 
-    match with_app_state(|state| state.terminal.handle_char(code_unit, lparam.0)) {
+    match with_app_state(|state| {
+        let consumed = state.terminal.handle_char(code_unit, lparam.0)?;
+        if consumed && state.terminal.take_repaint_requested() {
+            render_current_frame(state, hwnd, None)?;
+        }
+        Ok(consumed)
+    }) {
         Ok(consumed) => {
             trace!(
                 message = "WM_CHAR",
@@ -2327,13 +2507,17 @@ fn handle_key_down_message(
     }
 
     match with_app_state(|state| {
-        state.terminal.handle_key_event(
+        let consumed = state.terminal.handle_key_event(
             virtual_key,
             lparam.0,
             was_down,
             false,
             keyboard_mods(virtual_key, lparam.0, false),
-        )
+        )?;
+        if consumed && state.terminal.take_repaint_requested() {
+            render_current_frame(state, hwnd, None)?;
+        }
+        Ok(consumed)
     }) {
         Ok(consumed) => {
             trace!(
@@ -2370,13 +2554,17 @@ fn handle_key_up_message(
     };
 
     match with_app_state(|state| {
-        state.terminal.handle_key_event(
+        let consumed = state.terminal.handle_key_event(
             virtual_key,
             lparam.0,
             false,
             true,
             keyboard_mods(virtual_key, lparam.0, true),
-        )
+        )?;
+        if consumed && state.terminal.take_repaint_requested() {
+            render_current_frame(state, hwnd, None)?;
+        }
+        Ok(consumed)
     }) {
         Ok(consumed) => {
             trace!(
@@ -2937,27 +3125,25 @@ fn perform_scene_action(
             thread::Builder::new()
                 .name("teamy-studio-launcher-cursor-info".to_owned())
                 .spawn(move || {
-                    let current_exe = match std::env::current_exe() {
-                        Ok(path) => path,
-                        Err(error) => {
-                            error!(
-                                ?error,
-                                "failed to resolve Teamy Studio executable for cursor-info"
-                            );
-                            return;
-                        }
-                    };
-                    let command_argv = vec![
-                        current_exe.to_string_lossy().into_owned(),
-                        "cursor-info".to_owned(),
-                    ];
-                    if let Err(error) = super::open_terminal_window(
-                        &app_home,
-                        Some(&command_argv),
-                        None,
-                        Some("Cursor Info"),
-                        vt_engine,
-                    ) {
+                    let _ = (app_home, vt_engine);
+                    let terminal =
+                        match HostedTerminalSession::new_cursor_info_virtual(CursorInfoConfig {
+                            initial_mode: super::CursorInfoRenderMode::Overlay,
+                            scale: 10,
+                            pixel_size: super::CursorInfoPixelSize::HalfHeight,
+                        }) {
+                            Ok(terminal) => terminal,
+                            Err(error) => {
+                                error!(
+                                    ?error,
+                                    "failed to create Teamy Studio virtual cursor-info session"
+                                );
+                                return;
+                            }
+                        };
+                    if let Err(error) =
+                        run_with_terminal_session(terminal, 0, None, Some("Cursor Info"))
+                    {
                         error!(?error, "failed to open Teamy Studio cursor-info window");
                     }
                 })
@@ -3869,6 +4055,9 @@ fn handle_mouse_wheel(hwnd: WindowHandle, wparam: WPARAM, lparam: LPARAM) -> eyr
                     .terminal
                     .send_mouse_wheel(cell, high_word_i16(wparam.0) > 0)?
             {
+                if state.terminal.take_repaint_requested() {
+                    render_current_frame(state, hwnd, None)?;
+                }
                 return Ok(true);
             }
 
@@ -4750,6 +4939,9 @@ fn handle_right_button_up(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Result<bo
                 Some(RightClickTerminalAction::Paste) => {
                     with_app_state(|state| {
                         state.terminal.handle_paste(&clipboard_text)?;
+                        if state.terminal.take_repaint_requested() {
+                            render_current_frame(state, hwnd, None)?;
+                        }
                         Ok(())
                     })?;
                     Ok(true)
@@ -4764,6 +4956,9 @@ fn handle_right_button_up(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Result<bo
                     if choice == PasteConfirmationChoice::Paste {
                         with_app_state(|state| {
                             state.terminal.handle_paste(&clipboard_text)?;
+                            if state.terminal.take_repaint_requested() {
+                                render_current_frame(state, hwnd, None)?;
+                            }
                             Ok(())
                         })?;
                     }

@@ -1,25 +1,23 @@
 mod pixel_size;
 
-use std::io::{BufWriter, stderr};
+use std::io::{BufWriter, Write, stderr};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use std::{convert::Infallible, mem};
 
+use crossterm::event::{
+    self, Event, KeyCode, KeyEvent, KeyEventKind, MouseButton, MouseEvent, MouseEventKind,
+};
+use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use eyre::Context;
 use image::{Rgba, RgbaImage};
 use pixel_size::PixelSize;
+use ratatui::Frame;
 use ratatui::Terminal;
+use ratatui::backend::{CrosstermBackend, TestBackend};
 use ratatui::buffer::Buffer;
-use ratatui::crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-    MouseButton, MouseEvent, MouseEventKind,
-};
-use ratatui::crossterm::execute;
-use ratatui::crossterm::terminal::{
-    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
-};
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::prelude::CrosstermBackend;
-use ratatui::style::{Color, Style, Stylize};
+use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph, Widget};
 use windows::Win32::Foundation::{HWND, LPARAM, RECT};
@@ -28,6 +26,7 @@ use windows::Win32::Graphics::Gdi::{
     DIB_RGB_COLORS, DeleteDC, DeleteObject, EnumDisplayMonitors, GetDC, GetDIBits, GetMonitorInfoW,
     GetObjectW, HDC, HMONITOR, MONITORINFO, RGBQUAD, ReleaseDC, SRCCOPY, SelectObject, StretchBlt,
 };
+use windows::Win32::UI::Input::KeyboardAndMouse::{VK_DOWN, VK_ESCAPE, VK_LEFT, VK_RIGHT, VK_UP};
 use windows::Win32::UI::WindowsAndMessaging::{
     CURSOR_SHOWING, CURSOR_SUPPRESSED, CURSORINFO, CURSORINFO_FLAGS, EnumWindows, GetClassNameW,
     GetCursorInfo, GetIconInfo, GetSystemMetrics, GetWindowRect, HCURSOR, ICONINFO,
@@ -37,7 +36,12 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::BOOL;
 
-use super::spatial::{ScreenPoint, ScreenRect};
+use super::spatial::{ScreenPoint, ScreenRect, TerminalCellPoint};
+use super::windows_terminal::{
+    PollPtyOutputResult, PumpResult, TerminalDisplayBackground, TerminalDisplayGlyph,
+    TerminalDisplayRow, TerminalDisplayScrollbar, TerminalDisplayState, TerminalLayout,
+    TerminalPerformanceSnapshot, TerminalViewportMetrics,
+};
 
 const FRAME_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const MIN_SCALE: i32 = 1;
@@ -50,7 +54,52 @@ const SECONDARY_TASKBAR_WINDOW_CLASS_NAME: &str = "Shell_SecondaryTrayWnd";
 const DESKTOP_WINDOW_CLASS_NAMES: [&str; 2] = ["Progman", "WorkerW"];
 const SIDEBAR_WIDTH: u16 = 34;
 const LEGEND_STATIC_ROWS: u16 = 7;
+const CURSOR_INFO_ENTER_TERMINAL_UI: &str =
+    "\x1b[?1049h\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h";
+const CURSOR_INFO_EXIT_TERMINAL_UI: &str =
+    "\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l\x1b[?1049l";
 type PanicHook = Box<dyn Fn(&std::panic::PanicHookInfo<'_>) + Send + Sync + 'static>;
+
+#[derive(Debug)]
+struct SharedWriter<W> {
+    inner: Arc<Mutex<W>>,
+}
+
+impl<W> SharedWriter<W> {
+    fn new(writer: W) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(writer)),
+        }
+    }
+}
+
+impl<W> Clone for SharedWriter<W> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+}
+
+impl<W: Write> Write for SharedWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let mut writer = self.inner.lock().map_err(|error| {
+            std::io::Error::other(format!(
+                "cursor-info output writer mutex was poisoned: {error}"
+            ))
+        })?;
+        writer.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        let mut writer = self.inner.lock().map_err(|error| {
+            std::io::Error::other(format!(
+                "cursor-info output writer mutex was poisoned: {error}"
+            ))
+        })?;
+        writer.flush()
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CursorInfoRenderMode {
@@ -202,16 +251,19 @@ impl CursorInfoState {
     }
 }
 
-struct TerminalRestoreGuard {
+struct TerminalRestoreGuard<W: Write + Send + 'static> {
     original_hook: Arc<Mutex<Option<PanicHook>>>,
+    restore_writer: SharedWriter<W>,
 }
 
-impl TerminalRestoreGuard {
-    fn enter() -> eyre::Result<Self> {
+impl<W: Write + Send + 'static> TerminalRestoreGuard<W> {
+    fn enter(writer: SharedWriter<W>) -> eyre::Result<Self> {
         let original_hook = Arc::new(Mutex::new(Some(std::panic::take_hook())));
         let hook_for_panic = Arc::clone(&original_hook);
+        let writer_for_panic = writer.clone();
         std::panic::set_hook(Box::new(move |info| {
-            let _ = restore_terminal_state();
+            let mut writer = writer_for_panic.clone();
+            let _ = restore_terminal_state(&mut writer);
             if let Ok(guard) = hook_for_panic.lock()
                 && let Some(hook) = guard.as_ref()
             {
@@ -220,15 +272,20 @@ impl TerminalRestoreGuard {
         }));
 
         enable_raw_mode().wrap_err("failed to enable raw mode for cursor-info")?;
-        execute!(stderr(), EnterAlternateScreen, EnableMouseCapture)
+        let mut writer_handle = writer.clone();
+        write_terminal_ui_sequence(&mut writer_handle, CURSOR_INFO_ENTER_TERMINAL_UI)
             .wrap_err("failed to enter alternate screen for cursor-info")?;
-        Ok(Self { original_hook })
+        Ok(Self {
+            original_hook,
+            restore_writer: writer,
+        })
     }
 }
 
-impl Drop for TerminalRestoreGuard {
+impl<W: Write + Send + 'static> Drop for TerminalRestoreGuard<W> {
     fn drop(&mut self) {
-        let _ = restore_terminal_state();
+        let mut writer = self.restore_writer.clone();
+        let _ = restore_terminal_state(&mut writer);
         if let Ok(mut guard) = self.original_hook.lock()
             && let Some(hook) = guard.take()
         {
@@ -238,8 +295,16 @@ impl Drop for TerminalRestoreGuard {
 }
 
 pub fn run(config: CursorInfoConfig) -> eyre::Result<()> {
-    let _restore_guard = TerminalRestoreGuard::enter()?;
-    let backend = CrosstermBackend::new(BufWriter::new(stderr()));
+    run_with_crossterm_writer(stderr(), config)
+}
+
+fn run_with_crossterm_writer<W: Write + Send + 'static>(
+    writer: W,
+    config: CursorInfoConfig,
+) -> eyre::Result<()> {
+    let shared_writer = SharedWriter::new(writer);
+    let _restore_guard = TerminalRestoreGuard::enter(shared_writer.clone())?;
+    let backend = CrosstermBackend::new(BufWriter::new(shared_writer));
     let mut terminal =
         Terminal::new(backend).wrap_err("failed to create cursor-info terminal backend")?;
     terminal
@@ -251,15 +316,25 @@ pub fn run(config: CursorInfoConfig) -> eyre::Result<()> {
     run_event_loop(&mut terminal, &mut state)
 }
 
-fn restore_terminal_state() -> eyre::Result<()> {
+fn restore_terminal_state<W: Write>(writer: &mut W) -> eyre::Result<()> {
     disable_raw_mode().wrap_err("failed to disable raw mode")?;
-    execute!(stderr(), LeaveAlternateScreen, DisableMouseCapture)
+    write_terminal_ui_sequence(writer, CURSOR_INFO_EXIT_TERMINAL_UI)
         .wrap_err("failed to restore alternate screen")?;
     Ok(())
 }
 
-fn run_event_loop(
-    terminal: &mut Terminal<CrosstermBackend<BufWriter<std::io::Stderr>>>,
+fn write_terminal_ui_sequence<W: Write>(writer: &mut W, sequence: &str) -> eyre::Result<()> {
+    writer
+        .write_all(sequence.as_bytes())
+        .wrap_err("failed to write terminal control sequence")?;
+    writer
+        .flush()
+        .wrap_err("failed to flush terminal control sequence")?;
+    Ok(())
+}
+
+fn run_event_loop<W: Write>(
+    terminal: &mut Terminal<CrosstermBackend<BufWriter<SharedWriter<W>>>>,
     state: &mut CursorInfoState,
 ) -> eyre::Result<()> {
     loop {
@@ -268,43 +343,8 @@ fn run_event_loop(
             state.viewport_center = snapshot.cursor.hotspot;
         }
 
-        let terminal_area = terminal
-            .size()
-            .wrap_err("failed to query cursor-info terminal size")?;
-        let [canvas_outer, _sidebar_area] =
-            Layout::horizontal([Constraint::Fill(1), Constraint::Length(SIDEBAR_WIDTH)])
-                .areas(terminal_area.into());
-        state.last_canvas_area = Block::bordered().title("Viewport").inner(canvas_outer);
-
-        let frame_data = build_frame_data(state, &snapshot)?;
-
-        terminal
-            .draw(|frame| {
-                let area = frame.area();
-                let [canvas_outer, sidebar_area] =
-                    Layout::horizontal([Constraint::Fill(1), Constraint::Length(SIDEBAR_WIDTH)])
-                        .areas(area);
-                let canvas_block = Block::bordered().title("Viewport");
-                let canvas_area = canvas_block.inner(canvas_outer);
-                canvas_block.render(canvas_outer, frame.buffer_mut());
-                state.last_canvas_area = canvas_area;
-
-                let legend_height = legend_height(&snapshot);
-                let [legend_area, info_area] =
-                    Layout::vertical([Constraint::Length(legend_height), Constraint::Fill(1)])
-                        .areas(sidebar_area);
-
-                render_canvas(
-                    frame.buffer_mut(),
-                    canvas_area,
-                    state.pixel_size,
-                    &frame_data,
-                );
-                render_legend(frame.buffer_mut(), legend_area, &snapshot);
-                render_info(frame.buffer_mut(), info_area, state, &snapshot);
-            })
+        render_cursor_info_frame(terminal, state, &snapshot)
             .wrap_err("failed to draw cursor-info frame")?;
-        state.last_frame_started_at = Instant::now();
 
         if event::poll(FRAME_POLL_INTERVAL).wrap_err("failed to poll cursor-info input")? {
             match event::read().wrap_err("failed to read cursor-info input")? {
@@ -321,6 +361,225 @@ fn run_event_loop(
     }
 
     Ok(())
+}
+
+fn render_cursor_info_frame<B: ratatui::backend::Backend>(
+    terminal: &mut Terminal<B>,
+    state: &mut CursorInfoState,
+    snapshot: &CursorInfoSnapshot,
+) -> Result<(), B::Error> {
+    let terminal_area = terminal.size()?;
+    let [canvas_outer, _sidebar_area] =
+        Layout::horizontal([Constraint::Fill(1), Constraint::Length(SIDEBAR_WIDTH)])
+            .areas(terminal_area.into());
+    state.last_canvas_area = Block::bordered().title("Viewport").inner(canvas_outer);
+
+    let frame_data = build_frame_data(state, snapshot)
+        .expect("cursor-info frame data should build before drawing the frame");
+
+    terminal.draw(|frame| {
+        draw_cursor_info_frame(frame, state, snapshot, &frame_data);
+    })?;
+    state.last_frame_started_at = Instant::now();
+    Ok(())
+}
+
+fn draw_cursor_info_frame(
+    frame: &mut Frame<'_>,
+    state: &mut CursorInfoState,
+    snapshot: &CursorInfoSnapshot,
+    frame_data: &CursorInfoFrameData,
+) {
+    let area = frame.area();
+    let [canvas_outer, sidebar_area] =
+        Layout::horizontal([Constraint::Fill(1), Constraint::Length(SIDEBAR_WIDTH)]).areas(area);
+    let canvas_block = Block::bordered().title("Viewport");
+    let canvas_area = canvas_block.inner(canvas_outer);
+    canvas_block.render(canvas_outer, frame.buffer_mut());
+    state.last_canvas_area = canvas_area;
+
+    let legend_height = legend_height(snapshot);
+    let [legend_area, info_area] =
+        Layout::vertical([Constraint::Length(legend_height), Constraint::Fill(1)])
+            .areas(sidebar_area);
+
+    render_canvas(
+        frame.buffer_mut(),
+        canvas_area,
+        state.pixel_size,
+        frame_data,
+    );
+    render_legend(frame.buffer_mut(), legend_area, snapshot);
+    render_info(frame.buffer_mut(), info_area, state, snapshot);
+}
+
+fn test_backend_to_terminal_display(
+    backend: &TestBackend,
+    terminal_area: Rect,
+) -> TerminalDisplayState {
+    const TEAMY_FOREGROUND: [f32; 4] = [0.93, 0.95, 0.98, 1.0];
+    const TEAMY_BACKGROUND: [f32; 4] = [0.06, 0.07, 0.09, 1.0];
+
+    let buffer = backend.buffer();
+    let width = usize::from(terminal_area.width);
+    let height = usize::from(terminal_area.height);
+    let mut rows = Vec::with_capacity(height);
+    for row_index in 0..height {
+        let mut display_row = TerminalDisplayRow {
+            row: i32::try_from(row_index).unwrap_or(i32::MAX),
+            backgrounds: Vec::new(),
+            glyphs: Vec::new(),
+        };
+
+        for column_index in 0..width {
+            let cell = &buffer.content[row_index * width + column_index];
+            let viewport_cell = TerminalCellPoint::new(
+                i32::try_from(column_index).unwrap_or(i32::MAX),
+                i32::try_from(row_index).unwrap_or(i32::MAX),
+            );
+            let (glyph_color, background) = ratatui_cell_colors(
+                cell.fg,
+                cell.bg,
+                cell.modifier,
+                TEAMY_FOREGROUND,
+                TEAMY_BACKGROUND,
+            );
+            if let Some(background) = background {
+                display_row.backgrounds.push(TerminalDisplayBackground {
+                    cell: viewport_cell,
+                    color: background,
+                });
+            }
+
+            if !cell.skip {
+                let character = cell.symbol().chars().next().unwrap_or(' ');
+                if character != ' ' && !cell.modifier.contains(Modifier::HIDDEN) {
+                    display_row.glyphs.push(TerminalDisplayGlyph {
+                        cell: viewport_cell,
+                        character,
+                        color: glyph_color,
+                    });
+                }
+            }
+        }
+        rows.push(display_row);
+    }
+
+    TerminalDisplayState {
+        dirty_rows: (0..rows.len()).collect(),
+        rows,
+        cursor: None,
+        scrollbar: Some(TerminalDisplayScrollbar {
+            total: u64::from(terminal_area.height),
+            offset: 0,
+            visible: u64::from(terminal_area.height),
+        }),
+    }
+}
+
+fn ratatui_cell_colors(
+    foreground: Color,
+    background: Color,
+    modifier: Modifier,
+    default_foreground: [f32; 4],
+    default_background: [f32; 4],
+) -> ([f32; 4], Option<[f32; 4]>) {
+    let mut foreground = ratatui_color_to_rgba(foreground, default_foreground);
+    let mut background_rgba = ratatui_color_to_rgba(background, default_background);
+    let mut draw_background = background != Color::Reset;
+
+    if modifier.contains(Modifier::REVERSED) {
+        std::mem::swap(&mut foreground, &mut background_rgba);
+        draw_background = true;
+    }
+
+    (foreground, draw_background.then_some(background_rgba))
+}
+
+fn ratatui_color_to_rgba(color: Color, default_color: [f32; 4]) -> [f32; 4] {
+    match color {
+        Color::Reset => default_color,
+        Color::Black => xterm_palette_color(0),
+        Color::Red => xterm_palette_color(1),
+        Color::Green => xterm_palette_color(2),
+        Color::Yellow => xterm_palette_color(3),
+        Color::Blue => xterm_palette_color(4),
+        Color::Magenta => xterm_palette_color(5),
+        Color::Cyan => xterm_palette_color(6),
+        Color::Gray => xterm_palette_color(7),
+        Color::DarkGray => xterm_palette_color(8),
+        Color::LightRed => xterm_palette_color(9),
+        Color::LightGreen => xterm_palette_color(10),
+        Color::LightYellow => xterm_palette_color(11),
+        Color::LightBlue => xterm_palette_color(12),
+        Color::LightMagenta => xterm_palette_color(13),
+        Color::LightCyan => xterm_palette_color(14),
+        Color::White => xterm_palette_color(15),
+        Color::Rgb(r, g, b) => [
+            f32::from(r) / 255.0,
+            f32::from(g) / 255.0,
+            f32::from(b) / 255.0,
+            1.0,
+        ],
+        Color::Indexed(index) => xterm_palette_color(index),
+    }
+}
+
+fn xterm_palette_color(index: u8) -> [f32; 4] {
+    let (r, g, b) = match index {
+        0 => (0, 0, 0),
+        1 => (205, 49, 49),
+        2 => (13, 188, 121),
+        3 => (229, 229, 16),
+        4 => (36, 114, 200),
+        5 => (188, 63, 188),
+        6 => (17, 168, 205),
+        7 => (229, 229, 229),
+        8 => (102, 102, 102),
+        9 => (241, 76, 76),
+        10 => (35, 209, 139),
+        11 => (245, 245, 67),
+        12 => (59, 142, 234),
+        13 => (214, 112, 214),
+        14 => (41, 184, 219),
+        15 => (255, 255, 255),
+        16..=231 => {
+            let index = index - 16;
+            let red = index / 36;
+            let green = (index % 36) / 6;
+            let blue = index % 6;
+            let component = |value: u8| if value == 0 { 0 } else { (value * 40) + 55 };
+            (component(red), component(green), component(blue))
+        }
+        232..=255 => {
+            let gray = 8 + ((index - 232) * 10);
+            (gray, gray, gray)
+        }
+    };
+
+    [
+        f32::from(r) / 255.0,
+        f32::from(g) / 255.0,
+        f32::from(b) / 255.0,
+        1.0,
+    ]
+}
+
+fn test_backend_visible_text(backend: &TestBackend) -> String {
+    let buffer = backend.buffer();
+    let width = usize::from(buffer.area.width);
+    let height = usize::from(buffer.area.height);
+    let mut rows = Vec::with_capacity(height);
+    for row_index in 0..height {
+        let start = row_index * width;
+        let end = start + width;
+        let mut row = String::new();
+        for cell in &buffer.content[start..end] {
+            row.push_str(cell.symbol());
+        }
+        rows.push(row.trim_end().to_owned());
+    }
+    rows.join("\n")
 }
 
 fn legend_height(snapshot: &CursorInfoSnapshot) -> u16 {
@@ -406,6 +665,178 @@ struct CursorInfoFrameData {
     logical_width: u32,
     logical_height: u32,
     colors: RgbaImage,
+}
+
+pub(crate) struct CursorInfoVirtualSession {
+    terminal: Terminal<TestBackend>,
+    state: CursorInfoState,
+    display: Arc<TerminalDisplayState>,
+    visible_text: String,
+    should_close: bool,
+    repaint_requested: bool,
+    performance: TerminalPerformanceSnapshot,
+}
+
+impl CursorInfoVirtualSession {
+    pub(crate) fn new(config: CursorInfoConfig) -> eyre::Result<Self> {
+        let initial_snapshot = capture_snapshot()?;
+        let state = CursorInfoState::new(config, initial_snapshot.cursor.hotspot);
+        let terminal = unwrap_infallible(Terminal::new(TestBackend::new(80, 24)));
+        let mut session = Self {
+            terminal,
+            state,
+            display: Arc::new(TerminalDisplayState::default()),
+            visible_text: String::new(),
+            should_close: false,
+            repaint_requested: true,
+            performance: TerminalPerformanceSnapshot::default(),
+        };
+        session.render_snapshot(&initial_snapshot);
+        Ok(session)
+    }
+
+    pub(crate) fn rows(&self) -> u16 {
+        unwrap_infallible(self.terminal.size()).height
+    }
+
+    pub(crate) fn cached_display_state(&self) -> Arc<TerminalDisplayState> {
+        Arc::clone(&self.display)
+    }
+
+    pub(crate) fn take_repaint_requested(&mut self) -> bool {
+        mem::take(&mut self.repaint_requested)
+    }
+
+    pub(crate) fn resize(&mut self, layout: TerminalLayout) {
+        let (cols, rows) = layout.grid_size();
+        let size = unwrap_infallible(self.terminal.size());
+        if size.width == cols && size.height == rows {
+            return;
+        }
+
+        self.terminal.backend_mut().resize(cols, rows);
+        self.repaint_requested = true;
+    }
+
+    pub(crate) fn pump(&mut self) -> PumpResult {
+        PumpResult {
+            should_close: self.should_close,
+        }
+    }
+
+    pub(crate) fn poll_output(&mut self) -> eyre::Result<PollPtyOutputResult> {
+        let snapshot = capture_snapshot()?;
+        let queued_output = self.render_snapshot(&snapshot);
+        Ok(PollPtyOutputResult {
+            queued_output,
+            should_close: self.should_close,
+        })
+    }
+
+    pub(crate) fn handle_char(&mut self, code_unit: u32) -> bool {
+        let Some(character) = char::from_u32(code_unit) else {
+            return false;
+        };
+
+        let key = KeyEvent::from(KeyCode::Char(character));
+        let cursor_hotspot = self.state.viewport_center;
+        let close = handle_key_event(&mut self.state, key, cursor_hotspot);
+        self.should_close |= close;
+        self.repaint_requested = true;
+        true
+    }
+
+    pub(crate) fn handle_key_event(&mut self, vkey: u32, is_release: bool) -> bool {
+        if is_release {
+            return false;
+        }
+
+        let key_code = match vkey {
+            code if code == u32::from(VK_ESCAPE.0) => Some(KeyCode::Esc),
+            code if code == u32::from(VK_LEFT.0) => Some(KeyCode::Left),
+            code if code == u32::from(VK_RIGHT.0) => Some(KeyCode::Right),
+            code if code == u32::from(VK_UP.0) => Some(KeyCode::Up),
+            code if code == u32::from(VK_DOWN.0) => Some(KeyCode::Down),
+            _ => None,
+        };
+        let Some(key_code) = key_code else {
+            return false;
+        };
+
+        let cursor_hotspot = self.state.viewport_center;
+        let close = handle_key_event(&mut self.state, KeyEvent::from(key_code), cursor_hotspot);
+        self.should_close |= close;
+        self.repaint_requested = true;
+        true
+    }
+
+    pub(crate) fn handle_mouse_wheel(&mut self, scroll_up: bool) -> bool {
+        if scroll_up {
+            self.state.zoom_in();
+        } else {
+            self.state.zoom_out();
+        }
+        self.repaint_requested = true;
+        true
+    }
+
+    pub(crate) fn visible_text(&self) -> String {
+        self.visible_text.clone()
+    }
+
+    pub(crate) fn viewport_metrics(&self) -> TerminalViewportMetrics {
+        let visible = u64::from(self.rows().max(1));
+        TerminalViewportMetrics {
+            total: visible,
+            offset: 0,
+            visible,
+            scrollback: 0,
+        }
+    }
+
+    fn render_snapshot(&mut self, snapshot: &CursorInfoSnapshot) -> bool {
+        if self.state.follow_cursor {
+            self.state.viewport_center = snapshot.cursor.hotspot;
+        }
+
+        let size = unwrap_infallible(self.terminal.size());
+        let terminal_area = Rect::new(0, 0, size.width, size.height);
+        let frame_data = build_frame_data(&self.state, snapshot)
+            .expect("cursor-info virtual session should build frame data");
+        unwrap_infallible(self.terminal.draw(|frame| {
+            draw_cursor_info_frame(frame, &mut self.state, snapshot, &frame_data);
+        }));
+        self.state.last_frame_started_at = Instant::now();
+
+        let next_display = Arc::new(test_backend_to_terminal_display(
+            self.terminal.backend(),
+            terminal_area,
+        ));
+        let changed = self.display.as_ref() != next_display.as_ref();
+        if changed {
+            self.performance.display_publications =
+                self.performance.display_publications.saturating_add(1);
+            self.performance.dirty_rows_published = self
+                .performance
+                .dirty_rows_published
+                .saturating_add(u64::try_from(next_display.rows.len()).unwrap_or(u64::MAX));
+            self.performance.max_dirty_rows_published = self
+                .performance
+                .max_dirty_rows_published
+                .max(next_display.rows.len());
+            self.display = next_display;
+            self.visible_text = test_backend_visible_text(self.terminal.backend());
+            self.repaint_requested = true;
+        }
+        changed
+    }
+}
+
+fn unwrap_infallible<T>(result: Result<T, Infallible>) -> T {
+    match result {
+        Ok(value) => value,
+        Err(never) => match never {},
+    }
 }
 
 fn build_frame_data(
