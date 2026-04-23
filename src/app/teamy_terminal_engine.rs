@@ -9,6 +9,15 @@ use super::vt_types::ScrollViewport;
 type BellEffect = Box<dyn FnMut() + Send>;
 type PtyWriteEffect = Box<dyn FnMut(&[u8]) + Send>;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum MouseTrackingMode {
+    #[default]
+    Off,
+    Click,
+    Drag,
+    Any,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum EscapeState {
     Ground,
@@ -175,6 +184,8 @@ pub struct TeamyTerminalEngine {
     cursor_style: TeamyCursorStyle,
     cursor_visible: bool,
     alternate_screen: Option<TeamySavedScreen>,
+    mouse_tracking_mode: MouseTrackingMode,
+    sgr_mouse_mode: bool,
     saved_cursor: Option<TeamySavedCursor>,
     pending_utf8: Vec<u8>,
     escape_state: EscapeState,
@@ -202,6 +213,8 @@ impl TeamyTerminalEngine {
             cursor_style: TeamyCursorStyle::Block,
             cursor_visible: true,
             alternate_screen: None,
+            mouse_tracking_mode: MouseTrackingMode::Off,
+            sgr_mouse_mode: false,
             saved_cursor: None,
             pending_utf8: Vec::new(),
             escape_state: EscapeState::Ground,
@@ -224,6 +237,11 @@ impl TeamyTerminalEngine {
         F: FnMut(&[u8]) + Send + 'static,
     {
         self.pty_write_effect = Some(Box::new(effect));
+    }
+
+    #[must_use]
+    pub fn mouse_reporting_enabled(&self) -> bool {
+        !matches!(self.mouse_tracking_mode, MouseTrackingMode::Off) && self.sgr_mouse_mode
     }
 
     pub fn vt_write(&mut self, bytes: &[u8]) {
@@ -747,6 +765,28 @@ impl TeamyTerminalEngine {
 
         match parameters {
             "?25" => self.cursor_visible = enabled,
+            "?1000" => {
+                self.mouse_tracking_mode = if enabled {
+                    MouseTrackingMode::Click
+                } else {
+                    MouseTrackingMode::Off
+                };
+            }
+            "?1002" => {
+                self.mouse_tracking_mode = if enabled {
+                    MouseTrackingMode::Drag
+                } else {
+                    MouseTrackingMode::Off
+                };
+            }
+            "?1003" => {
+                self.mouse_tracking_mode = if enabled {
+                    MouseTrackingMode::Any
+                } else {
+                    MouseTrackingMode::Off
+                };
+            }
+            "?1006" => self.sgr_mouse_mode = enabled,
             "?1047" | "?1049" => {
                 if enabled {
                     if parameters == "?1049" {
@@ -1588,6 +1628,20 @@ mod tests {
         engine.vt_write(b"\x1b[?1049l");
 
         assert_eq!(engine.visible_text(), "shell\nprompt");
+    }
+
+    #[test]
+    fn sgr_mouse_reporting_requires_tracking_and_sgr_modes() {
+        let mut engine = TeamyTerminalEngine::new(16, 4, 16);
+
+        engine.vt_write(b"\x1b[?1000h");
+        assert!(!engine.mouse_reporting_enabled());
+
+        engine.vt_write(b"\x1b[?1006h");
+        assert!(engine.mouse_reporting_enabled());
+
+        engine.vt_write(b"\x1b[?1000l");
+        assert!(!engine.mouse_reporting_enabled());
     }
 
     #[test]

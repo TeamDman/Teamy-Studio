@@ -41,6 +41,7 @@ impl SceneWindowKind {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SceneAction {
     OpenTerminal,
+    OpenCursorInfo,
     OpenStorage,
     OpenAudioPicker,
     SelectWindowsBell,
@@ -168,6 +169,13 @@ pub fn scene_button_specs(scene_kind: SceneWindowKind) -> &'static [SceneButtonS
                 tooltip: "Open terminal",
                 sprite: SpriteId::Terminal,
                 color: [0.18, 0.25, 0.35, 1.0],
+            },
+            SceneButtonSpec {
+                action: SceneAction::OpenCursorInfo,
+                label: "Cursor Info",
+                tooltip: "Open cursor-info",
+                sprite: SpriteId::Terminal,
+                color: [0.16, 0.30, 0.24, 1.0],
             },
             SceneButtonSpec {
                 action: SceneAction::OpenStorage,
@@ -534,6 +542,11 @@ mod tests {
         assert!(
             specs
                 .iter()
+                .any(|spec| spec.action == SceneAction::OpenCursorInfo)
+        );
+        assert!(
+            specs
+                .iter()
                 .any(|spec| spec.action == SceneAction::OpenStorage)
         );
         assert!(
@@ -577,8 +590,8 @@ mod tests {
             .filter(|panel| matches!(panel.effect, PanelEffect::SceneButtonCard))
             .count();
 
-        assert_eq!(card_count, 3);
-        assert_eq!(scene.sprites.len(), 3);
+        assert_eq!(card_count, 4);
+        assert_eq!(scene.sprites.len(), 4);
     }
 
     // windowing[verify garden-band.shared]

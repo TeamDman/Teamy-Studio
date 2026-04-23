@@ -1,9 +1,11 @@
+pub mod cursor_info;
 pub mod facet_shape;
 pub mod global_args;
 pub mod output;
 pub mod self_test;
 pub mod terminal;
 
+use crate::cli::cursor_info::CursorInfoArgs;
 use crate::cli::global_args::GlobalArgs;
 use crate::cli::output::CliOutput;
 use crate::cli::self_test::SelfTestArgs;
@@ -66,11 +68,15 @@ impl Cli {
 }
 
 /// Teamy Studio commands.
+/// tool[impl cli.surface.cursor-info]
 /// tool[impl cli.surface.terminal]
 /// tool[impl cli.surface.self-test]
 #[derive(Facet, Arbitrary, Debug, PartialEq)]
 #[repr(u8)]
 pub enum Command {
+    // cli[impl command.surface.cursor-info]
+    /// Inspect live desktop-space cursor geometry, screenshot-backed context, and overlay modes.
+    CursorInfo(CursorInfoArgs),
     // cli[impl command.surface.terminal]
     /// Open and enumerate terminal windows.
     Terminal(TerminalArgs),
@@ -90,6 +96,7 @@ impl Command {
         cache_home: &crate::paths::CacheHome,
     ) -> eyre::Result<CliOutput> {
         match self {
+            Command::CursorInfo(args) => args.invoke(app_home, cache_home),
             Command::Terminal(args) => args.invoke(app_home, cache_home),
             Command::SelfTest(args) => args.invoke(app_home, cache_home),
         }

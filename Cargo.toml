@@ -43,6 +43,7 @@ crossterm = "0.29"
 fontdb = "0.23"
 libghostty-vt = { git = "https://github.com/TeamDman/libghostty-rs.git", rev = "5e5351c9dc4b800202721ce15017c929958f685d", optional = true }
 portable-pty = "0.9"
+ratatui = { version = "0.30.0", default-features = false, features = ["crossterm"] }
 sguaba = { version = "0.10.3", default-features = false, features = ["std"] }
 teamy-windows = "0.11.1"
 ttf-parser = "0.25"

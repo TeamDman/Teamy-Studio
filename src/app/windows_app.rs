@@ -888,7 +888,7 @@ fn run_with_terminal_session(
             taskbar_progress: TaskbarProgressController::default(),
             pointer_position: None,
             pending_window_drag: None,
-            diagnostic_panel_visible: true,
+            diagnostic_panel_visible: false,
             diagnostic_selection: None,
             pending_diagnostic_selection: None,
             diagnostic_selection_drag_point: None,
@@ -2932,6 +2932,38 @@ fn perform_scene_action(
                 .wrap_err("failed to spawn Teamy Studio terminal window thread")?;
             Ok(SceneActionDisposition::KeepOpen)
         }
+        SceneAction::OpenCursorInfo => {
+            let app_home = app_home.clone();
+            thread::Builder::new()
+                .name("teamy-studio-launcher-cursor-info".to_owned())
+                .spawn(move || {
+                    let current_exe = match std::env::current_exe() {
+                        Ok(path) => path,
+                        Err(error) => {
+                            error!(
+                                ?error,
+                                "failed to resolve Teamy Studio executable for cursor-info"
+                            );
+                            return;
+                        }
+                    };
+                    let command_argv = vec![
+                        current_exe.to_string_lossy().into_owned(),
+                        "cursor-info".to_owned(),
+                    ];
+                    if let Err(error) = super::open_terminal_window(
+                        &app_home,
+                        Some(&command_argv),
+                        None,
+                        Some("Cursor Info"),
+                        vt_engine,
+                    ) {
+                        error!(?error, "failed to open Teamy Studio cursor-info window");
+                    }
+                })
+                .wrap_err("failed to spawn Teamy Studio cursor-info window thread")?;
+            Ok(SceneActionDisposition::KeepOpen)
+        }
         SceneAction::OpenStorage => {
             let _ = MessageDialog::new()
                 .set_level(MessageLevel::Info)
@@ -3831,6 +3863,15 @@ fn handle_mouse_wheel(hwnd: WindowHandle, wparam: WPARAM, lparam: LPARAM) -> eyr
         return with_app_state(|state| {
             let layout = terminal_client_layout(hwnd, state)?;
             let point = screen_to_client_point(hwnd, lparam)?;
+            if let Some(cell) = terminal_cell_from_client_point(layout, point, true)
+                && state.terminal.mouse_reporting_enabled()
+                && state
+                    .terminal
+                    .send_mouse_wheel(cell, high_word_i16(wparam.0) > 0)?
+            {
+                return Ok(true);
+            }
+
             if !layout.code_panel_rect().contains(point) {
                 return Ok(false);
             }

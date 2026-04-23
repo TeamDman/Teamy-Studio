@@ -73,6 +73,7 @@ fn test_version_includes_semver_and_git_revision() {
 // tool[verify cli.global.log-filter]
 // tool[verify cli.global.log-file]
 // tool[verify cli.global.output-format]
+// tool[verify cli.surface.cursor-info]
 // tool[verify cli.surface.terminal]
 // tool[verify cli.surface.self-test]
 #[test]
@@ -81,6 +82,10 @@ fn test_root_help_describes_commands_args_and_environment() {
     let text = output_text(&output);
 
     assert!(output.status.success(), "help command failed:\n{text}");
+    assert!(
+        text.contains("cursor-info"),
+        "missing cursor-info command in help:\n{text}"
+    );
     assert!(
         text.contains("terminal"),
         "missing terminal command in help:\n{text}"

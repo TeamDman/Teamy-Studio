@@ -50,17 +50,17 @@ const DEFAULT_ROWS: u16 = 24;
 const MAX_SCROLLBACK: usize = 20_000;
 const PTY_READ_BUFFER_BYTES: usize = 128 * 1_024;
 const PTY_READ_CHANNEL_CAPACITY: usize = 8;
-const TERMINAL_OUTPUT_SLICE_BYTES: usize = 256;
-const TERMINAL_OUTPUT_MEDIUM_SLICE_BYTES: usize = 512;
-const TERMINAL_OUTPUT_BURST_SLICE_BYTES: usize = 1024;
+const TERMINAL_OUTPUT_SLICE_BYTES: usize = 4 * 1024;
+const TERMINAL_OUTPUT_MEDIUM_SLICE_BYTES: usize = 8 * 1024;
+const TERMINAL_OUTPUT_BURST_SLICE_BYTES: usize = 16 * 1024;
 const TERMINAL_OUTPUT_QUEUE_SOFT_LIMIT_BYTES: usize = 64 * 1_024;
 const TERMINAL_DISPLAY_PUBLISH_INTERVAL: Duration = Duration::from_millis(16);
 const TERMINAL_DISPLAY_MEDIUM_PUBLISH_INTERVAL: Duration = Duration::from_millis(20);
 const TERMINAL_DISPLAY_BURST_PUBLISH_INTERVAL: Duration = Duration::from_millis(24);
 const TERMINAL_WORKER_IDLE_TIMEOUT: Duration = Duration::from_millis(1);
-const TERMINAL_WORKER_PUMP_TIME_BUDGET: Duration = Duration::from_millis(2);
-const TERMINAL_WORKER_MEDIUM_PUMP_TIME_BUDGET: Duration = Duration::from_millis(3);
-const TERMINAL_WORKER_BURST_PUMP_TIME_BUDGET: Duration = Duration::from_millis(4);
+const TERMINAL_WORKER_PUMP_TIME_BUDGET: Duration = Duration::from_millis(4);
+const TERMINAL_WORKER_MEDIUM_PUMP_TIME_BUDGET: Duration = Duration::from_millis(6);
+const TERMINAL_WORKER_BURST_PUMP_TIME_BUDGET: Duration = Duration::from_millis(8);
 const PANEL_GAP: i32 = 14;
 const DIAGNOSTIC_PANEL_HEIGHT: i32 = 152;
 const MIN_TERMINAL_PANEL_HEIGHT: i32 = 180;
@@ -471,6 +471,14 @@ impl RuntimeTerminalEngine {
         }
     }
 
+    fn mouse_reporting_enabled(&self) -> bool {
+        match self {
+            #[cfg(feature = "ghostty")]
+            Self::Ghostty(_) => false,
+            Self::Teamy(engine) => engine.mouse_reporting_enabled(),
+        }
+    }
+
     fn viewport_metrics(&self) -> eyre::Result<TerminalViewportMetrics> {
         match self {
             #[cfg(feature = "ghostty")]
@@ -595,6 +603,11 @@ enum TerminalWorkerCommand {
     ViewportToScreenCell(TerminalCellPoint),
     ScrollViewportBy(isize),
     ScrollViewportToOffset(u64),
+    MouseReportingEnabled,
+    SendMouseWheel {
+        cell: TerminalCellPoint,
+        scroll_up: bool,
+    },
     VisibleDisplayStateWithSelection(Option<TerminalSelection>),
     CurrentKittyKeyboardFlags,
     Win32InputModeEnabled,
@@ -1237,6 +1250,33 @@ impl TerminalSession {
         }
     }
 
+    pub fn mouse_reporting_enabled(&self) -> bool {
+        match self.request_read_only(TerminalWorkerCommand::MouseReportingEnabled) {
+            Ok(response) => match response.payload {
+                TerminalWorkerResponsePayload::Bool(enabled) => enabled,
+                _ => false,
+            },
+            Err(_) => false,
+        }
+    }
+
+    pub fn send_mouse_wheel(
+        &mut self,
+        cell: TerminalCellPoint,
+        scroll_up: bool,
+    ) -> eyre::Result<bool> {
+        let response = self.request(TerminalWorkerCommand::SendMouseWheel { cell, scroll_up })?;
+        match response.payload {
+            TerminalWorkerResponsePayload::Bool(sent) => {
+                if sent {
+                    self.note_input_latency_start();
+                }
+                Ok(sent)
+            }
+            payload => Self::unexpected_response("SendMouseWheel", payload),
+        }
+    }
+
     pub fn visible_display_state_with_selection(
         &mut self,
         selection: Option<TerminalSelection>,
@@ -1471,6 +1511,12 @@ impl TerminalWorkerRunner {
             TerminalWorkerCommand::ScrollViewportToOffset(offset) => {
                 self.core.scroll_viewport_to_offset(offset)?;
                 TerminalWorkerResponsePayload::Unit
+            }
+            TerminalWorkerCommand::MouseReportingEnabled => {
+                TerminalWorkerResponsePayload::Bool(self.core.mouse_reporting_enabled())
+            }
+            TerminalWorkerCommand::SendMouseWheel { cell, scroll_up } => {
+                TerminalWorkerResponsePayload::Bool(self.core.send_mouse_wheel(cell, scroll_up)?)
             }
             TerminalWorkerCommand::VisibleDisplayStateWithSelection(selection) => {
                 TerminalWorkerResponsePayload::DisplayState(
@@ -1805,6 +1851,20 @@ impl TerminalCore {
             performance: TerminalPerformanceSnapshot::default(),
             closed: false,
         })
+    }
+
+    fn mouse_reporting_enabled(&self) -> bool {
+        self.engine.mouse_reporting_enabled()
+    }
+
+    fn send_mouse_wheel(&mut self, cell: TerminalCellPoint, scroll_up: bool) -> eyre::Result<bool> {
+        if !self.mouse_reporting_enabled() {
+            return Ok(false);
+        }
+
+        let sequence = sgr_mouse_wheel_sequence(cell, scroll_up);
+        self.write_input(sequence.as_bytes())?;
+        Ok(true)
     }
 
     #[must_use]
@@ -4124,6 +4184,13 @@ fn should_keep_active_prompt_visible_on_resize(tracking: SemanticPromptTracking)
         )
 }
 
+fn sgr_mouse_wheel_sequence(cell: TerminalCellPoint, scroll_up: bool) -> String {
+    let button_code = if scroll_up { 64 } else { 65 };
+    let column = cell.column().max(0) + 1;
+    let row = cell.row().max(0) + 1;
+    format!("\x1b[<{button_code};{column};{row}M")
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -4279,6 +4346,18 @@ mod tests {
         assert_eq!(
             teamy_command.get_env(VtEngineChoice::CURRENT_TERMINAL_VT_ENGINE_ENV_VAR),
             Some(OsStr::new("teamy"))
+        );
+    }
+
+    #[test]
+    fn sgr_mouse_wheel_sequence_uses_one_based_terminal_cells() {
+        assert_eq!(
+            super::sgr_mouse_wheel_sequence(TerminalCellPoint::new(4, 9), true),
+            "\x1b[<64;5;10M"
+        );
+        assert_eq!(
+            super::sgr_mouse_wheel_sequence(TerminalCellPoint::new(4, 9), false),
+            "\x1b[<65;5;10M"
         );
     }
 

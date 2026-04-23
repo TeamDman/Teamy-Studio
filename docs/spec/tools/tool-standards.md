@@ -34,6 +34,9 @@ The CLI help output must describe environment variables that affect program beha
 tool[cli.surface.window]
 The CLI must expose a `window show` command that launches the main application terminal window.
 
+tool[cli.surface.cursor-info]
+The CLI must expose a `cursor-info` command surface that launches the standalone cursor diagnostics TUI.
+
 tool[cli.surface.terminal]
 The CLI must expose a `terminal` command surface that supports `default-shell`, `list`, and `open` subcommands.
 

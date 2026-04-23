@@ -5,6 +5,7 @@ pub mod teamy_terminal_engine;
 mod vt_types;
 mod windows_app;
 mod windows_audio;
+mod windows_cursor_info;
 mod windows_d3d12_renderer;
 mod windows_dialogs;
 mod windows_scene;
@@ -22,6 +23,7 @@ use facet::Facet;
 
 pub use render_verification::{RenderOffscreenFixtureListReport, RenderOffscreenSelfTestReport};
 pub use windows_app::TerminalThroughputBenchmarkResultsReport;
+pub use windows_cursor_info::{CursorInfoConfig, CursorInfoPixelSize, CursorInfoRenderMode};
 pub use windows_terminal_replay::TerminalReplayReport;
 pub use windows_terminal_self_test::KeyboardInputSelfTestReport;
 
@@ -69,6 +71,17 @@ pub struct TerminalWindowSummary {
 /// This function will return an error if the platform-specific window cannot be launched.
 pub fn run(app_home: &AppHome) -> eyre::Result<()> {
     windows_app::run_launcher(app_home, VtEngineChoice::default())
+}
+
+/// Run the standalone cursor-info diagnostic TUI.
+///
+/// # Errors
+///
+/// This function will return an error if the terminal UI cannot be initialized or the
+/// Windows snapshot backend fails.
+pub fn run_cursor_info(app_home: &AppHome, config: CursorInfoConfig) -> eyre::Result<()> {
+    let _ = app_home;
+    windows_cursor_info::run(config)
 }
 
 /// Run the Teamy Studio application shell with an explicit VT engine.

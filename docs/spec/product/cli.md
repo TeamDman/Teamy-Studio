@@ -7,6 +7,9 @@ This specification covers the current Teamy Studio command surface, command-spec
 cli[command.surface.core]
 Invoking `teamy-studio.exe` with no explicit command must open the launcher window.
 
+cli[command.surface.cursor-info]
+The CLI must expose a `cursor-info` command that launches the standalone cursor diagnostics TUI.
+
 cli[command.surface.terminal]
 The CLI must expose a `terminal` command group.
 
