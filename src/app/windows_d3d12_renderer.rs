@@ -27,7 +27,7 @@ use std::fs;
 use std::ops::Range;
 use std::path::Path;
 use std::path::PathBuf;
-use std::sync::{Arc, Condvar, Mutex, mpsc};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, mpsc};
 use std::thread;
 use std::time::Instant;
 
@@ -81,6 +81,10 @@ const TEAMY_D3D12_GPU_VALIDATION_ENV: &str = "TEAMY_D3D12_GPU_VALIDATION";
 const TEAMY_D3D12_OFFSCREEN_ADAPTER_ENV: &str = "TEAMY_D3D12_OFFSCREEN_ADAPTER";
 const SPRITE_SLOT_SIZE: u32 = 320;
 const SPRITE_TARGET_SIZE: u32 = 256;
+
+static TERMINAL_FONT_CACHE: OnceLock<Result<Arc<LoadedTerminalFont>, String>> = OnceLock::new();
+static SPRITE_ATLAS_CACHE: OnceLock<Result<Arc<SpriteAtlas>, String>> = OnceLock::new();
+static COMPILED_SHADER_CACHE: OnceLock<Result<CompiledShaders, String>> = OnceLock::new();
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -158,7 +162,7 @@ struct SlugGlyph {
     advance: f32,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct LoadedTerminalFont {
     font_bytes: Vec<u8>,
     face_index: u32,
@@ -312,8 +316,8 @@ pub struct D3d12PanelRenderer {
     curve_buffer: ID3D12Resource,
     band_buffer: ID3D12Resource,
     _sprite_buffer: ID3D12Resource,
-    sprite_atlas: SpriteAtlas,
-    font: LoadedTerminalFont,
+    sprite_atlas: Arc<SpriteAtlas>,
+    font: Arc<LoadedTerminalFont>,
     glyph_cache: HashMap<char, SlugGlyph>,
     cached_chars: Vec<char>,
     glyph_cache_generation: u64,
@@ -670,6 +674,10 @@ fn render_thread_main_loop(
 impl D3d12PanelRenderer {
     #[instrument(level = "info", skip_all)]
     pub fn new(hwnd: HWND) -> eyre::Result<Self> {
+        let font_prewarm = maybe_spawn_terminal_font_prewarm()?;
+        let sprite_atlas_prewarm = maybe_spawn_sprite_atlas_prewarm()?;
+        let shader_prewarm = maybe_spawn_compiled_shader_prewarm()?;
+
         let (dxgi_factory, device, dxgi_info_queue) =
             info_span!("create_d3d12_device").in_scope(create_device)?;
         let command_queue =
@@ -684,6 +692,11 @@ impl D3d12PanelRenderer {
         unsafe { swap_chain.SetMaximumFrameLatency(1)? };
         let frame_latency_waitable_object =
             unsafe { Owned::new(swap_chain.GetFrameLatencyWaitableObject()) };
+        let sprite_atlas = await_renderer_startup_task(
+            sprite_atlas_prewarm,
+            cached_sprite_atlas,
+            "sprite atlas prewarm",
+        )?;
 
         let (rtv_heap, rtv_descriptor_size, render_targets) =
             info_span!("create_render_targets")
@@ -692,10 +705,14 @@ impl D3d12PanelRenderer {
             .in_scope(|| create_command_allocators(&device))?;
         let (srv_heap, curve_buffer, band_buffer, sprite_buffer, sprite_atlas) =
             info_span!("create_shader_resources_and_srv")
-                .in_scope(|| create_shader_resources_and_srv(&device))?;
-        let font = info_span!("load_terminal_font").in_scope(load_terminal_font)?;
+                .in_scope(|| create_shader_resources_and_srv(&device, Arc::clone(&sprite_atlas)))?;
         let root_signature =
             info_span!("create_root_signature").in_scope(|| create_root_signature(&device))?;
+        await_renderer_startup_task(
+            shader_prewarm,
+            || cached_compiled_shaders().map(|_| ()),
+            "compiled shader prewarm",
+        )?;
         let pipeline_state = info_span!("create_pipeline_state")
             .in_scope(|| create_pipeline_state(&device, &root_signature))?;
         let command_list: ID3D12GraphicsCommandList = unsafe {
@@ -714,6 +731,11 @@ impl D3d12PanelRenderer {
             .in_scope(|| create_shader_param_buffer(&device))?;
         let fence: ID3D12Fence = unsafe { device.CreateFence(0, D3D12_FENCE_FLAG_NONE) }?;
         let fence_event = unsafe { Owned::new(CreateEventW(None, false, false, None)?) };
+        let font = await_renderer_startup_task(
+            font_prewarm,
+            cached_terminal_font,
+            "terminal font prewarm",
+        )?;
 
         let viewport = D3D12_VIEWPORT {
             TopLeftX: 0.0,
@@ -2344,6 +2366,18 @@ fn load_terminal_font() -> eyre::Result<LoadedTerminalFont> {
     })
 }
 
+fn cached_terminal_font() -> eyre::Result<Arc<LoadedTerminalFont>> {
+    TERMINAL_FONT_CACHE
+        .get_or_init(|| {
+            load_terminal_font()
+                .map(Arc::new)
+                .map_err(|error| error.to_string())
+        })
+        .as_ref()
+        .map(Arc::clone)
+        .map_err(|error| eyre::eyre!(error.clone()))
+}
+
 fn build_slug_curve_buffer(
     font: &LoadedTerminalFont,
     chars: &[char],
@@ -2558,8 +2592,9 @@ pub fn render_frame_model_offscreen_image(
         create_vertex_buffer(&device).wrap_err("failed to create offscreen vertex buffer")?;
     let shader_param_buffer = create_shader_param_buffer(&device)
         .wrap_err("failed to create offscreen shader parameter buffer")?;
+    let sprite_atlas = cached_sprite_atlas()?;
     let (srv_heap, curve_buffer, band_buffer, _sprite_buffer, sprite_atlas) =
-        create_shader_resources_and_srv(&device)
+        create_shader_resources_and_srv(&device, sprite_atlas)
             .wrap_err("failed to create offscreen shader resources")?;
     let (render_target, rtv_heap) = create_offscreen_render_target(&device, width, height)
         .wrap_err_with(|| {
@@ -3740,6 +3775,65 @@ impl OutlineBuilder for QuadraticCurveBuilder {
     }
 }
 
+fn maybe_spawn_terminal_font_prewarm()
+-> eyre::Result<Option<thread::JoinHandle<eyre::Result<Arc<LoadedTerminalFont>>>>> {
+    if TERMINAL_FONT_CACHE.get().is_some() {
+        return Ok(None);
+    }
+
+    thread::Builder::new()
+        .name("teamy-d3d12-font-prewarm".to_owned())
+        .spawn(|| info_span!("load_terminal_font").in_scope(cached_terminal_font))
+        .map(Some)
+        .map_err(|error| eyre::eyre!("failed to spawn terminal font prewarm: {error}"))
+}
+
+fn maybe_spawn_sprite_atlas_prewarm()
+-> eyre::Result<Option<thread::JoinHandle<eyre::Result<Arc<SpriteAtlas>>>>> {
+    if SPRITE_ATLAS_CACHE.get().is_some() {
+        return Ok(None);
+    }
+
+    thread::Builder::new()
+        .name("teamy-d3d12-sprite-atlas-prewarm".to_owned())
+        .spawn(|| info_span!("build_sprite_atlas").in_scope(cached_sprite_atlas))
+        .map(Some)
+        .map_err(|error| eyre::eyre!("failed to spawn sprite atlas prewarm: {error}"))
+}
+
+fn maybe_spawn_compiled_shader_prewarm()
+-> eyre::Result<Option<thread::JoinHandle<eyre::Result<()>>>> {
+    if COMPILED_SHADER_CACHE.get().is_some() {
+        return Ok(None);
+    }
+
+    thread::Builder::new()
+        .name("teamy-d3d12-shader-prewarm".to_owned())
+        .spawn(|| {
+            info_span!("compile_pipeline_shaders")
+                .in_scope(|| cached_compiled_shaders().map(|_| ()))
+        })
+        .map(Some)
+        .map_err(|error| eyre::eyre!("failed to spawn compiled shader prewarm: {error}"))
+}
+
+fn await_renderer_startup_task<T, F>(
+    handle: Option<thread::JoinHandle<eyre::Result<T>>>,
+    fallback: F,
+    task_name: &str,
+) -> eyre::Result<T>
+where
+    F: FnOnce() -> eyre::Result<T>,
+{
+    match handle {
+        Some(handle) => match handle.join() {
+            Ok(result) => result.wrap_err_with(|| format!("{task_name} failed")),
+            Err(_panic) => Err(eyre::eyre!("{task_name} panicked")),
+        },
+        None => fallback(),
+    }
+}
+
 fn create_device() -> eyre::Result<(IDXGIFactory4, ID3D12Device, Option<IDXGIInfoQueue>)> {
     create_device_with_adapter(false)
 }
@@ -4052,15 +4146,7 @@ fn create_pipeline_state(
     device: &ID3D12Device,
     root_signature: &ID3D12RootSignature,
 ) -> eyre::Result<ID3D12PipelineState> {
-    let compile_flags = if cfg!(debug_assertions) {
-        D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION
-    } else {
-        0
-    };
-
-    let shader_path = shader_path();
-    let vertex_shader = compile_shader(&shader_path, s!("VSMain"), s!("vs_5_0"), compile_flags)?;
-    let pixel_shader = compile_shader(&shader_path, s!("PSMain"), s!("ps_5_0"), compile_flags)?;
+    let shaders = cached_compiled_shaders()?;
 
     let input_layout = [
         D3D12_INPUT_ELEMENT_DESC {
@@ -4139,8 +4225,8 @@ fn create_pipeline_state(
 
     let description = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
         pRootSignature: std::mem::ManuallyDrop::new(Some(root_signature.clone())),
-        VS: shader_bytecode(&vertex_shader),
-        PS: shader_bytecode(&pixel_shader),
+        VS: shader_bytecode_slice(&shaders.vertex),
+        PS: shader_bytecode_slice(&shaders.pixel),
         BlendState: D3D12_BLEND_DESC {
             AlphaToCoverageEnable: false.into(),
             IndependentBlendEnable: false.into(),
@@ -4191,6 +4277,30 @@ fn create_pipeline_state(
     Ok(unsafe { device.CreateGraphicsPipelineState(&description) }?)
 }
 
+fn cached_compiled_shaders() -> eyre::Result<&'static CompiledShaders> {
+    COMPILED_SHADER_CACHE
+        .get_or_init(|| compile_shaders_for_cache().map_err(|error| error.to_string()))
+        .as_ref()
+        .map_err(|error| eyre::eyre!(error.clone()))
+}
+
+fn compile_shaders_for_cache() -> eyre::Result<CompiledShaders> {
+    let compile_flags = if cfg!(debug_assertions) {
+        D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION
+    } else {
+        0
+    };
+
+    let shader_path = shader_path();
+    let vertex_shader = compile_shader(&shader_path, s!("VSMain"), s!("vs_5_0"), compile_flags)?;
+    let pixel_shader = compile_shader(&shader_path, s!("PSMain"), s!("ps_5_0"), compile_flags)?;
+
+    Ok(CompiledShaders {
+        vertex: shader_blob_bytes(&vertex_shader),
+        pixel: shader_blob_bytes(&pixel_shader),
+    })
+}
+
 #[derive(Debug)]
 struct IncludedShaderSource {
     _bytes: Box<[u8]>,
@@ -4201,6 +4311,12 @@ struct IncludedShaderSource {
 struct ShaderIncludeHandler {
     root_directory: PathBuf,
     sources: Mutex<HashMap<usize, IncludedShaderSource>>,
+}
+
+#[derive(Debug)]
+struct CompiledShaders {
+    vertex: Vec<u8>,
+    pixel: Vec<u8>,
 }
 
 impl ShaderIncludeHandler {
@@ -4353,10 +4469,20 @@ fn shader_error(error: windows::core::Error, blob: Option<ID3DBlob>) -> eyre::Er
     }
 }
 
-fn shader_bytecode(shader: &ID3DBlob) -> D3D12_SHADER_BYTECODE {
+fn shader_blob_bytes(shader: &ID3DBlob) -> Vec<u8> {
+    unsafe {
+        std::slice::from_raw_parts(
+            shader.GetBufferPointer() as *const u8,
+            shader.GetBufferSize(),
+        )
+    }
+    .to_vec()
+}
+
+fn shader_bytecode_slice(shader: &[u8]) -> D3D12_SHADER_BYTECODE {
     D3D12_SHADER_BYTECODE {
-        pShaderBytecode: unsafe { shader.GetBufferPointer() },
-        BytecodeLength: unsafe { shader.GetBufferSize() },
+        pShaderBytecode: shader.as_ptr() as *const c_void,
+        BytecodeLength: shader.len(),
     }
 }
 
@@ -4494,6 +4620,18 @@ fn build_sprite_atlas() -> eyre::Result<SpriteAtlas> {
         windows_audio,
         file_audio,
     })
+}
+
+fn cached_sprite_atlas() -> eyre::Result<Arc<SpriteAtlas>> {
+    SPRITE_ATLAS_CACHE
+        .get_or_init(|| {
+            build_sprite_atlas()
+                .map(Arc::new)
+                .map_err(|error| error.to_string())
+        })
+        .as_ref()
+        .map(Arc::clone)
+        .map_err(|error| eyre::eyre!(error.clone()))
 }
 
 fn decode_embedded_sprite(bytes: &[u8]) -> eyre::Result<RgbaImage> {
@@ -4638,18 +4776,18 @@ fn pack_rgba8(color: [u8; 4]) -> u32 {
 
 fn create_shader_resources_and_srv(
     device: &ID3D12Device,
+    sprite_atlas: Arc<SpriteAtlas>,
 ) -> eyre::Result<(
     ID3D12DescriptorHeap,
     ID3D12Resource,
     ID3D12Resource,
     ID3D12Resource,
-    SpriteAtlas,
+    Arc<SpriteAtlas>,
 )> {
     let curve_data = vec![[0.0_f32; 4]; MAX_CURVE_FLOAT4_COUNT];
     let byte_len = (curve_data.len() * std::mem::size_of::<[f32; 4]>()) as u64;
     let band_data = vec![0_u32; MAX_BAND_UINT_COUNT];
     let band_byte_len = (band_data.len() * std::mem::size_of::<u32>()) as u64;
-    let sprite_atlas = build_sprite_atlas()?;
     let sprite_byte_len = (sprite_atlas.pixels.len() * std::mem::size_of::<u32>()) as u64;
 
     let mut curve_buffer = None;
