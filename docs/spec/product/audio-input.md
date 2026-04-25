@@ -1,6 +1,6 @@
 # Audio Input
 
-This specification covers the first visible Teamy Studio microphone picker slice.
+This specification covers the visible Teamy Studio microphone picker and selected-device slices.
 
 ## CLI Inventory
 
@@ -50,5 +50,8 @@ The microphone picker must let the `Show diagnostics` chrome button and `Alt+X` 
 audio[gui.diagnostics-tui]
 The microphone picker diagnostics mode must render as a real TUI with blocks and selected-device colors, not as a plain debug-text dump.
 
-audio[gui.selection-dialog]
-Selecting a microphone in the first slice must show a simple dialog reporting the selected microphone instead of opening a per-device workflow window.
+audio[gui.selected-device-window]
+Selecting a microphone must open a selected-device window that shows the microphone icon, name, endpoint id, state, and sample rate.
+
+audio[gui.arm-for-record]
+The selected-device window must expose a default-on arm-for-record icon button with tooltip text, without starting capture.

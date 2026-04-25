@@ -9,7 +9,7 @@ use windows::Win32::Foundation::RECT;
 
 use super::cell_grid;
 use super::spatial::{ClientPoint, ClientRect, TerminalCellPoint};
-use super::windows_audio_input::AudioInputDeviceSummary;
+use super::windows_audio_input::{AudioInputDeviceSummary, AudioInputDeviceWindowState};
 use super::windows_d3d12_renderer::{
     ButtonVisualState, PanelEffect, RenderScene, SpriteId, WindowChromeButtonsState,
     preferred_background_color, preferred_title_bar_color, push_centered_text, push_glyph,
@@ -38,6 +38,7 @@ pub enum SceneWindowKind {
     Launcher,
     AudioPicker,
     AudioInputDevicePicker,
+    AudioInputDeviceDetails,
 }
 
 impl SceneWindowKind {
@@ -47,6 +48,7 @@ impl SceneWindowKind {
             Self::Launcher => "Teamy Studio",
             Self::AudioPicker => "Audio Sources",
             Self::AudioInputDevicePicker => "Audio Devices",
+            Self::AudioInputDeviceDetails => "Microphone",
         }
     }
 }
@@ -71,6 +73,18 @@ pub struct AudioInputDeviceRowLayout {
     pub row_rect: ClientRect,
     pub icon_rect: ClientRect,
     pub text_rect: ClientRect,
+}
+
+#[expect(
+    clippy::struct_field_names,
+    reason = "these rect names reflect the rendered detail regions and hit targets"
+)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AudioInputDeviceDetailLayout {
+    pub icon_rect: ClientRect,
+    pub info_rect: ClientRect,
+    pub arm_button_rect: ClientRect,
+    pub arm_status_rect: ClientRect,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -241,7 +255,7 @@ pub fn scene_button_specs(scene_kind: SceneWindowKind) -> &'static [SceneButtonS
                 color: [0.23, 0.19, 0.30, 1.0],
             },
         ],
-        SceneWindowKind::AudioInputDevicePicker => &[],
+        SceneWindowKind::AudioInputDevicePicker | SceneWindowKind::AudioInputDeviceDetails => &[],
     }
 }
 
@@ -384,6 +398,169 @@ pub fn audio_input_device_row_layout(
         icon_rect,
         text_rect,
     })
+}
+
+#[must_use]
+// audio[impl gui.selected-device-window]
+// audio[impl gui.arm-for-record]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the selected-device window composes one compact visual surface with metadata and controls"
+)]
+pub fn build_audio_input_device_detail_render_scene(
+    layout: TerminalLayout,
+    window_chrome_buttons_state: WindowChromeButtonsState,
+    device_state: Option<&AudioInputDeviceWindowState>,
+) -> RenderScene {
+    let mut scene = build_scene_shell(
+        layout,
+        SceneWindowKind::AudioInputDeviceDetails,
+        window_chrome_buttons_state,
+    );
+    let body_rect = layout.terminal_panel_rect().inset(24);
+
+    let Some(device_state) = device_state else {
+        let empty_rect = ClientRect::new(
+            body_rect.left(),
+            body_rect.top() + 48,
+            body_rect.right(),
+            body_rect.top() + 132,
+        );
+        push_panel(
+            &mut scene,
+            empty_rect.to_win32_rect(),
+            [0.13, 0.15, 0.17, 1.0],
+            PanelEffect::SceneButtonCard,
+        );
+        push_text_block(
+            &mut scene,
+            empty_rect.inset(18).to_win32_rect(),
+            "No microphone is selected.",
+            10,
+            18,
+            [0.92, 0.93, 0.95, 1.0],
+        );
+        return scene;
+    };
+
+    let detail_layout = audio_input_device_detail_layout(body_rect);
+    let device = &device_state.device;
+    push_panel(
+        &mut scene,
+        body_rect.to_win32_rect(),
+        [0.10, 0.13, 0.15, 1.0],
+        PanelEffect::SceneBody,
+    );
+    push_sprite(
+        &mut scene,
+        detail_layout.icon_rect.to_win32_rect(),
+        [1.0, 1.0, 1.0, 1.0],
+        SpriteId::Audio,
+    );
+
+    let default_marker = if device.is_default { " [default]" } else { "" };
+    let sample_rate = device.sample_rate_hz.map_or_else(
+        || "sample rate: unknown".to_owned(),
+        |rate| format!("sample rate: {rate} Hz"),
+    );
+    let details = format!(
+        "{}{}\n{}\nstate: {}\n{}",
+        device.name, default_marker, sample_rate, device.state, device.id
+    );
+    push_text_block(
+        &mut scene,
+        detail_layout.info_rect.to_win32_rect(),
+        &details,
+        10,
+        18,
+        [0.95, 0.96, 0.98, 1.0],
+    );
+
+    push_panel_with_data(
+        &mut scene,
+        detail_layout.arm_button_rect.to_win32_rect(),
+        if device_state.armed_for_record {
+            [0.16, 0.36, 0.25, 1.0]
+        } else {
+            [0.18, 0.20, 0.22, 1.0]
+        },
+        PanelEffect::SceneButtonCard,
+        [
+            0.0,
+            if device_state.armed_for_record {
+                1.0
+            } else {
+                0.0
+            },
+            0.0,
+            0.0,
+        ],
+    );
+    push_sprite(
+        &mut scene,
+        detail_layout.arm_button_rect.inset(14).to_win32_rect(),
+        if device_state.armed_for_record {
+            [0.72, 1.0, 0.80, 1.0]
+        } else {
+            [0.68, 0.70, 0.72, 1.0]
+        },
+        SpriteId::Audio,
+    );
+    push_text_block(
+        &mut scene,
+        detail_layout.arm_status_rect.to_win32_rect(),
+        if device_state.armed_for_record {
+            "Armed for future recording"
+        } else {
+            "Recording arm disabled"
+        },
+        10,
+        18,
+        if device_state.armed_for_record {
+            [0.76, 0.96, 0.82, 1.0]
+        } else {
+            [0.82, 0.84, 0.86, 1.0]
+        },
+    );
+
+    scene
+}
+
+#[must_use]
+pub fn audio_input_device_detail_layout(body_rect: ClientRect) -> AudioInputDeviceDetailLayout {
+    let icon_size = body_rect.width().min(body_rect.height()).clamp(96, 164);
+    let icon_rect = ClientRect::new(
+        body_rect.left() + 28,
+        body_rect.top() + 42,
+        body_rect.left() + 28 + icon_size,
+        body_rect.top() + 42 + icon_size,
+    );
+    let arm_button_size = 74;
+    let arm_button_rect = ClientRect::new(
+        icon_rect.left(),
+        icon_rect.bottom() + 36,
+        icon_rect.left() + arm_button_size,
+        icon_rect.bottom() + 36 + arm_button_size,
+    );
+    let arm_status_rect = ClientRect::new(
+        arm_button_rect.right() + 18,
+        arm_button_rect.top() + 14,
+        body_rect.right() - 28,
+        arm_button_rect.bottom() - 10,
+    );
+    let info_rect = ClientRect::new(
+        icon_rect.right() + 32,
+        icon_rect.top() + 6,
+        body_rect.right() - 28,
+        icon_rect.bottom() + 24,
+    );
+
+    AudioInputDeviceDetailLayout {
+        icon_rect,
+        info_rect,
+        arm_button_rect,
+        arm_status_rect,
+    }
 }
 
 #[must_use]
@@ -947,6 +1124,12 @@ mod tests {
         }
     }
 
+    fn sample_audio_input_device_window() -> AudioInputDeviceWindowState {
+        let mut device = sample_audio_input_device("endpoint-a", "Studio Mic");
+        device.sample_rate_hz = Some(48_000);
+        AudioInputDeviceWindowState::new(device)
+    }
+
     #[test]
     fn scene_button_layouts_center_buttons_in_the_body() {
         let layouts =
@@ -1105,6 +1288,34 @@ mod tests {
                 .iter()
                 .any(|cell| { cell.symbol().contains("D") && cell.bg == Color::Rgb(28, 76, 88) })
         );
+    }
+
+    #[test]
+    // audio[verify gui.selected-device-window]
+    // audio[verify gui.arm-for-record]
+    fn audio_input_device_detail_render_shows_device_and_arm_button() {
+        let state = sample_audio_input_device_window();
+        let scene = build_audio_input_device_detail_render_scene(
+            sample_layout(),
+            WindowChromeButtonsState::default(),
+            Some(&state),
+        );
+        let body_rect = sample_layout().terminal_panel_rect().inset(24);
+        let detail_layout = audio_input_device_detail_layout(body_rect);
+
+        assert!(
+            scene
+                .sprites
+                .iter()
+                .any(|sprite| sprite.rect == detail_layout.icon_rect.to_win32_rect())
+        );
+        assert!(
+            scene
+                .panels
+                .iter()
+                .any(|panel| panel.rect == detail_layout.arm_button_rect.to_win32_rect())
+        );
+        assert!(!scene.glyphs.is_empty());
     }
 
     // windowing[verify garden-band.shared]

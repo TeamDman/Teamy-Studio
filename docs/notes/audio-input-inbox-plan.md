@@ -34,19 +34,16 @@ The product rule is simple: dictated text must never be sprayed into whichever e
   - Decided the audio-device UI should be hybrid from the start: terminal invocation keeps TUI behavior, while the GUI main menu gets an `Audio Devices` button that opens a dedicated window with pretty mode by default and a `Show diagnostics` chrome toggle to reveal the TUI/diagnostic view.
   - Decided TUI logic should be reusable and mode-aware so waveform, spectrogram, and chooser views can render as ratatui/cell-grid views in terminal mode and as richer native graphics in pretty window mode.
   - Decided the first visible GUI slice is all about the mic picker window: it includes the `Audio Devices` main-menu button with an image, a mic picker window listing name/icon/id/sample rate, keyboard navigation in pretty and TUI modes, `Alt+X` to toggle diagnostics/modes, and a storage-style dialog showing the picked microphone or microphones. The per-device audio-device window and `arm for record` control are deferred.
+  - Implemented the selected-microphone window slice: choosing a microphone now opens a dedicated microphone window with icon, name, endpoint id, state, sample rate, and a default-on arm-for-record icon button with tooltip text. This remains a no-capture UI control.
   - Captured the current Tracey status on 2026-04-25: all tracked requirements are covered. Verification remains partial: behavior 31/56, cli 26/44, convention 0/4, os 6/10, publishing 0/8, tool-standards 22/28, windowing 11/16.
   - Observed `tracey query unmapped` still reports broad repo-wide mapping debt, so new work should add explicit requirement references for touched code instead of trying to solve all historical mapping debt in this slice.
 - Current focus:
-  - Pick and document the next implementation slice for improving Teamy Studio after the large narration.
+  - Move from microphone choice into safe transcription inbox shell work, while preserving the no-capture boundary until capture is implemented explicitly.
 - Remaining work:
-  - Add a new product spec for audio input and safe transcription staging.
-  - Add a small recording-device inventory backend.
-  - Add the hybrid audio-device interaction model that can drive both real terminal TUI behavior and Teamy-window pretty rendering.
-  - Add an `Audio Devices` main-menu GUI button with an image and a mic picker window with pretty/TUI diagnostic modes.
   - Add a transcription inbox window that can display staged text without sending it to the OS focus target.
   - Only after the inbox exists, connect real capture and transcription.
 - Next step:
-  - Land the Tracey spec and first vertical GUI slice: recording-device enumeration, `teamy-studio audio input-device list`, `Audio Devices` main-menu button, mic picker window, sample-rate display, microphone icons, keyboard navigation in both modes, `Alt+X` diagnostics/mode toggle, and a storage-style picked-microphone dialog.
+  - Land the transcription inbox shell: a Teamy-owned window with staged text chunks and explicit copy/clear/append actions before any capture or transcription backend is attached.
 
 ## Why This Slice
 

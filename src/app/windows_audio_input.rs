@@ -58,6 +58,28 @@ pub struct AudioInputPickerState {
     pub devices: Vec<AudioInputDeviceSummary>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AudioInputDeviceWindowState {
+    pub device: AudioInputDeviceSummary,
+    pub armed_for_record: bool,
+}
+
+impl AudioInputDeviceWindowState {
+    #[must_use]
+    // audio[impl gui.selected-device-window]
+    // audio[impl gui.arm-for-record]
+    pub const fn new(device: AudioInputDeviceSummary) -> Self {
+        Self {
+            device,
+            armed_for_record: true,
+        }
+    }
+
+    pub const fn toggle_record_arm(&mut self) {
+        self.armed_for_record = !self.armed_for_record;
+    }
+}
+
 impl AudioInputPickerState {
     #[must_use]
     pub fn new(devices: Vec<AudioInputDeviceSummary>) -> Self {
@@ -181,17 +203,6 @@ pub fn list_active_audio_input_devices() -> eyre::Result<Vec<AudioInputDeviceSum
     }
 
     Ok(devices)
-}
-
-pub fn selected_audio_input_device_dialog_text(device: &AudioInputDeviceSummary) -> String {
-    let sample_rate = device.sample_rate_hz.map_or_else(
-        || "sample rate: unknown".to_owned(),
-        |rate| format!("sample rate: {rate} Hz"),
-    );
-    format!(
-        "Selected microphone:\n{}\n\nEndpoint id:\n{}\n\n{}",
-        device.name, device.id, sample_rate
-    )
 }
 
 #[expect(
@@ -350,12 +361,12 @@ mod tests {
     }
 
     #[test]
-    // audio[verify gui.selection-dialog]
-    fn selected_device_dialog_mentions_name_id_and_unknown_sample_rate() {
-        let text = selected_audio_input_device_dialog_text(&device("endpoint-id", "Studio Mic"));
+    // audio[verify gui.arm-for-record]
+    fn selected_device_window_starts_armed_and_can_toggle() {
+        let mut state = AudioInputDeviceWindowState::new(device("endpoint-id", "Studio Mic"));
 
-        assert!(text.contains("Studio Mic"));
-        assert!(text.contains("endpoint-id"));
-        assert!(text.contains("sample rate: unknown"));
+        assert!(state.armed_for_record);
+        state.toggle_record_arm();
+        assert!(!state.armed_for_record);
     }
 }
