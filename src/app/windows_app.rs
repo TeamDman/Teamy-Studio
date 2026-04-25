@@ -13,6 +13,7 @@ use eyre::Context;
 use facet::Facet;
 use rfd::{FileDialog, MessageButtons, MessageDialog, MessageLevel};
 use tracing::{debug, error, info, info_span, instrument};
+use widestring::U16CString;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, CLEARTYPE_QUALITY, CreateFontIndirectW, DeleteObject, EndPaint, GetDC,
@@ -50,12 +51,12 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_SYSKEYUP, WM_TIMER, WNDCLASSEXW, WS_EX_APPWINDOW, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOPMOST,
     WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP, WS_THICKFRAME, WS_VISIBLE,
 };
-use windows::core::{BOOL, PCWSTR, PWSTR, w};
+use windows::core::{BOOL, PCWSTR, w};
 
 use crate::paths::{AppHome, CacheHome};
 use crate::win32_support::clipboard::{read_clipboard, write_clipboard};
 use crate::win32_support::module::get_current_module;
-use crate::win32_support::string::EasyPCWSTR;
+use crate::win32_support::string::{EasyPCWSTR, PWSTRBuffer};
 
 use super::cell_grid;
 use super::spatial::{
@@ -380,7 +381,7 @@ struct SceneAppState {
 #[derive(Debug, Default)]
 struct ChromeTooltipController {
     hwnd: Option<HWND>,
-    text: Vec<u16>,
+    text: PWSTRBuffer,
     visible: bool,
 }
 
@@ -409,7 +410,7 @@ impl ChromeTooltipController {
 
         let mut controller = Self {
             hwnd: Some(hwnd),
-            text: wide_null_terminated(""),
+            text: PWSTRBuffer::default(),
             visible: false,
         };
         let tool = controller.tool_info(owner.raw());
@@ -440,7 +441,7 @@ impl ChromeTooltipController {
             return Ok(());
         };
 
-        self.text = wide_null_terminated(text);
+        self.text.set(text)?;
         let tool = self.tool_info(owner.raw());
         let tool_ptr: *const TTTOOLINFOW = &raw const tool;
         // Safety: the tooltip control reads the provided tool descriptor for this message call only.
@@ -513,7 +514,7 @@ impl ChromeTooltipController {
             uFlags: TTF_TRACK | TTF_ABSOLUTE,
             hwnd: owner,
             uId: 1,
-            lpszText: PWSTR(self.text.as_mut_ptr()),
+            lpszText: self.text.as_pwstr(),
             ..Default::default()
         }
     }
@@ -4036,8 +4037,9 @@ fn terminal_font_definition(font_height: i32) -> LOGFONTW {
         lfQuality: CLEARTYPE_QUALITY,
         ..Default::default()
     };
-    for (slot, value) in font.lfFaceName.iter_mut().zip(FONT_FAMILY.encode_utf16()) {
-        *slot = value;
+    let font_family = U16CString::from_str(FONT_FAMILY).expect("font family must not contain nul");
+    for (slot, value) in font.lfFaceName.iter_mut().zip(font_family.as_slice()) {
+        *slot = *value;
     }
     font
 }
@@ -5316,10 +5318,6 @@ fn left_mouse_button_is_down() -> bool {
     // Safety: querying the async key state for the left mouse button does not require extra invariants.
     let state = unsafe { GetKeyState(i32::from(VK_LBUTTON.0)) };
     (state.cast_unsigned() & 0x8000) != 0
-}
-
-fn wide_null_terminated(value: &str) -> Vec<u16> {
-    value.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
 fn update_terminal_chrome_tooltip(

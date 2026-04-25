@@ -3,6 +3,7 @@
 
 disallowed-methods = [
   { path = "std::env::set_var", reason = "Avoid setting global environment variables; use helpers (tempfile/TempEnv) or design APIs that accept configuration explicitly" },
+  { path = "std::os::windows::ffi::OsStrExt::encode_wide", reason = "Avoid ad hoc UTF-16 conversion for Win32 strings; use win32_support::string::EasyPCWSTR or PWSTRBuffer instead" },
 ]
 
 disallowed-macros = [
