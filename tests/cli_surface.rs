@@ -76,6 +76,7 @@ fn test_version_includes_semver_and_git_revision() {
 // tool[verify cli.surface.cursor-info]
 // tool[verify cli.surface.terminal]
 // tool[verify cli.surface.self-test]
+// audio[verify cli.audio-command]
 #[test]
 fn test_root_help_describes_commands_args_and_environment() {
     let output = run_teamy_studio(&["--help"], &[]);
@@ -93,6 +94,10 @@ fn test_root_help_describes_commands_args_and_environment() {
     assert!(
         text.contains("self-test"),
         "missing self-test command in help:\n{text}"
+    );
+    assert!(
+        text.contains("audio"),
+        "missing audio command in help:\n{text}"
     );
     assert!(
         !text.contains("\n    workspace\n"),
@@ -126,6 +131,38 @@ fn test_root_help_describes_commands_args_and_environment() {
     assert!(
         text.contains("RUST_LOG"),
         "missing RUST_LOG in help:\n{text}"
+    );
+}
+
+// audio[verify cli.audio-command]
+// audio[verify cli.input-device-command]
+// audio[verify cli.input-device-list]
+#[test]
+fn test_audio_input_device_help_is_available() {
+    let output = run_teamy_studio(&["audio", "--help"], &[]);
+    let text = output_text(&output);
+
+    assert!(output.status.success(), "audio help failed:\n{text}");
+    assert!(
+        text.contains("input-device"),
+        "missing input-device subcommand in help:\n{text}"
+    );
+
+    let output = run_teamy_studio(&["audio", "input-device", "--help"], &[]);
+    let text = output_text(&output);
+
+    assert!(output.status.success(), "input-device help failed:\n{text}");
+    assert!(
+        text.contains("list"),
+        "missing list subcommand in help:\n{text}"
+    );
+
+    let output = run_teamy_studio(&["audio", "input-device", "list", "--help"], &[]);
+    let text = output_text(&output);
+
+    assert!(
+        output.status.success(),
+        "input-device list help failed:\n{text}"
     );
 }
 

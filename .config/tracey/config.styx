@@ -93,4 +93,16 @@ specs (
             }
         )
     }
+    {
+        name teamy-studio-audio-input
+        source_url https://github.com/TeamDman/Teamy-Studio
+        include (docs/spec/product/audio-input.md)
+        impls (
+            {
+                name rust
+                include (src/**/*.rs)
+                test_include (tests/**/*.rs)
+            }
+        )
+    }
 )

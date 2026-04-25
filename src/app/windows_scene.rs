@@ -1,14 +1,22 @@
 use std::time::{Duration, Instant};
 
+use ratatui::buffer::Buffer;
+use ratatui::layout::{Constraint, Direction, Layout, Rect as RatatuiRect};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Widget, Wrap};
+use windows::Win32::Foundation::RECT;
+
 use super::cell_grid;
-use super::spatial::{ClientPoint, ClientRect};
+use super::spatial::{ClientPoint, ClientRect, TerminalCellPoint};
+use super::windows_audio_input::AudioInputDeviceSummary;
 use super::windows_d3d12_renderer::{
     ButtonVisualState, PanelEffect, RenderScene, SpriteId, WindowChromeButtonsState,
-    preferred_background_color, preferred_title_bar_color, push_centered_text, push_panel,
-    push_panel_with_data, push_sprite, push_title_text, push_window_chrome_buttons,
-    push_window_garden_frame,
+    preferred_background_color, preferred_title_bar_color, push_centered_text, push_glyph,
+    push_panel, push_panel_with_data, push_sprite, push_text_block, push_title_text,
+    push_window_chrome_buttons, push_window_garden_frame,
 };
-use super::windows_terminal::TerminalLayout;
+use super::windows_terminal::{TerminalLayout, TerminalSelection};
 
 pub const DEFAULT_MAX_BUTTON_SIZE: i32 = 300;
 const MIN_BUTTON_GAP: i32 = 12;
@@ -21,11 +29,15 @@ const MIN_BUTTON_SPRITE_INSET: i32 = 12;
 const MAX_BUTTON_SPRITE_INSET: i32 = 24;
 const BUTTON_PROXIMITY_RADIUS_PX: f64 = 96.0;
 const CLICK_DECAY_DURATION: Duration = Duration::from_millis(220);
+const DIAGNOSTIC_TEXT_COLOR: [f32; 4] = [0.92, 0.94, 0.96, 1.0];
+const DIAGNOSTIC_SELECTION_FOREGROUND: [f32; 4] = [0.04, 0.05, 0.06, 1.0];
+const DIAGNOSTIC_SELECTION_BACKGROUND: [f32; 4] = [0.42, 0.67, 0.98, 1.0];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SceneWindowKind {
     Launcher,
     AudioPicker,
+    AudioInputDevicePicker,
 }
 
 impl SceneWindowKind {
@@ -34,6 +46,7 @@ impl SceneWindowKind {
         match self {
             Self::Launcher => "Teamy Studio",
             Self::AudioPicker => "Audio Sources",
+            Self::AudioInputDevicePicker => "Audio Devices",
         }
     }
 }
@@ -44,8 +57,20 @@ pub enum SceneAction {
     OpenCursorInfo,
     OpenStorage,
     OpenAudioPicker,
+    OpenAudioInputDevices,
     SelectWindowsBell,
     SelectFileBell,
+}
+
+#[expect(
+    clippy::struct_field_names,
+    reason = "these names distinguish the rendered row regions used for hit testing"
+)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AudioInputDeviceRowLayout {
+    pub row_rect: ClientRect,
+    pub icon_rect: ClientRect,
+    pub text_rect: ClientRect,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -191,6 +216,14 @@ pub fn scene_button_specs(scene_kind: SceneWindowKind) -> &'static [SceneButtonS
                 sprite: SpriteId::Audio,
                 color: [0.25, 0.21, 0.11, 1.0],
             },
+            SceneButtonSpec {
+                // audio[impl gui.launcher-button]
+                action: SceneAction::OpenAudioInputDevices,
+                label: "Audio Devices",
+                tooltip: "Choose microphone input device",
+                sprite: SpriteId::Audio,
+                color: [0.13, 0.25, 0.32, 1.0],
+            },
         ],
         SceneWindowKind::AudioPicker => &[
             SceneButtonSpec {
@@ -208,7 +241,149 @@ pub fn scene_button_specs(scene_kind: SceneWindowKind) -> &'static [SceneButtonS
                 color: [0.23, 0.19, 0.30, 1.0],
             },
         ],
+        SceneWindowKind::AudioInputDevicePicker => &[],
     }
+}
+
+#[must_use]
+// audio[impl gui.picker-window]
+// audio[impl gui.pretty-device-list]
+pub fn build_audio_input_device_picker_render_scene(
+    layout: TerminalLayout,
+    window_chrome_buttons_state: WindowChromeButtonsState,
+    devices: &[AudioInputDeviceSummary],
+    selected_index: usize,
+) -> RenderScene {
+    let mut scene = build_scene_shell(
+        layout,
+        SceneWindowKind::AudioInputDevicePicker,
+        window_chrome_buttons_state,
+    );
+    let body_rect = layout.terminal_panel_rect().inset(22);
+    let title_rect = ClientRect::new(
+        body_rect.left(),
+        body_rect.top(),
+        body_rect.right(),
+        body_rect.top() + 44,
+    );
+    push_title_text(
+        &mut scene,
+        title_rect.to_win32_rect(),
+        "Microphones",
+        [0.98, 0.98, 1.0, 1.0],
+    );
+
+    if devices.is_empty() {
+        let empty_rect = ClientRect::new(
+            body_rect.left(),
+            title_rect.bottom() + 24,
+            body_rect.right(),
+            title_rect.bottom() + 96,
+        );
+        push_panel(
+            &mut scene,
+            empty_rect.to_win32_rect(),
+            [0.13, 0.15, 0.17, 1.0],
+            PanelEffect::SceneButtonCard,
+        );
+        push_text_block(
+            &mut scene,
+            empty_rect.inset(16).to_win32_rect(),
+            "No active Windows recording devices were found.",
+            10,
+            18,
+            [0.92, 0.93, 0.95, 1.0],
+        );
+        return scene;
+    }
+
+    for (index, device) in devices.iter().enumerate() {
+        let Some(row_layout) = audio_input_device_row_layout(body_rect, index, devices.len())
+        else {
+            break;
+        };
+        let selected = index == selected_index;
+        push_panel_with_data(
+            &mut scene,
+            row_layout.row_rect.to_win32_rect(),
+            if selected {
+                [0.20, 0.31, 0.38, 1.0]
+            } else {
+                [0.13, 0.16, 0.19, 1.0]
+            },
+            PanelEffect::SceneButtonCard,
+            [0.0, if selected { 1.0 } else { 0.0 }, 0.0, 0.0],
+        );
+        push_sprite(
+            &mut scene,
+            row_layout.icon_rect.to_win32_rect(),
+            [1.0, 1.0, 1.0, 1.0],
+            SpriteId::Audio,
+        );
+        let default_marker = if device.is_default { " [default]" } else { "" };
+        let sample_rate = device.sample_rate_hz.map_or_else(
+            || "sample rate: unknown".to_owned(),
+            |rate| format!("sample rate: {rate} Hz"),
+        );
+        let text = format!(
+            "{}{}\n{}\n{}",
+            device.name, default_marker, sample_rate, device.id
+        );
+        push_text_block(
+            &mut scene,
+            row_layout.text_rect.to_win32_rect(),
+            &text,
+            9,
+            16,
+            [0.95, 0.96, 0.98, 1.0],
+        );
+    }
+
+    scene
+}
+
+#[must_use]
+pub fn audio_input_device_row_layout(
+    body_rect: ClientRect,
+    index: usize,
+    device_count: usize,
+) -> Option<AudioInputDeviceRowLayout> {
+    if device_count == 0 {
+        return None;
+    }
+    let index_i32 = i32::try_from(index).ok()?;
+    let list_top = body_rect.top() + 66;
+    let row_height = 96;
+    let row_gap = 12;
+    let row_top = list_top + index_i32 * (row_height + row_gap);
+    if row_top >= body_rect.bottom() {
+        return None;
+    }
+    let row_rect = ClientRect::new(
+        body_rect.left(),
+        row_top,
+        body_rect.right(),
+        (row_top + row_height).min(body_rect.bottom()),
+    );
+    let icon_size = (row_rect.height() - 28).clamp(36, 68);
+    let icon_top = row_rect.top() + ((row_rect.height() - icon_size) / 2);
+    let icon_rect = ClientRect::new(
+        row_rect.left() + 18,
+        icon_top,
+        row_rect.left() + 18 + icon_size,
+        icon_top + icon_size,
+    );
+    let text_rect = ClientRect::new(
+        icon_rect.right() + 18,
+        row_rect.top() + 14,
+        row_rect.right() - 18,
+        row_rect.bottom() - 12,
+    );
+    Some(AudioInputDeviceRowLayout {
+        row_rect,
+        icon_rect,
+        text_rect,
+    })
 }
 
 #[must_use]
@@ -236,6 +411,311 @@ pub fn build_scene_diagnostic_render_scene(
     scene.sprites.extend(diagnostic_scene.sprites);
     scene.overlay_panels.extend(diagnostic_scene.overlay_panels);
     scene
+}
+
+#[must_use]
+// audio[impl gui.diagnostics-tui]
+pub fn build_audio_input_device_diagnostic_render_scene(
+    layout: TerminalLayout,
+    window_chrome_buttons_state: WindowChromeButtonsState,
+    devices: &[AudioInputDeviceSummary],
+    selected_index: usize,
+    selection: Option<TerminalSelection>,
+    cell_width: i32,
+    cell_height: i32,
+) -> RenderScene {
+    let mut scene = build_scene_shell(
+        layout,
+        SceneWindowKind::AudioInputDevicePicker,
+        window_chrome_buttons_state,
+    );
+    let body_rect = layout.terminal_panel_rect().inset(20);
+    let diagnostic_scene = build_audio_input_device_diagnostic_body_scene(
+        body_rect,
+        devices,
+        selected_index,
+        selection,
+        cell_width,
+        cell_height,
+    );
+    scene.panels.extend(diagnostic_scene.panels);
+    scene.glyphs.extend(diagnostic_scene.glyphs);
+    scene.sprites.extend(diagnostic_scene.sprites);
+    scene.overlay_panels.extend(diagnostic_scene.overlay_panels);
+    scene
+}
+
+fn build_audio_input_device_diagnostic_body_scene(
+    body_rect: ClientRect,
+    devices: &[AudioInputDeviceSummary],
+    selected_index: usize,
+    selection: Option<TerminalSelection>,
+    cell_width: i32,
+    cell_height: i32,
+) -> RenderScene {
+    let columns = u16::try_from((body_rect.width() / cell_width.max(1)).max(0)).unwrap_or_default();
+    let rows = u16::try_from((body_rect.height() / cell_height.max(1)).max(0)).unwrap_or_default();
+    if columns == 0 || rows == 0 {
+        return empty_render_scene();
+    }
+
+    let area = RatatuiRect::new(0, 0, columns, rows);
+    let mut buffer = Buffer::empty(area);
+    render_audio_input_device_diagnostic_buffer(&mut buffer, area, devices, selected_index);
+    ratatui_buffer_to_scene(body_rect, &buffer, selection, cell_width, cell_height)
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "the ratatui diagnostic layout is clearer when the three blocks are composed together"
+)]
+fn render_audio_input_device_diagnostic_buffer(
+    buffer: &mut Buffer,
+    area: RatatuiRect,
+    devices: &[AudioInputDeviceSummary],
+    selected_index: usize,
+) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(5),
+            Constraint::Min(4),
+            Constraint::Length(3),
+        ])
+        .split(area);
+    let selected_name = devices
+        .get(selected_index)
+        .map_or("None", |device| device.name.as_str());
+    let header = Paragraph::new(vec![
+        Line::from(vec![
+            Span::styled("Mode ", Style::new().fg(Color::DarkGray)),
+            Span::styled(
+                "diagnostics",
+                Style::new()
+                    .fg(Color::LightCyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("Selected ", Style::new().fg(Color::DarkGray)),
+            Span::styled(
+                selected_name.to_owned(),
+                Style::new().fg(Color::White).add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("Devices ", Style::new().fg(Color::DarkGray)),
+            Span::styled(
+                devices.len().to_string(),
+                Style::new().fg(Color::LightGreen),
+            ),
+        ]),
+    ])
+    .block(
+        Block::default()
+            .title(" Audio Devices ")
+            .borders(Borders::ALL)
+            .border_style(Style::new().fg(Color::Cyan)),
+    )
+    .wrap(Wrap { trim: true });
+    header.render(chunks[0], buffer);
+
+    let items = if devices.is_empty() {
+        vec![ListItem::new(Line::styled(
+            "No active Windows recording devices found",
+            Style::new().fg(Color::LightYellow),
+        ))]
+    } else {
+        devices
+            .iter()
+            .enumerate()
+            .map(|(index, device)| {
+                audio_input_device_diagnostic_item(index, selected_index, device)
+            })
+            .collect()
+    };
+    let list = List::new(items).block(
+        Block::default()
+            .title(" Active Microphones ")
+            .borders(Borders::ALL)
+            .border_style(Style::new().fg(Color::Blue)),
+    );
+    list.render(chunks[1], buffer);
+
+    let footer = Paragraph::new(Line::from(vec![
+        Span::styled(
+            "Up/Down",
+            Style::new()
+                .fg(Color::LightCyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" navigate  "),
+        Span::styled(
+            "Enter",
+            Style::new()
+                .fg(Color::LightCyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" choose  "),
+        Span::styled(
+            "Alt+X",
+            Style::new()
+                .fg(Color::LightCyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" pretty view  "),
+        Span::styled(
+            "Esc",
+            Style::new()
+                .fg(Color::LightCyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" close"),
+    ]))
+    .block(
+        Block::default()
+            .title(" Controls ")
+            .borders(Borders::ALL)
+            .border_style(Style::new().fg(Color::DarkGray)),
+    );
+    footer.render(chunks[2], buffer);
+}
+
+fn audio_input_device_diagnostic_item<'a>(
+    index: usize,
+    selected_index: usize,
+    device: &AudioInputDeviceSummary,
+) -> ListItem<'a> {
+    let selected = index == selected_index;
+    let sample_rate = device.sample_rate_hz.map_or_else(
+        || "sample rate unknown".to_owned(),
+        |rate| format!("{rate} Hz"),
+    );
+    let default_marker = if device.is_default { " default" } else { "" };
+    let base_style = if selected {
+        Style::new()
+            .fg(Color::White)
+            .bg(Color::Rgb(28, 76, 88))
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::new().fg(Color::Gray)
+    };
+
+    ListItem::new(vec![
+        Line::from(vec![
+            Span::styled(if selected { "> " } else { "  " }, base_style),
+            Span::styled(device.name.clone(), base_style),
+            Span::styled(default_marker, base_style.fg(Color::LightGreen)),
+        ]),
+        Line::from(vec![
+            Span::styled("    ", base_style),
+            Span::styled(sample_rate, base_style.fg(Color::LightBlue)),
+            Span::styled(" | ", base_style),
+            Span::styled(device.state.clone(), base_style.fg(Color::LightGreen)),
+        ]),
+        Line::from(vec![
+            Span::styled("    ", base_style),
+            Span::styled(device.id.clone(), base_style.fg(Color::DarkGray)),
+        ]),
+    ])
+    .style(base_style)
+}
+
+fn ratatui_buffer_to_scene(
+    body_rect: ClientRect,
+    buffer: &Buffer,
+    selection: Option<TerminalSelection>,
+    cell_width: i32,
+    cell_height: i32,
+) -> RenderScene {
+    let mut scene = empty_render_scene();
+    for row in 0..buffer.area.height {
+        for column in 0..buffer.area.width {
+            let Some(cell) = buffer.cell((column, row)) else {
+                continue;
+            };
+            let column_i32 = i32::from(column);
+            let row_i32 = i32::from(row);
+            let terminal_cell = TerminalCellPoint::new(column_i32, row_i32);
+            let selected = selection.is_some_and(|selection| selection.contains(terminal_cell));
+            let rect = RECT {
+                left: body_rect.left() + column_i32 * cell_width,
+                top: body_rect.top() + row_i32 * cell_height,
+                right: body_rect.left() + (column_i32 + 1) * cell_width,
+                bottom: body_rect.top() + (row_i32 + 1) * cell_height,
+            };
+
+            if selected {
+                push_panel(
+                    &mut scene,
+                    rect,
+                    DIAGNOSTIC_SELECTION_BACKGROUND,
+                    PanelEffect::TerminalFill,
+                );
+            } else if let Some(background) = ratatui_color_to_rgba(cell.bg) {
+                push_panel(&mut scene, rect, background, PanelEffect::TerminalFill);
+            }
+
+            let symbol = cell.symbol();
+            let Some(character) = symbol
+                .chars()
+                .next()
+                .filter(|character| !character.is_whitespace())
+            else {
+                continue;
+            };
+            push_glyph(
+                &mut scene,
+                rect,
+                character,
+                if selected {
+                    DIAGNOSTIC_SELECTION_FOREGROUND
+                } else {
+                    ratatui_color_to_rgba(cell.fg).unwrap_or(DIAGNOSTIC_TEXT_COLOR)
+                },
+            );
+        }
+    }
+    scene
+}
+
+fn empty_render_scene() -> RenderScene {
+    RenderScene {
+        panels: Vec::new(),
+        glyphs: Vec::new(),
+        sprites: Vec::new(),
+        overlay_panels: Vec::new(),
+    }
+}
+
+fn ratatui_color_to_rgba(color: Color) -> Option<[f32; 4]> {
+    let [red, green, blue] = match color {
+        Color::Reset => return None,
+        Color::Black => [10, 12, 14],
+        Color::Red => [210, 76, 76],
+        Color::Green => [88, 188, 116],
+        Color::Yellow => [212, 176, 74],
+        Color::Blue => [76, 126, 220],
+        Color::Magenta => [190, 110, 210],
+        Color::Cyan => [80, 190, 210],
+        Color::Gray => [190, 196, 204],
+        Color::DarkGray => [102, 112, 124],
+        Color::LightRed => [238, 112, 112],
+        Color::LightGreen => [124, 224, 148],
+        Color::LightYellow => [240, 210, 112],
+        Color::LightBlue => [122, 172, 255],
+        Color::LightMagenta => [220, 150, 238],
+        Color::LightCyan => [126, 230, 238],
+        Color::White => [242, 246, 250],
+        Color::Rgb(red, green, blue) => [red, green, blue],
+        Color::Indexed(index) => [index, index, index],
+    };
+    Some([
+        f32::from(red) / 255.0,
+        f32::from(green) / 255.0,
+        f32::from(blue) / 255.0,
+        1.0,
+    ])
 }
 
 #[must_use]
@@ -456,6 +936,17 @@ mod tests {
         }
     }
 
+    fn sample_audio_input_device(id: &str, name: &str) -> AudioInputDeviceSummary {
+        AudioInputDeviceSummary {
+            id: id.to_owned(),
+            name: name.to_owned(),
+            is_default: false,
+            state: "active".to_owned(),
+            icon: "microphone".to_owned(),
+            sample_rate_hz: None,
+        }
+    }
+
     #[test]
     fn scene_button_layouts_center_buttons_in_the_body() {
         let layouts =
@@ -576,6 +1067,7 @@ mod tests {
 
     // windowing[verify launcher.buttons.large-image-cards]
     #[test]
+    // audio[verify gui.launcher-button]
     fn launcher_scene_uses_card_panels_for_primary_actions() {
         let scene = build_scene_render_scene(
             sample_layout(),
@@ -590,8 +1082,29 @@ mod tests {
             .filter(|panel| matches!(panel.effect, PanelEffect::SceneButtonCard))
             .count();
 
-        assert_eq!(card_count, 4);
-        assert_eq!(scene.sprites.len(), 4);
+        assert_eq!(card_count, 5);
+        assert_eq!(scene.sprites.len(), 5);
+    }
+
+    #[test]
+    // audio[verify gui.diagnostics-tui]
+    fn audio_input_diagnostics_render_blocks_and_selected_color() {
+        let devices = vec![
+            sample_audio_input_device("endpoint-a", "Studio Mic"),
+            sample_audio_input_device("endpoint-b", "Desk Mic"),
+        ];
+        let area = RatatuiRect::new(0, 0, 80, 24);
+        let mut buffer = Buffer::empty(area);
+
+        render_audio_input_device_diagnostic_buffer(&mut buffer, area, &devices, 1);
+
+        assert_ne!(buffer.cell((0, 0)).map(|cell| cell.symbol()), Some(" "));
+        assert!(
+            buffer
+                .content()
+                .iter()
+                .any(|cell| { cell.symbol().contains("D") && cell.bg == Color::Rgb(28, 76, 88) })
+        );
     }
 
     // windowing[verify garden-band.shared]

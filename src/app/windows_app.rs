@@ -29,8 +29,8 @@ use windows::Win32::UI::Controls::{
 };
 use windows::Win32::UI::HiDpi::{GetDpiForSystem, GetDpiForWindow};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, VK_ADD, VK_CONTROL, VK_LBUTTON, VK_MENU, VK_OEM_MINUS, VK_OEM_PLUS, VK_SHIFT,
-    VK_SUBTRACT,
+    GetKeyState, VK_ADD, VK_CONTROL, VK_DOWN, VK_ESCAPE, VK_LBUTTON, VK_MENU, VK_OEM_MINUS,
+    VK_OEM_PLUS, VK_RETURN, VK_SHIFT, VK_SUBTRACT, VK_TAB, VK_UP,
 };
 use windows::Win32::UI::Shell::{
     ITaskbarList3, TBPF_ERROR, TBPF_INDETERMINATE, TBPF_NOPROGRESS, TBPF_NORMAL, TBPF_PAUSED,
@@ -67,6 +67,10 @@ use super::vt_types::key;
 use super::windows_audio::{
     BellSource, current_bell_source, current_bell_source_label, initialize_bell_source,
     ring_terminal_bell, set_bell_source,
+};
+use super::windows_audio_input::{
+    AudioInputPickerKey, AudioInputPickerKeyResult, AudioInputPickerState,
+    list_active_audio_input_devices, selected_audio_input_device_dialog_text,
 };
 use super::windows_cursor_info::{CursorInfoConfig, CursorInfoVirtualSession};
 use super::windows_d3d12_renderer::{
@@ -351,6 +355,7 @@ enum WindowChromeButton {
 enum ScenePressedTarget {
     ChromeButton(WindowChromeButton),
     Action(SceneAction),
+    AudioInputDevice(usize),
 }
 
 struct SceneAppState {
@@ -359,6 +364,7 @@ struct SceneAppState {
     dpi: u32,
     scene_kind: SceneWindowKind,
     vt_engine: VtEngineChoice,
+    audio_input_picker: AudioInputPickerState,
     pointer_position: Option<ClientPoint>,
     pressed_target: Option<ScenePressedTarget>,
     last_clicked_action: Option<ClickState<SceneAction>>,
@@ -826,7 +832,16 @@ enum ScenePointerAction {
     Handled,
     RenderOnly,
     Invoke(SceneAction),
+    ChooseAudioInputDevice(usize),
     WindowChrome(WindowChromeButton),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum SceneKeyAction {
+    NotHandled,
+    Handled,
+    CloseWindow,
+    ShowAudioInputDeviceDialog(Option<String>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1141,6 +1156,11 @@ fn run_scene_window(
         measure_terminal_cell_size(scaled_font_height(TERMINAL_FONT_HEIGHT, dpi))?;
     let (diagnostic_cell_width, diagnostic_cell_height) =
         measure_terminal_cell_size(scaled_font_height(DIAGNOSTIC_FONT_HEIGHT, dpi))?;
+    let audio_input_picker = if scene_kind == SceneWindowKind::AudioInputDevicePicker {
+        AudioInputPickerState::new(list_active_audio_input_devices().unwrap_or_default())
+    } else {
+        AudioInputPickerState::default()
+    };
 
     SCENE_APP_STATE.with(|state| {
         *state.borrow_mut() = Some(SceneAppState {
@@ -1149,6 +1169,7 @@ fn run_scene_window(
             dpi,
             scene_kind,
             vt_engine,
+            audio_input_picker,
             pointer_position: None,
             pressed_target: None,
             last_clicked_action: None,
@@ -1891,6 +1912,7 @@ extern "system" fn scene_window_proc(
         WM_DPICHANGED => handle_scene_dpi_changed(hwnd, lparam),
         WM_SIZE => handle_scene_size(hwnd),
         WM_TIMER if wparam.0 == FOCUSED_RENDER_TIMER_ID => handle_scene_focused_render_timer(hwnd),
+        WM_KEYDOWN | WM_SYSKEYDOWN => handle_scene_key_down_message(hwnd, message, wparam, lparam),
         WM_LBUTTONDOWN => handle_bool_message(hwnd, message, wparam, lparam, |hwnd| {
             handle_scene_left_button_down(hwnd, lparam)
         }),
@@ -2002,6 +2024,76 @@ fn handle_scene_focus_changed(hwnd: WindowHandle, focused: bool) -> LRESULT {
     }
 }
 
+fn handle_scene_key_down_message(
+    hwnd: WindowHandle,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    let virtual_key = match wparam_to_u32(wparam) {
+        Ok(virtual_key) => virtual_key,
+        Err(error) => return fail_and_close(hwnd, &error),
+    };
+    let action = with_scene_app_state(|state| {
+        if alt_key_is_down() && virtual_key == u32::from(b'X') {
+            // audio[impl gui.diagnostics-toggle]
+            scene_toggle_diagnostics_panel(state);
+            render_scene_window_frame(state, hwnd, None, false)?;
+            return Ok(SceneKeyAction::Handled);
+        }
+
+        if state.scene_kind != SceneWindowKind::AudioInputDevicePicker {
+            return Ok(SceneKeyAction::NotHandled);
+        }
+
+        let Some(key) = audio_input_picker_key_from_virtual_key(virtual_key) else {
+            return Ok(SceneKeyAction::NotHandled);
+        };
+        match state.audio_input_picker.handle_key(key) {
+            AudioInputPickerKeyResult::Handled => {
+                render_scene_window_frame(state, hwnd, None, false)?;
+                Ok(SceneKeyAction::Handled)
+            }
+            AudioInputPickerKeyResult::Choose => {
+                let description = state
+                    .audio_input_picker
+                    .selected_device()
+                    .map(selected_audio_input_device_dialog_text);
+                render_scene_window_frame(state, hwnd, None, false)?;
+                Ok(SceneKeyAction::ShowAudioInputDeviceDialog(description))
+            }
+            AudioInputPickerKeyResult::Close => Ok(SceneKeyAction::CloseWindow),
+        }
+    });
+
+    match action {
+        Ok(SceneKeyAction::NotHandled) => {
+            trace!(
+                message = if message == WM_SYSKEYDOWN {
+                    "WM_SYSKEYDOWN"
+                } else {
+                    "WM_KEYDOWN"
+                },
+                vkey = virtual_key,
+                lparam = lparam.0,
+                consumed = false,
+                "processed scene keyboard down message"
+            );
+            def_window_proc(hwnd, message, wparam, lparam)
+        }
+        Ok(SceneKeyAction::Handled) => LRESULT(0),
+        Ok(SceneKeyAction::CloseWindow) => {
+            hwnd.post_close();
+            LRESULT(0)
+        }
+        Ok(SceneKeyAction::ShowAudioInputDeviceDialog(description)) => {
+            show_selected_audio_input_device_dialog(description);
+            LRESULT(0)
+        }
+        Err(error) => fail_and_close(hwnd, &error),
+    }
+}
+
 fn handle_scene_destroy_message(hwnd: WindowHandle) -> LRESULT {
     SCENE_APP_STATE.with(|state| {
         if let Some(state) = state.borrow_mut().as_mut() {
@@ -2013,6 +2105,10 @@ fn handle_scene_destroy_message(hwnd: WindowHandle) -> LRESULT {
     LRESULT(0)
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "scene pointer dispatch keeps the chrome, diagnostics, launcher, and picker hit paths together"
+)]
 fn handle_scene_left_button_down(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Result<bool> {
     let point = ClientPoint::from_lparam(lparam);
     let selection_mode = if alt_key_is_down() {
@@ -2070,6 +2166,14 @@ fn handle_scene_left_button_down(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Re
             return Ok(ScenePointerAction::Invoke(action));
         }
 
+        if let Some(index) = audio_input_device_at_point(state, layout, point) {
+            state.pending_diagnostic_selection = None;
+            state.pressed_target = Some(ScenePressedTarget::AudioInputDevice(index));
+            state.audio_input_picker.select_index(index);
+            hwnd.capture_mouse();
+            return Ok(ScenePointerAction::ChooseAudioInputDevice(index));
+        }
+
         if scene_drag_handle_contains(layout, point) {
             state.diagnostic_selection = None;
             state.pending_diagnostic_selection = None;
@@ -2100,6 +2204,18 @@ fn handle_scene_left_button_down(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Re
             if disposition == SceneActionDisposition::CloseWindow {
                 hwnd.post_close();
             }
+            Ok(true)
+        }
+        ScenePointerAction::ChooseAudioInputDevice(index) => {
+            let description = with_scene_app_state(|state| {
+                Ok(state
+                    .audio_input_picker
+                    .devices
+                    .get(index)
+                    .map(selected_audio_input_device_dialog_text))
+            })?;
+            show_selected_audio_input_device_dialog(description);
+            with_scene_app_state(|state| render_scene_window_frame(state, hwnd, None, false))?;
             Ok(true)
         }
     }
@@ -2162,6 +2278,18 @@ fn handle_scene_left_button_up(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Resu
             if disposition == SceneActionDisposition::CloseWindow {
                 hwnd.post_close();
             }
+            Ok(true)
+        }
+        ScenePointerAction::ChooseAudioInputDevice(index) => {
+            let description = with_scene_app_state(|state| {
+                Ok(state
+                    .audio_input_picker
+                    .devices
+                    .get(index)
+                    .map(selected_audio_input_device_dialog_text))
+            })?;
+            show_selected_audio_input_device_dialog(description);
+            with_scene_app_state(|state| render_scene_window_frame(state, hwnd, None, false))?;
             Ok(true)
         }
     }
@@ -2887,7 +3015,19 @@ fn render_scene_window_frame(
 
     let layout = scene_client_layout(hwnd, state)?;
     let window_chrome_buttons_state = scene_window_chrome_buttons_state(state, hwnd, layout);
-    let scene = if state.diagnostics_visible {
+    let scene = if state.diagnostics_visible
+        && state.scene_kind == SceneWindowKind::AudioInputDevicePicker
+    {
+        windows_scene::build_audio_input_device_diagnostic_render_scene(
+            layout,
+            window_chrome_buttons_state,
+            &state.audio_input_picker.devices,
+            state.audio_input_picker.selected_index,
+            state.diagnostic_selection,
+            state.diagnostic_cell_width,
+            state.diagnostic_cell_height,
+        )
+    } else if state.diagnostics_visible {
         windows_scene::build_scene_diagnostic_render_scene(
             layout,
             state.scene_kind,
@@ -2896,6 +3036,13 @@ fn render_scene_window_frame(
             state.diagnostic_selection,
             state.diagnostic_cell_width,
             state.diagnostic_cell_height,
+        )
+    } else if state.scene_kind == SceneWindowKind::AudioInputDevicePicker {
+        windows_scene::build_audio_input_device_picker_render_scene(
+            layout,
+            window_chrome_buttons_state,
+            &state.audio_input_picker.devices,
+            state.audio_input_picker.selected_index,
         )
     } else {
         windows_scene::build_scene_render_scene(
@@ -2980,6 +3127,22 @@ fn build_scene_diagnostic_text(state: &SceneAppState) -> String {
 
     if let BellSource::File(path) = current_bell_source() {
         lines.push(format!("bell-file\t{}", path.display()));
+    }
+
+    if state.scene_kind == SceneWindowKind::AudioInputDevicePicker {
+        lines.push(format!(
+            "audio-input-selected-index\t{}",
+            state.audio_input_picker.selected_index
+        ));
+        lines.push("audio-input-devices".to_owned());
+        for (index, device) in state.audio_input_picker.devices.iter().enumerate() {
+            let status = if index == state.audio_input_picker.selected_index {
+                "selected"
+            } else {
+                "available"
+            };
+            lines.push(format!("- {}\t{}\t{}", device.name, status, device.id));
+        }
     }
 
     lines.push(String::new());
@@ -3103,9 +3266,64 @@ fn scene_interactive_region_contains(
             || (state.diagnostics_visible && scene_diagnostic_text_rect(layout).contains(point))
             || (!state.diagnostics_visible
                 && scene_action_at_point(state.scene_kind, layout, point).is_some())
+            || (!state.diagnostics_visible
+                && audio_input_device_at_point(state, layout, point).is_some())
     })
 }
 
+fn audio_input_device_at_point(
+    state: &SceneAppState,
+    layout: TerminalLayout,
+    point: ClientPoint,
+) -> Option<usize> {
+    if state.scene_kind != SceneWindowKind::AudioInputDevicePicker {
+        return None;
+    }
+    let body_rect = layout.terminal_panel_rect().inset(22);
+    (0..state.audio_input_picker.devices.len()).find(|index| {
+        windows_scene::audio_input_device_row_layout(
+            body_rect,
+            *index,
+            state.audio_input_picker.devices.len(),
+        )
+        .is_some_and(|row| row.row_rect.contains(point))
+    })
+}
+
+fn audio_input_picker_key_from_virtual_key(virtual_key: u32) -> Option<AudioInputPickerKey> {
+    if virtual_key == u32::from(VK_UP.0) {
+        return Some(AudioInputPickerKey::Up);
+    }
+    if virtual_key == u32::from(VK_DOWN.0) {
+        return Some(AudioInputPickerKey::Down);
+    }
+    if virtual_key == u32::from(VK_TAB.0) {
+        return Some(AudioInputPickerKey::Tab);
+    }
+    if virtual_key == u32::from(VK_RETURN.0) {
+        return Some(AudioInputPickerKey::Enter);
+    }
+    if virtual_key == u32::from(VK_ESCAPE.0) {
+        return Some(AudioInputPickerKey::Escape);
+    }
+    None
+}
+
+fn show_selected_audio_input_device_dialog(description: Option<String>) {
+    // audio[impl gui.selection-dialog]
+    let description = description.unwrap_or_else(|| "No active microphone is selected.".to_owned());
+    let _ = MessageDialog::new()
+        .set_level(MessageLevel::Info)
+        .set_title("Audio Devices")
+        .set_description(&description)
+        .set_buttons(MessageButtons::Ok)
+        .show();
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "scene action dispatch is intentionally centralized for small launcher actions"
+)]
 fn perform_scene_action(
     app_home: &AppHome,
     vt_engine: VtEngineChoice,
@@ -3177,6 +3395,23 @@ fn perform_scene_action(
                     }
                 })
                 .wrap_err("failed to spawn Teamy Studio audio picker thread")?;
+            Ok(SceneActionDisposition::KeepOpen)
+        }
+        SceneAction::OpenAudioInputDevices => {
+            // audio[impl gui.picker-window]
+            let app_home = app_home.clone();
+            thread::Builder::new()
+                .name("teamy-studio-audio-input-devices".to_owned())
+                .spawn(move || {
+                    if let Err(error) = run_scene_window(
+                        &app_home,
+                        SceneWindowKind::AudioInputDevicePicker,
+                        vt_engine,
+                    ) {
+                        error!(?error, "failed to open audio input device picker window");
+                    }
+                })
+                .wrap_err("failed to spawn Teamy Studio audio input device picker thread")?;
             Ok(SceneActionDisposition::KeepOpen)
         }
         SceneAction::SelectWindowsBell => {
@@ -5734,6 +5969,7 @@ mod tests {
             dpi: USER_DEFAULT_SCREEN_DPI,
             scene_kind: SceneWindowKind::Launcher,
             vt_engine: VtEngineChoice::default(),
+            audio_input_picker: AudioInputPickerState::default(),
             pointer_position: None,
             pressed_target: None,
             last_clicked_action: None,

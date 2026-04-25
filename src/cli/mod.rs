@@ -1,3 +1,4 @@
+pub mod audio;
 pub mod cursor_info;
 pub mod facet_shape;
 pub mod global_args;
@@ -5,6 +6,7 @@ pub mod output;
 pub mod self_test;
 pub mod terminal;
 
+use crate::cli::audio::AudioArgs;
 use crate::cli::cursor_info::CursorInfoArgs;
 use crate::cli::global_args::GlobalArgs;
 use crate::cli::output::CliOutput;
@@ -68,12 +70,16 @@ impl Cli {
 }
 
 /// Teamy Studio commands.
+/// audio[impl cli.audio-command]
 /// tool[impl cli.surface.cursor-info]
 /// tool[impl cli.surface.terminal]
 /// tool[impl cli.surface.self-test]
 #[derive(Facet, Arbitrary, Debug, PartialEq)]
 #[repr(u8)]
 pub enum Command {
+    // audio[impl cli.audio-command]
+    /// Enumerate and inspect audio devices.
+    Audio(AudioArgs),
     // cli[impl command.surface.cursor-info]
     /// Inspect live desktop-space cursor geometry, screenshot-backed context, and overlay modes.
     CursorInfo(CursorInfoArgs),
@@ -96,6 +102,7 @@ impl Command {
         cache_home: &crate::paths::CacheHome,
     ) -> eyre::Result<CliOutput> {
         match self {
+            Command::Audio(args) => args.invoke(app_home, cache_home),
             Command::CursorInfo(args) => args.invoke(app_home, cache_home),
             Command::Terminal(args) => args.invoke(app_home, cache_home),
             Command::SelfTest(args) => args.invoke(app_home, cache_home),

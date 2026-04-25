@@ -5,6 +5,7 @@ pub mod teamy_terminal_engine;
 mod vt_types;
 mod windows_app;
 mod windows_audio;
+mod windows_audio_input;
 mod windows_cursor_info;
 mod windows_d3d12_renderer;
 mod windows_dialogs;
@@ -23,6 +24,9 @@ use facet::Facet;
 
 pub use render_verification::{RenderOffscreenFixtureListReport, RenderOffscreenSelfTestReport};
 pub use windows_app::TerminalThroughputBenchmarkResultsReport;
+pub use windows_audio_input::{
+    AudioInputDeviceListReport, AudioInputDeviceSummary, list_active_audio_input_devices,
+};
 pub use windows_cursor_info::{CursorInfoConfig, CursorInfoPixelSize, CursorInfoRenderMode};
 pub use windows_terminal_replay::TerminalReplayReport;
 pub use windows_terminal_self_test::KeyboardInputSelfTestReport;
