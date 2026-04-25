@@ -233,6 +233,7 @@ pub enum PanelEffect {
     WindowChromeMaximize = 18,
     WindowChromeRestore = 19,
     WindowChromeClose = 20,
+    GearButton = 21,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]

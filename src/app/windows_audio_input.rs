@@ -2,6 +2,7 @@ use arbitrary::Arbitrary;
 use eyre::Context;
 use facet::Facet;
 use std::ffi::c_void;
+use std::process::Command;
 use windows::Win32::Devices::Properties;
 use windows::Win32::Foundation::{PROPERTYKEY, RPC_E_CHANGED_MODE};
 use windows::Win32::Media::Audio::{
@@ -49,6 +50,7 @@ pub enum AudioInputPickerKey {
     Down,
     Tab,
     Enter,
+    LegacyRecordingDevices,
     Escape,
 }
 
@@ -131,6 +133,9 @@ impl AudioInputPickerState {
                 AudioInputPickerKeyResult::Handled
             }
             AudioInputPickerKey::Enter => AudioInputPickerKeyResult::Choose,
+            AudioInputPickerKey::LegacyRecordingDevices => {
+                AudioInputPickerKeyResult::OpenLegacyRecordingDevices
+            }
             AudioInputPickerKey::Escape => AudioInputPickerKeyResult::Close,
         }
     }
@@ -140,7 +145,37 @@ impl AudioInputPickerState {
 pub enum AudioInputPickerKeyResult {
     Handled,
     Choose,
+    OpenLegacyRecordingDevices,
     Close,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LegacyRecordingDevicesCommand {
+    pub program: &'static str,
+    pub args: &'static [&'static str],
+}
+
+#[must_use]
+pub const fn legacy_recording_devices_command() -> LegacyRecordingDevicesCommand {
+    LegacyRecordingDevicesCommand {
+        program: "control.exe",
+        args: &["mmsys.cpl,,1"],
+    }
+}
+
+/// Open the legacy Windows Recording Devices dialog.
+///
+/// # Errors
+///
+/// Returns an error when Windows cannot spawn the legacy control panel command.
+// audio[impl gui.legacy-recording-dialog]
+pub fn open_legacy_recording_devices_dialog() -> eyre::Result<()> {
+    let command = legacy_recording_devices_command();
+    Command::new(command.program)
+        .args(command.args)
+        .spawn()
+        .wrap_err("failed to open Windows legacy recording devices dialog")?;
+    Ok(())
 }
 
 #[derive(Facet, Arbitrary, Debug, PartialEq, Eq)]
@@ -368,5 +403,14 @@ mod tests {
         assert!(state.armed_for_record);
         state.toggle_record_arm();
         assert!(!state.armed_for_record);
+    }
+
+    #[test]
+    // audio[verify gui.legacy-recording-dialog]
+    fn legacy_recording_devices_command_opens_recording_tab() {
+        let command = legacy_recording_devices_command();
+
+        assert_eq!(command.program, "control.exe");
+        assert_eq!(command.args, &["mmsys.cpl,,1"]);
     }
 }

@@ -85,6 +85,7 @@ pub struct AudioInputDeviceDetailLayout {
     pub info_rect: ClientRect,
     pub arm_button_rect: ClientRect,
     pub arm_status_rect: ClientRect,
+    pub legacy_recording_button_rect: ClientRect,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -286,6 +287,9 @@ pub fn build_audio_input_device_picker_render_scene(
         "Microphones",
         [0.98, 0.98, 1.0, 1.0],
     );
+    let legacy_dialog_button_rect = audio_input_legacy_recording_dialog_button_rect(body_rect);
+    // audio[impl gui.legacy-recording-dialog]
+    push_legacy_recording_dialog_button(&mut scene, legacy_dialog_button_rect);
 
     if devices.is_empty() {
         let empty_rect = ClientRect::new(
@@ -401,6 +405,16 @@ pub fn audio_input_device_row_layout(
 }
 
 #[must_use]
+pub fn audio_input_legacy_recording_dialog_button_rect(body_rect: ClientRect) -> ClientRect {
+    ClientRect::new(
+        body_rect.right() - 42,
+        body_rect.top() + 2,
+        body_rect.right(),
+        body_rect.top() + 44,
+    )
+}
+
+#[must_use]
 // audio[impl gui.selected-device-window]
 // audio[impl gui.arm-for-record]
 #[expect(
@@ -475,6 +489,7 @@ pub fn build_audio_input_device_detail_render_scene(
         18,
         [0.95, 0.96, 0.98, 1.0],
     );
+    push_legacy_recording_dialog_button(&mut scene, detail_layout.legacy_recording_button_rect);
 
     push_panel_with_data(
         &mut scene,
@@ -551,8 +566,14 @@ pub fn audio_input_device_detail_layout(body_rect: ClientRect) -> AudioInputDevi
     let info_rect = ClientRect::new(
         icon_rect.right() + 32,
         icon_rect.top() + 6,
-        body_rect.right() - 28,
+        body_rect.right() - 84,
         icon_rect.bottom() + 24,
+    );
+    let legacy_recording_button_rect = ClientRect::new(
+        body_rect.right() - 58,
+        body_rect.top() + 28,
+        body_rect.right() - 16,
+        body_rect.top() + 70,
     );
 
     AudioInputDeviceDetailLayout {
@@ -560,7 +581,19 @@ pub fn audio_input_device_detail_layout(body_rect: ClientRect) -> AudioInputDevi
         info_rect,
         arm_button_rect,
         arm_status_rect,
+        legacy_recording_button_rect,
     }
+}
+
+// audio[impl gui.legacy-recording-dialog]
+fn push_legacy_recording_dialog_button(scene: &mut RenderScene, rect: ClientRect) {
+    push_panel_with_data(
+        scene,
+        rect.to_win32_rect(),
+        [0.16, 0.22, 0.29, 1.0],
+        PanelEffect::GearButton,
+        [0.0, 0.0, 0.0, 0.0],
+    );
 }
 
 #[must_use]
@@ -657,7 +690,7 @@ fn render_audio_input_device_diagnostic_buffer(
         .constraints([
             Constraint::Length(5),
             Constraint::Min(4),
-            Constraint::Length(3),
+            Constraint::Length(4),
         ])
         .split(area);
     let selected_name = devices
@@ -719,36 +752,47 @@ fn render_audio_input_device_diagnostic_buffer(
     );
     list.render(chunks[1], buffer);
 
-    let footer = Paragraph::new(Line::from(vec![
-        Span::styled(
-            "Up/Down",
-            Style::new()
-                .fg(Color::LightCyan)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(" navigate  "),
-        Span::styled(
-            "Enter",
-            Style::new()
-                .fg(Color::LightCyan)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(" choose  "),
-        Span::styled(
-            "Alt+X",
-            Style::new()
-                .fg(Color::LightCyan)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(" pretty view  "),
-        Span::styled(
-            "Esc",
-            Style::new()
-                .fg(Color::LightCyan)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(" close"),
-    ]))
+    let footer = Paragraph::new(vec![
+        Line::from(vec![
+            Span::styled(
+                "Up/Down",
+                Style::new()
+                    .fg(Color::LightCyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" navigate  "),
+            Span::styled(
+                "Enter",
+                Style::new()
+                    .fg(Color::LightCyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" choose  "),
+            Span::styled(
+                "Esc",
+                Style::new()
+                    .fg(Color::LightCyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" close"),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                "Alt+X",
+                Style::new()
+                    .fg(Color::LightCyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" pretty view  "),
+            Span::styled(
+                "Alt+R",
+                Style::new()
+                    .fg(Color::LightCyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" Windows recording devices"),
+        ]),
+    ])
     .block(
         Block::default()
             .title(" Controls ")
@@ -1291,8 +1335,31 @@ mod tests {
     }
 
     #[test]
+    // audio[verify gui.legacy-recording-dialog]
+    fn audio_input_picker_render_shows_legacy_windows_gear_button() {
+        let devices = vec![sample_audio_input_device("endpoint-a", "Studio Mic")];
+        let scene = build_audio_input_device_picker_render_scene(
+            sample_layout(),
+            WindowChromeButtonsState::default(),
+            &devices,
+            0,
+        );
+        let body_rect = sample_layout().terminal_panel_rect().inset(22);
+        let legacy_dialog_rect = audio_input_legacy_recording_dialog_button_rect(body_rect);
+
+        assert!(
+            scene
+                .panels
+                .iter()
+                .any(|panel| panel.rect == legacy_dialog_rect.to_win32_rect()
+                    && matches!(panel.effect, PanelEffect::GearButton))
+        );
+    }
+
+    #[test]
     // audio[verify gui.selected-device-window]
     // audio[verify gui.arm-for-record]
+    // audio[verify gui.legacy-recording-dialog]
     fn audio_input_device_detail_render_shows_device_and_arm_button() {
         let state = sample_audio_input_device_window();
         let scene = build_audio_input_device_detail_render_scene(
@@ -1315,6 +1382,9 @@ mod tests {
                 .iter()
                 .any(|panel| panel.rect == detail_layout.arm_button_rect.to_win32_rect())
         );
+        assert!(scene.panels.iter().any(|panel| panel.rect
+            == detail_layout.legacy_recording_button_rect.to_win32_rect()
+            && matches!(panel.effect, PanelEffect::GearButton)));
         assert!(!scene.glyphs.is_empty());
     }
 

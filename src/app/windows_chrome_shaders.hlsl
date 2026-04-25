@@ -100,6 +100,23 @@ float icon_close(float2 uv) {
     return max(line1, line2);
 }
 
+float ring_mask(float2 uv, float2 center, float radius, float thickness) {
+    float distance_field = abs(length(uv - center) - radius);
+    return 1.0 - smoothstep(thickness, thickness + 0.018, distance_field);
+}
+
+float icon_gear(float2 uv) {
+    float2 p = uv - 0.5;
+    float angle = atan2(p.y, p.x);
+    float tooth_wave = abs(cos(angle * 8.0));
+    float tooth_radius = 0.31 + (0.075 * smoothstep(0.62, 0.96, tooth_wave));
+    float outer = 1.0 - smoothstep(tooth_radius, tooth_radius + 0.018, length(p));
+    float inner_clear = 1.0 - smoothstep(0.125, 0.145, length(p));
+    float body = saturate(outer - inner_clear);
+    float ring = ring_mask(uv, float2(0.5, 0.5), 0.22, 0.04);
+    return saturate(max(body, ring));
+}
+
 float chrome_icon_mask(float2 uv, float effect) {
     if (effect < 16.5) {
         return icon_diagnostics(uv);
@@ -115,6 +132,10 @@ float chrome_icon_mask(float2 uv, float effect) {
 
     if (effect < 19.5) {
         return icon_restore(uv);
+    }
+
+    if (effect > 20.5) {
+        return icon_gear(uv);
     }
 
     return icon_close(uv);

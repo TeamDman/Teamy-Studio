@@ -41,6 +41,9 @@ The microphone picker must default to a pretty device list that shows the device
 audio[gui.windows-icon-sprite]
 The microphone picker should render microphone imagery from a Windows icon resource when the resource is available.
 
+audio[gui.legacy-recording-dialog]
+The microphone picker must expose a shader-rendered gear button and hotkey that open the Windows legacy Recording Devices dialog, and the selected-device window must reuse that gear button.
+
 audio[gui.keyboard-navigation]
 The microphone picker must support keyboard navigation and selection in both pretty and diagnostics modes.
 
