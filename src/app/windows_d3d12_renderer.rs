@@ -234,6 +234,7 @@ pub enum PanelEffect {
     WindowChromeRestore = 19,
     WindowChromeClose = 20,
     GearButton = 21,
+    RecordArmButton = 22,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]

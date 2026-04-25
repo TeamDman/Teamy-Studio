@@ -3,8 +3,11 @@ use std::time::{Duration, Instant};
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Direction, Layout, Rect as RatatuiRect};
 use ratatui::style::{Color, Modifier, Style};
+use ratatui::symbols;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Widget, Wrap};
+use ratatui::widgets::{
+    Axis, Block, Borders, Chart, Dataset, GraphType, List, ListItem, Paragraph, Widget, Wrap,
+};
 use windows::Win32::Foundation::RECT;
 
 use super::cell_grid;
@@ -86,6 +89,9 @@ pub struct AudioInputDeviceDetailLayout {
     pub arm_button_rect: ClientRect,
     pub arm_status_rect: ClientRect,
     pub legacy_recording_button_rect: ClientRect,
+    pub buffer_section_rect: ClientRect,
+    pub waveform_rect: ClientRect,
+    pub timeline_label_rect: ClientRect,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -494,14 +500,21 @@ pub fn build_audio_input_device_detail_render_scene(
     push_panel_with_data(
         &mut scene,
         detail_layout.arm_button_rect.to_win32_rect(),
-        if device_state.armed_for_record {
-            [0.16, 0.36, 0.25, 1.0]
+        if device_state.is_recording() {
+            [0.92, 0.09, 0.07, 1.0]
+        } else if device_state.armed_for_record {
+            [0.44, 0.05, 0.05, 1.0]
         } else {
-            [0.18, 0.20, 0.22, 1.0]
+            [0.18, 0.05, 0.05, 1.0]
         },
-        PanelEffect::SceneButtonCard,
+        // audio[impl gui.record-arm-shader]
+        PanelEffect::RecordArmButton,
         [
-            0.0,
+            if device_state.is_recording() {
+                1.0
+            } else {
+                0.0
+            },
             if device_state.armed_for_record {
                 1.0
             } else {
@@ -511,32 +524,28 @@ pub fn build_audio_input_device_detail_render_scene(
             0.0,
         ],
     );
-    push_sprite(
-        &mut scene,
-        detail_layout.arm_button_rect.inset(14).to_win32_rect(),
-        if device_state.armed_for_record {
-            [0.72, 1.0, 0.80, 1.0]
-        } else {
-            [0.68, 0.70, 0.72, 1.0]
-        },
-        SpriteId::Audio,
-    );
     push_text_block(
         &mut scene,
         detail_layout.arm_status_rect.to_win32_rect(),
-        if device_state.armed_for_record {
-            "Armed for future recording"
+        if device_state.is_recording() {
+            "Recording"
+        } else if device_state.armed_for_record {
+            "Armed for recording"
         } else {
             "Recording arm disabled"
         },
         10,
         18,
-        if device_state.armed_for_record {
-            [0.76, 0.96, 0.82, 1.0]
+        if device_state.is_recording() {
+            [1.0, 0.64, 0.58, 1.0]
+        } else if device_state.armed_for_record {
+            [0.94, 0.74, 0.70, 1.0]
         } else {
             [0.82, 0.84, 0.86, 1.0]
         },
     );
+    // audio[impl gui.audio-buffer-waveform]
+    push_audio_input_buffer_section(&mut scene, detail_layout, device_state);
 
     scene
 }
@@ -575,6 +584,24 @@ pub fn audio_input_device_detail_layout(body_rect: ClientRect) -> AudioInputDevi
         body_rect.right() - 16,
         body_rect.top() + 70,
     );
+    let buffer_section_rect = ClientRect::new(
+        body_rect.left() + 28,
+        arm_button_rect.bottom() + 38,
+        body_rect.right() - 28,
+        body_rect.bottom() - 28,
+    );
+    let timeline_label_rect = ClientRect::new(
+        buffer_section_rect.left() + 16,
+        buffer_section_rect.top() + 12,
+        buffer_section_rect.right() - 16,
+        buffer_section_rect.top() + 48,
+    );
+    let waveform_rect = ClientRect::new(
+        buffer_section_rect.left() + 16,
+        timeline_label_rect.bottom() + 10,
+        buffer_section_rect.right() - 16,
+        buffer_section_rect.bottom() - 16,
+    );
 
     AudioInputDeviceDetailLayout {
         icon_rect,
@@ -582,7 +609,238 @@ pub fn audio_input_device_detail_layout(body_rect: ClientRect) -> AudioInputDevi
         arm_button_rect,
         arm_status_rect,
         legacy_recording_button_rect,
+        buffer_section_rect,
+        waveform_rect,
+        timeline_label_rect,
     }
+}
+
+fn push_audio_input_buffer_section(
+    scene: &mut RenderScene,
+    detail_layout: AudioInputDeviceDetailLayout,
+    device_state: &AudioInputDeviceWindowState,
+) {
+    push_panel(
+        scene,
+        detail_layout.buffer_section_rect.to_win32_rect(),
+        [0.08, 0.10, 0.12, 1.0],
+        PanelEffect::SceneBody,
+    );
+    let duration_seconds = device_state.runtime.duration_seconds();
+    let selection_text = device_state.runtime.selection.map_or_else(
+        || "selection: none".to_owned(),
+        |selection| {
+            format!(
+                "selection: {:.2}s - {:.2}s ({:.2}s)",
+                selection.begin_seconds,
+                selection.end_seconds,
+                selection.duration_seconds()
+            )
+        },
+    );
+    let labels = format!(
+        "Audio Buffer   duration {:.2}s   rec {:.2}s   play {:.2}s   transcript {:.2}s\n{}   Space play/pause   Enter record   J/K/L shuttle",
+        duration_seconds,
+        device_state.runtime.recording_head_seconds,
+        device_state.runtime.playback.head_seconds,
+        device_state.runtime.transcription_head_seconds,
+        selection_text
+    );
+    push_text_block(
+        scene,
+        detail_layout.timeline_label_rect.to_win32_rect(),
+        &labels,
+        9,
+        16,
+        [0.88, 0.91, 0.94, 1.0],
+    );
+    push_waveform(scene, detail_layout.waveform_rect, device_state);
+}
+
+fn push_waveform(
+    scene: &mut RenderScene,
+    waveform_rect: ClientRect,
+    device_state: &AudioInputDeviceWindowState,
+) {
+    push_panel(
+        scene,
+        waveform_rect.to_win32_rect(),
+        [0.04, 0.05, 0.06, 1.0],
+        PanelEffect::TerminalFill,
+    );
+    let samples = device_state.runtime.samples();
+    let duration_seconds = device_state.runtime.duration_seconds().max(1.0);
+    if let Some(selection) = device_state.runtime.selection {
+        push_head_region(
+            scene,
+            waveform_rect,
+            duration_seconds,
+            selection.begin_seconds,
+            selection.end_seconds,
+            [0.28, 0.48, 0.72, 0.34],
+        );
+    }
+    if samples.is_empty() {
+        push_text_block(
+            scene,
+            waveform_rect.inset(16).to_win32_rect(),
+            "No recorded audio yet.",
+            10,
+            18,
+            [0.52, 0.56, 0.60, 1.0],
+        );
+    } else {
+        push_waveform_bars(scene, waveform_rect, &samples);
+    }
+    push_timeline_head(
+        scene,
+        waveform_rect,
+        duration_seconds,
+        device_state.runtime.recording_head_seconds,
+        [1.0, 0.20, 0.16, 1.0],
+    );
+    push_timeline_head(
+        scene,
+        waveform_rect,
+        duration_seconds,
+        device_state.runtime.playback.head_seconds,
+        [0.28, 0.72, 1.0, 1.0],
+    );
+    push_timeline_head(
+        scene,
+        waveform_rect,
+        duration_seconds,
+        device_state.runtime.transcription_head_seconds,
+        [0.85, 0.56, 1.0, 1.0],
+    );
+    if let Some(selection) = device_state.runtime.selection {
+        push_timeline_head(
+            scene,
+            waveform_rect,
+            duration_seconds,
+            selection.begin_seconds,
+            [0.95, 0.86, 0.30, 1.0],
+        );
+        push_timeline_head(
+            scene,
+            waveform_rect,
+            duration_seconds,
+            selection.end_seconds,
+            [0.95, 0.86, 0.30, 1.0],
+        );
+    }
+}
+
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    reason = "waveform amplitudes are deliberately converted to integer pixel bar heights"
+)]
+fn push_waveform_bars(scene: &mut RenderScene, waveform_rect: ClientRect, samples: &[f32]) {
+    let width = waveform_rect.width().max(1);
+    let mid_y = waveform_rect.top() + waveform_rect.height() / 2;
+    let half_height = (waveform_rect.height() / 2 - 6).max(2);
+    let bars = width;
+    let peak = samples
+        .iter()
+        .map(|sample| sample.abs())
+        .fold(0.0_f32, f32::max)
+        .max(0.015);
+    for bar_index in 0..bars {
+        let start = (usize::try_from(bar_index).unwrap_or_default() * samples.len())
+            / usize::try_from(bars).unwrap_or(1);
+        let end = ((usize::try_from(bar_index + 1).unwrap_or_default() * samples.len())
+            / usize::try_from(bars).unwrap_or(1))
+        .max(start + 1)
+        .min(samples.len());
+        let amplitude = samples[start..end]
+            .iter()
+            .map(|sample| sample.abs())
+            .fold(0.0_f32, f32::max)
+            / peak;
+        let amplitude = amplitude.clamp(0.0, 1.0);
+        let bar_height = (amplitude * half_height as f32).round() as i32;
+        let x = waveform_rect.left() + (bar_index * waveform_rect.width()) / bars;
+        let next_x = waveform_rect.left() + ((bar_index + 1) * waveform_rect.width()) / bars;
+        let rect = ClientRect::new(
+            x,
+            mid_y - bar_height.max(1),
+            next_x.max(x + 1).min(waveform_rect.right()),
+            mid_y + bar_height.max(1),
+        );
+        push_panel(
+            scene,
+            rect.to_win32_rect(),
+            [0.40, 0.78, 0.86, 1.0],
+            PanelEffect::TerminalFill,
+        );
+    }
+}
+
+fn push_timeline_head(
+    scene: &mut RenderScene,
+    waveform_rect: ClientRect,
+    duration_seconds: f64,
+    seconds: f64,
+    color: [f32; 4],
+) {
+    let x = timeline_seconds_to_x(waveform_rect, duration_seconds, seconds);
+    let rect = ClientRect::new(x - 1, waveform_rect.top(), x + 2, waveform_rect.bottom());
+    push_panel(
+        scene,
+        rect.to_win32_rect(),
+        color,
+        PanelEffect::TerminalFill,
+    );
+}
+
+fn push_head_region(
+    scene: &mut RenderScene,
+    waveform_rect: ClientRect,
+    duration_seconds: f64,
+    begin_seconds: f64,
+    end_seconds: f64,
+    color: [f32; 4],
+) {
+    let begin_x = timeline_seconds_to_x(waveform_rect, duration_seconds, begin_seconds);
+    let end_x = timeline_seconds_to_x(waveform_rect, duration_seconds, end_seconds);
+    let rect = ClientRect::new(
+        begin_x.min(end_x),
+        waveform_rect.top(),
+        begin_x.max(end_x),
+        waveform_rect.bottom(),
+    );
+    push_panel(
+        scene,
+        rect.to_win32_rect(),
+        color,
+        PanelEffect::TerminalFill,
+    );
+}
+
+#[must_use]
+pub fn audio_input_timeline_seconds_from_point(
+    waveform_rect: ClientRect,
+    duration_seconds: f64,
+    point: ClientPoint,
+) -> f64 {
+    let width = waveform_rect.width().max(1);
+    let point_x = point
+        .to_win32_point()
+        .map_or(waveform_rect.left(), |point| point.x);
+    let offset = (point_x - waveform_rect.left()).clamp(0, width);
+    (f64::from(offset) / f64::from(width)) * duration_seconds.max(1.0)
+}
+
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "timeline seconds are clamped and converted to pixel x coordinates"
+)]
+fn timeline_seconds_to_x(waveform_rect: ClientRect, duration_seconds: f64, seconds: f64) -> i32 {
+    let width = waveform_rect.width().max(1);
+    waveform_rect.left()
+        + ((seconds.clamp(0.0, duration_seconds.max(1.0)) / duration_seconds.max(1.0))
+            * f64::from(width)) as i32
 }
 
 // audio[impl gui.legacy-recording-dialog]
@@ -653,6 +911,230 @@ pub fn build_audio_input_device_diagnostic_render_scene(
     scene.sprites.extend(diagnostic_scene.sprites);
     scene.overlay_panels.extend(diagnostic_scene.overlay_panels);
     scene
+}
+
+#[must_use]
+// audio[impl gui.selected-device-diagnostics-tui]
+pub fn build_audio_input_device_detail_diagnostic_render_scene(
+    layout: TerminalLayout,
+    window_chrome_buttons_state: WindowChromeButtonsState,
+    device_state: Option<&AudioInputDeviceWindowState>,
+    selection: Option<TerminalSelection>,
+    cell_width: i32,
+    cell_height: i32,
+) -> RenderScene {
+    let mut scene = build_scene_shell(
+        layout,
+        SceneWindowKind::AudioInputDeviceDetails,
+        window_chrome_buttons_state,
+    );
+    let body_rect = layout.terminal_panel_rect().inset(20);
+    let diagnostic_scene = build_audio_input_device_detail_diagnostic_body_scene(
+        body_rect,
+        device_state,
+        selection,
+        cell_width,
+        cell_height,
+    );
+    scene.panels.extend(diagnostic_scene.panels);
+    scene.glyphs.extend(diagnostic_scene.glyphs);
+    scene.sprites.extend(diagnostic_scene.sprites);
+    scene.overlay_panels.extend(diagnostic_scene.overlay_panels);
+    scene
+}
+
+fn build_audio_input_device_detail_diagnostic_body_scene(
+    body_rect: ClientRect,
+    device_state: Option<&AudioInputDeviceWindowState>,
+    selection: Option<TerminalSelection>,
+    cell_width: i32,
+    cell_height: i32,
+) -> RenderScene {
+    let columns = u16::try_from((body_rect.width() / cell_width.max(1)).max(0)).unwrap_or_default();
+    let rows = u16::try_from((body_rect.height() / cell_height.max(1)).max(0)).unwrap_or_default();
+    if columns == 0 || rows == 0 {
+        return empty_render_scene();
+    }
+
+    let area = RatatuiRect::new(0, 0, columns, rows);
+    let mut buffer = Buffer::empty(area);
+    render_audio_input_device_detail_diagnostic_buffer(&mut buffer, area, device_state);
+    ratatui_buffer_to_scene(body_rect, &buffer, selection, cell_width, cell_height)
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "the microphone diagnostics TUI composes status, chart, and controls together"
+)]
+fn render_audio_input_device_detail_diagnostic_buffer(
+    buffer: &mut Buffer,
+    area: RatatuiRect,
+    device_state: Option<&AudioInputDeviceWindowState>,
+) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(7),
+            Constraint::Min(7),
+            Constraint::Length(5),
+        ])
+        .split(area);
+    let Some(device_state) = device_state else {
+        Paragraph::new("No microphone selected")
+            .block(Block::default().title(" Microphone ").borders(Borders::ALL))
+            .render(area, buffer);
+        return;
+    };
+
+    let duration_seconds = device_state.runtime.duration_seconds();
+    let sample_rate = device_state.runtime.sample_rate_hz();
+    let status = if device_state.is_recording() {
+        "recording"
+    } else if device_state.is_playing() {
+        "playing"
+    } else if device_state.armed_for_record {
+        "armed"
+    } else {
+        "idle"
+    };
+    let header = Paragraph::new(vec![
+        Line::from(vec![
+            Span::styled("Device ", Style::new().fg(Color::DarkGray)),
+            Span::styled(
+                device_state.device.name.clone(),
+                Style::new().fg(Color::White).add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("Status ", Style::new().fg(Color::DarkGray)),
+            Span::styled(
+                status,
+                Style::new()
+                    .fg(Color::LightRed)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("   "),
+            Span::styled("Duration ", Style::new().fg(Color::DarkGray)),
+            Span::styled(
+                format!("{duration_seconds:.2}s"),
+                Style::new().fg(Color::LightCyan),
+            ),
+            Span::raw("   "),
+            Span::styled("Sample rate ", Style::new().fg(Color::DarkGray)),
+            Span::styled(
+                format!("{sample_rate} Hz"),
+                Style::new().fg(Color::LightGreen),
+            ),
+        ]),
+        Line::from(device_state.device.id.clone()),
+    ])
+    .block(
+        Block::default()
+            .title(" Microphone ")
+            .borders(Borders::ALL)
+            .border_style(Style::new().fg(Color::Cyan)),
+    )
+    .wrap(Wrap { trim: true });
+    header.render(chunks[0], buffer);
+
+    let points = waveform_chart_points(&device_state.runtime.samples(), duration_seconds.max(1.0));
+    let datasets = vec![
+        Dataset::default()
+            .name("waveform")
+            .marker(symbols::Marker::Braille)
+            .graph_type(GraphType::Line)
+            .style(Style::new().fg(Color::LightCyan))
+            .data(&points),
+    ];
+    let chart = Chart::new(datasets)
+        .block(
+            Block::default()
+                .title(" Audio Buffer ")
+                .borders(Borders::ALL)
+                .border_style(Style::new().fg(Color::Blue)),
+        )
+        .x_axis(Axis::default().bounds([0.0, duration_seconds.max(1.0)]))
+        .y_axis(Axis::default().bounds([-1.0, 1.0]));
+    chart.render(chunks[1], buffer);
+
+    let selection_line = device_state.runtime.selection.map_or_else(
+        || "Selection none".to_owned(),
+        |selection| {
+            format!(
+                "Selection {:.2}s - {:.2}s ({:.2}s)",
+                selection.begin_seconds,
+                selection.end_seconds,
+                selection.duration_seconds()
+            )
+        },
+    );
+    let footer = Paragraph::new(vec![
+        Line::from(vec![
+            Span::styled(
+                "Enter",
+                Style::new()
+                    .fg(Color::LightCyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" record  "),
+            Span::styled(
+                "Space",
+                Style::new()
+                    .fg(Color::LightCyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" play/pause  "),
+            Span::styled(
+                "J/K/L",
+                Style::new()
+                    .fg(Color::LightCyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" shuttle  "),
+            Span::styled(
+                "Alt+X",
+                Style::new()
+                    .fg(Color::LightCyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" pretty"),
+        ]),
+        Line::from(selection_line),
+    ])
+    .block(
+        Block::default()
+            .title(" Controls ")
+            .borders(Borders::ALL)
+            .border_style(Style::new().fg(Color::DarkGray)),
+    );
+    footer.render(chunks[2], buffer);
+}
+
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "ratatui chart coordinates are display-scale f64 values"
+)]
+fn waveform_chart_points(samples: &[f32], duration_seconds: f64) -> Vec<(f64, f64)> {
+    if samples.is_empty() {
+        return vec![(0.0, 0.0), (duration_seconds, 0.0)];
+    }
+    let max_points = 240usize;
+    let points = samples.len().min(max_points);
+    let peak = samples
+        .iter()
+        .map(|sample| sample.abs())
+        .fold(0.0_f32, f32::max)
+        .max(0.015);
+    (0..points)
+        .map(|index| {
+            let sample_index = (index * samples.len()) / points;
+            let x = (index as f64 / points.saturating_sub(1).max(1) as f64) * duration_seconds;
+            (
+                x,
+                f64::from((samples[sample_index] / peak).clamp(-1.0, 1.0)),
+            )
+        })
+        .collect()
 }
 
 fn build_audio_input_device_diagnostic_body_scene(

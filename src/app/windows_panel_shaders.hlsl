@@ -399,7 +399,9 @@ float4 PSMain(PsInput input) : SV_TARGET {
     }
 
     float4 shaded = input.color;
-    if (input.effect > 15.5) {
+    if (input.effect > 21.5) {
+        shaded = apply_record_arm_button(input.uv, input.color, input.glyphData);
+    } else if (input.effect > 15.5) {
         shaded = apply_window_chrome_button(input.uv, input.color, input.glyphData, input.effect);
     } else if (input.effect > 14.5) {
         shaded = apply_scene_body(input.uv, input.color);

@@ -58,3 +58,21 @@ Selecting a microphone must open a selected-device window that shows the microph
 
 audio[gui.arm-for-record]
 The selected-device window must expose a default-on arm-for-record icon button with tooltip text, without starting capture.
+
+audio[gui.recording-state]
+The selected-device window must let Enter and the record button start and stop recording from the chosen microphone.
+
+audio[gui.record-arm-shader]
+The selected-device window record button must be shader-rendered as a dull red circle when inactive and a glowing pulsing red circle while recording.
+
+audio[gui.audio-buffer-waveform]
+The selected-device window must render the recorded audio buffer as a waveform with recording, playback, transcription, and selection heads.
+
+audio[gui.playback-transport]
+The selected-device window must let Space play or pause the recorded buffer, K pause playback, and repeated J/L adjust backward or forward shuttle speed.
+
+audio[gui.waveform-selection]
+Clicking the waveform without meaningful drag must place the playback head, while dragging past a small pixel tolerance must create a visible selection range.
+
+audio[gui.selected-device-diagnostics-tui]
+The selected-device diagnostics mode must render as a ratatui application with microphone status, waveform chart, and shared transport hotkeys.

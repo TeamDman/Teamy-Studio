@@ -36,15 +36,19 @@ The product rule is simple: dictated text must never be sprayed into whichever e
   - Decided the first visible GUI slice is all about the mic picker window: it includes the `Audio Devices` main-menu button with an image, a mic picker window listing name/icon/id/sample rate, keyboard navigation in pretty and TUI modes, `Alt+X` to toggle diagnostics/modes, and a storage-style dialog showing the picked microphone or microphones. The per-device audio-device window and `arm for record` control are deferred.
   - Implemented the selected-microphone window slice: choosing a microphone now opens a dedicated microphone window with icon, name, endpoint id, state, sample rate, and a default-on arm-for-record icon button with tooltip text. This remains a no-capture UI control.
   - Added Windows legacy recording-device integration: the microphone picker has a shader-rendered gear button and hotkey for the legacy Recording Devices dialog, and the selected-microphone window reuses the gear button. Per-row properties buttons were removed because there is no supported direct jump to a specific Core Audio endpoint properties page.
+  - Implemented the first selected-microphone recording slice: Enter and the shader record button start/stop WASAPI capture from the chosen endpoint, the microphone page renders an audio-buffer waveform with recording/playback/transcription/selection heads, Space plays the captured buffer from a generated WAV handoff, J/K/L update transport speed state, click places the playback head, drag creates a visible selection, and diagnostics mode now renders a ratatui microphone dashboard with a chart-backed waveform.
+  - Fixed the first real smoke-test issues in the recording slice: playback generation now starts from the current playback head, pause explicitly stops active WinMM playback, J/L generate crude fast/reverse shuttle buffers, and the pretty/TUI waveforms normalize amplitude to available vertical space and render full-width bars to avoid periodic visual gaps.
+  - Validated the recording slice with `./check-all.ps1` on 2026-04-25: format, clippy, build, tests, and Tracey passed. Tracey reported `teamy-studio-audio-input/rust: 23 of 23 requirements are covered. 9 of 23 have a verification reference.`
   - Captured the current Tracey status on 2026-04-25: all tracked requirements are covered. Verification remains partial: behavior 31/56, cli 26/44, convention 0/4, os 6/10, publishing 0/8, tool-standards 22/28, windowing 11/16.
   - Observed `tracey query unmapped` still reports broad repo-wide mapping debt, so new work should add explicit requirement references for touched code instead of trying to solve all historical mapping debt in this slice.
 - Current focus:
-  - Move from microphone choice into safe transcription inbox shell work, while preserving the no-capture boundary until capture is implemented explicitly.
+  - Manually smoke test the selected-microphone recording path with real hardware, then decide whether to harden capture/playback or move to the transcription inbox shell.
 - Remaining work:
-  - Add a transcription inbox window that can display staged text without sending it to the OS focus target.
-  - Only after the inbox exists, connect real capture and transcription.
+  - Harden the first capture/playback path after validation and manual smoke testing.
+  - Add the transcription inbox window that can display staged text without sending it to the OS focus target.
+  - Connect transcription after capture and the inbox exist.
 - Next step:
-  - Land the transcription inbox shell: a Teamy-owned window with staged text chunks and explicit copy/clear/append actions before any capture or transcription backend is attached.
+  - Smoke test microphone capture and buffer playback from the selected-device window, including pretty/TUI toggling and waveform click/drag selection.
 
 ## Why This Slice
 

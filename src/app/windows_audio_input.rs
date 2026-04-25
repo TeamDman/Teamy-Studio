@@ -2,12 +2,22 @@ use arbitrary::Arbitrary;
 use eyre::Context;
 use facet::Facet;
 use std::ffi::c_void;
+use std::fs;
+use std::io::Write;
+use std::path::PathBuf;
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use uom::si::f64::Time;
+use uom::si::time::second;
 use windows::Win32::Devices::Properties;
 use windows::Win32::Foundation::{PROPERTYKEY, RPC_E_CHANGED_MODE};
 use windows::Win32::Media::Audio::{
-    DEVICE_STATE_ACTIVE, ERole, IAudioClient, IMMDevice, IMMDeviceCollection, IMMDeviceEnumerator,
-    MMDeviceEnumerator, eCapture,
+    AUDCLNT_SHAREMODE_SHARED, DEVICE_STATE_ACTIVE, ERole, IAudioCaptureClient, IAudioClient,
+    IMMDevice, IMMDeviceCollection, IMMDeviceEnumerator, MMDeviceEnumerator, PlaySoundW, SND_ASYNC,
+    SND_FILENAME, SND_FLAGS, SND_NODEFAULT, WAVEFORMATEX, WAVEFORMATEXTENSIBLE, eCapture,
 };
 use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::System::Com::StructuredStorage::PropVariantClear;
@@ -17,7 +27,9 @@ use windows::Win32::System::Com::{
 };
 use windows::Win32::System::Variant::VT_LPWSTR;
 use windows::Win32::UI::Shell::PropertiesSystem::IPropertyStore;
-use windows::core::GUID;
+use windows::core::{GUID, PCWSTR};
+
+use crate::win32_support::string::EasyPCWSTR;
 
 const GENERIC_WINDOWS_MIC_ICON_PATH: &str = "@%SystemRoot%\\system32\\mmres.dll,-3012";
 const PKEY_DEVICE_ICON: PROPERTYKEY = PROPERTYKEY {
@@ -28,6 +40,17 @@ const PKEY_DEVICE_CLASS_ICON: PROPERTYKEY = PROPERTYKEY {
     fmtid: GUID::from_u128(0x259abffc_507a_4ce8_8c10_9640b8a1c907),
     pid: 12,
 };
+const AUDCLNT_BUFFERFLAGS_SILENT: u32 = 0x0000_0002;
+const WAVE_FORMAT_PCM: u16 = 0x0001;
+const WAVE_FORMAT_IEEE_FLOAT: u16 = 0x0003;
+const WAVE_FORMAT_EXTENSIBLE: u16 = 0xfffe;
+const KSDATAFORMAT_SUBTYPE_PCM: GUID = GUID::from_u128(0x00000001_0000_0010_8000_00aa00389b71);
+const KSDATAFORMAT_SUBTYPE_IEEE_FLOAT: GUID =
+    GUID::from_u128(0x00000003_0000_0010_8000_00aa00389b71);
+const WASAPI_SHARED_BUFFER_100NS: i64 = 10_000_000;
+const CAPTURE_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const PLAYBACK_SELECTION_TOLERANCE_PX: i32 = 2;
+const PLAYBACK_STOP_FLAGS: SND_FLAGS = SND_FLAGS(0);
 
 #[derive(Clone, Debug, Facet, PartialEq, Eq)]
 pub struct AudioInputDeviceSummary {
@@ -60,26 +83,398 @@ pub struct AudioInputPickerState {
     pub devices: Vec<AudioInputDeviceSummary>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct AudioInputDeviceWindowState {
     pub device: AudioInputDeviceSummary,
     pub armed_for_record: bool,
+    pub runtime: AudioInputRuntimeState,
+    capture_session: Option<AudioInputCaptureSession>,
+    playback_file_path: Option<PathBuf>,
 }
 
 impl AudioInputDeviceWindowState {
     #[must_use]
     // audio[impl gui.selected-device-window]
     // audio[impl gui.arm-for-record]
-    pub const fn new(device: AudioInputDeviceSummary) -> Self {
+    pub fn new(device: AudioInputDeviceSummary) -> Self {
         Self {
             device,
             armed_for_record: true,
+            runtime: AudioInputRuntimeState::default(),
+            capture_session: None,
+            playback_file_path: None,
         }
     }
 
-    pub const fn toggle_record_arm(&mut self) {
-        self.armed_for_record = !self.armed_for_record;
+    #[must_use]
+    // audio[impl gui.recording-state]
+    pub fn is_recording(&self) -> bool {
+        self.capture_session.is_some()
     }
+
+    #[must_use]
+    pub fn is_playing(&self) -> bool {
+        self.runtime.playback.started_at.is_some()
+    }
+
+    // audio[impl gui.recording-state]
+    pub fn toggle_recording(&mut self) -> eyre::Result<()> {
+        if self.is_recording() {
+            self.stop_recording();
+            return Ok(());
+        }
+        self.start_recording()
+    }
+
+    // audio[impl gui.playback-transport]
+    pub fn toggle_playback(&mut self) -> eyre::Result<()> {
+        self.sync_playback_head();
+        if self.is_playing() {
+            self.pause_playback();
+            return Ok(());
+        }
+        self.start_playback(1.0)
+    }
+
+    pub fn pause_playback(&mut self) {
+        self.sync_playback_head();
+        stop_windows_playback();
+        self.runtime.playback.started_at = None;
+        self.runtime.playback.speed = 0.0;
+    }
+
+    pub fn playback_forward(&mut self) -> eyre::Result<()> {
+        let next_speed = if self.runtime.playback.speed > 0.0 {
+            (self.runtime.playback.speed + 1.0).min(8.0)
+        } else {
+            1.0
+        };
+        self.start_playback(next_speed)
+    }
+
+    pub fn playback_backward(&mut self) -> eyre::Result<()> {
+        self.sync_playback_head();
+        let next_speed = if self.runtime.playback.speed < 0.0 {
+            (self.runtime.playback.speed - 1.0).max(-8.0)
+        } else {
+            -1.0
+        };
+        self.start_playback(next_speed)
+    }
+
+    pub fn sync_transport(&mut self) {
+        self.sync_playback_head();
+        if self.is_recording() {
+            self.runtime.recording_head_seconds = self.runtime.duration_seconds();
+        }
+    }
+
+    // audio[impl gui.waveform-selection]
+    pub fn begin_timeline_interaction(&mut self, seconds: f64, x: i32) {
+        self.runtime.timeline_drag = Some(AudioInputTimelineDrag {
+            anchor_seconds: seconds,
+            current_seconds: seconds,
+            origin_x: x,
+        });
+        self.runtime.selection = None;
+    }
+
+    // audio[impl gui.waveform-selection]
+    pub fn update_timeline_interaction(&mut self, seconds: f64) {
+        if let Some(drag) = self.runtime.timeline_drag.as_mut() {
+            drag.current_seconds = seconds;
+            self.runtime.selection = AudioInputSelection::new(drag.anchor_seconds, seconds);
+        }
+    }
+
+    // audio[impl gui.waveform-selection]
+    pub fn complete_timeline_interaction(&mut self, seconds: f64, x: i32) -> eyre::Result<()> {
+        let Some(drag) = self.runtime.timeline_drag.take() else {
+            return Ok(());
+        };
+        if (x - drag.origin_x).abs() <= PLAYBACK_SELECTION_TOLERANCE_PX {
+            let was_playing = self.is_playing();
+            let speed = if self.runtime.playback.speed == 0.0 {
+                1.0
+            } else {
+                self.runtime.playback.speed
+            };
+            self.pause_playback();
+            self.runtime.playback.head_seconds = seconds;
+            self.runtime.selection = None;
+            if was_playing {
+                self.start_playback(speed)?;
+            }
+            return Ok(());
+        }
+        self.runtime.selection = AudioInputSelection::new(drag.anchor_seconds, seconds);
+        Ok(())
+    }
+
+    fn start_recording(&mut self) -> eyre::Result<()> {
+        if !self.armed_for_record {
+            return Ok(());
+        }
+        self.runtime.clear_error();
+        self.runtime.clear_audio();
+        self.runtime.recording_head_seconds = 0.0;
+        let session = AudioInputCaptureSession::start(
+            self.device.id.clone(),
+            Arc::clone(&self.runtime.shared),
+        )?;
+        self.capture_session = Some(session);
+        Ok(())
+    }
+
+    fn stop_recording(&mut self) {
+        if let Some(session) = self.capture_session.take() {
+            session.stop();
+        }
+        self.runtime.recording_head_seconds = self.runtime.duration_seconds();
+    }
+
+    fn start_playback(&mut self, speed: f64) -> eyre::Result<()> {
+        self.sync_playback_head();
+        let samples = self.runtime.samples();
+        if samples.is_empty() {
+            return Ok(());
+        }
+        let sample_rate = self.runtime.sample_rate_hz();
+        let playback_samples = playback_samples_from_head(
+            &samples,
+            sample_rate,
+            self.runtime.playback.head_seconds,
+            speed,
+        );
+        if playback_samples.is_empty() {
+            return Ok(());
+        }
+        stop_windows_playback();
+        let playback_path = write_audio_input_playback_wav(sample_rate, &playback_samples)?;
+        let wide_path = playback_path.as_path().easy_pcwstr()?;
+        // Safety: the path guard owns a valid nul-terminated UTF-16 string for this call.
+        let result = unsafe {
+            PlaySoundW(
+                wide_path.as_ref(),
+                None,
+                SND_ASYNC | SND_FILENAME | SND_NODEFAULT,
+            )
+        };
+        if !result.as_bool() {
+            eyre::bail!("failed to play recorded audio buffer")
+        }
+        self.playback_file_path = Some(playback_path);
+        if self.runtime.playback.head_seconds >= self.runtime.duration_seconds() {
+            self.runtime.playback.head_seconds = 0.0;
+        }
+        self.runtime.playback.started_at = Some(Instant::now());
+        self.runtime.playback.speed = speed;
+        Ok(())
+    }
+
+    fn sync_playback_head(&mut self) {
+        let Some(started_at) = self.runtime.playback.started_at else {
+            return;
+        };
+        let elapsed = started_at.elapsed().as_secs_f64() * self.runtime.playback.speed.abs();
+        if self.runtime.playback.speed < 0.0 {
+            self.runtime.playback.head_seconds =
+                (self.runtime.playback.head_seconds - elapsed).max(0.0);
+            if self.runtime.playback.head_seconds <= 0.0 {
+                self.runtime.playback.started_at = None;
+                self.runtime.playback.speed = 0.0;
+            } else {
+                self.runtime.playback.started_at = Some(Instant::now());
+            }
+            return;
+        }
+        self.runtime.playback.head_seconds =
+            (self.runtime.playback.head_seconds + elapsed).min(self.runtime.duration_seconds());
+        if self.runtime.playback.head_seconds >= self.runtime.duration_seconds() {
+            self.runtime.playback.started_at = None;
+            self.runtime.playback.speed = 0.0;
+        } else {
+            self.runtime.playback.started_at = Some(Instant::now());
+        }
+    }
+}
+
+impl Drop for AudioInputDeviceWindowState {
+    fn drop(&mut self) {
+        self.stop_recording();
+        stop_windows_playback();
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct AudioInputRuntimeState {
+    shared: Arc<Mutex<AudioInputSharedBuffer>>,
+    pub playback: AudioInputPlaybackState,
+    pub transcription_head_seconds: f64,
+    pub recording_head_seconds: f64,
+    pub selection: Option<AudioInputSelection>,
+    pub timeline_drag: Option<AudioInputTimelineDrag>,
+}
+
+impl Default for AudioInputRuntimeState {
+    fn default() -> Self {
+        Self {
+            shared: Arc::new(Mutex::new(AudioInputSharedBuffer::default())),
+            playback: AudioInputPlaybackState::default(),
+            transcription_head_seconds: 0.0,
+            recording_head_seconds: 0.0,
+            selection: None,
+            timeline_drag: None,
+        }
+    }
+}
+
+impl AudioInputRuntimeState {
+    #[must_use]
+    pub fn samples(&self) -> Vec<f32> {
+        self.shared
+            .lock()
+            .map(|buffer| buffer.samples.clone())
+            .unwrap_or_default()
+    }
+
+    #[must_use]
+    pub fn sample_rate_hz(&self) -> u32 {
+        self.shared
+            .lock()
+            .map_or(48_000, |buffer| buffer.sample_rate_hz)
+    }
+
+    #[must_use]
+    pub fn duration_seconds(&self) -> f64 {
+        let Ok(buffer) = self.shared.lock() else {
+            return 0.0;
+        };
+        seconds_from_samples(buffer.samples.len(), buffer.sample_rate_hz).get::<second>()
+    }
+
+    #[must_use]
+    pub fn last_error(&self) -> Option<String> {
+        self.shared
+            .lock()
+            .ok()
+            .and_then(|buffer| buffer.last_error.clone())
+    }
+
+    fn clear_audio(&mut self) {
+        if let Ok(mut buffer) = self.shared.lock() {
+            buffer.samples.clear();
+            buffer.last_error = None;
+        }
+        self.playback = AudioInputPlaybackState::default();
+        self.selection = None;
+        self.timeline_drag = None;
+    }
+
+    fn clear_error(&mut self) {
+        if let Ok(mut buffer) = self.shared.lock() {
+            buffer.last_error = None;
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct AudioInputPlaybackState {
+    pub head_seconds: f64,
+    pub speed: f64,
+    started_at: Option<Instant>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AudioInputSelection {
+    pub begin_seconds: f64,
+    pub end_seconds: f64,
+}
+
+impl AudioInputSelection {
+    #[must_use]
+    pub fn new(first_seconds: f64, second_seconds: f64) -> Option<Self> {
+        if (first_seconds - second_seconds).abs() <= f64::EPSILON {
+            return None;
+        }
+        Some(Self {
+            begin_seconds: first_seconds.min(second_seconds),
+            end_seconds: first_seconds.max(second_seconds),
+        })
+    }
+
+    #[must_use]
+    pub fn duration_seconds(self) -> f64 {
+        self.end_seconds - self.begin_seconds
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AudioInputTimelineDrag {
+    pub anchor_seconds: f64,
+    pub current_seconds: f64,
+    pub origin_x: i32,
+}
+
+#[derive(Debug)]
+struct AudioInputSharedBuffer {
+    samples: Vec<f32>,
+    sample_rate_hz: u32,
+    last_error: Option<String>,
+}
+
+impl Default for AudioInputSharedBuffer {
+    fn default() -> Self {
+        Self {
+            samples: Vec::new(),
+            sample_rate_hz: 48_000,
+            last_error: None,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct AudioInputCaptureSession {
+    stop_requested: Arc<AtomicBool>,
+    thread: JoinHandle<()>,
+}
+
+impl AudioInputCaptureSession {
+    fn start(
+        endpoint_id: String,
+        shared: Arc<Mutex<AudioInputSharedBuffer>>,
+    ) -> eyre::Result<Self> {
+        let stop_requested = Arc::new(AtomicBool::new(false));
+        let capture_stop_requested = Arc::clone(&stop_requested);
+        let thread = thread::Builder::new()
+            .name("teamy-studio-audio-input-capture".to_owned())
+            .spawn(move || {
+                if let Err(error) =
+                    capture_audio_input(endpoint_id, &shared, &capture_stop_requested)
+                    && let Ok(mut buffer) = shared.lock()
+                {
+                    buffer.last_error = Some(error.to_string());
+                }
+            })
+            .wrap_err("failed to spawn audio input capture thread")?;
+        Ok(Self {
+            stop_requested,
+            thread,
+        })
+    }
+
+    fn stop(self) {
+        self.stop_requested.store(true, Ordering::Release);
+        let _ = self.thread.join();
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AudioSampleFormat {
+    Float32,
+    Pcm16,
+    Pcm24,
+    Pcm32,
 }
 
 impl AudioInputPickerState {
@@ -317,6 +712,311 @@ fn device_mix_sample_rate_hz(device: &IMMDevice) -> eyre::Result<u32> {
     Ok(sample_rate)
 }
 
+#[expect(
+    clippy::undocumented_unsafe_blocks,
+    reason = "WASAPI capture requires COM activation, borrowed format memory, and raw audio buffers"
+)]
+fn capture_audio_input(
+    endpoint_id: String,
+    shared: &Arc<Mutex<AudioInputSharedBuffer>>,
+    stop_requested: &Arc<AtomicBool>,
+) -> eyre::Result<()> {
+    let _com = ComApartment::initialize()?;
+    let enumerator: IMMDeviceEnumerator = unsafe {
+        CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_INPROC_SERVER)
+            .wrap_err("failed to create Windows audio endpoint enumerator")?
+    };
+    let endpoint_id = endpoint_id.easy_pcwstr()?;
+    let device = unsafe { enumerator.GetDevice(endpoint_id.as_ref())? };
+    let audio_client: IAudioClient = unsafe { device.Activate(CLSCTX_ALL, None)? };
+    let mix_format = unsafe { audio_client.GetMixFormat()? };
+    if mix_format.is_null() {
+        eyre::bail!("audio client returned a null capture mix format")
+    }
+
+    let capture_format = unsafe { audio_capture_format(mix_format)? };
+    if let Ok(mut buffer) = shared.lock() {
+        buffer.sample_rate_hz = capture_format.sample_rate_hz;
+        buffer.last_error = None;
+    }
+
+    let initialize_result = unsafe {
+        audio_client.Initialize(
+            AUDCLNT_SHAREMODE_SHARED,
+            0,
+            WASAPI_SHARED_BUFFER_100NS,
+            0,
+            mix_format,
+            None,
+        )
+    };
+    initialize_result?;
+    let capture_client: IAudioCaptureClient = unsafe { audio_client.GetService()? };
+    unsafe { audio_client.Start()? };
+    let capture_result =
+        poll_capture_client(&capture_client, capture_format, shared, stop_requested);
+    let _ = unsafe { audio_client.Stop() };
+    unsafe { CoTaskMemFree(Some(mix_format.cast::<c_void>())) };
+    capture_result
+}
+
+#[expect(
+    clippy::undocumented_unsafe_blocks,
+    reason = "WASAPI packet access exposes borrowed raw buffers until ReleaseBuffer"
+)]
+fn poll_capture_client(
+    capture_client: &IAudioCaptureClient,
+    capture_format: AudioCaptureFormat,
+    shared: &Arc<Mutex<AudioInputSharedBuffer>>,
+    stop_requested: &Arc<AtomicBool>,
+) -> eyre::Result<()> {
+    while !stop_requested.load(Ordering::Acquire) {
+        let mut packet_frames = unsafe { capture_client.GetNextPacketSize()? };
+        while packet_frames > 0 {
+            let mut data = std::ptr::null_mut();
+            let mut frames_to_read = 0;
+            let mut flags = 0;
+            let buffer_result = unsafe {
+                capture_client.GetBuffer(
+                    &raw mut data,
+                    &raw mut frames_to_read,
+                    &raw mut flags,
+                    None,
+                    None,
+                )
+            };
+            buffer_result?;
+            let mut samples = Vec::new();
+            if flags & AUDCLNT_BUFFERFLAGS_SILENT != 0 {
+                samples.resize(usize::try_from(frames_to_read).unwrap_or_default(), 0.0);
+            } else if !data.is_null() {
+                samples = unsafe { capture_frames_as_mono(data, frames_to_read, capture_format) };
+            }
+            unsafe { capture_client.ReleaseBuffer(frames_to_read)? };
+            if !samples.is_empty()
+                && let Ok(mut buffer) = shared.lock()
+            {
+                buffer.samples.extend(samples);
+            }
+            packet_frames = unsafe { capture_client.GetNextPacketSize()? };
+        }
+        thread::sleep(CAPTURE_POLL_INTERVAL);
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AudioCaptureFormat {
+    sample_rate_hz: u32,
+    channels: u16,
+    block_align: u16,
+    sample_format: AudioSampleFormat,
+}
+
+#[expect(
+    clippy::undocumented_unsafe_blocks,
+    clippy::multiple_unsafe_ops_per_block,
+    reason = "WASAPI returns packed format structs that require unaligned reads"
+)]
+unsafe fn audio_capture_format(format: *const WAVEFORMATEX) -> eyre::Result<AudioCaptureFormat> {
+    let wave_format = unsafe { format.read_unaligned() };
+    let format_tag = wave_format.wFormatTag;
+    let bits_per_sample = wave_format.wBitsPerSample;
+    let sample_format = if format_tag == WAVE_FORMAT_EXTENSIBLE {
+        let extensible = format.cast::<WAVEFORMATEXTENSIBLE>();
+        let sub_format = unsafe { std::ptr::addr_of!((*extensible).SubFormat).read_unaligned() };
+        if sub_format == KSDATAFORMAT_SUBTYPE_IEEE_FLOAT && bits_per_sample == 32 {
+            AudioSampleFormat::Float32
+        } else if sub_format == KSDATAFORMAT_SUBTYPE_PCM {
+            pcm_sample_format(bits_per_sample)?
+        } else {
+            eyre::bail!("unsupported WASAPI extensible capture sample format")
+        }
+    } else if format_tag == WAVE_FORMAT_IEEE_FLOAT && bits_per_sample == 32 {
+        AudioSampleFormat::Float32
+    } else if format_tag == WAVE_FORMAT_PCM {
+        pcm_sample_format(bits_per_sample)?
+    } else {
+        eyre::bail!("unsupported WASAPI capture sample format tag {format_tag}")
+    };
+    Ok(AudioCaptureFormat {
+        sample_rate_hz: wave_format.nSamplesPerSec,
+        channels: wave_format.nChannels.max(1),
+        block_align: wave_format.nBlockAlign,
+        sample_format,
+    })
+}
+
+fn pcm_sample_format(bits_per_sample: u16) -> eyre::Result<AudioSampleFormat> {
+    match bits_per_sample {
+        16 => Ok(AudioSampleFormat::Pcm16),
+        24 => Ok(AudioSampleFormat::Pcm24),
+        32 => Ok(AudioSampleFormat::Pcm32),
+        _ => eyre::bail!("unsupported WASAPI PCM bit depth {bits_per_sample}"),
+    }
+}
+
+#[expect(
+    clippy::undocumented_unsafe_blocks,
+    reason = "captured WASAPI frames are raw bytes converted into normalized mono f32 samples"
+)]
+unsafe fn capture_frames_as_mono(
+    data: *const u8,
+    frame_count: u32,
+    capture_format: AudioCaptureFormat,
+) -> Vec<f32> {
+    let frame_count = usize::try_from(frame_count).unwrap_or_default();
+    let channels = usize::from(capture_format.channels);
+    let block_align = usize::from(capture_format.block_align);
+    let bytes_per_sample = block_align / channels.max(1);
+    let mut samples = Vec::with_capacity(frame_count);
+    for frame_index in 0..frame_count {
+        let frame_base = unsafe { data.add(frame_index * block_align) };
+        let mut sum = 0.0;
+        for channel_index in 0..channels {
+            let sample_base = unsafe { frame_base.add(channel_index * bytes_per_sample) };
+            sum += unsafe { read_capture_sample(sample_base, capture_format.sample_format) };
+        }
+        samples.push(sum / f32::from(capture_format.channels));
+    }
+    samples
+}
+
+#[expect(
+    clippy::undocumented_unsafe_blocks,
+    clippy::multiple_unsafe_ops_per_block,
+    clippy::cast_lossless,
+    clippy::cast_precision_loss,
+    reason = "sample decoding reads packed PCM bytes and normalizes them to f32"
+)]
+unsafe fn read_capture_sample(sample_base: *const u8, sample_format: AudioSampleFormat) -> f32 {
+    match sample_format {
+        AudioSampleFormat::Float32 => {
+            unsafe { sample_base.cast::<f32>().read_unaligned() }.clamp(-1.0, 1.0)
+        }
+        AudioSampleFormat::Pcm16 => {
+            f32::from(unsafe { sample_base.cast::<i16>().read_unaligned() }) / 32768.0
+        }
+        AudioSampleFormat::Pcm24 => {
+            let byte0 = unsafe { *sample_base.add(0) } as i32;
+            let byte1 = unsafe { *sample_base.add(1) } as i32;
+            let byte2 = unsafe { *sample_base.add(2) } as i32;
+            let value = (byte0 | (byte1 << 8) | (byte2 << 16)) << 8 >> 8;
+            value as f32 / 8_388_608.0
+        }
+        AudioSampleFormat::Pcm32 => {
+            (unsafe { sample_base.cast::<i32>().read_unaligned() }) as f32 / 2_147_483_648.0
+        }
+    }
+}
+
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "timeline durations are display-scale f64 values derived from sample counts"
+)]
+fn seconds_from_samples(sample_count: usize, sample_rate_hz: u32) -> Time {
+    if sample_rate_hz == 0 {
+        return Time::new::<second>(0.0);
+    }
+    Time::new::<second>(sample_count as f64 / f64::from(sample_rate_hz))
+}
+
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "playback head seconds are clamped before converting to a sample index"
+)]
+fn sample_index_for_seconds(sample_rate_hz: u32, seconds: f64, sample_len: usize) -> usize {
+    if sample_rate_hz == 0 || sample_len == 0 {
+        return 0;
+    }
+    let sample_index = (seconds.max(0.0) * f64::from(sample_rate_hz)).floor();
+    if !sample_index.is_finite() || sample_index <= 0.0 {
+        return 0;
+    }
+    let sample_index = sample_index as usize;
+    sample_index.min(sample_len.saturating_sub(1))
+}
+
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "playback transport maps display seconds and shuttle speed onto sample indexes"
+)]
+fn playback_samples_from_head(
+    samples: &[f32],
+    sample_rate_hz: u32,
+    head_seconds: f64,
+    speed: f64,
+) -> Vec<f32> {
+    if samples.is_empty() {
+        return Vec::new();
+    }
+    let speed = if speed == 0.0 {
+        1.0
+    } else {
+        speed.clamp(-8.0, 8.0)
+    };
+    let stride = speed.abs().round().max(1.0) as usize;
+    let head_index = sample_index_for_seconds(sample_rate_hz, head_seconds, samples.len());
+    if speed < 0.0 {
+        return samples[..=head_index]
+            .iter()
+            .rev()
+            .step_by(stride)
+            .copied()
+            .collect();
+    }
+    samples[head_index..]
+        .iter()
+        .step_by(stride)
+        .copied()
+        .collect()
+}
+
+#[expect(
+    clippy::undocumented_unsafe_blocks,
+    reason = "PlaySoundW accepts null sound/module pointers to stop current async playback"
+)]
+fn stop_windows_playback() {
+    let _ = unsafe { PlaySoundW(PCWSTR::null(), None, PLAYBACK_STOP_FLAGS) };
+}
+
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "WAV playback writes clamped f32 samples into intentional 16-bit PCM values"
+)]
+fn write_audio_input_playback_wav(sample_rate_hz: u32, samples: &[f32]) -> eyre::Result<PathBuf> {
+    let path = std::env::temp_dir().join(format!(
+        "teamy-studio-audio-input-{}.wav",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    let mut file = fs::File::create(&path)
+        .wrap_err_with(|| format!("failed to create playback wav at {}", path.display()))?;
+    let data_bytes = u32::try_from(samples.len().saturating_mul(2)).unwrap_or(u32::MAX);
+    let chunk_size = 36u32.saturating_add(data_bytes);
+    file.write_all(b"RIFF")?;
+    file.write_all(&chunk_size.to_le_bytes())?;
+    file.write_all(b"WAVEfmt ")?;
+    file.write_all(&16u32.to_le_bytes())?;
+    file.write_all(&1u16.to_le_bytes())?;
+    file.write_all(&1u16.to_le_bytes())?;
+    file.write_all(&sample_rate_hz.to_le_bytes())?;
+    file.write_all(&sample_rate_hz.saturating_mul(2).to_le_bytes())?;
+    file.write_all(&2u16.to_le_bytes())?;
+    file.write_all(&16u16.to_le_bytes())?;
+    file.write_all(b"data")?;
+    file.write_all(&data_bytes.to_le_bytes())?;
+    for sample in samples {
+        let value = (sample.clamp(-1.0, 1.0) * f32::from(i16::MAX)).round() as i16;
+        file.write_all(&value.to_le_bytes())?;
+    }
+    Ok(path)
+}
+
 struct ComApartment {
     uninitialize_on_drop: bool,
 }
@@ -397,12 +1097,10 @@ mod tests {
 
     #[test]
     // audio[verify gui.arm-for-record]
-    fn selected_device_window_starts_armed_and_can_toggle() {
-        let mut state = AudioInputDeviceWindowState::new(device("endpoint-id", "Studio Mic"));
+    fn selected_device_window_starts_armed() {
+        let state = AudioInputDeviceWindowState::new(device("endpoint-id", "Studio Mic"));
 
         assert!(state.armed_for_record);
-        state.toggle_record_arm();
-        assert!(!state.armed_for_record);
     }
 
     #[test]
@@ -412,5 +1110,38 @@ mod tests {
 
         assert_eq!(command.program, "control.exe");
         assert_eq!(command.args, &["mmsys.cpl,,1"]);
+    }
+
+    #[test]
+    // audio[verify gui.playback-transport]
+    fn playback_samples_start_at_playback_head() {
+        let samples = [0.0, 0.1, 0.2, 0.3, 0.4];
+
+        assert_eq!(
+            playback_samples_from_head(&samples, 10, 0.2, 1.0),
+            vec![0.2, 0.3, 0.4]
+        );
+    }
+
+    #[test]
+    // audio[verify gui.playback-transport]
+    fn reverse_playback_samples_walk_back_from_playback_head() {
+        let samples = [0.0, 0.1, 0.2, 0.3, 0.4];
+
+        assert_eq!(
+            playback_samples_from_head(&samples, 10, 0.3, -1.0),
+            vec![0.3, 0.2, 0.1, 0.0]
+        );
+    }
+
+    #[test]
+    // audio[verify gui.playback-transport]
+    fn fast_playback_samples_stride_forward_from_playback_head() {
+        let samples = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5];
+
+        assert_eq!(
+            playback_samples_from_head(&samples, 10, 0.1, 2.0),
+            vec![0.1, 0.3, 0.5]
+        );
     }
 }

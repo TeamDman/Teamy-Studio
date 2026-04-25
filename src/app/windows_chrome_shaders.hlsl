@@ -253,3 +253,23 @@ float4 apply_window_chrome_button(float2 uv, float4 color, float4 state, float e
     shaded = lerp(shaded, iconColor, iconMask);
     return float4(shaded, color.a);
 }
+
+float4 apply_record_arm_button(float2 uv, float4 color, float4 state) {
+    float t = PanelTime();
+    float recording = state.x;
+    float armed = state.y;
+    float2 p = uv - 0.5;
+    float radius = length(p);
+    float circle = 1.0 - smoothstep(0.32, 0.36, radius);
+    float rim = 1.0 - smoothstep(0.38, 0.48, radius);
+    float pulse = 0.5 + (0.5 * sin(t * 5.6));
+    float glow = recording * (0.28 + 0.42 * pulse) * (1.0 - smoothstep(0.34, 0.72, radius));
+    float3 inactiveRed = float3(0.32, 0.04, 0.035);
+    float3 armedRed = float3(0.55, 0.055, 0.045);
+    float3 hotRed = float3(1.0, 0.10, 0.07);
+    float3 shaded = lerp(inactiveRed, armedRed, armed);
+    shaded = lerp(shaded, hotRed, recording * (0.75 + 0.25 * pulse));
+    shaded += hotRed * glow;
+    float alpha = saturate(max(circle, rim * (0.28 + recording * 0.42)) + glow);
+    return float4(shaded, alpha * color.a);
+}
