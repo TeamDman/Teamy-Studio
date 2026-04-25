@@ -11,6 +11,7 @@ When debugging a bug, follow this workflow:
 
 **Goal:** Get a failing test that demonstrates the bug using REAL data.
 
+- Add or update the failing automated test BEFORE implementation when possible
 - Copy the EXACT input that triggers the bug (don't paraphrase or simplify yet)
 - Use the EXACT types/structs from the failing code
 - Verify the test actually fails with the same error message

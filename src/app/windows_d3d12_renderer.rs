@@ -2056,6 +2056,7 @@ pub fn window_garden_shader_data(layout: TerminalLayout) -> [f32; 4] {
 }
 
 /// windowing[impl garden-band.outward]
+/// windowing[impl garden-band.feathered]
 pub fn push_window_garden_frame(scene: &mut RenderScene, layout: TerminalLayout) {
     push_panel_with_data(
         scene,
@@ -5809,6 +5810,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        not(feature = "font-snapshot-tests"),
+        ignore = "expensive font snapshot artifacts are opt-in; run with --features font-snapshot-tests"
+    )]
     fn glyph_snapshots_write_debug_artifacts() -> eyre::Result<()> {
         let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let output_dir = manifest_dir
@@ -5831,7 +5836,10 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "fontdue comparison artifacts are diagnostic-only while render verification uses D3D12 output"]
+    #[cfg_attr(
+        not(feature = "font-snapshot-tests"),
+        ignore = "expensive font snapshot artifacts are opt-in; run with --features font-snapshot-tests"
+    )]
     fn fontdue_reference_snapshots_write_debug_artifacts() -> eyre::Result<()> {
         let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let output_dir = manifest_dir
@@ -5856,7 +5864,10 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "fontdue diff artifacts are diagnostic-only while render verification uses D3D12 output"]
+    #[cfg_attr(
+        not(feature = "font-snapshot-tests"),
+        ignore = "expensive font snapshot artifacts are opt-in; run with --features font-snapshot-tests"
+    )]
     fn fontdue_comparison_diffs_write_debug_artifacts() -> eyre::Result<()> {
         let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let output_dir = manifest_dir
@@ -5904,6 +5915,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        not(feature = "font-snapshot-tests"),
+        ignore = "expensive font snapshot artifacts are opt-in; run with --features font-snapshot-tests"
+    )]
     fn unicode_snapshot_sheet_writes_debug_artifacts() -> eyre::Result<()> {
         let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let output_dir = manifest_dir

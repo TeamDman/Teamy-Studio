@@ -65,6 +65,7 @@ pub struct TerminalWindowSummary {
 
 /// Run the Teamy Studio application shell.
 // cli[impl command.surface.core]
+/// windowing[impl launcher.startup.default]
 ///
 /// # Errors
 ///
@@ -165,6 +166,8 @@ pub fn run_keyboard_input_self_test(
 }
 
 /// Run the terminal throughput self-test benchmark.
+/// cli[impl command.surface.self-test-terminal-throughput]
+/// tool[impl cli.surface.self-test-terminal-throughput]
 ///
 /// # Errors
 ///
@@ -183,6 +186,9 @@ pub fn run_terminal_throughput_self_test(
 // cli[impl command.surface.self-test-terminal-replay]
 // cli[impl self-test.terminal-replay.artifact-output]
 /// tool[impl cli.surface.self-test]
+/// behavior[impl window.interaction.rendering.headless-verification]
+/// tool[impl tests.headless.required-for-terminal-engine]
+/// tool[impl tests.performance.terminal-throughput-replay]
 ///
 /// # Errors
 ///
@@ -201,6 +207,8 @@ pub fn run_terminal_replay_self_test(
 // cli[impl self-test.render-offscreen.fixture-flag]
 // cli[impl self-test.render-offscreen.update-expected-flag]
 /// tool[impl cli.surface.self-test]
+/// behavior[impl window.interaction.rendering.headless-verification]
+/// tool[impl tests.headless.required-for-terminal-engine]
 ///
 /// # Errors
 ///

@@ -11,6 +11,7 @@ use crate::cli::output::CliOutput;
 // cli[impl command.surface.terminal]
 /// tool[impl cli.surface.terminal]
 /// tool[impl cli.help.describes-terminal]
+/// tool[impl cli.help.describes-shell]
 #[derive(Facet, Arbitrary, Debug, PartialEq)]
 pub struct TerminalArgs {
     /// The terminal subcommand to run.

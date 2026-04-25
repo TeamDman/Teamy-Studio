@@ -935,6 +935,9 @@ fn dispatch_message(message: &MSG) {
 /// Launch the Teamy Studio terminal window and block until it closes.
 /// behavior[impl window.startup.centered]
 /// behavior[impl window.startup.size]
+/// behavior[impl window.appearance.shell]
+/// behavior[impl window.appearance.shell-configured-default]
+/// behavior[impl window.appearance.shell-starts-in-workspace-cell-dir]
 /// os[impl window.appearance.translucent]
 ///
 /// # Errors
@@ -2238,6 +2241,7 @@ fn handle_scene_mouse_move(
 }
 
 fn handle_scene_right_button_up(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Result<bool> {
+    // windowing[impl diagnostics.text.selection-and-copy]
     let point = ClientPoint::from_lparam(lparam);
 
     let copy_text = with_scene_app_state(|state| {
@@ -3176,6 +3180,8 @@ fn perform_scene_action(
             Ok(SceneActionDisposition::KeepOpen)
         }
         SceneAction::SelectWindowsBell => {
+            // windowing[impl audio-picker.selection.persisted]
+            // windowing[impl audio-picker.selection.preview]
             set_bell_source(app_home, BellSource::Windows)?;
             ring_terminal_bell();
             Ok(SceneActionDisposition::CloseWindow)
@@ -3189,6 +3195,8 @@ fn perform_scene_action(
                 return Ok(SceneActionDisposition::KeepOpen);
             };
 
+            // windowing[impl audio-picker.selection.persisted]
+            // windowing[impl audio-picker.selection.preview]
             set_bell_source(app_home, BellSource::File(path))?;
             ring_terminal_bell();
             Ok(SceneActionDisposition::CloseWindow)
@@ -3217,6 +3225,7 @@ fn measure_focused_render_interval_ms() -> u32 {
 }
 
 fn terminal_scrollbar_visual_state(state: &AppState) -> TerminalScrollbarVisualState {
+    // behavior[impl window.appearance.terminal.scrollbar.stateful]
     let thumb_grabbed = state.terminal_scrollbar_drag.is_some();
     let hovered_part = if thumb_grabbed {
         Some(TerminalScrollbarPart::Thumb)
@@ -3235,6 +3244,7 @@ fn terminal_scrollbar_geometry(
     scrollbar_rect: ClientRect,
     scrollbar: TerminalDisplayScrollbar,
 ) -> Option<TerminalScrollbarGeometry> {
+    // behavior[impl window.appearance.terminal.scrollbar.shader]
     if scrollbar_rect.width() <= 0
         || scrollbar_rect.height() <= 0
         || scrollbar.total == 0
@@ -3278,6 +3288,7 @@ fn terminal_scrollbar_hit_test(
     scrollbar: TerminalDisplayScrollbar,
     point: ClientPoint,
 ) -> Option<TerminalScrollbarPart> {
+    // behavior[impl window.interaction.scrollback.scrollbar-track-grab]
     if !scrollbar_rect.contains(point) {
         return None;
     }
@@ -3296,6 +3307,7 @@ fn terminal_scrollbar_offset_for_pointer(
     point: ClientPoint,
     grab_offset_y: i32,
 ) -> eyre::Result<u64> {
+    // behavior[impl window.interaction.scrollback.scrollbar-drag]
     if geometry.travel <= 0 || geometry.max_offset == 0 {
         return Ok(0);
     }
@@ -3331,6 +3343,7 @@ fn terminal_cursor_overlay_color(
     mut color: [f32; 4],
     style: TerminalDisplayCursorStyle,
 ) -> [f32; 4] {
+    // behavior[impl window.appearance.terminal.cursor.legible-block]
     color[3] = match style {
         TerminalDisplayCursorStyle::Block => 0.42,
         TerminalDisplayCursorStyle::BlockHollow => 0.95,
@@ -3731,6 +3744,7 @@ fn terminal_throughput_benchmark_command(
     mode: TerminalThroughputBenchmarkMode,
     line_count: usize,
 ) -> eyre::Result<portable_pty::CommandBuilder> {
+    // tool[impl tests.performance.terminal-throughput-pwsh-noprofile]
     let script = match mode {
         TerminalThroughputBenchmarkMode::MeasureCommandOutHost => format!(
             concat!(
@@ -4047,6 +4061,7 @@ fn terminal_font_definition(font_height: i32) -> LOGFONTW {
 fn handle_mouse_wheel(hwnd: WindowHandle, wparam: WPARAM, lparam: LPARAM) -> eyre::Result<bool> {
     // behavior[impl window.interaction.zoom.terminal]
     // behavior[impl window.interaction.zoom.output]
+    // behavior[impl window.interaction.scrollback.mouse-wheel]
     let ctrl_down = control_key_is_down();
     if !ctrl_down {
         return with_app_state(|state| {
@@ -5971,6 +5986,33 @@ mod tests {
         ));
     }
 
+    // tool[verify tests.performance.terminal-throughput-pwsh-noprofile]
+    #[test]
+    fn terminal_throughput_measure_command_uses_pwsh_noprofile() {
+        let command = terminal_throughput_benchmark_command(
+            TerminalThroughputBenchmarkMode::MeasureCommandOutHost,
+            8,
+        )
+        .expect("benchmark command should build");
+        let argv = command
+            .get_argv()
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        assert!(
+            argv.first().is_some_and(|arg| {
+                std::path::Path::new(arg)
+                    .file_name()
+                    .is_some_and(|name| name.eq_ignore_ascii_case("pwsh.exe"))
+            }),
+            "expected pwsh.exe launcher, got {argv:?}"
+        );
+        assert!(argv.iter().any(|arg| arg == "-NoProfile"));
+        assert!(argv.iter().any(|arg| arg == "-Command"));
+    }
+
+    // tool[verify tests.performance.terminal-throughput-pwsh-noprofile]
     #[test]
     fn parses_terminal_throughput_measure_command_marker() {
         let screen = concat!(

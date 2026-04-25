@@ -1,7 +1,8 @@
 use crate::cli::global_args::GlobalArgs;
-use chrono::Local;
+use chrono::{DateTime, Local};
 use eyre::bail;
 use std::fs::File;
+use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -22,6 +23,56 @@ fn exclude_tracy_frame_mark(meta: &Metadata<'_>) -> bool {
     meta.fields().field("tracy.frame_mark").is_none()
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum LogFilterSelection {
+    Explicit(String),
+    FromEnv(String),
+    Default(LevelFilter),
+}
+
+fn select_log_filter(
+    global_args: &GlobalArgs,
+    rust_log: Option<&str>,
+) -> eyre::Result<LogFilterSelection> {
+    match (global_args.debug, global_args.log_filter.as_deref()) {
+        (true, Some(_)) => bail!("cannot specify log filter with --debug"),
+        (false, Some(filter)) => Ok(LogFilterSelection::Explicit(filter.to_owned())),
+        (_, None) => match rust_log {
+            Some(filter) => Ok(LogFilterSelection::FromEnv(filter.to_owned())),
+            None => Ok(LogFilterSelection::Default(if global_args.debug {
+                LevelFilter::DEBUG
+            } else {
+                LevelFilter::INFO
+            })),
+        },
+    }
+}
+
+fn build_env_filter(global_args: &GlobalArgs, rust_log: Option<&str>) -> eyre::Result<EnvFilter> {
+    let builder = EnvFilter::builder();
+    match select_log_filter(global_args, rust_log)? {
+        LogFilterSelection::Explicit(filter) => Ok(builder
+            .with_default_directive(LevelFilter::from_str(&filter)?.into())
+            .parse("")?),
+        LogFilterSelection::FromEnv(filter) => Ok(builder.parse(filter)?),
+        LogFilterSelection::Default(level) => {
+            Ok(builder.with_default_directive(level.into()).parse("")?)
+        }
+    }
+}
+
+fn resolve_json_log_path(log_file: Option<&str>, now: DateTime<Local>) -> Option<PathBuf> {
+    match log_file {
+        None => None,
+        Some(path) if PathBuf::from(path).is_dir() => {
+            let timestamp = now.format("%Y-%m-%d_%H-%M-%S");
+            let filename = format!("log_{timestamp}.ndjson");
+            Some(PathBuf::from(path).join(filename))
+        }
+        Some(path) => Some(PathBuf::from(path)),
+    }
+}
+
 /// Initialize logging based on the provided configuration.
 /// tool[impl logging.stderr-output]
 /// tool[impl logging.file-path-option]
@@ -40,14 +91,12 @@ fn exclude_tracy_frame_mark(meta: &Metadata<'_>) -> bool {
 pub fn init_logging(global_args: &GlobalArgs) -> eyre::Result<()> {
     let subscriber = Registry::default();
 
-    let env_filter_layer = EnvFilter::builder()
-        .with_default_directive(match (global_args.debug, global_args.log_filter.as_ref()) {
-            (true, None) => LevelFilter::DEBUG.into(),
-            (false, None) => LevelFilter::INFO.into(),
-            (true, Some(_)) => bail!("cannot specify log filter with --debug"),
-            (false, Some(x)) => LevelFilter::from_str(x)?.into(),
-        })
-        .from_env()?;
+    let rust_log = if global_args.log_filter.is_none() {
+        std::env::var("RUST_LOG").ok()
+    } else {
+        None
+    };
+    let env_filter_layer = build_env_filter(global_args, rust_log.as_deref())?;
     let subscriber = subscriber.with(env_filter_layer);
 
     let stderr_layer = tracing_subscriber::fmt::layer()
@@ -61,15 +110,7 @@ pub fn init_logging(global_args: &GlobalArgs) -> eyre::Result<()> {
     let stderr_layer = stderr_layer.with_filter(FilterFn::new(exclude_tracy_frame_mark));
     let subscriber = subscriber.with(stderr_layer);
 
-    let json_log_path = match global_args.log_file.as_ref() {
-        None => None,
-        Some(path) if std::path::PathBuf::from(path).is_dir() => {
-            let timestamp = Local::now().format("%Y-%m-%d_%H-%M-%S");
-            let filename = format!("log_{timestamp}.ndjson");
-            Some(std::path::PathBuf::from(path).join(filename))
-        }
-        Some(path) => Some(std::path::PathBuf::from(path)),
-    };
+    let json_log_path = resolve_json_log_path(global_args.log_file.as_deref(), Local::now());
     let json_layer = if let Some(ref json_log_path) = json_log_path {
         if let Some(parent) = json_log_path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -118,4 +159,97 @@ pub fn init_logging(global_args: &GlobalArgs) -> eyre::Result<()> {
         "Tracing initialized"
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{LogFilterSelection, resolve_json_log_path, select_log_filter};
+    use crate::cli::global_args::GlobalArgs;
+
+    fn test_global_args() -> GlobalArgs {
+        GlobalArgs::default()
+    }
+
+    // tool[verify logging.filter.debug-conflicts-with-log-filter]
+    #[test]
+    fn debug_conflicts_with_explicit_log_filter() {
+        let args = GlobalArgs {
+            debug: true,
+            log_filter: Some("trace".to_owned()),
+            ..test_global_args()
+        };
+
+        let error = select_log_filter(&args, None).expect_err("debug plus log-filter should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("cannot specify log filter with --debug")
+        );
+    }
+
+    // tool[verify logging.filter.from-env]
+    #[test]
+    fn rust_log_is_used_when_explicit_filter_is_omitted() {
+        let selection = select_log_filter(&test_global_args(), Some("warn"))
+            .expect("RUST_LOG should be accepted when --log-filter is omitted");
+
+        assert_eq!(selection, LogFilterSelection::FromEnv("warn".to_owned()));
+    }
+
+    // tool[verify logging.filter.defaults]
+    #[test]
+    fn debug_defaults_to_debug_filter_when_no_filter_is_provided() {
+        let args = GlobalArgs {
+            debug: true,
+            ..test_global_args()
+        };
+
+        let selection =
+            select_log_filter(&args, None).expect("debug default filter should resolve");
+
+        assert_eq!(
+            selection,
+            LogFilterSelection::Default(tracing::level_filters::LevelFilter::DEBUG)
+        );
+    }
+
+    // tool[verify logging.filter.defaults]
+    #[test]
+    fn non_debug_defaults_to_info_filter_when_no_filter_is_provided() {
+        let selection = select_log_filter(&test_global_args(), None)
+            .expect("non-debug default filter should resolve");
+
+        assert_eq!(
+            selection,
+            LogFilterSelection::Default(tracing::level_filters::LevelFilter::INFO)
+        );
+    }
+
+    // tool[verify logging.file-path-option]
+    #[test]
+    fn explicit_log_file_path_is_preserved() {
+        let path = std::path::Path::new("logs").join("teamy.ndjson");
+        let resolved = resolve_json_log_path(Some(&path.to_string_lossy()), chrono::Local::now())
+            .expect("explicit log file path should resolve");
+
+        assert_eq!(resolved, path);
+    }
+
+    // tool[verify logging.file-path-option]
+    #[test]
+    fn directory_log_file_path_gets_timestamped_ndjson_filename() {
+        let dir = tempfile::tempdir().expect("temporary log directory should be created");
+
+        let resolved =
+            resolve_json_log_path(Some(&dir.path().to_string_lossy()), chrono::Local::now())
+                .expect("directory log path should resolve to a file inside the directory");
+
+        assert_eq!(resolved.parent(), Some(dir.path()));
+        assert!(
+            resolved
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("log_") && name.ends_with(".ndjson"))
+        );
+    }
 }

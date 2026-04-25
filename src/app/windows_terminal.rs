@@ -224,6 +224,7 @@ pub enum TerminalDisplayCursorStyle {
     Bar,
     Block,
     Underline,
+    #[cfg_attr(not(any(test, feature = "ghostty")), allow(dead_code))]
     BlockHollow,
 }
 
@@ -517,6 +518,8 @@ impl RuntimeTerminalEngine {
     }
 
     fn screen_row_cells(&self, row: u32, cols: u16) -> eyre::Result<Vec<String>> {
+        #[cfg(not(feature = "ghostty"))]
+        let _ = cols;
         match self {
             #[cfg(feature = "ghostty")]
             Self::Ghostty(engine) => ghostty_screen_row_cells(engine, cols, row),
@@ -533,6 +536,15 @@ impl RuntimeTerminalEngine {
         unshifted_codepoint: char,
         response: &mut Vec<u8>,
     ) -> eyre::Result<()> {
+        #[cfg(not(feature = "ghostty"))]
+        let _ = (
+            &action,
+            &mapped_key,
+            &mods,
+            &consumed_mods,
+            &unshifted_codepoint,
+            &mut *response,
+        );
         match self {
             #[cfg(feature = "ghostty")]
             Self::Ghostty(engine) => engine.encode_key_event(
@@ -2561,6 +2573,9 @@ impl TerminalCore {
     ) -> eyre::Result<TerminalDisplayState> {
         let viewport = self.viewport_metrics()?;
         let selection_active = selection.is_some();
+        #[cfg(not(feature = "ghostty"))]
+        let _ = selection_active;
+        #[cfg(feature = "ghostty")]
         let previous_display = (!selection_active).then(|| Arc::clone(&self.cached_display));
 
         match &mut self.engine {
@@ -3532,6 +3547,7 @@ fn selection_row_bounds(selection: TerminalSelection) -> (i32, i32) {
     }
 }
 
+// behavior[impl window.interaction.clipboard.selection-preserves-scrolled-history]
 fn extract_selected_text(rows: &[TerminalTextRow], selection: TerminalSelection) -> String {
     let mut selected_rows = Vec::new();
 

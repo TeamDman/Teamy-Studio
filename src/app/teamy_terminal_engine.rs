@@ -171,6 +171,7 @@ pub struct TeamyViewportMetrics {
     missing_debug_implementations,
     reason = "contains a callback field that is intentionally not debug-printable"
 )]
+// behavior[impl window.appearance.shell.teamy-terminal-engine]
 pub struct TeamyTerminalEngine {
     cols: usize,
     rows: usize,
@@ -672,6 +673,7 @@ impl TeamyTerminalEngine {
 
             match final_byte {
                 'C' => {
+                    // behavior[impl window.appearance.terminal.csi-cursor-right]
                     let count = parameters
                         .split(';')
                         .next()
@@ -681,6 +683,7 @@ impl TeamyTerminalEngine {
                     self.cursor_right(count.max(1));
                 }
                 'D' => {
+                    // behavior[impl window.appearance.terminal.csi-cursor-left]
                     let count = parameters
                         .split(';')
                         .next()
@@ -690,6 +693,7 @@ impl TeamyTerminalEngine {
                     self.cursor_left(count.max(1));
                 }
                 'G' => {
+                    // behavior[impl window.appearance.terminal.csi-cursor-horizontal-absolute]
                     let column = parameters
                         .split(';')
                         .next()
@@ -722,6 +726,7 @@ impl TeamyTerminalEngine {
                     self.erase_in_display(mode);
                 }
                 'K' => {
+                    // behavior[impl window.appearance.terminal.csi-erase-line]
                     let mode = parameters
                         .split(';')
                         .next()
@@ -731,6 +736,7 @@ impl TeamyTerminalEngine {
                     self.erase_in_line(mode);
                 }
                 'P' => {
+                    // behavior[impl window.appearance.terminal.csi-delete-character]
                     let count = parameters
                         .split(';')
                         .next()

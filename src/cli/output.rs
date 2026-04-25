@@ -55,6 +55,9 @@ impl CliOutput {
     ///
     /// This function will return an error if the selected output format cannot be rendered
     /// or if the rendered output cannot be written to stdout.
+    /// cli[impl global.output-format]
+    /// cli[impl global.output-format.default-terminal]
+    /// cli[impl global.output-format.default-redirected]
     pub fn emit(self, requested_format: Option<OutputFormat>) -> eyre::Result<()> {
         let Some(output) = self.0 else {
             return Ok(());

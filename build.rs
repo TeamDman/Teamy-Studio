@@ -85,6 +85,11 @@ fn stage_binary(source_dir: &Path, output_dir: &Path, file_name: &str, label: &s
 
     let destination = output_dir.join(file_name);
     if let Err(error) = fs::copy(&source, &destination) {
+        // If a previously staged binary is currently running, keep the existing
+        // copy instead of emitting a warning for a rebuild-local file lock.
+        if error.raw_os_error() == Some(32) && destination.exists() {
+            return;
+        }
         println!(
             "cargo:warning=failed to stage {} from {} to {}: {}",
             label,

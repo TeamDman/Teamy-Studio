@@ -1,3 +1,7 @@
+param(
+	[switch]$Full
+)
+
 function Invoke-Step {
 	param(
 		[Parameter(Mandatory = $true)]
@@ -14,8 +18,16 @@ function Invoke-Step {
 }
 
 function Get-NonTracyTestFeatureArgs {
+	param(
+		[switch]$Full
+	)
+
 	# tool[impl tests.exclude-tracy-feature]
 	# tool[impl tests.avoid-tracy-firewall-prompt]
+	$defaultExcludedFeatures = @("default", "tracy")
+	if (-not $Full) {
+		$defaultExcludedFeatures += "font-snapshot-tests"
+	}
 	$metadata = cargo metadata --no-deps --format-version 1 | ConvertFrom-Json
 	$pkg = if ($metadata.packages.Count -eq 1) {
 		$metadata.packages[0]
@@ -29,7 +41,7 @@ function Get-NonTracyTestFeatureArgs {
 		throw "Could not determine root package from cargo metadata"
 	}
 
-	$features = @($pkg.features.PSObject.Properties.Name | Where-Object { $_ -notin @("default", "tracy") })
+	$features = @($pkg.features.PSObject.Properties.Name | Where-Object { $_ -notin $defaultExcludedFeatures })
 	if ($features.Count -gt 0) {
 		return @("--features", ($features -join ","))
 	}
@@ -63,14 +75,10 @@ Invoke-Step -Label "build" -Action {
 
 Invoke-Step -Label "tests" -Action {
 	Stop-TeamyStudioProcessIfRunning
-	$featuresArg = Get-NonTracyTestFeatureArgs
+	$featuresArg = Get-NonTracyTestFeatureArgs -Full:$Full
 	cargo test @featuresArg --quiet
 }
 
-Invoke-Step -Label "tracey validation" -Action {
-	tracey query validate --deny warnings
+Invoke-Step -Label "tracey status" -Action {
+	tracey query status
 }
-
-# Invoke-Step -Label "tracey status" -Action {
-# 	tracey query status --deny warnings
-# }

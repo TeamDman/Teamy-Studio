@@ -1,7 +1,12 @@
-use std::fs;
 use std::path::Path;
+
+#[cfg(feature = "ghostty")]
 use std::time::Instant;
 
+#[cfg(feature = "ghostty")]
+use std::fs;
+
+#[cfg(feature = "ghostty")]
 use eyre::Context;
 use facet::Facet;
 #[cfg(feature = "ghostty")]
@@ -9,10 +14,11 @@ use libghostty_vt::TerminalOptions;
 #[cfg(feature = "ghostty")]
 use libghostty_vt::render::{CellIterator, RowIterator};
 
+#[cfg(feature = "ghostty")]
 use crate::app::teamy_terminal_engine::{
-    TeamyCursorStyle, TeamyDisplayCursor, TeamyDisplayState, TeamyTerminalEngine,
-    TeamyTraceSnapshot,
+    TeamyCursorStyle, TeamyDisplayCursor, TeamyTerminalEngine,
 };
+use crate::app::teamy_terminal_engine::{TeamyDisplayState, TeamyTraceSnapshot};
 
 #[cfg(feature = "ghostty")]
 use super::windows_terminal_engine::GhosttyTerminalEngine;
@@ -51,6 +57,7 @@ pub struct TerminalReplayReport {
     teamy_trace: TeamyTraceSnapshot,
 }
 
+#[cfg(feature = "ghostty")]
 #[derive(Clone, Debug)]
 struct TerminalReplaySample {
     apply_ms: f64,
@@ -198,6 +205,7 @@ fn run_ghostty_terminal_replay_sample(
     })
 }
 
+#[cfg(feature = "ghostty")]
 fn run_teamy_terminal_replay_sample(fixture: &TerminalReplayFixture) -> TerminalReplaySample {
     let mut engine = TeamyTerminalEngine::new(fixture.cols, fixture.rows, fixture.max_scrollback);
 
@@ -233,6 +241,7 @@ fn run_teamy_terminal_replay_sample(fixture: &TerminalReplayFixture) -> Terminal
     }
 }
 
+#[cfg(feature = "ghostty")]
 fn teamy_visible_text_from_display(display: &TeamyDisplayState) -> String {
     let mut lines = display
         .visible_rows
@@ -297,6 +306,7 @@ fn visible_text(engine: &mut GhosttyTerminalEngine) -> eyre::Result<String> {
     })
 }
 
+#[cfg(feature = "ghostty")]
 fn median_f64<T>(samples: &[T], selector: impl Fn(&T) -> f64) -> f64 {
     let mut values = samples.iter().map(selector).collect::<Vec<_>>();
     values.sort_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal));
@@ -308,6 +318,7 @@ fn median_f64<T>(samples: &[T], selector: impl Fn(&T) -> f64) -> f64 {
     }
 }
 
+#[cfg(feature = "ghostty")]
 fn median_u64<T>(samples: &[T], selector: impl Fn(&T) -> u64) -> u64 {
     let mut values = samples.iter().map(selector).collect::<Vec<_>>();
     values.sort_unstable();
@@ -363,6 +374,8 @@ mod tests {
         visible_text(&mut engine)
     }
 
+    // tool[verify tests.performance.terminal-throughput-replay]
+    // tool[verify tests.headless.required-for-terminal-engine]
     #[test]
     fn replay_sample_produces_visible_text() -> eyre::Result<()> {
         let fixture = TerminalReplayFixture {
@@ -554,6 +567,8 @@ mod tests {
         Ok(())
     }
 
+    // tool[verify tests.performance.terminal-throughput-replay]
+    // tool[verify tests.headless.required-for-terminal-engine]
     #[test]
     fn teamy_engine_matches_ghostty_for_supported_file_fixtures() -> eyre::Result<()> {
         for fixture_name in [
