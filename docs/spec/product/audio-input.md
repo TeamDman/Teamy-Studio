@@ -21,6 +21,12 @@ Audio input inventory must enumerate active Windows recording endpoints without 
 audio[enumerate.endpoint-id]
 Each audio input device entry must include the stable Core Audio endpoint id.
 
+audio[enumerate.sample-rate]
+Each audio input device entry should include the endpoint mix-format sample rate when Windows exposes it without starting capture.
+
+audio[enumerate.windows-icon]
+Each audio input device entry must include the Windows device icon resource path or a Windows microphone icon fallback resource.
+
 ## Picker Window
 
 audio[gui.launcher-button]
@@ -31,6 +37,9 @@ The `Audio Devices` button must open a dedicated microphone picker window.
 
 audio[gui.pretty-device-list]
 The microphone picker must default to a pretty device list that shows the device name, icon, endpoint id, and sample-rate availability.
+
+audio[gui.windows-icon-sprite]
+The microphone picker should render microphone imagery from a Windows icon resource when the resource is available.
 
 audio[gui.keyboard-navigation]
 The microphone picker must support keyboard navigation and selection in both pretty and diagnostics modes.

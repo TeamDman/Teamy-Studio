@@ -1,18 +1,32 @@
 use arbitrary::Arbitrary;
 use eyre::Context;
 use facet::Facet;
+use std::ffi::c_void;
 use windows::Win32::Devices::Properties;
 use windows::Win32::Foundation::{PROPERTYKEY, RPC_E_CHANGED_MODE};
 use windows::Win32::Media::Audio::{
-    DEVICE_STATE_ACTIVE, ERole, IMMDevice, IMMDeviceCollection, IMMDeviceEnumerator,
+    DEVICE_STATE_ACTIVE, ERole, IAudioClient, IMMDevice, IMMDeviceCollection, IMMDeviceEnumerator,
     MMDeviceEnumerator, eCapture,
 };
+use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::System::Com::StructuredStorage::PropVariantClear;
 use windows::Win32::System::Com::{
-    CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoUninitialize,
-    STGM_READ,
+    CLSCTX_ALL, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx,
+    CoUninitialize, STGM_READ,
 };
+use windows::Win32::System::Variant::VT_LPWSTR;
 use windows::Win32::UI::Shell::PropertiesSystem::IPropertyStore;
+use windows::core::GUID;
+
+const GENERIC_WINDOWS_MIC_ICON_PATH: &str = "@%SystemRoot%\\system32\\mmres.dll,-3012";
+const PKEY_DEVICE_ICON: PROPERTYKEY = PROPERTYKEY {
+    fmtid: GUID::from_u128(0x259abffc_507a_4ce8_8c10_9640b8a1c907),
+    pid: 10,
+};
+const PKEY_DEVICE_CLASS_ICON: PROPERTYKEY = PROPERTYKEY {
+    fmtid: GUID::from_u128(0x259abffc_507a_4ce8_8c10_9640b8a1c907),
+    pid: 12,
+};
 
 #[derive(Clone, Debug, Facet, PartialEq, Eq)]
 pub struct AudioInputDeviceSummary {
@@ -143,8 +157,15 @@ pub fn list_active_audio_input_devices() -> eyre::Result<Vec<AudioInputDeviceSum
         // audio[impl enumerate.endpoint-id]
         let id = unsafe { device.GetId()? };
         let id = unsafe { id.to_string()? };
-        let name =
-            device_friendly_name(&device).unwrap_or_else(|_| "Unknown microphone".to_owned());
+        let properties = unsafe { device.OpenPropertyStore(STGM_READ).ok() };
+        let name = properties
+            .as_ref()
+            .and_then(|properties| device_friendly_name(properties).ok())
+            .unwrap_or_else(|| "Unknown microphone".to_owned());
+        let icon = properties
+            .as_ref()
+            .and_then(device_icon_path)
+            .unwrap_or_else(|| GENERIC_WINDOWS_MIC_ICON_PATH.to_owned());
         devices.push(AudioInputDeviceSummary {
             is_default: default_id
                 .as_ref()
@@ -152,8 +173,10 @@ pub fn list_active_audio_input_devices() -> eyre::Result<Vec<AudioInputDeviceSum
             id,
             name,
             state: "active".to_owned(),
-            icon: "microphone".to_owned(),
-            sample_rate_hz: None,
+            // audio[impl enumerate.windows-icon]
+            icon,
+            // audio[impl enumerate.sample-rate]
+            sample_rate_hz: device_mix_sample_rate_hz(&device).ok(),
         });
     }
 
@@ -185,26 +208,67 @@ fn default_capture_endpoint_id(enumerator: &IMMDeviceEnumerator) -> Option<Strin
     unsafe { id.to_string().ok() }
 }
 
+fn device_friendly_name(properties: &IPropertyStore) -> eyre::Result<String> {
+    let friendly_name_key =
+        std::ptr::from_ref(&Properties::DEVPKEY_Device_FriendlyName).cast::<PROPERTYKEY>();
+    property_store_string_value(properties, friendly_name_key)
+}
+
+fn device_icon_path(properties: &IPropertyStore) -> Option<String> {
+    let icon_key = PKEY_DEVICE_ICON;
+    if let Ok(icon_path) = property_store_string_value(properties, std::ptr::from_ref(&icon_key)) {
+        return Some(icon_path);
+    }
+    let class_icon_key = PKEY_DEVICE_CLASS_ICON;
+    if let Ok(icon_path) =
+        property_store_string_value(properties, std::ptr::from_ref(&class_icon_key))
+    {
+        return Some(icon_path);
+    }
+    None
+}
+
 #[expect(
     clippy::undocumented_unsafe_blocks,
     clippy::multiple_unsafe_ops_per_block,
     reason = "PROPVARIANT string extraction follows the Windows property-store layout"
 )]
-fn device_friendly_name(device: &IMMDevice) -> eyre::Result<String> {
-    let properties: IPropertyStore = unsafe { device.OpenPropertyStore(STGM_READ)? };
-    let friendly_name_key =
-        std::ptr::from_ref(&Properties::DEVPKEY_Device_FriendlyName).cast::<PROPERTYKEY>();
-    let mut value = unsafe { properties.GetValue(friendly_name_key)? };
+fn property_store_string_value(
+    properties: &IPropertyStore,
+    key: *const PROPERTYKEY,
+) -> eyre::Result<String> {
+    let mut value = unsafe { properties.GetValue(key)? };
+    let variant_type = unsafe { value.Anonymous.Anonymous.vt };
+    if variant_type != VT_LPWSTR {
+        unsafe { PropVariantClear(&raw mut value)? };
+        eyre::bail!("property value is not a UTF-16 string")
+    }
     let name = unsafe {
         let pwstr = value.Anonymous.Anonymous.Anonymous.pwszVal;
         if pwstr.is_null() {
-            "Unknown microphone".to_owned()
+            String::new()
         } else {
             pwstr.to_string()?
         }
     };
     unsafe { PropVariantClear(&raw mut value)? };
     Ok(name)
+}
+
+#[expect(
+    clippy::undocumented_unsafe_blocks,
+    reason = "IAudioClient mix-format query activates metadata only and frees COM memory immediately"
+)]
+fn device_mix_sample_rate_hz(device: &IMMDevice) -> eyre::Result<u32> {
+    let audio_client: IAudioClient = unsafe { device.Activate(CLSCTX_ALL, None)? };
+    let mix_format = unsafe { audio_client.GetMixFormat()? };
+    if mix_format.is_null() {
+        eyre::bail!("audio client returned a null mix format")
+    }
+    let sample_rate_ptr = unsafe { std::ptr::addr_of!((*mix_format).nSamplesPerSec) };
+    let sample_rate = unsafe { sample_rate_ptr.read_unaligned() };
+    unsafe { CoTaskMemFree(Some(mix_format.cast::<c_void>())) };
+    Ok(sample_rate)
 }
 
 struct ComApartment {

@@ -39,6 +39,12 @@ impl<'a> PCWSTRGuard<'a> {
     }
 }
 
+/// Builds a Win32 integer resource pointer such as `MAKEINTRESOURCEW`.
+#[must_use]
+pub fn int_resource_pcwstr(resource_id: usize) -> PCWSTR {
+    PCWSTR(resource_id as *const u16)
+}
+
 impl Deref for PCWSTRGuard<'_> {
     type Target = U16CStr;
 

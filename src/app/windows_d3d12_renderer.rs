@@ -31,6 +31,7 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock, mpsc};
 use std::thread;
 use std::time::Instant;
 
+use crate::win32_support::string::{EasyPCWSTR, int_resource_pcwstr};
 // os[impl os.windows.rendering.direct3d12]
 use eyre::Context;
 use fontdb::{Database, Family, Query, Source};
@@ -40,7 +41,7 @@ use image::{ImageBuffer, Rgba, RgbaImage};
 use tracing::debug_span;
 use tracing::{info, info_span, instrument, warn};
 use ttf_parser::{Face, GlyphId, OutlineBuilder};
-use windows::Win32::Foundation::{E_FAIL, HANDLE, HWND, RECT, TRUE};
+use windows::Win32::Foundation::{E_FAIL, FreeLibrary, HANDLE, HWND, RECT, TRUE};
 use windows::Win32::Graphics::Direct3D::Fxc::{
     D3DCOMPILE_DEBUG, D3DCOMPILE_SKIP_OPTIMIZATION, D3DCompileFromFile,
 };
@@ -53,8 +54,15 @@ use windows::Win32::Graphics::DirectComposition::*;
 use windows::Win32::Graphics::Dwm::DwmGetColorizationColor;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
+use windows::Win32::Graphics::Gdi::{
+    BI_RGB, BITMAPINFO, CreateCompatibleDC, CreateDIBSection, DIB_RGB_COLORS, DeleteDC,
+    DeleteObject, GetDC, HBITMAP, HDC, HGDIOBJ, ReleaseDC, SelectObject,
+};
+use windows::Win32::System::LibraryLoader::LoadLibraryW;
 use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObjectEx};
-use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
+use windows::Win32::UI::WindowsAndMessaging::{
+    DI_NORMAL, DestroyIcon, DrawIconEx, GetClientRect, HICON, IMAGE_FLAGS, IMAGE_ICON, LoadImageW,
+};
 use windows::core::BOOL;
 use windows::core::{Error, HSTRING, Interface, Owned, PCSTR, s};
 
@@ -4679,6 +4687,11 @@ fn fit_sprite_to_target(sprite: &RgbaImage, target_size: u32) -> RgbaImage {
 }
 
 fn generate_audio_sprite() -> RgbaImage {
+    // audio[impl gui.windows-icon-sprite]
+    windows_microphone_icon_sprite().unwrap_or_else(generate_fallback_audio_sprite)
+}
+
+fn generate_fallback_audio_sprite() -> RgbaImage {
     let mut image = RgbaImage::new(SPRITE_TARGET_SIZE, SPRITE_TARGET_SIZE);
     fill_circle(&mut image, 88.0, 176.0, 36.0, [245, 199, 96, 255]);
     fill_circle(&mut image, 158.0, 160.0, 34.0, [245, 199, 96, 255]);
@@ -4687,6 +4700,155 @@ fn generate_audio_sprite() -> RgbaImage {
     stroke_ring(&mut image, 168.0, 136.0, 66.0, 8.0, [92, 206, 255, 220]);
     stroke_ring(&mut image, 168.0, 136.0, 92.0, 8.0, [92, 206, 255, 180]);
     image
+}
+
+#[expect(
+    clippy::undocumented_unsafe_blocks,
+    reason = "loading and drawing a stock Windows icon requires Win32 handle calls"
+)]
+fn windows_microphone_icon_sprite() -> Option<RgbaImage> {
+    let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_owned());
+    let dll_path = format!("{system_root}\\system32\\mmres.dll");
+    let dll_path = dll_path.easy_pcwstr().ok()?;
+    let module = unsafe { LoadLibraryW(dll_path.as_ref()).ok()? };
+    let _module_guard = ModuleGuard(module);
+    let resource = int_resource_pcwstr(3012);
+    let icon_handle = unsafe {
+        LoadImageW(
+            Some(module.into()),
+            resource,
+            IMAGE_ICON,
+            i32::try_from(SPRITE_TARGET_SIZE).ok()?,
+            i32::try_from(SPRITE_TARGET_SIZE).ok()?,
+            IMAGE_FLAGS::default(),
+        )
+        .ok()?
+    };
+    let icon = HICON(icon_handle.0);
+    let _icon_guard = IconGuard(icon);
+    unsafe { draw_icon_to_rgba_image(icon, SPRITE_TARGET_SIZE).ok() }
+}
+
+#[expect(
+    clippy::undocumented_unsafe_blocks,
+    reason = "the DIB section exposes a temporary pixel buffer owned by GDI for icon drawing"
+)]
+unsafe fn draw_icon_to_rgba_image(icon: HICON, size: u32) -> eyre::Result<RgbaImage> {
+    let size_i32 = i32::try_from(size).wrap_err("icon target size did not fit in i32")?;
+    let screen_dc = unsafe { GetDC(None) };
+    if screen_dc.is_invalid() {
+        eyre::bail!("failed to acquire screen DC for icon rendering")
+    }
+    let _screen_dc_guard = ReleaseDcGuard(screen_dc);
+    let memory_dc = unsafe { CreateCompatibleDC(Some(screen_dc)) };
+    if memory_dc.is_invalid() {
+        eyre::bail!("failed to create memory DC for icon rendering")
+    }
+    let _memory_dc_guard = DeleteDcGuard(memory_dc);
+
+    let mut bitmap_info = BITMAPINFO::default();
+    bitmap_info.bmiHeader.biSize = std::mem::size_of_val(&bitmap_info.bmiHeader) as u32;
+    bitmap_info.bmiHeader.biWidth = size_i32;
+    bitmap_info.bmiHeader.biHeight = -size_i32;
+    bitmap_info.bmiHeader.biPlanes = 1;
+    bitmap_info.bmiHeader.biBitCount = 32;
+    bitmap_info.bmiHeader.biCompression = BI_RGB.0;
+    let mut bits = std::ptr::null_mut();
+    let bitmap = unsafe {
+        CreateDIBSection(
+            Some(memory_dc),
+            &raw const bitmap_info,
+            DIB_RGB_COLORS,
+            &raw mut bits,
+            None,
+            0,
+        )?
+    };
+    let _bitmap_guard = BitmapGuard(bitmap);
+    let old_object = unsafe { SelectObject(memory_dc, bitmap.into()) };
+    let _select_guard = SelectObjectGuard {
+        dc: memory_dc,
+        old_object,
+    };
+    unsafe {
+        DrawIconEx(
+            memory_dc, 0, 0, icon, size_i32, size_i32, 0, None, DI_NORMAL,
+        )?
+    };
+
+    let byte_len = usize::try_from(size * size * 4).wrap_err("icon byte length overflowed")?;
+    let bgra = unsafe { std::slice::from_raw_parts(bits.cast::<u8>(), byte_len) };
+    let mut rgba = vec![0_u8; byte_len];
+    for (source, destination) in bgra.chunks_exact(4).zip(rgba.chunks_exact_mut(4)) {
+        destination[0] = source[2];
+        destination[1] = source[1];
+        destination[2] = source[0];
+        destination[3] = source[3];
+    }
+    ImageBuffer::from_vec(size, size, rgba).ok_or_else(|| eyre::eyre!("failed to build icon image"))
+}
+
+struct ModuleGuard(windows::Win32::Foundation::HMODULE);
+
+impl Drop for ModuleGuard {
+    fn drop(&mut self) {
+        if !self.0.is_invalid() {
+            unsafe { _ = FreeLibrary(self.0) };
+        }
+    }
+}
+
+struct IconGuard(HICON);
+
+impl Drop for IconGuard {
+    fn drop(&mut self) {
+        if !self.0.is_invalid() {
+            unsafe { _ = DestroyIcon(self.0) };
+        }
+    }
+}
+
+struct ReleaseDcGuard(HDC);
+
+impl Drop for ReleaseDcGuard {
+    fn drop(&mut self) {
+        if !self.0.is_invalid() {
+            unsafe { _ = ReleaseDC(None, self.0) };
+        }
+    }
+}
+
+struct DeleteDcGuard(HDC);
+
+impl Drop for DeleteDcGuard {
+    fn drop(&mut self) {
+        if !self.0.is_invalid() {
+            unsafe { _ = DeleteDC(self.0) };
+        }
+    }
+}
+
+struct BitmapGuard(HBITMAP);
+
+impl Drop for BitmapGuard {
+    fn drop(&mut self) {
+        if !self.0.is_invalid() {
+            unsafe { _ = DeleteObject(self.0.into()) };
+        }
+    }
+}
+
+struct SelectObjectGuard {
+    dc: HDC,
+    old_object: HGDIOBJ,
+}
+
+impl Drop for SelectObjectGuard {
+    fn drop(&mut self) {
+        if !self.dc.is_invalid() && !self.old_object.is_invalid() {
+            unsafe { _ = SelectObject(self.dc, self.old_object) };
+        }
+    }
 }
 
 fn generate_windows_audio_sprite() -> RgbaImage {
