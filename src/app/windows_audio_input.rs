@@ -57,6 +57,9 @@ const WASAPI_SHARED_BUFFER_100NS: i64 = 10_000_000;
 const CAPTURE_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const PLAYBACK_SELECTION_TOLERANCE_PX: i32 = 2;
 const PLAYBACK_STOP_FLAGS: SND_FLAGS = SND_FLAGS(0);
+const TRANSCRIPTION_PREVIEW_COLUMNS: usize = 72;
+const TRANSCRIPTION_PREVIEW_BINS: usize = 18;
+const TRANSCRIPTION_PREVIEW_RECOMPUTE_INTERVAL: Duration = Duration::from_millis(90);
 
 #[derive(Clone, Debug, Facet, PartialEq, Eq)]
 pub struct AudioInputDeviceSummary {
@@ -154,7 +157,17 @@ impl AudioInputDeviceWindowState {
         self.runtime.transcription.enabled = !self.runtime.transcription.enabled;
         if self.runtime.transcription.enabled {
             self.transcription_worker.reset_for_enabled_session();
+            self.runtime.transcription.last_sent_reason = None;
         }
+    }
+
+    // audio[impl transcription.manual-flush]
+    pub fn flush_transcription_chunk(&mut self) {
+        self.runtime.transcription.enabled = true;
+        self.runtime.refresh_transcription_preview_cache();
+        self.transcription_worker.flush_requested = true;
+        self.transcription_worker.debug_request_completed = false;
+        self.runtime.transcription.last_sent_reason = Some("manual flush queued".to_owned());
     }
 
     // audio[impl transcription.debug-runtime-tick]
@@ -162,16 +175,34 @@ impl AudioInputDeviceWindowState {
         self.drain_debug_transcription_result();
         if !self.runtime.transcription.enabled
             || self.transcription_worker.request_in_flight
-            || self.transcription_worker.debug_request_completed
+            || (self.transcription_worker.debug_request_completed
+                && !self.transcription_worker.flush_requested)
         {
             return;
         }
         let request_id = self.transcription_worker.next_request_id;
         self.transcription_worker.next_request_id += 1;
         self.transcription_worker.request_in_flight = true;
+        let flush_requested = self.transcription_worker.flush_requested;
+        self.transcription_worker.flush_requested = false;
+        self.runtime.transcription.last_sent_reason = Some(if flush_requested {
+            format!("manual flush sent request {request_id}")
+        } else {
+            format!("preview chunk sent request {request_id}")
+        });
         let (sender, receiver) = mpsc::channel();
         self.transcription_worker.result_receiver = Some(receiver);
-        let transcript_text = format!("debug transcript request {request_id}");
+        let chunk_seconds = self.runtime.transcription.chunk_seconds;
+        let energy = self.runtime.transcription.energy_rms;
+        let transcript_text = if flush_requested {
+            format!(
+                "manual flush request {request_id}; chunk {chunk_seconds:.2}s; energy {energy:.3}"
+            )
+        } else {
+            format!(
+                "debug transcript request {request_id}; chunk {chunk_seconds:.2}s; energy {energy:.3}"
+            )
+        };
         let _ = thread::Builder::new()
             .name("teamy-studio-debug-transcription".to_owned())
             .spawn(move || {
@@ -190,6 +221,7 @@ impl AudioInputDeviceWindowState {
             Ok(Ok(result)) => {
                 self.transcription_worker.request_in_flight = false;
                 self.transcription_worker.debug_request_completed = true;
+                self.runtime.transcription.last_completed_request_id = Some(result.request_id);
                 if self.runtime.transcription.enabled && result.ok {
                     self.runtime
                         .transcription
@@ -199,6 +231,7 @@ impl AudioInputDeviceWindowState {
             Ok(Err(error)) => {
                 self.transcription_worker.request_in_flight = false;
                 self.transcription_worker.debug_request_completed = true;
+                self.runtime.transcription.last_error = Some(error.clone());
                 if self.runtime.transcription.enabled {
                     self.runtime.transcription.stage_transcript_text(&format!(
                         "transcription debug path failed: {error}"
@@ -211,6 +244,7 @@ impl AudioInputDeviceWindowState {
             Err(TryRecvError::Disconnected) => {
                 self.transcription_worker.request_in_flight = false;
                 self.transcription_worker.debug_request_completed = true;
+                self.runtime.transcription.last_error = Some("debug path disconnected".to_owned());
                 if self.runtime.transcription.enabled {
                     self.runtime
                         .transcription
@@ -285,6 +319,7 @@ impl AudioInputDeviceWindowState {
 
     pub fn sync_transport(&mut self) {
         self.sync_playback_head();
+        self.runtime.refresh_transcription_preview_cache();
         self.tick_debug_transcription_runtime();
         self.runtime.recording_head_seconds = self.runtime.write_head_seconds();
     }
@@ -543,16 +578,41 @@ impl Default for AudioInputRuntimeState {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct AudioInputTranscriptionState {
     pub enabled: bool,
     pub staged_text: String,
+    pub preview: AudioInputMelSpectrogramPreview,
+    pub chunk_seconds: f64,
+    pub energy_rms: f32,
+    pub last_sent_reason: Option<String>,
+    pub last_completed_request_id: Option<u64>,
+    pub last_error: Option<String>,
+    preview_last_updated_at: Option<Instant>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct AudioInputMelSpectrogramPreview {
+    pub columns: usize,
+    pub bins: usize,
+    pub intensities: Vec<f32>,
+    pub cache_key: AudioInputMelSpectrogramPreviewCacheKey,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AudioInputMelSpectrogramPreviewCacheKey {
+    pub sample_count: usize,
+    pub sample_rate_hz: u32,
+    pub head_millis: u64,
+    pub columns: usize,
+    pub bins: usize,
 }
 
 struct AudioInputTranscriptionWorkerState {
     next_request_id: u64,
     request_in_flight: bool,
     debug_request_completed: bool,
+    flush_requested: bool,
     result_receiver: Option<Receiver<Result<AudioTranscriptionControlResult, String>>>,
 }
 
@@ -562,6 +622,7 @@ impl Default for AudioInputTranscriptionWorkerState {
             next_request_id: 1,
             request_in_flight: false,
             debug_request_completed: false,
+            flush_requested: false,
             result_receiver: None,
         }
     }
@@ -573,6 +634,7 @@ impl std::fmt::Debug for AudioInputTranscriptionWorkerState {
             .field("next_request_id", &self.next_request_id)
             .field("request_in_flight", &self.request_in_flight)
             .field("debug_request_completed", &self.debug_request_completed)
+            .field("flush_requested", &self.flush_requested)
             .field("has_result_receiver", &self.result_receiver.is_some())
             .finish()
     }
@@ -582,6 +644,7 @@ impl AudioInputTranscriptionWorkerState {
     fn reset_for_enabled_session(&mut self) {
         self.request_in_flight = false;
         self.debug_request_completed = false;
+        self.flush_requested = false;
         self.result_receiver = None;
     }
 }
@@ -600,6 +663,58 @@ impl AudioInputTranscriptionState {
 }
 
 impl AudioInputRuntimeState {
+    // audio[impl transcription.cached-preview]
+    pub fn refresh_transcription_preview_cache(&mut self) {
+        #[cfg(feature = "tracy")]
+        let _span = tracing::debug_span!("refresh_transcription_preview_cache").entered();
+        if !self.transcription.enabled {
+            return;
+        }
+        let Ok(buffer) = self.shared.lock() else {
+            return;
+        };
+        let head_millis = seconds_to_millis(self.transcription_head_seconds);
+        let cache_key = AudioInputMelSpectrogramPreviewCacheKey {
+            sample_count: buffer.samples.len(),
+            sample_rate_hz: buffer.sample_rate_hz,
+            head_millis,
+            columns: TRANSCRIPTION_PREVIEW_COLUMNS,
+            bins: TRANSCRIPTION_PREVIEW_BINS,
+        };
+        if self.transcription.preview.cache_key == cache_key {
+            return;
+        }
+        if self.transcription.preview.cache_key.sample_rate_hz == cache_key.sample_rate_hz
+            && self.transcription.preview.cache_key.head_millis == cache_key.head_millis
+            && self.transcription.preview.cache_key.columns == cache_key.columns
+            && self.transcription.preview.cache_key.bins == cache_key.bins
+            && self
+                .transcription
+                .preview_last_updated_at
+                .is_some_and(|updated_at| {
+                    updated_at.elapsed() < TRANSCRIPTION_PREVIEW_RECOMPUTE_INTERVAL
+                })
+        {
+            return;
+        }
+        let start_index = sample_index_from_seconds(
+            self.transcription_head_seconds,
+            buffer.sample_rate_hz,
+            buffer.samples.len(),
+        );
+        let lookahead = &buffer.samples[start_index..];
+        self.transcription.chunk_seconds =
+            seconds_from_samples(lookahead.len(), buffer.sample_rate_hz).get::<second>();
+        self.transcription.energy_rms = audio_rms_energy(lookahead);
+        self.transcription.preview = build_mel_spectrogram_preview(
+            lookahead,
+            TRANSCRIPTION_PREVIEW_COLUMNS,
+            TRANSCRIPTION_PREVIEW_BINS,
+            cache_key,
+        );
+        self.transcription.preview_last_updated_at = Some(Instant::now());
+    }
+
     #[must_use]
     pub fn samples(&self) -> Vec<f32> {
         self.shared
@@ -663,6 +778,91 @@ impl AudioInputRuntimeState {
     fn sync_write_head_from_recording_head(&mut self) {
         self.set_write_head_seconds(self.recording_head_seconds);
     }
+}
+
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "timeline seconds are clamped before conversion to sample indices"
+)]
+fn sample_index_from_seconds(seconds: f64, sample_rate_hz: u32, sample_count: usize) -> usize {
+    ((seconds.max(0.0) * f64::from(sample_rate_hz)) as usize).min(sample_count)
+}
+
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "RMS energy divides by a small display buffer sample count"
+)]
+fn audio_rms_energy(samples: &[f32]) -> f32 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+    let sum = samples
+        .iter()
+        .map(|sample| sample.clamp(-1.0, 1.0).powi(2))
+        .sum::<f32>();
+    (sum / samples.len() as f32).sqrt()
+}
+
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "preview bins are deliberately normalized into display intensities"
+)]
+fn build_mel_spectrogram_preview(
+    samples: &[f32],
+    columns: usize,
+    bins: usize,
+    cache_key: AudioInputMelSpectrogramPreviewCacheKey,
+) -> AudioInputMelSpectrogramPreview {
+    if samples.is_empty() {
+        return AudioInputMelSpectrogramPreview {
+            columns,
+            bins,
+            intensities: vec![0.0; columns * bins],
+            cache_key,
+        };
+    }
+    let peak = samples
+        .iter()
+        .map(|sample| sample.abs())
+        .fold(0.0_f32, f32::max)
+        .max(0.015);
+    let mut intensities = vec![0.0; columns * bins];
+    for column in 0..columns {
+        let start = (column * samples.len()) / columns;
+        let end = (((column + 1) * samples.len()) / columns)
+            .max(start + 1)
+            .min(samples.len());
+        let chunk = &samples[start..end];
+        for bin in 0..bins {
+            let mel_position = (bin + 1) as f32 / bins as f32;
+            let folded_energy = chunk
+                .iter()
+                .enumerate()
+                .map(|(index, sample)| {
+                    let phase = (index as f32 * (bin + 1) as f32 * 0.071).sin().abs();
+                    sample.abs() * (0.34 + phase * 0.66) * mel_position.sqrt()
+                })
+                .sum::<f32>()
+                / chunk.len().max(1) as f32;
+            intensities[(bin * columns) + column] = (folded_energy / peak).clamp(0.0, 1.0);
+        }
+    }
+    AudioInputMelSpectrogramPreview {
+        columns,
+        bins,
+        intensities,
+        cache_key,
+    }
+}
+
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "seconds are display-scale values and millis saturate for cache keys"
+)]
+fn seconds_to_millis(seconds: f64) -> u64 {
+    (seconds.max(0.0) * 1_000.0).round() as u64
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -1743,6 +1943,42 @@ mod tests {
         assert_eq!(
             state.runtime.transcription.staged_text,
             "hello from the pipe"
+        );
+    }
+
+    #[test]
+    // audio[verify transcription.cached-preview]
+    fn transcription_preview_cache_tracks_chunk_energy_and_shape() {
+        let mut runtime = AudioInputRuntimeState::default();
+        runtime.transcription.enabled = true;
+        {
+            let mut buffer = runtime.shared.lock().expect("shared buffer should lock");
+            buffer.sample_rate_hz = 48_000;
+            buffer.samples = vec![0.25; 4_800];
+        }
+
+        runtime.refresh_transcription_preview_cache();
+
+        assert_eq!(runtime.transcription.preview.columns, 72);
+        assert_eq!(runtime.transcription.preview.bins, 18);
+        assert_eq!(runtime.transcription.preview.intensities.len(), 72 * 18);
+        assert_eq!(runtime.transcription.chunk_seconds, 0.1);
+        assert!(runtime.transcription.energy_rms > 0.0);
+    }
+
+    #[test]
+    // audio[verify transcription.manual-flush]
+    fn manual_flush_enables_transcription_and_queues_chunk_send() {
+        let mut state = AudioInputDeviceWindowState::new(device("endpoint-id", "Studio Mic"));
+
+        state.flush_transcription_chunk();
+
+        assert!(state.runtime.transcription.enabled);
+        assert!(state.transcription_worker.flush_requested);
+        assert!(!state.transcription_worker.debug_request_completed);
+        assert_eq!(
+            state.runtime.transcription.last_sent_reason.as_deref(),
+            Some("manual flush queued")
         );
     }
 }

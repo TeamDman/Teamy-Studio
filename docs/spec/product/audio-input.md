@@ -45,6 +45,12 @@ Rust must consume transcription daemon results by releasing returned shared-memo
 audio[transcription.debug-runtime-tick]
 When transcription is enabled in the microphone window, Rust must be able to run a nonblocking debug transcription tick that submits a placeholder log-mel tensor to the Python pipe path and stages the returned text in the transcript island.
 
+audio[transcription.cached-preview]
+The microphone transcription preview must cache spectrogram intensity and energy calculations outside the render-only path so focused-frame redraws can reuse the latest computed preview.
+
+audio[transcription.manual-flush]
+The microphone window must provide a manual flush control that sends the current transcription chunk without waiting for a future full-duration chunk boundary, and the UI must indicate chunk duration, energy, send state, and completed request id.
+
 audio[transcription.shared-memory-pool-status]
 Rust must expose the initial shared-memory slot-pool sizing and live queue counters that the CLI and GUI can report before Python inference is started.
 

@@ -411,6 +411,7 @@ enum ScenePressedTarget {
     AudioInputDevice(usize),
     AudioInputDeviceArm,
     AudioInputTranscription,
+    AudioInputTranscriptionFlush,
     AudioInputPlayback,
     AudioInputDeviceLoopback,
     AudioInputTimelineHead(AudioInputTimelineHeadKind),
@@ -977,6 +978,7 @@ enum ScenePointerAction {
     ChooseAudioInputDevice(usize),
     ToggleAudioInputRecording,
     ToggleAudioInputTranscription,
+    FlushAudioInputTranscription,
     ToggleAudioInputPlayback,
     ToggleAudioInputLoopback,
     BeginAudioInputTimeline,
@@ -994,6 +996,7 @@ enum SceneKeyAction {
     CopySelectedText(String),
     ToggleAudioInputRecording,
     ToggleAudioInputTranscription,
+    FlushAudioInputTranscription,
     ToggleAudioInputPlayback,
     PauseAudioInputPlayback,
     AudioInputPlaybackForward,
@@ -2264,6 +2267,9 @@ fn handle_scene_key_down_message(
             if virtual_key == u32::from(b'T') {
                 return Ok(SceneKeyAction::ToggleAudioInputTranscription);
             }
+            if virtual_key == u32::from(b'F') {
+                return Ok(SceneKeyAction::FlushAudioInputTranscription);
+            }
             if virtual_key == u32::from(b'K') {
                 return Ok(SceneKeyAction::PauseAudioInputPlayback);
             }
@@ -2453,6 +2459,18 @@ fn handle_scene_key_down_message(
             let result = with_scene_app_state(|state| {
                 if let Some(device_window) = state.audio_input_device_window.as_mut() {
                     device_window.toggle_transcription();
+                }
+                render_scene_window_frame(state, hwnd, None, false)
+            });
+            match result {
+                Ok(()) => LRESULT(0),
+                Err(error) => fail_and_close(hwnd, &error),
+            }
+        }
+        Ok(SceneKeyAction::FlushAudioInputTranscription) => {
+            let result = with_scene_app_state(|state| {
+                if let Some(device_window) = state.audio_input_device_window.as_mut() {
+                    device_window.flush_transcription_chunk();
                 }
                 render_scene_window_frame(state, hwnd, None, false)
             });
@@ -2683,6 +2701,13 @@ fn handle_scene_left_button_down(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Re
             return Ok(ScenePointerAction::ToggleAudioInputTranscription);
         }
 
+        if audio_input_device_transcription_flush_button_at_point(state, layout, point) {
+            state.pending_diagnostic_selection = None;
+            state.pressed_target = Some(ScenePressedTarget::AudioInputTranscriptionFlush);
+            hwnd.capture_mouse();
+            return Ok(ScenePointerAction::FlushAudioInputTranscription);
+        }
+
         if audio_input_device_play_pause_button_at_point(state, layout, point) {
             state.pending_diagnostic_selection = None;
             state.pressed_target = Some(ScenePressedTarget::AudioInputPlayback);
@@ -2787,6 +2812,15 @@ fn handle_scene_left_button_down(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Re
             with_scene_app_state(|state| {
                 if let Some(device_window) = state.audio_input_device_window.as_mut() {
                     device_window.toggle_transcription();
+                }
+                render_scene_window_frame(state, hwnd, None, false)
+            })?;
+            Ok(true)
+        }
+        ScenePointerAction::FlushAudioInputTranscription => {
+            with_scene_app_state(|state| {
+                if let Some(device_window) = state.audio_input_device_window.as_mut() {
+                    device_window.flush_transcription_chunk();
                 }
                 render_scene_window_frame(state, hwnd, None, false)
             })?;
@@ -2947,6 +2981,15 @@ fn handle_scene_left_button_up(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Resu
             with_scene_app_state(|state| {
                 if let Some(device_window) = state.audio_input_device_window.as_mut() {
                     device_window.toggle_transcription();
+                }
+                render_scene_window_frame(state, hwnd, None, false)
+            })?;
+            Ok(true)
+        }
+        ScenePointerAction::FlushAudioInputTranscription => {
+            with_scene_app_state(|state| {
+                if let Some(device_window) = state.audio_input_device_window.as_mut() {
+                    device_window.flush_transcription_chunk();
                 }
                 render_scene_window_frame(state, hwnd, None, false)
             })?;
@@ -4008,6 +4051,11 @@ fn audio_input_device_detail_visual_state(
         ),
         transcription_pressed: state.pressed_target
             == Some(ScenePressedTarget::AudioInputTranscription),
+        transcription_flush_hovered: audio_input_device_transcription_flush_button_at_point(
+            state, layout, point,
+        ),
+        transcription_flush_pressed: state.pressed_target
+            == Some(ScenePressedTarget::AudioInputTranscriptionFlush),
         playback_hovered: audio_input_device_play_pause_button_at_point(state, layout, point),
         playback_pressed: state.pressed_target == Some(ScenePressedTarget::AudioInputPlayback),
         loopback_hovered: audio_input_device_loopback_button_at_point(state, layout, point),
@@ -4349,6 +4397,8 @@ fn scene_interactive_region_contains(
             || (!state.diagnostics_visible
                 && audio_input_device_transcription_button_at_point(state, layout, point))
             || (!state.diagnostics_visible
+                && audio_input_device_transcription_flush_button_at_point(state, layout, point))
+            || (!state.diagnostics_visible
                 && audio_input_device_play_pause_button_at_point(state, layout, point))
             || (!state.diagnostics_visible
                 && audio_input_device_loopback_button_at_point(state, layout, point))
@@ -4461,6 +4511,22 @@ fn audio_input_device_transcription_button_at_point(
     let body_rect = layout.terminal_panel_rect().inset(24);
     windows_scene::audio_input_device_detail_layout(body_rect)
         .transcription_button_rect
+        .contains(point)
+}
+
+fn audio_input_device_transcription_flush_button_at_point(
+    state: &SceneAppState,
+    layout: TerminalLayout,
+    point: ClientPoint,
+) -> bool {
+    if state.scene_kind != SceneWindowKind::AudioInputDeviceDetails
+        || state.audio_input_device_window.is_none()
+    {
+        return false;
+    }
+    let body_rect = layout.terminal_panel_rect().inset(24);
+    windows_scene::audio_input_device_detail_layout(body_rect)
+        .transcription_flush_button_rect
         .contains(point)
 }
 
@@ -7147,6 +7213,7 @@ fn scene_cursor_for_point(
         && (legacy_recording_devices_button_at_point(state, layout, point)
             || audio_input_device_arm_button_at_point(state, layout, point)
             || audio_input_device_transcription_button_at_point(state, layout, point)
+            || audio_input_device_transcription_flush_button_at_point(state, layout, point)
             || audio_input_device_play_pause_button_at_point(state, layout, point)
             || audio_input_device_loopback_button_at_point(state, layout, point)
             || audio_input_device_detail_legacy_recording_button_at_point(state, layout, point))
@@ -7325,6 +7392,13 @@ fn update_scene_chrome_tooltip(
 
     if let Some((tooltip_text, anchor_rect)) =
         audio_input_device_transcription_tooltip(state, layout, point)
+    {
+        show_scene_tooltip(state, hwnd, point, tooltip_text, anchor_rect)?;
+        return Ok(());
+    }
+
+    if let Some((tooltip_text, anchor_rect)) =
+        audio_input_device_transcription_flush_tooltip(state, layout, point)
     {
         show_scene_tooltip(state, hwnd, point, tooltip_text, anchor_rect)?;
         return Ok(());
@@ -7590,6 +7664,28 @@ fn audio_input_device_transcription_tooltip(
         },
         rect,
     ))
+}
+
+fn audio_input_device_transcription_flush_tooltip(
+    state: &SceneAppState,
+    layout: TerminalLayout,
+    point: ClientPoint,
+) -> Option<(&'static str, ClientRect)> {
+    if state.diagnostics_visible
+        || state.scene_kind != SceneWindowKind::AudioInputDeviceDetails
+        || state.audio_input_device_window.is_none()
+    {
+        return None;
+    }
+
+    let body_rect = layout.terminal_panel_rect().inset(24);
+    let rect =
+        windows_scene::audio_input_device_detail_layout(body_rect).transcription_flush_button_rect;
+    if !rect.contains(point) {
+        return None;
+    }
+
+    Some(("Flush current transcription chunk (F)", rect))
 }
 
 fn audio_input_device_play_pause_tooltip(

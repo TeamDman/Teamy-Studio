@@ -54,6 +54,7 @@ The guiding idea from the source note is that Teamy Studio should not merely mim
   - Connected the Python daemon scaffold to the named-pipe debug path, including validation of a real Rust-created shared-memory slot and return of a slot-release result.
   - Added the Rust-side result-staging hook so returned daemon text can appear in the microphone transcript island while released slots return to the pool.
   - Added the first app-side debug transcription tick, letting the mic window launch the Python pipe path off the UI thread and stage the returned debug transcript text.
+  - Added cached spectrogram/energy preview state plus a manual transcription chunk flush control, making the chunk/send feedback visible before real WhisperX inference lands.
 - Current focus:
   - Use the microphone timeline, shared-memory slot pool, named-pipe Python handoff, and daemon dashboard as the first real proving ground for captured-audio feature preparation.
 - Remaining work:

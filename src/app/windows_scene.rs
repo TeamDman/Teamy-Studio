@@ -106,6 +106,7 @@ pub struct AudioInputDeviceDetailLayout {
     pub info_rect: ClientRect,
     pub arm_button_rect: ClientRect,
     pub transcription_button_rect: ClientRect,
+    pub transcription_flush_button_rect: ClientRect,
     pub play_pause_button_rect: ClientRect,
     pub loopback_button_rect: ClientRect,
     pub arm_status_rect: ClientRect,
@@ -131,6 +132,8 @@ pub struct AudioInputTimelineHeadGrabberLayout {
 pub struct AudioInputDeviceDetailVisualState {
     pub transcription_hovered: bool,
     pub transcription_pressed: bool,
+    pub transcription_flush_hovered: bool,
+    pub transcription_flush_pressed: bool,
     pub playback_hovered: bool,
     pub playback_pressed: bool,
     pub loopback_hovered: bool,
@@ -1381,6 +1384,35 @@ pub fn build_audio_input_device_detail_render_scene(
             0.0,
         ],
     );
+    push_panel(
+        &mut scene,
+        detail_layout
+            .transcription_flush_button_rect
+            .to_win32_rect(),
+        if visual_state.transcription_flush_pressed {
+            [0.58, 0.36, 0.18, 1.0]
+        } else if visual_state.transcription_flush_hovered {
+            [0.36, 0.25, 0.17, 1.0]
+        } else {
+            [0.18, 0.15, 0.12, 1.0]
+        },
+        PanelEffect::TerminalFill,
+    );
+    push_text_block(
+        &mut scene,
+        detail_layout
+            .transcription_flush_button_rect
+            .inset(8)
+            .to_win32_rect(),
+        "Flush chunk",
+        8,
+        14,
+        if device_state.runtime.transcription.enabled {
+            [0.95, 0.78, 0.50, 1.0]
+        } else {
+            [0.62, 0.58, 0.52, 1.0]
+        },
+    );
     push_panel_with_data(
         &mut scene,
         detail_layout.play_pause_button_rect.to_win32_rect(),
@@ -1507,6 +1539,10 @@ pub fn audio_input_device_detail_selectable_text_rect(
 }
 
 #[must_use]
+#[expect(
+    clippy::too_many_lines,
+    reason = "audio detail geometry is kept in one function so hit testing and rendering share it"
+)]
 pub fn audio_input_device_detail_layout(body_rect: ClientRect) -> AudioInputDeviceDetailLayout {
     let icon_size = body_rect.width().min(body_rect.height()).clamp(96, 164);
     let icon_rect = ClientRect::new(
@@ -1542,6 +1578,12 @@ pub fn audio_input_device_detail_layout(body_rect: ClientRect) -> AudioInputDevi
         arm_button_rect.top() + 5,
         play_pause_button_rect.left() - 24,
         arm_button_rect.top() + 5 + transcription_button_size,
+    );
+    let transcription_flush_button_rect = ClientRect::new(
+        transcription_button_rect.left(),
+        arm_button_rect.bottom() + 8,
+        loopback_button_rect.right(),
+        arm_button_rect.bottom() + 32,
     );
     let arm_status_rect = ClientRect::new(
         arm_button_rect.right() + 18,
@@ -1597,6 +1639,7 @@ pub fn audio_input_device_detail_layout(body_rect: ClientRect) -> AudioInputDevi
         info_rect,
         arm_button_rect,
         transcription_button_rect,
+        transcription_flush_button_rect,
         play_pause_button_rect,
         loopback_button_rect,
         arm_status_rect,
@@ -1807,8 +1850,13 @@ fn push_mel_spectrogram(
         return;
     }
 
-    let samples = device_state.runtime.samples();
-    if samples.is_empty() {
+    let preview = &device_state.runtime.transcription.preview;
+    if preview.intensities.is_empty()
+        || preview
+            .intensities
+            .iter()
+            .all(|intensity| *intensity == 0.0)
+    {
         push_text_block(
             scene,
             inner_rect.to_win32_rect(),
@@ -1820,63 +1868,39 @@ fn push_mel_spectrogram(
         return;
     }
 
-    push_mel_spectrogram_tiles(
+    push_mel_spectrogram_tiles(scene, inner_rect, device_state);
+    let status = transcription_preview_status_text(device_state);
+    push_text_block(
         scene,
-        inner_rect,
-        &samples,
-        device_state.runtime.sample_rate_hz(),
-        device_state.runtime.transcription_head_seconds,
+        ClientRect::new(
+            inner_rect.left() + 8,
+            inner_rect.top() + 6,
+            inner_rect.right() - 8,
+            inner_rect.top() + 38,
+        )
+        .to_win32_rect(),
+        &status,
+        8,
+        14,
+        [0.88, 0.86, 0.74, 1.0],
     );
 }
 
-#[expect(
-    clippy::cast_possible_truncation,
-    clippy::cast_precision_loss,
-    clippy::cast_sign_loss,
-    reason = "audio sample indices and preview amplitudes are clamped to display dimensions"
-)]
 fn push_mel_spectrogram_tiles(
     scene: &mut RenderScene,
     rect: ClientRect,
-    samples: &[f32],
-    sample_rate_hz: u32,
-    head_seconds: f64,
+    device_state: &AudioInputDeviceWindowState,
 ) {
-    let start_index = ((head_seconds.max(0.0) * f64::from(sample_rate_hz)) as usize)
-        .min(samples.len().saturating_sub(1));
-    let lookahead = &samples[start_index..];
-    if lookahead.is_empty() {
+    let preview = &device_state.runtime.transcription.preview;
+    if preview.columns == 0 || preview.bins == 0 {
         return;
     }
+    let columns = i32::try_from(preview.columns).unwrap_or(1).max(1);
+    let bins = i32::try_from(preview.bins).unwrap_or(1).max(1);
 
-    let columns = (rect.width() / 10).clamp(18, 72);
-    let bins = (rect.height() / 8).clamp(8, 18);
-    let columns_usize = usize::try_from(columns).unwrap_or(1);
-    let bins_usize = usize::try_from(bins).unwrap_or(1);
-    let peak = lookahead
-        .iter()
-        .map(|sample| sample.abs())
-        .fold(0.0_f32, f32::max)
-        .max(0.015);
-
-    for column in 0..columns_usize {
-        let start = (column * lookahead.len()) / columns_usize;
-        let end = (((column + 1) * lookahead.len()) / columns_usize)
-            .max(start + 1)
-            .min(lookahead.len());
-        let chunk = &lookahead[start..end];
-        for bin in 0..bins_usize {
-            let mel_position = (bin + 1) as f32 / bins_usize as f32;
-            let folded_energy = chunk
-                .iter()
-                .enumerate()
-                .map(|(index, sample)| {
-                    let phase = (index as f32 * (bin + 1) as f32 * 0.071).sin().abs();
-                    sample.abs() * (0.34 + phase * 0.66) * mel_position.sqrt()
-                })
-                .sum::<f32>()
-                / chunk.len().max(1) as f32;
-            let intensity = (folded_energy / peak).clamp(0.0, 1.0);
+    for column in 0..preview.columns {
+        for bin in 0..preview.bins {
+            let intensity = preview.intensities[(bin * preview.columns) + column];
             let color = mel_spectrogram_color(intensity);
             let left =
                 rect.left() + (i32::try_from(column).unwrap_or_default() * rect.width()) / columns;
@@ -1895,6 +1919,21 @@ fn push_mel_spectrogram_tiles(
             );
         }
     }
+}
+
+fn transcription_preview_status_text(device_state: &AudioInputDeviceWindowState) -> String {
+    let transcription = &device_state.runtime.transcription;
+    let request_text = transcription
+        .last_sent_reason
+        .as_deref()
+        .unwrap_or("no chunk sent yet");
+    let completed = transcription
+        .last_completed_request_id
+        .map_or_else(|| "none".to_owned(), |request_id| request_id.to_string());
+    format!(
+        "chunk {:.2}s  energy {:.3}  sent: {}  done: {}",
+        transcription.chunk_seconds, transcription.energy_rms, request_text, completed
+    )
 }
 
 fn mel_spectrogram_color(intensity: f32) -> [f32; 4] {
