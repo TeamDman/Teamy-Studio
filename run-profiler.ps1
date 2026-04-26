@@ -200,6 +200,10 @@ if (Get-Command tracy-profiler.exe -ErrorAction SilentlyContinue) {
 }
 
 $overallStopwatch.Stop()
+
+Write-Host "CSV:"
+tracy-csvexport.exe $capturePath
+
 Write-Host "Timing summary:"
 Write-Host "  capture launch: $(Format-Elapsed $captureLaunchElapsed)"
 if ($commandElapsed) {
