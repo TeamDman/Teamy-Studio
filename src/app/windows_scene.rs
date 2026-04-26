@@ -10,9 +10,14 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Axis, Block, Borders, Chart, Dataset, GraphType, List, ListItem, Paragraph, Widget, Wrap,
 };
+use uom::si::f64::Time;
+use uom::si::time::second;
 use windows::Win32::Foundation::RECT;
 
-use crate::timeline::TimelineDocument;
+use crate::timeline::{
+    TimelineDocument, TimelineRulerTick, TimelineTimeNs, TimelineTimeRangeNs, TimelineTrack,
+    TimelineTrackKind, TimelineViewport, TimelineViewportPoint,
+};
 
 use super::AudioTranscriptionDaemonStatusReport;
 use super::cell_grid;
@@ -44,6 +49,15 @@ const CLICK_DECAY_DURATION: Duration = Duration::from_millis(220);
 const DIAGNOSTIC_TEXT_COLOR: [f32; 4] = [0.92, 0.94, 0.96, 1.0];
 const DIAGNOSTIC_SELECTION_FOREGROUND: [f32; 4] = [0.04, 0.05, 0.06, 1.0];
 const DIAGNOSTIC_SELECTION_BACKGROUND: [f32; 4] = [0.42, 0.67, 0.98, 1.0];
+const TIMELINE_TRACK_ROW_HEIGHT: i32 = 72;
+const TIMELINE_TRACK_ROW_GAP: i32 = 10;
+const TIMELINE_SCROLLBAR_THICKNESS: i32 = 12;
+const TIMELINE_SCROLLBAR_MIN_THUMB: i32 = 24;
+const TIMELINE_SELECTION_FILL: [f32; 4] = [0.42, 0.67, 0.98, 0.18];
+const TIMELINE_SELECTION_BORDER: [f32; 4] = [0.76, 0.86, 0.98, 0.92];
+const TIMELINE_SELECTION_INTERSECTION: [f32; 4] = [0.95, 0.86, 0.30, 0.36];
+const TIMELINE_SCROLLBAR_TRACK: [f32; 4] = [0.16, 0.18, 0.22, 0.92];
+const TIMELINE_SCROLLBAR_THUMB: [f32; 4] = [0.48, 0.56, 0.66, 0.94];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SceneWindowKind {
@@ -55,6 +69,7 @@ pub enum SceneWindowKind {
     CursorGallery,
     DemoMode,
     TimelineStart,
+    TimelineAddTrack,
     Timeline,
 }
 
@@ -70,6 +85,7 @@ impl SceneWindowKind {
             Self::CursorGallery => "Cursor Gallery",
             Self::DemoMode => "Demo Mode",
             Self::TimelineStart | Self::Timeline => "Timeline",
+            Self::TimelineAddTrack => "Add Track",
         }
     }
 }
@@ -87,10 +103,333 @@ pub enum SceneAction {
     OpenAudioDaemon,
     OpenAudioInputDevices,
     OpenTimeline,
+    OpenTimelineTrackMenu,
     CreateBlankTimeline,
+    PanTimelineLeft,
+    PanTimelineRight,
+    ZoomTimelineIn,
+    ZoomTimelineOut,
+    AppendMicrophoneTrack,
+    CloseTimelineTrackMenu,
     ImportTimeline,
     SelectWindowsBell,
     SelectFileBell,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct TimelineDocumentVisualState {
+    pub add_track_button: ButtonVisualState,
+    pub transport_play_button: ButtonVisualState,
+    pub microphone_record_button: ButtonVisualState,
+    pub pan_left_button: ButtonVisualState,
+    pub pan_right_button: ButtonVisualState,
+    pub zoom_in_button: ButtonVisualState,
+    pub zoom_out_button: ButtonVisualState,
+    pub hovered_head: Option<AudioInputTimelineHeadKind>,
+    pub grabbed_head: Option<AudioInputTimelineHeadKind>,
+    pub vertical_scroll_offset: i32,
+    pub selection: Option<TimelineRectSelection>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TimelineAudioHeadGrabberLayout {
+    pub kind: AudioInputTimelineHeadKind,
+    pub rect: ClientRect,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TimelineTrackVerticalRange {
+    top: i32,
+    bottom: i32,
+}
+
+impl TimelineTrackVerticalRange {
+    #[must_use]
+    pub fn new(top: i32, bottom: i32) -> Self {
+        if top <= bottom {
+            Self { top, bottom }
+        } else {
+            Self {
+                top: bottom,
+                bottom: top,
+            }
+        }
+    }
+
+    #[must_use]
+    pub const fn top(self) -> i32 {
+        self.top
+    }
+
+    #[must_use]
+    pub const fn bottom(self) -> i32 {
+        self.bottom
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TimelineRectSelection {
+    time_range: TimelineTimeRangeNs,
+    track_y_range: TimelineTrackVerticalRange,
+}
+
+impl TimelineRectSelection {
+    #[must_use]
+    pub const fn new(
+        time_range: TimelineTimeRangeNs,
+        track_y_range: TimelineTrackVerticalRange,
+    ) -> Self {
+        Self {
+            time_range,
+            track_y_range,
+        }
+    }
+
+    #[must_use]
+    pub const fn time_range(self) -> TimelineTimeRangeNs {
+        self.time_range
+    }
+
+    #[must_use]
+    pub const fn track_y_range(self) -> TimelineTrackVerticalRange {
+        self.track_y_range
+    }
+}
+
+#[expect(
+    clippy::struct_field_names,
+    reason = "timeline layout stores named regions used for rendering and hit testing"
+)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TimelineDocumentLayout {
+    pub body_rect: ClientRect,
+    pub track_list_rect: ClientRect,
+    pub add_track_rect: ClientRect,
+    pub track_text_rect: ClientRect,
+    pub ruler_rect: ClientRect,
+    pub transport_panel_rect: ClientRect,
+    pub viewport_controls_rect: ClientRect,
+    pub time_axis_rect: ClientRect,
+    pub content_rect: ClientRect,
+    pub scrollport_rect: ClientRect,
+    pub horizontal_scrollbar_rect: ClientRect,
+    pub vertical_scrollbar_rect: ClientRect,
+}
+
+#[must_use]
+pub fn timeline_document_layout(body_rect: ClientRect) -> TimelineDocumentLayout {
+    let track_list_width = (body_rect.width() / 4).clamp(180, 300);
+    let ruler_height = 54;
+    let gap = 12;
+    let scrollbar_gap = 6;
+    let track_list_rect = ClientRect::new(
+        body_rect.left(),
+        body_rect.top(),
+        body_rect.left() + track_list_width,
+        body_rect.bottom(),
+    );
+    let add_track_rect = ClientRect::new(
+        track_list_rect.left() + 14,
+        track_list_rect.top() + 14,
+        track_list_rect.right() - 14,
+        track_list_rect.top() + 58,
+    );
+    let track_text_rect = ClientRect::new(
+        track_list_rect.left() + 14,
+        add_track_rect.bottom() + 14,
+        track_list_rect.right() - 14,
+        track_list_rect.bottom() - 14,
+    );
+    let ruler_rect = ClientRect::new(
+        track_list_rect.right() + gap,
+        body_rect.top(),
+        body_rect.right(),
+        body_rect.top() + ruler_height,
+    );
+    let transport_panel_rect = ClientRect::new(
+        ruler_rect.left() + 6,
+        ruler_rect.top() + 8,
+        ruler_rect.left() + 96,
+        ruler_rect.bottom() - 8,
+    );
+    let viewport_controls_rect = ClientRect::new(
+        ruler_rect.right() - 216,
+        ruler_rect.top() + 8,
+        ruler_rect.right() - 12,
+        ruler_rect.bottom() - 8,
+    );
+    let time_axis_rect = ClientRect::new(
+        transport_panel_rect.right() + 10,
+        ruler_rect.top(),
+        viewport_controls_rect.left() - 10,
+        ruler_rect.bottom(),
+    );
+    let content_rect = ClientRect::new(
+        ruler_rect.left(),
+        ruler_rect.bottom() + gap,
+        body_rect.right(),
+        body_rect.bottom(),
+    );
+    let scrollport_rect = ClientRect::new(
+        time_axis_rect.left(),
+        content_rect.top() + 6,
+        time_axis_rect.right(),
+        content_rect.bottom() - TIMELINE_SCROLLBAR_THICKNESS - scrollbar_gap,
+    );
+    let horizontal_scrollbar_rect = ClientRect::new(
+        scrollport_rect.left(),
+        scrollport_rect.bottom() + scrollbar_gap,
+        scrollport_rect.right(),
+        content_rect.bottom() - 6,
+    );
+    let vertical_scrollbar_rect = ClientRect::new(
+        scrollport_rect.right() + scrollbar_gap,
+        scrollport_rect.top(),
+        content_rect.right() - 6,
+        scrollport_rect.bottom(),
+    );
+
+    TimelineDocumentLayout {
+        body_rect,
+        track_list_rect,
+        add_track_rect,
+        track_text_rect,
+        ruler_rect,
+        transport_panel_rect,
+        viewport_controls_rect,
+        time_axis_rect,
+        content_rect,
+        scrollport_rect,
+        horizontal_scrollbar_rect,
+        vertical_scrollbar_rect,
+    }
+}
+
+#[must_use]
+pub fn timeline_track_world_height(track_count: usize) -> i32 {
+    let track_count = i32::try_from(track_count).unwrap_or(i32::MAX);
+    if track_count <= 0 {
+        return 0;
+    }
+
+    track_count.saturating_mul(TIMELINE_TRACK_ROW_HEIGHT)
+        + track_count
+            .saturating_sub(1)
+            .saturating_mul(TIMELINE_TRACK_ROW_GAP)
+}
+
+#[must_use]
+pub fn timeline_clamp_vertical_scroll_offset(
+    layout: TimelineDocumentLayout,
+    track_count: usize,
+    offset: i32,
+) -> i32 {
+    let max_offset = timeline_track_world_height(track_count)
+        .saturating_sub(layout.scrollport_rect.height().max(0));
+    offset.clamp(0, max_offset.max(0))
+}
+
+#[must_use]
+pub fn timeline_selection_surface_contains(
+    layout: TimelineDocumentLayout,
+    point: ClientPoint,
+) -> bool {
+    layout.time_axis_rect.contains(point) || layout.scrollport_rect.contains(point)
+}
+
+#[must_use]
+pub fn timeline_scroll_interaction_contains(
+    layout: TimelineDocumentLayout,
+    point: ClientPoint,
+) -> bool {
+    timeline_selection_surface_contains(layout, point)
+        || layout.horizontal_scrollbar_rect.contains(point)
+        || layout.vertical_scrollbar_rect.contains(point)
+}
+
+#[must_use]
+pub fn timeline_viewport_point_from_client_point(
+    layout: TimelineDocumentLayout,
+    point: ClientPoint,
+) -> TimelineViewportPoint {
+    let point_x = point
+        .to_win32_point()
+        .map_or(layout.scrollport_rect.left(), |point| point.x);
+    TimelineViewportPoint::new_pixels(f64::from(
+        (point_x - layout.scrollport_rect.left()).clamp(0, layout.scrollport_rect.width().max(0)),
+    ))
+}
+
+#[must_use]
+pub fn timeline_track_world_y_from_client_point(
+    layout: TimelineDocumentLayout,
+    vertical_scroll_offset: i32,
+    point: ClientPoint,
+) -> i32 {
+    let point_y = point
+        .to_win32_point()
+        .map_or(layout.scrollport_rect.top(), |point| point.y);
+    (point_y - layout.scrollport_rect.top()).saturating_add(vertical_scroll_offset)
+}
+
+#[must_use]
+pub fn timeline_viewport_control_rect(
+    layout: TimelineDocumentLayout,
+    action: SceneAction,
+) -> Option<ClientRect> {
+    let controls_rect = layout.viewport_controls_rect;
+    let gap = 8;
+    let button_width = ((controls_rect.width() - (gap * 3)) / 4).max(36);
+    let top = controls_rect.top();
+    let bottom = controls_rect.bottom();
+
+    [
+        SceneAction::PanTimelineLeft,
+        SceneAction::PanTimelineRight,
+        SceneAction::ZoomTimelineIn,
+        SceneAction::ZoomTimelineOut,
+    ]
+    .into_iter()
+    .enumerate()
+    .find_map(|(index, candidate)| {
+        (candidate == action).then(|| {
+            let index = i32::try_from(index).unwrap_or(0);
+            let left = controls_rect.left() + index * (button_width + gap);
+            ClientRect::new(
+                left,
+                top,
+                (left + button_width).min(controls_rect.right()),
+                bottom,
+            )
+        })
+    })
+}
+
+#[must_use]
+pub const fn timeline_viewport_control_label(action: SceneAction) -> Option<&'static str> {
+    match action {
+        SceneAction::PanTimelineLeft => Some("<-"),
+        SceneAction::PanTimelineRight => Some("->"),
+        SceneAction::ZoomTimelineIn => Some("+"),
+        SceneAction::ZoomTimelineOut => Some("-"),
+        _ => None,
+    }
+}
+
+#[must_use]
+pub const fn timeline_viewport_control_tooltip(action: SceneAction) -> Option<&'static str> {
+    match action {
+        SceneAction::PanTimelineLeft => Some("Pan timeline earlier"),
+        SceneAction::PanTimelineRight => Some("Pan timeline later"),
+        SceneAction::ZoomTimelineIn => Some("Zoom timeline in"),
+        SceneAction::ZoomTimelineOut => Some("Zoom timeline out"),
+        _ => None,
+    }
+}
+
+#[must_use]
+pub const fn timeline_transport_play_button_rect(layout: TimelineDocumentLayout) -> ClientRect {
+    layout.transport_panel_rect
 }
 
 #[expect(
@@ -474,12 +813,40 @@ pub fn scene_button_specs(scene_kind: SceneWindowKind) -> &'static [SceneButtonS
             },
             SceneButtonSpec {
                 // timeline[impl start-window.create-or-import]
-                // timeline[impl start-window.import-placeholder]
+                // timeline[impl import.tracy.file-picker]
                 action: SceneAction::ImportTimeline,
                 label: "Import",
                 tooltip: "Import a Tracy capture",
                 sprite: SpriteId::FileAudio,
                 color: [0.23, 0.19, 0.30, 1.0],
+            },
+        ],
+        SceneWindowKind::TimelineAddTrack => &[
+            SceneButtonSpec {
+                // timeline[impl add-track.workflow]
+                // timeline[impl add-track.microphone-placeholder]
+                action: SceneAction::AppendMicrophoneTrack,
+                label: "Microphone",
+                tooltip: "Create a pending microphone track",
+                sprite: SpriteId::WindowsAudio,
+                color: [0.17, 0.24, 0.31, 1.0],
+            },
+            SceneButtonSpec {
+                // timeline[impl add-track.workflow]
+                // timeline[impl add-track.tracy]
+                action: SceneAction::ImportTimeline,
+                label: "Tracing",
+                tooltip: "Append a Tracy capture track",
+                sprite: SpriteId::FileAudio,
+                color: [0.24, 0.19, 0.30, 1.0],
+            },
+            SceneButtonSpec {
+                // timeline[impl add-track.workflow]
+                action: SceneAction::CloseTimelineTrackMenu,
+                label: "Back",
+                tooltip: "Return to the timeline document",
+                sprite: SpriteId::Terminal,
+                color: [0.18, 0.18, 0.22, 1.0],
             },
         ],
         SceneWindowKind::AudioPicker => &[
@@ -510,102 +877,1064 @@ pub fn scene_button_specs(scene_kind: SceneWindowKind) -> &'static [SceneButtonS
 #[must_use]
 // timeline[impl blank.track-list]
 // timeline[impl blank.add-track-placeholder]
+#[expect(
+    clippy::too_many_lines,
+    reason = "timeline scene composition keeps the coupled layout and overlay drawing in one place"
+)]
 pub fn build_blank_timeline_render_scene(
     layout: TerminalLayout,
     window_chrome_buttons_state: WindowChromeButtonsState,
     document: Option<&TimelineDocument>,
+    audio_input_state: Option<&AudioInputDeviceWindowState>,
+    visual_state: TimelineDocumentVisualState,
 ) -> RenderScene {
     let mut scene = build_scene_shell(
         layout,
         SceneWindowKind::Timeline,
         window_chrome_buttons_state,
     );
-    let body_rect = layout.terminal_panel_rect().inset(24);
+    let timeline_layout = timeline_document_layout(layout.terminal_panel_rect().inset(24));
     push_panel(
         &mut scene,
-        body_rect.to_win32_rect(),
+        timeline_layout.body_rect.to_win32_rect(),
         [0.08, 0.09, 0.11, 1.0],
         PanelEffect::SceneBody,
     );
 
-    let track_list_width = (body_rect.width() / 4).clamp(180, 300);
-    let ruler_height = 54;
-    let gap = 12;
-    let track_list_rect = ClientRect::new(
-        body_rect.left(),
-        body_rect.top(),
-        body_rect.left() + track_list_width,
-        body_rect.bottom(),
-    );
-    let add_track_rect = ClientRect::new(
-        track_list_rect.left() + 14,
-        track_list_rect.top() + 14,
-        track_list_rect.right() - 14,
-        track_list_rect.top() + 58,
-    );
-    let ruler_rect = ClientRect::new(
-        track_list_rect.right() + gap,
-        body_rect.top(),
-        body_rect.right(),
-        body_rect.top() + ruler_height,
-    );
-    let content_rect = ClientRect::new(
-        ruler_rect.left(),
-        ruler_rect.bottom() + gap,
-        body_rect.right(),
-        body_rect.bottom(),
-    );
-
+    // timeline[impl blank.tool-panels]
     push_panel(
         &mut scene,
-        track_list_rect.to_win32_rect(),
+        timeline_layout.track_list_rect.to_win32_rect(),
         [0.11, 0.12, 0.15, 1.0],
         PanelEffect::SceneButtonCard,
     );
-    push_panel(
+    push_timeline_track_list_panel(
         &mut scene,
-        add_track_rect.to_win32_rect(),
+        timeline_layout,
+        document,
+        audio_input_state,
+        visual_state,
+    );
+    push_panel_with_data(
+        &mut scene,
+        timeline_layout.add_track_rect.to_win32_rect(),
         [0.15, 0.18, 0.20, 1.0],
         PanelEffect::SceneButtonCard,
+        visual_state.add_track_button.shader_data(),
     );
     push_centered_text(
         &mut scene,
-        add_track_rect.to_win32_rect(),
+        timeline_layout.add_track_rect.to_win32_rect(),
         "Add Track",
         [0.82, 0.86, 0.90, 1.0],
     );
     push_panel(
         &mut scene,
-        ruler_rect.to_win32_rect(),
+        timeline_layout.ruler_rect.to_win32_rect(),
         [0.12, 0.13, 0.16, 1.0],
         PanelEffect::TerminalPanel,
     );
-    let ruler_label = document.map_or("0 ns".to_owned(), |document| {
-        format!("{} ns", document.viewport().origin().as_i64())
-    });
-    push_centered_text(
-        &mut scene,
-        ruler_rect.to_win32_rect(),
-        &ruler_label,
-        [0.74, 0.78, 0.84, 1.0],
-    );
+    push_timeline_transport_panel(&mut scene, timeline_layout, audio_input_state, visual_state);
     push_panel(
         &mut scene,
-        content_rect.to_win32_rect(),
+        timeline_layout.viewport_controls_rect.to_win32_rect(),
+        [0.14, 0.16, 0.20, 0.96],
+        PanelEffect::SceneButtonCard,
+    );
+    push_timeline_viewport_controls(&mut scene, timeline_layout, visual_state);
+    push_panel(
+        &mut scene,
+        timeline_layout.content_rect.to_win32_rect(),
         [0.07, 0.08, 0.10, 1.0],
         PanelEffect::TerminalFill,
     );
-    let content_label = document.map_or("Blank timeline".to_owned(), |document| {
-        format!("Blank timeline - {} tracks", document.tracks().len())
-    });
-    push_centered_text(
+    push_panel(
         &mut scene,
-        content_rect.to_win32_rect(),
-        &content_label,
-        [0.68, 0.72, 0.78, 1.0],
+        timeline_layout.scrollport_rect.to_win32_rect(),
+        [0.08, 0.09, 0.11, 1.0],
+        PanelEffect::TerminalFill,
+    );
+    let viewport = document.map_or_else(TimelineViewport::default, TimelineDocument::viewport);
+    let track_count = document.map_or(0, |document| document.tracks().len());
+    let vertical_scroll_offset = timeline_clamp_vertical_scroll_offset(
+        timeline_layout,
+        track_count,
+        visual_state.vertical_scroll_offset,
+    );
+    let visible_selection_rect = visual_state.selection.and_then(|selection| {
+        timeline_visible_selection_rect(
+            timeline_layout,
+            viewport,
+            selection,
+            vertical_scroll_offset,
+            track_count,
+        )
+    });
+    let ruler_selection_rect = visual_state.selection.and_then(|selection| {
+        timeline_visible_selection_time_band_rect(timeline_layout, viewport, selection)
+    });
+    let ruler_ticks = viewport.ruler_ticks(timeline_layout.time_axis_rect.width(), 6);
+    for tick in &ruler_ticks {
+        push_timeline_ruler_tick(&mut scene, timeline_layout, tick);
+    }
+    if let Some(ruler_selection_rect) = ruler_selection_rect {
+        push_panel(
+            &mut scene,
+            ruler_selection_rect.to_win32_rect(),
+            TIMELINE_SELECTION_FILL,
+            PanelEffect::TerminalFill,
+        );
+    }
+    if let Some(document) = document.filter(|document| !document.tracks().is_empty()) {
+        push_timeline_track_preview_rows(
+            &mut scene,
+            timeline_layout,
+            document,
+            audio_input_state,
+            vertical_scroll_offset,
+            visible_selection_rect,
+        );
+    } else {
+        let content_text = timeline_content_text(document);
+        push_text_block(
+            &mut scene,
+            timeline_layout.scrollport_rect.inset(18).to_win32_rect(),
+            &content_text,
+            9,
+            16,
+            [0.68, 0.72, 0.78, 1.0],
+        );
+    }
+    if let Some(audio_input_state) = audio_input_state {
+        push_timeline_audio_heads(
+            &mut scene,
+            timeline_layout,
+            viewport,
+            audio_input_state,
+            visual_state,
+        );
+    }
+    if let Some(selection_rect) = visible_selection_rect {
+        push_timeline_selection_overlay(&mut scene, selection_rect);
+    }
+    push_timeline_scrollbars(
+        &mut scene,
+        timeline_layout,
+        document,
+        viewport,
+        visual_state.selection,
+        vertical_scroll_offset,
     );
 
     scene
+}
+
+// timeline[impl content.preview-lanes]
+fn push_timeline_track_preview_rows(
+    scene: &mut RenderScene,
+    layout: TimelineDocumentLayout,
+    document: &TimelineDocument,
+    audio_input_state: Option<&AudioInputDeviceWindowState>,
+    vertical_scroll_offset: i32,
+    visible_selection_rect: Option<ClientRect>,
+) {
+    if layout.scrollport_rect.width() <= 0 || layout.scrollport_rect.height() <= 0 {
+        return;
+    }
+
+    for (index, track) in document.tracks().iter().enumerate() {
+        let Some(row_rect) =
+            timeline_track_row_rect(layout.scrollport_rect, index, vertical_scroll_offset)
+        else {
+            continue;
+        };
+        push_panel(
+            scene,
+            row_rect.to_win32_rect(),
+            [0.10, 0.11, 0.14, 0.92],
+            PanelEffect::SceneButtonCard,
+        );
+
+        let label_rect = ClientRect::new(
+            row_rect.left() + 10,
+            row_rect.top() + 8,
+            row_rect.right() - 10,
+            (row_rect.top() + 26).min(row_rect.bottom()),
+        );
+        push_text_block(
+            scene,
+            label_rect.to_win32_rect(),
+            track.name(),
+            8,
+            16,
+            [0.80, 0.84, 0.90, 1.0],
+        );
+
+        if let Some(preview_rect) = timeline_track_preview_clip_rect(
+            row_rect,
+            layout.scrollport_rect,
+            document.viewport(),
+            track,
+            audio_input_state,
+        ) {
+            push_panel(
+                scene,
+                preview_rect.to_win32_rect(),
+                timeline_track_preview_color(track.kind()),
+                PanelEffect::TerminalFill,
+            );
+            if preview_rect.width() >= 72 {
+                push_centered_text(
+                    scene,
+                    preview_rect.to_win32_rect(),
+                    match track.kind() {
+                        TimelineTrackKind::Audio => "Audio",
+                        TimelineTrackKind::TracingSpans => "Tracing",
+                    },
+                    [0.96, 0.98, 1.0, 1.0],
+                );
+            }
+
+            if let Some(selection_rect) = visible_selection_rect
+                && let Some(intersection_rect) =
+                    client_rect_intersection(preview_rect, selection_rect)
+            {
+                push_panel(
+                    scene,
+                    intersection_rect.to_win32_rect(),
+                    TIMELINE_SELECTION_INTERSECTION,
+                    PanelEffect::TerminalFill,
+                );
+            }
+        }
+    }
+}
+
+fn push_timeline_transport_panel(
+    scene: &mut RenderScene,
+    layout: TimelineDocumentLayout,
+    audio_input_state: Option<&AudioInputDeviceWindowState>,
+    visual_state: TimelineDocumentVisualState,
+) {
+    let rect = timeline_transport_play_button_rect(layout);
+    push_panel_with_data(
+        scene,
+        rect.to_win32_rect(),
+        if audio_input_state.is_some_and(AudioInputDeviceWindowState::is_playing) {
+            [0.16, 0.44, 0.58, 1.0]
+        } else {
+            [0.13, 0.21, 0.28, 1.0]
+        },
+        PanelEffect::SceneButtonCard,
+        visual_state.transport_play_button.shader_data(),
+    );
+    push_centered_text(
+        scene,
+        rect.to_win32_rect(),
+        if audio_input_state.is_some_and(AudioInputDeviceWindowState::is_playing) {
+            "Pause"
+        } else {
+            "Play"
+        },
+        [0.92, 0.95, 0.98, 1.0],
+    );
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "the timeline track-list tool panel builds row cards, metadata, and the record button together so the layout stays local"
+)]
+fn push_timeline_track_list_panel(
+    scene: &mut RenderScene,
+    layout: TimelineDocumentLayout,
+    document: Option<&TimelineDocument>,
+    audio_input_state: Option<&AudioInputDeviceWindowState>,
+    visual_state: TimelineDocumentVisualState,
+) {
+    // timeline[impl track.microphone-row]
+    let Some(document) = document else {
+        let track_text = timeline_track_list_text(None);
+        push_text_block(
+            scene,
+            layout.track_text_rect.to_win32_rect(),
+            &track_text,
+            9,
+            16,
+            [0.84, 0.88, 0.92, 1.0],
+        );
+        return;
+    };
+
+    if document.tracks().is_empty() {
+        let track_text = timeline_track_list_text(Some(document));
+        push_text_block(
+            scene,
+            layout.track_text_rect.to_win32_rect(),
+            &track_text,
+            9,
+            16,
+            [0.84, 0.88, 0.92, 1.0],
+        );
+        return;
+    }
+
+    for (index, track) in document.tracks().iter().enumerate() {
+        let Some(row_rect) = timeline_track_list_row_rect(layout, index) else {
+            continue;
+        };
+        push_panel(
+            scene,
+            row_rect.to_win32_rect(),
+            [0.10, 0.11, 0.14, 0.92],
+            PanelEffect::SceneButtonCard,
+        );
+
+        let icon_rect = ClientRect::new(
+            row_rect.left() + 10,
+            row_rect.top() + 12,
+            row_rect.left() + 38,
+            row_rect.top() + 40,
+        );
+        push_sprite(
+            scene,
+            icon_rect.to_win32_rect(),
+            [0.92, 0.95, 0.98, 1.0],
+            if track.kind() == TimelineTrackKind::Audio {
+                SpriteId::WindowsAudio
+            } else {
+                SpriteId::FileAudio
+            },
+        );
+
+        let button_rect = timeline_track_record_button_rect(layout, index);
+        if track.kind() == TimelineTrackKind::Audio
+            && let Some(button_rect) = button_rect
+        {
+            push_panel_with_data(
+                scene,
+                button_rect.to_win32_rect(),
+                if audio_input_state.is_some_and(AudioInputDeviceWindowState::is_recording) {
+                    [0.72, 0.10, 0.10, 1.0]
+                } else {
+                    [0.28, 0.10, 0.10, 1.0]
+                },
+                PanelEffect::SceneButtonCard,
+                visual_state.microphone_record_button.shader_data(),
+            );
+            push_centered_text(
+                scene,
+                button_rect.to_win32_rect(),
+                if audio_input_state.is_some_and(AudioInputDeviceWindowState::is_recording) {
+                    "Stop"
+                } else {
+                    "Rec"
+                },
+                [0.98, 0.92, 0.92, 1.0],
+            );
+        }
+
+        let detail_right = button_rect.map_or(row_rect.right() - 12, |rect| rect.left() - 10);
+        push_text_block(
+            scene,
+            ClientRect::new(
+                icon_rect.right() + 10,
+                row_rect.top() + 10,
+                detail_right,
+                row_rect.top() + 30,
+            )
+            .to_win32_rect(),
+            track.name(),
+            9,
+            16,
+            [0.88, 0.91, 0.95, 1.0],
+        );
+        push_text_block(
+            scene,
+            ClientRect::new(
+                icon_rect.right() + 10,
+                row_rect.top() + 32,
+                detail_right,
+                row_rect.bottom() - 10,
+            )
+            .to_win32_rect(),
+            &timeline_track_row_detail_text(track, audio_input_state),
+            8,
+            14,
+            [0.68, 0.74, 0.80, 1.0],
+        );
+    }
+}
+
+fn timeline_track_row_detail_text(
+    track: &TimelineTrack,
+    audio_input_state: Option<&AudioInputDeviceWindowState>,
+) -> String {
+    if track.kind() != TimelineTrackKind::Audio {
+        return track.detail_line();
+    }
+
+    let Some(audio_input_state) = audio_input_state else {
+        return track.detail_line();
+    };
+
+    format!(
+        "{}  rec {:.2}s  play {:.2}s{}",
+        audio_input_state.device.state,
+        audio_input_state.runtime.recording_head_seconds,
+        audio_input_state.runtime.playback.head_seconds,
+        if audio_input_state.is_recording() {
+            "  recording"
+        } else {
+            ""
+        }
+    )
+}
+
+fn push_timeline_viewport_controls(
+    scene: &mut RenderScene,
+    layout: TimelineDocumentLayout,
+    visual_state: TimelineDocumentVisualState,
+) {
+    let controls = [
+        (
+            SceneAction::PanTimelineLeft,
+            visual_state.pan_left_button,
+            [0.20, 0.26, 0.34, 1.0],
+        ),
+        (
+            SceneAction::PanTimelineRight,
+            visual_state.pan_right_button,
+            [0.20, 0.26, 0.34, 1.0],
+        ),
+        (
+            SceneAction::ZoomTimelineIn,
+            visual_state.zoom_in_button,
+            [0.24, 0.34, 0.24, 1.0],
+        ),
+        (
+            SceneAction::ZoomTimelineOut,
+            visual_state.zoom_out_button,
+            [0.34, 0.22, 0.22, 1.0],
+        ),
+    ];
+
+    for (action, button_state, color) in controls {
+        let Some(rect) = timeline_viewport_control_rect(layout, action) else {
+            continue;
+        };
+        let Some(label) = timeline_viewport_control_label(action) else {
+            continue;
+        };
+        push_panel_with_data(
+            scene,
+            rect.to_win32_rect(),
+            color,
+            PanelEffect::SceneButtonCard,
+            button_state.shader_data(),
+        );
+        push_centered_text(scene, rect.to_win32_rect(), label, [0.92, 0.95, 0.98, 1.0]);
+    }
+}
+
+fn timeline_track_row_rect(
+    scrollport_rect: ClientRect,
+    row_index: usize,
+    vertical_scroll_offset: i32,
+) -> Option<ClientRect> {
+    let world_top = timeline_track_row_world_top(row_index);
+    let world_bottom = world_top.saturating_add(TIMELINE_TRACK_ROW_HEIGHT);
+    let top = scrollport_rect.top() + world_top - vertical_scroll_offset;
+    let bottom = scrollport_rect.top() + world_bottom - vertical_scroll_offset;
+    let visible_top = top.max(scrollport_rect.top());
+    let visible_bottom = bottom.min(scrollport_rect.bottom());
+    (visible_bottom > visible_top).then(|| {
+        ClientRect::new(
+            scrollport_rect.left(),
+            visible_top,
+            scrollport_rect.right(),
+            visible_bottom,
+        )
+    })
+}
+
+#[must_use]
+pub fn timeline_track_list_row_rect(
+    layout: TimelineDocumentLayout,
+    row_index: usize,
+) -> Option<ClientRect> {
+    let world_top = timeline_track_row_world_top(row_index);
+    let world_bottom = world_top.saturating_add(TIMELINE_TRACK_ROW_HEIGHT);
+    let top = layout.track_text_rect.top() + world_top;
+    let bottom = layout.track_text_rect.top() + world_bottom;
+    let visible_top = top.max(layout.track_text_rect.top());
+    let visible_bottom = bottom.min(layout.track_text_rect.bottom());
+    (visible_bottom > visible_top).then(|| {
+        ClientRect::new(
+            layout.track_text_rect.left(),
+            visible_top,
+            layout.track_text_rect.right(),
+            visible_bottom,
+        )
+    })
+}
+
+#[must_use]
+pub fn timeline_track_record_button_rect(
+    layout: TimelineDocumentLayout,
+    row_index: usize,
+) -> Option<ClientRect> {
+    timeline_track_list_row_rect(layout, row_index).map(|row_rect| {
+        ClientRect::new(
+            row_rect.right() - 46,
+            row_rect.top() + 12,
+            row_rect.right() - 12,
+            (row_rect.top() + 46).min(row_rect.bottom() - 12),
+        )
+    })
+}
+
+fn timeline_track_preview_clip_rect(
+    row_rect: ClientRect,
+    content_rect: ClientRect,
+    viewport: TimelineViewport,
+    track: &TimelineTrack,
+    audio_input_state: Option<&AudioInputDeviceWindowState>,
+) -> Option<ClientRect> {
+    let preview_range = if track.kind() == TimelineTrackKind::Audio {
+        audio_input_state.map_or(track.preview_range(), timeline_audio_preview_range)
+    } else {
+        track.preview_range()
+    };
+    let projected = viewport.project_range(preview_range);
+    let content_width_pixels = content_rect.width().max(0);
+    let start_pixels = projected.start().pixels();
+    let end_pixels = projected.end().pixels();
+    if end_pixels <= 0.0 || start_pixels >= f64::from(content_width_pixels) {
+        return None;
+    }
+
+    let clip_top = row_rect.top() + 28;
+    let clip_bottom = row_rect.bottom() - 10;
+    if clip_bottom <= clip_top {
+        return None;
+    }
+
+    let clip_left =
+        content_rect.left() + f64_to_i32_clamped(start_pixels.round(), 0, content_width_pixels);
+    let clip_right =
+        content_rect.left() + f64_to_i32_clamped(end_pixels.round(), 0, content_width_pixels);
+    let clip_right = (clip_right.max(clip_left + 8)).min(content_rect.right());
+    if clip_right <= clip_left {
+        return None;
+    }
+
+    Some(ClientRect::new(
+        clip_left,
+        clip_top,
+        clip_right,
+        clip_bottom,
+    ))
+}
+
+fn timeline_audio_preview_range(
+    audio_input_state: &AudioInputDeviceWindowState,
+) -> TimelineTimeRangeNs {
+    let duration_seconds = audio_input_state
+        .runtime
+        .duration_seconds()
+        .max(audio_input_state.runtime.recording_head_seconds)
+        .max(audio_input_state.runtime.playback.head_seconds)
+        .max(0.0);
+    TimelineTimeRangeNs::new(
+        TimelineTimeNs::ZERO,
+        TimelineTimeNs::from_duration(Time::new::<second>(duration_seconds)),
+    )
+}
+
+fn timeline_track_preview_color(kind: TimelineTrackKind) -> [f32; 4] {
+    match kind {
+        TimelineTrackKind::Audio => [0.19, 0.55, 0.44, 0.95],
+        TimelineTrackKind::TracingSpans => [0.70, 0.47, 0.26, 0.95],
+    }
+}
+
+fn timeline_track_row_world_top(row_index: usize) -> i32 {
+    let row_index = i32::try_from(row_index).unwrap_or(i32::MAX);
+    row_index.saturating_mul(TIMELINE_TRACK_ROW_HEIGHT + TIMELINE_TRACK_ROW_GAP)
+}
+
+fn timeline_audio_head_x(
+    layout: TimelineDocumentLayout,
+    viewport: TimelineViewport,
+    seconds: f64,
+) -> i32 {
+    let time = TimelineTimeNs::from_duration(Time::new::<second>(seconds.max(0.0)));
+    let pixels = viewport.time_to_x(time).pixels().round();
+    layout.time_axis_rect.left()
+        + f64_to_i32_clamped(pixels, 0, layout.time_axis_rect.width().max(0))
+}
+
+#[must_use]
+pub fn timeline_audio_head_grabbers(
+    layout: TimelineDocumentLayout,
+    viewport: TimelineViewport,
+    audio_input_state: &AudioInputDeviceWindowState,
+) -> Vec<TimelineAudioHeadGrabberLayout> {
+    let mut heads = vec![
+        (
+            AudioInputTimelineHeadKind::Recording,
+            timeline_audio_head_x(
+                layout,
+                viewport,
+                audio_input_state.runtime.recording_head_seconds,
+            ),
+        ),
+        (
+            AudioInputTimelineHeadKind::Playback,
+            timeline_audio_head_x(
+                layout,
+                viewport,
+                audio_input_state.runtime.playback.head_seconds,
+            ),
+        ),
+    ];
+    heads.sort_by_key(|(kind, x)| (*x, head_kind_sort_key(*kind)));
+    let grabber_size: i32 = 14;
+    let vertical_gap: i32 = 4;
+    let threshold = (grabber_size + 2).unsigned_abs();
+    let mut previous_x = i32::MIN;
+    let mut stack_index = 0;
+    heads
+        .into_iter()
+        .map(|(kind, x)| {
+            if previous_x != i32::MIN && x.abs_diff(previous_x) <= threshold {
+                stack_index += 1;
+            } else {
+                stack_index = 0;
+                previous_x = x;
+            }
+            let top = layout.time_axis_rect.top() + 8 + stack_index * (grabber_size + vertical_gap);
+            TimelineAudioHeadGrabberLayout {
+                kind,
+                rect: ClientRect::new(x - 7, top, x + 7, top + grabber_size),
+            }
+        })
+        .collect()
+}
+
+fn push_timeline_audio_heads(
+    scene: &mut RenderScene,
+    layout: TimelineDocumentLayout,
+    viewport: TimelineViewport,
+    audio_input_state: &AudioInputDeviceWindowState,
+    visual_state: TimelineDocumentVisualState,
+) {
+    // timeline[impl heads.recording-playback]
+    for (_kind, seconds, color) in [
+        (
+            AudioInputTimelineHeadKind::Recording,
+            audio_input_state.runtime.recording_head_seconds,
+            timeline_head_color(AudioInputTimelineHeadKind::Recording),
+        ),
+        (
+            AudioInputTimelineHeadKind::Playback,
+            audio_input_state.runtime.playback.head_seconds,
+            timeline_head_color(AudioInputTimelineHeadKind::Playback),
+        ),
+    ] {
+        let x = timeline_audio_head_x(layout, viewport, seconds);
+        push_panel(
+            scene,
+            ClientRect::new(
+                x - 1,
+                layout.time_axis_rect.top(),
+                x + 2,
+                layout.scrollport_rect.bottom(),
+            )
+            .to_win32_rect(),
+            color,
+            PanelEffect::TerminalFill,
+        );
+    }
+
+    for grabber in timeline_audio_head_grabbers(layout, viewport, audio_input_state) {
+        let active = match grabber.kind {
+            AudioInputTimelineHeadKind::Recording => audio_input_state.is_recording(),
+            AudioInputTimelineHeadKind::Playback => audio_input_state.is_playing(),
+            AudioInputTimelineHeadKind::Transcription => false,
+        };
+        push_panel_with_data(
+            scene,
+            grabber.rect.to_win32_rect(),
+            timeline_head_color(grabber.kind),
+            PanelEffect::TimelineHeadGrabber,
+            [
+                if active { 1.0 } else { 0.0 },
+                if visual_state.hovered_head == Some(grabber.kind) {
+                    1.0
+                } else {
+                    0.0
+                },
+                if visual_state.grabbed_head == Some(grabber.kind) {
+                    1.0
+                } else {
+                    0.0
+                },
+                head_kind_shader_index(grabber.kind),
+            ],
+        );
+    }
+}
+
+fn timeline_visible_selection_rect(
+    layout: TimelineDocumentLayout,
+    viewport: TimelineViewport,
+    selection: TimelineRectSelection,
+    vertical_scroll_offset: i32,
+    track_count: usize,
+) -> Option<ClientRect> {
+    let total_track_height = timeline_track_world_height(track_count);
+    if total_track_height <= 0 {
+        return None;
+    }
+
+    let (left, right) =
+        timeline_visible_selection_x_bounds(layout, viewport, selection.time_range())?;
+    let top_world = selection.track_y_range().top().clamp(0, total_track_height);
+    let bottom_world = selection
+        .track_y_range()
+        .bottom()
+        .clamp(0, total_track_height);
+    let top = layout.scrollport_rect.top() + top_world - vertical_scroll_offset;
+    let bottom = layout.scrollport_rect.top() + bottom_world - vertical_scroll_offset;
+    let visible_top = top.max(layout.scrollport_rect.top());
+    let visible_bottom = bottom.min(layout.scrollport_rect.bottom());
+    (right > left && visible_bottom > visible_top)
+        .then(|| ClientRect::new(left, visible_top, right, visible_bottom))
+}
+
+fn timeline_visible_selection_time_band_rect(
+    layout: TimelineDocumentLayout,
+    viewport: TimelineViewport,
+    selection: TimelineRectSelection,
+) -> Option<ClientRect> {
+    let (left, right) =
+        timeline_visible_selection_x_bounds(layout, viewport, selection.time_range())?;
+    (right > left).then(|| {
+        ClientRect::new(
+            left,
+            layout.time_axis_rect.top() + 8,
+            right,
+            layout.time_axis_rect.bottom() - 8,
+        )
+    })
+}
+
+fn timeline_visible_selection_x_bounds(
+    layout: TimelineDocumentLayout,
+    viewport: TimelineViewport,
+    time_range: TimelineTimeRangeNs,
+) -> Option<(i32, i32)> {
+    let projected = viewport.project_range(time_range);
+    let axis_width = layout.time_axis_rect.width().max(0);
+    let start = projected.start().pixels();
+    let end = projected.end().pixels();
+    if end <= 0.0 || start >= f64::from(axis_width) {
+        return None;
+    }
+
+    let left = layout.time_axis_rect.left() + f64_to_i32_clamped(start.round(), 0, axis_width);
+    let right = layout.time_axis_rect.left() + f64_to_i32_clamped(end.round(), 0, axis_width);
+    Some((left.min(right), right.max(left)))
+}
+
+// timeline[impl selection.rectangle]
+// timeline[impl selection.ruler-all-tracks]
+fn push_timeline_selection_overlay(scene: &mut RenderScene, rect: ClientRect) {
+    push_panel(
+        scene,
+        rect.to_win32_rect(),
+        TIMELINE_SELECTION_FILL,
+        PanelEffect::TerminalFill,
+    );
+    for border_rect in outline_rects(rect) {
+        push_panel(
+            scene,
+            border_rect.to_win32_rect(),
+            TIMELINE_SELECTION_BORDER,
+            PanelEffect::SceneButtonCard,
+        );
+    }
+}
+
+// timeline[impl viewport.scrollbars]
+fn push_timeline_scrollbars(
+    scene: &mut RenderScene,
+    layout: TimelineDocumentLayout,
+    document: Option<&TimelineDocument>,
+    viewport: TimelineViewport,
+    selection: Option<TimelineRectSelection>,
+    vertical_scroll_offset: i32,
+) {
+    push_panel(
+        scene,
+        layout.horizontal_scrollbar_rect.to_win32_rect(),
+        TIMELINE_SCROLLBAR_TRACK,
+        PanelEffect::SceneButtonCard,
+    );
+    if let Some(thumb_rect) =
+        timeline_horizontal_scrollbar_thumb_rect(layout, document, viewport, selection)
+    {
+        push_panel(
+            scene,
+            thumb_rect.to_win32_rect(),
+            TIMELINE_SCROLLBAR_THUMB,
+            PanelEffect::TerminalFill,
+        );
+    }
+
+    push_panel(
+        scene,
+        layout.vertical_scrollbar_rect.to_win32_rect(),
+        TIMELINE_SCROLLBAR_TRACK,
+        PanelEffect::SceneButtonCard,
+    );
+    if let Some(thumb_rect) = timeline_vertical_scrollbar_thumb_rect(
+        layout,
+        document.map_or(0, |document| document.tracks().len()),
+        vertical_scroll_offset,
+    ) {
+        push_panel(
+            scene,
+            thumb_rect.to_win32_rect(),
+            TIMELINE_SCROLLBAR_THUMB,
+            PanelEffect::TerminalFill,
+        );
+    }
+}
+
+fn timeline_horizontal_scrollbar_thumb_rect(
+    layout: TimelineDocumentLayout,
+    document: Option<&TimelineDocument>,
+    viewport: TimelineViewport,
+    selection: Option<TimelineRectSelection>,
+) -> Option<ClientRect> {
+    let scrollbar_rect = layout.horizontal_scrollbar_rect;
+    if scrollbar_rect.width() <= 0 || scrollbar_rect.height() <= 0 {
+        return None;
+    }
+
+    let visible_width = layout.time_axis_rect.width().max(1);
+    let visible_end =
+        viewport.x_to_time(TimelineViewportPoint::new_pixels(f64::from(visible_width)));
+    let visible_range = TimelineTimeRangeNs::new(viewport.origin(), visible_end);
+    let total_range = timeline_document_time_bounds(document, visible_range, selection);
+    let total_duration = (total_range.end().as_i64() - total_range.start().as_i64()).max(1);
+    let visible_duration = (visible_range.end().as_i64() - visible_range.start().as_i64()).max(1);
+    let track_width = scrollbar_rect.width().max(1);
+    let min_thumb_width = TIMELINE_SCROLLBAR_MIN_THUMB.min(track_width);
+    let proportional_thumb = ((i128::from(track_width) * i128::from(visible_duration))
+        / i128::from(total_duration))
+    .clamp(i128::from(min_thumb_width), i128::from(track_width));
+    let thumb_width = i32::try_from(proportional_thumb).unwrap_or(track_width);
+    let travel = (track_width - thumb_width).max(0);
+    let available_duration = (total_duration - visible_duration).max(0);
+    let offset_duration = (visible_range.start().as_i64() - total_range.start().as_i64()).max(0);
+    let thumb_offset = if available_duration == 0 || travel == 0 {
+        0
+    } else {
+        i32::try_from(
+            (i128::from(travel) * i128::from(offset_duration)) / i128::from(available_duration),
+        )
+        .unwrap_or(0)
+    };
+    let thumb_left = scrollbar_rect.left() + thumb_offset;
+    Some(ClientRect::new(
+        thumb_left,
+        scrollbar_rect.top(),
+        (thumb_left + thumb_width).min(scrollbar_rect.right()),
+        scrollbar_rect.bottom(),
+    ))
+}
+
+fn timeline_vertical_scrollbar_thumb_rect(
+    layout: TimelineDocumentLayout,
+    track_count: usize,
+    vertical_scroll_offset: i32,
+) -> Option<ClientRect> {
+    let scrollbar_rect = layout.vertical_scrollbar_rect;
+    if scrollbar_rect.width() <= 0 || scrollbar_rect.height() <= 0 {
+        return None;
+    }
+
+    let visible_height = layout.scrollport_rect.height().max(1);
+    let total_height = timeline_track_world_height(track_count).max(visible_height);
+    let track_height = scrollbar_rect.height().max(1);
+    let min_thumb_height = TIMELINE_SCROLLBAR_MIN_THUMB.min(track_height);
+    let proportional_thumb = ((i128::from(track_height) * i128::from(visible_height))
+        / i128::from(total_height.max(1)))
+    .clamp(i128::from(min_thumb_height), i128::from(track_height));
+    let thumb_height = i32::try_from(proportional_thumb).unwrap_or(track_height);
+    let travel = (track_height - thumb_height).max(0);
+    let available_height = (total_height - visible_height).max(0);
+    let thumb_offset = if available_height == 0 || travel == 0 {
+        0
+    } else {
+        i32::try_from(
+            (i128::from(travel) * i128::from(vertical_scroll_offset.clamp(0, available_height)))
+                / i128::from(available_height),
+        )
+        .unwrap_or(0)
+    };
+    let thumb_top = scrollbar_rect.top() + thumb_offset;
+    Some(ClientRect::new(
+        scrollbar_rect.left(),
+        thumb_top,
+        scrollbar_rect.right(),
+        (thumb_top + thumb_height).min(scrollbar_rect.bottom()),
+    ))
+}
+
+fn timeline_document_time_bounds(
+    document: Option<&TimelineDocument>,
+    visible_range: TimelineTimeRangeNs,
+    selection: Option<TimelineRectSelection>,
+) -> TimelineTimeRangeNs {
+    let mut bounds = visible_range;
+    if let Some(document) = document {
+        for track in document.tracks() {
+            bounds = union_time_ranges(bounds, track.preview_range());
+        }
+    }
+    if let Some(selection) = selection {
+        bounds = union_time_ranges(bounds, selection.time_range());
+    }
+    bounds
+}
+
+fn union_time_ranges(left: TimelineTimeRangeNs, right: TimelineTimeRangeNs) -> TimelineTimeRangeNs {
+    TimelineTimeRangeNs::new(
+        TimelineTimeNs::new(left.start().as_i64().min(right.start().as_i64())),
+        TimelineTimeNs::new(left.end().as_i64().max(right.end().as_i64())),
+    )
+}
+
+fn outline_rects(rect: ClientRect) -> [ClientRect; 4] {
+    [
+        ClientRect::new(rect.left(), rect.top(), rect.right(), rect.top() + 1),
+        ClientRect::new(rect.left(), rect.bottom() - 1, rect.right(), rect.bottom()),
+        ClientRect::new(rect.left(), rect.top(), rect.left() + 1, rect.bottom()),
+        ClientRect::new(rect.right() - 1, rect.top(), rect.right(), rect.bottom()),
+    ]
+}
+
+fn client_rect_intersection(left: ClientRect, right: ClientRect) -> Option<ClientRect> {
+    let intersection = ClientRect::new(
+        left.left().max(right.left()),
+        left.top().max(right.top()),
+        left.right().min(right.right()),
+        left.bottom().min(right.bottom()),
+    );
+    (intersection.right() > intersection.left() && intersection.bottom() > intersection.top())
+        .then_some(intersection)
+}
+
+fn timeline_track_list_text(document: Option<&TimelineDocument>) -> String {
+    let mut track_text = String::from("Tracks\n\n");
+    if let Some(document) = document {
+        if document.tracks().is_empty() {
+            track_text.push_str("No tracks yet.\n\nImport a .tracy capture or add audio later.");
+        } else {
+            for track in document.tracks() {
+                let _ = writeln!(track_text, "{}\n  {}\n", track.name(), track.detail_line());
+            }
+        }
+    } else {
+        track_text.push_str("No timeline document loaded.");
+    }
+    track_text
+}
+
+fn timeline_content_text(document: Option<&TimelineDocument>) -> String {
+    document.map_or_else(
+        || "Blank timeline\n\nNo document loaded yet.".to_owned(),
+        |document| {
+            format!(
+                "{}\n{}\n\nTracks: {}\nViewport origin: {} ns\nEdit list entries: {}",
+                document.title(),
+                document.subtitle(),
+                document.tracks().len(),
+                document.viewport().origin().as_i64(),
+                document.edits().len(),
+            )
+        },
+    )
+}
+
+fn push_timeline_ruler_tick(
+    scene: &mut RenderScene,
+    layout: TimelineDocumentLayout,
+    tick: &TimelineRulerTick,
+) {
+    let tick_x = layout.time_axis_rect.left()
+        + timeline_tick_pixel_offset(tick, layout.time_axis_rect.width());
+    let tick_rect = ClientRect::new(
+        tick_x,
+        layout.time_axis_rect.top() + 6,
+        (tick_x + 1).min(layout.time_axis_rect.right()),
+        layout.time_axis_rect.bottom() - 6,
+    );
+    push_panel(
+        scene,
+        tick_rect.to_win32_rect(),
+        [0.58, 0.63, 0.70, 0.9],
+        PanelEffect::SceneButtonCard,
+    );
+
+    let grid_rect = ClientRect::new(
+        tick_x,
+        layout.scrollport_rect.top(),
+        (tick_x + 1).min(layout.scrollport_rect.right()),
+        layout.scrollport_rect.bottom(),
+    );
+    push_panel(
+        scene,
+        grid_rect.to_win32_rect(),
+        [0.20, 0.23, 0.28, 0.65],
+        PanelEffect::SceneButtonCard,
+    );
+
+    let label_rect = ClientRect::new(
+        (tick_x - 40).max(layout.time_axis_rect.left() + 6),
+        layout.time_axis_rect.top() + 8,
+        (tick_x + 44).min(layout.time_axis_rect.right() - 6),
+        layout.time_axis_rect.bottom() - 8,
+    );
+    push_text_block(
+        scene,
+        label_rect.to_win32_rect(),
+        tick.label(),
+        8,
+        16,
+        [0.80, 0.84, 0.90, 1.0],
+    );
+}
+
+fn timeline_tick_pixel_offset(tick: &TimelineRulerTick, ruler_width_pixels: i32) -> i32 {
+    let pixels = tick.x().pixels().round();
+    if !pixels.is_finite() {
+        return 0;
+    }
+
+    f64_to_i32_clamped(pixels, 0, ruler_width_pixels.max(0))
+}
+
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "timeline ruler positions are rounded and clamped to the visible pixel range before conversion to i32"
+)]
+fn f64_to_i32_clamped(value: f64, min: i32, max: i32) -> i32 {
+    value.clamp(f64::from(min), f64::from(max)) as i32
 }
 
 #[must_use]
@@ -3958,7 +5287,7 @@ mod tests {
 
     // timeline[verify start-window.create-or-import]
     // timeline[verify start-window.new-blank]
-    // timeline[verify start-window.import-placeholder]
+    // timeline[verify import.tracy.file-picker]
     #[test]
     fn timeline_start_scene_specs_expose_new_and_import() {
         let specs = scene_button_specs(SceneWindowKind::TimelineStart);
@@ -3978,6 +5307,8 @@ mod tests {
             sample_layout(),
             WindowChromeButtonsState::default(),
             None,
+            None,
+            TimelineDocumentVisualState::default(),
         );
 
         assert!(scene.panels.len() >= 7);
@@ -4004,9 +5335,201 @@ mod tests {
             sample_layout(),
             WindowChromeButtonsState::default(),
             Some(&document),
+            None,
+            TimelineDocumentVisualState::default(),
         );
 
-        assert!(scene.glyphs.len() >= "Blank timeline - 0 tracks".chars().count());
+        assert!(scene.glyphs.len() >= "Blank timeline".chars().count());
+    }
+
+    #[test]
+    // timeline[verify import.tracy.document]
+    // timeline[verify track.kinds]
+    fn imported_timeline_render_scene_includes_track_details() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let capture_path = temp_dir.path().join("capture.tracy");
+        std::fs::write(&capture_path, [b't', b'r', 253, b'P', 0, 2, 0, 0]).expect("capture");
+        let document = TimelineDocument::import_tracy_capture(&capture_path).expect("import");
+
+        let scene = build_blank_timeline_render_scene(
+            sample_layout(),
+            WindowChromeButtonsState::default(),
+            Some(&document),
+            None,
+            TimelineDocumentVisualState::default(),
+        );
+
+        assert!(scene.glyphs.len() >= "Tracing spanscapture.tracyTracy capture".chars().count());
+    }
+
+    #[test]
+    // timeline[verify content.preview-lanes]
+    fn timeline_render_scene_projects_track_preview_block_into_content_area() {
+        let mut document = TimelineDocument::blank();
+        let _ = document.append_microphone_track();
+        let layout = timeline_document_layout(sample_layout().terminal_panel_rect().inset(24));
+        let row_rect = timeline_track_row_rect(layout.scrollport_rect, 0, 0).expect("row rect");
+        let expected_preview_rect = timeline_track_preview_clip_rect(
+            row_rect,
+            layout.scrollport_rect,
+            document.viewport(),
+            &document.tracks()[0],
+            None,
+        )
+        .expect("preview rect");
+
+        let scene = build_blank_timeline_render_scene(
+            sample_layout(),
+            WindowChromeButtonsState::default(),
+            Some(&document),
+            None,
+            TimelineDocumentVisualState::default(),
+        );
+
+        assert!(scene.panels.iter().any(|panel| {
+            panel.rect == expected_preview_rect.to_win32_rect()
+                && panel.effect == PanelEffect::TerminalFill
+                && panel.color == timeline_track_preview_color(TimelineTrackKind::Audio)
+        }));
+    }
+
+    #[test]
+    // timeline[verify viewport.scrollbars]
+    fn timeline_render_scene_draws_scrollbar_thumbs() {
+        let mut document = TimelineDocument::blank();
+        let _ = document.append_microphone_track();
+        let layout = timeline_document_layout(sample_layout().terminal_panel_rect().inset(24));
+        let horizontal_thumb = timeline_horizontal_scrollbar_thumb_rect(
+            layout,
+            Some(&document),
+            document.viewport(),
+            None,
+        )
+        .expect("horizontal thumb rect");
+        let vertical_thumb =
+            timeline_vertical_scrollbar_thumb_rect(layout, document.tracks().len(), 0)
+                .expect("vertical thumb rect");
+
+        let scene = build_blank_timeline_render_scene(
+            sample_layout(),
+            WindowChromeButtonsState::default(),
+            Some(&document),
+            None,
+            TimelineDocumentVisualState::default(),
+        );
+
+        assert!(scene.panels.iter().any(|panel| {
+            panel.rect == horizontal_thumb.to_win32_rect()
+                && panel.effect == PanelEffect::TerminalFill
+                && panel.color == TIMELINE_SCROLLBAR_THUMB
+        }));
+        assert!(scene.panels.iter().any(|panel| {
+            panel.rect == vertical_thumb.to_win32_rect()
+                && panel.effect == PanelEffect::TerminalFill
+                && panel.color == TIMELINE_SCROLLBAR_THUMB
+        }));
+    }
+
+    #[test]
+    // timeline[verify selection.rectangle]
+    fn timeline_visible_selection_rect_is_limited_to_selected_rows() {
+        let document = TimelineDocument::blank();
+        let layout = timeline_document_layout(sample_layout().terminal_panel_rect().inset(24));
+        let selection = TimelineRectSelection::new(
+            TimelineTimeRangeNs::new(
+                TimelineTimeNs::new(250_000_000),
+                TimelineTimeNs::new(750_000_000),
+            ),
+            TimelineTrackVerticalRange::new(
+                10,
+                TIMELINE_TRACK_ROW_HEIGHT + TIMELINE_TRACK_ROW_GAP + 8,
+            ),
+        );
+
+        let rect = timeline_visible_selection_rect(layout, document.viewport(), selection, 0, 2)
+            .expect("selection rect");
+
+        assert!(rect.top() > layout.scrollport_rect.top());
+        assert!(rect.bottom() < layout.scrollport_rect.bottom());
+        assert!(rect.height() < layout.scrollport_rect.height());
+    }
+
+    #[test]
+    // timeline[verify selection.ruler-all-tracks]
+    fn timeline_ruler_selection_band_spans_the_full_time_axis_for_all_track_selection() {
+        let document = TimelineDocument::blank();
+        let layout = timeline_document_layout(sample_layout().terminal_panel_rect().inset(24));
+        let selection = TimelineRectSelection::new(
+            TimelineTimeRangeNs::new(
+                TimelineTimeNs::new(125_000_000),
+                TimelineTimeNs::new(625_000_000),
+            ),
+            TimelineTrackVerticalRange::new(0, timeline_track_world_height(6)),
+        );
+
+        let band_rect =
+            timeline_visible_selection_time_band_rect(layout, document.viewport(), selection)
+                .expect("ruler band rect");
+
+        assert_eq!(band_rect.top(), layout.time_axis_rect.top() + 8);
+        assert_eq!(band_rect.bottom(), layout.time_axis_rect.bottom() - 8);
+        assert!(band_rect.left() >= layout.time_axis_rect.left());
+        assert!(band_rect.right() <= layout.time_axis_rect.right());
+    }
+
+    // timeline[verify add-track.workflow]
+    #[test]
+    fn timeline_add_track_scene_specs_expose_microphone_tracing_and_back() {
+        let specs = scene_button_specs(SceneWindowKind::TimelineAddTrack);
+
+        assert_eq!(specs.len(), 3);
+        assert_eq!(specs[0].action, SceneAction::AppendMicrophoneTrack);
+        assert_eq!(specs[1].action, SceneAction::ImportTimeline);
+        assert_eq!(specs[2].action, SceneAction::CloseTimelineTrackMenu);
+    }
+
+    #[test]
+    fn timeline_document_layout_reserves_a_clickable_add_track_region() {
+        let layout = timeline_document_layout(sample_layout().terminal_panel_rect().inset(24));
+
+        assert!(layout.add_track_rect.left() >= layout.track_list_rect.left());
+        assert!(layout.add_track_rect.right() <= layout.track_list_rect.right());
+        assert!(layout.track_text_rect.top() >= layout.add_track_rect.bottom());
+        assert!(layout.viewport_controls_rect.left() >= layout.ruler_rect.left());
+        assert!(layout.viewport_controls_rect.right() <= layout.ruler_rect.right());
+        assert!(layout.scrollport_rect.right() <= layout.time_axis_rect.right());
+        assert!(layout.horizontal_scrollbar_rect.top() >= layout.scrollport_rect.bottom());
+        assert!(layout.vertical_scrollbar_rect.left() >= layout.scrollport_rect.right());
+    }
+
+    #[test]
+    // timeline[verify viewport.pan-controls]
+    // timeline[verify viewport.zoom-controls]
+    fn blank_timeline_render_scene_draws_viewport_controls() {
+        let document = TimelineDocument::blank();
+        let layout = timeline_document_layout(sample_layout().terminal_panel_rect().inset(24));
+        let scene = build_blank_timeline_render_scene(
+            sample_layout(),
+            WindowChromeButtonsState::default(),
+            Some(&document),
+            None,
+            TimelineDocumentVisualState::default(),
+        );
+
+        for action in [
+            SceneAction::PanTimelineLeft,
+            SceneAction::PanTimelineRight,
+            SceneAction::ZoomTimelineIn,
+            SceneAction::ZoomTimelineOut,
+        ] {
+            let rect = timeline_viewport_control_rect(layout, action).expect("control rect");
+            assert!(
+                scene
+                    .panels
+                    .iter()
+                    .any(|panel| panel.rect == rect.to_win32_rect())
+            );
+        }
     }
 
     // windowing[verify audio-picker.buttons.windows]
@@ -4072,11 +5595,11 @@ mod tests {
     fn audio_daemon_controls_have_stable_hit_rects() {
         let body_rect = sample_layout().terminal_panel_rect().inset(24);
         let first = audio_daemon_model_button_rect(body_rect, 0, 6);
-        let second = audio_daemon_model_button_rect(body_rect, 1, 6);
+        let second_button = audio_daemon_model_button_rect(body_rect, 1, 6);
         let cuda = audio_daemon_cuda_check_button_rect(body_rect);
 
         assert!(first.width() > 0);
-        assert!(second.left() > first.left());
+        assert!(second_button.left() > first.left());
         assert!(cuda.width() > 0);
         assert!(cuda.bottom() <= body_rect.bottom());
     }

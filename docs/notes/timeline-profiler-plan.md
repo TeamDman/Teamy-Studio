@@ -9,30 +9,24 @@ The first proof should let the launcher open a Timeline flow, create an empty ti
 ## Current Status
 
 - Done so far:
-  - Added the Tracy repository to the VS Code workspace at `G:\Programming\Repos\tracy`, including `profiler\src` and the server-side capture loading code under `server\`.
-  - Added `<activeCodePage>UTF-8</activeCodePage>` to `resources/app.manifest`. This asks Windows to use UTF-8 as the process active ANSI code page for non-Unicode Win32 APIs; it is useful defensive hygiene for libraries or legacy calls that still pass narrow strings, but Teamy should continue preferring UTF-16 Windows APIs where practical.
-  - Confirmed Teamy already has a launcher action system in `src/app/windows_scene.rs` and `src/app/windows_app.rs` using `SceneAction`, `SceneWindowKind`, `scene_button_specs`, `run_scene_window`, and centralized scene rendering/dispatch.
-  - Confirmed Teamy already has microphone selection and detail windows with capture state, shared sample buffers, recording/playback/transcription heads, waveform selection, mel preview caching, and transcript staging in `src/app/windows_audio_input.rs`.
-  - Confirmed the renderer already has timeline-oriented shader concepts such as `TimelineHeadGrabber` and audio detail layout fields for waveform, mel spectrogram, transcript terminal, and timeline labels.
-  - Inspected Tracy capture loading enough to identify the first format boundary: `server/TracyWorker.cpp` reads a `tracy` version header, initialization metadata, string/source-location tables, messages, CPU zones, GPU zones, plots, memory events, call stacks, frame images, and context-switch sections through `server/TracyFileRead.hpp`.
-  - Added `docs/spec/product/timeline.md` and registered `teamy-studio-timeline` in `.config/tracey/config.styx`.
-  - Added a Timeline launcher button that opens a Timeline start window.
-  - Added New and Import actions to the Timeline start window; New switches the same window into a blank timeline document and Import reports a placeholder until the Tracy reader lands.
-  - Added blank timeline rendering with an empty track list area, add-track placeholder, time ruler, and content area.
-  - Added tests and Tracey references for the Timeline launcher button, start window actions, blank timeline view, and import placeholder.
-  - Added `src/timeline/mod.rs` with pure timeline document, track id, track, integer-nanosecond time, and viewport projection types.
-  - Added tests for blank document defaults and integer-nanosecond viewport projection.
-  - Added `TimelineDocument` storage to `SceneAppState`; the Timeline start window's New action now creates a blank document in window state.
-  - Updated the blank timeline renderer to consume optional document state for the ruler and track-count display.
+  - Added the dedicated timeline product spec and kept Tracey mappings current; `tracey query status` now reports `teamy-studio-timeline` at 34 of 34 requirements covered.
+  - Landed the Timeline launcher/start workflow, blank document creation, and `.tracy` import flow with append-to-existing-track behavior for imported tracing captures.
+  - Reworked `src/timeline/mod.rs` into a typed timeline model with integer nanosecond time, typed viewport projection, ruler ticks, track projections, non-destructive edit placeholders, and append APIs for both tracing and audio tracks.
+  - Implemented document-backed viewport controls, keyboard panning/zooming, cursor-anchored mouse-wheel zoom, right-drag panning, visible scrollbars, rectangular marquee selection, and ruler-driven all-track selection.
+  - Integrated the timeline scene with the existing live audio runtime from `src/app/windows_audio_input.rs` instead of creating a second transport implementation.
+  - Added a microphone-backed timeline row that shows the live device name, device icon, and record button in the left tool panel.
+  - Added a transport tool panel with a play/pause button, spacebar transport toggle, and visible draggable recording/playback heads aligned to the timeline ruler.
+  - Added animated elastic mouse-wheel zoom so the timeline eases between the current and target viewport instead of snapping.
+  - Updated tests and validation so `./check-all.ps1` passes with the timeline microphone/transport slice.
 - Current focus:
-  - Add interactive viewport movement to the blank timeline window so pan/zoom changes update document-backed render state.
+  - Convert the current live-runtime timeline integration into a durable document model for recorded clips while preserving the new transport/tool-panel behavior.
 - Remaining work:
-  - Implement a Rust Tracy capture reader that starts with capture metadata, strings/source locations, threads, messages, and CPU zones.
-  - Render Tracy zones/messages on a zoomable timeline with nanosecond precision.
-  - Generalize the timeline model so microphone tracks and Tracy capture tracks share the same viewport, track layout, selection, and clip/zone rendering concepts.
-  - Add live microphone track creation from the existing audio-device picker and shared capture buffer.
+  - Persist recorded timeline audio as document-owned clip/source state instead of reflecting only the live `AudioInputDeviceWindowState` runtime.
+  - Introduce a shared timeline-session object if detached native tool windows are still desired; the current implementation deliberately uses in-window tool panels because scene windows do not yet share mutable session state.
+  - Implement the Rust Tracy capture reader and zone/message rendering path beyond the current file-header/track append workflow.
+  - Extend the timeline model to carry real clip placement, source media references, transcription regions, and later editing primitives.
 - Next step:
-  - Add input handling for basic blank-timeline pan/zoom and render the updated viewport origin/scale in the ruler.
+  - Add persisted recorded audio sources/clips to `TimelineDocument`, then bind the existing live microphone transport so recording writes document-visible clip data instead of only advancing runtime heads.
 
 ## Constraints And Assumptions
 
@@ -42,6 +36,7 @@ The first proof should let the launcher open a Timeline flow, create an empty ti
 - The first UI should use Teamy scene windows and renderer primitives rather than introducing ImGui or Tracy UI code.
 - The new timeline behavior is a new product surface, not a narrow extension of audio input or windowing. It should get a dedicated Tracey spec.
 - The existing microphone detail timeline is useful prior art, but it is a single-device surface. The new timeline should become a multi-track document/view model that audio input can feed into later.
+- Separate detached tool windows are not a cheap follow-up in the current scene architecture. Each scene window owns thread-local state today, so detached timeline tools require an explicit shared timeline-session layer instead of more ad hoc window state plumbing.
 - The viewer should be able to load large captures incrementally or with indexed summaries eventually. The first slice may parse a bounded subset, but the architecture should not require materializing every visual primitive for every frame.
 - `.tracy` captures may contain source paths, messages, symbols, and other sensitive data. The UI should treat loaded captures as local files and avoid accidental export or logging of payload text.
 
@@ -56,6 +51,9 @@ The first proof should let the launcher open a Timeline flow, create an empty ti
 - Tracy messages must render as point events or annotations at their capture timestamp.
 - The timeline viewport must support pan and zoom without changing the underlying timeline data.
 - The track list must support adding a microphone-derived track in a later slice by reusing the existing microphone picker.
+- The current timeline UI should use in-window tool panels for track list, transport, and viewport controls until a shared detached-window session architecture exists.
+- Live microphone tracks must expose device identity, recording control, and draggable transport heads in the timeline itself.
+- Recording from the timeline should become durable document state rather than staying a purely live runtime projection.
 - A microphone track must eventually map one source medium, such as a live sample buffer or recorded clip, into one or more track lanes depending on mono/stereo channel count.
 - Audio clips, Tracy zones, transcription work ranges, and user selections should share one interval/marker vocabulary so the timeline can visualize what is being recorded, processed, transcribed, or selected.
 
@@ -113,7 +111,9 @@ The first Teamy timeline UI should feel like an operational editor, not a market
 - The first Tracy view can render nested zones as horizontal bars stacked by depth within each thread track.
 - Message markers can render as ticks/diamonds in a message lane.
 
-For microphone workflows, reuse the existing `AudioInputDevicePicker` and `AudioInputDeviceWindowState` machinery at first. The add-track flow should open a small Teamy scene/modal asking what kind of track to add; choosing Microphone should open or reuse the microphone picker and then add mono/stereo audio channel tracks to the timeline document.
+For microphone workflows, reuse the existing `AudioInputDevicePicker` and `AudioInputDeviceWindowState` machinery at first. The current timeline already follows this direction by binding microphone rows to the live audio runtime and rendering the transport directly in the timeline scene. The next step is to push captured data into document-owned clip/source structures so the runtime becomes the recorder/player for the document instead of the document surrogate.
+
+For tool windows, keep the current in-window panel treatment until the timeline has a proper shared session object. Detached native tool windows should come only after there is one owner for timeline document state, transport state, hover/selection state, and tool-window synchronization.
 
 ## Tracey Specification Strategy
 
@@ -254,19 +254,58 @@ Tasks:
 
 - Add add-track UI that offers Microphone as a track source.
 - Reuse or open the existing `AudioInputDevicePicker` to choose a microphone.
-- Determine mono/stereo channel count from the selected endpoint/capture format.
-- Add one track for mono or two linked channel tracks for stereo.
-- Start/stop recording from the timeline and append samples to the source medium.
-- Render a live waveform view backed by the captured sample buffer.
+- Bind the chosen/default microphone device to a timeline audio track and reuse the live audio runtime for timeline transport.
+- Render microphone device identity, recording control, transport play/pause control, and draggable recording/playback heads inside the timeline scene.
+- Keep the current tool surfaces in-window rather than detached until the timeline has shared session state.
 
 Definition of done:
 
 - A new empty timeline can add microphone-backed tracks.
-- Recording appends live audio to the timeline source.
-- The waveform updates while recording.
-- Track clips remain views into the recorded source medium.
+- The timeline shows the live device name/icon/record control in the left panel.
+- The timeline exposes play/pause and draggable recording/playback heads in the transport/ruler area.
+- Wheel zoom animates elastically while preserving cursor-anchored zoom semantics.
 
-### Phase 7: Transcription Regions And Editing Primitives
+Status:
+
+- Completed.
+
+### Phase 7: Persist Recorded Audio Into The Timeline Document
+
+Objective: Replace the current runtime-only recording projection with durable document-owned audio source and clip state.
+
+Tasks:
+
+- Add timeline audio source/clip structures that can reference recorded sample buffers independently of the live device window state.
+- Decide whether the first persisted clip path stores in-memory buffers, temp files, or a simple project-local asset path.
+- On timeline recording start/stop, create or extend document-owned audio clips and keep them synchronized with the live transport.
+- Render recorded clips from document state so they remain visible after transport/runtime state changes.
+- Add tests for clip creation, appended duration updates, and source-vs-clip invariants.
+
+Definition of done:
+
+- Recording from the timeline creates durable audio clip/source state in `TimelineDocument`.
+- Recorded material remains visible and replayable without depending on a transient live-only projection.
+- The document model still preserves non-destructive clip semantics.
+
+### Phase 8: Shared Timeline Session For Detached Tool Windows
+
+Objective: Enable true detached timeline tool windows only after the timeline has a shared session layer.
+
+Tasks:
+
+- Introduce a shared timeline-session object that owns document, transport, selection, viewport, and tool-window synchronization state.
+- Refactor scene-window startup so multiple timeline-related windows can bind to the same session instead of each creating isolated thread-local state.
+- Split the current in-window track list, transport, and viewport controls into optional detached scene windows backed by the shared session.
+- Keep hit-testing, tooltips, cursor state, and render invalidation synchronized across all attached windows.
+- Add tests or harness coverage for session reuse and synchronized tool-window updates where practical.
+
+Definition of done:
+
+- Detached timeline tool windows stay synchronized with the main timeline document and transport.
+- Opening/closing a tool window does not fork timeline state.
+- The main timeline can still fall back to in-window panels when detached windows are disabled or unavailable.
+
+### Phase 9: Transcription Regions And Editing Primitives
 
 Objective: Use the timeline as the control surface for transcription and audio editing.
 
@@ -292,26 +331,28 @@ Definition of done:
 4. Render CPU zones/messages from a local `.tracy` capture.
 5. Profile and index the viewer for pan/zoom performance.
 6. Add microphone-backed tracks using existing audio picker/capture code.
-7. Add transcription regions and audio clip editing primitives.
+7. Persist recorded audio as document-owned sources/clips.
+8. Add a shared session layer before detached timeline tool windows.
+9. Add transcription regions and audio clip editing primitives.
 
 ## Open Decisions
 
 - Whether the first `.tracy` parser should support all compression modes immediately or start with whichever mode local `tracy-capture.exe` emits.
 - Whether timeline windows should stay in the scene-window system or eventually become a dedicated renderer path with more specialized GPU buffers.
-- Whether the add-track chooser should be a scene window, modal-like overlay, or dedicated popup window.
-- How much of the existing audio-input detail timeline should be folded into the new timeline framework versus left as a focused single-device control surface.
+- Whether persisted recorded audio should first live in memory, temp files, or an explicit project-asset path.
+- When detached timeline tool windows become important enough to justify the shared session refactor.
+- How much of the existing audio-input detail timeline should be folded into the new timeline framework versus left as a focused single-device control surface once the timeline owns durable clip state.
 - Whether Teamy's own timeline document should use a custom binary format, JSON sidecar plus media files, or a database-style store once audio editing lands.
 
 ## First Concrete Slice
 
-Implement Phase 1 only:
+Implement Phase 7 next:
 
-- Create `docs/spec/product/timeline.md`.
-- Register `teamy-studio-timeline` in `.config/tracey/config.styx`.
-- Add Timeline to the launcher card list.
-- Add a Timeline scene window with Create New and Load Tracy buttons.
-- Make both buttons report placeholder behavior if their backing logic is not implemented yet.
-- Add tests for launcher exposure and Timeline window render contents.
-- Run `./check-all.ps1`.
+- Extend `TimelineDocument` with durable recorded-audio source/clip types.
+- Decide and document the first persistence boundary for recorded buffers.
+- Bind timeline recording start/stop to clip creation or extension instead of live-only runtime projection.
+- Render recorded clip state from the document so it survives transport changes.
+- Add focused tests for clip append behavior and source-vs-clip invariants.
+- Run `./check-all.ps1` and `tracey query status`.
 
-This slice creates the user-visible entry point without committing to the full parser or audio editing architecture too early.
+This slice keeps momentum on the newly landed timeline microphone workflow by turning it into real timeline document state before taking on the larger shared-session refactor for detached tool windows.
