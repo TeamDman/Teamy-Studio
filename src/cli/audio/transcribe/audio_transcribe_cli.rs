@@ -2,8 +2,12 @@ use arbitrary::Arbitrary;
 use eyre::{Context, bail};
 use facet::Facet;
 use figue as args;
+use serde::Serialize;
+use std::collections::{BTreeMap, VecDeque};
+use std::io::{Write, stdout};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use crate::cli::output::CliOutput;
@@ -55,6 +59,16 @@ pub struct AudioTranscribeArgs {
     /// Replace the prepared output if it already exists.
     #[facet(args::named, default)]
     pub overwrite: bool,
+
+    /// Number of parallel Burn decoder workers for demo samples, or long-input chunk batch size.
+    // audio[impl cli.transcribe-decode-workers]
+    #[facet(args::named)]
+    pub decode_workers: Option<usize>,
+
+    /// Write ordered per-chunk timing diagnostics as JSON Lines to this file.
+    // audio[impl cli.transcribe-timing-jsonl]
+    #[facet(args::named)]
+    pub timing_jsonl: Option<String>,
 }
 
 impl AudioTranscribeArgs {
@@ -110,22 +124,30 @@ impl AudioTranscribeArgs {
             )
         })?;
         tracing::debug!(elapsed_ms = model_load_started_at.elapsed().as_millis(), layout = ?model.layout, "Inspected Burn Whisper model directory");
-        let decoder = crate::whisper::LoadedWhisperGreedyDecoder::load(model, max_decode_tokens)?;
+        let decode_workers = self.effective_decode_workers(model.dims.as_ref(), usize::MAX)?;
+        let decoder =
+            crate::whisper::LoadedWhisperGreedyDecoder::load(model.clone(), max_decode_tokens)?;
         let result = transcribe_one_input(
             &input_path,
             metadata,
-            cache_home,
-            &self,
-            &decoder,
-            false,
-            max_decode_tokens,
+            TranscribeOneContext {
+                cache_home,
+                args: &self,
+                decoder: &decoder,
+                is_demo: false,
+                max_decode_tokens,
+                decode_workers,
+            },
         )?;
         tracing::debug!(
             elapsed_ms = command_started_at.elapsed().as_millis(),
             "Finished audio transcribe command"
         );
 
-        println!("{}", result.text);
+        self.write_timing_jsonl(&result.timing_records)?;
+        if !result.streamed_stdout {
+            println!("{}", result.text);
+        }
         Ok(CliOutput::none())
     }
 
@@ -163,7 +185,9 @@ impl AudioTranscribeArgs {
                 self.model,
             )
         })?;
-        let decoder = crate::whisper::LoadedWhisperGreedyDecoder::load(model, max_decode_tokens)?;
+        let decode_workers = self.effective_decode_workers(model.dims.as_ref(), items.len())?;
+        let decoder =
+            crate::whisper::LoadedWhisperGreedyDecoder::load(model.clone(), max_decode_tokens)?;
         let mut progress = DemoBatchProgress::new(totals);
 
         if demo_count > 1 {
@@ -173,21 +197,43 @@ impl AudioTranscribeArgs {
             );
         }
 
-        for (index, item) in items.into_iter().enumerate() {
-            tracing::info!(path = %item.clip.wav_path.display(), expected_text = %item.clip.expected_text, "Starting demo transcription sample");
-            if self.compare_python {
-                print_python_reference_comparison(&item.clip.wav_path, &self.model)?;
-            }
-            let result = transcribe_one_input(
-                &item.clip.wav_path,
-                item.metadata,
+        let results = if decode_workers > 1 && items.len() > 1 {
+            transcribe_demo_items_parallel(
+                items,
                 cache_home,
                 self,
-                &decoder,
-                true,
+                &model,
                 max_decode_tokens,
-            )?;
+                decode_workers,
+            )?
+        } else {
+            let mut results = Vec::new();
+            for item in items {
+                tracing::info!(path = %item.clip.wav_path.display(), expected_text = %item.clip.expected_text, "Starting demo transcription sample");
+                if self.compare_python {
+                    print_python_reference_comparison(&item.clip.wav_path, &self.model)?;
+                }
+                let result = transcribe_one_input(
+                    &item.clip.wav_path,
+                    item.metadata,
+                    TranscribeOneContext {
+                        cache_home,
+                        args: self,
+                        decoder: &decoder,
+                        is_demo: true,
+                        max_decode_tokens,
+                        decode_workers: 1,
+                    },
+                )?;
+                results.push((item.clip, result));
+            }
+            results
+        };
+
+        let mut timing_records = Vec::new();
+        for (index, (clip, result)) in results.into_iter().enumerate() {
             println!("{}", result.text);
+            timing_records.extend(result.timing_records.iter().cloned());
             progress.record(&result);
             if demo_count > 1 {
                 tracing::info!(
@@ -195,8 +241,9 @@ impl AudioTranscribeArgs {
                     progress.render(
                         "demo_metrics",
                         index + 1,
-                        &item.clip.wav_path.display().to_string(),
-                        query_gpu_memory()
+                        &clip.wav_path.display().to_string(),
+                        query_gpu_memory(),
+                        &[],
                     )
                 );
             }
@@ -206,7 +253,41 @@ impl AudioTranscribeArgs {
             elapsed_ms = command_started_at.elapsed().as_millis(),
             "Finished audio transcribe demo batch"
         );
+        self.write_timing_jsonl(&timing_records)?;
         Ok(CliOutput::none())
+    }
+
+    fn write_timing_jsonl(&self, records: &[TranscriptionTimingRecord]) -> eyre::Result<()> {
+        let Some(path) = self.timing_jsonl.as_deref() else {
+            return Ok(());
+        };
+        write_timing_jsonl(Path::new(path), records)
+    }
+
+    fn effective_decode_workers(
+        &self,
+        dims: Option<&crate::whisper::WhisperDims>,
+        work_items: usize,
+    ) -> eyre::Result<usize> {
+        let requested = self.decode_workers.unwrap_or_else(|| {
+            // audio[impl cli.transcribe-decode-workers]
+            let host_parallelism =
+                std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+            let vram_cap = automatic_worker_cap_from_vram(&self.model, dims).unwrap_or(1);
+            let workers = vram_cap.min(work_items.max(1));
+            tracing::info!(
+                workers,
+                host_parallelism,
+                vram_cap,
+                model = %self.model,
+                "Selected automatic Burn Whisper decode parallelism"
+            );
+            workers
+        });
+        if requested == 0 {
+            bail!("--decode-workers must be at least 1");
+        }
+        Ok(requested.min(work_items.max(1)))
     }
 }
 
@@ -263,6 +344,8 @@ struct TranscribedInput {
     bytes: u64,
     audio_seconds: f64,
     words: usize,
+    timing_records: Vec<TranscriptionTimingRecord>,
+    streamed_stdout: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -270,15 +353,93 @@ struct TranscriptionChunkResult {
     text: String,
     audio_seconds: f64,
     words: usize,
+    timing_record: TranscriptionTimingRecord,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+struct TranscriptionTimingRecord {
+    schema: &'static str,
+    backend: &'static str,
+    input_path: String,
+    chunk_index: usize,
+    chunk_total: usize,
+    start_seconds: f64,
+    end_seconds: f64,
+    audio_seconds: f64,
+    frontend_elapsed_ms: u128,
+    decode_elapsed_ms: u128,
+    decoder_total_elapsed_ms: u128,
+    encoder_elapsed_ms: u128,
+    decoder_elapsed_ms: u128,
+    generated_tokens: usize,
+    tokens_per_second: f64,
+    audio_seconds_per_second: f64,
+    stop_reason: String,
+    words: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct AudioChunk<'a> {
     index: usize,
     total: usize,
+    total_samples: usize,
     start_sample: usize,
     end_sample: usize,
     samples: &'a [f32],
+}
+
+struct ChunkProgressContext<'a> {
+    input_path: &'a Path,
+    bytes: u64,
+    progress: &'a mut DemoBatchProgress,
+    transcript_streamer: Option<&'a mut OrderedTranscriptStreamer>,
+}
+
+struct OrderedTranscriptStreamer {
+    next_chunk_index: usize,
+    pending: BTreeMap<usize, String>,
+    wrote_anything: bool,
+}
+
+impl OrderedTranscriptStreamer {
+    fn new() -> Self {
+        Self {
+            next_chunk_index: 1,
+            pending: BTreeMap::new(),
+            wrote_anything: false,
+        }
+    }
+
+    fn push(&mut self, chunk_index: usize, text: &str) -> eyre::Result<()> {
+        // audio[impl cli.transcribe-streaming-stdout]
+        self.pending.insert(chunk_index, text.trim().to_owned());
+        self.flush_ready()
+    }
+
+    fn finish(&mut self) -> eyre::Result<()> {
+        if self.wrote_anything {
+            println!();
+            stdout()
+                .flush()
+                .wrap_err("failed to flush transcript stdout")?;
+        }
+        Ok(())
+    }
+
+    fn flush_ready(&mut self) -> eyre::Result<()> {
+        let mut output = stdout().lock();
+        while let Some(text) = self.pending.remove(&self.next_chunk_index) {
+            if !text.is_empty() {
+                if self.wrote_anything {
+                    write!(output, " ").wrap_err("failed to write transcript separator")?;
+                }
+                write!(output, "{text}").wrap_err("failed to write transcript chunk")?;
+                self.wrote_anything = true;
+            }
+            self.next_chunk_index = self.next_chunk_index.saturating_add(1);
+        }
+        output.flush().wrap_err("failed to flush transcript stdout")
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -289,6 +450,9 @@ struct DemoBatchProgress {
     processed_bytes: u64,
     processed_audio_seconds: f64,
     processed_words: usize,
+    estimated_decode_work_units_per_item: Option<u64>,
+    estimated_decode_work_total_units: Option<u64>,
+    estimated_decode_work_completed_units: u64,
 }
 
 impl DemoBatchProgress {
@@ -300,14 +464,48 @@ impl DemoBatchProgress {
             processed_bytes: 0,
             processed_audio_seconds: 0.0,
             processed_words: 0,
+            estimated_decode_work_units_per_item: None,
+            estimated_decode_work_total_units: None,
+            estimated_decode_work_completed_units: 0,
         }
     }
 
+    fn configure_estimated_decode_work(&mut self, items: usize, units_per_item: u64) {
+        if items == 0 || units_per_item == 0 {
+            return;
+        }
+        self.estimated_decode_work_units_per_item = Some(units_per_item);
+        self.estimated_decode_work_total_units =
+            Some(units_per_item.saturating_mul(usize_to_u64_saturating(items)));
+    }
+
+    fn estimated_decode_work_units_per_item(&self) -> Option<u64> {
+        self.estimated_decode_work_units_per_item
+    }
+
+    fn record_estimated_decode_work(&mut self, completed_units: u64) {
+        let completed_units = self
+            .estimated_decode_work_total_units
+            .map_or(completed_units, |total| completed_units.min(total));
+        self.estimated_decode_work_completed_units = self
+            .estimated_decode_work_completed_units
+            .max(completed_units);
+    }
+
     fn record(&mut self, input: &TranscribedInput) {
+        self.record_values(input.bytes, input.audio_seconds, input.words);
+    }
+
+    fn record_values(&mut self, bytes: u64, audio_seconds: f64, words: usize) {
         self.processed_items = self.processed_items.saturating_add(1);
-        self.processed_bytes = self.processed_bytes.saturating_add(input.bytes);
-        self.processed_audio_seconds += input.audio_seconds;
-        self.processed_words = self.processed_words.saturating_add(input.words);
+        self.processed_bytes = self.processed_bytes.saturating_add(bytes);
+        self.processed_audio_seconds += audio_seconds;
+        self.processed_words = self.processed_words.saturating_add(words);
+        if let Some(units_per_item) = self.estimated_decode_work_units_per_item {
+            self.record_estimated_decode_work(
+                units_per_item.saturating_mul(usize_to_u64_saturating(self.processed_items)),
+            );
+        }
     }
 
     #[expect(
@@ -320,16 +518,9 @@ impl DemoBatchProgress {
         current_index: usize,
         current_label: &str,
         gpu: Option<GpuMemorySnapshot>,
+        detail_lines: &[String],
     ) -> String {
         let elapsed = self.started_at.elapsed().as_secs_f64().max(f64::EPSILON);
-        let bytes_per_second = self.processed_bytes as f64 / elapsed;
-        let audio_seconds_per_second = self.processed_audio_seconds / elapsed;
-        let items_per_second = self.processed_items as f64 / elapsed;
-        let words_per_second = self.processed_words as f64 / elapsed;
-        let bytes_remaining = self.totals.bytes.saturating_sub(self.processed_bytes);
-        let items_remaining = self.totals.items.saturating_sub(self.processed_items);
-        let audio_seconds_remaining =
-            (self.totals.audio_seconds - self.processed_audio_seconds).max(0.0);
         let (vram_used, vram_remaining) = gpu.map_or_else(
             || ("unknown".to_owned(), "unknown".to_owned()),
             |snapshot| {
@@ -340,7 +531,52 @@ impl DemoBatchProgress {
             },
         );
 
-        [
+        if let Some(total_units) = self.estimated_decode_work_total_units {
+            // audio[impl cli.transcribe-estimated-decode-work-progress]
+            let completed_units = self.estimated_decode_work_completed_units.min(total_units);
+            let remaining_units = total_units.saturating_sub(completed_units);
+            let units_per_second = completed_units as f64 / elapsed;
+            let percent = if total_units == 0 {
+                100.0
+            } else {
+                completed_units as f64 * 100.0 / total_units as f64
+            };
+            let mut lines = vec![format!("{header}:")];
+            if detail_lines.is_empty() {
+                lines.push(format!("  item: {current_index}/{}", self.totals.items));
+            } else {
+                lines.extend(detail_lines.iter().map(|detail| format!("  {detail}")));
+            }
+            lines.extend([
+                format!("  current: {current_label}"),
+                format!("  work units total: {total_units}"),
+                format!("  work units remaining: {remaining_units}"),
+                format!("  work percent complete: {percent:.2}%"),
+                format!("  work units per second: {units_per_second:.0}"),
+                format!(
+                    "  work eta: {}",
+                    format_clock_eta(remaining_units as f64, units_per_second)
+                ),
+                format!(
+                    "  work countdown: {}",
+                    format_eta(remaining_units as f64, units_per_second)
+                ),
+                format!("  vram_used: {vram_used}"),
+                format!("  vram_remaining: {vram_remaining}"),
+            ]);
+            return lines.join("\n");
+        }
+
+        let bytes_per_second = self.processed_bytes as f64 / elapsed;
+        let audio_seconds_per_second = self.processed_audio_seconds / elapsed;
+        let items_per_second = self.processed_items as f64 / elapsed;
+        let words_per_second = self.processed_words as f64 / elapsed;
+        let bytes_remaining = self.totals.bytes.saturating_sub(self.processed_bytes);
+        let items_remaining = self.totals.items.saturating_sub(self.processed_items);
+        let audio_seconds_remaining =
+            (self.totals.audio_seconds - self.processed_audio_seconds).max(0.0);
+
+        let mut lines = vec![
             format!("{header}:"),
             format!("  item: {current_index}/{}", self.totals.items),
             format!("  current: {current_label}"),
@@ -366,10 +602,12 @@ impl DemoBatchProgress {
             format!("  bytes_remaining: {}", human_bytes(bytes_remaining)),
             format!("  audio_seconds_remaining: {audio_seconds_remaining:.3}"),
             format!("  items_remaining: {items_remaining}"),
+        ];
+        lines.extend([
             format!("  vram_used: {vram_used}"),
             format!("  vram_remaining: {vram_remaining}"),
-        ]
-        .join("\n")
+        ]);
+        lines.join("\n")
     }
 }
 
@@ -394,45 +632,32 @@ fn parse_demo_sample_count(input: Option<&str>) -> eyre::Result<usize> {
     Ok(count)
 }
 
+#[derive(Clone, Copy)]
+struct TranscribeOneContext<'a> {
+    cache_home: &'a crate::paths::CacheHome,
+    args: &'a AudioTranscribeArgs,
+    decoder: &'a crate::whisper::LoadedWhisperGreedyDecoder,
+    is_demo: bool,
+    max_decode_tokens: usize,
+    decode_workers: usize,
+}
+
 fn transcribe_one_input(
     input_path: &Path,
     metadata: crate::audio::AudioMetadata,
-    cache_home: &crate::paths::CacheHome,
-    args: &AudioTranscribeArgs,
-    decoder: &crate::whisper::LoadedWhisperGreedyDecoder,
-    is_demo: bool,
-    max_decode_tokens: usize,
+    context: TranscribeOneContext<'_>,
 ) -> eyre::Result<TranscribedInput> {
     let bytes = std::fs::metadata(input_path)
         .wrap_err_with(|| format!("failed to stat {}", input_path.display()))?
         .len();
     let original_duration_seconds = metadata.duration_seconds;
-    let issues = crate::audio::validate_for_transcription(&metadata);
-    tracing::debug!(issue_count = issues.len(), sample_rate_hz = ?metadata.sample_rate_hz, channels = ?metadata.channels, "Inspected transcription input audio");
-
-    let effective_audio = if issues.is_empty() {
-        tracing::debug!(path = %input_path.display(), "Loading already-compliant transcription audio");
-        crate::transcription::load_validated_audio(input_path, metadata)?
-    } else if args.resample || is_demo {
-        let output_path = args.prepared_output.as_ref().map_or_else(
-            || default_prepared_output_path(cache_home, input_path),
-            PathBuf::from,
-        );
-        let resample_started_at = Instant::now();
-        let overwrite = args.overwrite || is_demo;
-        tracing::debug!(input = %input_path.display(), output = %output_path.display(), overwrite, "Preparing transcription audio with ffmpeg");
-        let prepared = crate::audio::prepare_audio(input_path, &output_path, overwrite)?;
-        tracing::debug!(elapsed_ms = resample_started_at.elapsed().as_millis(), output = %prepared.path.display(), "Prepared transcription audio");
-        crate::transcription::load_validated_audio(&prepared.path, prepared.metadata)?
-    } else {
-        bail!(crate::audio::render_transcription_contract_error(
-            &metadata, &issues,
-        ));
-    };
+    let effective_audio = load_effective_transcription_audio(input_path, metadata, &context)?;
 
     let audio_seconds =
         original_duration_seconds.unwrap_or_else(|| effective_audio.duration_seconds());
+    // audio[impl cli.transcribe-long-input-chunks]
     let chunks = audio_chunks(&effective_audio.samples);
+    // audio[impl cli.transcribe-progress-tracing]
     tracing::info!(
         path = %input_path.display(),
         bytes = %human_bytes(bytes),
@@ -450,41 +675,49 @@ fn transcribe_one_input(
         bytes,
         audio_seconds,
     });
+    progress.configure_estimated_decode_work(
+        chunks.len(),
+        estimated_decode_work_units_per_item(context.decoder),
+    );
+    let mut transcript_streamer = (!context.is_demo).then(OrderedTranscriptStreamer::new);
     let chunk_count = chunks.len();
-    let mut chunk_results = Vec::with_capacity(chunks.len());
-    for chunk in chunks {
-        let chunk_result =
-            transcribe_audio_chunk(&effective_audio, chunk, decoder, max_decode_tokens)?;
-        if chunk_count > 1 {
-            let estimated_chunk_bytes = if chunk.index == chunk.total {
-                bytes.saturating_sub(progress.processed_bytes)
-            } else {
-                estimate_chunk_bytes(bytes, audio_seconds, chunk_result.audio_seconds)
-            };
-            progress.record(&TranscribedInput {
-                text: chunk_result.text.clone(),
-                bytes: estimated_chunk_bytes,
-                audio_seconds: chunk_result.audio_seconds,
-                words: chunk_result.words,
-            });
-            tracing::info!(
-                "{}",
-                progress.render(
-                    "transcription_metrics",
-                    chunk.index,
-                    &format!(
-                        "{} chunk {}/{} ({:.3}s..{:.3}s)",
-                        input_path.display(),
-                        chunk.index,
-                        chunk.total,
-                        sample_index_seconds(chunk.start_sample),
-                        sample_index_seconds(chunk.end_sample)
-                    ),
-                    query_gpu_memory()
-                )
-            );
+    let chunk_results = if context.decode_workers > 1 && chunk_count > 1 {
+        transcribe_audio_chunks_batched(
+            &effective_audio,
+            &chunks,
+            context.decoder,
+            context.decode_workers,
+            ChunkProgressContext {
+                input_path,
+                bytes,
+                progress: &mut progress,
+                transcript_streamer: transcript_streamer.as_mut(),
+            },
+        )?
+    } else {
+        let mut chunk_results = Vec::with_capacity(chunks.len());
+        for chunk in &chunks {
+            let chunk_result = transcribe_audio_chunk(
+                &effective_audio,
+                *chunk,
+                context.decoder,
+                context.max_decode_tokens,
+            )?;
+            record_completed_chunk(
+                input_path,
+                *chunk,
+                &chunk_result,
+                &mut progress,
+                bytes,
+                transcript_streamer.as_mut(),
+                true,
+            )?;
+            chunk_results.push(chunk_result);
         }
-        chunk_results.push(chunk_result);
+        chunk_results
+    };
+    if let Some(streamer) = transcript_streamer.as_mut() {
+        streamer.finish()?;
     }
 
     let text = chunk_results
@@ -494,12 +727,511 @@ fn transcribe_one_input(
         .collect::<Vec<_>>()
         .join(" ");
     let words = chunk_results.iter().map(|chunk| chunk.words).sum();
+    let timing_records = chunk_results
+        .iter()
+        .map(|chunk| chunk.timing_record.clone())
+        .collect();
     Ok(TranscribedInput {
         text,
         bytes,
         audio_seconds,
         words,
+        timing_records,
+        streamed_stdout: transcript_streamer.is_some(),
     })
+}
+
+fn record_completed_chunk(
+    input_path: &Path,
+    chunk: AudioChunk<'_>,
+    result: &TranscriptionChunkResult,
+    progress: &mut DemoBatchProgress,
+    bytes: u64,
+    transcript_streamer: Option<&mut OrderedTranscriptStreamer>,
+    log_progress: bool,
+) -> eyre::Result<()> {
+    if let Some(streamer) = transcript_streamer {
+        streamer.push(chunk.index, &result.text)?;
+    }
+    progress.record_values(
+        chunk_audio_bytes(bytes, chunk),
+        result.audio_seconds,
+        result.words,
+    );
+    if log_progress {
+        log_overall_progress(
+            input_path,
+            progress,
+            &format!(
+                "completed chunk {}/{} ({:.3}s..{:.3}s)",
+                chunk.index,
+                chunk.total,
+                sample_index_seconds(chunk.start_sample),
+                sample_index_seconds(chunk.end_sample)
+            ),
+            &[],
+        );
+    }
+    Ok(())
+}
+
+fn load_effective_transcription_audio(
+    input_path: &Path,
+    metadata: crate::audio::AudioMetadata,
+    context: &TranscribeOneContext<'_>,
+) -> eyre::Result<crate::transcription::ValidatedAudio> {
+    let issues = crate::audio::validate_for_transcription(&metadata);
+    if issues.is_empty() {
+        return crate::transcription::load_validated_audio(input_path, metadata);
+    }
+
+    let prepared_output = context.args.prepared_output.as_deref().map_or_else(
+        || default_prepared_output_path(context.cache_home, input_path),
+        PathBuf::from,
+    );
+
+    let prepared = if prepared_output.exists() && !context.args.overwrite {
+        crate::audio::PreparedAudio {
+            metadata: crate::audio::inspect_audio(&prepared_output)?,
+            path: prepared_output,
+        }
+    } else {
+        tracing::info!(input = %input_path.display(), output = %prepared_output.display(), "Preparing audio for transcription");
+        crate::audio::prepare_audio(input_path, &prepared_output, context.args.overwrite)?
+    };
+    crate::transcription::load_validated_audio(&prepared.path, prepared.metadata)
+}
+
+fn chunk_audio_bytes(total_bytes: u64, chunk: AudioChunk<'_>) -> u64 {
+    let total_audio_seconds = sample_index_seconds(chunk.total_samples);
+    estimate_chunk_bytes(
+        total_bytes,
+        total_audio_seconds,
+        sample_index_seconds(chunk.samples.len()),
+    )
+}
+
+fn estimated_decode_work_units_per_item(
+    decoder: &crate::whisper::LoadedWhisperGreedyDecoder,
+) -> u64 {
+    usize_to_u64_saturating(decoder.decode_limit())
+        .saturating_mul(usize_to_u64_saturating(decoder.decoder_layer_count()))
+}
+
+fn usize_to_u64_saturating(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
+}
+
+fn transcribe_audio_chunks_batched(
+    input: &crate::transcription::ValidatedAudio,
+    chunks: &[AudioChunk<'_>],
+    decoder: &crate::whisper::LoadedWhisperGreedyDecoder,
+    batch_size: usize,
+    progress_context: ChunkProgressContext<'_>,
+) -> eyre::Result<Vec<TranscriptionChunkResult>> {
+    // audio[impl cli.transcribe-decode-workers]
+    // audio[impl cli.transcribe-batched-chunks]
+    let ChunkProgressContext {
+        input_path,
+        bytes,
+        progress,
+        mut transcript_streamer,
+    } = progress_context;
+    let batch_size = batch_size.min(chunks.len().max(1));
+    tracing::info!(batch_size, chunks = chunks.len(), path = %input.path.display(), "Starting batched audio chunk transcription");
+    let mut results = Vec::with_capacity(chunks.len());
+    let batch_total = chunks.len().div_ceil(batch_size);
+    for (batch_index, batch) in chunks.chunks(batch_size).enumerate() {
+        let batch_number = batch_index + 1;
+        log_overall_progress(
+            input_path,
+            progress,
+            &format!(
+                "preparing chunks {}..{}",
+                batch.first().map_or(0, |chunk| chunk.index),
+                batch.last().map_or(0, |chunk| chunk.index)
+            ),
+            &[batch_progress_line(batch, batch_number, batch_total)],
+        );
+        let mut features = Vec::with_capacity(batch.len());
+        let mut frontend_elapsed_ms = Vec::with_capacity(batch.len());
+        for chunk in batch {
+            let request_started_at = Instant::now();
+            features.push(crate::frontend::whisper_log_mel_spectrogram(chunk.samples));
+            frontend_elapsed_ms.push(request_started_at.elapsed().as_millis());
+        }
+
+        let decode_started_at = Instant::now();
+        let summaries = decoder.decode_batch_with_progress(&features, |decode_progress| {
+            if should_log_batch_token_progress(decode_progress) {
+                log_batch_decode_progress(
+                    input_path,
+                    batch,
+                    progress,
+                    batch_number,
+                    batch_total,
+                    decode_progress,
+                );
+            }
+        })?;
+        let decode_elapsed_ms = decode_started_at.elapsed().as_millis();
+        for ((chunk, summary), frontend_elapsed_ms) in batch
+            .iter()
+            .copied()
+            .zip(summaries)
+            .zip(frontend_elapsed_ms)
+        {
+            let result = transcription_chunk_result_from_summary(
+                input,
+                chunk,
+                frontend_elapsed_ms,
+                decode_elapsed_ms,
+                summary,
+            );
+            record_completed_chunk(
+                input_path,
+                chunk,
+                &result,
+                progress,
+                bytes,
+                transcript_streamer.as_deref_mut(),
+                false,
+            )?;
+            results.push(result);
+        }
+        log_overall_progress(
+            input_path,
+            progress,
+            &format!(
+                "completed chunks {}..{}",
+                batch.first().map_or(0, |chunk| chunk.index),
+                batch.last().map_or(0, |chunk| chunk.index)
+            ),
+            &[batch_progress_line(batch, batch_number, batch_total)],
+        );
+    }
+    Ok(results)
+}
+
+fn should_log_batch_token_progress(progress: crate::whisper::BatchedGreedyDecodeProgress) -> bool {
+    let token_should_report = progress.token_index == 1
+        || progress.token_index == progress.decode_limit
+        || progress.token_index.is_multiple_of(5)
+        || progress.active_items == 0;
+    if !token_should_report {
+        return false;
+    }
+
+    match (progress.decoder_layer_index, progress.decoder_layer_total) {
+        (Some(layer_index), Some(layer_total)) => {
+            if layer_total <= 4 {
+                layer_index == 1 || layer_index == layer_total
+            } else {
+                layer_index == 1
+                    || layer_index == layer_total
+                    || layer_index == layer_total / 4
+                    || layer_index == layer_total / 2
+                    || layer_index == (layer_total * 3) / 4
+            }
+        }
+        _ => progress.active_items == 0 || progress.token_index == progress.decode_limit,
+    }
+}
+
+fn log_overall_progress(
+    input_path: &Path,
+    progress: &DemoBatchProgress,
+    current_label: &str,
+    detail_lines: &[String],
+) {
+    // audio[impl cli.transcribe-unified-progress]
+    tracing::info!(
+        path = %input_path.display(),
+        "{}",
+        progress.render(
+            "estimated progress report",
+            progress.processed_items,
+            current_label,
+            query_gpu_memory(),
+            detail_lines,
+        ),
+    );
+}
+
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "batch progress diagnostics are approximate human-scale values"
+)]
+fn log_batch_decode_progress(
+    input_path: &Path,
+    batch: &[AudioChunk<'_>],
+    progress: &mut DemoBatchProgress,
+    batch_number: usize,
+    batch_total: usize,
+    decode_progress: crate::whisper::BatchedGreedyDecodeProgress,
+) {
+    let (first_chunk, last_chunk) = batch_chunk_bounds(batch);
+    if let Some(completed_units) = estimated_decode_work_completed_for_batch(
+        batch,
+        progress.estimated_decode_work_units_per_item(),
+        decode_progress,
+    ) {
+        progress.record_estimated_decode_work(completed_units);
+    }
+    let token_steps_per_second = per_second(
+        decode_progress.token_index as f64,
+        decode_progress.elapsed_ms,
+    );
+    let layer = match (
+        decode_progress.decoder_layer_index,
+        decode_progress.decoder_layer_total,
+    ) {
+        (Some(index), Some(total)) => format!("decoder_layer: {index}/{total}"),
+        _ => "decoder_layer: complete".to_owned(),
+    };
+    log_overall_progress(
+        input_path,
+        progress,
+        &format!("decoding chunks {first_chunk}..{last_chunk}"),
+        &[
+            batch_progress_line(batch, batch_number, batch_total),
+            format!("decode_phase: {:?}", decode_progress.phase),
+            format!(
+                "token_step: {}/{}",
+                decode_progress.token_index, decode_progress.decode_limit
+            ),
+            layer,
+            format!(
+                "active_items: {}/{}",
+                decode_progress.active_items, decode_progress.batch_size
+            ),
+            format!("token_steps_per_second: {token_steps_per_second:.3}"),
+        ],
+    );
+}
+
+fn estimated_decode_work_completed_for_batch(
+    batch: &[AudioChunk<'_>],
+    units_per_item: Option<u64>,
+    decode_progress: crate::whisper::BatchedGreedyDecodeProgress,
+) -> Option<u64> {
+    let first_chunk = batch.first()?;
+    let units_per_item = units_per_item?;
+    let completed_before_batch =
+        usize_to_u64_saturating(first_chunk.index.saturating_sub(1)).saturating_mul(units_per_item);
+    let completed_in_batch =
+        estimated_decode_work_completed_in_batch(batch.len(), units_per_item, decode_progress);
+    Some(completed_before_batch.saturating_add(completed_in_batch))
+}
+
+fn estimated_decode_work_completed_in_batch(
+    batch_len: usize,
+    units_per_item: u64,
+    decode_progress: crate::whisper::BatchedGreedyDecodeProgress,
+) -> u64 {
+    let batch_len = usize_to_u64_saturating(batch_len);
+    match decode_progress.phase {
+        crate::whisper::BatchedGreedyDecodePhase::EncoderStart
+        | crate::whisper::BatchedGreedyDecodePhase::EncoderComplete => 0,
+        crate::whisper::BatchedGreedyDecodePhase::TokenComplete => {
+            if decode_progress.decode_limit == 0 {
+                return units_per_item.saturating_mul(batch_len);
+            }
+            let completed_tokens = usize_to_u64_saturating(decode_progress.token_index);
+            let decode_limit = usize_to_u64_saturating(decode_progress.decode_limit);
+            units_per_item
+                .saturating_mul(completed_tokens)
+                .checked_div(decode_limit)
+                .unwrap_or(units_per_item)
+                .saturating_mul(batch_len)
+        }
+        crate::whisper::BatchedGreedyDecodePhase::DecoderLayer => {
+            let Some(layer_index) = decode_progress.decoder_layer_index else {
+                return 0;
+            };
+            let Some(layer_total) = decode_progress.decoder_layer_total else {
+                return 0;
+            };
+            let completed_layers = usize_to_u64_saturating(
+                decode_progress
+                    .token_index
+                    .saturating_sub(1)
+                    .saturating_mul(layer_total)
+                    .saturating_add(layer_index),
+            );
+            completed_layers
+                .min(units_per_item)
+                .saturating_mul(batch_len)
+        }
+    }
+}
+
+fn batch_chunk_bounds(batch: &[AudioChunk<'_>]) -> (usize, usize) {
+    let first = batch.first().map_or(0, |chunk| chunk.index);
+    let last = batch.last().map_or(first, |chunk| chunk.index);
+    (first, last)
+}
+
+fn batch_progress_line(
+    batch: &[AudioChunk<'_>],
+    batch_number: usize,
+    batch_total: usize,
+) -> String {
+    let completed_items = batch.last().map_or(0, |chunk| chunk.index);
+    let total_items = batch.last().map_or(0, |chunk| chunk.total);
+    format!("batch: {batch_number} of {batch_total} ({completed_items} of {total_items} items)")
+}
+
+fn transcribe_demo_items_parallel(
+    items: Vec<DemoBatchItem>,
+    cache_home: &crate::paths::CacheHome,
+    args: &AudioTranscribeArgs,
+    model: &crate::model::WhisperModelArtifacts,
+    max_decode_tokens: usize,
+    decode_workers: usize,
+) -> eyre::Result<Vec<(VctkDemoClip, TranscribedInput)>> {
+    // audio[impl cli.transcribe-decode-workers]
+    tracing::info!(
+        decode_workers,
+        items = items.len(),
+        "Starting parallel demo transcription workers"
+    );
+    let work = Mutex::new(
+        items
+            .into_iter()
+            .enumerate()
+            .collect::<VecDeque<(usize, DemoBatchItem)>>(),
+    );
+    let mut results = Vec::new();
+    std::thread::scope(|scope| -> eyre::Result<()> {
+        let mut handles = Vec::new();
+        for worker_index in 0..decode_workers {
+            let work = &work;
+            handles.push(scope.spawn(move || -> eyre::Result<Vec<(usize, VctkDemoClip, TranscribedInput)>> {
+                let decoder = crate::whisper::LoadedWhisperGreedyDecoder::load(
+                    model.clone(),
+                    max_decode_tokens,
+                )?;
+                let mut worker_results = Vec::new();
+                loop {
+                    let Some((index, item)) = work.lock().expect("demo work queue lock should not be poisoned").pop_front() else {
+                        break;
+                    };
+                    tracing::info!(worker_index, path = %item.clip.wav_path.display(), expected_text = %item.clip.expected_text, "Starting demo transcription sample");
+                    if args.compare_python {
+                        print_python_reference_comparison(&item.clip.wav_path, &args.model)?;
+                    }
+                    let result = transcribe_one_input(
+                        &item.clip.wav_path,
+                        item.metadata,
+                        TranscribeOneContext {
+                            cache_home,
+                            args,
+                            decoder: &decoder,
+                            is_demo: true,
+                            max_decode_tokens,
+                            decode_workers: 1,
+                        },
+                    )?;
+                    worker_results.push((index, item.clip, result));
+                }
+                Ok(worker_results)
+            }));
+        }
+        for handle in handles {
+            let worker_results = handle
+                .join()
+                .map_err(|_panic| eyre::eyre!("parallel demo transcription worker panicked"))??;
+            results.extend(worker_results);
+        }
+        Ok(())
+    })?;
+    results.sort_by_key(|(index, _, _)| *index);
+    Ok(results
+        .into_iter()
+        .map(|(_, clip, result)| (clip, result))
+        .collect())
+}
+
+fn automatic_worker_cap_from_vram(
+    model_name: &str,
+    dims: Option<&crate::whisper::WhisperDims>,
+) -> Option<usize> {
+    // audio[impl cli.transcribe-vram-aware-workers]
+    let gpu = query_gpu_memory()?;
+    let per_worker_bytes = estimate_decode_worker_vram_bytes(model_name, dims);
+    if per_worker_bytes == 0 {
+        return None;
+    }
+
+    let reservable_bytes = gpu.free_bytes.saturating_mul(85) / 100;
+    let workers = (reservable_bytes / per_worker_bytes).max(1);
+    tracing::info!(
+        vram_free = %human_bytes(gpu.free_bytes),
+        vram_reservable = %human_bytes(reservable_bytes),
+        estimated_worker_vram = %human_bytes(per_worker_bytes),
+        workers,
+        model = %model_name,
+        "Estimated Burn Whisper decode parallelism from available VRAM"
+    );
+    usize::try_from(workers).ok()
+}
+
+fn estimate_decode_worker_vram_bytes(
+    model_name: &str,
+    dims: Option<&crate::whisper::WhisperDims>,
+) -> u64 {
+    known_model_worker_vram_bytes(model_name)
+        .or_else(|| dims.map(estimate_worker_vram_bytes_from_dims))
+        .unwrap_or_else(gibibytes)
+}
+
+fn known_model_worker_vram_bytes(model_name: &str) -> Option<u64> {
+    crate::model::KNOWN_WHISPER_MODELS
+        .iter()
+        .find(|model| model.name.eq_ignore_ascii_case(model_name))
+        .and_then(|model| parse_parameter_count(model.parameter_count))
+        .map(estimate_worker_vram_bytes_from_parameters)
+}
+
+fn parse_parameter_count(parameter_count: &str) -> Option<u64> {
+    let normalized = parameter_count.trim();
+    let numeric = normalized
+        .trim_end_matches('M')
+        .trim_end_matches('m')
+        .trim_end_matches('B')
+        .trim_end_matches('b')
+        .trim();
+    let multiplier = if normalized.ends_with('B') || normalized.ends_with('b') {
+        1_000_000_000
+    } else {
+        1_000_000
+    };
+    numeric.parse::<u64>().ok()?.checked_mul(multiplier)
+}
+
+fn estimate_worker_vram_bytes_from_parameters(parameters: u64) -> u64 {
+    let parameter_bytes = parameters.saturating_mul(4);
+    parameter_bytes
+        .saturating_add(256 * mebibytes())
+        .max(384 * mebibytes())
+}
+
+fn estimate_worker_vram_bytes_from_dims(dims: &crate::whisper::WhisperDims) -> u64 {
+    match dims.audio.n_audio_state {
+        0..=512 => gibibytes(),
+        513..=768 => 2 * gibibytes(),
+        769..=1024 => 5 * gibibytes(),
+        _ => 10 * gibibytes(),
+    }
+}
+
+fn mebibytes() -> u64 {
+    1024 * 1024
+}
+
+fn gibibytes() -> u64 {
+    1024 * 1024 * 1024
 }
 
 fn transcribe_audio_chunk(
@@ -516,8 +1248,9 @@ fn transcribe_audio_chunk(
     );
     let request_started_at = Instant::now();
     let features = crate::frontend::whisper_log_mel_spectrogram(chunk.samples);
+    let frontend_elapsed_ms = request_started_at.elapsed().as_millis();
     tracing::debug!(
-        elapsed_ms = request_started_at.elapsed().as_millis(),
+        elapsed_ms = frontend_elapsed_ms,
         mel_bins = features.n_mels,
         frames = features.n_frames,
         chunk_index = chunk.index,
@@ -531,14 +1264,92 @@ fn transcribe_audio_chunk(
         "Starting Burn Whisper chunk decode"
     );
     let summary = decoder.decode(&features)?;
-    tracing::debug!(elapsed_ms = decode_started_at.elapsed().as_millis(), text = %summary.text, stop_reason = ?summary.stop_reason, generated_tokens = summary.generated_token_ids.len(), chunk_index = chunk.index, chunk_total = chunk.total, path = %input.path.display(), "Finished Burn Whisper chunk decode");
-    let audio_seconds = sample_index_seconds(chunk.samples.len());
+    let decode_elapsed_ms = decode_started_at.elapsed().as_millis();
+    Ok(transcription_chunk_result_from_summary(
+        input,
+        chunk,
+        frontend_elapsed_ms,
+        decode_elapsed_ms,
+        summary,
+    ))
+}
+
+fn transcription_chunk_result_from_summary(
+    input: &crate::transcription::ValidatedAudio,
+    chunk: AudioChunk<'_>,
+    frontend_elapsed_ms: u128,
+    decode_elapsed_ms: u128,
+    summary: crate::whisper::GreedyDecodeSummary,
+) -> TranscriptionChunkResult {
+    let generated_tokens = summary.generated_token_ids.len();
+    let chunk_audio_seconds = sample_index_seconds(chunk.samples.len());
+    let tokens_per_second = tokens_per_second(generated_tokens, summary.decoder_elapsed_ms);
+    let audio_seconds_per_second = per_second(chunk_audio_seconds, decode_elapsed_ms);
     let words = summary.text.split_whitespace().count();
-    Ok(TranscriptionChunkResult {
+    tracing::debug!(elapsed_ms = decode_elapsed_ms, text = %summary.text, stop_reason = ?summary.stop_reason, generated_tokens, chunk_index = chunk.index, chunk_total = chunk.total, path = %input.path.display(), "Finished Burn Whisper chunk decode");
+    // audio[impl cli.transcribe-stage-timing]
+    tracing::debug!(
+        path = %input.path.display(),
+        chunk_index = chunk.index,
+        chunk_total = chunk.total,
+        chunk_audio_seconds,
+        frontend_elapsed_ms,
+        decode_elapsed_ms,
+        decoder_total_elapsed_ms = summary.total_elapsed_ms,
+        encoder_elapsed_ms = summary.encoder_elapsed_ms,
+        decoder_elapsed_ms = summary.decoder_elapsed_ms,
+        generated_tokens,
+        tokens_per_second,
+        audio_seconds_per_second,
+        stop_reason = ?summary.stop_reason,
+        "Transcribed audio chunk"
+    );
+    let audio_seconds = chunk_audio_seconds;
+    let timing_record = TranscriptionTimingRecord {
+        schema: "teamy-studio.audio.transcription-timing.v1",
+        backend: "burn-cuda-greedy",
+        input_path: input.path.display().to_string(),
+        chunk_index: chunk.index,
+        chunk_total: chunk.total,
+        start_seconds: sample_index_seconds(chunk.start_sample),
+        end_seconds: sample_index_seconds(chunk.end_sample),
+        audio_seconds,
+        frontend_elapsed_ms,
+        decode_elapsed_ms,
+        decoder_total_elapsed_ms: summary.total_elapsed_ms,
+        encoder_elapsed_ms: summary.encoder_elapsed_ms,
+        decoder_elapsed_ms: summary.decoder_elapsed_ms,
+        generated_tokens,
+        tokens_per_second,
+        audio_seconds_per_second,
+        stop_reason: format!("{:?}", summary.stop_reason),
+        words,
+    };
+    TranscriptionChunkResult {
         text: summary.text,
         audio_seconds,
         words,
-    })
+        timing_record,
+    }
+}
+
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "stage timing diagnostics are approximate human-scale throughput values"
+)]
+fn tokens_per_second(tokens: usize, elapsed_ms: u128) -> f64 {
+    per_second(tokens as f64, elapsed_ms)
+}
+
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "stage timing diagnostics are approximate human-scale throughput values"
+)]
+fn per_second(value: f64, elapsed_ms: u128) -> f64 {
+    if elapsed_ms == 0 {
+        return 0.0;
+    }
+    value / (elapsed_ms as f64 / 1000.0)
 }
 
 #[expect(
@@ -549,22 +1360,84 @@ fn sample_index_seconds(sample_index: usize) -> f64 {
     sample_index as f64 / f64::from(crate::audio::TRANSCRIPTION_SAMPLE_RATE)
 }
 
+const SPEECH_BOUNDARY_SEARCH_SECONDS: usize = 2;
+const SPEECH_BOUNDARY_FRAME_MS: usize = 50;
+const MIN_SPEECH_AWARE_CHUNK_SECONDS: usize = 5;
+
 fn audio_chunks(samples: &[f32]) -> Vec<AudioChunk<'_>> {
-    let chunk_samples = crate::frontend::N_SAMPLES;
-    let total = samples.len().div_ceil(chunk_samples).max(1);
-    (0..total)
-        .map(|offset| {
-            let start_sample = offset * chunk_samples;
-            let end_sample = (start_sample + chunk_samples).min(samples.len());
-            AudioChunk {
-                index: offset + 1,
-                total,
-                start_sample,
-                end_sample,
-                samples: &samples[start_sample..end_sample],
-            }
+    // audio[impl cli.transcribe-speech-aware-chunks]
+    let boundaries = speech_aware_chunk_boundaries(samples);
+    let total = boundaries.len().max(1);
+    boundaries
+        .into_iter()
+        .enumerate()
+        .map(|(offset, (start_sample, end_sample))| AudioChunk {
+            index: offset + 1,
+            total,
+            total_samples: samples.len(),
+            start_sample,
+            end_sample,
+            samples: &samples[start_sample..end_sample],
         })
         .collect()
+}
+
+fn speech_aware_chunk_boundaries(samples: &[f32]) -> Vec<(usize, usize)> {
+    if samples.is_empty() {
+        return vec![(0, 0)];
+    }
+
+    let max_chunk_samples = crate::frontend::N_SAMPLES;
+    let min_chunk_samples = MIN_SPEECH_AWARE_CHUNK_SECONDS
+        .saturating_mul(crate::audio::TRANSCRIPTION_SAMPLE_RATE as usize);
+    let mut boundaries = Vec::new();
+    let mut start_sample = 0;
+    while start_sample < samples.len() {
+        let hard_end = (start_sample + max_chunk_samples).min(samples.len());
+        if hard_end == samples.len() {
+            boundaries.push((start_sample, hard_end));
+            break;
+        }
+
+        let snapped_end = quietest_boundary_before(samples, start_sample, hard_end)
+            .filter(|boundary| *boundary > start_sample + min_chunk_samples)
+            .unwrap_or(hard_end);
+        boundaries.push((start_sample, snapped_end));
+        start_sample = snapped_end;
+    }
+    boundaries
+}
+
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "frame energy comparison only needs approximate relative RMS values"
+)]
+fn quietest_boundary_before(
+    samples: &[f32],
+    start_sample: usize,
+    hard_end: usize,
+) -> Option<usize> {
+    let sample_rate = crate::audio::TRANSCRIPTION_SAMPLE_RATE as usize;
+    let search_samples = SPEECH_BOUNDARY_SEARCH_SECONDS.saturating_mul(sample_rate);
+    let frame_samples = (SPEECH_BOUNDARY_FRAME_MS.saturating_mul(sample_rate) / 1000).max(1);
+    let search_start = hard_end.saturating_sub(search_samples).max(start_sample);
+    if search_start >= hard_end || hard_end.saturating_sub(search_start) < frame_samples {
+        return None;
+    }
+
+    (search_start..=hard_end - frame_samples)
+        .step_by(frame_samples)
+        .map(|frame_start| {
+            let frame_end = frame_start + frame_samples;
+            let energy = samples[frame_start..frame_end]
+                .iter()
+                .map(|sample| sample * sample)
+                .sum::<f32>()
+                / frame_samples as f32;
+            (frame_start + frame_samples / 2, energy)
+        })
+        .min_by(|(_, left), (_, right)| left.total_cmp(right))
+        .map(|(boundary, _)| boundary)
 }
 
 #[expect(
@@ -594,6 +1467,37 @@ fn default_prepared_output_path(cache_home: &crate::paths::CacheHome, input: &Pa
         .join("audio")
         .join("prepared")
         .join(format!("{stem}.16khz-mono.wav"))
+}
+
+fn write_timing_jsonl(path: &Path, records: &[TranscriptionTimingRecord]) -> eyre::Result<()> {
+    // audio[impl cli.transcribe-timing-jsonl]
+    let file = std::fs::File::create(path).wrap_err_with(|| {
+        format!(
+            "failed to create transcription timing JSONL file {}",
+            path.display()
+        )
+    })?;
+    let mut writer = std::io::BufWriter::new(file);
+    for record in records {
+        serde_json::to_writer(&mut writer, record).wrap_err_with(|| {
+            format!(
+                "failed to serialize transcription timing record for {} chunk {}/{}",
+                record.input_path, record.chunk_index, record.chunk_total
+            )
+        })?;
+        writer.write_all(b"\n").wrap_err_with(|| {
+            format!(
+                "failed to write transcription timing JSONL file {}",
+                path.display()
+            )
+        })?;
+    }
+    writer.flush().wrap_err_with(|| {
+        format!(
+            "failed to flush transcription timing JSONL file {}",
+            path.display()
+        )
+    })
 }
 
 fn find_vctk_demo_clips(count: usize) -> eyre::Result<Vec<VctkDemoClip>> {
@@ -739,6 +1643,28 @@ fn format_eta(remaining: f64, per_second: f64) -> String {
     format_duration(Duration::from_secs_f64(remaining / per_second))
 }
 
+fn format_clock_eta(remaining: f64, per_second: f64) -> String {
+    if remaining <= 0.0 {
+        return chrono::Local::now()
+            .format("%I:%M%p")
+            .to_string()
+            .trim_start_matches('0')
+            .to_owned();
+    }
+    if !per_second.is_finite() || per_second <= f64::EPSILON {
+        return "unknown".to_owned();
+    }
+    let countdown = Duration::from_secs_f64(remaining / per_second);
+    let Ok(countdown) = chrono::Duration::from_std(countdown) else {
+        return "unknown".to_owned();
+    };
+    (chrono::Local::now() + countdown)
+        .format("%I:%M%p")
+        .to_string()
+        .trim_start_matches('0')
+        .to_owned()
+}
+
 fn format_duration(duration: Duration) -> String {
     let total_seconds = duration.as_secs();
     let hours = total_seconds / 3600;
@@ -825,4 +1751,86 @@ print(json.dumps({
         tracing::debug!(stderr = %stderr.trim(), "Python comparison wrote stderr");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_count(seconds: usize) -> usize {
+        seconds * crate::audio::TRANSCRIPTION_SAMPLE_RATE as usize
+    }
+
+    #[test]
+    fn speech_aware_chunks_keep_short_audio_as_one_chunk() {
+        let samples = vec![0.1; sample_count(12)];
+
+        let chunks = audio_chunks(&samples);
+
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].start_sample, 0);
+        assert_eq!(chunks[0].end_sample, samples.len());
+        assert_eq!(chunks[0].total_samples, samples.len());
+    }
+
+    #[test]
+    fn speech_aware_chunks_snap_to_quiet_boundary_before_window_limit() {
+        let mut samples = vec![0.4; sample_count(61)];
+        let silence_start = sample_count(29);
+        let silence_end = sample_count(30);
+        for sample in &mut samples[silence_start..silence_end] {
+            *sample = 0.0;
+        }
+
+        let chunks = audio_chunks(&samples);
+
+        assert!(chunks.len() >= 3);
+        assert!(chunks[0].end_sample >= silence_start);
+        assert!(chunks[0].end_sample <= silence_end);
+        assert_eq!(chunks[1].start_sample, chunks[0].end_sample);
+    }
+
+    #[test]
+    fn speech_aware_chunks_do_not_exceed_whisper_window() {
+        let samples = vec![0.4; sample_count(95)];
+
+        let chunks = audio_chunks(&samples);
+
+        assert!(chunks.len() >= 4);
+        assert!(
+            chunks
+                .iter()
+                .all(|chunk| chunk.samples.len() <= crate::frontend::N_SAMPLES)
+        );
+        assert_eq!(chunks.first().expect("at least one chunk").start_sample, 0);
+        assert_eq!(
+            chunks.last().expect("at least one chunk").end_sample,
+            samples.len()
+        );
+    }
+
+    #[test]
+    fn estimated_decode_work_advances_with_decoder_layers() {
+        let samples = vec![0.4; sample_count(61)];
+        let chunks = audio_chunks(&samples);
+        let units_per_item = 12;
+
+        let completed = estimated_decode_work_completed_for_batch(
+            &chunks[1..3],
+            Some(units_per_item),
+            crate::whisper::BatchedGreedyDecodeProgress {
+                phase: crate::whisper::BatchedGreedyDecodePhase::DecoderLayer,
+                token_index: 2,
+                decode_limit: 3,
+                batch_size: 2,
+                active_items: 2,
+                decoder_layer_index: Some(2),
+                decoder_layer_total: Some(4),
+                elapsed_ms: 100,
+            },
+        )
+        .expect("batch has chunks and configured work units");
+
+        assert_eq!(completed, units_per_item + 2 * 6);
+    }
 }

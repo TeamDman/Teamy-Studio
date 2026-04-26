@@ -234,6 +234,15 @@ pub struct WhisperTextDecoder<B: Backend> {
 
 impl<B: Backend> WhisperTextDecoder<B> {
     pub fn forward(&self, tokens: Tensor<B, 2, Int>, encoder_output: Tensor<B, 3>) -> Tensor<B, 3> {
+        self.forward_with_layer_progress(tokens, encoder_output, |_, _| {})
+    }
+
+    fn forward_with_layer_progress(
+        &self,
+        tokens: Tensor<B, 2, Int>,
+        encoder_output: Tensor<B, 3>,
+        mut on_layer: impl FnMut(usize, usize),
+    ) -> Tensor<B, 3> {
         let [_batch, seq_len] = tokens.dims();
         assert!(
             seq_len <= self.n_text_ctx,
@@ -249,8 +258,10 @@ impl<B: Backend> WhisperTextDecoder<B> {
                 .slice([0..seq_len])
                 .unsqueeze::<3>();
 
-        for block in &self.blocks {
+        let layer_total = self.blocks.len();
+        for (layer_index, block) in self.blocks.iter().enumerate() {
             x = block.forward(x, encoder_output.clone(), self.mask.val());
+            on_layer(layer_index + 1, layer_total);
         }
 
         let x = self.ln.forward(x);
@@ -791,9 +802,33 @@ pub struct GreedyDecodeSummary {
     pub generated_token_ids: Vec<usize>,
     pub encoder_output_dims: [usize; 3],
     pub last_decoder_logits_dims: [usize; 3],
+    pub total_elapsed_ms: u128,
+    pub encoder_elapsed_ms: u128,
+    pub decoder_elapsed_ms: u128,
     pub terminated_on_end_of_text: bool,
     pub stop_reason: DecodeStopReason,
     pub text: String,
+}
+
+/// Progress reported from one batched greedy decode token step.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BatchedGreedyDecodeProgress {
+    pub phase: BatchedGreedyDecodePhase,
+    pub token_index: usize,
+    pub decode_limit: usize,
+    pub batch_size: usize,
+    pub active_items: usize,
+    pub decoder_layer_index: Option<usize>,
+    pub decoder_layer_total: Option<usize>,
+    pub elapsed_ms: u128,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BatchedGreedyDecodePhase {
+    EncoderStart,
+    EncoderComplete,
+    DecoderLayer,
+    TokenComplete,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -858,8 +893,9 @@ impl LoadedWhisperGreedyDecoder {
             .model
             .encoder
             .forward(features_to_tensor(features, &self.device));
+        let encoder_elapsed_ms = encoder_started_at.elapsed().as_millis();
         let encoder_output_dims = encoder_output.dims();
-        tracing::debug!(elapsed_ms = encoder_started_at.elapsed().as_millis(), encoder_output_dims = ?encoder_output_dims, "Finished Burn Whisper encoder forward pass");
+        tracing::debug!(elapsed_ms = encoder_elapsed_ms, encoder_output_dims = ?encoder_output_dims, "Finished Burn Whisper encoder forward pass");
 
         let remaining_ctx = self
             .model
@@ -879,6 +915,7 @@ impl LoadedWhisperGreedyDecoder {
             remaining_ctx,
             "Starting Burn Whisper greedy token loop"
         );
+        let decoder_started_at = Instant::now();
         for token_index in 0..decode_limit {
             let token_started_at = Instant::now();
             tracing::debug!(
@@ -910,19 +947,217 @@ impl LoadedWhisperGreedyDecoder {
                 break;
             }
         }
+        let decoder_elapsed_ms = decoder_started_at.elapsed().as_millis();
 
         let text = decode_token_ids(&self.artifacts, &generated_token_ids, true)?;
-        tracing::debug!(elapsed_ms = total_started_at.elapsed().as_millis(), generated_tokens = generated_token_ids.len(), stop_reason = ?stop_reason, text = %text, "Finished Burn Whisper greedy decode");
+        let total_elapsed_ms = total_started_at.elapsed().as_millis();
+        tracing::debug!(elapsed_ms = total_elapsed_ms, encoder_elapsed_ms, decoder_elapsed_ms, generated_tokens = generated_token_ids.len(), stop_reason = ?stop_reason, text = %text, "Finished Burn Whisper greedy decode");
 
         Ok(GreedyDecodeSummary {
             prompt_token_ids: self.prompt_token_ids.clone(),
             generated_token_ids,
             encoder_output_dims,
             last_decoder_logits_dims,
+            total_elapsed_ms,
+            encoder_elapsed_ms,
+            decoder_elapsed_ms,
             terminated_on_end_of_text,
             stop_reason,
             text,
         })
+    }
+
+    pub fn decoder_layer_count(&self) -> usize {
+        self.model.decoder.blocks.len()
+    }
+
+    pub fn decode_limit(&self) -> usize {
+        let remaining_ctx = self
+            .model
+            .decoder
+            .n_text_ctx
+            .saturating_sub(self.prompt_token_ids.len());
+        self.max_decode_tokens.min(remaining_ctx)
+    }
+
+    /// Decode a batch of Whisper feature tensors with one loaded model.
+    ///
+    /// This is still greedy full-prefix decoding, but it uses one batched encoder/decoder graph
+    /// per token step instead of loading or invoking one model per audio chunk.
+    ///
+    /// # Errors
+    ///
+    /// This function will return an error if the batch is empty, feature shapes differ, Burn
+    /// inference fails, or tokenizer decoding fails.
+    pub fn decode_batch(
+        &self,
+        features: &[WhisperLogMelSpectrogram],
+    ) -> eyre::Result<Vec<GreedyDecodeSummary>> {
+        self.decode_batch_with_progress(features, |_| {})
+    }
+
+    /// Decode a batch and report progress after each greedy token step.
+    ///
+    /// # Errors
+    ///
+    /// This function will return an error if the batch is empty, feature shapes differ, Burn
+    /// inference fails, or tokenizer decoding fails.
+    pub fn decode_batch_with_progress(
+        &self,
+        features: &[WhisperLogMelSpectrogram],
+        mut on_progress: impl FnMut(BatchedGreedyDecodeProgress),
+    ) -> eyre::Result<Vec<GreedyDecodeSummary>> {
+        // audio[impl cli.transcribe-batched-chunks]
+        if features.is_empty() {
+            bail!("Batched greedy decode requires at least one feature tensor");
+        }
+
+        let total_started_at = Instant::now();
+        tracing::debug!(batch_size = features.len(), prompt_tokens = ?self.prompt_token_ids, suppressed_tokens = self.suppressed_token_ids.len(), "Starting batched Burn Whisper encoder forward pass");
+        let batch_size = features.len();
+        let decode_limit = self.decode_limit();
+        on_progress(BatchedGreedyDecodeProgress {
+            phase: BatchedGreedyDecodePhase::EncoderStart,
+            token_index: 0,
+            decode_limit,
+            batch_size,
+            active_items: batch_size,
+            decoder_layer_index: None,
+            decoder_layer_total: None,
+            elapsed_ms: 0,
+        });
+        let encoder_started_at = Instant::now();
+        let encoder_output = self
+            .model
+            .encoder
+            .forward(features_to_batch_tensor(features, &self.device)?);
+        let encoder_elapsed_ms = encoder_started_at.elapsed().as_millis();
+        let encoder_output_dims = encoder_output.dims();
+        tracing::debug!(elapsed_ms = encoder_elapsed_ms, encoder_output_dims = ?encoder_output_dims, "Finished batched Burn Whisper encoder forward pass");
+        on_progress(BatchedGreedyDecodeProgress {
+            phase: BatchedGreedyDecodePhase::EncoderComplete,
+            token_index: 0,
+            decode_limit,
+            batch_size,
+            active_items: batch_size,
+            decoder_layer_index: None,
+            decoder_layer_total: None,
+            elapsed_ms: total_started_at.elapsed().as_millis(),
+        });
+
+        let remaining_ctx = self
+            .model
+            .decoder
+            .n_text_ctx
+            .saturating_sub(self.prompt_token_ids.len());
+        let mut all_token_ids = vec![self.prompt_token_ids.clone(); batch_size];
+        let mut generated_token_ids = vec![Vec::new(); batch_size];
+        let mut terminated_on_end_of_text = vec![false; batch_size];
+        let mut stop_reasons = vec![DecodeStopReason::MaxDecodeTokens; batch_size];
+        let mut active = vec![true; batch_size];
+        let mut active_count = batch_size;
+        let mut last_decoder_logits_dims = [
+            batch_size,
+            self.prompt_token_ids.len(),
+            self.model.decoder.n_vocab,
+        ];
+
+        tracing::debug!(
+            batch_size,
+            decode_limit,
+            remaining_ctx,
+            "Starting batched Burn Whisper greedy token loop"
+        );
+        let decoder_started_at = Instant::now();
+        for token_index in 0..decode_limit {
+            if active_count == 0 {
+                break;
+            }
+            let token_started_at = Instant::now();
+            let decoder_logits = self.model.decoder.forward_with_layer_progress(
+                token_id_rows_to_tensor(&all_token_ids, &self.device)?,
+                encoder_output.clone(),
+                |decoder_layer_index, decoder_layer_total| {
+                    on_progress(BatchedGreedyDecodeProgress {
+                        phase: BatchedGreedyDecodePhase::DecoderLayer,
+                        token_index: token_index + 1,
+                        decode_limit,
+                        batch_size,
+                        active_items: active_count,
+                        decoder_layer_index: Some(decoder_layer_index),
+                        decoder_layer_total: Some(decoder_layer_total),
+                        elapsed_ms: decoder_started_at.elapsed().as_millis(),
+                    });
+                },
+            );
+            last_decoder_logits_dims = decoder_logits.dims();
+            let next_token_ids =
+                greedy_next_token_ids(&decoder_logits, &self.suppressed_token_ids)?;
+            tracing::debug!(token_index, elapsed_ms = token_started_at.elapsed().as_millis(), decoder_logits_dims = ?last_decoder_logits_dims, "Finished batched Burn Whisper decoder token step");
+
+            for (item_index, next_token_id) in next_token_ids.into_iter().enumerate() {
+                if !active[item_index] {
+                    all_token_ids[item_index].push(self.end_of_text);
+                    continue;
+                }
+
+                if next_token_id == self.end_of_text {
+                    terminated_on_end_of_text[item_index] = true;
+                    stop_reasons[item_index] = DecodeStopReason::EndOfText;
+                    active[item_index] = false;
+                    active_count = active_count.saturating_sub(1);
+                    all_token_ids[item_index].push(next_token_id);
+                    continue;
+                }
+
+                all_token_ids[item_index].push(next_token_id);
+                generated_token_ids[item_index].push(next_token_id);
+
+                if has_repeated_token_collapse(
+                    &generated_token_ids[item_index],
+                    RUST_ONLY_REPEAT_TOKEN_LIMIT,
+                ) {
+                    stop_reasons[item_index] = DecodeStopReason::RepeatedTokenCollapse;
+                    active[item_index] = false;
+                    active_count = active_count.saturating_sub(1);
+                }
+            }
+            on_progress(BatchedGreedyDecodeProgress {
+                phase: BatchedGreedyDecodePhase::TokenComplete,
+                token_index: token_index + 1,
+                decode_limit,
+                batch_size,
+                active_items: active_count,
+                decoder_layer_index: None,
+                decoder_layer_total: None,
+                elapsed_ms: decoder_started_at.elapsed().as_millis(),
+            });
+        }
+        let decoder_elapsed_ms = decoder_started_at.elapsed().as_millis();
+        let total_elapsed_ms = total_started_at.elapsed().as_millis();
+
+        generated_token_ids
+            .into_iter()
+            .zip(terminated_on_end_of_text)
+            .zip(stop_reasons)
+            .map(
+                |((generated_token_ids, terminated_on_end_of_text), stop_reason)| {
+                    let text = decode_token_ids(&self.artifacts, &generated_token_ids, true)?;
+                    Ok(GreedyDecodeSummary {
+                        prompt_token_ids: self.prompt_token_ids.clone(),
+                        generated_token_ids,
+                        encoder_output_dims,
+                        last_decoder_logits_dims,
+                        total_elapsed_ms,
+                        encoder_elapsed_ms,
+                        decoder_elapsed_ms,
+                        terminated_on_end_of_text,
+                        stop_reason,
+                        text,
+                    })
+                },
+            )
+            .collect()
     }
 }
 
@@ -1453,6 +1688,32 @@ fn features_to_tensor<B: Backend>(
     )
 }
 
+fn features_to_batch_tensor<B: Backend>(
+    features: &[WhisperLogMelSpectrogram],
+    device: &B::Device,
+) -> eyre::Result<Tensor<B, 3>> {
+    let Some(first) = features.first() else {
+        bail!("Batched feature tensor requires at least one item");
+    };
+    let mut values = Vec::with_capacity(features.len() * first.values.len());
+    for feature in features {
+        if feature.n_mels != first.n_mels || feature.n_frames != first.n_frames {
+            bail!(
+                "Batched feature tensor expected uniform shape {}x{} but found {}x{}",
+                first.n_mels,
+                first.n_frames,
+                feature.n_mels,
+                feature.n_frames
+            );
+        }
+        values.extend_from_slice(&feature.values);
+    }
+    Ok(Tensor::<B, 3>::from_data(
+        TensorData::new(values, [features.len(), first.n_mels, first.n_frames]),
+        device,
+    ))
+}
+
 fn token_ids_to_tensor<B: Backend>(token_ids: &[usize], device: &B::Device) -> Tensor<B, 2, Int> {
     Tensor::<B, 2, Int>::from_data(
         TensorData::new(
@@ -1464,6 +1725,34 @@ fn token_ids_to_tensor<B: Backend>(token_ids: &[usize], device: &B::Device) -> T
         ),
         device,
     )
+}
+
+fn token_id_rows_to_tensor<B: Backend>(
+    token_rows: &[Vec<usize>],
+    device: &B::Device,
+) -> eyre::Result<Tensor<B, 2, Int>> {
+    let Some(first) = token_rows.first() else {
+        bail!("Batched token tensor requires at least one row");
+    };
+    let seq_len = first.len();
+    let mut values = Vec::with_capacity(token_rows.len() * seq_len);
+    for row in token_rows {
+        if row.len() != seq_len {
+            bail!(
+                "Batched token tensor expected uniform sequence length {} but found {}",
+                seq_len,
+                row.len()
+            );
+        }
+        values.extend(
+            row.iter()
+                .map(|token_id| i64::try_from(*token_id).unwrap_or(i64::MAX)),
+        );
+    }
+    Ok(Tensor::<B, 2, Int>::from_data(
+        TensorData::new(values, [token_rows.len(), seq_len]),
+        device,
+    ))
 }
 
 fn greedy_next_token_id<B: Backend>(
@@ -1499,6 +1788,40 @@ fn greedy_next_token_id<B: Backend>(
         .max_by(|(_, left), (_, right)| left.total_cmp(right))
         .ok_or_else(|| eyre::eyre!("Decoder logits did not contain a final timestep"))?;
     Ok(token_id)
+}
+
+fn greedy_next_token_ids<B: Backend>(
+    logits: &Tensor<B, 3>,
+    suppressed_token_ids: &[usize],
+) -> eyre::Result<Vec<usize>> {
+    let [batch_size, seq_len, vocab_size] = logits.dims();
+    if batch_size == 0 || seq_len == 0 || vocab_size == 0 {
+        bail!(
+            "Batched greedy decode expected non-empty logits but found batch {}, sequence length {}, and vocab size {}",
+            batch_size,
+            seq_len,
+            vocab_size
+        );
+    }
+
+    let values = logits
+        .to_data()
+        .to_vec::<f32>()
+        .map_err(|error| eyre::eyre!("Failed to read batched decoder logits: {:?}", error))?;
+    (0..batch_size)
+        .map(|batch_index| {
+            let last_step_offset = (batch_index * seq_len + (seq_len - 1)) * vocab_size;
+            let last_step = &values[last_step_offset..last_step_offset + vocab_size];
+            let (token_id, _value) = last_step
+                .iter()
+                .copied()
+                .enumerate()
+                .filter(|(token_id, _)| !suppressed_token_ids.contains(token_id))
+                .max_by(|(_, left), (_, right)| left.total_cmp(right))
+                .ok_or_else(|| eyre::eyre!("Decoder logits did not contain a final timestep"))?;
+            Ok(token_id)
+        })
+        .collect()
 }
 
 fn top_logit_ids(

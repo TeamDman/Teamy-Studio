@@ -37,6 +37,39 @@ The `audio` command group must expose a `transcribe` subcommand that accepts a W
 audio[cli.transcribe-demo]
 The `audio transcribe` command must expose a demo mode that finds a local VCTK WAV clip and matching transcript text, prepares the audio if needed, runs the Burn transcription path, and emits the transcript text on stdout.
 
+audio[cli.transcribe-long-input-chunks]
+The `audio transcribe` command must process long inputs as a sequence of Whisper-sized chunks rather than silently trimming transcription to the first chunk.
+
+audio[cli.transcribe-speech-aware-chunks]
+The `audio transcribe` command should prefer quiet audio boundaries near the Whisper window limit so long-input chunks are less likely to split active speech mid-word.
+
+audio[cli.transcribe-progress-tracing]
+The `audio transcribe` command must emit progress, probe, and throughput diagnostics through tracing so redirected stdout contains transcript text only.
+
+audio[cli.transcribe-unified-progress]
+The `audio transcribe` command must report long-input progress through one overall progress structure rather than separate batch and chunk metric streams.
+
+audio[cli.transcribe-estimated-decode-work-progress]
+The `audio transcribe` command must use a simplified estimated decode-work progress report for batched long-input transcription, including batch position, total work units, remaining work units, percent complete, work-unit throughput, countdown, clock ETA, and GPU memory rather than byte, audio-second, or per-item throughput.
+
+audio[cli.transcribe-streaming-stdout]
+The `audio transcribe` command must stream completed transcript chunks to stdout in input order as soon as all preceding chunks are available.
+
+audio[cli.transcribe-stage-timing]
+The `audio transcribe` command must expose chunk-level stage timing diagnostics for frontend feature extraction, encoder execution, decoder token generation, and generated-token throughput.
+
+audio[cli.transcribe-decode-workers]
+The `audio transcribe` command must be able to process independent demo samples and long-input chunks with a bounded number of decode workers while preserving transcript output order.
+
+audio[cli.transcribe-vram-aware-workers]
+When `audio transcribe` chooses a decode worker count automatically, it must use available GPU memory and the selected Whisper model size instead of a fixed worker cap.
+
+audio[cli.transcribe-batched-chunks]
+The `audio transcribe` command must be able to submit multiple long-input chunks through one loaded Burn Whisper model as bounded tensor batches while preserving ordered transcript and timing output.
+
+audio[cli.transcribe-timing-jsonl]
+The `audio transcribe` command must be able to write ordered per-chunk timing diagnostics as JSON Lines to a user-selected file without mixing benchmark data into transcript stdout.
+
 ## Python Transcription Boundary
 
 audio[python.daemon-project]
