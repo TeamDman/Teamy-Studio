@@ -1,5 +1,6 @@
 use crate::cli::audio::daemon::AudioDaemonArgs;
 use crate::cli::audio::input_device::AudioInputDeviceArgs;
+use crate::cli::audio::transcribe::AudioTranscribeArgs;
 use crate::cli::output::CliOutput;
 use arbitrary::Arbitrary;
 use facet::Facet;
@@ -24,6 +25,9 @@ pub enum AudioCommand {
     // audio[impl cli.input-device-command]
     /// Enumerate and inspect audio input devices.
     InputDevice(AudioInputDeviceArgs),
+    // audio[impl cli.transcribe-command]
+    /// Transcribe a 16 kHz mono PCM WAV file with the Burn Whisper backend.
+    Transcribe(AudioTranscribeArgs),
 }
 
 impl AudioArgs {
@@ -38,6 +42,7 @@ impl AudioArgs {
         match self.command {
             AudioCommand::Daemon(args) => args.invoke(app_home, cache_home),
             AudioCommand::InputDevice(args) => args.invoke(app_home, cache_home),
+            AudioCommand::Transcribe(args) => args.invoke(app_home, cache_home),
         }
     }
 }

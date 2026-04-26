@@ -19,6 +19,9 @@ The `audio` command group must expose a `daemon` subcommand group for the local 
 audio[cli.daemon-status]
 The `audio daemon` command group must expose a `status` subcommand that reports the resolved Python daemon source, cache paths, and tensor handoff contract.
 
+audio[cli.transcribe-command]
+The `audio` command group must expose a `transcribe` subcommand that accepts a WAV path, runs the Rust Burn Whisper transcription path with either a registered default model directory or an explicit converted model directory, and emits the transcript text on stdout.
+
 ## Python Transcription Boundary
 
 audio[python.daemon-project]
