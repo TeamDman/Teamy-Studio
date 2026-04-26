@@ -3,7 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 import mmap
-import os
 import time
 from typing import Callable
 
@@ -256,6 +255,39 @@ def _torch_device() -> str:
     except ImportError:
         return "cpu"
     return "cuda" if torch.cuda.is_available() else "cpu"
+
+
+def cuda_check_report() -> dict[str, object]:
+    try:
+        import torch
+    except ImportError as exc:
+        return {
+            "ok": False,
+            "torch_imported": False,
+            "cuda_available": False,
+            "error": str(exc),
+        }
+    cuda_available = bool(torch.cuda.is_available())
+    device_count = int(torch.cuda.device_count()) if cuda_available else 0
+    devices = []
+    for index in range(device_count):
+        devices.append(
+            {
+                "index": index,
+                "name": torch.cuda.get_device_name(index),
+                "capability": ".".join(map(str, torch.cuda.get_device_capability(index))),
+            }
+        )
+    return {
+        "ok": cuda_available,
+        "torch_imported": True,
+        "torch_version": getattr(torch, "__version__", "unknown"),
+        "cuda_available": cuda_available,
+        "cuda_version": getattr(torch.version, "cuda", None),
+        "device_count": device_count,
+        "devices": devices,
+        "error": None if cuda_available else "torch.cuda.is_available() returned False",
+    }
 
 
 def _transcribe_with_whisperx(audio: object, model_name: str) -> str:

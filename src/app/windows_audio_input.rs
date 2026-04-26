@@ -34,6 +34,7 @@ use windows::core::{GUID, PCWSTR};
 use super::audio_transcription::{
     AudioTranscriptionControlResult, AudioTranscriptionSharedMemorySlotPool,
     audio_transcription_run_python_transcription_request_once_from_samples,
+    audio_transcription_selected_model_name,
 };
 use crate::win32_support::string::EasyPCWSTR;
 
@@ -59,7 +60,8 @@ const PLAYBACK_SELECTION_TOLERANCE_PX: i32 = 2;
 const PLAYBACK_STOP_FLAGS: SND_FLAGS = SND_FLAGS(0);
 const TRANSCRIPTION_PREVIEW_COLUMNS: usize = 72;
 const TRANSCRIPTION_PREVIEW_BINS: usize = 18;
-const TRANSCRIPTION_PREVIEW_RECOMPUTE_INTERVAL: Duration = Duration::from_millis(90);
+const TRANSCRIPTION_PREVIEW_RECOMPUTE_INTERVAL: Duration = Duration::from_millis(250);
+const TRANSCRIPTION_PREVIEW_MAX_SAMPLES_PER_CELL: usize = 12;
 
 #[derive(Clone, Debug, Facet, PartialEq, Eq)]
 pub struct AudioInputDeviceSummary {
@@ -185,16 +187,17 @@ impl AudioInputDeviceWindowState {
         self.transcription_worker.request_in_flight = true;
         let flush_requested = self.transcription_worker.flush_requested;
         self.transcription_worker.flush_requested = false;
+        let selected_model = audio_transcription_selected_model_name();
         self.runtime.transcription.last_sent_reason = Some(if flush_requested {
-            format!("manual flush sent request {request_id}")
+            format!("manual flush sent request {request_id} with {selected_model}")
         } else {
-            format!("preview chunk sent request {request_id}")
+            format!("preview chunk sent request {request_id} with {selected_model}")
         });
-        let (sender, receiver) = mpsc::channel();
-        self.transcription_worker.result_receiver = Some(receiver);
-        let chunk_seconds = self.runtime.transcription.chunk_seconds;
-        let energy = self.runtime.transcription.energy_rms;
         let (chunk_samples, sample_rate_hz) = self.runtime.transcription_chunk_samples();
+        self.transcription_worker.sent_chunk_end_seconds = Some(
+            self.runtime.transcription_head_seconds
+                + seconds_from_samples(chunk_samples.len(), sample_rate_hz).get::<second>(),
+        );
         if !flush_requested
             && chunk_samples.len() < usize::try_from(sample_rate_hz / 2).unwrap_or(0)
         {
@@ -203,12 +206,11 @@ impl AudioInputDeviceWindowState {
                 Some("waiting for audio chunk".to_owned());
             return;
         }
+        let (sender, receiver) = mpsc::channel();
+        self.transcription_worker.result_receiver = Some(receiver);
         let _ = thread::Builder::new()
             .name("teamy-studio-transcription".to_owned())
             .spawn(move || {
-                let _ = flush_requested;
-                let _ = chunk_seconds;
-                let _ = energy;
                 let result =
                     audio_transcription_run_python_transcription_request_once_from_samples(
                         request_id,
@@ -229,6 +231,14 @@ impl AudioInputDeviceWindowState {
                 self.transcription_worker.request_in_flight = false;
                 self.transcription_worker.debug_request_completed = true;
                 self.runtime.transcription.last_completed_request_id = Some(result.request_id);
+                // audio[impl transcription.head-progress]
+                if result.ok
+                    && let Some(chunk_end_seconds) =
+                        self.transcription_worker.sent_chunk_end_seconds.take()
+                {
+                    self.runtime.transcription_head_seconds =
+                        clamp_head_seconds(chunk_end_seconds, self.runtime.duration_seconds());
+                }
                 if self.runtime.transcription.enabled {
                     if result.ok {
                         self.runtime
@@ -249,6 +259,7 @@ impl AudioInputDeviceWindowState {
             Ok(Err(error)) => {
                 self.transcription_worker.request_in_flight = false;
                 self.transcription_worker.debug_request_completed = true;
+                self.transcription_worker.sent_chunk_end_seconds = None;
                 self.runtime.transcription.last_error = Some(error.clone());
                 if self.runtime.transcription.enabled {
                     self.runtime
@@ -262,6 +273,7 @@ impl AudioInputDeviceWindowState {
             Err(TryRecvError::Disconnected) => {
                 self.transcription_worker.request_in_flight = false;
                 self.transcription_worker.debug_request_completed = true;
+                self.transcription_worker.sent_chunk_end_seconds = None;
                 self.runtime.transcription.last_error =
                     Some("transcription path disconnected".to_owned());
                 if self.runtime.transcription.enabled {
@@ -632,6 +644,7 @@ struct AudioInputTranscriptionWorkerState {
     request_in_flight: bool,
     debug_request_completed: bool,
     flush_requested: bool,
+    sent_chunk_end_seconds: Option<f64>,
     result_receiver: Option<Receiver<Result<AudioTranscriptionControlResult, String>>>,
 }
 
@@ -642,6 +655,7 @@ impl Default for AudioInputTranscriptionWorkerState {
             request_in_flight: false,
             debug_request_completed: false,
             flush_requested: false,
+            sent_chunk_end_seconds: None,
             result_receiver: None,
         }
     }
@@ -654,6 +668,7 @@ impl std::fmt::Debug for AudioInputTranscriptionWorkerState {
             .field("request_in_flight", &self.request_in_flight)
             .field("debug_request_completed", &self.debug_request_completed)
             .field("flush_requested", &self.flush_requested)
+            .field("sent_chunk_end_seconds", &self.sent_chunk_end_seconds)
             .field("has_result_receiver", &self.result_receiver.is_some())
             .finish()
     }
@@ -664,6 +679,7 @@ impl AudioInputTranscriptionWorkerState {
         self.request_in_flight = false;
         self.debug_request_completed = false;
         self.flush_requested = false;
+        self.sent_chunk_end_seconds = None;
         self.result_receiver = None;
     }
 }
@@ -689,44 +705,50 @@ impl AudioInputRuntimeState {
         if !self.transcription.enabled {
             return;
         }
-        let Ok(buffer) = self.shared.lock() else {
-            return;
+        let (lookahead, sample_rate_hz, cache_key) = {
+            let Ok(buffer) = self.shared.lock() else {
+                return;
+            };
+            let head_millis = seconds_to_millis(self.transcription_head_seconds);
+            let cache_key = AudioInputMelSpectrogramPreviewCacheKey {
+                sample_count: buffer.samples.len(),
+                sample_rate_hz: buffer.sample_rate_hz,
+                head_millis,
+                columns: TRANSCRIPTION_PREVIEW_COLUMNS,
+                bins: TRANSCRIPTION_PREVIEW_BINS,
+            };
+            if self.transcription.preview.cache_key == cache_key {
+                return;
+            }
+            if self.transcription.preview.cache_key.sample_rate_hz == cache_key.sample_rate_hz
+                && self.transcription.preview.cache_key.head_millis == cache_key.head_millis
+                && self.transcription.preview.cache_key.columns == cache_key.columns
+                && self.transcription.preview.cache_key.bins == cache_key.bins
+                && self
+                    .transcription
+                    .preview_last_updated_at
+                    .is_some_and(|updated_at| {
+                        updated_at.elapsed() < TRANSCRIPTION_PREVIEW_RECOMPUTE_INTERVAL
+                    })
+            {
+                return;
+            }
+            let start_index = sample_index_from_seconds(
+                self.transcription_head_seconds,
+                buffer.sample_rate_hz,
+                buffer.samples.len(),
+            );
+            (
+                buffer.samples[start_index..].to_vec(),
+                buffer.sample_rate_hz,
+                cache_key,
+            )
         };
-        let head_millis = seconds_to_millis(self.transcription_head_seconds);
-        let cache_key = AudioInputMelSpectrogramPreviewCacheKey {
-            sample_count: buffer.samples.len(),
-            sample_rate_hz: buffer.sample_rate_hz,
-            head_millis,
-            columns: TRANSCRIPTION_PREVIEW_COLUMNS,
-            bins: TRANSCRIPTION_PREVIEW_BINS,
-        };
-        if self.transcription.preview.cache_key == cache_key {
-            return;
-        }
-        if self.transcription.preview.cache_key.sample_rate_hz == cache_key.sample_rate_hz
-            && self.transcription.preview.cache_key.head_millis == cache_key.head_millis
-            && self.transcription.preview.cache_key.columns == cache_key.columns
-            && self.transcription.preview.cache_key.bins == cache_key.bins
-            && self
-                .transcription
-                .preview_last_updated_at
-                .is_some_and(|updated_at| {
-                    updated_at.elapsed() < TRANSCRIPTION_PREVIEW_RECOMPUTE_INTERVAL
-                })
-        {
-            return;
-        }
-        let start_index = sample_index_from_seconds(
-            self.transcription_head_seconds,
-            buffer.sample_rate_hz,
-            buffer.samples.len(),
-        );
-        let lookahead = &buffer.samples[start_index..];
         self.transcription.chunk_seconds =
-            seconds_from_samples(lookahead.len(), buffer.sample_rate_hz).get::<second>();
-        self.transcription.energy_rms = audio_rms_energy(lookahead);
+            seconds_from_samples(lookahead.len(), sample_rate_hz).get::<second>();
+        self.transcription.energy_rms = audio_rms_energy(&lookahead);
         self.transcription.preview = build_mel_spectrogram_preview(
-            lookahead,
+            &lookahead,
             TRANSCRIPTION_PREVIEW_COLUMNS,
             TRANSCRIPTION_PREVIEW_BINS,
             cache_key,
@@ -872,8 +894,10 @@ fn build_mel_spectrogram_preview(
         let chunk = &samples[start..end];
         for bin in 0..bins {
             let mel_position = (bin + 1) as f32 / bins as f32;
+            let sample_stride = (chunk.len() / TRANSCRIPTION_PREVIEW_MAX_SAMPLES_PER_CELL).max(1);
             let folded_energy = chunk
                 .iter()
+                .step_by(sample_stride)
                 .enumerate()
                 .map(|(index, sample)| {
                     let phase = (index as f32 * (bin + 1) as f32 * 0.071).sin().abs();
@@ -1980,6 +2004,45 @@ mod tests {
             state.runtime.transcription.staged_text,
             "hello from the pipe"
         );
+    }
+
+    #[test]
+    // audio[verify transcription.head-progress]
+    fn successful_transcription_result_advances_transcription_head() {
+        use super::super::audio_transcription::{
+            AudioTranscriptionControlResult, WHISPER_CONTROL_PROTOCOL_VERSION,
+        };
+
+        let mut state = AudioInputDeviceWindowState::new(device("endpoint-id", "Studio Mic"));
+        state.runtime.transcription.enabled = true;
+        {
+            let mut buffer = state
+                .runtime
+                .shared
+                .lock()
+                .expect("shared buffer should lock");
+            buffer.sample_rate_hz = 10;
+            buffer.samples = vec![0.0; 30];
+        }
+        let (sender, receiver) = mpsc::channel();
+        sender
+            .send(Ok(AudioTranscriptionControlResult {
+                protocol_version: WHISPER_CONTROL_PROTOCOL_VERSION,
+                kind: "transcription-result".to_owned(),
+                request_id: 5,
+                slot_id: 0,
+                release_slot: true,
+                ok: true,
+                transcript_text: "done".to_owned(),
+                error: None,
+            }))
+            .expect("result should send");
+        state.transcription_worker.result_receiver = Some(receiver);
+        state.transcription_worker.sent_chunk_end_seconds = Some(1.7);
+
+        state.drain_debug_transcription_result();
+
+        assert_eq!(state.runtime.transcription_head_seconds, 1.7);
     }
 
     #[test]

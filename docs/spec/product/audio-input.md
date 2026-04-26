@@ -57,6 +57,15 @@ The microphone transcription preview must cache spectrogram intensity and energy
 audio[transcription.manual-flush]
 The microphone window must provide a manual flush control that sends the current transcription chunk without waiting for a future full-duration chunk boundary, and the UI must indicate chunk duration, energy, send state, and completed request id.
 
+audio[transcription.head-progress]
+When a transcription chunk completes successfully, the microphone window must advance the transcription head to the end of the submitted chunk so subsequent chunks start from unprocessed audio.
+
+audio[transcription.model-selection]
+The audio daemon window must expose the available Whisper transcription models, default to the largest listed model, and use the selected model for future transcription requests.
+
+audio[transcription.cuda-check]
+The audio daemon window must provide a CUDA check control that runs `torch.cuda.is_available()` through the managed Python daemon environment and shows the result in a user-visible message box.
+
 audio[transcription.shared-memory-pool-status]
 Rust must expose the initial shared-memory slot-pool sizing and live queue counters that the CLI and GUI can report before Python inference is started.
 

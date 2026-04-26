@@ -2,6 +2,7 @@ use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::process::Command;
 use std::ptr::NonNull;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use eyre::Context;
@@ -29,10 +30,51 @@ pub const WHISPER_DAEMON_SOURCE_PARENT_DIR: &str = "python";
 pub const WHISPER_DAEMON_SOURCE_DIR_NAME: &str = "whisperx-daemon";
 pub const WHISPER_SHARED_MEMORY_MINIMUM_SLOTS: usize = 3;
 pub const WHISPER_CONTROL_PROTOCOL_VERSION: u32 = 1;
+pub const WHISPER_TRANSCRIPTION_MODELS: [&str; 6] = [
+    "large-v3",
+    "large-v2",
+    "medium.en",
+    "small.en",
+    "base.en",
+    "tiny.en",
+];
+
+static SELECTED_WHISPER_MODEL_INDEX: AtomicUsize = AtomicUsize::new(0);
 
 #[must_use]
 pub fn audio_transcription_named_pipe_path(pipe_name: &str) -> String {
     format!(r"\\.\pipe\{pipe_name}")
+}
+
+#[must_use]
+// audio[impl transcription.model-selection]
+pub fn audio_transcription_available_model_names() -> Vec<String> {
+    WHISPER_TRANSCRIPTION_MODELS
+        .iter()
+        .map(|model| (*model).to_owned())
+        .collect()
+}
+
+#[must_use]
+// audio[impl transcription.model-selection]
+pub fn audio_transcription_selected_model_index() -> usize {
+    SELECTED_WHISPER_MODEL_INDEX
+        .load(Ordering::Acquire)
+        .min(WHISPER_TRANSCRIPTION_MODELS.len() - 1)
+}
+
+#[must_use]
+// audio[impl transcription.model-selection]
+pub fn audio_transcription_selected_model_name() -> String {
+    WHISPER_TRANSCRIPTION_MODELS[audio_transcription_selected_model_index()].to_owned()
+}
+
+// audio[impl transcription.model-selection]
+pub fn audio_transcription_select_model_index(index: usize) {
+    SELECTED_WHISPER_MODEL_INDEX.store(
+        index.min(WHISPER_TRANSCRIPTION_MODELS.len() - 1),
+        Ordering::Release,
+    );
 }
 
 #[must_use]
@@ -210,6 +252,8 @@ pub struct AudioTranscriptionDaemonStatusReport {
     pub control_transport: String,
     pub payload_transport: String,
     pub python_entrypoint: String,
+    pub selected_model: String,
+    pub available_models: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -516,7 +560,7 @@ pub fn audio_transcription_run_python_transcription_request_once_from_samples(
         .arg("--validate-shared-memory-slot")
         .arg("--transcribe-shared-memory-slot")
         .arg("--model")
-        .arg(std::env::var("TEAMY_WHISPER_MODEL").unwrap_or_else(|_| "small.en".to_owned()))
+        .arg(audio_transcription_selected_model_name())
         .current_dir(&daemon_source_dir)
         .spawn()
         .wrap_err("failed to launch transcription daemon through uv")?;
@@ -530,6 +574,40 @@ pub fn audio_transcription_run_python_transcription_request_once_from_samples(
         eyre::bail!("transcription daemon exited with {child_status}");
     }
     Ok(result)
+}
+
+/// # Errors
+///
+/// Returns an error if the Python daemon cannot be launched or the CUDA check exits with failure.
+// audio[impl transcription.cuda-check]
+pub fn audio_transcription_run_python_cuda_check() -> eyre::Result<String> {
+    let daemon_source_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join(WHISPER_DAEMON_SOURCE_PARENT_DIR)
+        .join(WHISPER_DAEMON_SOURCE_DIR_NAME);
+    let output = Command::new("uv")
+        .arg("run")
+        .arg("--no-project")
+        .arg("--with")
+        .arg("torch")
+        .arg("--with")
+        .arg("numpy")
+        .arg("python")
+        .arg("-m")
+        .arg("teamy_whisperx_daemon")
+        .arg("--cuda-check")
+        .current_dir(&daemon_source_dir)
+        .output()
+        .wrap_err("failed to launch CUDA check through uv")?;
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+    if !output.status.success() {
+        eyre::bail!("CUDA check exited with {}\n{}", output.status, stderr);
+    }
+    Ok(if stderr.is_empty() {
+        stdout
+    } else {
+        format!("{stdout}\n\n{stderr}")
+    })
 }
 
 #[derive(Debug)]
@@ -778,6 +856,8 @@ pub fn audio_transcription_daemon_status_with_pool_status(
         control_transport: "windows named pipe".to_owned(),
         payload_transport: "rust-owned shared-memory slot".to_owned(),
         python_entrypoint: "teamy_whisperx_daemon".to_owned(),
+        selected_model: audio_transcription_selected_model_name(),
+        available_models: audio_transcription_available_model_names(),
     }
 }
 

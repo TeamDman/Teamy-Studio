@@ -57,8 +57,9 @@ The guiding idea from the source note is that Teamy Studio should not merely mim
   - Added cached spectrogram/energy preview state plus a manual transcription chunk flush control, making the chunk/send feedback visible before real WhisperX inference lands.
   - Replaced the debug transcription worker's all-zero placeholder payload with a Rust-prepared 80 x 3000 handoff tensor derived from recorded microphone samples ahead of the transcription head.
   - Added the first real speech-to-text path: the mic window sends captured audio chunks to Python as 16 kHz mono `f32` shared-memory payloads, Python runs Whisper through the managed `uv` environment, and returned text is staged in the transcript island.
+  - Added model-selection and CUDA-check controls to the audio-daemon window, and smoothed transcription preview refresh work so focused frames spend less time in preview cache rebuilds.
 - Current focus:
-  - Use the microphone timeline, shared-memory slot pool, named-pipe Python handoff, and daemon dashboard as the first real proving ground for keeping the transcription model hot across repeated chunks.
+  - Use the microphone timeline, shared-memory slot pool, named-pipe Python handoff, and daemon dashboard as the first real proving ground for keeping the selected transcription model hot across repeated chunks.
 - Remaining work:
   - Add Tracey requirements for each new behavior area before implementation lands.
   - Add shallow launcher stubs for the new surfaces.

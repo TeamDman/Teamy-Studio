@@ -58,8 +58,10 @@ The product rule is simple: dictated text must never be sprayed into whichever e
   - Replaced the all-zero placeholder handoff in the debug transcription worker with a Rust-prepared fixed 80 x 3000 handoff tensor derived from the recorded microphone samples ahead of the transcription head.
   - Added a real one-shot transcription lane: Rust resamples the current microphone chunk to 16 kHz mono `f32`, sends it through a Rust-owned shared-memory slot as `transcribe-audio-f32`, launches the Python daemon through `uv run --no-project --with numpy --with openai-whisper`, and stages Whisper transcript results in the microphone transcript island.
   - Prewarmed the managed `uv` transcription environment and `small.en` model on 2026-04-26, then verified the shared-memory Python path against the local VCTK `p230_397.wav` sample. The daemon returned `Is there a waiting list?` for the expected `Is there a waiting list ?` transcript.
+  - Reduced transcription-preview stutter by shortening the shared-buffer lock scope, throttling preview refreshes more aggressively, and capping pseudo-spectrogram sampling per display cell. Successful transcription results now advance the transcription head to the end of the submitted chunk.
+  - Added audio-daemon window controls for model selection, defaulting to `large-v3`, and a `CUDA Check` button that runs `torch.cuda.is_available()` through the managed Python daemon environment and shows the JSON result in a message box.
 - Current focus:
-  - Continue from working one-shot Whisper transcription toward a longer-lived daemon loop and eventual WhisperX-specific inference.
+  - Continue from working one-shot Whisper transcription with selectable models toward a longer-lived daemon loop and eventual WhisperX-specific inference.
 - Remaining work:
   - Harden the first capture/playback path after more real-hardware smoke testing, especially for loopback latency, render-format mismatches, and longer recordings.
   - Replace the current mel-preview visualization with the same log-mel feature data that will be sent to Python.
@@ -67,7 +69,7 @@ The product rule is simple: dictated text must never be sprayed into whichever e
   - Add the Teamy-owned Python WhisperX daemon project setup/doctor path for CUDA/model readiness.
   - Feed returned transcript chunks into the hosted transcript island without sending them to the OS focus target.
 - Next step:
-  - Keep the Python daemon process alive across transcription requests so the model is not reloaded for every manual flush, then add a full `audio daemon doctor` path for environment/model readiness.
+  - Keep the Python daemon process alive across transcription requests so the selected model is not reloaded for every manual flush, then add a full `audio daemon doctor` path for environment/model readiness.
 
 ## Why This Slice
 

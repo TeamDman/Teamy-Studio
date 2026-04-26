@@ -412,6 +412,8 @@ enum ScenePressedTarget {
     AudioInputDeviceArm,
     AudioInputTranscription,
     AudioInputTranscriptionFlush,
+    AudioDaemonCudaCheck,
+    AudioDaemonModel(usize),
     AudioInputPlayback,
     AudioInputDeviceLoopback,
     AudioInputTimelineHead(AudioInputTimelineHeadKind),
@@ -979,6 +981,8 @@ enum ScenePointerAction {
     ToggleAudioInputRecording,
     ToggleAudioInputTranscription,
     FlushAudioInputTranscription,
+    RunAudioDaemonCudaCheck,
+    SelectAudioDaemonModel(usize),
     ToggleAudioInputPlayback,
     ToggleAudioInputLoopback,
     BeginAudioInputTimeline,
@@ -2687,6 +2691,20 @@ fn handle_scene_left_button_down(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Re
             return Ok(ScenePointerAction::ChooseAudioInputDevice(index));
         }
 
+        if let Some(index) = audio_daemon_model_at_point(state, layout, point) {
+            state.pending_diagnostic_selection = None;
+            state.pressed_target = Some(ScenePressedTarget::AudioDaemonModel(index));
+            hwnd.capture_mouse();
+            return Ok(ScenePointerAction::SelectAudioDaemonModel(index));
+        }
+
+        if audio_daemon_cuda_check_button_at_point(state, layout, point) {
+            state.pending_diagnostic_selection = None;
+            state.pressed_target = Some(ScenePressedTarget::AudioDaemonCudaCheck);
+            hwnd.capture_mouse();
+            return Ok(ScenePointerAction::RunAudioDaemonCudaCheck);
+        }
+
         if audio_input_device_arm_button_at_point(state, layout, point) {
             state.pending_diagnostic_selection = None;
             state.pressed_target = Some(ScenePressedTarget::AudioInputDeviceArm);
@@ -2824,6 +2842,16 @@ fn handle_scene_left_button_down(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Re
                 }
                 render_scene_window_frame(state, hwnd, None, false)
             })?;
+            Ok(true)
+        }
+        ScenePointerAction::SelectAudioDaemonModel(index) => {
+            super::audio_transcription_select_model_index(index);
+            with_scene_app_state(|state| render_scene_window_frame(state, hwnd, None, false))?;
+            Ok(true)
+        }
+        ScenePointerAction::RunAudioDaemonCudaCheck => {
+            show_audio_daemon_cuda_check_result();
+            with_scene_app_state(|state| render_scene_window_frame(state, hwnd, None, false))?;
             Ok(true)
         }
         ScenePointerAction::ToggleAudioInputPlayback => {
@@ -2993,6 +3021,16 @@ fn handle_scene_left_button_up(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Resu
                 }
                 render_scene_window_frame(state, hwnd, None, false)
             })?;
+            Ok(true)
+        }
+        ScenePointerAction::SelectAudioDaemonModel(index) => {
+            super::audio_transcription_select_model_index(index);
+            with_scene_app_state(|state| render_scene_window_frame(state, hwnd, None, false))?;
+            Ok(true)
+        }
+        ScenePointerAction::RunAudioDaemonCudaCheck => {
+            show_audio_daemon_cuda_check_result();
+            with_scene_app_state(|state| render_scene_window_frame(state, hwnd, None, false))?;
             Ok(true)
         }
         ScenePointerAction::ToggleAudioInputPlayback => {
@@ -3903,6 +3941,7 @@ fn render_scene_window_frame(
             layout,
             window_chrome_buttons_state,
             &daemon_status,
+            audio_daemon_visual_state(state, layout),
         )
     } else if state.scene_kind == SceneWindowKind::CursorGallery {
         windows_scene::build_cursor_gallery_render_scene(
@@ -4069,6 +4108,24 @@ fn audio_input_device_detail_visual_state(
     }
 }
 
+fn audio_daemon_visual_state(
+    state: &SceneAppState,
+    layout: TerminalLayout,
+) -> windows_scene::AudioDaemonVisualState {
+    let Some(point) = state.pointer_position else {
+        return windows_scene::AudioDaemonVisualState::default();
+    };
+    windows_scene::AudioDaemonVisualState {
+        cuda_check_hovered: audio_daemon_cuda_check_button_at_point(state, layout, point),
+        cuda_check_pressed: state.pressed_target == Some(ScenePressedTarget::AudioDaemonCudaCheck),
+        hovered_model_index: audio_daemon_model_at_point(state, layout, point),
+        pressed_model_index: match state.pressed_target {
+            Some(ScenePressedTarget::AudioDaemonModel(index)) => Some(index),
+            _ => None,
+        },
+    }
+}
+
 fn scene_selected_text_for_copy(state: &SceneAppState, layout: TerminalLayout) -> Option<String> {
     let selection = state.diagnostic_selection?;
 
@@ -4227,6 +4284,10 @@ fn push_audio_daemon_diagnostic_text(lines: &mut Vec<String>) {
     lines.push(format!(
         "audio-daemon-payload-transport\t{}",
         daemon_status.payload_transport
+    ));
+    lines.push(format!(
+        "audio-daemon-selected-model\t{}",
+        daemon_status.selected_model
     ));
     lines.push(format!(
         "audio-daemon-tensor\t{}x{}\t{}\t{} bytes",
@@ -4393,6 +4454,10 @@ fn scene_interactive_region_contains(
             || (!state.diagnostics_visible
                 && audio_input_device_at_point(state, layout, point).is_some())
             || (!state.diagnostics_visible
+                && audio_daemon_model_at_point(state, layout, point).is_some())
+            || (!state.diagnostics_visible
+                && audio_daemon_cuda_check_button_at_point(state, layout, point))
+            || (!state.diagnostics_visible
                 && audio_input_device_arm_button_at_point(state, layout, point))
             || (!state.diagnostics_visible
                 && audio_input_device_transcription_button_at_point(state, layout, point))
@@ -4464,6 +4529,34 @@ fn audio_input_device_at_point(
         )
         .is_some_and(|row| row.row_rect.contains(point))
     })
+}
+
+fn audio_daemon_model_at_point(
+    state: &SceneAppState,
+    layout: TerminalLayout,
+    point: ClientPoint,
+) -> Option<usize> {
+    if state.scene_kind != SceneWindowKind::AudioDaemon || state.diagnostics_visible {
+        return None;
+    }
+    let body_rect = layout.terminal_panel_rect().inset(24);
+    let model_count = super::audio_transcription_available_model_names().len();
+    (0..model_count).find(|index| {
+        windows_scene::audio_daemon_model_button_rect(body_rect, *index, model_count)
+            .contains(point)
+    })
+}
+
+fn audio_daemon_cuda_check_button_at_point(
+    state: &SceneAppState,
+    layout: TerminalLayout,
+    point: ClientPoint,
+) -> bool {
+    if state.scene_kind != SceneWindowKind::AudioDaemon || state.diagnostics_visible {
+        return false;
+    }
+    let body_rect = layout.terminal_panel_rect().inset(24);
+    windows_scene::audio_daemon_cuda_check_button_rect(body_rect).contains(point)
 }
 
 fn audio_input_device_arm_button_at_point(
@@ -4602,6 +4695,20 @@ fn open_legacy_recording_devices_from_scene(hwnd: WindowHandle) {
         );
         hwnd.post_close();
     }
+}
+
+fn show_audio_daemon_cuda_check_result() {
+    // audio[impl transcription.cuda-check]
+    let description = match super::audio_transcription_run_python_cuda_check() {
+        Ok(report) => report,
+        Err(error) => format!("CUDA check failed to run: {error}"),
+    };
+    let _ = MessageDialog::new()
+        .set_level(MessageLevel::Info)
+        .set_title("CUDA Check")
+        .set_description(&description)
+        .set_buttons(MessageButtons::Ok)
+        .show();
 }
 
 fn open_audio_input_device_window_from_scene(
@@ -7211,6 +7318,8 @@ fn scene_cursor_for_point(
 
     if !state.diagnostics_visible
         && (legacy_recording_devices_button_at_point(state, layout, point)
+            || audio_daemon_model_at_point(state, layout, point).is_some()
+            || audio_daemon_cuda_check_button_at_point(state, layout, point)
             || audio_input_device_arm_button_at_point(state, layout, point)
             || audio_input_device_transcription_button_at_point(state, layout, point)
             || audio_input_device_transcription_flush_button_at_point(state, layout, point)

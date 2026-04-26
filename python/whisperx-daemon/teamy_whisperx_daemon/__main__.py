@@ -5,6 +5,7 @@ import json
 import sys
 
 from .protocol import (
+    cuda_check_report,
     debug_result_for_request,
     default_tensor_contract,
     encode_control_result_line,
@@ -62,9 +63,18 @@ def main(argv: list[str] | None = None) -> int:
         choices=("auto", "whisperx", "whisper"),
         help="transcription backend preference",
     )
+    parser.add_argument(
+        "--cuda-check",
+        action="store_true",
+        help="print torch.cuda.is_available diagnostics as JSON",
+    )
     args = parser.parse_args(argv)
 
     contract = default_tensor_contract()
+    if args.cuda_check:
+        print(json.dumps(cuda_check_report(), indent=2))
+        return 0
+
     if args.connect_pipe_once:
         run_debug_pipe_once(
             args.connect_pipe_once,

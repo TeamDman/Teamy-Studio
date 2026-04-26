@@ -142,6 +142,14 @@ pub struct AudioInputDeviceDetailVisualState {
     pub grabbed_head: Option<AudioInputTimelineHeadKind>,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AudioDaemonVisualState {
+    pub cuda_check_hovered: bool,
+    pub cuda_check_pressed: bool,
+    pub hovered_model_index: Option<usize>,
+    pub pressed_model_index: Option<usize>,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct DemoModeVisualState {
     pub demo_button: ButtonVisualState,
@@ -460,10 +468,15 @@ pub fn scene_button_specs(scene_kind: SceneWindowKind) -> &'static [SceneButtonS
 
 #[must_use]
 // audio[impl gui.daemon-window]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the daemon window composes status panels, model controls, and CUDA actions"
+)]
 pub fn build_audio_daemon_render_scene(
     layout: TerminalLayout,
     window_chrome_buttons_state: WindowChromeButtonsState,
     status: &AudioTranscriptionDaemonStatusReport,
+    visual_state: AudioDaemonVisualState,
 ) -> RenderScene {
     let mut scene = build_scene_shell(
         layout,
@@ -491,11 +504,70 @@ pub fn build_audio_daemon_render_scene(
         [0.98, 0.96, 1.0, 1.0],
     );
 
-    let contract_rect = ClientRect::new(
+    let model_rect = ClientRect::new(
         body_rect.left() + 18,
         title_rect.bottom() + 18,
         body_rect.right() - 18,
-        title_rect.bottom() + 180,
+        title_rect.bottom() + 112,
+    );
+    push_panel(
+        &mut scene,
+        model_rect.to_win32_rect(),
+        [0.12, 0.14, 0.18, 1.0],
+        PanelEffect::SceneButtonCard,
+    );
+    push_text_block(
+        &mut scene,
+        ClientRect::new(
+            model_rect.left() + 16,
+            model_rect.top() + 12,
+            model_rect.right() - 16,
+            model_rect.top() + 34,
+        )
+        .to_win32_rect(),
+        &format!("Model: {}", status.selected_model),
+        9,
+        16,
+        [0.92, 0.94, 0.98, 1.0],
+    );
+    for (index, model) in status.available_models.iter().enumerate() {
+        let button_rect =
+            audio_daemon_model_button_rect(body_rect, index, status.available_models.len());
+        let active = model == &status.selected_model;
+        push_panel_with_data(
+            &mut scene,
+            button_rect.to_win32_rect(),
+            if active {
+                [0.24, 0.38, 0.30, 1.0]
+            } else {
+                [0.17, 0.18, 0.23, 1.0]
+            },
+            PanelEffect::SceneButtonCard,
+            ButtonVisualState {
+                hovered: visual_state.hovered_model_index == Some(index),
+                pressed: visual_state.pressed_model_index == Some(index),
+                active,
+                ..Default::default()
+            }
+            .shader_data(),
+        );
+        push_centered_text(
+            &mut scene,
+            button_rect.to_win32_rect(),
+            model,
+            if active {
+                [0.90, 1.0, 0.92, 1.0]
+            } else {
+                [0.86, 0.88, 0.94, 1.0]
+            },
+        );
+    }
+
+    let contract_rect = ClientRect::new(
+        body_rect.left() + 18,
+        model_rect.bottom() + 16,
+        body_rect.right() - 18,
+        model_rect.bottom() + 162,
     );
     push_panel(
         &mut scene,
@@ -553,8 +625,56 @@ pub fn build_audio_daemon_render_scene(
         16,
         [0.93, 0.88, 0.98, 1.0],
     );
+    let cuda_rect = audio_daemon_cuda_check_button_rect(body_rect);
+    push_panel_with_data(
+        &mut scene,
+        cuda_rect.to_win32_rect(),
+        [0.16, 0.25, 0.35, 1.0],
+        PanelEffect::SceneButtonCard,
+        ButtonVisualState {
+            hovered: visual_state.cuda_check_hovered,
+            pressed: visual_state.cuda_check_pressed,
+            ..Default::default()
+        }
+        .shader_data(),
+    );
+    push_centered_text(
+        &mut scene,
+        cuda_rect.to_win32_rect(),
+        "CUDA Check",
+        [0.90, 0.96, 1.0, 1.0],
+    );
 
     scene
+}
+
+#[must_use]
+// audio[impl transcription.model-selection]
+pub fn audio_daemon_model_button_rect(
+    body_rect: ClientRect,
+    index: usize,
+    model_count: usize,
+) -> ClientRect {
+    let model_count = i32::try_from(model_count.max(1)).unwrap_or(1);
+    let gap = 8;
+    let row_left = body_rect.left() + 34;
+    let row_right = body_rect.right() - 34;
+    let row_width = (row_right - row_left).max(1);
+    let button_width = ((row_width - gap * (model_count - 1)) / model_count).max(48);
+    let left = row_left + i32::try_from(index).unwrap_or_default() * (button_width + gap);
+    let top = body_rect.top() + 88;
+    ClientRect::new(left, top, (left + button_width).min(row_right), top + 36)
+}
+
+#[must_use]
+// audio[impl transcription.cuda-check]
+pub fn audio_daemon_cuda_check_button_rect(body_rect: ClientRect) -> ClientRect {
+    ClientRect::new(
+        body_rect.right() - 186,
+        body_rect.bottom() - 70,
+        body_rect.right() - 34,
+        body_rect.bottom() - 34,
+    )
 }
 
 fn audio_daemon_contract_text(status: &AudioTranscriptionDaemonStatusReport) -> String {
@@ -583,9 +703,10 @@ fn audio_daemon_paths_text(status: &AudioTranscriptionDaemonStatusReport) -> Str
 
 fn audio_daemon_control_text(status: &AudioTranscriptionDaemonStatusReport) -> String {
     format!(
-        "Transports\ncontrol: {}\npayload: {}\nqueued requests: {}\noldest queued: {} ms\npython lag: {} ms\n\nAlt+X opens the full diagnostics TUI.",
+        "Transports\ncontrol: {}\npayload: {}\nselected model: {}\nqueued requests: {}\noldest queued: {} ms\npython lag: {} ms\n\nAlt+X opens the full diagnostics TUI.",
         status.control_transport,
         status.payload_transport,
+        status.selected_model,
         status.queued_request_count,
         status.oldest_queued_age_ms,
         status.python_lag_ms,
@@ -2474,6 +2595,13 @@ fn render_audio_daemon_diagnostic_buffer(
                 Style::new().fg(Color::White),
             ),
         ]),
+        Line::from(vec![
+            Span::styled("Model ", Style::new().fg(Color::DarkGray)),
+            Span::styled(
+                status.selected_model.as_str(),
+                Style::new().fg(Color::LightGreen),
+            ),
+        ]),
     ])
     .block(
         Block::default()
@@ -3538,6 +3666,15 @@ mod tests {
             control_transport: "windows named pipe".to_owned(),
             payload_transport: "rust-owned shared-memory slot".to_owned(),
             python_entrypoint: "teamy_whisperx_daemon".to_owned(),
+            selected_model: "large-v3".to_owned(),
+            available_models: vec![
+                "large-v3".to_owned(),
+                "large-v2".to_owned(),
+                "medium.en".to_owned(),
+                "small.en".to_owned(),
+                "base.en".to_owned(),
+                "tiny.en".to_owned(),
+            ],
         }
     }
 
@@ -3719,10 +3856,26 @@ mod tests {
             sample_layout(),
             WindowChromeButtonsState::default(),
             &sample_audio_daemon_status(),
+            AudioDaemonVisualState::default(),
         );
 
-        assert!(scene.panels.len() >= 4);
+        assert!(scene.panels.len() >= 11);
         assert!(scene.glyphs.len() > 40);
+    }
+
+    #[test]
+    // audio[verify transcription.model-selection]
+    // audio[verify transcription.cuda-check]
+    fn audio_daemon_controls_have_stable_hit_rects() {
+        let body_rect = sample_layout().terminal_panel_rect().inset(24);
+        let first = audio_daemon_model_button_rect(body_rect, 0, 6);
+        let second = audio_daemon_model_button_rect(body_rect, 1, 6);
+        let cuda = audio_daemon_cuda_check_button_rect(body_rect);
+
+        assert!(first.width() > 0);
+        assert!(second.left() > first.left());
+        assert!(cuda.width() > 0);
+        assert!(cuda.bottom() <= body_rect.bottom());
     }
 
     #[test]
