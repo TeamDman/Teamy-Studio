@@ -8,6 +8,7 @@ mod windows_audio;
 mod windows_audio_input;
 mod windows_cursor_info;
 mod windows_d3d12_renderer;
+mod windows_demo_mode;
 mod windows_dialogs;
 mod windows_scene;
 mod windows_terminal;

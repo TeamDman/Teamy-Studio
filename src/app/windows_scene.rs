@@ -1,5 +1,7 @@
+use std::fmt::Write as _;
 use std::time::{Duration, Instant};
 
+use arbitrary::Arbitrary;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Direction, Layout, Rect as RatatuiRect};
 use ratatui::style::{Color, Modifier, Style};
@@ -24,6 +26,8 @@ use super::windows_d3d12_renderer::{
 use super::windows_terminal::{TerminalLayout, TerminalSelection};
 
 pub const DEFAULT_MAX_BUTTON_SIZE: i32 = 300;
+pub const AUDIO_INPUT_DEVICE_DETAIL_TEXT_CELL_WIDTH: i32 = 10;
+pub const AUDIO_INPUT_DEVICE_DETAIL_TEXT_CELL_HEIGHT: i32 = 18;
 const MIN_BUTTON_GAP: i32 = 12;
 const MAX_BUTTON_GAP: i32 = 48;
 const MIN_BUTTON_LABEL_GAP: i32 = 8;
@@ -44,6 +48,8 @@ pub enum SceneWindowKind {
     AudioPicker,
     AudioInputDevicePicker,
     AudioInputDeviceDetails,
+    CursorGallery,
+    DemoMode,
 }
 
 impl SceneWindowKind {
@@ -54,6 +60,8 @@ impl SceneWindowKind {
             Self::AudioPicker => "Audio Sources",
             Self::AudioInputDevicePicker => "Audio Devices",
             Self::AudioInputDeviceDetails => "Microphone",
+            Self::CursorGallery => "Cursor Gallery",
+            Self::DemoMode => "Demo Mode",
         }
     }
 }
@@ -62,7 +70,11 @@ impl SceneWindowKind {
 pub enum SceneAction {
     OpenTerminal,
     OpenCursorInfo,
+    OpenCursorGallery,
+    OpenDemoMode,
     OpenStorage,
+    OpenEnvironmentVariables,
+    OpenApplicationWindows,
     OpenAudioPicker,
     OpenAudioInputDevices,
     SelectWindowsBell,
@@ -111,6 +123,55 @@ pub struct AudioInputDeviceDetailVisualState {
     pub grabbed_head: Option<AudioInputTimelineHeadKind>,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct DemoModeVisualState {
+    pub demo_button: ButtonVisualState,
+    pub scramble_toggle: ButtonVisualState,
+}
+
+#[expect(
+    clippy::struct_field_names,
+    reason = "these names distinguish the rendered demo-mode regions used for hit testing"
+)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DemoModeLayout {
+    pub demo_button_bounds: ClientRect,
+    pub scramble_toggle_bounds: ClientRect,
+    pub scramble_toggle_track_bounds: ClientRect,
+    pub identifiers_bounds: ClientRect,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DemoInputDeviceIdentifier(String);
+
+impl DemoInputDeviceIdentifier {
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl<'a> Arbitrary<'a> for DemoInputDeviceIdentifier {
+    fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
+        let flow = u.int_in_range(0_u32..=2)?;
+        let data1 = u32::arbitrary(u)?;
+        let data2 = u16::arbitrary(u)?;
+        let data3 = u16::arbitrary(u)?;
+        let data4 = <[u8; 8]>::arbitrary(u)?;
+        Ok(Self(format!(
+            "{{0.0.1.{flow:08X}}}.{{{data1:08X}-{data2:04X}-{data3:04X}-{b0:02X}{b1:02X}-{b2:02X}{b3:02X}{b4:02X}{b5:02X}{b6:02X}{b7:02X}}}",
+            b0 = data4[0],
+            b1 = data4[1],
+            b2 = data4[2],
+            b3 = data4[3],
+            b4 = data4[4],
+            b5 = data4[5],
+            b6 = data4[6],
+            b7 = data4[7],
+        )))
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SceneButtonSpec {
     pub action: SceneAction,
@@ -118,6 +179,46 @@ pub struct SceneButtonSpec {
     pub tooltip: &'static str,
     pub sprite: SpriteId,
     pub color: [f32; 4],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CursorGallerySpriteSpec {
+    pub cursor: CursorGalleryCursorKind,
+    pub label: &'static str,
+    pub sprite: SpriteId,
+    pub color: [f32; 4],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CursorGalleryCursorKind {
+    Arrow,
+    Hand,
+    IBeam,
+    Cross,
+    Wait,
+    SizeAll,
+    Help,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CursorGalleryCellLayout {
+    pub index: usize,
+    pub spec: CursorGallerySpriteSpec,
+    pub card_rect: ClientRect,
+    pub sprite_rect: ClientRect,
+    pub label_rect: ClientRect,
+}
+
+impl CursorGalleryCellLayout {
+    #[must_use]
+    pub fn hit_rect(self) -> ClientRect {
+        ClientRect::new(
+            self.card_rect.left().min(self.label_rect.left()),
+            self.card_rect.top().min(self.label_rect.top()),
+            self.card_rect.right().max(self.label_rect.right()),
+            self.card_rect.bottom().max(self.label_rect.bottom()),
+        )
+    }
 }
 
 #[expect(
@@ -170,6 +271,7 @@ pub fn build_scene_render_scene(
     window_chrome_buttons_state: WindowChromeButtonsState,
     max_button_size: i32,
     button_states: &[(SceneAction, ButtonVisualState)],
+    virtual_cursor: Option<ClientPoint>,
 ) -> RenderScene {
     let mut scene = build_scene_shell(layout, scene_kind, window_chrome_buttons_state);
 
@@ -214,13 +316,25 @@ pub fn build_scene_render_scene(
         );
     }
 
+    if scene_kind == SceneWindowKind::Launcher {
+        push_virtual_cursor_pointer(
+            &mut scene,
+            virtual_cursor,
+            SpriteId::CursorHand,
+            [0.48, 0.95, 1.0, 0.96],
+        );
+    }
+
     scene
 }
 
 #[must_use]
 // windowing[impl launcher.buttons.terminal]
 // windowing[impl launcher.buttons.storage-placeholder]
+// windowing[impl launcher.buttons.environment-variables-placeholder]
+// windowing[impl launcher.buttons.application-windows-placeholder]
 // windowing[impl launcher.buttons.audio-picker]
+// windowing[impl launcher.buttons.cursor-gallery]
 // windowing[impl audio-picker.buttons.windows]
 // windowing[impl audio-picker.buttons.file]
 pub fn scene_button_specs(scene_kind: SceneWindowKind) -> &'static [SceneButtonSpec] {
@@ -241,11 +355,40 @@ pub fn scene_button_specs(scene_kind: SceneWindowKind) -> &'static [SceneButtonS
                 color: [0.16, 0.30, 0.24, 1.0],
             },
             SceneButtonSpec {
+                action: SceneAction::OpenCursorGallery,
+                label: "Cursor Gallery",
+                tooltip: "Inspect OS cursor sprites",
+                sprite: SpriteId::CursorArrow,
+                color: [0.20, 0.18, 0.32, 1.0],
+            },
+            SceneButtonSpec {
+                // windowing[impl launcher.buttons.demo-mode]
+                action: SceneAction::OpenDemoMode,
+                label: "Demo Mode",
+                tooltip: "Open demo privacy controls",
+                sprite: SpriteId::Terminal,
+                color: [0.15, 0.25, 0.28, 1.0],
+            },
+            SceneButtonSpec {
                 action: SceneAction::OpenStorage,
                 label: "Storage",
                 tooltip: "Storage is not implemented yet",
                 sprite: SpriteId::Storage,
                 color: [0.30, 0.21, 0.14, 1.0],
+            },
+            SceneButtonSpec {
+                action: SceneAction::OpenEnvironmentVariables,
+                label: "Environment Variables",
+                tooltip: "Environment-variable inspector is not implemented yet",
+                sprite: SpriteId::Storage,
+                color: [0.18, 0.29, 0.22, 1.0],
+            },
+            SceneButtonSpec {
+                action: SceneAction::OpenApplicationWindows,
+                label: "Application Windows",
+                tooltip: "Application-window inspector is not implemented yet",
+                sprite: SpriteId::Terminal,
+                color: [0.22, 0.24, 0.34, 1.0],
             },
             SceneButtonSpec {
                 action: SceneAction::OpenAudioPicker,
@@ -279,7 +422,485 @@ pub fn scene_button_specs(scene_kind: SceneWindowKind) -> &'static [SceneButtonS
                 color: [0.23, 0.19, 0.30, 1.0],
             },
         ],
-        SceneWindowKind::AudioInputDevicePicker | SceneWindowKind::AudioInputDeviceDetails => &[],
+        SceneWindowKind::CursorGallery
+        | SceneWindowKind::DemoMode
+        | SceneWindowKind::AudioInputDevicePicker
+        | SceneWindowKind::AudioInputDeviceDetails => &[],
+    }
+}
+
+#[must_use]
+// windowing[impl demo-mode.input-device-identifier-scramble]
+pub fn demo_mode_input_device_identifiers(scramble: bool) -> Vec<String> {
+    if !scramble {
+        return vec![
+            "{0.0.1.00000000}.{6B24B7C8-8F5A-4B91-A784-2A27C1E8E001}".to_owned(),
+            "{0.0.1.00000001}.{41F27D33-5A64-44D0-BE6C-2C1D9AE84002}".to_owned(),
+            "{0.0.1.00000002}.{93CB0F4A-EB15-4E40-8F7C-9B8AB4E2D003}".to_owned(),
+        ];
+    }
+
+    [
+        b"teamy demo input device 0".as_slice(),
+        b"teamy demo input device 1".as_slice(),
+        b"teamy demo input device 2".as_slice(),
+    ]
+    .into_iter()
+    .map(demo_mode_scrambled_input_device_identifier)
+    .collect()
+}
+
+#[must_use]
+pub fn demo_mode_scrambled_input_device_identifier(seed: &[u8]) -> String {
+    let mut unstructured = arbitrary::Unstructured::new(seed);
+    DemoInputDeviceIdentifier::arbitrary(&mut unstructured).map_or_else(
+        |_| "{0.0.1.00000000}.{00000000-0000-0000-0000-000000000000}".to_owned(),
+        |identifier| identifier.as_str().to_owned(),
+    )
+}
+
+#[must_use]
+pub fn input_device_identifier_display_text(identifier: &str, scramble: bool) -> String {
+    // windowing[impl demo-mode.live-audio-device-scramble]
+    if scramble {
+        demo_mode_scrambled_input_device_identifier(identifier.as_bytes())
+    } else {
+        identifier.to_owned()
+    }
+}
+
+#[must_use]
+pub fn demo_mode_layout(body_rect: ClientRect) -> DemoModeLayout {
+    let button_width = body_rect.width().clamp(180, 360);
+    let button_left = body_rect.left() + ((body_rect.width() - button_width).max(0) / 2);
+    let demo_button_bounds = ClientRect::new(
+        button_left,
+        body_rect.top() + 38,
+        button_left + button_width,
+        body_rect.top() + 102,
+    );
+    let scramble_toggle_bounds = ClientRect::new(
+        body_rect.left() + 24,
+        demo_button_bounds.bottom() + 34,
+        body_rect.right() - 24,
+        demo_button_bounds.bottom() + 84,
+    );
+    let scramble_toggle_track_bounds = ClientRect::new(
+        scramble_toggle_bounds.left(),
+        scramble_toggle_bounds.top() + 8,
+        scramble_toggle_bounds.left() + 86,
+        scramble_toggle_bounds.top() + 42,
+    );
+    let identifiers_bounds = ClientRect::new(
+        body_rect.left() + 24,
+        scramble_toggle_bounds.bottom() + 24,
+        body_rect.right() - 24,
+        body_rect.bottom() - 24,
+    );
+
+    DemoModeLayout {
+        demo_button_bounds,
+        scramble_toggle_bounds,
+        scramble_toggle_track_bounds,
+        identifiers_bounds,
+    }
+}
+
+#[must_use]
+pub fn demo_mode_toggle_thumb_bounds(
+    layout: DemoModeLayout,
+    scramble_input_device_identifiers: bool,
+) -> ClientRect {
+    let track = layout.scramble_toggle_track_bounds;
+    let thumb_size = 28;
+    let left = if scramble_input_device_identifiers {
+        track.right() - thumb_size - 3
+    } else {
+        track.left() + 3
+    };
+    ClientRect::new(
+        left,
+        track.top() + 3,
+        left + thumb_size,
+        track.top() + 3 + thumb_size,
+    )
+}
+
+#[must_use]
+// windowing[impl demo-mode.window]
+pub fn build_demo_mode_render_scene(
+    layout: TerminalLayout,
+    window_chrome_buttons_state: WindowChromeButtonsState,
+    scramble_input_device_identifiers: bool,
+    visual_state: DemoModeVisualState,
+) -> RenderScene {
+    let mut scene = build_scene_shell(
+        layout,
+        SceneWindowKind::DemoMode,
+        window_chrome_buttons_state,
+    );
+    let body_rect = layout.terminal_panel_rect().inset(30);
+    let demo_layout = demo_mode_layout(body_rect);
+
+    push_panel_with_data(
+        &mut scene,
+        demo_layout.demo_button_bounds.to_win32_rect(),
+        [0.13, 0.28, 0.30, 0.96],
+        PanelEffect::SceneButtonCard,
+        visual_state.demo_button.shader_data(),
+    );
+    push_centered_text(
+        &mut scene,
+        demo_layout.demo_button_bounds.to_win32_rect(),
+        "Demo Mode",
+        [0.96, 0.98, 1.0, 1.0],
+    );
+
+    push_panel_with_data(
+        &mut scene,
+        demo_layout.scramble_toggle_bounds.to_win32_rect(),
+        [0.08, 0.09, 0.11, 0.92],
+        PanelEffect::SceneButtonCard,
+        visual_state.scramble_toggle.shader_data(),
+    );
+    // windowing[impl demo-mode.input-device-identifier-scramble]
+    push_panel_with_data(
+        &mut scene,
+        demo_layout.scramble_toggle_track_bounds.to_win32_rect(),
+        [0.16, 0.18, 0.20, 1.0],
+        PanelEffect::DemoToggle,
+        demo_mode_toggle_shader_data(
+            visual_state.scramble_toggle,
+            scramble_input_device_identifiers,
+        ),
+    );
+    let thumb_bounds =
+        demo_mode_toggle_thumb_bounds(demo_layout, scramble_input_device_identifiers);
+    push_panel(
+        &mut scene,
+        thumb_bounds.to_win32_rect(),
+        if scramble_input_device_identifiers {
+            [0.82, 1.00, 0.94, 1.0]
+        } else {
+            [1.00, 0.68, 0.66, 1.0]
+        },
+        PanelEffect::TerminalFill,
+    );
+    push_centered_text(
+        &mut scene,
+        ClientRect::new(
+            demo_layout.scramble_toggle_track_bounds.left(),
+            demo_layout.scramble_toggle_track_bounds.top(),
+            demo_layout.scramble_toggle_track_bounds.right(),
+            demo_layout.scramble_toggle_track_bounds.bottom(),
+        )
+        .to_win32_rect(),
+        if scramble_input_device_identifiers {
+            "ON"
+        } else {
+            "OFF"
+        },
+        [0.96, 0.98, 1.0, 1.0],
+    );
+    push_text_block(
+        &mut scene,
+        ClientRect::new(
+            demo_layout.scramble_toggle_track_bounds.right() + 16,
+            demo_layout.scramble_toggle_bounds.top() + 12,
+            demo_layout.scramble_toggle_bounds.right() - 12,
+            demo_layout.scramble_toggle_bounds.bottom(),
+        )
+        .to_win32_rect(),
+        "scramble input device identifiers",
+        10,
+        20,
+        [0.92, 0.95, 0.98, 1.0],
+    );
+
+    push_panel(
+        &mut scene,
+        demo_layout.identifiers_bounds.to_win32_rect(),
+        [0.05, 0.06, 0.08, 0.94],
+        PanelEffect::TerminalFill,
+    );
+    let identifier_text = demo_mode_identifier_text(scramble_input_device_identifiers);
+    push_text_block(
+        &mut scene,
+        demo_layout.identifiers_bounds.inset(14).to_win32_rect(),
+        &identifier_text,
+        8,
+        16,
+        [0.80, 0.90, 0.88, 1.0],
+    );
+
+    scene
+}
+
+fn demo_mode_toggle_shader_data(
+    visual_state: ButtonVisualState,
+    scramble_input_device_identifiers: bool,
+) -> [f32; 4] {
+    [
+        if scramble_input_device_identifiers {
+            1.0
+        } else {
+            0.0
+        },
+        if visual_state.hovered { 1.0 } else { 0.0 },
+        if visual_state.pressed { 1.0 } else { 0.0 },
+        visual_state.click_decay,
+    ]
+}
+
+fn demo_mode_identifier_text(scramble: bool) -> String {
+    let mode = if scramble {
+        "scrambled"
+    } else {
+        "representative"
+    };
+    let mut text = format!("input device identifiers ({mode})\n");
+    for (index, identifier) in demo_mode_input_device_identifiers(scramble)
+        .iter()
+        .enumerate()
+    {
+        let _ = writeln!(text, "{index}: {identifier}");
+    }
+    text
+}
+
+#[must_use]
+pub const fn cursor_gallery_sprite_specs() -> &'static [CursorGallerySpriteSpec] {
+    &[
+        CursorGallerySpriteSpec {
+            cursor: CursorGalleryCursorKind::Arrow,
+            label: "Arrow",
+            sprite: SpriteId::CursorArrow,
+            color: [0.48, 0.95, 1.00, 1.0],
+        },
+        CursorGallerySpriteSpec {
+            cursor: CursorGalleryCursorKind::Hand,
+            label: "Hand",
+            sprite: SpriteId::CursorHand,
+            color: [1.00, 0.56, 0.88, 1.0],
+        },
+        CursorGallerySpriteSpec {
+            cursor: CursorGalleryCursorKind::IBeam,
+            label: "I-Beam",
+            sprite: SpriteId::CursorIBeam,
+            color: [0.78, 1.00, 0.58, 1.0],
+        },
+        CursorGallerySpriteSpec {
+            cursor: CursorGalleryCursorKind::Cross,
+            label: "Cross",
+            sprite: SpriteId::CursorCross,
+            color: [1.00, 0.78, 0.36, 1.0],
+        },
+        CursorGallerySpriteSpec {
+            cursor: CursorGalleryCursorKind::Wait,
+            label: "Wait",
+            sprite: SpriteId::CursorWait,
+            color: [0.72, 0.64, 1.00, 1.0],
+        },
+        CursorGallerySpriteSpec {
+            cursor: CursorGalleryCursorKind::SizeAll,
+            label: "Move",
+            sprite: SpriteId::CursorSizeAll,
+            color: [0.44, 0.88, 0.70, 1.0],
+        },
+        CursorGallerySpriteSpec {
+            cursor: CursorGalleryCursorKind::Help,
+            label: "Help",
+            sprite: SpriteId::CursorHelp,
+            color: [1.00, 0.86, 0.48, 1.0],
+        },
+    ]
+}
+
+#[must_use]
+pub fn cursor_gallery_cell_layouts(layout: TerminalLayout) -> Vec<CursorGalleryCellLayout> {
+    let body_rect = layout.terminal_panel_rect().inset(30);
+    let title_rect = cursor_gallery_title_rect(body_rect);
+    let specs = cursor_gallery_sprite_specs();
+    let card_size = 132;
+    let gap = 24;
+    let top = title_rect.bottom() + 20;
+    let columns = usize::try_from(((body_rect.width() + gap) / (card_size + gap)).max(1))
+        .unwrap_or(1)
+        .max(1);
+
+    specs
+        .iter()
+        .copied()
+        .enumerate()
+        .filter_map(|(index, spec)| {
+            let column = i32::try_from(index % columns).unwrap_or_default();
+            let row = i32::try_from(index / columns).unwrap_or_default();
+            let left = body_rect.left() + column * (card_size + gap);
+            let card_top = top + row * (card_size + 52);
+            let card_rect = ClientRect::new(left, card_top, left + card_size, card_top + card_size);
+            (card_rect.top() < body_rect.bottom()).then_some(CursorGalleryCellLayout {
+                index,
+                spec,
+                card_rect,
+                sprite_rect: card_rect.inset(20),
+                label_rect: ClientRect::new(
+                    card_rect.left(),
+                    card_rect.bottom() + 6,
+                    card_rect.right(),
+                    card_rect.bottom() + 42,
+                ),
+            })
+        })
+        .collect()
+}
+
+#[must_use]
+// windowing[impl cursor-gallery.stock-os-cursors]
+// windowing[impl cursor-gallery.hover-cursor-shape]
+pub fn build_cursor_gallery_render_scene(
+    layout: TerminalLayout,
+    window_chrome_buttons_state: WindowChromeButtonsState,
+    selected_index: usize,
+    virtual_cursor: Option<ClientPoint>,
+    pointer_position: Option<ClientPoint>,
+) -> RenderScene {
+    let mut scene = build_scene_shell(
+        layout,
+        SceneWindowKind::CursorGallery,
+        window_chrome_buttons_state,
+    );
+    let body_rect = layout.terminal_panel_rect().inset(30);
+    let title_rect = cursor_gallery_title_rect(body_rect);
+    push_title_text(
+        &mut scene,
+        title_rect.to_win32_rect(),
+        "Cursor Gallery",
+        [0.96, 0.98, 1.00, 1.0],
+    );
+
+    let cells = cursor_gallery_cell_layouts(layout);
+    let selected_index = selected_index.min(cells.len().saturating_sub(1));
+    let pointer_hovered_index = pointer_position.and_then(|point| {
+        cells
+            .iter()
+            .find(|cell| cell.hit_rect().contains(point))
+            .map(|cell| cell.index)
+    });
+
+    for cell in &cells {
+        let active = cell.index == selected_index;
+        let hovered = pointer_hovered_index == Some(cell.index);
+        if active || hovered {
+            push_cursor_gallery_glow(&mut scene, cell.card_rect, cell.spec.color, hovered);
+        }
+
+        push_panel_with_data(
+            &mut scene,
+            cell.card_rect.to_win32_rect(),
+            if active || hovered {
+                [
+                    cell.spec.color[0] * 0.28,
+                    cell.spec.color[1] * 0.28,
+                    cell.spec.color[2] * 0.28,
+                    0.96,
+                ]
+            } else {
+                [0.11, 0.12, 0.16, 0.92]
+            },
+            PanelEffect::SceneButtonCard,
+            ButtonVisualState {
+                hover_near: if active || hovered { 1.0 } else { 0.0 },
+                hovered,
+                pressed: false,
+                click_decay: 0.0,
+                active,
+            }
+            .shader_data(),
+        );
+        push_sprite(
+            &mut scene,
+            cell.sprite_rect.to_win32_rect(),
+            cell.spec.color,
+            cell.spec.sprite,
+        );
+        push_centered_text(
+            &mut scene,
+            cell.label_rect.to_win32_rect(),
+            cell.spec.label,
+            [0.90, 0.92, 0.96, 1.0],
+        );
+    }
+
+    let pointer_spec = pointer_hovered_index
+        .and_then(|index| cells.iter().find(|cell| cell.index == index))
+        .or_else(|| cells.get(selected_index))
+        .map(|cell| cell.spec);
+    if let Some(pointer_spec) = pointer_spec {
+        let virtual_cursor = virtual_cursor.or_else(|| {
+            cells
+                .get(selected_index)
+                .map(|cell| client_rect_center(cell.hit_rect()))
+        });
+        push_virtual_cursor_pointer(
+            &mut scene,
+            virtual_cursor,
+            pointer_spec.sprite,
+            pointer_spec.color,
+        );
+    }
+
+    scene
+}
+
+fn client_rect_center(rect: ClientRect) -> ClientPoint {
+    ClientPoint::new(
+        rect.left() + (rect.width() / 2),
+        rect.top() + (rect.height() / 2),
+    )
+}
+
+fn cursor_gallery_title_rect(body_rect: ClientRect) -> ClientRect {
+    ClientRect::new(
+        body_rect.left(),
+        body_rect.top(),
+        body_rect.right(),
+        (body_rect.top() + 52).min(body_rect.bottom()),
+    )
+}
+
+fn push_cursor_gallery_glow(
+    scene: &mut RenderScene,
+    card_rect: ClientRect,
+    color: [f32; 4],
+    hovered: bool,
+) {
+    // windowing[impl cursor-gallery.hover-glow-color]
+    let glow_alpha = if hovered { 0.34 } else { 0.22 };
+    for (inflate, alpha) in [
+        (18, glow_alpha * 0.32),
+        (10, glow_alpha * 0.55),
+        (4, glow_alpha),
+    ] {
+        push_panel_with_data(
+            scene,
+            ClientRect::new(
+                card_rect.left() - inflate,
+                card_rect.top() - inflate,
+                card_rect.right() + inflate,
+                card_rect.bottom() + inflate,
+            )
+            .to_win32_rect(),
+            [color[0], color[1], color[2], alpha],
+            PanelEffect::SceneButtonCard,
+            ButtonVisualState {
+                hover_near: 1.0,
+                hovered,
+                pressed: false,
+                click_decay: 0.0,
+                active: true,
+            }
+            .shader_data(),
+        );
     }
 }
 
@@ -291,6 +912,7 @@ pub fn build_audio_input_device_picker_render_scene(
     window_chrome_buttons_state: WindowChromeButtonsState,
     devices: &[AudioInputDeviceSummary],
     selected_index: usize,
+    scramble_input_device_identifiers: bool,
 ) -> RenderScene {
     let mut scene = build_scene_shell(
         layout,
@@ -368,7 +990,10 @@ pub fn build_audio_input_device_picker_render_scene(
         );
         let text = format!(
             "{}{}\n{}\n{}",
-            device.name, default_marker, sample_rate, device.id
+            device.name,
+            default_marker,
+            sample_rate,
+            input_device_identifier_display_text(&device.id, scramble_input_device_identifiers)
         );
         push_text_block(
             &mut scene,
@@ -449,6 +1074,8 @@ pub fn build_audio_input_device_detail_render_scene(
     window_chrome_buttons_state: WindowChromeButtonsState,
     device_state: Option<&AudioInputDeviceWindowState>,
     visual_state: AudioInputDeviceDetailVisualState,
+    scramble_input_device_identifiers: bool,
+    text_selection: Option<TerminalSelection>,
 ) -> RenderScene {
     let mut scene = build_scene_shell(
         layout,
@@ -470,19 +1097,20 @@ pub fn build_audio_input_device_detail_render_scene(
             [0.13, 0.15, 0.17, 1.0],
             PanelEffect::SceneButtonCard,
         );
-        push_text_block(
+        let text = audio_input_device_detail_info_text(None, scramble_input_device_identifiers);
+        push_selectable_text_block(
             &mut scene,
-            empty_rect.inset(18).to_win32_rect(),
-            "No microphone is selected.",
-            10,
-            18,
+            empty_rect.inset(18),
+            &text,
+            AUDIO_INPUT_DEVICE_DETAIL_TEXT_CELL_WIDTH,
+            AUDIO_INPUT_DEVICE_DETAIL_TEXT_CELL_HEIGHT,
             [0.92, 0.93, 0.95, 1.0],
+            text_selection,
         );
         return scene;
     };
 
     let detail_layout = audio_input_device_detail_layout(body_rect);
-    let device = &device_state.device;
     push_panel(
         &mut scene,
         body_rect.to_win32_rect(),
@@ -496,22 +1124,16 @@ pub fn build_audio_input_device_detail_render_scene(
         SpriteId::Audio,
     );
 
-    let default_marker = if device.is_default { " [default]" } else { "" };
-    let sample_rate = device.sample_rate_hz.map_or_else(
-        || "sample rate: unknown".to_owned(),
-        |rate| format!("sample rate: {rate} Hz"),
-    );
-    let details = format!(
-        "{}{}\n{}\nstate: {}\n{}",
-        device.name, default_marker, sample_rate, device.state, device.id
-    );
-    push_text_block(
+    let details =
+        audio_input_device_detail_info_text(Some(device_state), scramble_input_device_identifiers);
+    push_selectable_text_block(
         &mut scene,
-        detail_layout.info_rect.to_win32_rect(),
+        detail_layout.info_rect,
         &details,
-        10,
-        18,
+        AUDIO_INPUT_DEVICE_DETAIL_TEXT_CELL_WIDTH,
+        AUDIO_INPUT_DEVICE_DETAIL_TEXT_CELL_HEIGHT,
         [0.95, 0.96, 0.98, 1.0],
+        text_selection,
     );
     push_legacy_recording_dialog_button(&mut scene, detail_layout.legacy_recording_button_rect);
 
@@ -614,6 +1236,50 @@ pub fn build_audio_input_device_detail_render_scene(
     push_audio_input_buffer_section(&mut scene, detail_layout, device_state, visual_state);
 
     scene
+}
+
+#[must_use]
+// windowing[impl scene.pretty-text.selection]
+pub fn audio_input_device_detail_info_text(
+    device_state: Option<&AudioInputDeviceWindowState>,
+    scramble_input_device_identifiers: bool,
+) -> String {
+    let Some(device_state) = device_state else {
+        return "No microphone is selected.".to_owned();
+    };
+
+    let device = &device_state.device;
+    let default_marker = if device.is_default { " [default]" } else { "" };
+    let sample_rate = device.sample_rate_hz.map_or_else(
+        || "sample rate: unknown".to_owned(),
+        |rate| format!("sample rate: {rate} Hz"),
+    );
+    format!(
+        "{}{}\n{}\nstate: {}\n{}",
+        device.name,
+        default_marker,
+        sample_rate,
+        device.state,
+        input_device_identifier_display_text(&device.id, scramble_input_device_identifiers)
+    )
+}
+
+#[must_use]
+pub fn audio_input_device_detail_selectable_text_rect(
+    body_rect: ClientRect,
+    has_device: bool,
+) -> ClientRect {
+    if has_device {
+        audio_input_device_detail_layout(body_rect).info_rect
+    } else {
+        ClientRect::new(
+            body_rect.left(),
+            body_rect.top() + 48,
+            body_rect.right(),
+            body_rect.top() + 132,
+        )
+        .inset(18)
+    }
 }
 
 #[must_use]
@@ -1051,6 +1717,31 @@ fn push_legacy_recording_dialog_button(scene: &mut RenderScene, rect: ClientRect
     );
 }
 
+fn push_selectable_text_block(
+    scene: &mut RenderScene,
+    rect: ClientRect,
+    text: &str,
+    cell_width: i32,
+    cell_height: i32,
+    color: [f32; 4],
+    selection: Option<TerminalSelection>,
+) {
+    let text_scene = cell_grid::build_text_grid_scene_with_palette(
+        rect,
+        text,
+        cell_width,
+        cell_height,
+        selection,
+        color,
+        [0.06, 0.07, 0.09, 1.0],
+        [0.42, 0.67, 0.98, 1.0],
+    );
+    scene.panels.extend(text_scene.panels);
+    scene.glyphs.extend(text_scene.glyphs);
+    scene.sprites.extend(text_scene.sprites);
+    scene.overlay_panels.extend(text_scene.overlay_panels);
+}
+
 #[must_use]
 /// windowing[impl diagnostics.scene-window.replaces-body]
 pub fn build_scene_diagnostic_render_scene(
@@ -1079,7 +1770,83 @@ pub fn build_scene_diagnostic_render_scene(
 }
 
 #[must_use]
+// windowing[impl diagnostics.launcher-tui]
+pub fn build_launcher_diagnostic_render_scene(
+    layout: TerminalLayout,
+    window_chrome_buttons_state: WindowChromeButtonsState,
+    selected_index: usize,
+    virtual_cursor: Option<ClientPoint>,
+    selection: Option<TerminalSelection>,
+    cell_width: i32,
+    cell_height: i32,
+) -> RenderScene {
+    let mut scene = build_scene_shell(
+        layout,
+        SceneWindowKind::Launcher,
+        window_chrome_buttons_state,
+    );
+    let body_rect = layout.terminal_panel_rect().inset(20);
+    let diagnostic_scene = build_launcher_diagnostic_body_scene(
+        body_rect,
+        selected_index,
+        virtual_cursor,
+        selection,
+        cell_width,
+        cell_height,
+    );
+    scene.panels.extend(diagnostic_scene.panels);
+    scene.glyphs.extend(diagnostic_scene.glyphs);
+    scene.sprites.extend(diagnostic_scene.sprites);
+    scene.overlay_panels.extend(diagnostic_scene.overlay_panels);
+    push_virtual_cursor_pointer(
+        &mut scene,
+        virtual_cursor,
+        SpriteId::CursorHand,
+        [0.48, 0.95, 1.0, 0.96],
+    );
+    scene
+}
+
+#[must_use]
+pub fn launcher_diagnostic_action_hit_rects(
+    layout: TerminalLayout,
+    cell_width: i32,
+    cell_height: i32,
+) -> Vec<ClientRect> {
+    let body_rect = layout.terminal_panel_rect().inset(20);
+    let columns = u16::try_from((body_rect.width() / cell_width.max(1)).max(0)).unwrap_or_default();
+    let rows = u16::try_from((body_rect.height() / cell_height.max(1)).max(0)).unwrap_or_default();
+    if columns == 0 || rows == 0 {
+        return Vec::new();
+    }
+
+    let area = RatatuiRect::new(0, 0, columns, rows);
+    let chunks = launcher_diagnostic_chunks(area);
+    let action_inner = ratatui_block_inner(chunks[1]);
+    let action_count = scene_button_specs(SceneWindowKind::Launcher).len();
+    (0..action_count)
+        .filter_map(|index| {
+            let row = action_inner
+                .y
+                .saturating_add(u16::try_from(index.saturating_mul(2)).ok()?);
+            (row < action_inner.y.saturating_add(action_inner.height)).then(|| {
+                ratatui_rect_to_client_rect(
+                    body_rect,
+                    RatatuiRect::new(action_inner.x, row, action_inner.width, 2),
+                    cell_width,
+                    cell_height,
+                )
+            })
+        })
+        .collect()
+}
+
+#[must_use]
 // audio[impl gui.diagnostics-tui]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "audio diagnostics rendering takes layout, selection, and demo-mode display policy together"
+)]
 pub fn build_audio_input_device_diagnostic_render_scene(
     layout: TerminalLayout,
     window_chrome_buttons_state: WindowChromeButtonsState,
@@ -1088,6 +1855,7 @@ pub fn build_audio_input_device_diagnostic_render_scene(
     selection: Option<TerminalSelection>,
     cell_width: i32,
     cell_height: i32,
+    scramble_input_device_identifiers: bool,
 ) -> RenderScene {
     let mut scene = build_scene_shell(
         layout,
@@ -1102,6 +1870,7 @@ pub fn build_audio_input_device_diagnostic_render_scene(
         selection,
         cell_width,
         cell_height,
+        scramble_input_device_identifiers,
     );
     scene.panels.extend(diagnostic_scene.panels);
     scene.glyphs.extend(diagnostic_scene.glyphs);
@@ -1119,6 +1888,7 @@ pub fn build_audio_input_device_detail_diagnostic_render_scene(
     selection: Option<TerminalSelection>,
     cell_width: i32,
     cell_height: i32,
+    scramble_input_device_identifiers: bool,
 ) -> RenderScene {
     let mut scene = build_scene_shell(
         layout,
@@ -1132,6 +1902,7 @@ pub fn build_audio_input_device_detail_diagnostic_render_scene(
         selection,
         cell_width,
         cell_height,
+        scramble_input_device_identifiers,
     );
     scene.panels.extend(diagnostic_scene.panels);
     scene.glyphs.extend(diagnostic_scene.glyphs);
@@ -1146,6 +1917,7 @@ fn build_audio_input_device_detail_diagnostic_body_scene(
     selection: Option<TerminalSelection>,
     cell_width: i32,
     cell_height: i32,
+    scramble_input_device_identifiers: bool,
 ) -> RenderScene {
     let columns = u16::try_from((body_rect.width() / cell_width.max(1)).max(0)).unwrap_or_default();
     let rows = u16::try_from((body_rect.height() / cell_height.max(1)).max(0)).unwrap_or_default();
@@ -1155,7 +1927,12 @@ fn build_audio_input_device_detail_diagnostic_body_scene(
 
     let area = RatatuiRect::new(0, 0, columns, rows);
     let mut buffer = Buffer::empty(area);
-    render_audio_input_device_detail_diagnostic_buffer(&mut buffer, area, device_state);
+    render_audio_input_device_detail_diagnostic_buffer(
+        &mut buffer,
+        area,
+        device_state,
+        scramble_input_device_identifiers,
+    );
     ratatui_buffer_to_scene(body_rect, &buffer, selection, cell_width, cell_height)
 }
 
@@ -1167,6 +1944,7 @@ fn render_audio_input_device_detail_diagnostic_buffer(
     buffer: &mut Buffer,
     area: RatatuiRect,
     device_state: Option<&AudioInputDeviceWindowState>,
+    scramble_input_device_identifiers: bool,
 ) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -1223,7 +2001,10 @@ fn render_audio_input_device_detail_diagnostic_buffer(
                 Style::new().fg(Color::LightGreen),
             ),
         ]),
-        Line::from(device_state.device.id.clone()),
+        Line::from(input_device_identifier_display_text(
+            &device_state.device.id,
+            scramble_input_device_identifiers,
+        )),
     ])
     .block(
         Block::default()
@@ -1341,6 +2122,7 @@ fn build_audio_input_device_diagnostic_body_scene(
     selection: Option<TerminalSelection>,
     cell_width: i32,
     cell_height: i32,
+    scramble_input_device_identifiers: bool,
 ) -> RenderScene {
     let columns = u16::try_from((body_rect.width() / cell_width.max(1)).max(0)).unwrap_or_default();
     let rows = u16::try_from((body_rect.height() / cell_height.max(1)).max(0)).unwrap_or_default();
@@ -1350,8 +2132,201 @@ fn build_audio_input_device_diagnostic_body_scene(
 
     let area = RatatuiRect::new(0, 0, columns, rows);
     let mut buffer = Buffer::empty(area);
-    render_audio_input_device_diagnostic_buffer(&mut buffer, area, devices, selected_index);
+    render_audio_input_device_diagnostic_buffer(
+        &mut buffer,
+        area,
+        devices,
+        selected_index,
+        scramble_input_device_identifiers,
+    );
     ratatui_buffer_to_scene(body_rect, &buffer, selection, cell_width, cell_height)
+}
+
+fn build_launcher_diagnostic_body_scene(
+    body_rect: ClientRect,
+    selected_index: usize,
+    virtual_cursor: Option<ClientPoint>,
+    selection: Option<TerminalSelection>,
+    cell_width: i32,
+    cell_height: i32,
+) -> RenderScene {
+    let columns = u16::try_from((body_rect.width() / cell_width.max(1)).max(0)).unwrap_or_default();
+    let rows = u16::try_from((body_rect.height() / cell_height.max(1)).max(0)).unwrap_or_default();
+    if columns == 0 || rows == 0 {
+        return empty_render_scene();
+    }
+
+    let area = RatatuiRect::new(0, 0, columns, rows);
+    let mut buffer = Buffer::empty(area);
+    render_launcher_diagnostic_buffer(&mut buffer, area, selected_index, virtual_cursor);
+    ratatui_buffer_to_scene(body_rect, &buffer, selection, cell_width, cell_height)
+}
+
+fn render_launcher_diagnostic_buffer(
+    buffer: &mut Buffer,
+    area: RatatuiRect,
+    selected_index: usize,
+    virtual_cursor: Option<ClientPoint>,
+) {
+    let specs = scene_button_specs(SceneWindowKind::Launcher);
+    let selected = specs.get(selected_index).unwrap_or(&specs[0]);
+    let cursor_label = virtual_cursor
+        .and_then(|point| point.to_win32_point().ok())
+        .map_or_else(
+            || "unset".to_owned(),
+            |point| format!("{}, {}", point.x, point.y),
+        );
+    let chunks = launcher_diagnostic_chunks(area);
+
+    let header = Paragraph::new(vec![
+        Line::from(vec![
+            Span::styled("Mode ", Style::new().fg(Color::DarkGray)),
+            Span::styled(
+                "diagnostics",
+                Style::new()
+                    .fg(Color::LightCyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("Selected ", Style::new().fg(Color::DarkGray)),
+            Span::styled(
+                selected.label,
+                Style::new().fg(Color::White).add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("Cards ", Style::new().fg(Color::DarkGray)),
+            Span::styled(specs.len().to_string(), Style::new().fg(Color::LightGreen)),
+        ]),
+        Line::from(vec![
+            Span::styled("Intent ", Style::new().fg(Color::DarkGray)),
+            Span::styled("main menu", Style::new().fg(Color::LightBlue)),
+        ]),
+        Line::from(vec![
+            Span::styled("Virtual cursor ", Style::new().fg(Color::DarkGray)),
+            Span::styled(cursor_label, Style::new().fg(Color::LightYellow)),
+        ]),
+    ])
+    .block(
+        Block::default()
+            .title(" Launcher ")
+            .borders(Borders::ALL)
+            .border_style(Style::new().fg(Color::Cyan)),
+    )
+    .wrap(Wrap { trim: true });
+    header.render(chunks[0], buffer);
+
+    let items: Vec<ListItem<'_>> = specs
+        .iter()
+        .enumerate()
+        .map(|(index, spec)| launcher_diagnostic_item(index, selected_index, spec))
+        .collect();
+    let list = List::new(items).block(
+        Block::default()
+            .title(" Actions ")
+            .borders(Borders::ALL)
+            .border_style(Style::new().fg(Color::Blue)),
+    );
+    list.render(chunks[1], buffer);
+
+    let footer = Paragraph::new(vec![
+        Line::from(vec![
+            Span::styled(
+                "Arrow keys / Tab",
+                Style::new()
+                    .fg(Color::LightCyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" navigate  "),
+            Span::styled(
+                "Enter / Space",
+                Style::new()
+                    .fg(Color::LightCyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" invoke"),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                "Alt+X",
+                Style::new()
+                    .fg(Color::LightCyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" pretty view"),
+        ]),
+    ])
+    .block(
+        Block::default()
+            .title(" Controls ")
+            .borders(Borders::ALL)
+            .border_style(Style::new().fg(Color::DarkGray)),
+    );
+    footer.render(chunks[2], buffer);
+}
+
+fn launcher_diagnostic_item<'a>(
+    index: usize,
+    selected_index: usize,
+    spec: &SceneButtonSpec,
+) -> ListItem<'a> {
+    let selected = index == selected_index;
+    let base_style = if selected {
+        Style::new()
+            .fg(Color::White)
+            .bg(Color::Rgb(50, 66, 98))
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::new().fg(Color::Gray)
+    };
+
+    ListItem::new(vec![
+        Line::from(vec![
+            Span::styled(if selected { "> " } else { "  " }, base_style),
+            Span::styled(spec.label, base_style),
+        ]),
+        Line::from(vec![
+            Span::styled("    ", base_style),
+            Span::styled(spec.tooltip, base_style.fg(Color::LightBlue)),
+        ]),
+    ])
+    .style(base_style)
+}
+
+fn launcher_diagnostic_chunks(area: RatatuiRect) -> std::rc::Rc<[RatatuiRect]> {
+    Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(7),
+            Constraint::Min(5),
+            Constraint::Length(4),
+        ])
+        .split(area)
+}
+
+fn ratatui_block_inner(rect: RatatuiRect) -> RatatuiRect {
+    let x = rect.x.saturating_add(1);
+    let y = rect.y.saturating_add(1);
+    let width = rect.width.saturating_sub(2);
+    let height = rect.height.saturating_sub(2);
+    RatatuiRect::new(x, y, width, height)
+}
+
+fn ratatui_rect_to_client_rect(
+    body_rect: ClientRect,
+    rect: RatatuiRect,
+    cell_width: i32,
+    cell_height: i32,
+) -> ClientRect {
+    let left = body_rect.left() + i32::from(rect.x) * cell_width;
+    let top = body_rect.top() + i32::from(rect.y) * cell_height;
+    ClientRect::new(
+        left,
+        top,
+        left + i32::from(rect.width) * cell_width,
+        top + i32::from(rect.height) * cell_height,
+    )
 }
 
 #[expect(
@@ -1363,6 +2338,7 @@ fn render_audio_input_device_diagnostic_buffer(
     area: RatatuiRect,
     devices: &[AudioInputDeviceSummary],
     selected_index: usize,
+    scramble_input_device_identifiers: bool,
 ) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -1419,7 +2395,12 @@ fn render_audio_input_device_diagnostic_buffer(
             .iter()
             .enumerate()
             .map(|(index, device)| {
-                audio_input_device_diagnostic_item(index, selected_index, device)
+                audio_input_device_diagnostic_item(
+                    index,
+                    selected_index,
+                    device,
+                    scramble_input_device_identifiers,
+                )
             })
             .collect()
     };
@@ -1485,6 +2466,7 @@ fn audio_input_device_diagnostic_item<'a>(
     index: usize,
     selected_index: usize,
     device: &AudioInputDeviceSummary,
+    scramble_input_device_identifiers: bool,
 ) -> ListItem<'a> {
     let selected = index == selected_index;
     let sample_rate = device.sample_rate_hz.map_or_else(
@@ -1515,7 +2497,10 @@ fn audio_input_device_diagnostic_item<'a>(
         ]),
         Line::from(vec![
             Span::styled("    ", base_style),
-            Span::styled(device.id.clone(), base_style.fg(Color::DarkGray)),
+            Span::styled(
+                input_device_identifier_display_text(&device.id, scramble_input_device_identifiers),
+                base_style.fg(Color::DarkGray),
+            ),
         ]),
     ])
     .style(base_style)
@@ -1794,6 +2779,36 @@ fn build_scene_shell(
     scene
 }
 
+fn push_virtual_cursor_pointer(
+    scene: &mut RenderScene,
+    virtual_cursor: Option<ClientPoint>,
+    sprite: SpriteId,
+    color: [f32; 4],
+) {
+    // windowing[impl virtual-cursor.os-cursor-sprite]
+    let Some(point) = virtual_cursor.and_then(|point| point.to_win32_point().ok()) else {
+        return;
+    };
+    let size = 66;
+    let left = point.x - 6;
+    let top = point.y - 4;
+    let pointer_rect = ClientRect::new(left, top, left + size, top + size);
+    let shadow_rect = ClientRect::new(
+        pointer_rect.left() + 4,
+        pointer_rect.top() + 5,
+        pointer_rect.right() + 4,
+        pointer_rect.bottom() + 5,
+    );
+
+    push_sprite(
+        scene,
+        shadow_rect.to_win32_rect(),
+        [0.0, 0.0, 0.0, 0.38],
+        sprite,
+    );
+    push_sprite(scene, pointer_rect.to_win32_rect(), color, sprite);
+}
+
 #[expect(
     clippy::cast_possible_truncation,
     reason = "the hover proximity is normalized into the 0..=1 range before conversion"
@@ -1926,6 +2941,10 @@ mod tests {
 
     // windowing[verify launcher.buttons.terminal]
     // windowing[verify launcher.buttons.storage-placeholder]
+    // windowing[verify launcher.buttons.environment-variables-placeholder]
+    // windowing[verify launcher.buttons.application-windows-placeholder]
+    // windowing[verify launcher.buttons.cursor-gallery]
+    // windowing[verify launcher.buttons.demo-mode]
     // windowing[verify launcher.buttons.audio-picker]
     #[test]
     fn launcher_scene_specs_expose_primary_actions() {
@@ -1944,7 +2963,27 @@ mod tests {
         assert!(
             specs
                 .iter()
+                .any(|spec| spec.action == SceneAction::OpenCursorGallery)
+        );
+        assert!(
+            specs
+                .iter()
+                .any(|spec| spec.action == SceneAction::OpenDemoMode)
+        );
+        assert!(
+            specs
+                .iter()
                 .any(|spec| spec.action == SceneAction::OpenStorage)
+        );
+        assert!(
+            specs
+                .iter()
+                .any(|spec| spec.action == SceneAction::OpenEnvironmentVariables)
+        );
+        assert!(
+            specs
+                .iter()
+                .any(|spec| spec.action == SceneAction::OpenApplicationWindows)
         );
         assert!(
             specs
@@ -1972,6 +3011,7 @@ mod tests {
     }
 
     // windowing[verify launcher.buttons.large-image-cards]
+    // windowing[verify launcher.keyboard-navigation]
     #[test]
     // audio[verify gui.launcher-button]
     fn launcher_scene_uses_card_panels_for_primary_actions() {
@@ -1981,6 +3021,7 @@ mod tests {
             WindowChromeButtonsState::default(),
             DEFAULT_MAX_BUTTON_SIZE,
             &[],
+            None,
         );
         let card_count = scene
             .panels
@@ -1988,8 +3029,95 @@ mod tests {
             .filter(|panel| matches!(panel.effect, PanelEffect::SceneButtonCard))
             .count();
 
-        assert_eq!(card_count, 5);
-        assert_eq!(scene.sprites.len(), 5);
+        assert_eq!(card_count, 9);
+        assert_eq!(scene.sprites.len(), 9);
+    }
+
+    // windowing[verify demo-mode.window]
+    // windowing[verify demo-mode.input-device-identifier-scramble]
+    #[test]
+    fn demo_mode_scene_draws_button_toggle_and_identifiers() {
+        let scene = build_demo_mode_render_scene(
+            sample_layout(),
+            WindowChromeButtonsState::default(),
+            true,
+            DemoModeVisualState::default(),
+        );
+
+        assert!(scene.panels.len() >= 4);
+        assert!(
+            demo_mode_input_device_identifiers(true)
+                .iter()
+                .all(|identifier| identifier.starts_with("{0.0.1."))
+        );
+        assert_ne!(
+            demo_mode_input_device_identifiers(false),
+            demo_mode_input_device_identifiers(true)
+        );
+    }
+
+    // windowing[verify virtual-cursor.os-cursor-sprite]
+    #[test]
+    fn launcher_scene_draws_virtual_cursor_pointer_when_present() {
+        let scene = build_scene_render_scene(
+            sample_layout(),
+            SceneWindowKind::Launcher,
+            WindowChromeButtonsState::default(),
+            DEFAULT_MAX_BUTTON_SIZE,
+            &[],
+            Some(ClientPoint::new(120, 140)),
+        );
+
+        assert!(
+            scene
+                .sprites
+                .iter()
+                .any(|sprite| sprite.sprite == SpriteId::CursorHand)
+        );
+    }
+
+    // windowing[verify cursor-gallery.stock-os-cursors]
+    // windowing[verify cursor-gallery.hover-glow-color]
+    #[test]
+    fn cursor_gallery_scene_draws_stock_cursor_sprites() {
+        let scene = build_cursor_gallery_render_scene(
+            sample_layout(),
+            WindowChromeButtonsState::default(),
+            0,
+            None,
+            None,
+        );
+
+        assert_eq!(cursor_gallery_sprite_specs().len(), 7);
+        assert!(scene.sprites.len() >= cursor_gallery_sprite_specs().len());
+        assert!(scene.panels.len() > cursor_gallery_sprite_specs().len());
+    }
+
+    // windowing[verify cursor-gallery.virtual-navigation]
+    #[test]
+    fn cursor_gallery_cell_layouts_expose_hit_rects() {
+        let cells = cursor_gallery_cell_layouts(sample_layout());
+
+        assert_eq!(cells.len(), cursor_gallery_sprite_specs().len());
+        assert!(cells.iter().all(|cell| cell.hit_rect().width() > 0));
+        assert!(cells.iter().all(|cell| cell.hit_rect().height() > 0));
+    }
+
+    #[test]
+    // windowing[verify diagnostics.launcher-tui]
+    fn launcher_diagnostics_render_blocks_and_selected_color() {
+        let area = RatatuiRect::new(0, 0, 82, 24);
+        let mut buffer = Buffer::empty(area);
+
+        render_launcher_diagnostic_buffer(&mut buffer, area, 1, Some(ClientPoint::new(42, 99)));
+
+        assert_ne!(buffer.cell((0, 0)).map(|cell| cell.symbol()), Some(" "));
+        assert!(
+            buffer
+                .content()
+                .iter()
+                .any(|cell| { cell.symbol().contains("C") && cell.bg == Color::Rgb(50, 66, 98) })
+        );
     }
 
     #[test]
@@ -2002,7 +3130,7 @@ mod tests {
         let area = RatatuiRect::new(0, 0, 80, 24);
         let mut buffer = Buffer::empty(area);
 
-        render_audio_input_device_diagnostic_buffer(&mut buffer, area, &devices, 1);
+        render_audio_input_device_diagnostic_buffer(&mut buffer, area, &devices, 1, false);
 
         assert_ne!(buffer.cell((0, 0)).map(|cell| cell.symbol()), Some(" "));
         assert!(
@@ -2022,6 +3150,7 @@ mod tests {
             WindowChromeButtonsState::default(),
             &devices,
             0,
+            false,
         );
         let body_rect = sample_layout().terminal_panel_rect().inset(22);
         let legacy_dialog_rect = audio_input_legacy_recording_dialog_button_rect(body_rect);
@@ -2046,6 +3175,8 @@ mod tests {
             WindowChromeButtonsState::default(),
             Some(&state),
             AudioInputDeviceDetailVisualState::default(),
+            false,
+            None,
         );
         let body_rect = sample_layout().terminal_panel_rect().inset(24);
         let detail_layout = audio_input_device_detail_layout(body_rect);
@@ -2069,6 +3200,44 @@ mod tests {
             == detail_layout.loopback_button_rect.to_win32_rect()
             && matches!(panel.effect, PanelEffect::LoopbackButton)));
         assert!(!scene.glyphs.is_empty());
+    }
+
+    #[test]
+    // windowing[verify scene.pretty-text.selection]
+    fn audio_input_device_detail_pretty_metadata_renders_selection() {
+        let state = sample_audio_input_device_window();
+        let selection = TerminalSelection::new(
+            TerminalCellPoint::new(0, 1),
+            TerminalCellPoint::new(10, 1),
+            crate::app::windows_terminal::TerminalSelectionMode::Linear,
+        );
+        let scene = build_audio_input_device_detail_render_scene(
+            sample_layout(),
+            WindowChromeButtonsState::default(),
+            Some(&state),
+            AudioInputDeviceDetailVisualState::default(),
+            false,
+            Some(selection),
+        );
+
+        assert!(scene.panels.iter().any(|panel| {
+            panel.effect == PanelEffect::TerminalFill && panel.color == [0.42, 0.67, 0.98, 1.0]
+        }));
+    }
+
+    #[test]
+    // windowing[verify demo-mode.input-device-identifier-scramble]
+    // windowing[verify demo-mode.live-audio-device-scramble]
+    fn input_device_identifier_display_text_scrambles_without_mutating_shape() {
+        let scrambled = input_device_identifier_display_text("endpoint-a", true);
+
+        assert_ne!(scrambled, "endpoint-a");
+        assert!(scrambled.starts_with("{0.0.1."));
+        assert!(!scrambled.starts_with("SWD\\MMDEVAPI\\"));
+        assert_eq!(
+            input_device_identifier_display_text("endpoint-a", false),
+            "endpoint-a"
+        );
     }
 
     // windowing[verify garden-band.shared]

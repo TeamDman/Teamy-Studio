@@ -12,6 +12,11 @@ float sdBox(float2 p, float2 b) {
     return length(max(d, 0.0)) + min(max(d.x, d.y), 0.0);
 }
 
+float sdRoundedBox(float2 p, float2 b, float r) {
+    float2 q = abs(p) - b + r.xx;
+    return length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - r;
+}
+
 float cross2d(float2 a, float2 b) {
     return (a.x * b.y) - (a.y * b.x);
 }
@@ -76,6 +81,14 @@ float line_segment_mask(float2 uv, float2 a, float2 b, float thickness) {
     return 1.0 - smoothstep(thickness, thickness + 0.02, distance_field);
 }
 
+float icon_pin(float2 uv) {
+    float head = box_fill_mask(uv, float2(0.50, 0.30), float2(0.18, 0.055));
+    float neck = line_segment_mask(uv, float2(0.50, 0.34), float2(0.50, 0.58), 0.045);
+    float tip = triangle_mask(uv, float2(0.38, 0.55), float2(0.62, 0.55), float2(0.50, 0.76), 0.018);
+    float shine = line_segment_mask(uv, float2(0.42, 0.24), float2(0.58, 0.24), 0.025);
+    return saturate(max(max(head, neck), max(tip, shine)));
+}
+
 float icon_minimize(float2 uv) {
     return box_fill_mask(uv, float2(0.5, 0.64), float2(0.22, 0.04));
 }
@@ -119,22 +132,26 @@ float icon_gear(float2 uv) {
 
 float chrome_icon_mask(float2 uv, float effect) {
     if (effect < 16.5) {
-        return icon_diagnostics(uv);
+        return icon_pin(uv);
     }
 
     if (effect < 17.5) {
-        return icon_minimize(uv);
+        return icon_diagnostics(uv);
     }
 
     if (effect < 18.5) {
-        return icon_maximize(uv);
+        return icon_minimize(uv);
     }
 
     if (effect < 19.5) {
+        return icon_maximize(uv);
+    }
+
+    if (effect < 20.5) {
         return icon_restore(uv);
     }
 
-    if (effect > 20.5) {
+    if (effect > 21.5) {
         return icon_gear(uv);
     }
 
@@ -321,5 +338,29 @@ float4 apply_timeline_head_grabber(float2 uv, float4 color, float4 state) {
     float3 shaded = color.rgb * (0.82 + (active * 0.10) + (hover * 0.10) + (grabbed * 0.18) + (scan * 0.04));
     shaded += float3(0.94, 0.96, 0.99) * (bevel * (0.08 + hover * 0.10 + grabbed * 0.12));
     float alpha = saturate((box * 0.98) + (bevel * 0.10));
+    return float4(shaded, alpha * color.a);
+}
+
+float4 apply_demo_toggle(float2 uv, float4 color, float4 state) {
+    float enabled = state.x;
+    float hover = state.y;
+    float pressed = state.z;
+    float transition = state.w;
+    float t = PanelTime();
+    float2 p = uv - 0.5;
+    float capsule = 1.0 - smoothstep(0.40, 0.50, sdRoundedBox(p, float2(0.46, 0.28), 0.25));
+    float rim = 1.0 - smoothstep(0.30, 0.48, abs(p.y));
+    float scan = 0.5 + (0.5 * sin((uv.x * 16.0) - (t * (1.0 + enabled * 1.4))));
+    float sparkle = 0.5 + (0.5 * sin((uv.y * 20.0) + (uv.x * 8.0) + (t * 2.2)));
+    float3 offColor = float3(0.30, 0.11, 0.14);
+    float3 onColor = float3(0.12, 0.62, 0.52);
+    float3 stateColor = lerp(offColor, onColor, enabled);
+    float sweepCenter = lerp(0.22, 0.78, enabled);
+    float sweep = exp(-pow((uv.x - sweepCenter) / 0.20, 2.0)) * transition;
+    float intensity = 0.78 + (hover * 0.12) + (scan * 0.07) + (sparkle * 0.04) + (sweep * 0.25) - (pressed * 0.10);
+    float3 shaded = stateColor * intensity;
+    shaded += lerp(float3(1.00, 0.36, 0.34), float3(0.70, 1.00, 0.92), enabled) * (rim * (0.11 + hover * 0.08 + transition * 0.18));
+    shaded += color.rgb * 0.04;
+    float alpha = saturate((capsule * 0.96) + (rim * 0.10));
     return float4(shaded, alpha * color.a);
 }

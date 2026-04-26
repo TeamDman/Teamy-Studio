@@ -1,7 +1,8 @@
 use std::cell::RefCell;
+use std::ffi::c_void;
 use std::marker::PhantomData;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 #[cfg(feature = "tracy")]
@@ -29,8 +30,8 @@ use windows::Win32::UI::Controls::{
 };
 use windows::Win32::UI::HiDpi::{GetDpiForSystem, GetDpiForWindow};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, VK_ADD, VK_CONTROL, VK_DOWN, VK_ESCAPE, VK_LBUTTON, VK_MENU, VK_OEM_MINUS,
-    VK_OEM_PLUS, VK_RETURN, VK_SHIFT, VK_SPACE, VK_SUBTRACT, VK_TAB, VK_UP,
+    GetKeyState, VK_ADD, VK_CONTROL, VK_DOWN, VK_ESCAPE, VK_LBUTTON, VK_LEFT, VK_MENU,
+    VK_OEM_MINUS, VK_OEM_PLUS, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_SPACE, VK_SUBTRACT, VK_TAB, VK_UP,
 };
 use windows::Win32::UI::Shell::{
     ITaskbarList3, TBPF_ERROR, TBPF_INDETERMINATE, TBPF_NOPROGRESS, TBPF_NORMAL, TBPF_PAUSED,
@@ -39,17 +40,19 @@ use windows::Win32::UI::Shell::{
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, EnumWindows, GetClassNameW,
     GetClientRect, GetCursorPos, GetMessageW, GetSystemMetrics, GetWindowRect,
-    GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, HTCAPTION, HTCLIENT, IDC_ARROW,
-    IDC_HAND, IDC_IBEAM, IDC_SIZEALL, IsWindowVisible, IsZoomed, KillTimer, LoadCursorW, MSG,
-    MoveWindow, PostMessageW, PostQuitMessage, RegisterClassExW, SM_CXPADDEDBORDER, SM_CXSCREEN,
-    SM_CXSIZEFRAME, SM_CYSCREEN, SM_CYSIZEFRAME, SW_MAXIMIZE, SW_MINIMIZE, SW_RESTORE, SW_SHOW,
-    SYSTEM_METRICS_INDEX, SendMessageW, SetCursor, SetTimer, SetWindowTextW, ShowWindow,
-    TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CHAR, WM_CLOSE, WM_DESTROY, WM_DPICHANGED,
-    WM_ENTERSIZEMOVE, WM_ERASEBKGND, WM_EXITSIZEMOVE, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCALCSIZE, WM_NCHITTEST,
-    WM_NCLBUTTONDOWN, WM_PAINT, WM_RBUTTONUP, WM_SETCURSOR, WM_SETFOCUS, WM_SIZE, WM_SYSKEYDOWN,
-    WM_SYSKEYUP, WM_TIMER, WNDCLASSEXW, WS_EX_APPWINDOW, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOPMOST,
-    WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP, WS_THICKFRAME, WS_VISIBLE,
+    GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, HTCAPTION, HTCLIENT,
+    HWND_NOTOPMOST, HWND_TOPMOST, IDC_ARROW, IDC_CROSS, IDC_HAND, IDC_HELP, IDC_IBEAM, IDC_SIZEALL,
+    IDC_WAIT, IsWindowVisible, IsZoomed, KillTimer, LoadCursorW, MSG, MoveWindow, PostMessageW,
+    PostQuitMessage, RegisterClassExW, SM_CXPADDEDBORDER, SM_CXSCREEN, SM_CXSIZEFRAME, SM_CYSCREEN,
+    SM_CYSIZEFRAME, SW_MAXIMIZE, SW_MINIMIZE, SW_RESTORE, SW_SHOW, SWP_NOACTIVATE, SWP_NOMOVE,
+    SWP_NOSIZE, SYSTEM_METRICS_INDEX, SendMessageW, SetCursor, SetTimer, SetWindowPos,
+    SetWindowTextW, ShowWindow, TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CHAR,
+    WM_CLOSE, WM_DESTROY, WM_DPICHANGED, WM_ENTERSIZEMOVE, WM_ERASEBKGND, WM_EXITSIZEMOVE,
+    WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
+    WM_NCCALCSIZE, WM_NCHITTEST, WM_NCLBUTTONDOWN, WM_PAINT, WM_RBUTTONUP, WM_SETCURSOR,
+    WM_SETFOCUS, WM_SIZE, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WNDCLASSEXW, WS_EX_APPWINDOW,
+    WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOPMOST, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP,
+    WS_THICKFRAME, WS_VISIBLE,
 };
 use windows::core::{BOOL, PCWSTR, w};
 
@@ -77,6 +80,9 @@ use super::windows_cursor_info::{CursorInfoConfig, CursorInfoVirtualSession};
 use super::windows_d3d12_renderer::{
     ButtonVisualState, RenderFrameModel, RenderThreadProxy, RendererTerminalVisualState,
     WindowChromeButtonsState,
+};
+use super::windows_demo_mode::{
+    current_demo_mode_state, initialize_demo_mode_state, set_scramble_input_device_identifiers,
 };
 use super::windows_dialogs::{
     PasteConfirmationChoice, paste_confirmation_required, show_multiline_paste_confirmation_dialog,
@@ -126,10 +132,53 @@ const TERMINAL_THROUGHPUT_BENCHMARK_MEASURE_PREFIX: &str =
 const TERMINAL_THROUGHPUT_BENCHMARK_TIMEOUT: Duration = Duration::from_mins(1);
 const TERMINAL_THROUGHPUT_BENCHMARK_POLL_INTERVAL: Duration = Duration::from_millis(1);
 const TERMINAL_THROUGHPUT_RESULTS_DIR: &str = "self-test/terminal-throughput";
+const DEMO_MODE_STATE_CHANGED_MESSAGE: u32 = WM_APP + 0x402;
 
 thread_local! {
     static APP_STATE: RefCell<Option<AppState>> = const { RefCell::new(None) };
     static SCENE_APP_STATE: RefCell<Option<SceneAppState>> = const { RefCell::new(None) };
+}
+
+fn scene_window_registry() -> &'static Mutex<Vec<isize>> {
+    static SCENE_WINDOW_REGISTRY: OnceLock<Mutex<Vec<isize>>> = OnceLock::new();
+
+    SCENE_WINDOW_REGISTRY.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn register_scene_window(hwnd: WindowHandle) {
+    if let Ok(mut windows) = scene_window_registry().lock() {
+        let raw = hwnd.raw().0 as isize;
+        if !windows.contains(&raw) {
+            windows.push(raw);
+        }
+    }
+}
+
+fn unregister_scene_window(hwnd: WindowHandle) {
+    if let Ok(mut windows) = scene_window_registry().lock() {
+        let raw = hwnd.raw().0 as isize;
+        windows.retain(|window| *window != raw);
+    }
+}
+
+fn broadcast_demo_mode_state_changed() {
+    // windowing[impl demo-mode.live-audio-device-scramble]
+    let Ok(windows) = scene_window_registry().lock() else {
+        return;
+    };
+
+    for raw in windows.iter().copied() {
+        let hwnd = HWND(raw as *mut c_void);
+        // Safety: the registry stores HWND values for live scene windows and stale entries are tolerated by PostMessageW.
+        let _ = unsafe {
+            PostMessageW(
+                Some(hwnd),
+                DEMO_MODE_STATE_CHANGED_MESSAGE,
+                WPARAM(0),
+                LPARAM(0),
+            )
+        };
+    }
 }
 
 #[expect(
@@ -150,6 +199,8 @@ struct AppState {
     pending_diagnostic_selection: Option<PendingTerminalSelection>,
     diagnostic_selection_drag_point: Option<ClientPoint>,
     pressed_chrome_button: Option<WindowChromeButton>,
+    pin_button_last_clicked_at: Option<Instant>,
+    pinned_topmost: bool,
     diagnostics_button_last_clicked_at: Option<Instant>,
     terminal_selection: Option<TerminalSelection>,
     pending_terminal_selection: Option<PendingTerminalSelection>,
@@ -346,6 +397,7 @@ impl HostedTerminalSession {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum WindowChromeButton {
+    Pin,
     Diagnostics,
     Minimize,
     MaximizeRestore,
@@ -362,8 +414,14 @@ enum ScenePressedTarget {
     AudioInputTimelineHead(AudioInputTimelineHeadKind),
     LegacyRecordingDevices,
     AudioInputTimeline,
+    DemoModeButton,
+    DemoModeScrambleToggle,
 }
 
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "window interaction state is tracked independently for input routing"
+)]
 struct SceneAppState {
     app_home: AppHome,
     hwnd: Option<WindowHandle>,
@@ -372,8 +430,14 @@ struct SceneAppState {
     vt_engine: VtEngineChoice,
     audio_input_picker: AudioInputPickerState,
     audio_input_device_window: Option<AudioInputDeviceWindowState>,
+    demo_mode_scramble_input_device_identifiers: DemoModeInputDeviceIdentifierScramble,
+    demo_mode_scramble_toggle_last_changed_at: Option<Instant>,
+    scene_action_selected_index: usize,
+    scene_virtual_cursor: Option<ClientPoint>,
     pointer_position: Option<ClientPoint>,
     pressed_target: Option<ScenePressedTarget>,
+    pin_button_last_clicked_at: Option<Instant>,
+    pinned_topmost: bool,
     last_clicked_action: Option<ClickState<SceneAction>>,
     diagnostics_button_last_clicked_at: Option<Instant>,
     diagnostics_visible: bool,
@@ -389,6 +453,46 @@ struct SceneAppState {
     diagnostic_cell_height: i32,
     chrome_tooltip: ChromeTooltipController,
     renderer: Option<RenderThreadProxy>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum DemoModeInputDeviceIdentifierScramble {
+    #[default]
+    Off,
+    On,
+}
+
+impl DemoModeInputDeviceIdentifierScramble {
+    const fn from_enabled(enabled: bool) -> Self {
+        if enabled { Self::On } else { Self::Off }
+    }
+
+    const fn is_enabled(self) -> bool {
+        matches!(self, Self::On)
+    }
+}
+
+fn sync_demo_mode_state(state: &mut SceneAppState) {
+    let enabled = current_demo_mode_state().scramble_input_device_identifiers;
+    let next = DemoModeInputDeviceIdentifierScramble::from_enabled(enabled);
+    if state.demo_mode_scramble_input_device_identifiers != next {
+        state.demo_mode_scramble_input_device_identifiers = next;
+        state.demo_mode_scramble_toggle_last_changed_at = Some(Instant::now());
+    }
+}
+
+fn toggle_demo_mode_scramble_input_device_identifiers(
+    state: &mut SceneAppState,
+) -> eyre::Result<()> {
+    let enabled = !state
+        .demo_mode_scramble_input_device_identifiers
+        .is_enabled();
+    set_scramble_input_device_identifiers(&state.app_home, enabled)?;
+    state.demo_mode_scramble_input_device_identifiers =
+        DemoModeInputDeviceIdentifierScramble::from_enabled(enabled);
+    state.demo_mode_scramble_toggle_last_changed_at = Some(Instant::now());
+    broadcast_demo_mode_state_changed();
+    Ok(())
 }
 
 #[derive(Debug, Default)]
@@ -613,6 +717,28 @@ impl WindowHandle {
         }
     }
 
+    fn set_topmost(self, enabled: bool) -> eyre::Result<()> {
+        self.window_thread.assert_window_thread();
+        let insert_after = if enabled {
+            HWND_TOPMOST
+        } else {
+            HWND_NOTOPMOST
+        };
+        // Safety: SetWindowPos is applied to this live top-level window without moving or resizing it.
+        unsafe {
+            SetWindowPos(
+                self.hwnd,
+                Some(insert_after),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            )
+        }
+        .wrap_err("failed to update window pin state")
+    }
+
     fn destroy(self) {
         self.window_thread.assert_window_thread();
         // Safety: `self.hwnd` is a live top-level window owned by this process on `self.window_thread`.
@@ -772,6 +898,13 @@ struct PendingTerminalSelection {
     mode: TerminalSelectionMode,
 }
 
+struct SceneSelectableTextTarget {
+    rect: ClientRect,
+    text: String,
+    cell_width: i32,
+    cell_height: i32,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PendingDragAction {
     NotHandled,
@@ -853,6 +986,7 @@ enum SceneKeyAction {
     Handled,
     CloseWindow,
     OpenAudioInputDeviceWindow(Option<AudioInputDeviceSummary>),
+    InvokeSceneAction(SceneAction),
     ToggleAudioInputRecording,
     ToggleAudioInputPlayback,
     PauseAudioInputPlayback,
@@ -1104,6 +1238,8 @@ fn run_with_terminal_session(
             pending_diagnostic_selection: None,
             diagnostic_selection_drag_point: None,
             pressed_chrome_button: None,
+            pin_button_last_clicked_at: None,
+            pinned_topmost: false,
             diagnostics_button_last_clicked_at: None,
             terminal_selection: None,
             pending_terminal_selection: None,
@@ -1167,6 +1303,7 @@ fn run_scene_window(
     vt_engine: VtEngineChoice,
     audio_input_device_window: Option<AudioInputDeviceWindowState>,
 ) -> eyre::Result<()> {
+    initialize_demo_mode_state(app_home)?;
     let window_thread = WindowThread::current();
     let dpi = system_dpi();
     let focused_render_interval_ms = measure_focused_render_interval_ms();
@@ -1189,8 +1326,17 @@ fn run_scene_window(
             vt_engine,
             audio_input_picker,
             audio_input_device_window,
+            demo_mode_scramble_input_device_identifiers:
+                DemoModeInputDeviceIdentifierScramble::from_enabled(
+                    current_demo_mode_state().scramble_input_device_identifiers,
+                ),
+            demo_mode_scramble_toggle_last_changed_at: None,
+            scene_action_selected_index: 0,
+            scene_virtual_cursor: None,
             pointer_position: None,
             pressed_target: None,
+            pin_button_last_clicked_at: None,
+            pinned_topmost: false,
             last_clicked_action: None,
             diagnostics_button_last_clicked_at: None,
             diagnostics_visible: false,
@@ -1210,6 +1356,7 @@ fn run_scene_window(
     });
 
     let hwnd = create_scene_window(window_thread, scene_kind.title())?;
+    register_scene_window(hwnd);
     let renderer = RenderThreadProxy::new(hwnd.raw())?;
     let chrome_tooltip = ChromeTooltipController::create(hwnd)?;
     with_scene_app_state(|state| {
@@ -1931,6 +2078,7 @@ extern "system" fn scene_window_proc(
         WM_DPICHANGED => handle_scene_dpi_changed(hwnd, lparam),
         WM_SIZE => handle_scene_size(hwnd),
         WM_TIMER if wparam.0 == FOCUSED_RENDER_TIMER_ID => handle_scene_focused_render_timer(hwnd),
+        DEMO_MODE_STATE_CHANGED_MESSAGE => handle_scene_demo_mode_state_changed(hwnd),
         WM_KEYDOWN | WM_SYSKEYDOWN => handle_scene_key_down_message(hwnd, message, wparam, lparam),
         WM_LBUTTONDOWN => handle_bool_message(hwnd, message, wparam, lparam, |hwnd| {
             handle_scene_left_button_down(hwnd, lparam)
@@ -2095,6 +2243,87 @@ fn handle_scene_key_down_message(
             }
         }
 
+        if state.scene_kind == SceneWindowKind::Launcher {
+            // windowing[impl launcher.keyboard-navigation]
+            if let Some(navigation) =
+                launcher_menu_navigation_from_virtual_key(virtual_key, shift_key_is_down())
+            {
+                let layout = scene_client_layout(hwnd, state)?;
+                let rects = scene_action_navigation_rects(state, layout);
+                let (selected_index, virtual_cursor) = next_scene_action_target(
+                    &rects,
+                    state.scene_action_selected_index,
+                    state.scene_virtual_cursor,
+                    navigation,
+                );
+                state.scene_action_selected_index = selected_index;
+                state.scene_virtual_cursor = Some(virtual_cursor);
+                render_scene_window_frame(state, hwnd, None, false)?;
+                update_scene_virtual_cursor_tooltip(state, hwnd)?;
+                return Ok(SceneKeyAction::Handled);
+            }
+            if virtual_key == u32::from(VK_RETURN.0) || virtual_key == u32::from(VK_SPACE.0) {
+                let Some(action) = selected_scene_action(state) else {
+                    return Ok(SceneKeyAction::NotHandled);
+                };
+                state.last_clicked_action = Some(ClickState {
+                    action,
+                    clicked_at: Instant::now(),
+                });
+                return Ok(SceneKeyAction::InvokeSceneAction(action));
+            }
+        }
+
+        if state.scene_kind == SceneWindowKind::CursorGallery {
+            // windowing[impl cursor-gallery.virtual-navigation]
+            if let Some(navigation) =
+                launcher_menu_navigation_from_virtual_key(virtual_key, shift_key_is_down())
+            {
+                let layout = scene_client_layout(hwnd, state)?;
+                let rects = cursor_gallery_navigation_rects(layout);
+                let (selected_index, virtual_cursor) = next_scene_action_target(
+                    &rects,
+                    state.scene_action_selected_index,
+                    state.scene_virtual_cursor,
+                    navigation,
+                );
+                state.scene_action_selected_index = selected_index;
+                state.scene_virtual_cursor = Some(virtual_cursor);
+                render_scene_window_frame(state, hwnd, None, false)?;
+                update_scene_virtual_cursor_tooltip(state, hwnd)?;
+                return Ok(SceneKeyAction::Handled);
+            }
+        }
+
+        if state.scene_kind == SceneWindowKind::DemoMode {
+            // windowing[impl demo-mode.window]
+            if let Some(navigation) =
+                launcher_menu_navigation_from_virtual_key(virtual_key, shift_key_is_down())
+            {
+                let layout = scene_client_layout(hwnd, state)?;
+                let rects = demo_mode_navigation_rects(layout);
+                let (selected_index, virtual_cursor) = next_scene_action_target(
+                    &rects,
+                    state.scene_action_selected_index,
+                    state.scene_virtual_cursor,
+                    navigation,
+                );
+                state.scene_action_selected_index = selected_index;
+                state.scene_virtual_cursor = Some(virtual_cursor);
+                render_scene_window_frame(state, hwnd, None, false)?;
+                update_scene_virtual_cursor_tooltip(state, hwnd)?;
+                return Ok(SceneKeyAction::Handled);
+            }
+            if virtual_key == u32::from(VK_RETURN.0) || virtual_key == u32::from(VK_SPACE.0) {
+                if state.scene_action_selected_index == 1 {
+                    toggle_demo_mode_scramble_input_device_identifiers(state)?;
+                }
+                render_scene_window_frame(state, hwnd, None, false)?;
+                update_scene_virtual_cursor_tooltip(state, hwnd)?;
+                return Ok(SceneKeyAction::Handled);
+            }
+        }
+
         if state.scene_kind != SceneWindowKind::AudioInputDevicePicker {
             return Ok(SceneKeyAction::NotHandled);
         }
@@ -2143,6 +2372,27 @@ fn handle_scene_key_down_message(
         Ok(SceneKeyAction::OpenAudioInputDeviceWindow(device)) => {
             open_audio_input_device_window_from_scene(hwnd, device);
             LRESULT(0)
+        }
+        Ok(SceneKeyAction::InvokeSceneAction(action)) => {
+            let result =
+                with_scene_app_state(|state| Ok((state.app_home.clone(), state.vt_engine)))
+                    .and_then(|(app_home, vt_engine)| {
+                        perform_scene_action(&app_home, vt_engine, action)
+                    })
+                    .and_then(|disposition| {
+                        with_scene_app_state(|state| {
+                            render_scene_window_frame(state, hwnd, None, false)
+                        })?;
+                        Ok(disposition)
+                    });
+            match result {
+                Ok(SceneActionDisposition::KeepOpen) => LRESULT(0),
+                Ok(SceneActionDisposition::CloseWindow) => {
+                    hwnd.post_close();
+                    LRESULT(0)
+                }
+                Err(error) => fail_and_close(hwnd, &error),
+            }
         }
         Ok(SceneKeyAction::ToggleAudioInputRecording) => {
             let result = with_scene_app_state(|state| {
@@ -2213,6 +2463,7 @@ fn handle_scene_key_down_message(
 }
 
 fn handle_scene_destroy_message(hwnd: WindowHandle) -> LRESULT {
+    unregister_scene_window(hwnd);
     SCENE_APP_STATE.with(|state| {
         if let Some(state) = state.borrow_mut().as_mut() {
             state.chrome_tooltip.destroy();
@@ -2221,6 +2472,17 @@ fn handle_scene_destroy_message(hwnd: WindowHandle) -> LRESULT {
     });
     hwnd.post_quit_message();
     LRESULT(0)
+}
+
+fn handle_scene_demo_mode_state_changed(hwnd: WindowHandle) -> LRESULT {
+    // windowing[impl demo-mode.live-audio-device-scramble]
+    match with_scene_app_state(|state| {
+        sync_demo_mode_state(state);
+        render_scene_window_frame(state, hwnd, None, true)
+    }) {
+        Ok(()) => LRESULT(0),
+        Err(error) => fail_and_close(hwnd, &error),
+    }
 }
 
 #[expect(
@@ -2250,6 +2512,10 @@ fn handle_scene_left_button_down(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Re
                 scene_toggle_diagnostics_panel(state);
                 return Ok(ScenePointerAction::RenderOnly);
             }
+            if button == WindowChromeButton::Pin {
+                scene_toggle_pin(state, hwnd)?;
+                return Ok(ScenePointerAction::RenderOnly);
+            }
             return Ok(ScenePointerAction::WindowChrome(button));
         }
 
@@ -2273,6 +2539,22 @@ fn handle_scene_left_button_down(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Re
             return Ok(ScenePointerAction::RenderOnly);
         }
 
+        if !state.diagnostics_visible
+            && let Some(cell) =
+                scene_pretty_text_cell_from_client_point(state, layout, point, false)
+        {
+            // windowing[impl scene.pretty-text.selection]
+            state.diagnostic_selection = None;
+            state.pending_diagnostic_selection = Some(PendingTerminalSelection {
+                origin: point,
+                anchor: cell,
+                mode: selection_mode,
+            });
+            state.diagnostic_selection_drag_point = Some(point);
+            hwnd.capture_mouse();
+            return Ok(ScenePointerAction::RenderOnly);
+        }
+
         if let Some(action) = scene_action_at_point(state.scene_kind, layout, point) {
             state.pending_diagnostic_selection = None;
             state.pressed_target = Some(ScenePressedTarget::Action(action));
@@ -2282,6 +2564,32 @@ fn handle_scene_left_button_down(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Re
                 clicked_at: Instant::now(),
             });
             return Ok(ScenePointerAction::Invoke(action));
+        }
+
+        if let Some(cell) = cursor_gallery_cell_at_point(state, layout, point) {
+            // windowing[impl cursor-gallery.virtual-navigation]
+            state.pending_diagnostic_selection = None;
+            state.scene_action_selected_index = cell.index;
+            state.scene_virtual_cursor = Some(rect_center(cell.hit_rect()));
+            hwnd.capture_mouse();
+            return Ok(ScenePointerAction::RenderOnly);
+        }
+
+        if demo_mode_button_at_point(state, layout, point) {
+            // windowing[impl demo-mode.window]
+            state.pending_diagnostic_selection = None;
+            state.pressed_target = Some(ScenePressedTarget::DemoModeButton);
+            hwnd.capture_mouse();
+            return Ok(ScenePointerAction::RenderOnly);
+        }
+
+        if demo_mode_scramble_toggle_at_point(state, layout, point) {
+            // windowing[impl demo-mode.input-device-identifier-scramble]
+            state.pending_diagnostic_selection = None;
+            state.pressed_target = Some(ScenePressedTarget::DemoModeScrambleToggle);
+            toggle_demo_mode_scramble_input_device_identifiers(state)?;
+            hwnd.capture_mouse();
+            return Ok(ScenePointerAction::RenderOnly);
         }
 
         if legacy_recording_devices_button_at_point(state, layout, point) {
@@ -2447,13 +2755,17 @@ fn handle_scene_left_button_up(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Resu
         if let Some(pending_selection) = state.pending_diagnostic_selection.take() {
             state.diagnostic_selection_drag_point = None;
             let layout = scene_client_layout(hwnd, state)?;
-            let cell = scene_diagnostic_cell_from_client_point(
-                layout,
-                point,
-                state.diagnostic_cell_width,
-                state.diagnostic_cell_height,
-                true,
-            );
+            let cell = if state.diagnostics_visible {
+                scene_diagnostic_cell_from_client_point(
+                    layout,
+                    point,
+                    state.diagnostic_cell_width,
+                    state.diagnostic_cell_height,
+                    true,
+                )
+            } else {
+                scene_pretty_text_cell_from_client_point(state, layout, point, true)
+            };
             if let Some(selection) =
                 complete_pending_terminal_selection(pending_selection, point, cell)
             {
@@ -2620,13 +2932,17 @@ fn handle_scene_mouse_move(
             update_pending_terminal_selection_action(pending_selection, point, true, None)
         } else {
             let layout = scene_client_layout(hwnd, state)?;
-            let cell = scene_diagnostic_cell_from_client_point(
-                layout,
-                point,
-                state.diagnostic_cell_width,
-                state.diagnostic_cell_height,
-                true,
-            );
+            let cell = if state.diagnostics_visible {
+                scene_diagnostic_cell_from_client_point(
+                    layout,
+                    point,
+                    state.diagnostic_cell_width,
+                    state.diagnostic_cell_height,
+                    true,
+                )
+            } else {
+                scene_pretty_text_cell_from_client_point(state, layout, point, true)
+            };
             update_pending_terminal_selection_action(pending_selection, point, true, cell)
         };
 
@@ -2672,26 +2988,43 @@ fn handle_scene_right_button_up(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Res
     let point = ClientPoint::from_lparam(lparam);
 
     let copy_text = with_scene_app_state(|state| {
-        if !state.diagnostics_visible {
-            return Ok(None);
-        }
-
         let layout = scene_client_layout(hwnd, state)?;
-        if !scene_diagnostic_text_rect(layout).contains(point) {
-            return Ok(None);
-        }
+        let text = if state.diagnostics_visible {
+            if !scene_diagnostic_text_rect(layout).contains(point) {
+                return Ok(None);
+            }
 
-        let diagnostic_text = build_scene_diagnostic_text(state);
-        let text = if let Some(selection) = state.diagnostic_selection.take() {
-            cell_grid::extract_selected_text(
-                scene_diagnostic_text_rect(layout),
-                &diagnostic_text,
-                state.diagnostic_cell_width,
-                state.diagnostic_cell_height,
-                selection,
-            )
+            let diagnostic_text = build_scene_diagnostic_text(state);
+            if let Some(selection) = state.diagnostic_selection.take() {
+                cell_grid::extract_selected_text(
+                    scene_diagnostic_text_rect(layout),
+                    &diagnostic_text,
+                    state.diagnostic_cell_width,
+                    state.diagnostic_cell_height,
+                    selection,
+                )
+            } else {
+                diagnostic_text
+            }
         } else {
-            diagnostic_text
+            let Some(target) = scene_pretty_text_target(state, layout) else {
+                return Ok(None);
+            };
+            if !target.rect.contains(point) {
+                return Ok(None);
+            }
+
+            if let Some(selection) = state.diagnostic_selection.take() {
+                cell_grid::extract_selected_text(
+                    target.rect,
+                    &target.text,
+                    target.cell_width,
+                    target.cell_height,
+                    selection,
+                )
+            } else {
+                target.text
+            }
         };
         Ok(Some(text))
     })?;
@@ -2725,6 +3058,7 @@ fn window_chrome_mouse_down_action(
     button_at_point: Option<WindowChromeButton>,
 ) -> WindowChromePointerAction {
     match button_at_point {
+        Some(WindowChromeButton::Pin) => WindowChromePointerAction::RenderOnly,
         Some(WindowChromeButton::Diagnostics) => WindowChromePointerAction::RenderOnly,
         Some(button) => WindowChromePointerAction::Execute(button),
         None => WindowChromePointerAction::NotHandled,
@@ -3201,6 +3535,13 @@ fn terminal_window_chrome_buttons_state(
     layout: TerminalLayout,
 ) -> WindowChromeButtonsState {
     WindowChromeButtonsState {
+        pin: window_chrome_button_visual_state(
+            layout.pin_button_rect(),
+            state.pointer_position,
+            state.pressed_chrome_button == Some(WindowChromeButton::Pin),
+            state.pin_button_last_clicked_at,
+            state.pinned_topmost,
+        ),
         diagnostics: window_chrome_button_visual_state(
             layout.diagnostics_button_rect(),
             state.pointer_position,
@@ -3229,6 +3570,7 @@ fn terminal_window_chrome_buttons_state(
             None,
             false,
         ),
+        pinned: state.pinned_topmost,
         maximized: hwnd.is_zoomed(),
         focused: state.window_focused,
     }
@@ -3240,6 +3582,13 @@ fn scene_window_chrome_buttons_state(
     layout: TerminalLayout,
 ) -> WindowChromeButtonsState {
     WindowChromeButtonsState {
+        pin: window_chrome_button_visual_state(
+            layout.pin_button_rect(),
+            state.pointer_position,
+            state.pressed_target == Some(ScenePressedTarget::ChromeButton(WindowChromeButton::Pin)),
+            state.pin_button_last_clicked_at,
+            state.pinned_topmost,
+        ),
         diagnostics: window_chrome_button_visual_state(
             layout.diagnostics_button_rect(),
             state.pointer_position,
@@ -3278,6 +3627,7 @@ fn scene_window_chrome_buttons_state(
             None,
             false,
         ),
+        pinned: state.pinned_topmost,
         maximized: hwnd.is_zoomed(),
         focused: state.window_focused,
     }
@@ -3300,12 +3650,18 @@ fn window_chrome_button_visual_state(
     )
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "scene window rendering dispatch is intentionally centralized across scene kinds"
+)]
 fn render_scene_window_frame(
     state: &mut SceneAppState,
     hwnd: WindowHandle,
     resize: Option<(u32, u32)>,
     force_redraw: bool,
 ) -> eyre::Result<()> {
+    sync_demo_mode_state(state);
+
     if let Some(device_window) = state.audio_input_device_window.as_mut() {
         device_window.sync_transport();
     }
@@ -3318,7 +3674,20 @@ fn render_scene_window_frame(
 
     let layout = scene_client_layout(hwnd, state)?;
     let window_chrome_buttons_state = scene_window_chrome_buttons_state(state, hwnd, layout);
-    let scene = if state.diagnostics_visible
+    let scramble_input_device_identifiers = state
+        .demo_mode_scramble_input_device_identifiers
+        .is_enabled();
+    let scene = if state.diagnostics_visible && state.scene_kind == SceneWindowKind::Launcher {
+        windows_scene::build_launcher_diagnostic_render_scene(
+            layout,
+            window_chrome_buttons_state,
+            state.scene_action_selected_index,
+            state.scene_virtual_cursor,
+            state.diagnostic_selection,
+            state.diagnostic_cell_width,
+            state.diagnostic_cell_height,
+        )
+    } else if state.diagnostics_visible
         && state.scene_kind == SceneWindowKind::AudioInputDevicePicker
     {
         windows_scene::build_audio_input_device_diagnostic_render_scene(
@@ -3329,6 +3698,7 @@ fn render_scene_window_frame(
             state.diagnostic_selection,
             state.diagnostic_cell_width,
             state.diagnostic_cell_height,
+            scramble_input_device_identifiers,
         )
     } else if state.diagnostics_visible
         && state.scene_kind == SceneWindowKind::AudioInputDeviceDetails
@@ -3340,6 +3710,7 @@ fn render_scene_window_frame(
             state.diagnostic_selection,
             state.diagnostic_cell_width,
             state.diagnostic_cell_height,
+            scramble_input_device_identifiers,
         )
     } else if state.diagnostics_visible {
         windows_scene::build_scene_diagnostic_render_scene(
@@ -3357,6 +3728,7 @@ fn render_scene_window_frame(
             window_chrome_buttons_state,
             &state.audio_input_picker.devices,
             state.audio_input_picker.selected_index,
+            scramble_input_device_identifiers,
         )
     } else if state.scene_kind == SceneWindowKind::AudioInputDeviceDetails {
         windows_scene::build_audio_input_device_detail_render_scene(
@@ -3364,6 +3736,23 @@ fn render_scene_window_frame(
             window_chrome_buttons_state,
             state.audio_input_device_window.as_ref(),
             audio_input_device_detail_visual_state(state, layout),
+            scramble_input_device_identifiers,
+            state.diagnostic_selection,
+        )
+    } else if state.scene_kind == SceneWindowKind::CursorGallery {
+        windows_scene::build_cursor_gallery_render_scene(
+            layout,
+            window_chrome_buttons_state,
+            state.scene_action_selected_index,
+            state.scene_virtual_cursor,
+            state.pointer_position,
+        )
+    } else if state.scene_kind == SceneWindowKind::DemoMode {
+        windows_scene::build_demo_mode_render_scene(
+            layout,
+            window_chrome_buttons_state,
+            scramble_input_device_identifiers,
+            demo_mode_visual_state(state, layout),
         )
     } else {
         windows_scene::build_scene_render_scene(
@@ -3372,6 +3761,7 @@ fn render_scene_window_frame(
             window_chrome_buttons_state,
             scaled_scene_button_size(state.dpi),
             &scene_button_visual_states(state, layout),
+            state.scene_virtual_cursor,
         )
     };
 
@@ -3403,6 +3793,46 @@ fn render_scene_window_frame(
     Ok(())
 }
 
+fn demo_mode_visual_state(
+    state: &SceneAppState,
+    layout: TerminalLayout,
+) -> windows_scene::DemoModeVisualState {
+    let demo_layout = windows_scene::demo_mode_layout(layout.terminal_panel_rect().inset(30));
+    windows_scene::DemoModeVisualState {
+        demo_button: windows_scene::compute_button_visual_state(
+            demo_layout.demo_button_bounds,
+            demo_mode_hover_point(state, demo_layout),
+            state.pressed_target == Some(ScenePressedTarget::DemoModeButton),
+            None,
+            false,
+            Instant::now(),
+        ),
+        scramble_toggle: windows_scene::compute_button_visual_state(
+            demo_layout.scramble_toggle_bounds,
+            demo_mode_hover_point(state, demo_layout),
+            state.pressed_target == Some(ScenePressedTarget::DemoModeScrambleToggle),
+            state.demo_mode_scramble_toggle_last_changed_at,
+            state
+                .demo_mode_scramble_input_device_identifiers
+                .is_enabled(),
+            Instant::now(),
+        ),
+    }
+}
+
+fn demo_mode_hover_point(
+    state: &SceneAppState,
+    layout: windows_scene::DemoModeLayout,
+) -> Option<ClientPoint> {
+    state
+        .pointer_position
+        .filter(|point| {
+            layout.demo_button_bounds.contains(*point)
+                || layout.scramble_toggle_bounds.contains(*point)
+        })
+        .or(state.scene_virtual_cursor)
+}
+
 fn scene_button_visual_states(
     state: &SceneAppState,
     layout: TerminalLayout,
@@ -3418,13 +3848,16 @@ fn scene_button_visual_states(
     specs
         .iter()
         .zip(button_layouts)
-        .map(|(spec, button_layout)| {
+        .enumerate()
+        .map(|(index, (spec, button_layout))| {
             let pressed = state.pressed_target == Some(ScenePressedTarget::Action(spec.action));
+            let selected = state.scene_kind == SceneWindowKind::Launcher
+                && index == state.scene_action_selected_index;
             let last_clicked = state
                 .last_clicked_action
                 .filter(|click| click.action == spec.action)
                 .map(|click| click.clicked_at);
-            let active = scene_action_active(spec.action);
+            let active = scene_action_active(spec.action) || selected;
             (
                 spec.action,
                 windows_scene::compute_button_visual_state(
@@ -3460,6 +3893,9 @@ fn audio_input_device_detail_visual_state(
 }
 
 fn build_scene_diagnostic_text(state: &SceneAppState) -> String {
+    let scramble_input_device_identifiers = state
+        .demo_mode_scramble_input_device_identifiers
+        .is_enabled();
     let mut lines = vec![
         format!("window\t{}", state.scene_kind.title()),
         format!("bell-source\t{}", current_bell_source_label()),
@@ -3481,7 +3917,15 @@ fn build_scene_diagnostic_text(state: &SceneAppState) -> String {
             } else {
                 "available"
             };
-            lines.push(format!("- {}\t{}\t{}", device.name, status, device.id));
+            lines.push(format!(
+                "- {}\t{}\t{}",
+                device.name,
+                status,
+                windows_scene::input_device_identifier_display_text(
+                    &device.id,
+                    scramble_input_device_identifiers,
+                )
+            ));
         }
     } else if let Some(device_window) = &state.audio_input_device_window {
         lines.push(format!(
@@ -3490,7 +3934,10 @@ fn build_scene_diagnostic_text(state: &SceneAppState) -> String {
         ));
         lines.push(format!(
             "audio-input-endpoint-id\t{}",
-            device_window.device.id
+            windows_scene::input_device_identifier_display_text(
+                &device_window.device.id,
+                scramble_input_device_identifiers,
+            )
         ));
         lines.push(format!(
             "audio-input-sample-rate\t{}",
@@ -3584,6 +4031,7 @@ fn scene_action_at_point(
 
 fn window_chrome_button_rect(layout: TerminalLayout, button: WindowChromeButton) -> ClientRect {
     match button {
+        WindowChromeButton::Pin => layout.pin_button_rect(),
         WindowChromeButton::Diagnostics => layout.diagnostics_button_rect(),
         WindowChromeButton::Minimize => layout.minimize_button_rect(),
         WindowChromeButton::MaximizeRestore => layout.maximize_restore_button_rect(),
@@ -3596,6 +4044,7 @@ fn window_chrome_button_at_point(
     point: ClientPoint,
 ) -> Option<WindowChromeButton> {
     [
+        WindowChromeButton::Pin,
         WindowChromeButton::Diagnostics,
         WindowChromeButton::Minimize,
         WindowChromeButton::MaximizeRestore,
@@ -3629,9 +4078,27 @@ fn scene_toggle_diagnostics_panel(state: &mut SceneAppState) {
     }
 }
 
+fn terminal_toggle_pin(state: &mut AppState, hwnd: WindowHandle) -> eyre::Result<()> {
+    // windowing[impl chrome.pin-button]
+    let pinned = !state.pinned_topmost;
+    hwnd.set_topmost(pinned)?;
+    state.pinned_topmost = pinned;
+    state.pin_button_last_clicked_at = Some(Instant::now());
+    Ok(())
+}
+
+fn scene_toggle_pin(state: &mut SceneAppState, hwnd: WindowHandle) -> eyre::Result<()> {
+    // windowing[impl chrome.pin-button]
+    let pinned = !state.pinned_topmost;
+    hwnd.set_topmost(pinned)?;
+    state.pinned_topmost = pinned;
+    state.pin_button_last_clicked_at = Some(Instant::now());
+    Ok(())
+}
+
 fn execute_window_chrome_button(hwnd: WindowHandle, button: WindowChromeButton) {
     match button {
-        WindowChromeButton::Diagnostics => {}
+        WindowChromeButton::Pin | WindowChromeButton::Diagnostics => {}
         WindowChromeButton::Minimize => hwnd.minimize(),
         WindowChromeButton::MaximizeRestore => hwnd.toggle_maximize_restore(),
         WindowChromeButton::Close => hwnd.post_close(),
@@ -3658,7 +4125,13 @@ fn scene_interactive_region_contains(
             || window_chrome_button_at_point(layout, point).is_some()
             || (state.diagnostics_visible && scene_diagnostic_text_rect(layout).contains(point))
             || (!state.diagnostics_visible
+                && scene_pretty_text_target(state, layout)
+                    .is_some_and(|target| target.rect.contains(point)))
+            || (!state.diagnostics_visible
                 && scene_action_at_point(state.scene_kind, layout, point).is_some())
+            || cursor_gallery_cell_at_point(state, layout, point).is_some()
+            || demo_mode_button_at_point(state, layout, point)
+            || demo_mode_scramble_toggle_at_point(state, layout, point)
             || (!state.diagnostics_visible
                 && legacy_recording_devices_button_at_point(state, layout, point))
             || (!state.diagnostics_visible
@@ -3674,6 +4147,30 @@ fn scene_interactive_region_contains(
             || (!state.diagnostics_visible
                 && audio_input_device_detail_legacy_recording_button_at_point(state, layout, point))
     })
+}
+
+fn demo_mode_button_at_point(
+    state: &SceneAppState,
+    layout: TerminalLayout,
+    point: ClientPoint,
+) -> bool {
+    state.scene_kind == SceneWindowKind::DemoMode
+        && !state.diagnostics_visible
+        && windows_scene::demo_mode_layout(layout.terminal_panel_rect().inset(30))
+            .demo_button_bounds
+            .contains(point)
+}
+
+fn demo_mode_scramble_toggle_at_point(
+    state: &SceneAppState,
+    layout: TerminalLayout,
+    point: ClientPoint,
+) -> bool {
+    state.scene_kind == SceneWindowKind::DemoMode
+        && !state.diagnostics_visible
+        && windows_scene::demo_mode_layout(layout.terminal_panel_rect().inset(30))
+            .scramble_toggle_bounds
+            .contains(point)
 }
 
 fn legacy_recording_devices_button_at_point(
@@ -3854,6 +4351,241 @@ fn audio_input_picker_key_from_virtual_key(virtual_key: u32) -> Option<AudioInpu
     None
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LauncherMenuNavigation {
+    Spatial(SpatialNavigationDirection),
+    Sequential(i32),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SpatialNavigationDirection {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
+fn launcher_menu_navigation_from_virtual_key(
+    virtual_key: u32,
+    shift_pressed: bool,
+) -> Option<LauncherMenuNavigation> {
+    if virtual_key == u32::from(VK_LEFT.0) || virtual_key == u32::from(VK_UP.0) {
+        return Some(LauncherMenuNavigation::Spatial(
+            if virtual_key == u32::from(VK_LEFT.0) {
+                SpatialNavigationDirection::Left
+            } else {
+                SpatialNavigationDirection::Up
+            },
+        ));
+    }
+    if virtual_key == u32::from(VK_RIGHT.0) || virtual_key == u32::from(VK_DOWN.0) {
+        return Some(LauncherMenuNavigation::Spatial(
+            if virtual_key == u32::from(VK_RIGHT.0) {
+                SpatialNavigationDirection::Right
+            } else {
+                SpatialNavigationDirection::Down
+            },
+        ));
+    }
+    if virtual_key == u32::from(VK_TAB.0) {
+        return Some(LauncherMenuNavigation::Sequential(if shift_pressed {
+            -1
+        } else {
+            1
+        }));
+    }
+    None
+}
+
+fn next_scene_action_target(
+    rects: &[ClientRect],
+    current_index: usize,
+    virtual_cursor: Option<ClientPoint>,
+    navigation: LauncherMenuNavigation,
+) -> (usize, ClientPoint) {
+    if rects.is_empty() {
+        return (0, ClientPoint::new(0, 0));
+    }
+    let current_index = current_index.min(rects.len().saturating_sub(1));
+    let origin = virtual_cursor.unwrap_or_else(|| rect_center(rects[current_index]));
+    let selected_index = match navigation {
+        LauncherMenuNavigation::Sequential(direction) => {
+            next_sequential_index(rects.len(), current_index, direction)
+        }
+        LauncherMenuNavigation::Spatial(direction) => {
+            next_spatial_index(rects, current_index, origin, direction).unwrap_or(current_index)
+        }
+    };
+    (selected_index, rect_center(rects[selected_index]))
+}
+
+fn scene_action_navigation_rects(state: &SceneAppState, layout: TerminalLayout) -> Vec<ClientRect> {
+    if state.scene_kind == SceneWindowKind::Launcher && state.diagnostics_visible {
+        let rects = windows_scene::launcher_diagnostic_action_hit_rects(
+            layout,
+            state.diagnostic_cell_width,
+            state.diagnostic_cell_height,
+        );
+        if !rects.is_empty() {
+            return rects;
+        }
+    }
+
+    scene_action_hit_rects(
+        state.scene_kind,
+        layout,
+        scaled_scene_button_size(state.dpi),
+    )
+}
+
+fn cursor_gallery_navigation_rects(layout: TerminalLayout) -> Vec<ClientRect> {
+    windows_scene::cursor_gallery_cell_layouts(layout)
+        .into_iter()
+        .map(windows_scene::CursorGalleryCellLayout::hit_rect)
+        .collect()
+}
+
+fn demo_mode_navigation_rects(layout: TerminalLayout) -> Vec<ClientRect> {
+    let demo_layout = windows_scene::demo_mode_layout(layout.terminal_panel_rect().inset(30));
+    vec![
+        demo_layout.demo_button_bounds,
+        demo_layout.scramble_toggle_bounds,
+    ]
+}
+
+fn cursor_gallery_cell_at_point(
+    state: &SceneAppState,
+    layout: TerminalLayout,
+    point: ClientPoint,
+) -> Option<windows_scene::CursorGalleryCellLayout> {
+    if state.scene_kind != SceneWindowKind::CursorGallery || state.diagnostics_visible {
+        return None;
+    }
+
+    windows_scene::cursor_gallery_cell_layouts(layout)
+        .into_iter()
+        .find(|cell| cell.hit_rect().contains(point))
+}
+
+fn scene_action_hit_rects(
+    scene_kind: SceneWindowKind,
+    layout: TerminalLayout,
+    max_button_size: i32,
+) -> Vec<ClientRect> {
+    let specs = windows_scene::scene_button_specs(scene_kind);
+    windows_scene::layout_scene_buttons(layout.terminal_panel_rect(), specs.len(), max_button_size)
+        .into_iter()
+        .map(windows_scene::SceneButtonLayout::hit_rect)
+        .collect()
+}
+
+fn next_sequential_index(action_count: usize, current_index: usize, direction: i32) -> usize {
+    if action_count == 0 {
+        return 0;
+    }
+    match direction.cmp(&0) {
+        std::cmp::Ordering::Less => current_index
+            .checked_sub(1)
+            .unwrap_or(action_count.saturating_sub(1)),
+        std::cmp::Ordering::Equal => current_index.min(action_count.saturating_sub(1)),
+        std::cmp::Ordering::Greater => (current_index + 1) % action_count,
+    }
+}
+
+fn next_spatial_index(
+    rects: &[ClientRect],
+    current_index: usize,
+    origin: ClientPoint,
+    direction: SpatialNavigationDirection,
+) -> Option<usize> {
+    let origin = origin.to_win32_point().ok()?;
+    rects
+        .iter()
+        .enumerate()
+        .filter(|(index, rect)| {
+            *index != current_index && rect_is_in_direction(**rect, origin, direction)
+        })
+        .map(|(index, rect)| (spatial_navigation_score(*rect, origin, direction), index))
+        .min_by_key(|(score, index)| (*score, *index))
+        .map(|(_, index)| index)
+}
+
+fn rect_is_in_direction(
+    rect: ClientRect,
+    origin: windows::Win32::Foundation::POINT,
+    direction: SpatialNavigationDirection,
+) -> bool {
+    let center = rect_center_point(rect);
+    match direction {
+        SpatialNavigationDirection::Left => center.x < origin.x,
+        SpatialNavigationDirection::Right => center.x > origin.x,
+        SpatialNavigationDirection::Up => center.y < origin.y,
+        SpatialNavigationDirection::Down => center.y > origin.y,
+    }
+}
+
+fn spatial_navigation_score(
+    rect: ClientRect,
+    origin: windows::Win32::Foundation::POINT,
+    direction: SpatialNavigationDirection,
+) -> i64 {
+    let closest = closest_point_on_rect(rect, origin);
+    let center = rect_center_point(rect);
+    let (primary, cross) = match direction {
+        SpatialNavigationDirection::Left | SpatialNavigationDirection::Right => (
+            (closest.x - origin.x).abs(),
+            distance_to_range(origin.y, rect.top(), rect.bottom()),
+        ),
+        SpatialNavigationDirection::Up | SpatialNavigationDirection::Down => (
+            (closest.y - origin.y).abs(),
+            distance_to_range(origin.x, rect.left(), rect.right()),
+        ),
+    };
+    let center_distance = (center.x - origin.x).abs() + (center.y - origin.y).abs();
+    let primary = i64::from(primary.max(1));
+    let cross = i64::from(cross);
+    let center_distance = i64::from(center_distance);
+    (primary * primary * 4) + (cross * cross * 9) + center_distance
+}
+
+fn closest_point_on_rect(
+    rect: ClientRect,
+    point: windows::Win32::Foundation::POINT,
+) -> windows::Win32::Foundation::POINT {
+    windows::Win32::Foundation::POINT {
+        x: point.x.clamp(rect.left(), rect.right()),
+        y: point.y.clamp(rect.top(), rect.bottom()),
+    }
+}
+
+fn distance_to_range(value: i32, start: i32, end: i32) -> i32 {
+    if value < start {
+        start - value
+    } else if value > end {
+        value - end
+    } else {
+        0
+    }
+}
+
+fn rect_center(rect: ClientRect) -> ClientPoint {
+    let center = rect_center_point(rect);
+    ClientPoint::new(center.x, center.y)
+}
+
+fn rect_center_point(rect: ClientRect) -> windows::Win32::Foundation::POINT {
+    windows::Win32::Foundation::POINT {
+        x: rect.left() + (rect.width() / 2),
+        y: rect.top() + (rect.height() / 2),
+    }
+}
+
+fn selected_scene_action(state: &SceneAppState) -> Option<SceneAction> {
+    windows_scene::scene_button_specs(state.scene_kind)
+        .get(state.scene_action_selected_index)
+        .map(|spec| spec.action)
+}
+
 #[expect(
     clippy::too_many_lines,
     reason = "scene action dispatch is intentionally centralized for small launcher actions"
@@ -3908,11 +4640,60 @@ fn perform_scene_action(
                 .wrap_err("failed to spawn Teamy Studio cursor-info window thread")?;
             Ok(SceneActionDisposition::KeepOpen)
         }
+        SceneAction::OpenCursorGallery => {
+            let app_home = app_home.clone();
+            thread::Builder::new()
+                .name("teamy-studio-cursor-gallery".to_owned())
+                .spawn(move || {
+                    if let Err(error) =
+                        run_scene_window(&app_home, SceneWindowKind::CursorGallery, vt_engine, None)
+                    {
+                        error!(?error, "failed to open cursor gallery window");
+                    }
+                })
+                .wrap_err("failed to spawn Teamy Studio cursor gallery thread")?;
+            Ok(SceneActionDisposition::KeepOpen)
+        }
+        SceneAction::OpenDemoMode => {
+            let app_home = app_home.clone();
+            thread::Builder::new()
+                .name("teamy-studio-demo-mode".to_owned())
+                .spawn(move || {
+                    if let Err(error) =
+                        run_scene_window(&app_home, SceneWindowKind::DemoMode, vt_engine, None)
+                    {
+                        error!(?error, "failed to open demo mode window");
+                    }
+                })
+                .wrap_err("failed to spawn Teamy Studio demo mode thread")?;
+            Ok(SceneActionDisposition::KeepOpen)
+        }
         SceneAction::OpenStorage => {
+            // windowing[impl launcher.buttons.storage-placeholder]
             let _ = MessageDialog::new()
                 .set_level(MessageLevel::Info)
                 .set_title("Storage")
                 .set_description("Storage is not implemented yet.")
+                .set_buttons(MessageButtons::Ok)
+                .show();
+            Ok(SceneActionDisposition::KeepOpen)
+        }
+        SceneAction::OpenEnvironmentVariables => {
+            // windowing[impl launcher.buttons.environment-variables-placeholder]
+            let _ = MessageDialog::new()
+                .set_level(MessageLevel::Info)
+                .set_title("Environment Variables")
+                .set_description("The environment-variable inspector is not implemented yet.")
+                .set_buttons(MessageButtons::Ok)
+                .show();
+            Ok(SceneActionDisposition::KeepOpen)
+        }
+        SceneAction::OpenApplicationWindows => {
+            // windowing[impl launcher.buttons.application-windows-placeholder]
+            let _ = MessageDialog::new()
+                .set_level(MessageLevel::Info)
+                .set_title("Application Windows")
+                .set_description("The application-window inspector is not implemented yet.")
                 .set_buttons(MessageButtons::Ok)
                 .show();
             Ok(SceneActionDisposition::KeepOpen)
@@ -5341,6 +6122,10 @@ fn handle_left_button_down(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Result<b
                 terminal_toggle_diagnostics_panel(state, hwnd)?;
                 return Ok(WindowChromePointerAction::RenderOnly);
             }
+            if button == WindowChromeButton::Pin {
+                terminal_toggle_pin(state, hwnd)?;
+                return Ok(WindowChromePointerAction::RenderOnly);
+            }
             return Ok(WindowChromePointerAction::Execute(button));
         }
 
@@ -5879,6 +6664,51 @@ fn scene_diagnostic_cell_from_client_point(
     )
 }
 
+fn scene_pretty_text_target(
+    state: &SceneAppState,
+    layout: TerminalLayout,
+) -> Option<SceneSelectableTextTarget> {
+    if state.diagnostics_visible || state.scene_kind != SceneWindowKind::AudioInputDeviceDetails {
+        return None;
+    }
+
+    let scramble_input_device_identifiers = state
+        .demo_mode_scramble_input_device_identifiers
+        .is_enabled();
+    let body_rect = layout.terminal_panel_rect().inset(24);
+    let rect = windows_scene::audio_input_device_detail_selectable_text_rect(
+        body_rect,
+        state.audio_input_device_window.is_some(),
+    );
+    let text = windows_scene::audio_input_device_detail_info_text(
+        state.audio_input_device_window.as_ref(),
+        scramble_input_device_identifiers,
+    );
+
+    Some(SceneSelectableTextTarget {
+        rect,
+        text,
+        cell_width: windows_scene::AUDIO_INPUT_DEVICE_DETAIL_TEXT_CELL_WIDTH,
+        cell_height: windows_scene::AUDIO_INPUT_DEVICE_DETAIL_TEXT_CELL_HEIGHT,
+    })
+}
+
+fn scene_pretty_text_cell_from_client_point(
+    state: &SceneAppState,
+    layout: TerminalLayout,
+    point: ClientPoint,
+    clamp_to_bounds: bool,
+) -> Option<TerminalCellPoint> {
+    let target = scene_pretty_text_target(state, layout)?;
+    cell_grid::cell_from_client_point(
+        target.rect,
+        point,
+        target.cell_width,
+        target.cell_height,
+        clamp_to_bounds,
+    )
+}
+
 fn terminal_interactive_region_contains(
     state: &AppState,
     layout: TerminalLayout,
@@ -6024,6 +6854,17 @@ fn scene_cursor_for_point(
         return Some(IDC_HAND);
     }
 
+    if let Some(cell) = cursor_gallery_cell_at_point(state, layout, point) {
+        // windowing[impl cursor-gallery.hover-cursor-shape]
+        return Some(cursor_gallery_system_cursor(cell.spec.cursor));
+    }
+
+    if demo_mode_button_at_point(state, layout, point)
+        || demo_mode_scramble_toggle_at_point(state, layout, point)
+    {
+        return Some(IDC_HAND);
+    }
+
     if !state.diagnostics_visible
         && (legacy_recording_devices_button_at_point(state, layout, point)
             || audio_input_device_arm_button_at_point(state, layout, point)
@@ -6050,6 +6891,18 @@ fn scene_cursor_for_point(
     }
 
     None
+}
+
+fn cursor_gallery_system_cursor(cursor: windows_scene::CursorGalleryCursorKind) -> PCWSTR {
+    match cursor {
+        windows_scene::CursorGalleryCursorKind::Arrow => IDC_ARROW,
+        windows_scene::CursorGalleryCursorKind::Hand => IDC_HAND,
+        windows_scene::CursorGalleryCursorKind::IBeam => IDC_IBEAM,
+        windows_scene::CursorGalleryCursorKind::Cross => IDC_CROSS,
+        windows_scene::CursorGalleryCursorKind::Wait => IDC_WAIT,
+        windows_scene::CursorGalleryCursorKind::SizeAll => IDC_SIZEALL,
+        windows_scene::CursorGalleryCursorKind::Help => IDC_HELP,
+    }
 }
 
 fn auto_scroll_pending_terminal_selection(
@@ -6137,6 +6990,7 @@ fn update_terminal_chrome_tooltip(
         point,
         state.diagnostic_panel_visible,
         hwnd.is_zoomed(),
+        state.pinned_topmost,
     )? {
         return Ok(());
     }
@@ -6158,7 +7012,30 @@ fn update_scene_chrome_tooltip(
         point,
         state.diagnostics_visible,
         hwnd.is_zoomed(),
+        state.pinned_topmost,
     )? {
+        return Ok(());
+    }
+
+    if let Some((tooltip_text, anchor_rect)) = cursor_gallery_cell_tooltip(state, layout, point) {
+        let anchor_rect = client_rect_to_screen_rect(hwnd, anchor_rect)?;
+        let cursor_rect = pointer_cursor_screen_rect(hwnd, point)?;
+        let monitor_bounds = monitor_work_rect(hwnd)?;
+        let tooltip_origin = tooltip_origin(anchor_rect, cursor_rect, monitor_bounds, tooltip_text);
+        state
+            .chrome_tooltip
+            .show_at(hwnd, tooltip_text, tooltip_origin)?;
+        return Ok(());
+    }
+
+    if let Some((tooltip_text, anchor_rect)) = demo_mode_control_tooltip(state, layout, point) {
+        let anchor_rect = client_rect_to_screen_rect(hwnd, anchor_rect)?;
+        let cursor_rect = pointer_cursor_screen_rect(hwnd, point)?;
+        let monitor_bounds = monitor_work_rect(hwnd)?;
+        let tooltip_origin = tooltip_origin(anchor_rect, cursor_rect, monitor_bounds, tooltip_text);
+        state
+            .chrome_tooltip
+            .show_at(hwnd, tooltip_text, tooltip_origin)?;
         return Ok(());
     }
 
@@ -6226,6 +7103,19 @@ fn update_scene_chrome_tooltip(
     Ok(())
 }
 
+// windowing[impl virtual-cursor.tooltips]
+fn update_scene_virtual_cursor_tooltip(
+    state: &mut SceneAppState,
+    hwnd: WindowHandle,
+) -> eyre::Result<()> {
+    let Some(point) = state.scene_virtual_cursor else {
+        state.chrome_tooltip.hide(hwnd);
+        return Ok(());
+    };
+
+    update_scene_chrome_tooltip(state, hwnd, point)
+}
+
 // behavior[impl window.appearance.chrome.tooltips.popover]
 // behavior[impl window.appearance.chrome.tooltips.cursor-clear]
 // behavior[impl window.appearance.chrome.tooltips.monitor-clamped]
@@ -6236,12 +7126,14 @@ fn update_window_chrome_tooltip(
     point: ClientPoint,
     diagnostics_active: bool,
     maximized: bool,
+    pinned: bool,
 ) -> eyre::Result<bool> {
     let Some(button) = window_chrome_button_at_point(layout, point) else {
         return Ok(false);
     };
 
-    let tooltip_text = window_chrome_button_tooltip_text(button, diagnostics_active, maximized);
+    let tooltip_text =
+        window_chrome_button_tooltip_text(button, diagnostics_active, maximized, pinned);
     let anchor_rect = client_rect_to_screen_rect(hwnd, window_chrome_button_rect(layout, button))?;
     let cursor_rect = pointer_cursor_screen_rect(hwnd, point)?;
     let monitor_bounds = monitor_work_rect(hwnd)?;
@@ -6276,6 +7168,37 @@ fn scene_action_tooltip(
                 .contains(point)
                 .then_some((spec.tooltip, button_layout.hit_rect()))
         })
+}
+
+fn cursor_gallery_cell_tooltip(
+    state: &SceneAppState,
+    layout: TerminalLayout,
+    point: ClientPoint,
+) -> Option<(&'static str, ClientRect)> {
+    cursor_gallery_cell_at_point(state, layout, point)
+        .map(|cell| (cell.spec.label, cell.hit_rect()))
+}
+
+fn demo_mode_control_tooltip(
+    state: &SceneAppState,
+    layout: TerminalLayout,
+    point: ClientPoint,
+) -> Option<(&'static str, ClientRect)> {
+    if state.diagnostics_visible || state.scene_kind != SceneWindowKind::DemoMode {
+        return None;
+    }
+
+    let demo_layout = windows_scene::demo_mode_layout(layout.terminal_panel_rect().inset(30));
+    if demo_layout.demo_button_bounds.contains(point) {
+        return Some((
+            "Demo Mode keeps showcase settings in one place.",
+            demo_layout.demo_button_bounds,
+        ));
+    }
+    demo_layout.scramble_toggle_bounds.contains(point).then_some((
+        "Scramble input device identifiers for demos. Generated IDs keep a stable endpoint-like shape while hiding real microphone or input-device values.",
+        demo_layout.scramble_toggle_bounds,
+    ))
 }
 
 // audio[impl gui.legacy-recording-dialog]
@@ -6397,8 +7320,16 @@ fn window_chrome_button_tooltip_text(
     button: WindowChromeButton,
     diagnostics_active: bool,
     maximized: bool,
+    pinned: bool,
 ) -> &'static str {
     match button {
+        WindowChromeButton::Pin => {
+            if pinned {
+                "Unpin window from top"
+            } else {
+                "Keep window on top"
+            }
+        }
         WindowChromeButton::Diagnostics => {
             if diagnostics_active {
                 "Hide diagnostics"
@@ -6689,8 +7620,15 @@ mod tests {
             vt_engine: VtEngineChoice::default(),
             audio_input_picker: AudioInputPickerState::default(),
             audio_input_device_window: None,
+            demo_mode_scramble_input_device_identifiers:
+                DemoModeInputDeviceIdentifierScramble::default(),
+            demo_mode_scramble_toggle_last_changed_at: None,
+            scene_action_selected_index: 0,
+            scene_virtual_cursor: None,
             pointer_position: None,
             pressed_target: None,
+            pin_button_last_clicked_at: None,
+            pinned_topmost: false,
             last_clicked_action: None,
             diagnostics_button_last_clicked_at: None,
             diagnostics_visible: false,
@@ -6730,6 +7668,99 @@ mod tests {
 
         assert_eq!(tooltip.0, "Open terminal");
         assert_eq!(tooltip.1, button_layouts[0].hit_rect());
+    }
+
+    // windowing[verify virtual-cursor.tooltips]
+    // windowing[verify demo-mode.input-device-identifier-scramble]
+    #[test]
+    fn demo_mode_toggle_exposes_hover_tooltip_and_navigation_rect() {
+        let state = SceneAppState {
+            app_home: AppHome(std::path::PathBuf::from(".")),
+            hwnd: None,
+            dpi: USER_DEFAULT_SCREEN_DPI,
+            scene_kind: SceneWindowKind::DemoMode,
+            vt_engine: VtEngineChoice::default(),
+            audio_input_picker: AudioInputPickerState::default(),
+            audio_input_device_window: None,
+            demo_mode_scramble_input_device_identifiers:
+                DemoModeInputDeviceIdentifierScramble::default(),
+            demo_mode_scramble_toggle_last_changed_at: None,
+            scene_action_selected_index: 0,
+            scene_virtual_cursor: None,
+            pointer_position: None,
+            pressed_target: None,
+            pin_button_last_clicked_at: None,
+            pinned_topmost: false,
+            last_clicked_action: None,
+            diagnostics_button_last_clicked_at: None,
+            diagnostics_visible: false,
+            diagnostic_selection: None,
+            pending_diagnostic_selection: None,
+            diagnostic_selection_drag_point: None,
+            in_move_size_loop: false,
+            window_focused: false,
+            focused_render_interval_ms: 16,
+            terminal_cell_width: 8,
+            terminal_cell_height: 16,
+            diagnostic_cell_width: 8,
+            diagnostic_cell_height: 16,
+            chrome_tooltip: ChromeTooltipController::default(),
+            renderer: None,
+        };
+        let layout = TerminalLayout {
+            client_width: 1040,
+            client_height: 680,
+            cell_width: 8,
+            cell_height: 16,
+            diagnostic_panel_visible: false,
+        };
+        let rects = demo_mode_navigation_rects(layout);
+        let toggle_point = rect_center(rects[1]);
+
+        let tooltip = demo_mode_control_tooltip(&state, layout, toggle_point)
+            .expect("demo mode toggle should expose native tooltip metadata");
+
+        assert_eq!(rects.len(), 2);
+        assert!(tooltip.0.contains("Scramble input device identifiers"));
+        assert_eq!(tooltip.1, rects[1]);
+    }
+
+    #[test]
+    // windowing[verify launcher.keyboard-navigation]
+    fn launcher_menu_keyboard_navigation_uses_spatial_targets() {
+        let specs = windows_scene::scene_button_specs(SceneWindowKind::Launcher);
+        let rects = vec![
+            ClientRect::new(0, 0, 10, 10),
+            ClientRect::new(20, 0, 30, 10),
+            ClientRect::new(20, 30, 30, 40),
+            ClientRect::new(0, 20, 10, 30),
+        ];
+        let origin = ClientPoint::new(5, 5);
+
+        assert_eq!(next_sequential_index(specs.len(), 0, -1), specs.len() - 1);
+        assert_eq!(next_sequential_index(specs.len(), specs.len() - 1, 1), 0);
+        assert_eq!(
+            launcher_menu_navigation_from_virtual_key(u32::from(VK_RIGHT.0), false),
+            Some(LauncherMenuNavigation::Spatial(
+                SpatialNavigationDirection::Right
+            ))
+        );
+        assert_eq!(
+            launcher_menu_navigation_from_virtual_key(u32::from(VK_TAB.0), false),
+            Some(LauncherMenuNavigation::Sequential(1))
+        );
+        assert_eq!(
+            launcher_menu_navigation_from_virtual_key(u32::from(VK_TAB.0), true),
+            Some(LauncherMenuNavigation::Sequential(-1))
+        );
+        assert_eq!(
+            next_spatial_index(&rects, 0, origin, SpatialNavigationDirection::Right),
+            Some(1)
+        );
+        assert_eq!(
+            next_spatial_index(&rects, 0, origin, SpatialNavigationDirection::Down),
+            Some(3)
+        );
     }
 
     #[test]

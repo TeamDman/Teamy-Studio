@@ -772,8 +772,9 @@ impl TerminalLayout {
     pub fn title_text_rect(self) -> ClientRect {
         let title_bar = self.title_bar_rect();
         let plus = self.diagnostics_button_rect();
+        let pin = self.pin_button_rect();
         ClientRect::new(
-            title_bar.left() + 18,
+            pin.right() + 12,
             title_bar.top(),
             (plus.left() - 12).max(title_bar.left() + 1),
             title_bar.bottom(),
@@ -837,6 +838,20 @@ impl TerminalLayout {
     #[must_use]
     pub fn close_button_rect(self) -> ClientRect {
         self.title_bar_button_rect(0)
+    }
+
+    #[must_use]
+    /// windowing[impl chrome.pin-button]
+    pub fn pin_button_rect(self) -> ClientRect {
+        let title_bar = self.title_bar_rect();
+        let button_size = (title_bar.height() - 14).clamp(24, 42);
+        let top = title_bar.top() + ((title_bar.height() - button_size) / 2);
+        ClientRect::new(
+            title_bar.left() + 10,
+            top,
+            title_bar.left() + 10 + button_size,
+            top + button_size,
+        )
     }
 
     #[must_use]
@@ -4255,6 +4270,7 @@ mod tests {
     // behavior[verify window.appearance.code-panel.terminal-alignment]
     // windowing[verify garden-band.shared]
     // windowing[verify diagnostics.toggle.shared-titlebar-button]
+    // windowing[verify chrome.pin-button]
     #[test]
     fn layout_regions_do_not_overlap_and_leave_terminal_room() {
         let layout = TerminalLayout {
@@ -4268,6 +4284,8 @@ mod tests {
         let full = layout.full_client_rect();
         let content = layout.content_frame_rect();
         let title = layout.title_bar_rect();
+        let pin = layout.pin_button_rect();
+        let title_text = layout.title_text_rect();
         let terminal_panel = layout.terminal_panel_rect();
         let diagnostic = layout.diagnostic_panel_rect();
         let details = layout.diagnostics_button_rect();
@@ -4283,6 +4301,8 @@ mod tests {
         assert_eq!(full.bottom() - content.bottom(), WINDOW_PADDING);
         assert!(title.bottom() <= terminal_panel.top());
         assert!(terminal_panel.bottom() <= diagnostic.top());
+        assert!(pin.left() >= title.left());
+        assert!(pin.right() <= title_text.left());
         assert!(details.left() < minimize.left());
         assert!(minimize.left() < maximize.left());
         assert!(maximize.left() < close.left());
@@ -4293,7 +4313,7 @@ mod tests {
             assert!(rect.right() <= content.right());
             assert!(rect.bottom() <= content.bottom());
         }
-        for button in [details, minimize, maximize, close] {
+        for button in [pin, details, minimize, maximize, close] {
             assert!(button.top() >= title.top());
             assert!(button.bottom() <= title.bottom());
         }

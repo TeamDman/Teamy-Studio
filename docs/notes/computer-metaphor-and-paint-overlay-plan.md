@@ -22,16 +22,38 @@ The guiding idea from the source note is that Teamy Studio should not merely mim
   - Fixed the observed microphone-page loopback label overlap by moving the loopback control to its own right-side lane.
   - Changed microphone loopback so it can start a monitor-only capture session even when recording is not active.
   - Validated the microphone-page corrections with `./check-all.ps1`: format, clippy, build, tests, and Tracey status passed.
+  - Added Tracey-backed launcher memory stubs for `Environment Variables` and `Application Windows`; each card opens an explicit placeholder dialog instead of silently doing nothing.
+  - Validated the launcher-stub slice with `./check-all.ps1`: format, clippy, build, tests, and Tracey status passed. Tracey reported `teamy-studio-windowing/rust: 18 of 18 requirements are covered. 13 of 18 have a verification reference.`
+  - Added main-menu keyboard navigation: Left/Up select the previous card, Right/Down/Tab select the next card, and Enter/Space invokes the selected card.
+  - Refined main-menu arrow navigation to use a virtual 2D cursor and rendered card hit rectangles, so vertical movement follows the actual wrapped layout instead of assuming fixed grid rows.
+  - Refined diagnostics-mode launcher navigation to extract action-row rectangles from the ratatui layout, so arrow keys navigate the visible TUI rows while diagnostics are active instead of continuing to use hidden pretty-card geometry.
+  - Replaced the launcher's generic `Alt+X` diagnostics body with a ratatui-style main-menu diagnostics application showing the selected card, action list, and controls.
+  - Validated the main-menu keyboard/diagnostics slice with `./check-all.ps1`: format, clippy, build, tests, and Tracey status passed. Tracey reported `teamy-studio-windowing/rust: 20 of 20 requirements are covered. 15 of 20 have a verification reference.`
+  - Added a visible virtual cursor pointer using enlarged, tinted OS cursor sprites in the renderer atlas.
+  - Added a `Cursor Gallery` launcher item for inspecting the stock OS cursor sprites used by the virtual cursor path.
+  - Extended the Cursor Gallery direction: gallery cells should be navigable shapes, hover should change both the native cursor and virtual cursor shape, and hover glow should use the gallery cell color.
+  - Documented the future SDF/shader cursor path: stock cursor bitmaps can later become edge, distance-field, or curve data for stylized shader rendering.
+  - Validated the cursor sprite/gallery slice with `./check-all.ps1`: format, clippy, build, tests, and Tracey status passed. Tracey reported `teamy-studio-windowing/rust: 24 of 24 requirements are covered. 18 of 24 have a verification reference.`
+  - Implemented the cursor-gallery interaction slice: arrow keys and Tab move the virtual cursor between cursor cells, physical mouse hover changes the native cursor shape, the virtual pointer uses the selected/hovered cursor sprite, and selected/hovered cells glow with the gallery color.
+  - Validated the cursor-gallery interaction slice with `./check-all.ps1`: format, clippy, build, tests, and Tracey status passed. Tracey reported `teamy-studio-windowing/rust: 27 of 27 requirements are covered. 20 of 27 have a verification reference.`
+  - Added the Demo Mode launcher/window slice with realistic Arbitrary-backed fake input-device identifiers for privacy-preserving demos.
+  - Replaced the Demo Mode scramble checkbox direction with a shader-animated toggle direction, including native hover text and keyboard virtual-cursor tooltip behavior.
+  - Made the Demo Mode scramble toggle persist to `demo-mode.txt` under the application home directory and broadcast live updates to open audio-device windows so endpoint IDs redraw as scrambled/unscrambled without reopening those windows.
+  - Validated the Demo Mode persistence/live-update slice with `./check-all.ps1`: format, clippy, build, tests, and Tracey status passed. Tracey reported `teamy-studio-windowing/rust: 33 of 33 requirements are covered. 26 of 33 have a verification reference.`
+  - Added a left-edge chrome pin affordance direction: Teamy windows can be pinned above other windows, and the shared chrome renderer now has a dedicated pin state/icon surface.
+  - Corrected Demo Mode fake input-device IDs so they preserve realistic endpoint shape without adding the `SWD\MMDEVAPI\` prefix when the obscured values do not have it.
+  - Began extending selectable text beyond diagnostics by making the selected microphone details render through the same text-grid selection model used for copyable diagnostics text.
 - Current focus:
-  - Turn the source note into a resumable roadmap that preserves the high-level design direction while identifying small, shippable slices.
+  - Finish and validate the shared chrome pin and pretty-mode text-selection slice, then continue turning the virtual cursor from a visible launcher pointer into a reusable shape-navigation cursor for whiteboarding, inspection, paint-overlay work, and cross-window teleport history.
 - Remaining work:
   - Add Tracey requirements for each new behavior area before implementation lands.
   - Add shallow launcher stubs for the new surfaces.
+  - Implement function-key teleport bindings for F1 through F12, including hold-to-bind, tap-to-focus, sound feedback, and undoable jump-history entries.
   - Build the first paint overlay mode for all Teamy windows.
   - Add application-window inspection using the Cursor Hero lessons.
   - Add environment variable, input-device, file-extension, shape, SDF, and timeline explorer surfaces as progressively richer windows.
 - Next step:
-  - Implement the first new UI stub slice from this plan: Tracey-backed launcher entries for `Environment Variables` and `Application Windows`.
+  - Promote the launcher's private shape-navigation helpers into a reusable module before adding function-key teleport areas, richer cursor motions, or paint overlay controls.
 
 ## Source Ideas Extracted
 
@@ -152,6 +174,21 @@ Teamy-relevant extraction:
 - The microphone waveform is already a 1D timeline; use it as the first real proving ground.
 - Later, build a screenshot/event replay buffer where the user can capture the screen from a few seconds ago.
 - Model streams as event producers and timelines as indexed views over those event streams.
+
+### Function-Key Teleport And Event History
+
+The latest interaction direction treats the virtual cursor as a place the user can bind, revisit, and undo like an edit in a paint application.
+
+Teamy-relevant extraction:
+
+- F1 through F12 should become window/cursor teleport slots.
+- Holding a function key for one second should bind that key to the current focused Teamy window and virtual cursor position, then play an audio confirmation.
+- Tapping a bound function key should focus the bound window and move that window's virtual cursor to the saved point.
+- The main menu opening flow should support binding F1 to the launcher, opening Cursor Gallery, binding F2 to that newly focused window, then tapping F1 or F2 to jump between them.
+- Event listener priority should define teleportable areas: scene controls, diagnostics/panels, paint overlay, terminal content, and finally window chrome. Window chrome should be the last keyboard listener and keep owning OS-level behavior such as Alt+F4.
+- If function keys also deliver character-like messages on some paths, Teamy should model that explicitly instead of treating those messages as accidental noise.
+- Every teleport should append an undoable history entry such as `jumped to cursor X from position Y`.
+- The history should become an edit timeline similar to Paint.NET: visible, replayable, and eventually undo/redo capable.
 
 ### Trink: Units, Dimensions, And Typed Transformations
 
@@ -366,6 +403,67 @@ Definition of done:
 - Tracey validates with no warnings.
 - `./check-all.ps1` passes.
 
+Status:
+
+- Completed for the first two cards: `Environment Variables` and `Application Windows`.
+- Added to the launcher imagery todo list: replace the PNG-backed imagery for `Terminal`, `Cursor Info`, `Storage`, `Environment Variables`, and `Application Windows` with code-generated imagery; intentionally leave `Audio` and `Audio Devices` on OS imagery during that change.
+- Remaining launcher memory cards are deferred until the first paint-mode slice lands.
+
+### Phase 1.5: Main Menu Keyboard And Diagnostics Polish
+
+Objective:
+
+- Make the launcher usable without the mouse and make its diagnostics mode feel like the richer ratatui diagnostics used by the audio surfaces.
+
+Tasks:
+
+- Add keyboard selection state for launcher cards.
+- Let arrow keys move a virtual 2D cursor through rendered card hit rectangles, choosing the next card by geometry rather than assuming a perfect fixed grid.
+- Keep Tab as sequential traversal and let Enter/Space invoke the selected card.
+- Render the selected launcher card with a visible active treatment.
+- Replace the launcher's plain diagnostics text body with a ratatui-style main-menu diagnostics application.
+- Keep `Alt+X` as the diagnostics toggle.
+
+Definition of done:
+
+- The launcher can be navigated and invoked from the keyboard.
+- `Alt+X` on the launcher shows a structured diagnostics TUI with selected action, action list, and controls.
+- `./check-all.ps1` passes.
+
+Status:
+
+- Completed. The selected card is highlighted in the pretty launcher, arrow keys navigate by rendered geometry through a virtual 2D cursor, `Alt+X` opens the ratatui-style diagnostics body, and diagnostics-mode navigation uses ratatui action-row shapes instead of hidden pretty-card geometry.
+
+### Phase 1.6: Inspectable Virtual Cursor And Shape Navigation
+
+Objective:
+
+- Generalize the launcher keyboard navigation model into an inspectable virtual cursor that can later power keyboard whiteboarding, paint overlay navigation, and cursor-info shape inspection.
+
+Tasks:
+
+- Promote the launcher's private action-rectangle navigation into a reusable shape-navigation module.
+- Represent navigable targets as simple shapes first: rectangles with centroids, hit regions, and nearest-perimeter queries.
+- Expose the virtual cursor point and current hovered target in diagnostics.
+- Draw the virtual cursor as a visible, enlarged, tinted pointer using OS cursor sprites in the renderer atlas.
+- Add a Cursor Gallery launcher item that shows the stock OS cursor sprite sheet for debugging.
+- In the Cursor Gallery, make the OS cursor cells navigable by the virtual cursor, make the native cursor take the hovered cell's cursor shape, and glow selected/hovered cells using the cell's gallery color.
+- Let a keyboard command click the target under the virtual cursor.
+- Add cursor-info or paint-overlay diagnostics that can show the navigable shape set for the current window.
+- Add later motion primitives such as `jump to the beginning of the line below the bottom of the ratatui block containing the cursor` once block, line, and text-run shapes are exposed.
+- Keep the longer-term cursor rendering route open: bake ground-truth SDFs or curve data for basic OS cursors, and eventually let a cursor shader render stylized silhouettes from edge/distance/shape data rather than relying only on tinted cursor bitmaps.
+- Add a Teamy-style custom color picker modeled after the Windows text-cursor custom color picker: a hue/saturation field, a value/brightness rail, draggable pucks controlled by the virtual cursor, compact RGB/HSV/hex editor islands, and a design-language-compatible `Done`/`Cancel` footer.
+- Treat editable text islands as embedded terminal sessions that can run a future `edit -` command; Enter focuses the island, then three Escape presses return to the virtual-pointer keyboard layer.
+- Add an Event Bus diagnostic surface that shows the known input-routing order for keyboard and mouse as a spatial TUI map with legend and text area, using the `ratatui-key-debug` triple-Escape behavior as a reference for layer escape semantics.
+- Explore a stethoscope observer window: a draggable probe can attach to a desktop-coordinate point, reports z-ordered windows occupying that point, and uses `sguaba` coordinate types for desktop/window/client-space clarity.
+
+Definition of done:
+
+- Keyboard navigation can operate over a list of drawn shapes without knowing whether they came from a grid, wrapped flow, whiteboard, or app inspector.
+- The virtual cursor point and chosen target are visible in diagnostics.
+- The launcher still uses the shared model.
+- `./check-all.ps1` passes.
+
 ### Phase 2: Paint Chrome Button
 
 Objective:
@@ -553,18 +651,29 @@ Definition of done:
 
 ## First Concrete Slice
 
-The first implementation slice after this plan should be small and visible:
+The first implementation slice after this plan was completed:
 
-1. Finish and validate the microphone loopback fixes from Phase 0.
-2. Add Tracey requirements for launcher memory stubs in `docs/spec/product/windowing.md`.
-3. Add two launcher stubs only:
+1. Finished and validated the microphone loopback fixes from Phase 0.
+2. Added Tracey requirements for launcher memory stubs in `docs/spec/product/windowing.md`.
+3. Added two launcher stubs:
    - `Environment Variables`
    - `Application Windows`
-4. Make each stub open an explicit placeholder scene or dialog.
-5. Run `./check-all.ps1`.
+4. Made each stub open an explicit placeholder dialog.
+5. Ran `./check-all.ps1` successfully.
 
 Why these two first:
 
 - `Environment Variables` is concrete and maps directly to the attached Windows dialogs.
 - `Application Windows` connects directly to prior Cursor Hero work and the user's desire to inspect other windows.
 - Both reinforce the central metaphor: Teamy Studio is becoming a tool for seeing the computer as structured, inspectable, manipulable state.
+
+## Next Concrete Slice
+
+Add the first shared paint-mode chrome button:
+
+1. Add windowing or paint-overlay Tracey requirements for a shared paint button beside diagnostics.
+2. Add a `WindowChromeButton::Paint` path, visual state, hit testing, tooltip, and click handling.
+3. Add state for whether paint mode is active in scene windows.
+4. Render the button inactive/active, using a fallback shader/icon if Paint shortcut extraction is not ready yet.
+5. Keep overlay drawing deferred unless the button/state path is already stable.
+6. Run `./check-all.ps1`.

@@ -61,10 +61,11 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::System::LibraryLoader::LoadLibraryW;
 use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObjectEx};
 use windows::Win32::UI::WindowsAndMessaging::{
-    DI_NORMAL, DestroyIcon, DrawIconEx, GetClientRect, HICON, IMAGE_FLAGS, IMAGE_ICON, LoadImageW,
+    DI_NORMAL, DestroyIcon, DrawIconEx, GetClientRect, HICON, IDC_ARROW, IDC_CROSS, IDC_HAND,
+    IDC_HELP, IDC_IBEAM, IDC_SIZEALL, IDC_WAIT, IMAGE_FLAGS, IMAGE_ICON, LoadCursorW, LoadImageW,
 };
 use windows::core::BOOL;
-use windows::core::{Error, HSTRING, Interface, Owned, PCSTR, s};
+use windows::core::{Error, HSTRING, Interface, Owned, PCSTR, PCWSTR, s};
 
 use super::cell_grid;
 use super::spatial::{ClientRect, TerminalCellPoint};
@@ -89,6 +90,8 @@ const TEAMY_D3D12_GPU_VALIDATION_ENV: &str = "TEAMY_D3D12_GPU_VALIDATION";
 const TEAMY_D3D12_OFFSCREEN_ADAPTER_ENV: &str = "TEAMY_D3D12_OFFSCREEN_ADAPTER";
 const SPRITE_SLOT_SIZE: u32 = 320;
 const SPRITE_TARGET_SIZE: u32 = 256;
+const SPRITE_ATLAS_COLUMNS: u32 = 4;
+const SPRITE_ATLAS_ROWS: u32 = 3;
 
 static TERMINAL_FONT_CACHE: OnceLock<Result<Arc<LoadedTerminalFont>, String>> = OnceLock::new();
 static SPRITE_ATLAS_CACHE: OnceLock<Result<Arc<SpriteAtlas>, String>> = OnceLock::new();
@@ -140,6 +143,13 @@ struct SpriteAtlas {
     audio: AtlasSprite,
     windows_audio: AtlasSprite,
     file_audio: AtlasSprite,
+    cursor_arrow: AtlasSprite,
+    cursor_hand: AtlasSprite,
+    cursor_ibeam: AtlasSprite,
+    cursor_cross: AtlasSprite,
+    cursor_wait: AtlasSprite,
+    cursor_size_all: AtlasSprite,
+    cursor_help: AtlasSprite,
 }
 
 impl SpriteAtlas {
@@ -150,6 +160,13 @@ impl SpriteAtlas {
             SpriteId::Audio => self.audio,
             SpriteId::WindowsAudio => self.windows_audio,
             SpriteId::FileAudio => self.file_audio,
+            SpriteId::CursorArrow => self.cursor_arrow,
+            SpriteId::CursorHand => self.cursor_hand,
+            SpriteId::CursorIBeam => self.cursor_ibeam,
+            SpriteId::CursorCross => self.cursor_cross,
+            SpriteId::CursorWait => self.cursor_wait,
+            SpriteId::CursorSizeAll => self.cursor_size_all,
+            SpriteId::CursorHelp => self.cursor_help,
         };
         [rect.uv_left, rect.uv_top, rect.uv_right, rect.uv_bottom]
     }
@@ -228,15 +245,17 @@ pub enum PanelEffect {
     SpriteImage = 13,
     SceneButtonCard = 14,
     SceneBody = 15,
-    WindowChromeDiagnostics = 16,
-    WindowChromeMinimize = 17,
-    WindowChromeMaximize = 18,
-    WindowChromeRestore = 19,
-    WindowChromeClose = 20,
-    GearButton = 21,
-    RecordArmButton = 22,
-    LoopbackButton = 23,
-    TimelineHeadGrabber = 24,
+    WindowChromePin = 16,
+    WindowChromeDiagnostics = 17,
+    WindowChromeMinimize = 18,
+    WindowChromeMaximize = 19,
+    WindowChromeRestore = 20,
+    WindowChromeClose = 21,
+    GearButton = 22,
+    RecordArmButton = 23,
+    LoopbackButton = 24,
+    TimelineHeadGrabber = 25,
+    DemoToggle = 26,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -261,6 +280,13 @@ pub enum SpriteId {
     Audio,
     WindowsAudio,
     FileAudio,
+    CursorArrow,
+    CursorHand,
+    CursorIBeam,
+    CursorCross,
+    CursorWait,
+    CursorSizeAll,
+    CursorHelp,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -371,10 +397,12 @@ pub struct RendererTerminalVisualState {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct WindowChromeButtonsState {
+    pub pin: ButtonVisualState,
     pub diagnostics: ButtonVisualState,
     pub minimize: ButtonVisualState,
     pub maximize_restore: ButtonVisualState,
     pub close: ButtonVisualState,
+    pub pinned: bool,
     pub maximized: bool,
     pub focused: bool,
 }
@@ -2108,6 +2136,16 @@ pub fn push_window_chrome_buttons(
     window_chrome_buttons_state: WindowChromeButtonsState,
 ) {
     let buttons = [
+        (
+            layout.pin_button_rect().to_win32_rect(),
+            window_chrome_button_color(
+                window_chrome_buttons_state.pin,
+                window_chrome_buttons_state.pinned,
+                false,
+            ),
+            window_chrome_buttons_state.pin,
+            PanelEffect::WindowChromePin,
+        ),
         (
             layout.diagnostics_button_rect().to_win32_rect(),
             window_chrome_button_color(
@@ -4598,8 +4636,8 @@ fn create_shader_param_buffer(device: &ID3D12Device) -> eyre::Result<ID3D12Resou
 }
 
 fn build_sprite_atlas() -> eyre::Result<SpriteAtlas> {
-    let width = SPRITE_SLOT_SIZE * 3;
-    let height = SPRITE_SLOT_SIZE * 2;
+    let width = SPRITE_SLOT_SIZE * SPRITE_ATLAS_COLUMNS;
+    let height = SPRITE_SLOT_SIZE * SPRITE_ATLAS_ROWS;
     let mut atlas = RgbaImage::new(width, height);
 
     let terminal = blit_sprite_into_slot(
@@ -4621,6 +4659,20 @@ fn build_sprite_atlas() -> eyre::Result<SpriteAtlas> {
     let audio = blit_sprite_into_slot(&mut atlas, 2, &generate_audio_sprite());
     let windows_audio = blit_sprite_into_slot(&mut atlas, 3, &generate_windows_audio_sprite());
     let file_audio = blit_sprite_into_slot(&mut atlas, 4, &generate_file_audio_sprite());
+    // windowing[impl cursor-gallery.stock-os-cursors]
+    // windowing[impl virtual-cursor.sdf-shader-roadmap]
+    let cursor_arrow =
+        blit_sprite_into_slot(&mut atlas, 5, &generate_stock_cursor_sprite(IDC_ARROW));
+    let cursor_hand = blit_sprite_into_slot(&mut atlas, 6, &generate_stock_cursor_sprite(IDC_HAND));
+    let cursor_ibeam =
+        blit_sprite_into_slot(&mut atlas, 7, &generate_stock_cursor_sprite(IDC_IBEAM));
+    let cursor_cross =
+        blit_sprite_into_slot(&mut atlas, 8, &generate_stock_cursor_sprite(IDC_CROSS));
+    let cursor_wait = blit_sprite_into_slot(&mut atlas, 9, &generate_stock_cursor_sprite(IDC_WAIT));
+    let cursor_size_all =
+        blit_sprite_into_slot(&mut atlas, 10, &generate_stock_cursor_sprite(IDC_SIZEALL));
+    let cursor_help =
+        blit_sprite_into_slot(&mut atlas, 11, &generate_stock_cursor_sprite(IDC_HELP));
 
     Ok(SpriteAtlas {
         width,
@@ -4631,6 +4683,13 @@ fn build_sprite_atlas() -> eyre::Result<SpriteAtlas> {
         audio,
         windows_audio,
         file_audio,
+        cursor_arrow,
+        cursor_hand,
+        cursor_ibeam,
+        cursor_cross,
+        cursor_wait,
+        cursor_size_all,
+        cursor_help,
     })
 }
 
@@ -4657,8 +4716,8 @@ fn blit_sprite_into_slot(
     slot_index: u32,
     sprite: &RgbaImage,
 ) -> AtlasSprite {
-    let slot_x = (slot_index % 3) * SPRITE_SLOT_SIZE;
-    let slot_y = (slot_index / 3) * SPRITE_SLOT_SIZE;
+    let slot_x = (slot_index % SPRITE_ATLAS_COLUMNS) * SPRITE_SLOT_SIZE;
+    let slot_y = (slot_index / SPRITE_ATLAS_COLUMNS) * SPRITE_SLOT_SIZE;
     let fitted = fit_sprite_to_target(sprite, SPRITE_TARGET_SIZE);
     let sprite_x = slot_x + ((SPRITE_SLOT_SIZE - fitted.width()) / 2);
     let sprite_y = slot_y + ((SPRITE_SLOT_SIZE - fitted.height()) / 2);
@@ -4679,6 +4738,22 @@ fn blit_sprite_into_slot(
         uv_right: (sprite_x + fitted.width()) as f32 / atlas.width() as f32,
         uv_bottom: (sprite_y + fitted.height()) as f32 / atlas.height() as f32,
     }
+}
+
+fn generate_stock_cursor_sprite(cursor_name: PCWSTR) -> RgbaImage {
+    windows_stock_cursor_sprite(cursor_name).unwrap_or_else(generate_fallback_cursor_sprite)
+}
+
+fn windows_stock_cursor_sprite(cursor_name: PCWSTR) -> Option<RgbaImage> {
+    let cursor = unsafe { LoadCursorW(None, cursor_name).ok()? };
+    unsafe { draw_icon_to_rgba_image(HICON(cursor.0), SPRITE_TARGET_SIZE).ok() }
+}
+
+fn generate_fallback_cursor_sprite() -> RgbaImage {
+    let mut image = RgbaImage::new(SPRITE_TARGET_SIZE, SPRITE_TARGET_SIZE);
+    fill_cursor_triangle(&mut image, [250, 250, 255, 255]);
+    stroke_cursor_triangle(&mut image, [30, 36, 48, 255]);
+    image
 }
 
 fn fit_sprite_to_target(sprite: &RgbaImage, target_size: u32) -> RgbaImage {
@@ -4882,6 +4957,68 @@ fn fill_rect(image: &mut RgbaImage, left: u32, top: u32, right: u32, bottom: u32
             image.put_pixel(x, y, Rgba(color));
         }
     }
+}
+
+fn fill_cursor_triangle(image: &mut RgbaImage, color: [u8; 4]) {
+    let points = [(28.0, 18.0), (28.0, 214.0), (174.0, 142.0)];
+    for pixel_y in 0..image.height() {
+        for pixel_x in 0..image.width() {
+            let point = (pixel_x as f32 + 0.5, pixel_y as f32 + 0.5);
+            if point_in_triangle(point, points) {
+                image.put_pixel(pixel_x, pixel_y, Rgba(color));
+            }
+        }
+    }
+}
+
+fn stroke_cursor_triangle(image: &mut RgbaImage, color: [u8; 4]) {
+    let points = [(28.0, 18.0), (28.0, 214.0), (174.0, 142.0)];
+    for pixel_y in 0..image.height() {
+        for pixel_x in 0..image.width() {
+            let point = (pixel_x as f32 + 0.5, pixel_y as f32 + 0.5);
+            let near_edge = points
+                .iter()
+                .zip(points.iter().cycle().skip(1))
+                .any(|(start, end)| distance_to_segment(point, *start, *end) <= 5.0);
+            if near_edge {
+                image.put_pixel(pixel_x, pixel_y, Rgba(color));
+            }
+        }
+    }
+}
+
+fn point_in_triangle(point: (f32, f32), points: [(f32, f32); 3]) -> bool {
+    let area = triangle_area(points[0], points[1], points[2]);
+    let area_a = triangle_area(point, points[1], points[2]);
+    let area_b = triangle_area(points[0], point, points[2]);
+    let area_c = triangle_area(points[0], points[1], point);
+    ((area_a + area_b + area_c) - area).abs() <= 0.5
+}
+
+fn triangle_area(first: (f32, f32), second: (f32, f32), third: (f32, f32)) -> f32 {
+    ((first.0 * (second.1 - third.1))
+        + (second.0 * (third.1 - first.1))
+        + (third.0 * (first.1 - second.1)))
+        .abs()
+        * 0.5
+}
+
+fn distance_to_segment(point: (f32, f32), start: (f32, f32), end: (f32, f32)) -> f32 {
+    let segment_x = end.0 - start.0;
+    let segment_y = end.1 - start.1;
+    let length_sq = (segment_x * segment_x) + (segment_y * segment_y);
+    if length_sq <= f32::EPSILON {
+        let dx = point.0 - start.0;
+        let dy = point.1 - start.1;
+        return ((dx * dx) + (dy * dy)).sqrt();
+    }
+    let projection =
+        (((point.0 - start.0) * segment_x) + ((point.1 - start.1) * segment_y)) / length_sq;
+    let clamped = projection.clamp(0.0, 1.0);
+    let closest = (start.0 + segment_x * clamped, start.1 + segment_y * clamped);
+    let dx = point.0 - closest.0;
+    let dy = point.1 - closest.1;
+    ((dx * dx) + (dy * dy)).sqrt()
 }
 
 fn fill_circle(image: &mut RgbaImage, center_x: f32, center_y: f32, radius: f32, color: [u8; 4]) {
@@ -5813,6 +5950,11 @@ mod tests {
         };
 
         let scene = build_panel_scene(layout, WindowChromeButtonsState::default());
+        let pin_button_count = scene
+            .panels
+            .iter()
+            .filter(|panel| matches!(panel.effect, PanelEffect::WindowChromePin))
+            .count();
         let diagnostics_button_count = scene
             .panels
             .iter()
@@ -5839,6 +5981,7 @@ mod tests {
             .filter(|panel| matches!(panel.effect, PanelEffect::WindowChromeClose))
             .count();
 
+        assert_eq!(pin_button_count, 1);
         assert_eq!(diagnostics_button_count, 1);
         assert_eq!(minimize_button_count, 1);
         assert_eq!(maximize_button_count, 1);
