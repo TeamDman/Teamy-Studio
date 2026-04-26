@@ -38,17 +38,20 @@ The product rule is simple: dictated text must never be sprayed into whichever e
   - Added Windows legacy recording-device integration: the microphone picker has a shader-rendered gear button and hotkey for the legacy Recording Devices dialog, and the selected-microphone window reuses the gear button. Per-row properties buttons were removed because there is no supported direct jump to a specific Core Audio endpoint properties page.
   - Implemented the first selected-microphone recording slice: Enter and the shader record button start/stop WASAPI capture from the chosen endpoint, the microphone page renders an audio-buffer waveform with recording/playback/transcription/selection heads, Space plays the captured buffer from a generated WAV handoff, J/K/L update transport speed state, click places the playback head, drag creates a visible selection, and diagnostics mode now renders a ratatui microphone dashboard with a chart-backed waveform.
   - Fixed the first real smoke-test issues in the recording slice: playback generation now starts from the current playback head, pause explicitly stops active WinMM playback, J/L generate crude fast/reverse shuttle buffers, and the pretty/TUI waveforms normalize amplitude to available vertical space and render full-width bars to avoid periodic visual gaps.
-  - Validated the recording slice with `./check-all.ps1` on 2026-04-25: format, clippy, build, tests, and Tracey passed. Tracey reported `teamy-studio-audio-input/rust: 23 of 23 requirements are covered. 9 of 23 have a verification reference.`
+  - Hardened the microphone-detail transport slice after smoke testing: forward playback at end-of-buffer now restarts cleanly, reverse playback can shuttle backward from the end, recording appends instead of clobbering, and the recording head now represents the active write position.
+  - Added microphone-detail control polish: the page now has a separated loopback toggle, draggable stacked grabbers for the recording/playback/transcription heads, hover tooltips for those heads, and a refined recording shader that no longer looks boxed in.
+  - Wired the loopback toggle into the capture path so microphone audio can be monitored through the default render endpoint even when recording is not active; when used outside recording, the monitor session does not append to the recorded buffer.
+  - Validated the recording slice with `./check-all.ps1` on 2026-04-25: format, clippy, build, tests, and Tracey passed. Tracey reported `teamy-studio-audio-input/rust: 23 of 23 requirements are covered. 11 of 23 have a verification reference.`
   - Captured the current Tracey status on 2026-04-25: all tracked requirements are covered. Verification remains partial: behavior 31/56, cli 26/44, convention 0/4, os 6/10, publishing 0/8, tool-standards 22/28, windowing 11/16.
   - Observed `tracey query unmapped` still reports broad repo-wide mapping debt, so new work should add explicit requirement references for touched code instead of trying to solve all historical mapping debt in this slice.
 - Current focus:
-  - Manually smoke test the selected-microphone recording path with real hardware, then decide whether to harden capture/playback or move to the transcription inbox shell.
+  - Manually smoke test the selected-microphone recording path with real hardware again, especially loopback monitoring, draggable head behavior, and append-style recording across multiple takes.
 - Remaining work:
-  - Harden the first capture/playback path after validation and manual smoke testing.
+  - Harden the first capture/playback path after more real-hardware smoke testing, especially for loopback latency, render-format mismatches, and longer recordings.
   - Add the transcription inbox window that can display staged text without sending it to the OS focus target.
   - Connect transcription after capture and the inbox exist.
 - Next step:
-  - Smoke test microphone capture and buffer playback from the selected-device window, including pretty/TUI toggling and waveform click/drag selection.
+  - Smoke test microphone capture, append-style recording, loopback monitoring, and draggable head repositioning from the selected-device window, including pretty/TUI toggling and waveform selection.
 
 ## Why This Slice
 

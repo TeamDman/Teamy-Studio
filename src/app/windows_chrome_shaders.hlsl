@@ -260,16 +260,66 @@ float4 apply_record_arm_button(float2 uv, float4 color, float4 state) {
     float armed = state.y;
     float2 p = uv - 0.5;
     float radius = length(p);
-    float circle = 1.0 - smoothstep(0.32, 0.36, radius);
-    float rim = 1.0 - smoothstep(0.38, 0.48, radius);
+    float circle = 1.0 - smoothstep(0.24, 0.30, radius);
+    float rim = 1.0 - smoothstep(0.30, 0.38, radius);
     float pulse = 0.5 + (0.5 * sin(t * 5.6));
-    float glow = recording * (0.28 + 0.42 * pulse) * (1.0 - smoothstep(0.34, 0.72, radius));
+    float glow = recording * (0.22 + 0.34 * pulse) * exp(-pow(max(radius - 0.20, 0.0) / 0.16, 2.0));
+    float soft = exp(-pow(radius / 0.34, 4.0));
     float3 inactiveRed = float3(0.32, 0.04, 0.035);
     float3 armedRed = float3(0.55, 0.055, 0.045);
     float3 hotRed = float3(1.0, 0.10, 0.07);
     float3 shaded = lerp(inactiveRed, armedRed, armed);
     shaded = lerp(shaded, hotRed, recording * (0.75 + 0.25 * pulse));
-    shaded += hotRed * glow;
-    float alpha = saturate(max(circle, rim * (0.28 + recording * 0.42)) + glow);
+    shaded += hotRed * (glow * 0.72);
+    shaded += color.rgb * (soft * 0.06);
+    float alpha = saturate((circle * 0.96) + (rim * (0.18 + recording * 0.20)) + (glow * 0.48));
+    return float4(shaded, alpha * color.a);
+}
+
+float loopback_icon(float2 uv) {
+    float2 left = uv - float2(0.36, 0.50);
+    float speaker = (1.0 - smoothstep(0.10, 0.13, abs(left.x))) * (1.0 - smoothstep(0.18, 0.21, abs(left.y)));
+    float cone = saturate(1.0 - abs((uv.x - 0.50) - (abs(uv.y - 0.50) * 0.9)) * 14.0) * step(0.39, uv.x) * step(uv.x, 0.58);
+    float2 ring_center = uv - float2(0.58, 0.50);
+    float ring1 = abs(length(ring_center) - 0.12);
+    float ring2 = abs(length(ring_center) - 0.19);
+    float waves = (1.0 - smoothstep(0.01, 0.03, ring1)) + (1.0 - smoothstep(0.01, 0.03, ring2));
+    return saturate(speaker + cone + waves);
+}
+
+float4 apply_loopback_button(float2 uv, float4 color, float4 state) {
+    float enabled = state.x;
+    float hover = state.y;
+    float pressed = state.z;
+    float t = PanelTime();
+    float2 p = uv - 0.5;
+    float radius = length(p);
+    float plate = 1.0 - smoothstep(0.42, 0.50, radius);
+    float rim = 1.0 - smoothstep(0.32, 0.44, radius);
+    float sweep = 0.5 + (0.5 * sin((uv.x * 9.0) - (t * (0.9 + enabled * 1.6))));
+    float shimmer = enabled * (0.5 + 0.5 * sin((uv.y * 12.0) + (t * 2.1)));
+    float intensity = 0.82 + (hover * 0.10) + (enabled * 0.18) + (sweep * 0.06) + (shimmer * 0.10) - (pressed * 0.08);
+    float3 base = lerp(float3(0.20, 0.30, 0.28), float3(0.26, 0.60, 0.52), enabled);
+    float3 shaded = base * intensity;
+    shaded += float3(0.74, 0.95, 0.88) * (rim * (0.08 + enabled * 0.16));
+    float icon = loopback_icon(uv);
+    shaded = lerp(shaded, float3(0.92, 0.98, 0.96), icon * (0.78 + enabled * 0.22));
+    float alpha = saturate((plate * 0.94) + (rim * 0.18));
+    return float4(shaded, alpha * color.a);
+}
+
+float4 apply_timeline_head_grabber(float2 uv, float4 color, float4 state) {
+    float active = state.x;
+    float hover = state.y;
+    float grabbed = state.z;
+    float kind = state.w;
+    float t = PanelTime();
+    float2 p = abs(uv - 0.5);
+    float box = (1.0 - smoothstep(0.34, 0.42, max(p.x, p.y))) * (1.0 - smoothstep(0.40, 0.50, length(uv - 0.5)));
+    float bevel = 1.0 - smoothstep(0.18, 0.46, max(p.x, p.y));
+    float scan = 0.5 + (0.5 * sin((uv.y * 18.0) + (t * (1.0 + grabbed)) + kind));
+    float3 shaded = color.rgb * (0.82 + (active * 0.10) + (hover * 0.10) + (grabbed * 0.18) + (scan * 0.04));
+    shaded += float3(0.94, 0.96, 0.99) * (bevel * (0.08 + hover * 0.10 + grabbed * 0.12));
+    float alpha = saturate((box * 0.98) + (bevel * 0.10));
     return float4(shaded, alpha * color.a);
 }

@@ -16,8 +16,9 @@ use windows::Win32::Devices::Properties;
 use windows::Win32::Foundation::{PROPERTYKEY, RPC_E_CHANGED_MODE};
 use windows::Win32::Media::Audio::{
     AUDCLNT_SHAREMODE_SHARED, DEVICE_STATE_ACTIVE, ERole, IAudioCaptureClient, IAudioClient,
-    IMMDevice, IMMDeviceCollection, IMMDeviceEnumerator, MMDeviceEnumerator, PlaySoundW, SND_ASYNC,
-    SND_FILENAME, SND_FLAGS, SND_NODEFAULT, WAVEFORMATEX, WAVEFORMATEXTENSIBLE, eCapture,
+    IAudioRenderClient, IMMDevice, IMMDeviceCollection, IMMDeviceEnumerator, MMDeviceEnumerator,
+    PlaySoundW, SND_ASYNC, SND_FILENAME, SND_FLAGS, SND_NODEFAULT, WAVEFORMATEX,
+    WAVEFORMATEXTENSIBLE, eCapture, eRender,
 };
 use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::System::Com::StructuredStorage::PropVariantClear;
@@ -87,8 +88,11 @@ pub struct AudioInputPickerState {
 pub struct AudioInputDeviceWindowState {
     pub device: AudioInputDeviceSummary,
     pub armed_for_record: bool,
+    pub loopback_enabled: bool,
     pub runtime: AudioInputRuntimeState,
+    loopback_requested: Arc<AtomicBool>,
     capture_session: Option<AudioInputCaptureSession>,
+    monitor_session: Option<AudioInputCaptureSession>,
     playback_file_path: Option<PathBuf>,
 }
 
@@ -100,8 +104,11 @@ impl AudioInputDeviceWindowState {
         Self {
             device,
             armed_for_record: true,
+            loopback_enabled: false,
             runtime: AudioInputRuntimeState::default(),
+            loopback_requested: Arc::new(AtomicBool::new(false)),
             capture_session: None,
+            monitor_session: None,
             playback_file_path: None,
         }
     }
@@ -120,8 +127,7 @@ impl AudioInputDeviceWindowState {
     // audio[impl gui.recording-state]
     pub fn toggle_recording(&mut self) -> eyre::Result<()> {
         if self.is_recording() {
-            self.stop_recording();
-            return Ok(());
+            return self.stop_recording();
         }
         self.start_recording()
     }
@@ -141,6 +147,20 @@ impl AudioInputDeviceWindowState {
         stop_windows_playback();
         self.runtime.playback.started_at = None;
         self.runtime.playback.speed = 0.0;
+    }
+
+    pub fn toggle_loopback(&mut self) -> eyre::Result<()> {
+        self.loopback_enabled = !self.loopback_enabled;
+        self.loopback_requested
+            .store(self.loopback_enabled, Ordering::Release);
+        if !self.loopback_enabled {
+            self.stop_loopback_monitor();
+            return Ok(());
+        }
+        if !self.is_recording() {
+            self.start_loopback_monitor()?;
+        }
+        Ok(())
     }
 
     pub fn playback_forward(&mut self) -> eyre::Result<()> {
@@ -164,26 +184,84 @@ impl AudioInputDeviceWindowState {
 
     pub fn sync_transport(&mut self) {
         self.sync_playback_head();
-        if self.is_recording() {
-            self.runtime.recording_head_seconds = self.runtime.duration_seconds();
+        self.runtime.recording_head_seconds = self.runtime.write_head_seconds();
+    }
+
+    pub fn set_head_seconds(&mut self, head: AudioInputTimelineHeadKind, seconds: f64) {
+        match head {
+            AudioInputTimelineHeadKind::Recording => {
+                self.runtime.set_write_head_seconds(seconds);
+                self.runtime.recording_head_seconds = self.runtime.write_head_seconds();
+            }
+            AudioInputTimelineHeadKind::Playback => {
+                self.pause_playback();
+                self.runtime.playback.head_seconds =
+                    clamp_head_seconds(seconds, self.runtime.duration_seconds());
+            }
+            AudioInputTimelineHeadKind::Transcription => {
+                self.runtime.transcription_head_seconds =
+                    clamp_head_seconds(seconds, self.runtime.duration_seconds());
+            }
+        }
+    }
+
+    pub fn begin_head_interaction(
+        &mut self,
+        head: AudioInputTimelineHeadKind,
+        pointer_seconds: f64,
+    ) {
+        let head_seconds = self.head_seconds(head);
+        self.runtime.timeline_drag = Some(AudioInputTimelineDrag {
+            interaction: AudioInputTimelineInteraction::Head(head),
+            anchor_seconds: head_seconds,
+            current_seconds: pointer_seconds,
+            origin_x: 0,
+            pointer_offset_seconds: pointer_seconds - head_seconds,
+        });
+    }
+
+    #[must_use]
+    pub fn head_seconds(&self, head: AudioInputTimelineHeadKind) -> f64 {
+        match head {
+            AudioInputTimelineHeadKind::Recording => self.runtime.recording_head_seconds,
+            AudioInputTimelineHeadKind::Playback => self.runtime.playback.head_seconds,
+            AudioInputTimelineHeadKind::Transcription => self.runtime.transcription_head_seconds,
         }
     }
 
     // audio[impl gui.waveform-selection]
     pub fn begin_timeline_interaction(&mut self, seconds: f64, x: i32) {
         self.runtime.timeline_drag = Some(AudioInputTimelineDrag {
+            interaction: AudioInputTimelineInteraction::Selection,
             anchor_seconds: seconds,
             current_seconds: seconds,
             origin_x: x,
+            pointer_offset_seconds: 0.0,
         });
         self.runtime.selection = None;
     }
 
     // audio[impl gui.waveform-selection]
     pub fn update_timeline_interaction(&mut self, seconds: f64) {
-        if let Some(drag) = self.runtime.timeline_drag.as_mut() {
-            drag.current_seconds = seconds;
-            self.runtime.selection = AudioInputSelection::new(drag.anchor_seconds, seconds);
+        let Some((interaction, anchor_seconds, pointer_offset_seconds)) =
+            self.runtime.timeline_drag.as_mut().map(|drag| {
+                drag.current_seconds = seconds;
+                (
+                    drag.interaction,
+                    drag.anchor_seconds,
+                    drag.pointer_offset_seconds,
+                )
+            })
+        else {
+            return;
+        };
+        match interaction {
+            AudioInputTimelineInteraction::Selection => {
+                self.runtime.selection = AudioInputSelection::new(anchor_seconds, seconds);
+            }
+            AudioInputTimelineInteraction::Head(head) => {
+                self.set_head_seconds(head, seconds - pointer_offset_seconds);
+            }
         }
     }
 
@@ -192,6 +270,10 @@ impl AudioInputDeviceWindowState {
         let Some(drag) = self.runtime.timeline_drag.take() else {
             return Ok(());
         };
+        if let AudioInputTimelineInteraction::Head(head) = drag.interaction {
+            self.set_head_seconds(head, seconds - drag.pointer_offset_seconds);
+            return Ok(());
+        }
         if (x - drag.origin_x).abs() <= PLAYBACK_SELECTION_TOLERANCE_PX {
             let was_playing = self.is_playing();
             let speed = if self.runtime.playback.speed == 0.0 {
@@ -212,25 +294,51 @@ impl AudioInputDeviceWindowState {
     }
 
     fn start_recording(&mut self) -> eyre::Result<()> {
-        if !self.armed_for_record {
-            return Ok(());
-        }
+        self.pause_playback();
+        self.stop_loopback_monitor();
         self.runtime.clear_error();
-        self.runtime.clear_audio();
-        self.runtime.recording_head_seconds = 0.0;
+        self.runtime.sync_write_head_from_recording_head();
+        self.runtime.recording_head_seconds = self.runtime.write_head_seconds();
         let session = AudioInputCaptureSession::start(
             self.device.id.clone(),
             Arc::clone(&self.runtime.shared),
+            Arc::clone(&self.loopback_requested),
+            true,
         )?;
         self.capture_session = Some(session);
         Ok(())
     }
 
-    fn stop_recording(&mut self) {
+    fn stop_recording(&mut self) -> eyre::Result<()> {
         if let Some(session) = self.capture_session.take() {
             session.stop();
         }
-        self.runtime.recording_head_seconds = self.runtime.duration_seconds();
+        self.runtime.recording_head_seconds = self.runtime.write_head_seconds();
+        if self.loopback_enabled {
+            self.start_loopback_monitor()?;
+        }
+        Ok(())
+    }
+
+    fn start_loopback_monitor(&mut self) -> eyre::Result<()> {
+        if self.monitor_session.is_some() {
+            return Ok(());
+        }
+        self.runtime.clear_error();
+        let session = AudioInputCaptureSession::start(
+            self.device.id.clone(),
+            Arc::clone(&self.runtime.shared),
+            Arc::clone(&self.loopback_requested),
+            false,
+        )?;
+        self.monitor_session = Some(session);
+        Ok(())
+    }
+
+    fn stop_loopback_monitor(&mut self) {
+        if let Some(session) = self.monitor_session.take() {
+            session.stop();
+        }
     }
 
     fn start_playback(&mut self, speed: f64) -> eyre::Result<()> {
@@ -239,14 +347,19 @@ impl AudioInputDeviceWindowState {
         if samples.is_empty() {
             return Ok(());
         }
+        let duration_seconds = self.runtime.duration_seconds();
         let sample_rate = self.runtime.sample_rate_hz();
-        let playback_samples = playback_samples_from_head(
-            &samples,
-            sample_rate,
+        let start_head_seconds = playback_start_head_seconds(
             self.runtime.playback.head_seconds,
+            duration_seconds,
             speed,
         );
+        self.runtime.playback.head_seconds = start_head_seconds;
+        let playback_samples =
+            playback_samples_from_head(&samples, sample_rate, start_head_seconds, speed);
         if playback_samples.is_empty() {
+            self.runtime.playback.started_at = None;
+            self.runtime.playback.speed = 0.0;
             return Ok(());
         }
         stop_windows_playback();
@@ -264,9 +377,6 @@ impl AudioInputDeviceWindowState {
             eyre::bail!("failed to play recorded audio buffer")
         }
         self.playback_file_path = Some(playback_path);
-        if self.runtime.playback.head_seconds >= self.runtime.duration_seconds() {
-            self.runtime.playback.head_seconds = 0.0;
-        }
         self.runtime.playback.started_at = Some(Instant::now());
         self.runtime.playback.speed = speed;
         Ok(())
@@ -301,7 +411,7 @@ impl AudioInputDeviceWindowState {
 
 impl Drop for AudioInputDeviceWindowState {
     fn drop(&mut self) {
-        self.stop_recording();
+        let _ = self.stop_recording();
         stop_windows_playback();
     }
 }
@@ -354,6 +464,14 @@ impl AudioInputRuntimeState {
     }
 
     #[must_use]
+    pub fn write_head_seconds(&self) -> f64 {
+        let Ok(buffer) = self.shared.lock() else {
+            return self.recording_head_seconds;
+        };
+        seconds_from_samples(buffer.write_head_index, buffer.sample_rate_hz).get::<second>()
+    }
+
+    #[must_use]
     pub fn last_error(&self) -> Option<String> {
         self.shared
             .lock()
@@ -361,20 +479,29 @@ impl AudioInputRuntimeState {
             .and_then(|buffer| buffer.last_error.clone())
     }
 
-    fn clear_audio(&mut self) {
-        if let Ok(mut buffer) = self.shared.lock() {
-            buffer.samples.clear();
-            buffer.last_error = None;
-        }
-        self.playback = AudioInputPlaybackState::default();
-        self.selection = None;
-        self.timeline_drag = None;
-    }
-
     fn clear_error(&mut self) {
         if let Ok(mut buffer) = self.shared.lock() {
             buffer.last_error = None;
         }
+    }
+
+    fn set_write_head_seconds(&mut self, seconds: f64) {
+        if let Ok(mut buffer) = self.shared.lock() {
+            buffer.write_head_index = sample_index_for_seconds(
+                buffer.sample_rate_hz,
+                clamp_head_seconds(
+                    seconds,
+                    seconds_from_samples(buffer.samples.len(), buffer.sample_rate_hz)
+                        .get::<second>(),
+                ),
+                buffer.samples.len().saturating_add(1),
+            )
+            .min(buffer.samples.len());
+        }
+    }
+
+    fn sync_write_head_from_recording_head(&mut self) {
+        self.set_write_head_seconds(self.recording_head_seconds);
     }
 }
 
@@ -411,14 +538,30 @@ impl AudioInputSelection {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct AudioInputTimelineDrag {
+    pub interaction: AudioInputTimelineInteraction,
     pub anchor_seconds: f64,
     pub current_seconds: f64,
     pub origin_x: i32,
+    pub pointer_offset_seconds: f64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AudioInputTimelineInteraction {
+    Selection,
+    Head(AudioInputTimelineHeadKind),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AudioInputTimelineHeadKind {
+    Recording,
+    Playback,
+    Transcription,
 }
 
 #[derive(Debug)]
 struct AudioInputSharedBuffer {
     samples: Vec<f32>,
+    write_head_index: usize,
     sample_rate_hz: u32,
     last_error: Option<String>,
 }
@@ -427,6 +570,7 @@ impl Default for AudioInputSharedBuffer {
     fn default() -> Self {
         Self {
             samples: Vec::new(),
+            write_head_index: 0,
             sample_rate_hz: 48_000,
             last_error: None,
         }
@@ -443,15 +587,21 @@ impl AudioInputCaptureSession {
     fn start(
         endpoint_id: String,
         shared: Arc<Mutex<AudioInputSharedBuffer>>,
+        loopback_requested: Arc<AtomicBool>,
+        write_to_buffer: bool,
     ) -> eyre::Result<Self> {
         let stop_requested = Arc::new(AtomicBool::new(false));
         let capture_stop_requested = Arc::clone(&stop_requested);
         let thread = thread::Builder::new()
             .name("teamy-studio-audio-input-capture".to_owned())
             .spawn(move || {
-                if let Err(error) =
-                    capture_audio_input(endpoint_id, &shared, &capture_stop_requested)
-                    && let Ok(mut buffer) = shared.lock()
+                if let Err(error) = capture_audio_input(
+                    endpoint_id,
+                    &shared,
+                    &capture_stop_requested,
+                    &loopback_requested,
+                    write_to_buffer,
+                ) && let Ok(mut buffer) = shared.lock()
                 {
                     buffer.last_error = Some(error.to_string());
                 }
@@ -720,6 +870,8 @@ fn capture_audio_input(
     endpoint_id: String,
     shared: &Arc<Mutex<AudioInputSharedBuffer>>,
     stop_requested: &Arc<AtomicBool>,
+    loopback_requested: &Arc<AtomicBool>,
+    write_to_buffer: bool,
 ) -> eyre::Result<()> {
     let _com = ComApartment::initialize()?;
     let enumerator: IMMDeviceEnumerator = unsafe {
@@ -753,8 +905,14 @@ fn capture_audio_input(
     initialize_result?;
     let capture_client: IAudioCaptureClient = unsafe { audio_client.GetService()? };
     unsafe { audio_client.Start()? };
-    let capture_result =
-        poll_capture_client(&capture_client, capture_format, shared, stop_requested);
+    let capture_result = poll_capture_client(
+        &capture_client,
+        capture_format,
+        shared,
+        stop_requested,
+        loopback_requested,
+        write_to_buffer,
+    );
     let _ = unsafe { audio_client.Stop() };
     unsafe { CoTaskMemFree(Some(mix_format.cast::<c_void>())) };
     capture_result
@@ -769,7 +927,10 @@ fn poll_capture_client(
     capture_format: AudioCaptureFormat,
     shared: &Arc<Mutex<AudioInputSharedBuffer>>,
     stop_requested: &Arc<AtomicBool>,
+    loopback_requested: &Arc<AtomicBool>,
+    write_to_buffer: bool,
 ) -> eyre::Result<()> {
+    let mut loopback_session = AudioLoopbackRenderSession::open_default().ok();
     while !stop_requested.load(Ordering::Acquire) {
         let mut packet_frames = unsafe { capture_client.GetNextPacketSize()? };
         while packet_frames > 0 {
@@ -793,10 +954,16 @@ fn poll_capture_client(
                 samples = unsafe { capture_frames_as_mono(data, frames_to_read, capture_format) };
             }
             unsafe { capture_client.ReleaseBuffer(frames_to_read)? };
-            if !samples.is_empty()
+            if write_to_buffer
+                && !samples.is_empty()
                 && let Ok(mut buffer) = shared.lock()
             {
-                buffer.samples.extend(samples);
+                write_samples_into_audio_buffer(&mut buffer, &samples);
+            }
+            if loopback_requested.load(Ordering::Acquire)
+                && let Some(session) = loopback_session.as_mut()
+            {
+                session.render_samples(&samples)?;
             }
             packet_frames = unsafe { capture_client.GetNextPacketSize()? };
         }
@@ -811,6 +978,95 @@ struct AudioCaptureFormat {
     channels: u16,
     block_align: u16,
     sample_format: AudioSampleFormat,
+}
+
+struct AudioLoopbackRenderSession {
+    audio_client: IAudioClient,
+    render_client: IAudioRenderClient,
+    render_format: AudioCaptureFormat,
+    buffer_frame_count: u32,
+}
+
+impl AudioLoopbackRenderSession {
+    #[expect(
+        clippy::undocumented_unsafe_blocks,
+        reason = "WASAPI render startup requires COM activation and shared-mode client initialization"
+    )]
+    fn open_default() -> eyre::Result<Self> {
+        let enumerator: IMMDeviceEnumerator = unsafe {
+            CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_INPROC_SERVER)
+                .wrap_err("failed to create Windows audio endpoint enumerator for loopback")?
+        };
+        let device = unsafe {
+            enumerator
+                .GetDefaultAudioEndpoint(eRender, ERole(1))
+                .wrap_err("failed to resolve the default render endpoint for microphone loopback")?
+        };
+        let audio_client: IAudioClient = unsafe { device.Activate(CLSCTX_ALL, None)? };
+        let mix_format = unsafe { audio_client.GetMixFormat()? };
+        if mix_format.is_null() {
+            eyre::bail!("audio client returned a null render mix format")
+        }
+        let render_format = unsafe { audio_capture_format(mix_format)? };
+        unsafe {
+            audio_client.Initialize(
+                AUDCLNT_SHAREMODE_SHARED,
+                0,
+                WASAPI_SHARED_BUFFER_100NS,
+                0,
+                mix_format,
+                None,
+            )?;
+        };
+        let render_client: IAudioRenderClient = unsafe { audio_client.GetService()? };
+        let buffer_frame_count = unsafe { audio_client.GetBufferSize()? };
+        unsafe { audio_client.Start()? };
+        unsafe { CoTaskMemFree(Some(mix_format.cast::<c_void>())) };
+        Ok(Self {
+            audio_client,
+            render_client,
+            render_format,
+            buffer_frame_count,
+        })
+    }
+
+    #[expect(
+        clippy::undocumented_unsafe_blocks,
+        reason = "loopback copies normalized mono samples into the default render mix format"
+    )]
+    fn render_samples(&mut self, mono_samples: &[f32]) -> eyre::Result<()> {
+        if mono_samples.is_empty() {
+            return Ok(());
+        }
+        let padding = unsafe { self.audio_client.GetCurrentPadding()? };
+        let available_frames = self.buffer_frame_count.saturating_sub(padding);
+        if available_frames == 0 {
+            return Ok(());
+        }
+        let render_frames = usize::try_from(available_frames).unwrap_or_default();
+        let converted = resample_mono_for_render(mono_samples, render_frames, self.render_format);
+        let frame_count = converted.len() / usize::from(self.render_format.channels.max(1));
+        if frame_count == 0 {
+            return Ok(());
+        }
+        let buffer = unsafe {
+            self.render_client
+                .GetBuffer(u32::try_from(frame_count).unwrap_or_default())?
+        };
+        unsafe { write_render_frames(buffer.cast::<u8>(), &converted, self.render_format) };
+        unsafe {
+            self.render_client
+                .ReleaseBuffer(u32::try_from(frame_count).unwrap_or_default(), 0)?;
+        };
+        Ok(())
+    }
+}
+
+impl Drop for AudioLoopbackRenderSession {
+    fn drop(&mut self) {
+        // Safety: stopping an initialized shared-mode audio client during drop releases the render stream.
+        let _ = unsafe { self.audio_client.Stop() };
+    }
 }
 
 #[expect(
@@ -910,6 +1166,77 @@ unsafe fn read_capture_sample(sample_base: *const u8, sample_format: AudioSample
     }
 }
 
+fn resample_mono_for_render(
+    mono_samples: &[f32],
+    output_frame_capacity: usize,
+    render_format: AudioCaptureFormat,
+) -> Vec<f32> {
+    if mono_samples.is_empty() || output_frame_capacity == 0 {
+        return Vec::new();
+    }
+    let output_frames = mono_samples.len().min(output_frame_capacity);
+    let channels = usize::from(render_format.channels.max(1));
+    let mut converted = Vec::with_capacity(output_frames.saturating_mul(channels));
+    for frame_index in 0..output_frames {
+        let source_index = (frame_index * mono_samples.len()) / output_frames;
+        let sample = mono_samples[source_index].clamp(-1.0, 1.0);
+        for _ in 0..channels {
+            converted.push(sample);
+        }
+    }
+    converted
+}
+
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::undocumented_unsafe_blocks,
+    reason = "loopback render writes normalized mono samples into the render endpoint buffer"
+)]
+unsafe fn write_render_frames(buffer: *mut u8, samples: &[f32], render_format: AudioCaptureFormat) {
+    match render_format.sample_format {
+        AudioSampleFormat::Float32 => {
+            for (index, sample) in samples.iter().copied().enumerate() {
+                let bytes = sample.to_le_bytes();
+                let sample_base = unsafe { buffer.add(index * size_of::<f32>()) };
+                for (offset, byte) in bytes.into_iter().enumerate() {
+                    let target = sample_base.wrapping_add(offset);
+                    unsafe { target.write(byte) };
+                }
+            }
+        }
+        AudioSampleFormat::Pcm16 => {
+            for (index, sample) in samples.iter().copied().enumerate() {
+                let bytes = ((sample * f32::from(i16::MAX)).round() as i16).to_le_bytes();
+                let sample_base = unsafe { buffer.add(index * size_of::<i16>()) };
+                for (offset, byte) in bytes.into_iter().enumerate() {
+                    let target = sample_base.wrapping_add(offset);
+                    unsafe { target.write(byte) };
+                }
+            }
+        }
+        AudioSampleFormat::Pcm24 => {
+            for (index, sample) in samples.iter().copied().enumerate() {
+                let sample = ((sample * 8_388_607.0).round() as i32).clamp(-8_388_608, 8_388_607);
+                let sample_bytes = sample.to_le_bytes();
+                let sample_base = unsafe { buffer.add(index * 3) };
+                unsafe { sample_base.write(sample_bytes[0]) };
+                unsafe { sample_base.wrapping_add(1).write(sample_bytes[1]) };
+                unsafe { sample_base.wrapping_add(2).write(sample_bytes[2]) };
+            }
+        }
+        AudioSampleFormat::Pcm32 => {
+            for (index, sample) in samples.iter().copied().enumerate() {
+                let bytes = ((sample * 2_147_483_647.0).round() as i32).to_le_bytes();
+                let sample_base = unsafe { buffer.add(index * size_of::<i32>()) };
+                for (offset, byte) in bytes.into_iter().enumerate() {
+                    let target = sample_base.wrapping_add(offset);
+                    unsafe { target.write(byte) };
+                }
+            }
+        }
+    }
+}
+
 #[expect(
     clippy::cast_precision_loss,
     reason = "timeline durations are display-scale f64 values derived from sample counts"
@@ -936,6 +1263,42 @@ fn sample_index_for_seconds(sample_rate_hz: u32, seconds: f64, sample_len: usize
     }
     let sample_index = sample_index as usize;
     sample_index.min(sample_len.saturating_sub(1))
+}
+
+fn clamp_head_seconds(seconds: f64, duration_seconds: f64) -> f64 {
+    seconds.clamp(0.0, duration_seconds.max(0.0))
+}
+
+fn playback_start_head_seconds(head_seconds: f64, duration_seconds: f64, speed: f64) -> f64 {
+    let duration_seconds = duration_seconds.max(0.0);
+    if duration_seconds <= f64::EPSILON {
+        return 0.0;
+    }
+    let clamped = clamp_head_seconds(head_seconds, duration_seconds);
+    if speed < 0.0 {
+        return clamped.min(duration_seconds);
+    }
+    if clamped >= duration_seconds {
+        return 0.0;
+    }
+    clamped
+}
+
+fn write_samples_into_audio_buffer(buffer: &mut AudioInputSharedBuffer, incoming_samples: &[f32]) {
+    let write_start = buffer.write_head_index.min(buffer.samples.len());
+    let overwrite_len = incoming_samples
+        .len()
+        .min(buffer.samples.len().saturating_sub(write_start));
+    if overwrite_len > 0 {
+        buffer.samples[write_start..write_start + overwrite_len]
+            .copy_from_slice(&incoming_samples[..overwrite_len]);
+    }
+    if overwrite_len < incoming_samples.len() {
+        buffer
+            .samples
+            .extend_from_slice(&incoming_samples[overwrite_len..]);
+    }
+    buffer.write_head_index = write_start.saturating_add(incoming_samples.len());
 }
 
 #[expect(
@@ -1143,5 +1506,49 @@ mod tests {
             playback_samples_from_head(&samples, 10, 0.1, 2.0),
             vec![0.1, 0.3, 0.5]
         );
+    }
+
+    #[test]
+    // audio[verify gui.playback-transport]
+    fn playback_restarts_from_beginning_when_playing_forward_at_end() {
+        assert_eq!(playback_start_head_seconds(2.0, 2.0, 1.0), 0.0);
+    }
+
+    #[test]
+    // audio[verify gui.playback-transport]
+    fn reverse_playback_keeps_end_head_when_shuttling_backward() {
+        assert_eq!(playback_start_head_seconds(2.0, 2.0, -1.0), 2.0);
+    }
+
+    #[test]
+    // audio[verify gui.audio-buffer-waveform]
+    fn writing_samples_appends_at_current_write_head() {
+        let mut buffer = AudioInputSharedBuffer {
+            samples: vec![0.1, 0.2, 0.3],
+            write_head_index: 3,
+            sample_rate_hz: 10,
+            last_error: None,
+        };
+
+        write_samples_into_audio_buffer(&mut buffer, &[0.4, 0.5]);
+
+        assert_eq!(buffer.samples, vec![0.1, 0.2, 0.3, 0.4, 0.5]);
+        assert_eq!(buffer.write_head_index, 5);
+    }
+
+    #[test]
+    // audio[verify gui.audio-buffer-waveform]
+    fn writing_samples_overwrites_from_repositioned_write_head() {
+        let mut buffer = AudioInputSharedBuffer {
+            samples: vec![0.1, 0.2, 0.3, 0.4],
+            write_head_index: 1,
+            sample_rate_hz: 10,
+            last_error: None,
+        };
+
+        write_samples_into_audio_buffer(&mut buffer, &[0.9, 0.8, 0.7]);
+
+        assert_eq!(buffer.samples, vec![0.1, 0.9, 0.8, 0.7]);
+        assert_eq!(buffer.write_head_index, 4);
     }
 }

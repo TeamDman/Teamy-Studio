@@ -399,7 +399,11 @@ float4 PSMain(PsInput input) : SV_TARGET {
     }
 
     float4 shaded = input.color;
-    if (input.effect > 21.5) {
+    if (input.effect > 23.5) {
+        shaded = apply_timeline_head_grabber(input.uv, input.color, input.glyphData);
+    } else if (input.effect > 22.5) {
+        shaded = apply_loopback_button(input.uv, input.color, input.glyphData);
+    } else if (input.effect > 21.5) {
         shaded = apply_record_arm_button(input.uv, input.color, input.glyphData);
     } else if (input.effect > 15.5) {
         shaded = apply_window_chrome_button(input.uv, input.color, input.glyphData, input.effect);

@@ -12,7 +12,9 @@ use windows::Win32::Foundation::RECT;
 
 use super::cell_grid;
 use super::spatial::{ClientPoint, ClientRect, TerminalCellPoint};
-use super::windows_audio_input::{AudioInputDeviceSummary, AudioInputDeviceWindowState};
+use super::windows_audio_input::{
+    AudioInputDeviceSummary, AudioInputDeviceWindowState, AudioInputTimelineHeadKind,
+};
 use super::windows_d3d12_renderer::{
     ButtonVisualState, PanelEffect, RenderScene, SpriteId, WindowChromeButtonsState,
     preferred_background_color, preferred_title_bar_color, push_centered_text, push_glyph,
@@ -87,11 +89,26 @@ pub struct AudioInputDeviceDetailLayout {
     pub icon_rect: ClientRect,
     pub info_rect: ClientRect,
     pub arm_button_rect: ClientRect,
+    pub loopback_button_rect: ClientRect,
     pub arm_status_rect: ClientRect,
     pub legacy_recording_button_rect: ClientRect,
     pub buffer_section_rect: ClientRect,
     pub waveform_rect: ClientRect,
     pub timeline_label_rect: ClientRect,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AudioInputTimelineHeadGrabberLayout {
+    pub kind: AudioInputTimelineHeadKind,
+    pub rect: ClientRect,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AudioInputDeviceDetailVisualState {
+    pub loopback_hovered: bool,
+    pub loopback_pressed: bool,
+    pub hovered_head: Option<AudioInputTimelineHeadKind>,
+    pub grabbed_head: Option<AudioInputTimelineHeadKind>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -431,6 +448,7 @@ pub fn build_audio_input_device_detail_render_scene(
     layout: TerminalLayout,
     window_chrome_buttons_state: WindowChromeButtonsState,
     device_state: Option<&AudioInputDeviceWindowState>,
+    visual_state: AudioInputDeviceDetailVisualState,
 ) -> RenderScene {
     let mut scene = build_scene_shell(
         layout,
@@ -524,15 +542,41 @@ pub fn build_audio_input_device_detail_render_scene(
             0.0,
         ],
     );
+    push_panel_with_data(
+        &mut scene,
+        detail_layout.loopback_button_rect.to_win32_rect(),
+        if device_state.loopback_enabled {
+            [0.20, 0.54, 0.46, 1.0]
+        } else {
+            [0.13, 0.24, 0.22, 1.0]
+        },
+        PanelEffect::LoopbackButton,
+        [
+            if device_state.loopback_enabled {
+                1.0
+            } else {
+                0.0
+            },
+            if visual_state.loopback_hovered {
+                1.0
+            } else {
+                0.0
+            },
+            if visual_state.loopback_pressed {
+                1.0
+            } else {
+                0.0
+            },
+            0.0,
+        ],
+    );
     push_text_block(
         &mut scene,
         detail_layout.arm_status_rect.to_win32_rect(),
         if device_state.is_recording() {
             "Recording"
-        } else if device_state.armed_for_record {
-            "Armed for recording"
         } else {
-            "Recording arm disabled"
+            "Not recording"
         },
         10,
         18,
@@ -544,8 +588,30 @@ pub fn build_audio_input_device_detail_render_scene(
             [0.82, 0.84, 0.86, 1.0]
         },
     );
+    push_text_block(
+        &mut scene,
+        ClientRect::new(
+            detail_layout.loopback_button_rect.right() + 16,
+            detail_layout.loopback_button_rect.top() + 10,
+            detail_layout.arm_status_rect.right(),
+            detail_layout.loopback_button_rect.bottom() - 8,
+        )
+        .to_win32_rect(),
+        if device_state.loopback_enabled {
+            "Loopback enabled"
+        } else {
+            "Loopback disabled"
+        },
+        10,
+        18,
+        if device_state.loopback_enabled {
+            [0.73, 0.93, 0.88, 1.0]
+        } else {
+            [0.76, 0.82, 0.84, 1.0]
+        },
+    );
     // audio[impl gui.audio-buffer-waveform]
-    push_audio_input_buffer_section(&mut scene, detail_layout, device_state);
+    push_audio_input_buffer_section(&mut scene, detail_layout, device_state, visual_state);
 
     scene
 }
@@ -566,10 +632,17 @@ pub fn audio_input_device_detail_layout(body_rect: ClientRect) -> AudioInputDevi
         icon_rect.left() + arm_button_size,
         icon_rect.bottom() + 36 + arm_button_size,
     );
+    let loopback_left = (body_rect.right() - 260).max(arm_button_rect.right() + 180);
+    let loopback_button_rect = ClientRect::new(
+        loopback_left,
+        arm_button_rect.top() + 8,
+        loopback_left + 58,
+        arm_button_rect.top() + 8 + 58,
+    );
     let arm_status_rect = ClientRect::new(
         arm_button_rect.right() + 18,
         arm_button_rect.top() + 14,
-        body_rect.right() - 28,
+        loopback_button_rect.left() - 24,
         arm_button_rect.bottom() - 10,
     );
     let info_rect = ClientRect::new(
@@ -607,6 +680,7 @@ pub fn audio_input_device_detail_layout(body_rect: ClientRect) -> AudioInputDevi
         icon_rect,
         info_rect,
         arm_button_rect,
+        loopback_button_rect,
         arm_status_rect,
         legacy_recording_button_rect,
         buffer_section_rect,
@@ -619,6 +693,7 @@ fn push_audio_input_buffer_section(
     scene: &mut RenderScene,
     detail_layout: AudioInputDeviceDetailLayout,
     device_state: &AudioInputDeviceWindowState,
+    visual_state: AudioInputDeviceDetailVisualState,
 ) {
     push_panel(
         scene,
@@ -654,13 +729,19 @@ fn push_audio_input_buffer_section(
         16,
         [0.88, 0.91, 0.94, 1.0],
     );
-    push_waveform(scene, detail_layout.waveform_rect, device_state);
+    push_waveform(
+        scene,
+        detail_layout.waveform_rect,
+        device_state,
+        visual_state,
+    );
 }
 
 fn push_waveform(
     scene: &mut RenderScene,
     waveform_rect: ClientRect,
     device_state: &AudioInputDeviceWindowState,
+    visual_state: AudioInputDeviceDetailVisualState,
 ) {
     push_panel(
         scene,
@@ -713,6 +794,7 @@ fn push_waveform(
         device_state.runtime.transcription_head_seconds,
         [0.85, 0.56, 1.0, 1.0],
     );
+    push_timeline_head_grabbers(scene, waveform_rect, device_state, visual_state);
     if let Some(selection) = device_state.runtime.selection {
         push_timeline_head(
             scene,
@@ -792,6 +874,121 @@ fn push_timeline_head(
         color,
         PanelEffect::TerminalFill,
     );
+}
+
+fn push_timeline_head_grabbers(
+    scene: &mut RenderScene,
+    waveform_rect: ClientRect,
+    device_state: &AudioInputDeviceWindowState,
+    visual_state: AudioInputDeviceDetailVisualState,
+) {
+    for grabber in audio_input_timeline_head_grabbers(waveform_rect, device_state) {
+        let active = match grabber.kind {
+            AudioInputTimelineHeadKind::Recording => device_state.is_recording(),
+            AudioInputTimelineHeadKind::Playback => device_state.is_playing(),
+            AudioInputTimelineHeadKind::Transcription => false,
+        };
+        push_panel_with_data(
+            scene,
+            grabber.rect.to_win32_rect(),
+            timeline_head_color(grabber.kind),
+            PanelEffect::TimelineHeadGrabber,
+            [
+                if active { 1.0 } else { 0.0 },
+                if visual_state.hovered_head == Some(grabber.kind) {
+                    1.0
+                } else {
+                    0.0
+                },
+                if visual_state.grabbed_head == Some(grabber.kind) {
+                    1.0
+                } else {
+                    0.0
+                },
+                head_kind_shader_index(grabber.kind),
+            ],
+        );
+    }
+}
+
+#[must_use]
+pub fn audio_input_timeline_head_grabbers(
+    waveform_rect: ClientRect,
+    device_state: &AudioInputDeviceWindowState,
+) -> Vec<AudioInputTimelineHeadGrabberLayout> {
+    let duration_seconds = device_state.runtime.duration_seconds().max(1.0);
+    let mut heads = vec![
+        (
+            AudioInputTimelineHeadKind::Recording,
+            timeline_seconds_to_x(
+                waveform_rect,
+                duration_seconds,
+                device_state.runtime.recording_head_seconds,
+            ),
+        ),
+        (
+            AudioInputTimelineHeadKind::Playback,
+            timeline_seconds_to_x(
+                waveform_rect,
+                duration_seconds,
+                device_state.runtime.playback.head_seconds,
+            ),
+        ),
+        (
+            AudioInputTimelineHeadKind::Transcription,
+            timeline_seconds_to_x(
+                waveform_rect,
+                duration_seconds,
+                device_state.runtime.transcription_head_seconds,
+            ),
+        ),
+    ];
+    heads.sort_by_key(|(kind, x)| (*x, head_kind_sort_key(*kind)));
+    let grabber_size: i32 = 14;
+    let vertical_gap: i32 = 4;
+    let threshold = (grabber_size + 2).cast_unsigned();
+    let mut previous_x = i32::MIN;
+    let mut stack_index = 0;
+    heads
+        .into_iter()
+        .map(|(kind, x)| {
+            if previous_x != i32::MIN && x.abs_diff(previous_x) <= threshold {
+                stack_index += 1;
+            } else {
+                stack_index = 0;
+                previous_x = x;
+            }
+            let top = waveform_rect.top() + 8 + stack_index * (grabber_size + vertical_gap);
+            AudioInputTimelineHeadGrabberLayout {
+                kind,
+                rect: ClientRect::new(x - 7, top, x + 7, top + grabber_size),
+            }
+        })
+        .collect()
+}
+
+fn timeline_head_color(head: AudioInputTimelineHeadKind) -> [f32; 4] {
+    match head {
+        AudioInputTimelineHeadKind::Recording => [1.0, 0.20, 0.16, 1.0],
+        AudioInputTimelineHeadKind::Playback => [0.28, 0.72, 1.0, 1.0],
+        AudioInputTimelineHeadKind::Transcription => [0.85, 0.56, 1.0, 1.0],
+    }
+}
+
+fn head_kind_shader_index(head: AudioInputTimelineHeadKind) -> f32 {
+    match head {
+        AudioInputTimelineHeadKind::Recording => 0.0,
+        AudioInputTimelineHeadKind::Playback => 1.0,
+        AudioInputTimelineHeadKind::Transcription => 2.0,
+    }
+}
+
+fn head_kind_sort_key(head: AudioInputTimelineHeadKind) -> i32 {
+    match head {
+        AudioInputTimelineHeadKind::Recording => 0,
+        AudioInputTimelineHeadKind::Playback => 1,
+        AudioInputTimelineHeadKind::Transcription => 2,
+    }
 }
 
 fn push_head_region(
@@ -1848,6 +2045,7 @@ mod tests {
             sample_layout(),
             WindowChromeButtonsState::default(),
             Some(&state),
+            AudioInputDeviceDetailVisualState::default(),
         );
         let body_rect = sample_layout().terminal_panel_rect().inset(24);
         let detail_layout = audio_input_device_detail_layout(body_rect);
@@ -1867,6 +2065,9 @@ mod tests {
         assert!(scene.panels.iter().any(|panel| panel.rect
             == detail_layout.legacy_recording_button_rect.to_win32_rect()
             && matches!(panel.effect, PanelEffect::GearButton)));
+        assert!(scene.panels.iter().any(|panel| panel.rect
+            == detail_layout.loopback_button_rect.to_win32_rect()
+            && matches!(panel.effect, PanelEffect::LoopbackButton)));
         assert!(!scene.glyphs.is_empty());
     }
 

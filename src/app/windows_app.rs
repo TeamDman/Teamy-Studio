@@ -70,8 +70,8 @@ use super::windows_audio::{
 };
 use super::windows_audio_input::{
     AudioInputDeviceSummary, AudioInputDeviceWindowState, AudioInputPickerKey,
-    AudioInputPickerKeyResult, AudioInputPickerState, list_active_audio_input_devices,
-    open_legacy_recording_devices_dialog,
+    AudioInputPickerKeyResult, AudioInputPickerState, AudioInputTimelineHeadKind,
+    list_active_audio_input_devices, open_legacy_recording_devices_dialog,
 };
 use super::windows_cursor_info::{CursorInfoConfig, CursorInfoVirtualSession};
 use super::windows_d3d12_renderer::{
@@ -358,6 +358,8 @@ enum ScenePressedTarget {
     Action(SceneAction),
     AudioInputDevice(usize),
     AudioInputDeviceArm,
+    AudioInputDeviceLoopback,
+    AudioInputTimelineHead(AudioInputTimelineHeadKind),
     LegacyRecordingDevices,
     AudioInputTimeline,
 }
@@ -839,6 +841,7 @@ enum ScenePointerAction {
     Invoke(SceneAction),
     ChooseAudioInputDevice(usize),
     ToggleAudioInputRecording,
+    ToggleAudioInputLoopback,
     BeginAudioInputTimeline,
     OpenLegacyRecordingDevices,
     WindowChrome(WindowChromeButton),
@@ -2310,6 +2313,31 @@ fn handle_scene_left_button_down(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Re
             return Ok(ScenePointerAction::ToggleAudioInputRecording);
         }
 
+        if audio_input_device_loopback_button_at_point(state, layout, point) {
+            state.pending_diagnostic_selection = None;
+            state.pressed_target = Some(ScenePressedTarget::AudioInputDeviceLoopback);
+            hwnd.capture_mouse();
+            return Ok(ScenePointerAction::ToggleAudioInputLoopback);
+        }
+
+        if let Some(head) = audio_input_timeline_head_at_point(state, layout, point) {
+            state.pending_diagnostic_selection = None;
+            state.pressed_target = Some(ScenePressedTarget::AudioInputTimelineHead(head));
+            if let Some(device_window) = state.audio_input_device_window.as_mut() {
+                let body_rect = layout.terminal_panel_rect().inset(24);
+                let detail_layout = windows_scene::audio_input_device_detail_layout(body_rect);
+                let duration_seconds = device_window.runtime.duration_seconds();
+                let seconds = windows_scene::audio_input_timeline_seconds_from_point(
+                    detail_layout.waveform_rect,
+                    duration_seconds,
+                    point,
+                );
+                device_window.begin_head_interaction(head, seconds);
+            }
+            hwnd.capture_mouse();
+            return Ok(ScenePointerAction::RenderOnly);
+        }
+
         if audio_input_timeline_at_point(state, layout, point).is_some() {
             state.pending_diagnostic_selection = None;
             state.pressed_target = Some(ScenePressedTarget::AudioInputTimeline);
@@ -2378,6 +2406,15 @@ fn handle_scene_left_button_down(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Re
             })?;
             Ok(true)
         }
+        ScenePointerAction::ToggleAudioInputLoopback => {
+            with_scene_app_state(|state| {
+                if let Some(device_window) = state.audio_input_device_window.as_mut() {
+                    device_window.toggle_loopback()?;
+                }
+                render_scene_window_frame(state, hwnd, None, false)
+            })?;
+            Ok(true)
+        }
         ScenePointerAction::BeginAudioInputTimeline => {
             with_scene_app_state(|state| render_scene_window_frame(state, hwnd, None, false))?;
             Ok(true)
@@ -2390,6 +2427,10 @@ fn handle_scene_left_button_down(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Re
     }
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "pointer release routing for the scene window stays easier to follow in one handler"
+)]
 fn handle_scene_left_button_up(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Result<bool> {
     let point = ClientPoint::from_lparam(lparam);
     let should_release_capture = with_scene_app_state(|state| {
@@ -2422,6 +2463,26 @@ fn handle_scene_left_button_up(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Resu
         }
 
         if pressed_target == Some(ScenePressedTarget::AudioInputTimeline) {
+            let layout = scene_client_layout(hwnd, state)?;
+            if let Some(device_window) = state.audio_input_device_window.as_mut() {
+                let body_rect = layout.terminal_panel_rect().inset(24);
+                let detail_layout = windows_scene::audio_input_device_detail_layout(body_rect);
+                let duration_seconds = device_window.runtime.duration_seconds();
+                let seconds = windows_scene::audio_input_timeline_seconds_from_point(
+                    detail_layout.waveform_rect,
+                    duration_seconds,
+                    point,
+                );
+                let point_x = point.to_win32_point().map_or(0, |point| point.x);
+                device_window.complete_timeline_interaction(seconds, point_x)?;
+            }
+            return Ok(ScenePointerAction::RenderOnly);
+        }
+
+        if matches!(
+            pressed_target,
+            Some(ScenePressedTarget::AudioInputTimelineHead(_))
+        ) {
             let layout = scene_client_layout(hwnd, state)?;
             if let Some(device_window) = state.audio_input_device_window.as_mut() {
                 let body_rect = layout.terminal_panel_rect().inset(24);
@@ -2483,6 +2544,15 @@ fn handle_scene_left_button_up(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Resu
             })?;
             Ok(true)
         }
+        ScenePointerAction::ToggleAudioInputLoopback => {
+            with_scene_app_state(|state| {
+                if let Some(device_window) = state.audio_input_device_window.as_mut() {
+                    device_window.toggle_loopback()?;
+                }
+                render_scene_window_frame(state, hwnd, None, false)
+            })?;
+            Ok(true)
+        }
         ScenePointerAction::BeginAudioInputTimeline => {
             with_scene_app_state(|state| render_scene_window_frame(state, hwnd, None, false))?;
             Ok(true)
@@ -2509,7 +2579,13 @@ fn handle_scene_mouse_move(
     })?;
 
     let timeline_dragging = with_scene_app_state(|state| {
-        if state.pressed_target != Some(ScenePressedTarget::AudioInputTimeline) {
+        if !matches!(
+            state.pressed_target,
+            Some(
+                ScenePressedTarget::AudioInputTimeline
+                    | ScenePressedTarget::AudioInputTimelineHead(_)
+            )
+        ) {
             return Ok(false);
         }
         let layout = scene_client_layout(hwnd, state)?;
@@ -3287,6 +3363,7 @@ fn render_scene_window_frame(
             layout,
             window_chrome_buttons_state,
             state.audio_input_device_window.as_ref(),
+            audio_input_device_detail_visual_state(state, layout),
         )
     } else {
         windows_scene::build_scene_render_scene(
@@ -3361,6 +3438,25 @@ fn scene_button_visual_states(
             )
         })
         .collect()
+}
+
+fn audio_input_device_detail_visual_state(
+    state: &SceneAppState,
+    layout: TerminalLayout,
+) -> windows_scene::AudioInputDeviceDetailVisualState {
+    let Some(point) = state.pointer_position else {
+        return windows_scene::AudioInputDeviceDetailVisualState::default();
+    };
+    windows_scene::AudioInputDeviceDetailVisualState {
+        loopback_hovered: audio_input_device_loopback_button_at_point(state, layout, point),
+        loopback_pressed: state.pressed_target
+            == Some(ScenePressedTarget::AudioInputDeviceLoopback),
+        hovered_head: audio_input_timeline_head_at_point(state, layout, point),
+        grabbed_head: match state.pressed_target {
+            Some(ScenePressedTarget::AudioInputTimelineHead(head)) => Some(head),
+            _ => None,
+        },
+    }
 }
 
 fn build_scene_diagnostic_text(state: &SceneAppState) -> String {
@@ -3570,6 +3666,10 @@ fn scene_interactive_region_contains(
             || (!state.diagnostics_visible
                 && audio_input_device_arm_button_at_point(state, layout, point))
             || (!state.diagnostics_visible
+                && audio_input_device_loopback_button_at_point(state, layout, point))
+            || (!state.diagnostics_visible
+                && audio_input_timeline_head_at_point(state, layout, point).is_some())
+            || (!state.diagnostics_visible
                 && audio_input_timeline_at_point(state, layout, point).is_some())
             || (!state.diagnostics_visible
                 && audio_input_device_detail_legacy_recording_button_at_point(state, layout, point))
@@ -3623,6 +3723,22 @@ fn audio_input_device_arm_button_at_point(
         .contains(point)
 }
 
+fn audio_input_device_loopback_button_at_point(
+    state: &SceneAppState,
+    layout: TerminalLayout,
+    point: ClientPoint,
+) -> bool {
+    if state.scene_kind != SceneWindowKind::AudioInputDeviceDetails
+        || state.audio_input_device_window.is_none()
+    {
+        return false;
+    }
+    let body_rect = layout.terminal_panel_rect().inset(24);
+    windows_scene::audio_input_device_detail_layout(body_rect)
+        .loopback_button_rect
+        .contains(point)
+}
+
 fn audio_input_device_detail_legacy_recording_button_at_point(
     state: &SceneAppState,
     layout: TerminalLayout,
@@ -3652,6 +3768,23 @@ fn audio_input_timeline_at_point(
     let body_rect = layout.terminal_panel_rect().inset(24);
     let waveform_rect = windows_scene::audio_input_device_detail_layout(body_rect).waveform_rect;
     waveform_rect.contains(point).then_some(waveform_rect)
+}
+
+fn audio_input_timeline_head_at_point(
+    state: &SceneAppState,
+    layout: TerminalLayout,
+    point: ClientPoint,
+) -> Option<AudioInputTimelineHeadKind> {
+    if state.scene_kind != SceneWindowKind::AudioInputDeviceDetails {
+        return None;
+    }
+    let body_rect = layout.terminal_panel_rect().inset(24);
+    let waveform_rect = windows_scene::audio_input_device_detail_layout(body_rect).waveform_rect;
+    let device_window = state.audio_input_device_window.as_ref()?;
+    windows_scene::audio_input_timeline_head_grabbers(waveform_rect, device_window)
+        .into_iter()
+        .find(|grabber| grabber.rect.contains(point))
+        .map(|grabber| grabber.kind)
 }
 
 fn open_legacy_recording_devices_from_scene(hwnd: WindowHandle) {
@@ -5894,9 +6027,16 @@ fn scene_cursor_for_point(
     if !state.diagnostics_visible
         && (legacy_recording_devices_button_at_point(state, layout, point)
             || audio_input_device_arm_button_at_point(state, layout, point)
+            || audio_input_device_loopback_button_at_point(state, layout, point)
             || audio_input_device_detail_legacy_recording_button_at_point(state, layout, point))
     {
         return Some(IDC_HAND);
+    }
+
+    if !state.diagnostics_visible
+        && audio_input_timeline_head_at_point(state, layout, point).is_some()
+    {
+        return Some(IDC_SIZEALL);
     }
 
     if !state.diagnostics_visible && audio_input_timeline_at_point(state, layout, point).is_some() {
@@ -6056,6 +6196,32 @@ fn update_scene_chrome_tooltip(
         return Ok(());
     }
 
+    if let Some((tooltip_text, anchor_rect)) =
+        audio_input_device_loopback_tooltip(state, layout, point)
+    {
+        let anchor_rect = client_rect_to_screen_rect(hwnd, anchor_rect)?;
+        let cursor_rect = pointer_cursor_screen_rect(hwnd, point)?;
+        let monitor_bounds = monitor_work_rect(hwnd)?;
+        let tooltip_origin = tooltip_origin(anchor_rect, cursor_rect, monitor_bounds, tooltip_text);
+        state
+            .chrome_tooltip
+            .show_at(hwnd, tooltip_text, tooltip_origin)?;
+        return Ok(());
+    }
+
+    if let Some((tooltip_text, anchor_rect)) =
+        audio_input_timeline_head_tooltip(state, layout, point)
+    {
+        let anchor_rect = client_rect_to_screen_rect(hwnd, anchor_rect)?;
+        let cursor_rect = pointer_cursor_screen_rect(hwnd, point)?;
+        let monitor_bounds = monitor_work_rect(hwnd)?;
+        let tooltip_origin = tooltip_origin(anchor_rect, cursor_rect, monitor_bounds, tooltip_text);
+        state
+            .chrome_tooltip
+            .show_at(hwnd, tooltip_text, tooltip_origin)?;
+        return Ok(());
+    }
+
     state.chrome_tooltip.hide(hwnd);
     Ok(())
 }
@@ -6168,6 +6334,62 @@ fn audio_input_device_arm_tooltip(
             "Start recording (Enter)"
         },
         arm_button_rect,
+    ))
+}
+
+fn audio_input_device_loopback_tooltip(
+    state: &SceneAppState,
+    layout: TerminalLayout,
+    point: ClientPoint,
+) -> Option<(&'static str, ClientRect)> {
+    if state.diagnostics_visible
+        || state.scene_kind != SceneWindowKind::AudioInputDeviceDetails
+        || state.audio_input_device_window.is_none()
+    {
+        return None;
+    }
+
+    let body_rect = layout.terminal_panel_rect().inset(24);
+    let rect = windows_scene::audio_input_device_detail_layout(body_rect).loopback_button_rect;
+    if !rect.contains(point) {
+        return None;
+    }
+
+    Some((
+        if state
+            .audio_input_device_window
+            .as_ref()
+            .is_some_and(|window| window.loopback_enabled)
+        {
+            "Disable microphone loopback"
+        } else {
+            "Enable microphone loopback"
+        },
+        rect,
+    ))
+}
+
+fn audio_input_timeline_head_tooltip(
+    state: &SceneAppState,
+    layout: TerminalLayout,
+    point: ClientPoint,
+) -> Option<(&'static str, ClientRect)> {
+    if state.diagnostics_visible || state.scene_kind != SceneWindowKind::AudioInputDeviceDetails {
+        return None;
+    }
+    let body_rect = layout.terminal_panel_rect().inset(24);
+    let waveform_rect = windows_scene::audio_input_device_detail_layout(body_rect).waveform_rect;
+    let device_window = state.audio_input_device_window.as_ref()?;
+    let grabber = windows_scene::audio_input_timeline_head_grabbers(waveform_rect, device_window)
+        .into_iter()
+        .find(|grabber| grabber.rect.contains(point))?;
+    Some((
+        match grabber.kind {
+            AudioInputTimelineHeadKind::Recording => "Recording head",
+            AudioInputTimelineHeadKind::Playback => "Playback head",
+            AudioInputTimelineHeadKind::Transcription => "Transcription head",
+        },
+        grabber.rect,
     ))
 }
 
