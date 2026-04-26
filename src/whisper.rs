@@ -807,9 +807,9 @@ pub fn run_prompt_forward_pass(
     artifacts: &WhisperModelArtifacts,
     features: &WhisperLogMelSpectrogram,
 ) -> eyre::Result<PromptForwardPassSummary> {
-    let model = load_whisper_model_from_artifacts(artifacts)?;
     let prompt_token_ids = default_decoder_prompt_token_ids(artifacts)?;
-    let device = Default::default();
+    let device = whisper_inference_device();
+    let model = load_whisper_model_from_burnpack::<WhisperInferenceBackend>(artifacts, &device)?;
     let feature_tensor = features_to_tensor(features, &device);
     let token_tensor = token_ids_to_tensor(&prompt_token_ids, &device);
 
@@ -916,6 +916,13 @@ pub fn encode_features_with_model(
     artifacts: &WhisperModelArtifacts,
     features: &WhisperLogMelSpectrogram,
 ) -> eyre::Result<[usize; 3]> {
+    if matches!(artifacts.layout, crate::model::WhisperModelLayout::BurnPack) {
+        let device = whisper_inference_device();
+        let model =
+            load_whisper_model_from_burnpack::<WhisperInferenceBackend>(artifacts, &device)?;
+        let input = features_to_tensor(features, &device);
+        return Ok(model.encoder.forward(input).dims());
+    }
     let encoder = load_audio_encoder_from_artifacts(artifacts)?;
     let device = Default::default();
     let input = Tensor::<WhisperCpuBackend, 3>::from_data(
@@ -935,12 +942,12 @@ pub fn default_decoder_prompt_token_ids(
     let tokenizer = load_tokenizer(artifacts)?;
 
     let mut tokens = Vec::new();
-    for token in [
-        "<|startoftranscript|>",
-        "<|en|>",
-        "<|transcribe|>",
-        "<|notimestamps|>",
-    ] {
+    let mut prompt_tokens = vec!["<|startoftranscript|>"];
+    if !is_english_only_whisper_model(artifacts) {
+        prompt_tokens.push("<|en|>");
+    }
+    prompt_tokens.extend(["<|transcribe|>", "<|notimestamps|>"]);
+    for token in prompt_tokens {
         tokens.push(required_token_id(
             &tokenizer,
             &artifacts.tokenizer.path,
@@ -949,6 +956,13 @@ pub fn default_decoder_prompt_token_ids(
     }
 
     Ok(tokens)
+}
+
+fn is_english_only_whisper_model(artifacts: &WhisperModelArtifacts) -> bool {
+    artifacts
+        .dims
+        .as_ref()
+        .is_some_and(|dims| dims.text.n_vocab <= 51_864)
 }
 
 pub fn decode_token_ids(
@@ -1431,6 +1445,8 @@ fn greedy_next_token_id<B: Backend>(
         .map_err(|error| eyre::eyre!("Failed to read decoder logits: {:?}", error))?;
     let last_step_offset = (seq_len - 1) * vocab_size;
     let last_step = &values[last_step_offset..last_step_offset + vocab_size];
+    let top = top_logit_ids(last_step, suppressed_token_ids, 10);
+    tracing::debug!(?top, "Rust Burn decoder top logits");
 
     let (token_id, _value) = last_step
         .iter()
@@ -1440,6 +1456,22 @@ fn greedy_next_token_id<B: Backend>(
         .max_by(|(_, left), (_, right)| left.total_cmp(right))
         .ok_or_else(|| eyre::eyre!("Decoder logits did not contain a final timestep"))?;
     Ok(token_id)
+}
+
+fn top_logit_ids(
+    values: &[f32],
+    suppressed_token_ids: &[usize],
+    count: usize,
+) -> Vec<(usize, f32)> {
+    let mut top = values
+        .iter()
+        .copied()
+        .enumerate()
+        .filter(|(token_id, _)| !suppressed_token_ids.contains(token_id))
+        .collect::<Vec<_>>();
+    top.sort_by(|(_, left), (_, right)| right.total_cmp(left));
+    top.truncate(count);
+    top
 }
 
 fn has_repeated_token_collapse(token_ids: &[usize], repeat_limit: usize) -> bool {

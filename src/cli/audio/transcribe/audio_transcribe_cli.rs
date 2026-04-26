@@ -3,6 +3,7 @@ use eyre::{Context, bail};
 use facet::Facet;
 use figue as args;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::Instant;
 
 use crate::cli::output::CliOutput;
@@ -10,6 +11,10 @@ use crate::cli::output::CliOutput;
 /// Transcribe a WAV file with the Rust Burn Whisper backend.
 // audio[impl cli.transcribe-command]
 #[derive(Facet, Arbitrary, Debug, PartialEq)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "CLI flags map directly to switches"
+)]
 #[facet(rename_all = "kebab-case")]
 pub struct AudioTranscribeArgs {
     /// Audio file to transcribe.
@@ -24,6 +29,10 @@ pub struct AudioTranscribeArgs {
     /// Managed model name under `{cache_home}/models/<model>`.
     #[facet(args::named, default = crate::model::DEFAULT_TRANSCRIPTION_MODEL_NAME.to_owned())]
     pub model: String,
+
+    /// Print a Python `OpenAI` Whisper CUDA reference transcript and first-step logits.
+    #[facet(args::named, default)]
+    pub compare_python: bool,
 
     /// Converted Whisper model directory containing tokenizer.json, model.bpk, and dims.json.
     ///
@@ -79,6 +88,10 @@ impl AudioTranscribeArgs {
         let metadata = crate::audio::inspect_audio(&input_path)?;
         let issues = crate::audio::validate_for_transcription(&metadata);
         tracing::debug!(issue_count = issues.len(), sample_rate_hz = ?metadata.sample_rate_hz, channels = ?metadata.channels, "Inspected transcription input audio");
+
+        if self.compare_python {
+            print_python_reference_comparison(&input_path, &self.model)?;
+        }
 
         let effective_audio = if issues.is_empty() {
             tracing::debug!(path = %input_path.display(), "Loading already-compliant transcription audio");
@@ -190,6 +203,7 @@ fn find_vctk_demo_clip_under(root: &Path) -> eyre::Result<Option<VctkDemoClip>> 
         return Ok(None);
     }
 
+    let mut clips = Vec::new();
     for speaker in std::fs::read_dir(&wav_root)
         .wrap_err_with(|| format!("failed to read VCTK wav root {}", wav_root.display()))?
     {
@@ -223,12 +237,87 @@ fn find_vctk_demo_clip_under(root: &Path) -> eyre::Result<Option<VctkDemoClip>> 
                     .wrap_err_with(|| format!("failed to read {}", transcript_path.display()))?
                     .trim()
                     .to_owned();
-                return Ok(Some(VctkDemoClip {
+                clips.push(VctkDemoClip {
                     wav_path,
                     expected_text,
-                }));
+                });
             }
         }
     }
-    Ok(None)
+    if clips.is_empty() {
+        return Ok(None);
+    }
+    clips.sort_by(|left, right| left.wav_path.cmp(&right.wav_path));
+    let seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos() as usize);
+    let index = seed % clips.len();
+    Ok(clips.into_iter().nth(index))
+}
+
+fn print_python_reference_comparison(input_path: &Path, model_name: &str) -> eyre::Result<()> {
+    let script = r"
+import json, sys, torch, whisper
+audio_path = sys.argv[1]
+model_name = sys.argv[2]
+model = whisper.load_model(model_name, device='cuda' if torch.cuda.is_available() else 'cpu')
+audio = whisper.load_audio(audio_path)
+mel = whisper.log_mel_spectrogram(whisper.pad_or_trim(audio)).to(model.device)
+tokenizer = whisper.tokenizer.get_tokenizer(model.is_multilingual, language='en', task='transcribe')
+prompt = [tokenizer.sot]
+if model.is_multilingual:
+    prompt.append(tokenizer.language_token)
+prompt.extend([tokenizer.transcribe, tokenizer.no_timestamps])
+with torch.no_grad():
+    encoder_output = model.encoder(mel.unsqueeze(0))
+    logits = model.decoder(torch.tensor([prompt], device=model.device), encoder_output)
+    top = torch.topk(logits[0, -1], 10)
+    decoded = [tokenizer.decode([int(token_id)]) for token_id in top.indices.tolist()]
+    text = whisper.decode(model, mel, whisper.DecodingOptions(language='en', task='transcribe', without_timestamps=True, fp16=torch.cuda.is_available())).text
+print(json.dumps({
+    'backend': 'openai-whisper-python',
+    'device': str(model.device),
+    'model': model_name,
+    'is_multilingual': model.is_multilingual,
+    'prompt': prompt,
+    'transcript': text,
+    'encoder_shape': list(encoder_output.shape),
+    'decoder_logits_shape': list(logits.shape),
+    'top_ids': top.indices.tolist(),
+    'top_values': [float(value) for value in top.values],
+    'top_decoded': decoded,
+}, indent=2))
+";
+    let output = Command::new("uv")
+        .arg("run")
+        .arg("--no-project")
+        .arg("--index")
+        .arg("https://download.pytorch.org/whl/cu128")
+        .arg("--with")
+        .arg("numpy")
+        .arg("--with")
+        .arg("openai-whisper")
+        .arg("--with")
+        .arg("torch")
+        .arg("python")
+        .arg("-c")
+        .arg(script)
+        .arg(input_path)
+        .arg(model_name)
+        .output()
+        .wrap_err("failed to run Python OpenAI Whisper comparison")?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !output.status.success() {
+        bail!(
+            "Python OpenAI Whisper comparison failed with {}\n{}",
+            output.status,
+            stderr.trim()
+        );
+    }
+    eprintln!("Python reference:\n{}", stdout.trim());
+    if !stderr.trim().is_empty() {
+        tracing::debug!(stderr = %stderr.trim(), "Python comparison wrote stderr");
+    }
+    Ok(())
 }

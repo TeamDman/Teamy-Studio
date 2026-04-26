@@ -4,6 +4,7 @@ use burn_store::{BurnpackStore, ModuleSnapshot, PytorchStore, pytorch::PytorchRe
 use eyre::{WrapErr, bail};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use crate::paths::{AppHome, CacheHome};
 use crate::whisper::{WhisperCpuBackend, WhisperDims, WhisperModel, WhisperModelConfig};
@@ -486,13 +487,60 @@ pub fn convert_checkpoint_to_model_dir(
     let dims = load_checkpoint_dims(checkpoint)?;
     println!("Loaded checkpoint dims from {}", checkpoint.display());
 
-    let mut model = import_whisper_model_from_checkpoint(checkpoint, &dims)?;
+    let normalized_checkpoint = normalize_checkpoint_for_burn_store(checkpoint, output_dir)?;
+    let mut model = import_whisper_model_from_checkpoint(&normalized_checkpoint, &dims)?;
     let burnpack_path = output_dir.join(MODEL_BURNPACK_FILE_NAME);
     save_model_burnpack(&mut model, &burnpack_path, &dims)?;
+    let _ = std::fs::remove_file(&normalized_checkpoint);
     write_dims_file(&output_dir.join(MODEL_DIMS_FILE_NAME), &dims)?;
     install_tokenizer_file(output_dir, checkpoint, model_id, tokenizer, tokenizer_url)?;
 
     inspect_model_dir(output_dir)
+}
+
+fn normalize_checkpoint_for_burn_store(
+    checkpoint: &Path,
+    output_dir: &Path,
+) -> eyre::Result<PathBuf> {
+    let normalized_checkpoint = output_dir.join("checkpoint.contiguous-fp32.pt");
+    let script = r"
+import sys, torch
+source, destination = sys.argv[1], sys.argv[2]
+checkpoint = torch.load(source, map_location='cpu')
+state = checkpoint.get('model_state_dict')
+if state is None:
+    raise RuntimeError('checkpoint is missing model_state_dict')
+checkpoint['model_state_dict'] = {
+    key: value.detach().float().contiguous() if torch.is_tensor(value) and value.is_floating_point() else value
+    for key, value in state.items()
+}
+torch.save(checkpoint, destination)
+";
+    let output = Command::new("uv")
+        .arg("run")
+        .arg("--no-project")
+        .arg("--index")
+        .arg("https://download.pytorch.org/whl/cu128")
+        .arg("--with")
+        .arg("torch")
+        .arg("python")
+        .arg("-c")
+        .arg(script)
+        .arg(checkpoint)
+        .arg(&normalized_checkpoint)
+        .output()
+        .wrap_err("failed to run Python checkpoint normalization")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!(
+            "Failed to normalize Whisper checkpoint {} for Burn import: {}",
+            checkpoint.display(),
+            stderr.trim()
+        );
+    }
+
+    Ok(normalized_checkpoint)
 }
 
 #[must_use]
@@ -919,6 +967,14 @@ fn import_whisper_model_from_checkpoint(
             checkpoint.display()
         )
     })?;
+
+    if !result.errors.is_empty() {
+        bail!(
+            "Checkpoint import from {} reported tensor errors after remapping: {:?}",
+            checkpoint.display(),
+            result.errors,
+        );
+    }
 
     let allowed_missing = ["decoder.mask"];
     let unexpected_missing = result
