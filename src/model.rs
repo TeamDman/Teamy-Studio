@@ -17,6 +17,44 @@ pub const DEFAULT_MODEL_PACKAGE_URL_ENV_VAR: &str = "TEAMY_STUDIO_WHISPER_MODEL_
 pub const TOKENIZER_FILE_NAME: &str = "tokenizer.json";
 pub const MODEL_BURNPACK_FILE_NAME: &str = "model.bpk";
 pub const MODEL_DIMS_FILE_NAME: &str = "dims.json";
+pub const DEFAULT_TRANSCRIPTION_MODEL_NAME: &str = "tiny.en";
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreparedNamedModel {
+    pub managed_dir: PathBuf,
+    pub artifacts: WhisperModelArtifacts,
+    pub registered_model_dirs: Vec<PathBuf>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KnownWhisperModel {
+    pub name: &'static str,
+    pub checkpoint_url: &'static str,
+    pub hugging_face_model_id: &'static str,
+}
+
+pub const KNOWN_WHISPER_MODELS: [KnownWhisperModel; 4] = [
+    KnownWhisperModel {
+        name: "tiny.en",
+        checkpoint_url: "https://openaipublic.azureedge.net/main/whisper/models/d3dd57d32accea0b295c96e26691aa14d8822fac7d9d27d5dc00b4ca2826dd03/tiny.en.pt",
+        hugging_face_model_id: "openai/whisper-tiny.en",
+    },
+    KnownWhisperModel {
+        name: "tiny",
+        checkpoint_url: "https://openaipublic.azureedge.net/main/whisper/models/65147644a518d12f04e32d6f3b26facc3f8dd46e5390956a9424a650c0ce22b9/tiny.pt",
+        hugging_face_model_id: "openai/whisper-tiny",
+    },
+    KnownWhisperModel {
+        name: "base.en",
+        checkpoint_url: "https://openaipublic.azureedge.net/main/whisper/models/25a8566e1d0c1e2231d1c762132cd20e0f96a85d16145c3a00adf5d1ac670ead/base.en.pt",
+        hugging_face_model_id: "openai/whisper-base.en",
+    },
+    KnownWhisperModel {
+        name: "base",
+        checkpoint_url: "https://openaipublic.azureedge.net/main/whisper/models/ed3a0b6b1c0edf879ad9b11b1af5a0e6ab5db9205f891f668f8b0e6c6326e34e/base.pt",
+        hugging_face_model_id: "openai/whisper-base",
+    },
+];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PreparedModelDir {
@@ -555,6 +593,92 @@ pub fn resolve_default_model_dir(app_home: &AppHome) -> eyre::Result<Option<Path
 }
 
 #[must_use]
+pub fn managed_model_dir(cache_home: &CacheHome, model_name: &str) -> PathBuf {
+    managed_models_dir(cache_home).join(model_name)
+}
+
+/// Resolve the default model path for transcription.
+///
+/// # Errors
+///
+/// This function will return an error if the registry cannot be read.
+pub fn resolve_transcription_model_dir(
+    app_home: &AppHome,
+    cache_home: &CacheHome,
+    model_name: Option<&str>,
+    explicit_model_dir: Option<&Path>,
+) -> eyre::Result<PathBuf> {
+    if let Some(model_dir) = explicit_model_dir {
+        return Ok(model_dir.to_path_buf());
+    }
+    if let Some(model_name) = model_name.filter(|value| !value.trim().is_empty()) {
+        return Ok(managed_model_dir(cache_home, model_name.trim()));
+    }
+    if let Some(registered) = resolve_default_model_dir(app_home)? {
+        return Ok(registered);
+    }
+    Ok(managed_model_dir(
+        cache_home,
+        DEFAULT_TRANSCRIPTION_MODEL_NAME,
+    ))
+}
+
+/// Prepare one known OpenAI Whisper checkpoint into Teamy's managed cache model directory.
+///
+/// # Errors
+///
+/// This function will return an error if the model name is unknown, the checkpoint cannot be
+/// downloaded, the checkpoint cannot be converted, or the converted model cannot be registered.
+pub fn prepare_known_whisper_model(
+    app_home: &AppHome,
+    cache_home: &CacheHome,
+    model_name: &str,
+    overwrite: bool,
+) -> eyre::Result<PreparedNamedModel> {
+    let known = known_whisper_model(model_name).ok_or_else(|| {
+        eyre::eyre!(
+            "Unknown Whisper model `{model_name}`. Known models: {}",
+            KNOWN_WHISPER_MODELS
+                .iter()
+                .map(|model| model.name)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    })?;
+    let checkpoint = download_known_whisper_checkpoint(cache_home, known)?;
+    let managed_dir = managed_model_dir(cache_home, known.name);
+    if managed_dir.exists() {
+        if overwrite {
+            std::fs::remove_dir_all(&managed_dir).wrap_err_with(|| {
+                format!("Failed to replace managed model {}", managed_dir.display())
+            })?;
+        } else {
+            let artifacts = inspect_model_dir(&managed_dir)?;
+            let registered_model_dirs = add_registered_model_dir(app_home, &managed_dir)?;
+            return Ok(PreparedNamedModel {
+                managed_dir,
+                artifacts,
+                registered_model_dirs,
+            });
+        }
+    }
+
+    let artifacts = convert_checkpoint_to_model_dir(
+        &checkpoint,
+        &managed_dir,
+        Some(known.hugging_face_model_id),
+        None,
+        None,
+    )?;
+    let registered_model_dirs = add_registered_model_dir(app_home, &managed_dir)?;
+    Ok(PreparedNamedModel {
+        managed_dir,
+        artifacts,
+        registered_model_dirs,
+    })
+}
+
+#[must_use]
 pub fn render_registered_model_dirs(model_dirs: &[PathBuf]) -> String {
     if model_dirs.is_empty() {
         return "No registered model directories.".to_owned();
@@ -587,6 +711,32 @@ pub fn managed_model_downloads_dir(cache_home: &CacheHome) -> PathBuf {
 #[must_use]
 pub fn managed_model_conversions_dir(cache_home: &CacheHome) -> PathBuf {
     managed_models_dir(cache_home).join(MANAGED_MODEL_CONVERSIONS_DIR_NAME)
+}
+
+fn known_whisper_model(model_name: &str) -> Option<&'static KnownWhisperModel> {
+    let requested = model_name.trim();
+    KNOWN_WHISPER_MODELS
+        .iter()
+        .find(|model| model.name.eq_ignore_ascii_case(requested))
+}
+
+fn download_known_whisper_checkpoint(
+    cache_home: &CacheHome,
+    known: &KnownWhisperModel,
+) -> eyre::Result<PathBuf> {
+    let downloads_dir = managed_model_downloads_dir(cache_home);
+    std::fs::create_dir_all(&downloads_dir).wrap_err_with(|| {
+        format!(
+            "Failed to create managed model downloads dir {}",
+            downloads_dir.display()
+        )
+    })?;
+    let checkpoint = downloads_dir.join(format!("{}.pt", known.name));
+    if checkpoint.is_file() {
+        return Ok(checkpoint);
+    }
+    download_to_file(known.checkpoint_url, &checkpoint)?;
+    Ok(checkpoint)
 }
 
 fn validate_prepared_model_dir(root: &Path) -> eyre::Result<WhisperModelArtifacts> {

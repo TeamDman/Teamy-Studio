@@ -1,7 +1,7 @@
 #![expect(warnings, reason = "ported experimental Burn Whisper prototype")]
 
 use burn::{
-    backend::NdArray,
+    backend::{Cuda, NdArray, cuda::CudaDevice},
     config::Config,
     module::{Ignored, Module, Param},
     nn::{
@@ -16,12 +16,19 @@ use npy::NpyData;
 use serde::{Deserialize, Serialize};
 use std::io::Read;
 use std::path::Path;
+use std::time::Instant;
 
 use crate::{frontend::WhisperLogMelSpectrogram, model::WhisperModelArtifacts};
 
 pub type WhisperCpuBackend = NdArray<f32>;
+pub type WhisperInferenceBackend = Cuda<f32, i32>;
 pub const DEFAULT_MAX_DECODE_TOKENS: usize = 64;
 const RUST_ONLY_REPEAT_TOKEN_LIMIT: usize = 4;
+
+#[must_use]
+pub fn whisper_inference_device() -> CudaDevice {
+    CudaDevice::default()
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WhisperDims {
@@ -730,6 +737,47 @@ pub fn load_whisper_model_from_artifacts(
     })
 }
 
+fn load_whisper_model_from_burnpack<B: Backend>(
+    artifacts: &WhisperModelArtifacts,
+    device: &B::Device,
+) -> eyre::Result<WhisperModel<B>> {
+    if !matches!(artifacts.layout, crate::model::WhisperModelLayout::BurnPack) {
+        bail!(
+            "Burn CUDA inference currently requires a Burnpack model, but {} uses the {} layout",
+            artifacts.root.display(),
+            artifacts.layout.as_str(),
+        );
+    }
+    let dims = artifacts
+        .dims
+        .as_ref()
+        .ok_or_else(|| eyre::eyre!("Burnpack model artifacts did not include Whisper dims"))?;
+    let config = WhisperModelConfig {
+        audio: WhisperAudioEncoderConfig::from_dims(&dims.audio),
+        text: WhisperTextDecoderConfig::from_dims(&dims.text),
+    };
+    let mut model = config.init::<B>(device);
+    let burnpack_path = artifacts.burnpack_path.as_ref().ok_or_else(|| {
+        eyre::eyre!("Burnpack model artifacts did not include a weights file path")
+    })?;
+    let mut store = BurnpackStore::from_file(burnpack_path).allow_partial(true);
+    let result = model.load_from(&mut store).map_err(|error| {
+        eyre::eyre!(
+            "Failed to load Burnpack model weights from {}: {}",
+            burnpack_path.display(),
+            error
+        )
+    })?;
+    if !result.errors.is_empty() {
+        bail!(
+            "Burnpack model load reported tensor errors for {}: {:?}",
+            burnpack_path.display(),
+            result.errors
+        );
+    }
+    Ok(model)
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PromptForwardPassSummary {
     pub prompt_token_ids: Vec<usize>,
@@ -781,16 +829,26 @@ pub fn greedy_decode_with_model(
     features: &WhisperLogMelSpectrogram,
     max_decode_tokens: usize,
 ) -> eyre::Result<GreedyDecodeSummary> {
-    let model = load_whisper_model_from_artifacts(artifacts)?;
+    let total_started_at = Instant::now();
+    let device = whisper_inference_device();
+    tracing::debug!(model_root = %artifacts.root.display(), max_decode_tokens, device = ?device, backend = "burn-cuda", "Loading Burn Whisper model for greedy decode");
+    let model_load_started_at = Instant::now();
+    let model = load_whisper_model_from_burnpack::<WhisperInferenceBackend>(artifacts, &device)?;
+    tracing::debug!(
+        elapsed_ms = model_load_started_at.elapsed().as_millis(),
+        "Loaded Burn Whisper model"
+    );
     let prompt_token_ids = default_decoder_prompt_token_ids(artifacts)?;
     let end_of_text = special_token_id(artifacts, "<|endoftext|>")?;
     // WHISPERX-PARITY GUARD:
     // WhisperX forwards `suppress_tokens` into faster-whisper generation.
     // This Rust greedy loop mirrors that intent by masking obvious control tokens.
     let suppressed_token_ids = default_suppressed_token_ids(artifacts, end_of_text)?;
-    let device = Default::default();
+    tracing::debug!(prompt_tokens = ?prompt_token_ids, suppressed_tokens = suppressed_token_ids.len(), "Starting Burn Whisper encoder forward pass");
+    let encoder_started_at = Instant::now();
     let encoder_output = model.encoder.forward(features_to_tensor(features, &device));
     let encoder_output_dims = encoder_output.dims();
+    tracing::debug!(elapsed_ms = encoder_started_at.elapsed().as_millis(), encoder_output_dims = ?encoder_output_dims, "Finished Burn Whisper encoder forward pass");
 
     let remaining_ctx = model
         .decoder
@@ -803,13 +861,25 @@ pub fn greedy_decode_with_model(
     let mut terminated_on_end_of_text = false;
     let mut stop_reason = DecodeStopReason::MaxDecodeTokens;
 
-    for _ in 0..decode_limit {
+    tracing::debug!(
+        decode_limit,
+        remaining_ctx,
+        "Starting Burn Whisper greedy token loop"
+    );
+    for token_index in 0..decode_limit {
+        let token_started_at = Instant::now();
+        tracing::debug!(
+            token_index,
+            context_tokens = all_token_ids.len(),
+            "Starting Burn Whisper decoder token step"
+        );
         let decoder_logits = model.decoder.forward(
             token_ids_to_tensor(&all_token_ids, &device),
             encoder_output.clone(),
         );
         last_decoder_logits_dims = decoder_logits.dims();
         let next_token_id = greedy_next_token_id(&decoder_logits, &suppressed_token_ids)?;
+        tracing::debug!(token_index, next_token_id, elapsed_ms = token_started_at.elapsed().as_millis(), decoder_logits_dims = ?last_decoder_logits_dims, "Finished Burn Whisper decoder token step");
         if next_token_id == end_of_text {
             terminated_on_end_of_text = true;
             stop_reason = DecodeStopReason::EndOfText;
@@ -829,6 +899,7 @@ pub fn greedy_decode_with_model(
     }
 
     let text = decode_token_ids(artifacts, &generated_token_ids, true)?;
+    tracing::debug!(elapsed_ms = total_started_at.elapsed().as_millis(), generated_tokens = generated_token_ids.len(), stop_reason = ?stop_reason, text = %text, "Finished Burn Whisper greedy decode");
 
     Ok(GreedyDecodeSummary {
         prompt_token_ids,
@@ -1312,11 +1383,11 @@ fn required_token_id(
         })
 }
 
-fn features_to_tensor(
+fn features_to_tensor<B: Backend>(
     features: &WhisperLogMelSpectrogram,
-    device: &<WhisperCpuBackend as Backend>::Device,
-) -> Tensor<WhisperCpuBackend, 3> {
-    Tensor::<WhisperCpuBackend, 3>::from_data(
+    device: &B::Device,
+) -> Tensor<B, 3> {
+    Tensor::<B, 3>::from_data(
         TensorData::new(
             features.values.clone(),
             [1, features.n_mels, features.n_frames],
@@ -1325,11 +1396,8 @@ fn features_to_tensor(
     )
 }
 
-fn token_ids_to_tensor(
-    token_ids: &[usize],
-    device: &<WhisperCpuBackend as Backend>::Device,
-) -> Tensor<WhisperCpuBackend, 2, Int> {
-    Tensor::<WhisperCpuBackend, 2, Int>::from_data(
+fn token_ids_to_tensor<B: Backend>(token_ids: &[usize], device: &B::Device) -> Tensor<B, 2, Int> {
+    Tensor::<B, 2, Int>::from_data(
         TensorData::new(
             token_ids
                 .iter()
@@ -1341,8 +1409,8 @@ fn token_ids_to_tensor(
     )
 }
 
-fn greedy_next_token_id(
-    logits: &Tensor<WhisperCpuBackend, 3>,
+fn greedy_next_token_id<B: Backend>(
+    logits: &Tensor<B, 3>,
     suppressed_token_ids: &[usize],
 ) -> eyre::Result<usize> {
     let [batch_size, seq_len, vocab_size] = logits.dims();

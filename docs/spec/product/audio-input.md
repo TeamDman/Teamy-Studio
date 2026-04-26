@@ -19,8 +19,23 @@ The `audio` command group must expose a `daemon` subcommand group for the local 
 audio[cli.daemon-status]
 The `audio daemon` command group must expose a `status` subcommand that reports the resolved Python daemon source, cache paths, and tensor handoff contract.
 
+audio[cli.model-command]
+The `audio` command group must expose a `model` subcommand group for managed Burn Whisper models in the Teamy Studio cache directory.
+
+audio[cli.model-list]
+The `audio model` command group must expose a `list` subcommand that reports known models, the default cache model directory, and registered model directories.
+
+audio[cli.model-show]
+The `audio model` command group must expose a `show` subcommand that inspects a managed model by name or an explicit model directory.
+
+audio[cli.model-prepare]
+The `audio model` command group must expose a `prepare` subcommand that downloads a known Whisper checkpoint, converts it to a Burn model under `{cache_home}/models/{model_name}`, and registers it as the default transcription model.
+
 audio[cli.transcribe-command]
 The `audio` command group must expose a `transcribe` subcommand that accepts a WAV path, runs the Rust Burn Whisper transcription path with either a registered default model directory or an explicit converted model directory, and emits the transcript text on stdout.
+
+audio[cli.transcribe-demo]
+The `audio transcribe` command must expose a demo mode that finds a local VCTK WAV clip and matching transcript text, prepares the audio if needed, runs the Burn transcription path, and emits the transcript text on stdout.
 
 ## Python Transcription Boundary
 

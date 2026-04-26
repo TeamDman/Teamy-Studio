@@ -8,6 +8,7 @@ use crate::model::WhisperModelArtifacts;
 use crate::whisper::{DecodeStopReason, GreedyDecodeSummary};
 use eyre::{Context, ContextCompat, bail};
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ValidatedAudio {
@@ -65,6 +66,14 @@ impl BurnWhisperBackend {
 
 impl TranscriptionBackend for BurnWhisperBackend {
     fn transcribe(&self, request: &TranscriptionRequest) -> eyre::Result<TranscriptionResult> {
+        tracing::debug!(
+            samples = request.input.samples.len(),
+            duration_seconds = request.input.duration_seconds(),
+            mel_bins = request.features.n_mels,
+            frames = request.features.n_frames,
+            max_decode_tokens = self.max_decode_tokens.min(request.max_decode_tokens),
+            "Burn Whisper backend received transcription request"
+        );
         let model = request.model.as_ref().ok_or_else(|| {
             eyre::eyre!(
                 "Burn Whisper backend requires a model directory. Loaded {} samples ({:.3} s) from {} and produced {}x{} Whisper frontend features, but no model was attached to the request.",
@@ -76,11 +85,13 @@ impl TranscriptionBackend for BurnWhisperBackend {
             )
         })?;
 
+        let started_at = Instant::now();
         let summary = crate::whisper::greedy_decode_with_model(
             model,
             &request.features,
             self.max_decode_tokens.min(request.max_decode_tokens),
         )?;
+        tracing::debug!(elapsed_ms = started_at.elapsed().as_millis(), stop_reason = ?summary.stop_reason, generated_tokens = summary.generated_token_ids.len(), "Burn Whisper backend completed greedy decode");
 
         Ok(transcription_result_from_greedy_decode(summary))
     }
@@ -112,6 +123,7 @@ impl TranscriptionBackend for MissingBackend {
 ///
 /// This function will return an error if the metadata is non-compliant or the WAV samples cannot be decoded.
 pub fn load_validated_audio(path: &Path, metadata: AudioMetadata) -> eyre::Result<ValidatedAudio> {
+    let started_at = Instant::now();
     let issues = validate_for_transcription(&metadata);
     if !issues.is_empty() {
         bail!(crate::audio::render_transcription_contract_error(
@@ -169,6 +181,7 @@ pub fn load_validated_audio(path: &Path, metadata: AudioMetadata) -> eyre::Resul
         );
     }
 
+    tracing::debug!(path = %path.display(), samples = samples.len(), elapsed_ms = started_at.elapsed().as_millis(), "Loaded validated transcription audio");
     Ok(ValidatedAudio {
         path: path.to_path_buf(),
         metadata,
@@ -192,7 +205,15 @@ pub fn build_transcription_request(
     model: Option<WhisperModelArtifacts>,
     max_decode_tokens: usize,
 ) -> TranscriptionRequest {
+    let started_at = Instant::now();
     let features = whisper_log_mel_spectrogram(&input.samples);
+    tracing::debug!(
+        samples = input.samples.len(),
+        mel_bins = features.n_mels,
+        frames = features.n_frames,
+        elapsed_ms = started_at.elapsed().as_millis(),
+        "Computed Whisper log-mel frontend features"
+    );
     TranscriptionRequest {
         input,
         features,
