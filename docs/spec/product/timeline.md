@@ -23,3 +23,14 @@ A blank timeline document must render an empty track list area, a time ruler are
 
 timeline[blank.add-track-placeholder]
 A blank timeline document must reserve an add-track affordance area so microphone and media tracks can be added in a later slice.
+
+## Document Model
+
+timeline[document.blank-model]
+A blank timeline document must have a stable identity, no tracks, and a viewport initialized at zero nanoseconds.
+
+timeline[viewport.nanoseconds]
+Timeline document and viewport positions must store time as integer nanoseconds instead of floating-point seconds.
+
+timeline[viewport.projection]
+The timeline viewport must convert between integer nanosecond positions and horizontal pixels without mutating document data.

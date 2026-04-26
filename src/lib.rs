@@ -9,6 +9,7 @@ pub mod logging_init;
 pub mod model;
 pub mod paths;
 pub mod shell_default;
+pub mod timeline;
 pub mod transcription;
 pub mod whisper;
 pub mod win32_support;

@@ -20,15 +20,17 @@ The first proof should let the launcher open a Timeline flow, create an empty ti
   - Added New and Import actions to the Timeline start window; New switches the same window into a blank timeline document and Import reports a placeholder until the Tracy reader lands.
   - Added blank timeline rendering with an empty track list area, add-track placeholder, time ruler, and content area.
   - Added tests and Tracey references for the Timeline launcher button, start window actions, blank timeline view, and import placeholder.
+  - Added `src/timeline/mod.rs` with pure timeline document, track id, track, integer-nanosecond time, and viewport projection types.
+  - Added tests for blank document defaults and integer-nanosecond viewport projection.
 - Current focus:
-  - Move from the UI shell into a real timeline document model and viewport state.
+  - Thread the pure timeline document model into `SceneAppState` so the blank timeline window renders from state rather than fixed placeholder geometry.
 - Remaining work:
   - Implement a Rust Tracy capture reader that starts with capture metadata, strings/source locations, threads, messages, and CPU zones.
   - Render Tracy zones/messages on a zoomable timeline with nanosecond precision.
   - Generalize the timeline model so microphone tracks and Tracy capture tracks share the same viewport, track layout, selection, and clip/zone rendering concepts.
   - Add live microphone track creation from the existing audio-device picker and shared capture buffer.
 - Next step:
-  - Add pure timeline data types for document, tracks, integer-nanosecond time, and viewport projection, then thread those through the blank timeline window.
+  - Add `TimelineWindowState` to the app window layer and pass document/viewport state into the timeline renderer.
 
 ## Constraints And Assumptions
 
