@@ -7,6 +7,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -32,6 +33,7 @@ use windows::core::{GUID, PCWSTR};
 
 use super::audio_transcription::{
     AudioTranscriptionControlResult, AudioTranscriptionSharedMemorySlotPool,
+    audio_transcription_run_python_debug_request_once,
 };
 use crate::win32_support::string::EasyPCWSTR;
 
@@ -97,6 +99,7 @@ pub struct AudioInputDeviceWindowState {
     capture_session: Option<AudioInputCaptureSession>,
     monitor_session: Option<AudioInputCaptureSession>,
     playback_file_path: Option<PathBuf>,
+    transcription_worker: AudioInputTranscriptionWorkerState,
 }
 
 impl AudioInputDeviceWindowState {
@@ -113,6 +116,7 @@ impl AudioInputDeviceWindowState {
             capture_session: None,
             monitor_session: None,
             playback_file_path: None,
+            transcription_worker: AudioInputTranscriptionWorkerState::default(),
         }
     }
 
@@ -148,6 +152,72 @@ impl AudioInputDeviceWindowState {
     // audio[impl gui.transcription-toggle]
     pub fn toggle_transcription(&mut self) {
         self.runtime.transcription.enabled = !self.runtime.transcription.enabled;
+        if self.runtime.transcription.enabled {
+            self.transcription_worker.reset_for_enabled_session();
+        }
+    }
+
+    // audio[impl transcription.debug-runtime-tick]
+    pub fn tick_debug_transcription_runtime(&mut self) {
+        self.drain_debug_transcription_result();
+        if !self.runtime.transcription.enabled
+            || self.transcription_worker.request_in_flight
+            || self.transcription_worker.debug_request_completed
+        {
+            return;
+        }
+        let request_id = self.transcription_worker.next_request_id;
+        self.transcription_worker.next_request_id += 1;
+        self.transcription_worker.request_in_flight = true;
+        let (sender, receiver) = mpsc::channel();
+        self.transcription_worker.result_receiver = Some(receiver);
+        let transcript_text = format!("debug transcript request {request_id}");
+        let _ = thread::Builder::new()
+            .name("teamy-studio-debug-transcription".to_owned())
+            .spawn(move || {
+                let result =
+                    audio_transcription_run_python_debug_request_once(request_id, &transcript_text)
+                        .map_err(|error| error.to_string());
+                let _ = sender.send(result);
+            });
+    }
+
+    fn drain_debug_transcription_result(&mut self) {
+        let Some(receiver) = self.transcription_worker.result_receiver.take() else {
+            return;
+        };
+        match receiver.try_recv() {
+            Ok(Ok(result)) => {
+                self.transcription_worker.request_in_flight = false;
+                self.transcription_worker.debug_request_completed = true;
+                if self.runtime.transcription.enabled && result.ok {
+                    self.runtime
+                        .transcription
+                        .stage_transcript_text(&result.transcript_text);
+                }
+            }
+            Ok(Err(error)) => {
+                self.transcription_worker.request_in_flight = false;
+                self.transcription_worker.debug_request_completed = true;
+                if self.runtime.transcription.enabled {
+                    self.runtime.transcription.stage_transcript_text(&format!(
+                        "transcription debug path failed: {error}"
+                    ));
+                }
+            }
+            Err(TryRecvError::Empty) => {
+                self.transcription_worker.result_receiver = Some(receiver);
+            }
+            Err(TryRecvError::Disconnected) => {
+                self.transcription_worker.request_in_flight = false;
+                self.transcription_worker.debug_request_completed = true;
+                if self.runtime.transcription.enabled {
+                    self.runtime
+                        .transcription
+                        .stage_transcript_text("transcription debug path disconnected");
+                }
+            }
+        }
     }
 
     #[cfg_attr(
@@ -215,6 +285,7 @@ impl AudioInputDeviceWindowState {
 
     pub fn sync_transport(&mut self) {
         self.sync_playback_head();
+        self.tick_debug_transcription_runtime();
         self.runtime.recording_head_seconds = self.runtime.write_head_seconds();
     }
 
@@ -476,6 +547,43 @@ impl Default for AudioInputRuntimeState {
 pub struct AudioInputTranscriptionState {
     pub enabled: bool,
     pub staged_text: String,
+}
+
+struct AudioInputTranscriptionWorkerState {
+    next_request_id: u64,
+    request_in_flight: bool,
+    debug_request_completed: bool,
+    result_receiver: Option<Receiver<Result<AudioTranscriptionControlResult, String>>>,
+}
+
+impl Default for AudioInputTranscriptionWorkerState {
+    fn default() -> Self {
+        Self {
+            next_request_id: 1,
+            request_in_flight: false,
+            debug_request_completed: false,
+            result_receiver: None,
+        }
+    }
+}
+
+impl std::fmt::Debug for AudioInputTranscriptionWorkerState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AudioInputTranscriptionWorkerState")
+            .field("next_request_id", &self.next_request_id)
+            .field("request_in_flight", &self.request_in_flight)
+            .field("debug_request_completed", &self.debug_request_completed)
+            .field("has_result_receiver", &self.result_receiver.is_some())
+            .finish()
+    }
+}
+
+impl AudioInputTranscriptionWorkerState {
+    fn reset_for_enabled_session(&mut self) {
+        self.request_in_flight = false;
+        self.debug_request_completed = false;
+        self.result_receiver = None;
+    }
 }
 
 impl AudioInputTranscriptionState {

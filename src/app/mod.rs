@@ -31,6 +31,7 @@ pub use audio_transcription::{
     WhisperLogMel80x3000, audio_transcription_control_request_for_queued_request,
     audio_transcription_daemon_status, audio_transcription_daemon_status_with_pool_status,
     audio_transcription_named_pipe_path, audio_transcription_named_pipe_request_roundtrip,
+    audio_transcription_run_python_debug_request_once,
     decode_audio_transcription_control_result_line,
     encode_audio_transcription_control_request_line,
 };

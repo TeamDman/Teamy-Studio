@@ -1,7 +1,8 @@
 use std::collections::VecDeque;
 use std::path::PathBuf;
+use std::process::Command;
 use std::ptr::NonNull;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use eyre::Context;
 use facet::Facet;
@@ -253,6 +254,57 @@ pub async fn audio_transcription_named_pipe_request_roundtrip(
         eyre::bail!("audio transcription daemon closed the named pipe without a result");
     }
     decode_audio_transcription_control_result_line(&result_line)
+}
+
+/// # Errors
+///
+/// Returns an error if the shared-memory slot cannot be created, the local Python daemon process
+/// cannot be launched, or the debug pipe request does not complete successfully.
+// audio[impl transcription.debug-runtime-tick]
+pub fn audio_transcription_run_python_debug_request_once(
+    request_id: u64,
+    transcript_text: &str,
+) -> eyre::Result<AudioTranscriptionControlResult> {
+    let daemon_source_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join(WHISPER_DAEMON_SOURCE_PARENT_DIR)
+        .join(WHISPER_DAEMON_SOURCE_DIR_NAME);
+    let pipe_path = audio_transcription_named_pipe_path(&format!(
+        "TeamyStudioAudioTranscriptionDebug-{}-{request_id}",
+        std::process::id()
+    ));
+    let mut pool = AudioTranscriptionSharedMemorySlotPool::new(1)?;
+    let queued_request = pool.enqueue_tensor(request_id, &WhisperLogMel80x3000::zeros())?;
+    let control_request = audio_transcription_control_request_for_queued_request(&queued_request);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .enable_time()
+        .build()
+        .wrap_err("failed to start debug transcription runtime")?;
+    let roundtrip = audio_transcription_named_pipe_request_roundtrip(&pipe_path, &control_request);
+    let mut child = Command::new("python")
+        .arg("-m")
+        .arg("teamy_whisperx_daemon")
+        .arg("--connect-pipe-once")
+        .arg(&pipe_path)
+        .arg("--validate-shared-memory-slot")
+        .arg("--debug-transcript-text")
+        .arg(transcript_text)
+        .current_dir(&daemon_source_dir)
+        .spawn()
+        .wrap_err("failed to launch debug transcription daemon")?;
+    let result = runtime
+        .block_on(async { tokio::time::timeout(Duration::from_secs(10), roundtrip).await })
+        .wrap_err("debug transcription daemon timed out")??;
+    let child_status = child
+        .wait()
+        .wrap_err("failed to wait for debug transcription daemon")?;
+    if !child_status.success() {
+        eyre::bail!("debug transcription daemon exited with {child_status}");
+    }
+    if result.release_slot {
+        pool.release_slot(result.slot_id);
+    }
+    Ok(result)
 }
 
 #[derive(Debug)]
@@ -744,5 +796,24 @@ mod tests {
             pool.release_slot(result.slot_id);
             assert_eq!(pool.status().queued_request_count, 0);
         });
+    }
+
+    #[test]
+    // audio[verify transcription.debug-runtime-tick]
+    fn python_debug_request_runner_returns_requested_transcript_text() {
+        let python_daemon_dir = std::env::current_dir()
+            .expect("current dir should be readable")
+            .join("python")
+            .join("whisperx-daemon");
+        if !python_daemon_dir.exists() {
+            return;
+        }
+
+        let result = audio_transcription_run_python_debug_request_once(71, "debug text from app")
+            .expect("debug transcription request should finish");
+
+        assert_eq!(result.request_id, 71);
+        assert!(result.release_slot);
+        assert_eq!(result.transcript_text, "debug text from app");
     }
 }

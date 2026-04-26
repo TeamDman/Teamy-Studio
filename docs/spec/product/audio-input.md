@@ -42,6 +42,9 @@ Rust must provide a live Windows named-pipe transport that sends one queued tran
 audio[transcription.result-staging]
 Rust must consume transcription daemon results by releasing returned shared-memory slots and staging successful transcript text in the microphone transcript island state.
 
+audio[transcription.debug-runtime-tick]
+When transcription is enabled in the microphone window, Rust must be able to run a nonblocking debug transcription tick that submits a placeholder log-mel tensor to the Python pipe path and stages the returned text in the transcript island.
+
 audio[transcription.shared-memory-pool-status]
 Rust must expose the initial shared-memory slot-pool sizing and live queue counters that the CLI and GUI can report before Python inference is started.
 

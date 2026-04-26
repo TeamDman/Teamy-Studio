@@ -53,8 +53,9 @@ The guiding idea from the source note is that Teamy Studio should not merely mim
   - Added the first tested Rust-side live named-pipe transport for one transcription request/result roundtrip.
   - Connected the Python daemon scaffold to the named-pipe debug path, including validation of a real Rust-created shared-memory slot and return of a slot-release result.
   - Added the Rust-side result-staging hook so returned daemon text can appear in the microphone transcript island while released slots return to the pool.
+  - Added the first app-side debug transcription tick, letting the mic window launch the Python pipe path off the UI thread and stage the returned debug transcript text.
 - Current focus:
-  - Use the microphone timeline, shared-memory slot pool, named-pipe Python handoff, and daemon dashboard as the first real proving ground for app-owned transcription runtime plumbing.
+  - Use the microphone timeline, shared-memory slot pool, named-pipe Python handoff, and daemon dashboard as the first real proving ground for captured-audio feature preparation.
 - Remaining work:
   - Add Tracey requirements for each new behavior area before implementation lands.
   - Add shallow launcher stubs for the new surfaces.
@@ -63,7 +64,7 @@ The guiding idea from the source note is that Teamy Studio should not merely mim
   - Add application-window inspection using the Cursor Hero lessons.
   - Add environment variable, input-device, file-extension, shape, SDF, and timeline explorer surfaces as progressively richer windows.
 - Next step:
-  - Continue in `docs/notes/audio-input-inbox-plan.md` with an app-side debug transcription tick before returning to paint chrome.
+  - Continue in `docs/notes/audio-input-inbox-plan.md` with Rust log-mel preparation from recorded samples before returning to paint chrome.
 
 ## Source Ideas Extracted
 

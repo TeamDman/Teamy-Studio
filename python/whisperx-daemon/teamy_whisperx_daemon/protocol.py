@@ -148,6 +148,7 @@ def run_debug_pipe_once(
     pipe_path: str,
     *,
     validate_slot: bool = False,
+    transcript_text: str = "",
     retry_seconds: float = 5.0,
 ) -> None:
     deadline = time.monotonic() + retry_seconds
@@ -165,5 +166,9 @@ def run_debug_pipe_once(
         request = parse_control_request_line(request_line)
         if validate_slot:
             validate_shared_memory_slot(request)
-        pipe.write(encode_control_result_line(debug_result_for_request(request)).encode("utf-8"))
+        pipe.write(
+            encode_control_result_line(
+                debug_result_for_request(request, transcript_text)
+            ).encode("utf-8")
+        )
         pipe.flush()

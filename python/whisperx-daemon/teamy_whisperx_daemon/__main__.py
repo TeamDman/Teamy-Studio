@@ -40,6 +40,11 @@ def main(argv: list[str] | None = None) -> int:
         "--connect-pipe-once",
         help="connect to a Rust-owned named pipe, handle one debug request, then exit",
     )
+    parser.add_argument(
+        "--debug-transcript-text",
+        default="",
+        help="transcript text to return from --connect-pipe-once",
+    )
     args = parser.parse_args(argv)
 
     contract = default_tensor_contract()
@@ -47,6 +52,7 @@ def main(argv: list[str] | None = None) -> int:
         run_debug_pipe_once(
             args.connect_pipe_once,
             validate_slot=args.validate_shared_memory_slot,
+            transcript_text=args.debug_transcript_text,
         )
         return 0
 

@@ -53,16 +53,17 @@ The product rule is simple: dictated text must never be sprayed into whichever e
   - Added the first live Windows named-pipe transport helper: Rust creates a pipe, sends one JSONL transcription request, reads one JSONL result, validates it, and has a passing roundtrip test that acts as a fake daemon.
   - Connected the Python daemon scaffold to the pipe for a one-request debug path: Rust now smoke-tests a real shared-memory slot, launches `python -m teamy_whisperx_daemon`, lets Python validate the mapped slot, and consumes the returned release result.
   - Added the Rust-side result-staging hook for daemon responses: successful transcript text is appended to the microphone transcript island state, and returned slots are released back to the shared-memory pool.
+  - Added the first app-side debug transcription tick: when transcription is enabled in the mic window, a focused-frame tick starts a nonblocking worker that submits a placeholder log-mel tensor through the Python pipe path and stages the returned debug transcript text.
 - Current focus:
-  - Continue from the tested one-request debug loop toward an app-owned transcription runtime that can drive the pipe while the mic window is open.
+  - Continue from the app-owned debug transcription tick toward replacing placeholder log-mel tensors with features derived from captured microphone audio.
 - Remaining work:
   - Harden the first capture/playback path after more real-hardware smoke testing, especially for loopback latency, render-format mismatches, and longer recordings.
   - Replace the current mel-preview visualization with the same log-mel feature data that will be sent to Python.
-  - Add the app-owned runtime plumbing that submits captured windows of audio into the debug transcription path while transcription is enabled.
+  - Replace the placeholder log-mel tensor in the debug transcription path with features derived from captured microphone audio.
   - Add the Teamy-owned Python WhisperX daemon project and validation path.
   - Feed returned transcript chunks into the hosted transcript island without sending them to the OS focus target.
 - Next step:
-  - Add an app-side debug transcription tick that enqueues a placeholder log-mel tensor, runs the Python pipe smoke path, and applies the returned transcript result to the mic window.
+  - Add a Rust log-mel preparation stage that consumes recorded samples ahead of the transcription head and fills the fixed 80 x 3000 handoff tensor.
 
 ## Why This Slice
 
