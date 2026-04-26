@@ -47,8 +47,10 @@ The target is not to copy WhisperX line for line. The target is to identify the 
   - Smoke-tested `cargo run -- audio transcribe --demo 4 --max-decode-tokens 8 --timing-jsonl target\tmp\demo4-cached-decode-smoke.jsonl`; the run produced four ordered transcript lines and four timing records without runtime errors.
   - Compared the cached batched demo output with the existing full-prefix single-file decode path on the same four prepared WAVs; all four emitted transcript lines matched exactly.
   - Added Tracy spans for the long-media `audio transcribe <wav>` flow so captures distinguish command setup, model resolution/loading, audio preparation, chunk splitting, batch feature extraction, encoder forward, decoder prefill, decoder token steps, greedy token selection, and decoder self-attention/cross-attention/MLP work.
+  - Used the Tracy capture for the 43-minute Clay prepared WAV to make two measured performance changes: log-mel feature extraction now runs in parallel across chunks in each batch, and batched greedy token selection uses Burn argmax plus a CPU fallback only when the winning token is suppressed. A first attempt with Burn `topk_with_indices` was rejected because it made greedy token selection much slower than the CPU scan.
+  - Re-profiled the Clay prepared WAV after those changes. Warm traced command time moved from about 23.0s to about 18.7s. The outer `prepare_whisper_batch_features` span dropped from about 3.53s to about 0.33s wall time; nested per-chunk frontend spans still sum to several seconds in CSV exports because they now run concurrently across worker threads.
 - Current focus:
-  - Use the new Tracy spans on the Clay long-media capture to decide whether the next performance slice should be frontend CPU feature extraction, Burn encoder/decoder GPU work, batch sizing, or transcription policy.
+  - Use the new Tracy spans on the Clay long-media capture to decide whether the next performance slice should target decoder self-attention, batch sizing, model-load/kernel warmup, or transcription policy.
 - Remaining work:
   - Compare Rust/Burn stage timings against Python OpenAI Whisper and WhisperX/faster-whisper on the same samples.
   - Measure cached batched decoder performance against the earlier full-prefix batched decode on longer decode limits and representative long media.
@@ -56,6 +58,7 @@ The target is not to copy WhisperX line for line. The target is to identify the 
   - Add Whisper decode policy controls from faster-whisper/WhisperX: no-speech thresholding, compression-ratio and logprob fallback, temperature fallback, and beam/best-of settings where they improve quality without hiding regressions.
   - Add timestamp-token or alignment support so chunk boundaries and final transcript segments carry reliable source offsets.
   - Tune true batched chunk inference for independent 30-second windows; the first implementation exists, but batch sizing, feature preparation, and progress timing still need measured improvement.
+  - Investigate whether decoder self-attention cache concatenation or tensor allocation can be reduced; after frontend parallelization, decoder token steps and self-attention are again the dominant measured cost.
   - Investigate fp16 or mixed precision inference in Burn/CubeCL for CUDA.
   - Investigate replacing or augmenting the Burn path with faster-whisper/CTranslate2 for the Python daemon path.
   - Add VAD or silence skipping so long media does not spend full decode effort on empty chunks.

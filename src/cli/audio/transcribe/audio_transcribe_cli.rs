@@ -886,17 +886,15 @@ fn transcribe_audio_chunks_batched(
             ),
             &[batch_progress_line(batch, batch_number, batch_total)],
         );
-        let mut features = Vec::with_capacity(batch.len());
-        let mut frontend_elapsed_ms = Vec::with_capacity(batch.len());
-        let () = {
+        let prepared_features = {
             #[cfg(feature = "tracy")]
             let _span = tracing::debug_span!("prepare_whisper_batch_features").entered();
-            for chunk in batch {
-                let request_started_at = Instant::now();
-                features.push(crate::frontend::whisper_log_mel_spectrogram(chunk.samples));
-                frontend_elapsed_ms.push(request_started_at.elapsed().as_millis());
-            }
+            prepare_whisper_batch_features(batch.iter().map(|chunk| chunk.samples))?
         };
+        let features = prepared_features
+            .iter()
+            .map(|prepared| prepared.features.clone())
+            .collect::<Vec<_>>();
 
         let decode_started_at = Instant::now();
         let summaries = {
@@ -916,16 +914,13 @@ fn transcribe_audio_chunks_batched(
             })?
         };
         let decode_elapsed_ms = decode_started_at.elapsed().as_millis();
-        for ((chunk, summary), frontend_elapsed_ms) in batch
-            .iter()
-            .copied()
-            .zip(summaries)
-            .zip(frontend_elapsed_ms)
+        for ((chunk, summary), prepared_features) in
+            batch.iter().copied().zip(summaries).zip(prepared_features)
         {
             let result = transcription_chunk_result_from_summary(
                 input,
                 chunk,
-                frontend_elapsed_ms,
+                prepared_features.elapsed_ms,
                 decode_elapsed_ms,
                 summary,
             );
@@ -1133,6 +1128,73 @@ fn demo_batch_progress_line(
     format!("batch: {batch_number} of {batch_total} ({completed_items} of {total_items} items)")
 }
 
+struct PreparedWhisperFeature {
+    features: crate::frontend::WhisperLogMelSpectrogram,
+    elapsed_ms: u128,
+}
+
+fn prepare_whisper_batch_features<'a, I>(samples: I) -> eyre::Result<Vec<PreparedWhisperFeature>>
+where
+    I: IntoIterator<Item = &'a [f32]>,
+{
+    let samples = samples.into_iter().collect::<Vec<_>>();
+    let mut prepared = (0..samples.len()).map(|_| None).collect::<Vec<_>>();
+
+    std::thread::scope(|scope| -> eyre::Result<()> {
+        let handles = samples
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(index, samples)| {
+                scope.spawn(move || {
+                    let started_at = Instant::now();
+                    let features = crate::frontend::whisper_log_mel_spectrogram(samples);
+                    PreparedWhisperFeature {
+                        features,
+                        elapsed_ms: started_at.elapsed().as_millis(),
+                    }
+                    .with_index(index)
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for handle in handles {
+            let (index, feature) = handle.join().map_err(|panic| {
+                eyre::eyre!("Whisper feature worker panicked: {}", panic_message(&panic))
+            })?;
+            prepared[index] = Some(feature);
+        }
+        Ok(())
+    })?;
+
+    prepared
+        .into_iter()
+        .map(|feature| feature.ok_or_else(|| eyre::eyre!("Whisper feature worker did not return")))
+        .collect()
+}
+
+trait WithFeatureIndex {
+    fn with_index(self, index: usize) -> (usize, Self)
+    where
+        Self: Sized;
+}
+
+impl WithFeatureIndex for PreparedWhisperFeature {
+    fn with_index(self, index: usize) -> (usize, Self) {
+        (index, self)
+    }
+}
+
+fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
+    if let Some(message) = panic.downcast_ref::<&str>() {
+        return (*message).to_owned();
+    }
+    if let Some(message) = panic.downcast_ref::<String>() {
+        return message.clone();
+    }
+    "unknown panic payload".to_owned()
+}
+
 #[expect(
     clippy::cast_precision_loss,
     reason = "batch progress diagnostics are approximate human-scale values"
@@ -1284,15 +1346,12 @@ fn transcribe_demo_items_batched(
             "preparing demo batch",
             &[demo_batch_progress_line(batch, batch_number, batch_total)],
         );
-        let mut features = Vec::with_capacity(batch.len());
-        let mut frontend_elapsed_ms = Vec::with_capacity(batch.len());
-        for unit in batch {
-            let request_started_at = Instant::now();
-            features.push(crate::frontend::whisper_log_mel_spectrogram(
-                unit.chunk.samples,
-            ));
-            frontend_elapsed_ms.push(request_started_at.elapsed().as_millis());
-        }
+        let prepared_features =
+            prepare_whisper_batch_features(batch.iter().map(|unit| unit.chunk.samples))?;
+        let features = prepared_features
+            .iter()
+            .map(|prepared| prepared.features.clone())
+            .collect::<Vec<_>>();
 
         let decode_started_at = Instant::now();
         let summaries = decoder.decode_batch_with_progress(&features, |decode_progress| {
@@ -1321,17 +1380,14 @@ fn transcribe_demo_items_batched(
             }
         })?;
         let decode_elapsed_ms = decode_started_at.elapsed().as_millis();
-        for ((unit, summary), frontend_elapsed_ms) in batch
-            .iter()
-            .copied()
-            .zip(summaries)
-            .zip(frontend_elapsed_ms)
+        for ((unit, summary), prepared_features) in
+            batch.iter().copied().zip(summaries).zip(prepared_features)
         {
             let input = &prepared_inputs[unit.input_index];
             let result = transcription_chunk_result_from_summary(
                 &input.audio,
                 unit.chunk,
-                frontend_elapsed_ms,
+                prepared_features.elapsed_ms,
                 decode_elapsed_ms,
                 summary,
             );

@@ -2016,13 +2016,39 @@ fn greedy_next_token_ids<B: Backend>(
         );
     }
 
-    let values = logits
+    let last_step_logits =
+        logits
+            .clone()
+            .slice([0..batch_size, seq_len - 1..seq_len, 0..vocab_size]);
+    let argmax_token_ids = last_step_logits
+        .clone()
+        .argmax(2)
+        .to_data()
+        .convert::<i64>()
+        .to_vec::<i64>()
+        .map_err(|error| eyre::eyre!("Failed to read batched decoder argmax indices: {:?}", error))?
+        .into_iter()
+        .map(|token_id| {
+            usize::try_from(token_id)
+                .map_err(|_| eyre::eyre!("Decoder argmax token id was negative: {token_id}"))
+        })
+        .collect::<eyre::Result<Vec<_>>>()?;
+
+    if argmax_token_ids
+        .iter()
+        .all(|token_id| !suppressed_token_ids.contains(token_id))
+    {
+        return Ok(argmax_token_ids);
+    }
+
+    let values = last_step_logits
         .to_data()
         .to_vec::<f32>()
         .map_err(|error| eyre::eyre!("Failed to read batched decoder logits: {:?}", error))?;
+
     (0..batch_size)
         .map(|batch_index| {
-            let last_step_offset = (batch_index * seq_len + (seq_len - 1)) * vocab_size;
+            let last_step_offset = batch_index * vocab_size;
             let last_step = &values[last_step_offset..last_step_offset + vocab_size];
             let (token_id, _value) = last_step
                 .iter()
