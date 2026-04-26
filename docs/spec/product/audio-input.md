@@ -27,6 +27,9 @@ Teamy Studio must include a Teamy-owned Python daemon project for WhisperX integ
 audio[transcription.log-mel-contract]
 Rust must represent the Whisper transcription handoff as a fixed 80 x 3000 little-endian f32 log-mel tensor contract.
 
+audio[transcription.sample-derived-handoff]
+Rust must prepare the fixed transcription handoff tensor from the microphone audio chunk ahead of the transcription head before handing it to Python.
+
 audio[transcription.shared-memory-payload]
 The Python transcription boundary must treat each inference request payload as a Rust-owned shared-memory slot containing exactly one fixed-shape log-mel tensor.
 

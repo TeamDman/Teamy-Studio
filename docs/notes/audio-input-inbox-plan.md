@@ -55,16 +55,17 @@ The product rule is simple: dictated text must never be sprayed into whichever e
   - Added the Rust-side result-staging hook for daemon responses: successful transcript text is appended to the microphone transcript island state, and returned slots are released back to the shared-memory pool.
   - Added the first app-side debug transcription tick: when transcription is enabled in the mic window, a focused-frame tick starts a nonblocking worker that submits a placeholder log-mel tensor through the Python pipe path and stages the returned debug transcript text.
   - Moved the transcription preview's spectrogram/energy work out of the render-only path and into a cached runtime preview, added a Tracy-gated span around refreshes, and added a manual `Flush chunk` control with chunk duration, RMS energy, send state, and completed request feedback.
+  - Replaced the all-zero placeholder handoff in the debug transcription worker with a Rust-prepared fixed 80 x 3000 handoff tensor derived from the recorded microphone samples ahead of the transcription head.
 - Current focus:
-  - Continue from the cached preview/manual flush loop toward replacing placeholder log-mel tensors with features derived from captured microphone audio.
+  - Continue from Rust-prepared sample-derived handoff tensors toward a longer-lived daemon loop and real WhisperX inference.
 - Remaining work:
   - Harden the first capture/playback path after more real-hardware smoke testing, especially for loopback latency, render-format mismatches, and longer recordings.
   - Replace the current mel-preview visualization with the same log-mel feature data that will be sent to Python.
-  - Replace the placeholder log-mel tensor in the debug transcription path with features derived from captured microphone audio.
+  - Replace the one-shot Python debug process with a longer-lived daemon loop that can accept repeated prepared tensors.
   - Add the Teamy-owned Python WhisperX daemon project and validation path.
   - Feed returned transcript chunks into the hosted transcript island without sending them to the OS focus target.
 - Next step:
-  - Add a Rust log-mel preparation stage that consumes recorded samples ahead of the transcription head and fills the fixed 80 x 3000 handoff tensor.
+  - Keep the Python daemon process alive across transcription requests, then swap its debug transcript result for WhisperX inference over the prepared shared-memory tensor.
 
 ## Why This Slice
 

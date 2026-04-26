@@ -33,7 +33,8 @@ use windows::core::{GUID, PCWSTR};
 
 use super::audio_transcription::{
     AudioTranscriptionControlResult, AudioTranscriptionSharedMemorySlotPool,
-    audio_transcription_run_python_debug_request_once,
+    audio_transcription_prepare_handoff_tensor_from_samples,
+    audio_transcription_run_python_debug_request_once_with_tensor,
 };
 use crate::win32_support::string::EasyPCWSTR;
 
@@ -194,6 +195,7 @@ impl AudioInputDeviceWindowState {
         self.transcription_worker.result_receiver = Some(receiver);
         let chunk_seconds = self.runtime.transcription.chunk_seconds;
         let energy = self.runtime.transcription.energy_rms;
+        let (chunk_samples, sample_rate_hz) = self.runtime.transcription_chunk_samples();
         let transcript_text = if flush_requested {
             format!(
                 "manual flush request {request_id}; chunk {chunk_seconds:.2}s; energy {energy:.3}"
@@ -206,9 +208,16 @@ impl AudioInputDeviceWindowState {
         let _ = thread::Builder::new()
             .name("teamy-studio-debug-transcription".to_owned())
             .spawn(move || {
-                let result =
-                    audio_transcription_run_python_debug_request_once(request_id, &transcript_text)
-                        .map_err(|error| error.to_string());
+                let tensor = audio_transcription_prepare_handoff_tensor_from_samples(
+                    &chunk_samples,
+                    sample_rate_hz,
+                );
+                let result = audio_transcription_run_python_debug_request_once_with_tensor(
+                    request_id,
+                    &tensor,
+                    &transcript_text,
+                )
+                .map_err(|error| error.to_string());
                 let _ = sender.send(result);
             });
     }
@@ -713,6 +722,23 @@ impl AudioInputRuntimeState {
             cache_key,
         );
         self.transcription.preview_last_updated_at = Some(Instant::now());
+    }
+
+    #[must_use]
+    // audio[impl transcription.sample-derived-handoff]
+    pub fn transcription_chunk_samples(&self) -> (Vec<f32>, u32) {
+        let Ok(buffer) = self.shared.lock() else {
+            return (Vec::new(), 48_000);
+        };
+        let start_index = sample_index_from_seconds(
+            self.transcription_head_seconds,
+            buffer.sample_rate_hz,
+            buffer.samples.len(),
+        );
+        (
+            buffer.samples[start_index..].to_vec(),
+            buffer.sample_rate_hz,
+        )
     }
 
     #[must_use]
@@ -1964,6 +1990,23 @@ mod tests {
         assert_eq!(runtime.transcription.preview.intensities.len(), 72 * 18);
         assert_eq!(runtime.transcription.chunk_seconds, 0.1);
         assert!(runtime.transcription.energy_rms > 0.0);
+    }
+
+    #[test]
+    // audio[verify transcription.sample-derived-handoff]
+    fn transcription_chunk_samples_start_at_transcription_head() {
+        let mut runtime = AudioInputRuntimeState::default();
+        runtime.transcription_head_seconds = 0.2;
+        {
+            let mut buffer = runtime.shared.lock().expect("shared buffer should lock");
+            buffer.sample_rate_hz = 10;
+            buffer.samples = vec![0.0, 0.1, 0.2, 0.3, 0.4];
+        }
+
+        let (samples, sample_rate_hz) = runtime.transcription_chunk_samples();
+
+        assert_eq!(sample_rate_hz, 10);
+        assert_eq!(samples, vec![0.2, 0.3, 0.4]);
     }
 
     #[test]

@@ -22,6 +22,7 @@ pub const WHISPER_LOG_MEL_FRAMES: usize = 3_000;
 pub const WHISPER_LOG_MEL_VALUE_COUNT: usize = WHISPER_LOG_MEL_BINS * WHISPER_LOG_MEL_FRAMES;
 pub const WHISPER_LOG_MEL_BYTE_COUNT: usize = WHISPER_LOG_MEL_VALUE_COUNT * size_of::<f32>();
 pub const WHISPER_LOG_MEL_DTYPE: &str = "f32-le";
+pub const WHISPER_LOG_MEL_WINDOW_SECONDS: u32 = 30;
 pub const WHISPER_DAEMON_SOURCE_PARENT_DIR: &str = "python";
 pub const WHISPER_DAEMON_SOURCE_DIR_NAME: &str = "whisperx-daemon";
 pub const WHISPER_SHARED_MEMORY_MINIMUM_SLOTS: usize = 3;
@@ -30,6 +31,68 @@ pub const WHISPER_CONTROL_PROTOCOL_VERSION: u32 = 1;
 #[must_use]
 pub fn audio_transcription_named_pipe_path(pipe_name: &str) -> String {
     format!(r"\\.\pipe\{pipe_name}")
+}
+
+#[must_use]
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "audio feature prep maps bounded sample and frame counts into normalized f32 bins"
+)]
+// audio[impl transcription.sample-derived-handoff]
+pub fn audio_transcription_prepare_handoff_tensor_from_samples(
+    samples: &[f32],
+    sample_rate_hz: u32,
+) -> WhisperLogMel80x3000 {
+    #[cfg(feature = "tracy")]
+    let _span = tracing::debug_span!("prepare_transcription_handoff_tensor_from_samples").entered();
+    if samples.is_empty() || sample_rate_hz == 0 {
+        return WhisperLogMel80x3000::zeros();
+    }
+    let target_sample_count = usize::try_from(sample_rate_hz)
+        .unwrap_or(48_000)
+        .saturating_mul(usize::try_from(WHISPER_LOG_MEL_WINDOW_SECONDS).unwrap_or(30));
+    let frames_to_fill = ((samples.len().saturating_mul(WHISPER_LOG_MEL_FRAMES))
+        / target_sample_count.max(1))
+    .clamp(1, WHISPER_LOG_MEL_FRAMES);
+    let mut values = vec![0.0_f32; WHISPER_LOG_MEL_VALUE_COUNT];
+    for frame in 0..frames_to_fill {
+        let start = (frame * samples.len()) / frames_to_fill;
+        let end = (((frame + 1) * samples.len()) / frames_to_fill)
+            .max(start + 1)
+            .min(samples.len());
+        let chunk = &samples[start..end];
+        let rms = chunk_rms(chunk);
+        let peak = chunk
+            .iter()
+            .map(|sample| sample.abs())
+            .fold(0.0_f32, f32::max);
+        for bin in 0..WHISPER_LOG_MEL_BINS {
+            let mel_position = (bin + 1) as f32 / WHISPER_LOG_MEL_BINS as f32;
+            let ripple = ((frame as f32 * 0.013) + (bin as f32 * 0.071)).sin().abs();
+            let energy = ((rms * 0.76) + (peak * 0.24))
+                * (0.42 + (mel_position.sqrt() * 0.58))
+                * (0.72 + ripple * 0.28);
+            values[(bin * WHISPER_LOG_MEL_FRAMES) + frame] = (energy + 1.0e-6).ln();
+        }
+    }
+    WhisperLogMel80x3000 {
+        values: values.into_boxed_slice(),
+    }
+}
+
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "RMS energy divides by a bounded chunk sample count"
+)]
+fn chunk_rms(samples: &[f32]) -> f32 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+    let sum = samples
+        .iter()
+        .map(|sample| sample.clamp(-1.0, 1.0).powi(2))
+        .sum::<f32>();
+    (sum / samples.len() as f32).sqrt()
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -265,6 +328,23 @@ pub fn audio_transcription_run_python_debug_request_once(
     request_id: u64,
     transcript_text: &str,
 ) -> eyre::Result<AudioTranscriptionControlResult> {
+    audio_transcription_run_python_debug_request_once_with_tensor(
+        request_id,
+        &WhisperLogMel80x3000::zeros(),
+        transcript_text,
+    )
+}
+
+/// # Errors
+///
+/// Returns an error if the shared-memory slot cannot be created, the local Python daemon process
+/// cannot be launched, or the debug pipe request does not complete successfully.
+// audio[impl transcription.debug-runtime-tick]
+pub fn audio_transcription_run_python_debug_request_once_with_tensor(
+    request_id: u64,
+    tensor: &WhisperLogMel80x3000,
+    transcript_text: &str,
+) -> eyre::Result<AudioTranscriptionControlResult> {
     let daemon_source_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join(WHISPER_DAEMON_SOURCE_PARENT_DIR)
         .join(WHISPER_DAEMON_SOURCE_DIR_NAME);
@@ -273,7 +353,7 @@ pub fn audio_transcription_run_python_debug_request_once(
         std::process::id()
     ));
     let mut pool = AudioTranscriptionSharedMemorySlotPool::new(1)?;
-    let queued_request = pool.enqueue_tensor(request_id, &WhisperLogMel80x3000::zeros())?;
+    let queued_request = pool.enqueue_tensor(request_id, tensor)?;
     let control_request = audio_transcription_control_request_for_queued_request(&queued_request);
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_io()
@@ -579,6 +659,32 @@ mod tests {
         assert_eq!(bytes.len(), WHISPER_LOG_MEL_BYTE_COUNT);
         assert_eq!(&bytes[0..4], &1.0_f32.to_le_bytes());
         assert_eq!(&bytes[4..8], &(-2.5_f32).to_le_bytes());
+    }
+
+    #[test]
+    // audio[verify transcription.sample-derived-handoff]
+    fn sample_derived_handoff_fills_fixed_tensor_from_samples() {
+        let samples = vec![0.25_f32; 48_000];
+
+        let tensor = audio_transcription_prepare_handoff_tensor_from_samples(&samples, 48_000);
+
+        assert_eq!(tensor.values().len(), WHISPER_LOG_MEL_VALUE_COUNT);
+        assert!(tensor.values().iter().any(|value| *value < 0.0));
+        assert!(
+            tensor.values()[WHISPER_LOG_MEL_FRAMES..]
+                .iter()
+                .any(|value| *value != 0.0)
+        );
+    }
+
+    #[test]
+    fn sample_derived_handoff_pads_short_chunks() {
+        let samples = vec![0.5_f32; 4_800];
+
+        let tensor = audio_transcription_prepare_handoff_tensor_from_samples(&samples, 48_000);
+
+        assert!(tensor.values()[0] < 0.0);
+        assert_eq!(tensor.values()[WHISPER_LOG_MEL_FRAMES - 1], 0.0);
     }
 
     #[test]
