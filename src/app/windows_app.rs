@@ -116,8 +116,8 @@ const WINDOW_RESIZE_STEP_COLS: i32 = 4;
 const WINDOW_RESIZE_STEP_ROWS: i32 = 2;
 const MIN_WINDOW_CLIENT_WIDTH: i32 = 320;
 const MIN_WINDOW_CLIENT_HEIGHT: i32 = 240;
-const INITIAL_WINDOW_WIDTH: i32 = 1040;
-const INITIAL_WINDOW_HEIGHT: i32 = 680;
+const INITIAL_WINDOW_WIDTH: i32 = 1300;
+const INITIAL_WINDOW_HEIGHT: i32 = 900;
 const DRAG_START_THRESHOLD_PX: i32 = 0;
 const MIN_RESIZE_BORDER_THICKNESS: i32 = 1;
 const MOUSE_WHEEL_DELTA: i16 = 120;
@@ -7819,6 +7819,13 @@ mod tests {
             scene_window_shortcut_action(true, u32::from(b'D')),
             Some(SceneWindowShortcutAction::CloseWindow)
         );
+    }
+
+    #[test]
+    // behavior[verify window.startup.size]
+    fn initial_window_size_is_1300_by_900() {
+        assert_eq!(INITIAL_WINDOW_WIDTH, 1300);
+        assert_eq!(INITIAL_WINDOW_HEIGHT, 900);
     }
 
     // behavior[verify window.appearance.chrome.tooltips.cursor-clear]

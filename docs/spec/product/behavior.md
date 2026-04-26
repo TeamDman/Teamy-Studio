@@ -8,7 +8,7 @@ behavior[window.startup.centered]
 The launched terminal window must open centered on screen.
 
 behavior[window.startup.size]
-The launched terminal window must start at a fixed size suitable for an 80x24-style shell surface.
+The launched terminal and scene windows must start at a fixed 1300x900 logical-pixel size.
 
 ## Window Appearance
 

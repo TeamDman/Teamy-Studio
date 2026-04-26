@@ -1,0 +1,16 @@
+[project]
+name = "teamy-whisperx-daemon"
+version = "0.1.0"
+description = "Teamy Studio WhisperX daemon scaffold"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+whisperx = ["whisperx"]
+
+[project.scripts]
+teamy-whisperx-daemon = "teamy_whisperx_daemon.__main__:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

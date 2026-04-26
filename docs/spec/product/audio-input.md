@@ -13,6 +13,23 @@ The `audio` command group must expose an `input-device` subcommand group.
 audio[cli.input-device-list]
 The `audio input-device` command group must expose a `list` subcommand that reports audio input devices through the standard CLI output pipeline.
 
+audio[cli.daemon-command]
+The `audio` command group must expose a `daemon` subcommand group for the local transcription backend.
+
+audio[cli.daemon-status]
+The `audio daemon` command group must expose a `status` subcommand that reports the resolved Python daemon source, cache paths, and tensor handoff contract.
+
+## Python Transcription Boundary
+
+audio[python.daemon-project]
+Teamy Studio must include a Teamy-owned Python daemon project for WhisperX integration rather than depending on an external checkout.
+
+audio[transcription.log-mel-contract]
+Rust must represent the Whisper transcription handoff as a fixed 80 x 3000 little-endian f32 log-mel tensor contract.
+
+audio[transcription.shared-memory-payload]
+The Python transcription boundary must treat each inference request payload as a Rust-owned shared-memory slot containing exactly one fixed-shape log-mel tensor.
+
 ## Windows Device Enumeration
 
 audio[enumerate.active-windows-recording]

@@ -1,3 +1,4 @@
+mod audio_transcription;
 mod cell_grid;
 mod render_verification;
 mod spatial;
@@ -23,6 +24,9 @@ use crate::paths::{AppHome, CacheHome};
 use eyre::Context;
 use facet::Facet;
 
+pub use audio_transcription::{
+    AudioTranscriptionDaemonStatusReport, WhisperLogMel80x3000, audio_transcription_daemon_status,
+};
 pub use render_verification::{RenderOffscreenFixtureListReport, RenderOffscreenSelfTestReport};
 pub use windows_app::TerminalThroughputBenchmarkResultsReport;
 pub use windows_audio_input::{
