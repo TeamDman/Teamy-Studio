@@ -325,6 +325,36 @@ float4 apply_loopback_button(float2 uv, float4 color, float4 state) {
     return float4(shaded, alpha * color.a);
 }
 
+float pause_icon(float2 uv) {
+    float left_bar = box_fill_mask(uv, float2(0.42, 0.50), float2(0.045, 0.18));
+    float right_bar = box_fill_mask(uv, float2(0.58, 0.50), float2(0.045, 0.18));
+    return saturate(left_bar + right_bar);
+}
+
+float4 apply_playback_button(float2 uv, float4 color, float4 state) {
+    float playing = state.x;
+    float hover = state.y;
+    float pressed = state.z;
+    float speed = abs(state.w);
+    float t = PanelTime();
+    float2 p = uv - 0.5;
+    float radius = length(p);
+    float plate = 1.0 - smoothstep(0.42, 0.50, radius);
+    float rim = 1.0 - smoothstep(0.30, 0.44, radius);
+    float orbit = 0.5 + (0.5 * sin((atan2(p.y, p.x) * 3.0) + (t * (1.3 + speed * 0.25))));
+    float pulse = 0.5 + (0.5 * sin(t * (3.0 + playing * 2.0)));
+    float intensity = 0.80 + hover * 0.12 + playing * 0.18 + orbit * 0.08 + pulse * playing * 0.08 - pressed * 0.10;
+    float3 base = lerp(float3(0.16, 0.30, 0.38), float3(0.18, 0.54, 0.82), playing);
+    float3 shaded = base * intensity;
+    shaded += float3(0.72, 0.92, 1.00) * (rim * (0.10 + hover * 0.10 + playing * 0.12));
+    float play = icon_play(uv);
+    float pause = pause_icon(uv);
+    float icon = lerp(play, pause, playing);
+    shaded = lerp(shaded, float3(0.94, 0.99, 1.00), icon * (0.80 + hover * 0.12));
+    float alpha = saturate((plate * 0.96) + (rim * 0.16));
+    return float4(shaded, alpha * color.a);
+}
+
 float4 apply_timeline_head_grabber(float2 uv, float4 color, float4 state) {
     float active = state.x;
     float hover = state.y;

@@ -101,6 +101,7 @@ pub struct AudioInputDeviceDetailLayout {
     pub icon_rect: ClientRect,
     pub info_rect: ClientRect,
     pub arm_button_rect: ClientRect,
+    pub play_pause_button_rect: ClientRect,
     pub loopback_button_rect: ClientRect,
     pub arm_status_rect: ClientRect,
     pub legacy_recording_button_rect: ClientRect,
@@ -115,8 +116,14 @@ pub struct AudioInputTimelineHeadGrabberLayout {
     pub rect: ClientRect,
 }
 
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "independent hover and press state drives separate shader controls"
+)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct AudioInputDeviceDetailVisualState {
+    pub playback_hovered: bool,
+    pub playback_pressed: bool,
     pub loopback_hovered: bool,
     pub loopback_pressed: bool,
     pub hovered_head: Option<AudioInputTimelineHeadKind>,
@@ -1192,6 +1199,31 @@ pub fn build_audio_input_device_detail_render_scene(
             0.0,
         ],
     );
+    push_panel_with_data(
+        &mut scene,
+        detail_layout.play_pause_button_rect.to_win32_rect(),
+        if device_state.is_playing() {
+            [0.20, 0.56, 0.86, 1.0]
+        } else {
+            [0.14, 0.28, 0.38, 1.0]
+        },
+        // audio[impl gui.playback-transport]
+        PanelEffect::PlaybackButton,
+        [
+            if device_state.is_playing() { 1.0 } else { 0.0 },
+            if visual_state.playback_hovered {
+                1.0
+            } else {
+                0.0
+            },
+            if visual_state.playback_pressed {
+                1.0
+            } else {
+                0.0
+            },
+            playback_speed_shader_value(device_state.runtime.playback.speed),
+        ],
+    );
     push_text_block(
         &mut scene,
         detail_layout.arm_status_rect.to_win32_rect(),
@@ -1236,6 +1268,16 @@ pub fn build_audio_input_device_detail_render_scene(
     push_audio_input_buffer_section(&mut scene, detail_layout, device_state, visual_state);
 
     scene
+}
+
+fn playback_speed_shader_value(speed: f64) -> f32 {
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "playback shuttle speed is bounded to a small range before reaching shader data"
+    )]
+    {
+        speed as f32
+    }
 }
 
 #[must_use]
@@ -1305,10 +1347,17 @@ pub fn audio_input_device_detail_layout(body_rect: ClientRect) -> AudioInputDevi
         loopback_left + 58,
         arm_button_rect.top() + 8 + 58,
     );
+    let play_pause_button_size = 64;
+    let play_pause_button_rect = ClientRect::new(
+        loopback_button_rect.left() - 24 - play_pause_button_size,
+        arm_button_rect.top() + 5,
+        loopback_button_rect.left() - 24,
+        arm_button_rect.top() + 5 + play_pause_button_size,
+    );
     let arm_status_rect = ClientRect::new(
         arm_button_rect.right() + 18,
         arm_button_rect.top() + 14,
-        loopback_button_rect.left() - 24,
+        play_pause_button_rect.left() - 18,
         arm_button_rect.bottom() - 10,
     );
     let info_rect = ClientRect::new(
@@ -1346,6 +1395,7 @@ pub fn audio_input_device_detail_layout(body_rect: ClientRect) -> AudioInputDevi
         icon_rect,
         info_rect,
         arm_button_rect,
+        play_pause_button_rect,
         loopback_button_rect,
         arm_status_rect,
         legacy_recording_button_rect,
@@ -3167,6 +3217,7 @@ mod tests {
     #[test]
     // audio[verify gui.selected-device-window]
     // audio[verify gui.arm-for-record]
+    // audio[verify gui.playback-transport]
     // audio[verify gui.legacy-recording-dialog]
     fn audio_input_device_detail_render_shows_device_and_arm_button() {
         let state = sample_audio_input_device_window();
@@ -3199,6 +3250,9 @@ mod tests {
         assert!(scene.panels.iter().any(|panel| panel.rect
             == detail_layout.loopback_button_rect.to_win32_rect()
             && matches!(panel.effect, PanelEffect::LoopbackButton)));
+        assert!(scene.panels.iter().any(|panel| panel.rect
+            == detail_layout.play_pause_button_rect.to_win32_rect()
+            && matches!(panel.effect, PanelEffect::PlaybackButton)));
         assert!(!scene.glyphs.is_empty());
     }
 

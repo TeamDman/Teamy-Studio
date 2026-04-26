@@ -256,6 +256,7 @@ pub enum PanelEffect {
     LoopbackButton = 24,
     TimelineHeadGrabber = 25,
     DemoToggle = 26,
+    PlaybackButton = 27,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]

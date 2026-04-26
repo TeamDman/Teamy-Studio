@@ -69,7 +69,7 @@ audio[gui.audio-buffer-waveform]
 The selected-device window must render the recorded audio buffer as a waveform with recording, playback, transcription, and selection heads, and the recording head must represent the write location used for append-style capture.
 
 audio[gui.playback-transport]
-The selected-device window must let Space play or pause the recorded buffer, K pause playback, repeated J/L adjust backward or forward shuttle speed, and forward or reverse playback must behave sensibly when the playback head is already at the end of the buffer.
+The selected-device window must expose a shader-rendered play/pause button and let Space play or pause the recorded buffer, K pause playback, repeated J/L adjust backward or forward shuttle speed, and forward or reverse playback must behave sensibly when the playback head is already at the end of the buffer.
 
 audio[gui.waveform-selection]
 Clicking the waveform without meaningful drag must place the playback head, dragging past a small pixel tolerance must create a visible selection range, and the recording, playback, and transcription heads must also expose draggable grabbers that preserve grab offset, stack when they overlap, and show hover tooltips.

@@ -110,6 +110,12 @@ Diagnostics text in terminal and non-terminal windows must support mouse selecti
 windowing[scene.pretty-text.selection]
 Non-clickable pretty-mode text in scene windows, including selected microphone details such as name, sample rate, state, and endpoint identifier, must support mouse selection and clipboard copy with the same text-selection model used by diagnostics.
 
+windowing[scene.text.keyboard-copy]
+When selectable diagnostics or pretty-mode scene text has an active selection, pressing Ctrl+C in a scene window must copy the selected text to the clipboard.
+
+windowing[scene.keyboard-close]
+Scene windows must close when Ctrl+D is pressed, matching the lightweight exit shortcut for auxiliary Teamy windows.
+
 ## Garden Frame
 
 windowing[garden-band.shared]

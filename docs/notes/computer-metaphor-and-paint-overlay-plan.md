@@ -43,8 +43,10 @@ The guiding idea from the source note is that Teamy Studio should not merely mim
   - Added a left-edge chrome pin affordance direction: Teamy windows can be pinned above other windows, and the shared chrome renderer now has a dedicated pin state/icon surface.
   - Corrected Demo Mode fake input-device IDs so they preserve realistic endpoint shape without adding the `SWD\MMDEVAPI\` prefix when the obscured values do not have it.
   - Began extending selectable text beyond diagnostics by making the selected microphone details render through the same text-grid selection model used for copyable diagnostics text.
+  - Finished and validated the microphone transport polish slice: the selected microphone window now has a shader-rendered play/pause button, scene-window Ctrl+C copies active selectable text, and scene-window Ctrl+D closes the window.
+  - Validated the microphone playback/scene-shortcut slice with `./check-all.ps1`: format, clippy, build, tests, and Tracey status passed. Tracey reported `teamy-studio-windowing/rust: 37 of 37 requirements are covered. 30 of 37 have a verification reference.`
 - Current focus:
-  - Finish and validate the shared chrome pin and pretty-mode text-selection slice, then continue turning the virtual cursor from a visible launcher pointer into a reusable shape-navigation cursor for whiteboarding, inspection, paint-overlay work, and cross-window teleport history.
+  - Continue the plan with the first shared paint-mode chrome button, keeping it small: button state, hit testing, tooltip, and visible active/inactive rendering before overlay drawing grows larger.
 - Remaining work:
   - Add Tracey requirements for each new behavior area before implementation lands.
   - Add shallow launcher stubs for the new surfaces.
@@ -53,7 +55,7 @@ The guiding idea from the source note is that Teamy Studio should not merely mim
   - Add application-window inspection using the Cursor Hero lessons.
   - Add environment variable, input-device, file-extension, shape, SDF, and timeline explorer surfaces as progressively richer windows.
 - Next step:
-  - Promote the launcher's private shape-navigation helpers into a reusable module before adding function-key teleport areas, richer cursor motions, or paint overlay controls.
+  - Add the first shared paint-mode chrome button beside diagnostics, with Tracey requirements and tests, while keeping actual overlay drawing deferred unless the button path is stable.
 
 ## Source Ideas Extracted
 

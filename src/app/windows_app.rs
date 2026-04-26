@@ -410,6 +410,7 @@ enum ScenePressedTarget {
     Action(SceneAction),
     AudioInputDevice(usize),
     AudioInputDeviceArm,
+    AudioInputPlayback,
     AudioInputDeviceLoopback,
     AudioInputTimelineHead(AudioInputTimelineHeadKind),
     LegacyRecordingDevices,
@@ -974,6 +975,7 @@ enum ScenePointerAction {
     Invoke(SceneAction),
     ChooseAudioInputDevice(usize),
     ToggleAudioInputRecording,
+    ToggleAudioInputPlayback,
     ToggleAudioInputLoopback,
     BeginAudioInputTimeline,
     OpenLegacyRecordingDevices,
@@ -987,6 +989,7 @@ enum SceneKeyAction {
     CloseWindow,
     OpenAudioInputDeviceWindow(Option<AudioInputDeviceSummary>),
     InvokeSceneAction(SceneAction),
+    CopySelectedText(String),
     ToggleAudioInputRecording,
     ToggleAudioInputPlayback,
     PauseAudioInputPlayback,
@@ -1001,6 +1004,12 @@ enum WindowChromePointerAction {
     Handled,
     RenderOnly,
     Execute(WindowChromeButton),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SceneWindowShortcutAction {
+    CopySelection,
+    CloseWindow,
 }
 
 impl PendingDragAction {
@@ -2222,6 +2231,23 @@ fn handle_scene_key_down_message(
             return Ok(SceneKeyAction::OpenLegacyRecordingDevices);
         }
 
+        if let Some(shortcut) = scene_window_shortcut_action(control_key_is_down(), virtual_key) {
+            match shortcut {
+                SceneWindowShortcutAction::CopySelection => {
+                    // windowing[impl scene.text.keyboard-copy]
+                    let layout = scene_client_layout(hwnd, state)?;
+                    if let Some(text) = scene_selected_text_for_copy(state, layout) {
+                        return Ok(SceneKeyAction::CopySelectedText(text));
+                    }
+                    return Ok(SceneKeyAction::Handled);
+                }
+                SceneWindowShortcutAction::CloseWindow => {
+                    // windowing[impl scene.keyboard-close]
+                    return Ok(SceneKeyAction::CloseWindow);
+                }
+            }
+        }
+
         if state.scene_kind == SceneWindowKind::AudioInputDeviceDetails {
             if virtual_key == u32::from(VK_ESCAPE.0) {
                 return Ok(SceneKeyAction::CloseWindow);
@@ -2393,6 +2419,17 @@ fn handle_scene_key_down_message(
                 }
                 Err(error) => fail_and_close(hwnd, &error),
             }
+        }
+        Ok(SceneKeyAction::CopySelectedText(text)) => {
+            if !text.is_empty()
+                && let Err(error) = write_clipboard(&text)
+            {
+                error!(
+                    ?error,
+                    "failed to copy scene selected text to the clipboard"
+                );
+            }
+            LRESULT(0)
         }
         Ok(SceneKeyAction::ToggleAudioInputRecording) => {
             let result = with_scene_app_state(|state| {
@@ -2621,6 +2658,13 @@ fn handle_scene_left_button_down(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Re
             return Ok(ScenePointerAction::ToggleAudioInputRecording);
         }
 
+        if audio_input_device_play_pause_button_at_point(state, layout, point) {
+            state.pending_diagnostic_selection = None;
+            state.pressed_target = Some(ScenePressedTarget::AudioInputPlayback);
+            hwnd.capture_mouse();
+            return Ok(ScenePointerAction::ToggleAudioInputPlayback);
+        }
+
         if audio_input_device_loopback_button_at_point(state, layout, point) {
             state.pending_diagnostic_selection = None;
             state.pressed_target = Some(ScenePressedTarget::AudioInputDeviceLoopback);
@@ -2709,6 +2753,15 @@ fn handle_scene_left_button_down(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Re
             with_scene_app_state(|state| {
                 if let Some(device_window) = state.audio_input_device_window.as_mut() {
                     device_window.toggle_recording()?;
+                }
+                render_scene_window_frame(state, hwnd, None, false)
+            })?;
+            Ok(true)
+        }
+        ScenePointerAction::ToggleAudioInputPlayback => {
+            with_scene_app_state(|state| {
+                if let Some(device_window) = state.audio_input_device_window.as_mut() {
+                    device_window.toggle_playback()?;
                 }
                 render_scene_window_frame(state, hwnd, None, false)
             })?;
@@ -2851,6 +2904,15 @@ fn handle_scene_left_button_up(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Resu
             with_scene_app_state(|state| {
                 if let Some(device_window) = state.audio_input_device_window.as_mut() {
                     device_window.toggle_recording()?;
+                }
+                render_scene_window_frame(state, hwnd, None, false)
+            })?;
+            Ok(true)
+        }
+        ScenePointerAction::ToggleAudioInputPlayback => {
+            with_scene_app_state(|state| {
+                if let Some(device_window) = state.audio_input_device_window.as_mut() {
+                    device_window.toggle_playback()?;
                 }
                 render_scene_window_frame(state, hwnd, None, false)
             })?;
@@ -3881,6 +3943,8 @@ fn audio_input_device_detail_visual_state(
         return windows_scene::AudioInputDeviceDetailVisualState::default();
     };
     windows_scene::AudioInputDeviceDetailVisualState {
+        playback_hovered: audio_input_device_play_pause_button_at_point(state, layout, point),
+        playback_pressed: state.pressed_target == Some(ScenePressedTarget::AudioInputPlayback),
         loopback_hovered: audio_input_device_loopback_button_at_point(state, layout, point),
         loopback_pressed: state.pressed_target
             == Some(ScenePressedTarget::AudioInputDeviceLoopback),
@@ -3890,6 +3954,30 @@ fn audio_input_device_detail_visual_state(
             _ => None,
         },
     }
+}
+
+fn scene_selected_text_for_copy(state: &SceneAppState, layout: TerminalLayout) -> Option<String> {
+    let selection = state.diagnostic_selection?;
+
+    if state.diagnostics_visible {
+        return Some(cell_grid::extract_selected_text(
+            scene_diagnostic_text_rect(layout),
+            &build_scene_diagnostic_text(state),
+            state.diagnostic_cell_width,
+            state.diagnostic_cell_height,
+            selection,
+        ));
+    }
+
+    let target = scene_pretty_text_target(state, layout)?;
+
+    Some(cell_grid::extract_selected_text(
+        target.rect,
+        &target.text,
+        target.cell_width,
+        target.cell_height,
+        selection,
+    ))
 }
 
 fn build_scene_diagnostic_text(state: &SceneAppState) -> String {
@@ -4139,6 +4227,8 @@ fn scene_interactive_region_contains(
             || (!state.diagnostics_visible
                 && audio_input_device_arm_button_at_point(state, layout, point))
             || (!state.diagnostics_visible
+                && audio_input_device_play_pause_button_at_point(state, layout, point))
+            || (!state.diagnostics_visible
                 && audio_input_device_loopback_button_at_point(state, layout, point))
             || (!state.diagnostics_visible
                 && audio_input_timeline_head_at_point(state, layout, point).is_some())
@@ -4233,6 +4323,22 @@ fn audio_input_device_loopback_button_at_point(
     let body_rect = layout.terminal_panel_rect().inset(24);
     windows_scene::audio_input_device_detail_layout(body_rect)
         .loopback_button_rect
+        .contains(point)
+}
+
+fn audio_input_device_play_pause_button_at_point(
+    state: &SceneAppState,
+    layout: TerminalLayout,
+    point: ClientPoint,
+) -> bool {
+    if state.scene_kind != SceneWindowKind::AudioInputDeviceDetails
+        || state.audio_input_device_window.is_none()
+    {
+        return false;
+    }
+    let body_rect = layout.terminal_panel_rect().inset(24);
+    windows_scene::audio_input_device_detail_layout(body_rect)
+        .play_pause_button_rect
         .contains(point)
 }
 
@@ -5706,6 +5812,25 @@ fn current_window_shortcut_action(virtual_key: u32) -> Option<WindowShortcutActi
     window_shortcut_action(control_key_is_down(), shift_key_is_down(), virtual_key)
 }
 
+fn scene_window_shortcut_action(
+    control_down: bool,
+    virtual_key: u32,
+) -> Option<SceneWindowShortcutAction> {
+    if !control_down {
+        return None;
+    }
+
+    if virtual_key == u32::from(b'C') {
+        return Some(SceneWindowShortcutAction::CopySelection);
+    }
+
+    if virtual_key == u32::from(b'D') {
+        return Some(SceneWindowShortcutAction::CloseWindow);
+    }
+
+    None
+}
+
 fn window_shortcut_action(
     control_down: bool,
     shift_down: bool,
@@ -7018,89 +7143,70 @@ fn update_scene_chrome_tooltip(
     }
 
     if let Some((tooltip_text, anchor_rect)) = cursor_gallery_cell_tooltip(state, layout, point) {
-        let anchor_rect = client_rect_to_screen_rect(hwnd, anchor_rect)?;
-        let cursor_rect = pointer_cursor_screen_rect(hwnd, point)?;
-        let monitor_bounds = monitor_work_rect(hwnd)?;
-        let tooltip_origin = tooltip_origin(anchor_rect, cursor_rect, monitor_bounds, tooltip_text);
-        state
-            .chrome_tooltip
-            .show_at(hwnd, tooltip_text, tooltip_origin)?;
+        show_scene_tooltip(state, hwnd, point, tooltip_text, anchor_rect)?;
         return Ok(());
     }
 
     if let Some((tooltip_text, anchor_rect)) = demo_mode_control_tooltip(state, layout, point) {
-        let anchor_rect = client_rect_to_screen_rect(hwnd, anchor_rect)?;
-        let cursor_rect = pointer_cursor_screen_rect(hwnd, point)?;
-        let monitor_bounds = monitor_work_rect(hwnd)?;
-        let tooltip_origin = tooltip_origin(anchor_rect, cursor_rect, monitor_bounds, tooltip_text);
-        state
-            .chrome_tooltip
-            .show_at(hwnd, tooltip_text, tooltip_origin)?;
+        show_scene_tooltip(state, hwnd, point, tooltip_text, anchor_rect)?;
         return Ok(());
     }
 
     if let Some((tooltip_text, anchor_rect)) = scene_action_tooltip(state, layout, point) {
-        let anchor_rect = client_rect_to_screen_rect(hwnd, anchor_rect)?;
-        let cursor_rect = pointer_cursor_screen_rect(hwnd, point)?;
-        let monitor_bounds = monitor_work_rect(hwnd)?;
-        let tooltip_origin = tooltip_origin(anchor_rect, cursor_rect, monitor_bounds, tooltip_text);
-        state
-            .chrome_tooltip
-            .show_at(hwnd, tooltip_text, tooltip_origin)?;
+        show_scene_tooltip(state, hwnd, point, tooltip_text, anchor_rect)?;
         return Ok(());
     }
 
     if let Some((tooltip_text, anchor_rect)) = audio_input_legacy_tooltip(state, layout, point) {
-        let anchor_rect = client_rect_to_screen_rect(hwnd, anchor_rect)?;
-        let cursor_rect = pointer_cursor_screen_rect(hwnd, point)?;
-        let monitor_bounds = monitor_work_rect(hwnd)?;
-        let tooltip_origin = tooltip_origin(anchor_rect, cursor_rect, monitor_bounds, tooltip_text);
-        state
-            .chrome_tooltip
-            .show_at(hwnd, tooltip_text, tooltip_origin)?;
+        show_scene_tooltip(state, hwnd, point, tooltip_text, anchor_rect)?;
         return Ok(());
     }
 
     if let Some((tooltip_text, anchor_rect)) = audio_input_device_arm_tooltip(state, layout, point)
     {
-        let anchor_rect = client_rect_to_screen_rect(hwnd, anchor_rect)?;
-        let cursor_rect = pointer_cursor_screen_rect(hwnd, point)?;
-        let monitor_bounds = monitor_work_rect(hwnd)?;
-        let tooltip_origin = tooltip_origin(anchor_rect, cursor_rect, monitor_bounds, tooltip_text);
-        state
-            .chrome_tooltip
-            .show_at(hwnd, tooltip_text, tooltip_origin)?;
+        show_scene_tooltip(state, hwnd, point, tooltip_text, anchor_rect)?;
+        return Ok(());
+    }
+
+    if let Some((tooltip_text, anchor_rect)) =
+        audio_input_device_play_pause_tooltip(state, layout, point)
+    {
+        show_scene_tooltip(state, hwnd, point, tooltip_text, anchor_rect)?;
         return Ok(());
     }
 
     if let Some((tooltip_text, anchor_rect)) =
         audio_input_device_loopback_tooltip(state, layout, point)
     {
-        let anchor_rect = client_rect_to_screen_rect(hwnd, anchor_rect)?;
-        let cursor_rect = pointer_cursor_screen_rect(hwnd, point)?;
-        let monitor_bounds = monitor_work_rect(hwnd)?;
-        let tooltip_origin = tooltip_origin(anchor_rect, cursor_rect, monitor_bounds, tooltip_text);
-        state
-            .chrome_tooltip
-            .show_at(hwnd, tooltip_text, tooltip_origin)?;
+        show_scene_tooltip(state, hwnd, point, tooltip_text, anchor_rect)?;
         return Ok(());
     }
 
     if let Some((tooltip_text, anchor_rect)) =
         audio_input_timeline_head_tooltip(state, layout, point)
     {
-        let anchor_rect = client_rect_to_screen_rect(hwnd, anchor_rect)?;
-        let cursor_rect = pointer_cursor_screen_rect(hwnd, point)?;
-        let monitor_bounds = monitor_work_rect(hwnd)?;
-        let tooltip_origin = tooltip_origin(anchor_rect, cursor_rect, monitor_bounds, tooltip_text);
-        state
-            .chrome_tooltip
-            .show_at(hwnd, tooltip_text, tooltip_origin)?;
+        show_scene_tooltip(state, hwnd, point, tooltip_text, anchor_rect)?;
         return Ok(());
     }
 
     state.chrome_tooltip.hide(hwnd);
     Ok(())
+}
+
+fn show_scene_tooltip(
+    state: &mut SceneAppState,
+    hwnd: WindowHandle,
+    point: ClientPoint,
+    tooltip_text: &str,
+    anchor_rect: ClientRect,
+) -> eyre::Result<()> {
+    let anchor_rect = client_rect_to_screen_rect(hwnd, anchor_rect)?;
+    let cursor_rect = pointer_cursor_screen_rect(hwnd, point)?;
+    let monitor_bounds = monitor_work_rect(hwnd)?;
+    let tooltip_origin = tooltip_origin(anchor_rect, cursor_rect, monitor_bounds, tooltip_text);
+    state
+        .chrome_tooltip
+        .show_at(hwnd, tooltip_text, tooltip_origin)
 }
 
 // windowing[impl virtual-cursor.tooltips]
@@ -7287,6 +7393,38 @@ fn audio_input_device_loopback_tooltip(
             "Disable microphone loopback"
         } else {
             "Enable microphone loopback"
+        },
+        rect,
+    ))
+}
+
+fn audio_input_device_play_pause_tooltip(
+    state: &SceneAppState,
+    layout: TerminalLayout,
+    point: ClientPoint,
+) -> Option<(&'static str, ClientRect)> {
+    if state.diagnostics_visible
+        || state.scene_kind != SceneWindowKind::AudioInputDeviceDetails
+        || state.audio_input_device_window.is_none()
+    {
+        return None;
+    }
+
+    let body_rect = layout.terminal_panel_rect().inset(24);
+    let rect = windows_scene::audio_input_device_detail_layout(body_rect).play_pause_button_rect;
+    if !rect.contains(point) {
+        return None;
+    }
+
+    Some((
+        if state
+            .audio_input_device_window
+            .as_ref()
+            .is_some_and(AudioInputDeviceWindowState::is_playing)
+        {
+            "Pause playback (Space)"
+        } else {
+            "Play recorded buffer (Space)"
         },
         rect,
     ))
@@ -7556,6 +7694,24 @@ mod tests {
             Some(WindowShortcutAction::WindowResize(ShortcutStep::Decrease))
         );
         assert_eq!(window_resize_direction(ShortcutStep::Decrease), -1);
+    }
+
+    #[test]
+    // windowing[verify scene.text.keyboard-copy]
+    fn ctrl_c_maps_to_scene_copy_selection() {
+        assert_eq!(
+            scene_window_shortcut_action(true, u32::from(b'C')),
+            Some(SceneWindowShortcutAction::CopySelection)
+        );
+    }
+
+    #[test]
+    // windowing[verify scene.keyboard-close]
+    fn ctrl_d_maps_to_scene_close_window() {
+        assert_eq!(
+            scene_window_shortcut_action(true, u32::from(b'D')),
+            Some(SceneWindowShortcutAction::CloseWindow)
+        );
     }
 
     // behavior[verify window.appearance.chrome.tooltips.cursor-clear]
