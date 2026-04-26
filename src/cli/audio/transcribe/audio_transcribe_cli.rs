@@ -167,12 +167,14 @@ impl AudioTranscribeArgs {
         let mut progress = DemoBatchProgress::new(totals);
 
         if demo_count > 1 {
-            eprintln!("Demo batch: {} samples", items.len());
+            tracing::info!(
+                samples = items.len(),
+                "Starting audio transcription demo batch"
+            );
         }
 
         for (index, item) in items.into_iter().enumerate() {
-            eprintln!("Demo clip: {}", item.clip.wav_path.display());
-            eprintln!("Expected text: {}", item.clip.expected_text);
+            tracing::info!(path = %item.clip.wav_path.display(), expected_text = %item.clip.expected_text, "Starting demo transcription sample");
             if self.compare_python {
                 print_python_reference_comparison(&item.clip.wav_path, &self.model)?;
             }
@@ -188,9 +190,14 @@ impl AudioTranscribeArgs {
             println!("{}", result.text);
             progress.record(&result);
             if demo_count > 1 {
-                eprintln!(
+                tracing::info!(
                     "{}",
-                    progress.render(index + 1, &item.clip, query_gpu_memory())
+                    progress.render(
+                        "demo_metrics",
+                        index + 1,
+                        &item.clip.wav_path.display().to_string(),
+                        query_gpu_memory()
+                    )
                 );
             }
         }
@@ -258,6 +265,22 @@ struct TranscribedInput {
     words: usize,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+struct TranscriptionChunkResult {
+    text: String,
+    audio_seconds: f64,
+    words: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct AudioChunk<'a> {
+    index: usize,
+    total: usize,
+    start_sample: usize,
+    end_sample: usize,
+    samples: &'a [f32],
+}
+
 #[derive(Clone, Debug)]
 struct DemoBatchProgress {
     totals: DemoBatchTotals,
@@ -293,8 +316,9 @@ impl DemoBatchProgress {
     )]
     fn render(
         &self,
+        header: &str,
         current_index: usize,
-        clip: &VctkDemoClip,
+        current_label: &str,
         gpu: Option<GpuMemorySnapshot>,
     ) -> String {
         let elapsed = self.started_at.elapsed().as_secs_f64().max(f64::EPSILON);
@@ -317,9 +341,9 @@ impl DemoBatchProgress {
         );
 
         [
-            "demo_metrics:".to_owned(),
+            format!("{header}:"),
             format!("  item: {current_index}/{}", self.totals.items),
-            format!("  clip: {}", clip.wav_path.display()),
+            format!("  current: {current_label}"),
             format!(
                 "  bytes_per_second: {}/s",
                 human_bytes_f64(bytes_per_second)
@@ -406,32 +430,158 @@ fn transcribe_one_input(
         ));
     };
 
-    tracing::debug!(
-        max_decode_tokens,
-        "Building Burn Whisper transcription request"
-    );
-    let request_started_at = Instant::now();
-    let request =
-        crate::transcription::build_transcription_request(effective_audio, None, max_decode_tokens);
-    tracing::debug!(
-        elapsed_ms = request_started_at.elapsed().as_millis(),
-        mel_bins = request.features.n_mels,
-        frames = request.features.n_frames,
-        "Built Burn Whisper transcription request"
-    );
-    let decode_started_at = Instant::now();
-    tracing::debug!("Starting Burn Whisper decode");
-    let summary = decoder.decode(&request.features)?;
-    tracing::debug!(elapsed_ms = decode_started_at.elapsed().as_millis(), text = %summary.text, stop_reason = ?summary.stop_reason, generated_tokens = summary.generated_token_ids.len(), "Finished Burn Whisper decode");
     let audio_seconds =
-        original_duration_seconds.unwrap_or_else(|| request.input.duration_seconds());
-    let words = summary.text.split_whitespace().count();
+        original_duration_seconds.unwrap_or_else(|| effective_audio.duration_seconds());
+    let chunks = audio_chunks(&effective_audio.samples);
+    tracing::info!(
+        path = %input_path.display(),
+        bytes = %human_bytes(bytes),
+        duration = %format_audio_duration(audio_seconds),
+        chunks = chunks.len(),
+        sample_rate_hz = ?effective_audio.metadata.sample_rate_hz,
+        channels = ?effective_audio.metadata.channels,
+        codec = %effective_audio.metadata.display_codec(),
+        container = %effective_audio.metadata.display_container(),
+        "Prepared audio transcription input"
+    );
+
+    let mut progress = DemoBatchProgress::new(DemoBatchTotals {
+        items: chunks.len(),
+        bytes,
+        audio_seconds,
+    });
+    let chunk_count = chunks.len();
+    let mut chunk_results = Vec::with_capacity(chunks.len());
+    for chunk in chunks {
+        let chunk_result =
+            transcribe_audio_chunk(&effective_audio, chunk, decoder, max_decode_tokens)?;
+        if chunk_count > 1 {
+            let estimated_chunk_bytes = if chunk.index == chunk.total {
+                bytes.saturating_sub(progress.processed_bytes)
+            } else {
+                estimate_chunk_bytes(bytes, audio_seconds, chunk_result.audio_seconds)
+            };
+            progress.record(&TranscribedInput {
+                text: chunk_result.text.clone(),
+                bytes: estimated_chunk_bytes,
+                audio_seconds: chunk_result.audio_seconds,
+                words: chunk_result.words,
+            });
+            tracing::info!(
+                "{}",
+                progress.render(
+                    "transcription_metrics",
+                    chunk.index,
+                    &format!(
+                        "{} chunk {}/{} ({:.3}s..{:.3}s)",
+                        input_path.display(),
+                        chunk.index,
+                        chunk.total,
+                        sample_index_seconds(chunk.start_sample),
+                        sample_index_seconds(chunk.end_sample)
+                    ),
+                    query_gpu_memory()
+                )
+            );
+        }
+        chunk_results.push(chunk_result);
+    }
+
+    let text = chunk_results
+        .iter()
+        .map(|chunk| chunk.text.trim())
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let words = chunk_results.iter().map(|chunk| chunk.words).sum();
     Ok(TranscribedInput {
-        text: summary.text,
+        text,
         bytes,
         audio_seconds,
         words,
     })
+}
+
+fn transcribe_audio_chunk(
+    input: &crate::transcription::ValidatedAudio,
+    chunk: AudioChunk<'_>,
+    decoder: &crate::whisper::LoadedWhisperGreedyDecoder,
+    max_decode_tokens: usize,
+) -> eyre::Result<TranscriptionChunkResult> {
+    tracing::debug!(
+        max_decode_tokens,
+        chunk_index = chunk.index,
+        chunk_total = chunk.total,
+        "Building Burn Whisper transcription chunk request"
+    );
+    let request_started_at = Instant::now();
+    let features = crate::frontend::whisper_log_mel_spectrogram(chunk.samples);
+    tracing::debug!(
+        elapsed_ms = request_started_at.elapsed().as_millis(),
+        mel_bins = features.n_mels,
+        frames = features.n_frames,
+        chunk_index = chunk.index,
+        chunk_total = chunk.total,
+        "Built Burn Whisper transcription chunk request"
+    );
+    let decode_started_at = Instant::now();
+    tracing::debug!(
+        chunk_index = chunk.index,
+        chunk_total = chunk.total,
+        "Starting Burn Whisper chunk decode"
+    );
+    let summary = decoder.decode(&features)?;
+    tracing::debug!(elapsed_ms = decode_started_at.elapsed().as_millis(), text = %summary.text, stop_reason = ?summary.stop_reason, generated_tokens = summary.generated_token_ids.len(), chunk_index = chunk.index, chunk_total = chunk.total, path = %input.path.display(), "Finished Burn Whisper chunk decode");
+    let audio_seconds = sample_index_seconds(chunk.samples.len());
+    let words = summary.text.split_whitespace().count();
+    Ok(TranscriptionChunkResult {
+        text: summary.text,
+        audio_seconds,
+        words,
+    })
+}
+
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "sample offsets are rendered as approximate seconds for progress diagnostics"
+)]
+fn sample_index_seconds(sample_index: usize) -> f64 {
+    sample_index as f64 / f64::from(crate::audio::TRANSCRIPTION_SAMPLE_RATE)
+}
+
+fn audio_chunks(samples: &[f32]) -> Vec<AudioChunk<'_>> {
+    let chunk_samples = crate::frontend::N_SAMPLES;
+    let total = samples.len().div_ceil(chunk_samples).max(1);
+    (0..total)
+        .map(|offset| {
+            let start_sample = offset * chunk_samples;
+            let end_sample = (start_sample + chunk_samples).min(samples.len());
+            AudioChunk {
+                index: offset + 1,
+                total,
+                start_sample,
+                end_sample,
+                samples: &samples[start_sample..end_sample],
+            }
+        })
+        .collect()
+}
+
+#[expect(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "chunk byte progress estimates map media bytes onto audio duration for human ETA display"
+)]
+fn estimate_chunk_bytes(
+    total_bytes: u64,
+    total_audio_seconds: f64,
+    chunk_audio_seconds: f64,
+) -> u64 {
+    if total_audio_seconds <= f64::EPSILON || !total_audio_seconds.is_finite() {
+        return 0;
+    }
+    ((total_bytes as f64) * (chunk_audio_seconds / total_audio_seconds)).round() as u64
 }
 
 fn default_prepared_output_path(cache_home: &crate::paths::CacheHome, input: &Path) -> PathBuf {
@@ -601,6 +751,13 @@ fn format_duration(duration: Duration) -> String {
     } else {
         format!("{seconds}s")
     }
+}
+
+fn format_audio_duration(seconds: f64) -> String {
+    if !seconds.is_finite() || seconds <= 0.0 {
+        return "unknown".to_owned();
+    }
+    format_duration(Duration::from_secs_f64(seconds))
 }
 
 fn print_python_reference_comparison(input_path: &Path, model_name: &str) -> eyre::Result<()> {
