@@ -30,6 +30,9 @@ use windows::Win32::System::Variant::VT_LPWSTR;
 use windows::Win32::UI::Shell::PropertiesSystem::IPropertyStore;
 use windows::core::{GUID, PCWSTR};
 
+use super::audio_transcription::{
+    AudioTranscriptionControlResult, AudioTranscriptionSharedMemorySlotPool,
+};
 use crate::win32_support::string::EasyPCWSTR;
 
 const GENERIC_WINDOWS_MIC_ICON_PATH: &str = "@%SystemRoot%\\system32\\mmres.dll,-3012";
@@ -145,6 +148,29 @@ impl AudioInputDeviceWindowState {
     // audio[impl gui.transcription-toggle]
     pub fn toggle_transcription(&mut self) {
         self.runtime.transcription.enabled = !self.runtime.transcription.enabled;
+    }
+
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "called by the daemon result loop in the next transcription slice"
+        )
+    )]
+    // audio[impl transcription.result-staging]
+    pub fn apply_transcription_result(
+        &mut self,
+        pool: &mut AudioTranscriptionSharedMemorySlotPool,
+        result: &AudioTranscriptionControlResult,
+    ) {
+        if result.release_slot {
+            pool.release_slot(result.slot_id);
+        }
+        if result.ok {
+            self.runtime
+                .transcription
+                .stage_transcript_text(&result.transcript_text);
+        }
     }
 
     pub fn pause_playback(&mut self) {
@@ -450,6 +476,19 @@ impl Default for AudioInputRuntimeState {
 pub struct AudioInputTranscriptionState {
     pub enabled: bool,
     pub staged_text: String,
+}
+
+impl AudioInputTranscriptionState {
+    // audio[impl transcription.result-staging]
+    pub fn stage_transcript_text(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        if !self.staged_text.is_empty() {
+            self.staged_text.push('\n');
+        }
+        self.staged_text.push_str(text);
+    }
 }
 
 impl AudioInputRuntimeState {
@@ -1563,5 +1602,39 @@ mod tests {
 
         assert_eq!(buffer.samples, vec![0.1, 0.9, 0.8, 0.7]);
         assert_eq!(buffer.write_head_index, 4);
+    }
+
+    #[test]
+    // audio[verify transcription.result-staging]
+    fn transcription_result_releases_slot_and_stages_text() {
+        use super::super::audio_transcription::{
+            AudioTranscriptionControlResult, AudioTranscriptionSharedMemorySlotPool,
+            WHISPER_CONTROL_PROTOCOL_VERSION, WhisperLogMel80x3000,
+        };
+
+        let mut pool = AudioTranscriptionSharedMemorySlotPool::new(1)
+            .expect("shared-memory pool should be created");
+        let queued = pool
+            .enqueue_tensor(41, &WhisperLogMel80x3000::zeros())
+            .expect("tensor should enqueue");
+        let mut state = AudioInputDeviceWindowState::new(device("endpoint-id", "Studio Mic"));
+        let result = AudioTranscriptionControlResult {
+            protocol_version: WHISPER_CONTROL_PROTOCOL_VERSION,
+            kind: "transcription-result".to_owned(),
+            request_id: 41,
+            slot_id: queued.slot_id,
+            release_slot: true,
+            ok: true,
+            transcript_text: "hello from the pipe".to_owned(),
+            error: None,
+        };
+
+        state.apply_transcription_result(&mut pool, &result);
+
+        assert_eq!(pool.status().queued_request_count, 0);
+        assert_eq!(
+            state.runtime.transcription.staged_text,
+            "hello from the pipe"
+        );
     }
 }

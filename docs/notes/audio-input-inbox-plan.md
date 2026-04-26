@@ -52,16 +52,17 @@ The product rule is simple: dictated text must never be sprayed into whichever e
   - Added the Rust/Python control-message contract for the future named pipe: Rust serializes queued shared-memory requests as versioned JSONL, Rust parses daemon result lines, and the Python daemon scaffold validates matching requests and emits slot-release debug results.
   - Added the first live Windows named-pipe transport helper: Rust creates a pipe, sends one JSONL transcription request, reads one JSONL result, validates it, and has a passing roundtrip test that acts as a fake daemon.
   - Connected the Python daemon scaffold to the pipe for a one-request debug path: Rust now smoke-tests a real shared-memory slot, launches `python -m teamy_whisperx_daemon`, lets Python validate the mapped slot, and consumes the returned release result.
+  - Added the Rust-side result-staging hook for daemon responses: successful transcript text is appended to the microphone transcript island state, and returned slots are released back to the shared-memory pool.
 - Current focus:
-  - Continue from the Python debug pipe loop into feeding returned debug transcript results into Rust audio transcription state.
+  - Continue from the tested one-request debug loop toward an app-owned transcription runtime that can drive the pipe while the mic window is open.
 - Remaining work:
   - Harden the first capture/playback path after more real-hardware smoke testing, especially for loopback latency, render-format mismatches, and longer recordings.
   - Replace the current mel-preview visualization with the same log-mel feature data that will be sent to Python.
-  - Connect returned daemon results to the microphone transcript island state.
+  - Add the app-owned runtime plumbing that submits captured windows of audio into the debug transcription path while transcription is enabled.
   - Add the Teamy-owned Python WhisperX daemon project and validation path.
   - Feed returned transcript chunks into the hosted transcript island without sending them to the OS focus target.
 - Next step:
-  - Add the Rust runtime plumbing that consumes a returned daemon result, releases the slot, and stages transcript text in the microphone transcript island.
+  - Add an app-side debug transcription tick that enqueues a placeholder log-mel tensor, runs the Python pipe smoke path, and applies the returned transcript result to the mic window.
 
 ## Why This Slice
 

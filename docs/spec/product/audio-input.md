@@ -39,6 +39,9 @@ Rust and Python must share a versioned JSONL control-message protocol for named-
 audio[transcription.live-named-pipe-transport]
 Rust must provide a live Windows named-pipe transport that sends one queued transcription control request to the daemon and validates one returned result line.
 
+audio[transcription.result-staging]
+Rust must consume transcription daemon results by releasing returned shared-memory slots and staging successful transcript text in the microphone transcript island state.
+
 audio[transcription.shared-memory-pool-status]
 Rust must expose the initial shared-memory slot-pool sizing and live queue counters that the CLI and GUI can report before Python inference is started.
 
