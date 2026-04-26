@@ -33,6 +33,9 @@ The Python transcription boundary must treat each inference request payload as a
 audio[transcription.shared-memory-slot-pool]
 Rust must manage an elastic shared-memory slot pool that writes fixed log-mel tensor payloads, queues ready requests for Python, and releases slots for reuse after Python returns ownership.
 
+audio[transcription.named-pipe-control-protocol]
+Rust and Python must share a versioned JSONL control-message protocol for named-pipe requests and results, including the shared-memory slot name, tensor contract, request id, result text, and slot-release instruction.
+
 audio[transcription.shared-memory-pool-status]
 Rust must expose the initial shared-memory slot-pool sizing and live queue counters that the CLI and GUI can report before Python inference is started.
 

@@ -22,6 +22,7 @@ pub const WHISPER_LOG_MEL_DTYPE: &str = "f32-le";
 pub const WHISPER_DAEMON_SOURCE_PARENT_DIR: &str = "python";
 pub const WHISPER_DAEMON_SOURCE_DIR_NAME: &str = "whisperx-daemon";
 pub const WHISPER_SHARED_MEMORY_MINIMUM_SLOTS: usize = 3;
+pub const WHISPER_CONTROL_PROTOCOL_VERSION: u32 = 1;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct WhisperLogMel80x3000 {
@@ -113,12 +114,99 @@ impl AudioTranscriptionSharedMemorySlotPoolStatus {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Facet, PartialEq, Eq)]
 pub struct AudioTranscriptionQueuedRequest {
     pub request_id: u64,
     pub slot_id: u64,
     pub slot_name: String,
     pub byte_len: usize,
+}
+
+#[derive(Clone, Debug, Facet, PartialEq, Eq)]
+pub struct AudioTranscriptionControlRequest {
+    pub protocol_version: u32,
+    pub kind: String,
+    pub request_id: u64,
+    pub slot_id: u64,
+    pub slot_name: String,
+    pub byte_len: usize,
+    pub tensor_dtype: String,
+    pub tensor_mel_bins: usize,
+    pub tensor_frames: usize,
+}
+
+#[derive(Clone, Debug, Facet, PartialEq, Eq)]
+pub struct AudioTranscriptionControlResult {
+    pub protocol_version: u32,
+    pub kind: String,
+    pub request_id: u64,
+    pub slot_id: u64,
+    pub release_slot: bool,
+    pub ok: bool,
+    pub transcript_text: String,
+    pub error: Option<String>,
+}
+
+#[must_use]
+// audio[impl transcription.named-pipe-control-protocol]
+pub fn audio_transcription_control_request_for_queued_request(
+    request: &AudioTranscriptionQueuedRequest,
+) -> AudioTranscriptionControlRequest {
+    AudioTranscriptionControlRequest {
+        protocol_version: WHISPER_CONTROL_PROTOCOL_VERSION,
+        kind: "transcribe-log-mel".to_owned(),
+        request_id: request.request_id,
+        slot_id: request.slot_id,
+        slot_name: request.slot_name.clone(),
+        byte_len: request.byte_len,
+        tensor_dtype: WHISPER_LOG_MEL_DTYPE.to_owned(),
+        tensor_mel_bins: WHISPER_LOG_MEL_BINS,
+        tensor_frames: WHISPER_LOG_MEL_FRAMES,
+    }
+}
+
+/// # Errors
+///
+/// Returns an error if the request cannot be serialized as a JSONL control message.
+// audio[impl transcription.named-pipe-control-protocol]
+pub fn encode_audio_transcription_control_request_line(
+    request: &AudioTranscriptionControlRequest,
+) -> eyre::Result<String> {
+    let mut line = facet_json::to_string(request)
+        .wrap_err("failed to serialize audio transcription control request")?;
+    line.push('\n');
+    Ok(line)
+}
+
+/// # Errors
+///
+/// Returns an error if the line is not a valid daemon result control message.
+// audio[impl transcription.named-pipe-control-protocol]
+pub fn decode_audio_transcription_control_result_line(
+    line: &str,
+) -> eyre::Result<AudioTranscriptionControlResult> {
+    let result: AudioTranscriptionControlResult = facet_json::from_str(line.trim_end())
+        .wrap_err("failed to parse audio transcription control result")?;
+    validate_audio_transcription_control_result(&result)?;
+    Ok(result)
+}
+
+fn validate_audio_transcription_control_result(
+    result: &AudioTranscriptionControlResult,
+) -> eyre::Result<()> {
+    if result.protocol_version != WHISPER_CONTROL_PROTOCOL_VERSION {
+        eyre::bail!(
+            "unsupported audio transcription control protocol version: {}",
+            result.protocol_version
+        );
+    }
+    if result.kind != "transcription-result" {
+        eyre::bail!(
+            "unsupported audio transcription control result kind: {}",
+            result.kind
+        );
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -454,5 +542,36 @@ mod tests {
         assert_eq!(status.slot_count, 4);
         assert_eq!(status.queued_request_count, 4);
         assert_eq!(status.total_bytes, WHISPER_LOG_MEL_BYTE_COUNT * 4);
+    }
+
+    #[test]
+    // audio[verify transcription.named-pipe-control-protocol]
+    fn control_request_line_reports_queued_shared_memory_slot() {
+        let queued = AudioTranscriptionQueuedRequest {
+            request_id: 7,
+            slot_id: 3,
+            slot_name: "Local\\TeamyStudioWhisperLogMel-test".to_owned(),
+            byte_len: WHISPER_LOG_MEL_BYTE_COUNT,
+        };
+        let request = audio_transcription_control_request_for_queued_request(&queued);
+
+        let line = encode_audio_transcription_control_request_line(&request)
+            .expect("request should serialize as JSONL");
+
+        assert!(line.ends_with('\n'));
+        assert!(line.contains("\"kind\":\"transcribe-log-mel\""));
+        assert!(line.contains("\"slot_name\":\"Local\\\\TeamyStudioWhisperLogMel-test\""));
+    }
+
+    #[test]
+    fn control_result_line_validates_protocol_version_and_kind() {
+        let line = r#"{"protocol_version":1,"kind":"transcription-result","request_id":7,"slot_id":3,"release_slot":true,"ok":true,"transcript_text":"hello","error":null}"#;
+
+        let result = decode_audio_transcription_control_result_line(line)
+            .expect("result should parse from daemon JSONL");
+
+        assert_eq!(result.request_id, 7);
+        assert!(result.release_slot);
+        assert_eq!(result.transcript_text, "hello");
     }
 }

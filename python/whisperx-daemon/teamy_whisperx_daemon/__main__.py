@@ -4,7 +4,14 @@ import argparse
 import json
 import sys
 
-from .protocol import default_tensor_contract, validate_tensor_payload
+from .protocol import (
+    debug_result_for_request,
+    default_tensor_contract,
+    encode_control_result_line,
+    parse_control_request_line,
+    validate_shared_memory_slot,
+    validate_tensor_payload,
+)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -19,9 +26,25 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="validate an all-zero payload with the default tensor shape",
     )
+    parser.add_argument(
+        "--validate-control-request",
+        help="validate one Rust JSONL control request and print a debug result",
+    )
+    parser.add_argument(
+        "--validate-shared-memory-slot",
+        action="store_true",
+        help="map and validate the shared-memory slot named by --validate-control-request",
+    )
     args = parser.parse_args(argv)
 
     contract = default_tensor_contract()
+    if args.validate_control_request:
+        request = parse_control_request_line(args.validate_control_request)
+        if args.validate_shared_memory_slot:
+            validate_shared_memory_slot(request)
+        print(encode_control_result_line(debug_result_for_request(request)), end="")
+        return 0
+
     if args.validate_zero_payload:
         validate_tensor_payload(bytes(contract.byte_count), contract)
 

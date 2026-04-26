@@ -25,10 +25,13 @@ use eyre::Context;
 use facet::Facet;
 
 pub use audio_transcription::{
+    AudioTranscriptionControlRequest, AudioTranscriptionControlResult,
     AudioTranscriptionDaemonStatusReport, AudioTranscriptionQueuedRequest,
     AudioTranscriptionSharedMemorySlotPool, AudioTranscriptionSharedMemorySlotPoolStatus,
-    WhisperLogMel80x3000, audio_transcription_daemon_status,
-    audio_transcription_daemon_status_with_pool_status,
+    WhisperLogMel80x3000, audio_transcription_control_request_for_queued_request,
+    audio_transcription_daemon_status, audio_transcription_daemon_status_with_pool_status,
+    decode_audio_transcription_control_result_line,
+    encode_audio_transcription_control_request_line,
 };
 pub use render_verification::{RenderOffscreenFixtureListReport, RenderOffscreenSelfTestReport};
 pub use windows_app::TerminalThroughputBenchmarkResultsReport;

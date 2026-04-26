@@ -49,16 +49,17 @@ The product rule is simple: dictated text must never be sprayed into whichever e
   - Started the Python integration slice: added a Rust `WhisperLogMel80x3000` payload contract, exposed `audio daemon status`, added a Teamy-owned `python/whisperx-daemon` scaffold, and changed the default Teamy window size to 1300x900.
   - Added the first daemon GUI surface: the main menu now has an `Audio Daemon` card, the daemon opens as a dedicated scene window, and diagnostics mode renders a ratatui status view over the Python entrypoint, cache paths, tensor payload contract, shared-memory slot-pool sizing, and queue counters.
   - Added the first real Rust-side shared-memory slot pool: it creates Windows file mappings, writes fixed `WhisperLogMel80x3000` payloads, queues ready requests for Python, elastically allocates an extra slot when every slot is queued, and releases slots for reuse.
+  - Added the Rust/Python control-message contract for the future named pipe: Rust serializes queued shared-memory requests as versioned JSONL, Rust parses daemon result lines, and the Python daemon scaffold validates matching requests and emits slot-release debug results.
 - Current focus:
-  - Continue from the Rust-owned shared-memory slot pool into named-pipe request/result messages and Python daemon slot validation.
+  - Continue from the shared JSONL control-message contract into a live named-pipe transport and Python daemon slot validation.
 - Remaining work:
   - Harden the first capture/playback path after more real-hardware smoke testing, especially for loopback latency, render-format mismatches, and longer recordings.
   - Replace the current mel-preview visualization with the same log-mel feature data that will be sent to Python.
-  - Add named-pipe control messages for request/result/slot release.
+  - Add the live named-pipe transport for request/result/slot release.
   - Add the Teamy-owned Python WhisperX daemon project and validation path.
   - Feed returned transcript chunks into the hosted transcript island without sending them to the OS focus target.
 - Next step:
-  - Add a named-pipe control protocol that sends queued shared-memory slot requests to Python and accepts result/slot-release responses.
+  - Add a live named-pipe transport that sends queued shared-memory slot requests to Python and accepts result/slot-release responses.
 
 ## Why This Slice
 
