@@ -51,16 +51,17 @@ The product rule is simple: dictated text must never be sprayed into whichever e
   - Added the first real Rust-side shared-memory slot pool: it creates Windows file mappings, writes fixed `WhisperLogMel80x3000` payloads, queues ready requests for Python, elastically allocates an extra slot when every slot is queued, and releases slots for reuse.
   - Added the Rust/Python control-message contract for the future named pipe: Rust serializes queued shared-memory requests as versioned JSONL, Rust parses daemon result lines, and the Python daemon scaffold validates matching requests and emits slot-release debug results.
   - Added the first live Windows named-pipe transport helper: Rust creates a pipe, sends one JSONL transcription request, reads one JSONL result, validates it, and has a passing roundtrip test that acts as a fake daemon.
+  - Connected the Python daemon scaffold to the pipe for a one-request debug path: Rust now smoke-tests a real shared-memory slot, launches `python -m teamy_whisperx_daemon`, lets Python validate the mapped slot, and consumes the returned release result.
 - Current focus:
-  - Continue from the Rust-side live named-pipe transport into a Python daemon pipe loop and shared-memory slot validation.
+  - Continue from the Python debug pipe loop into feeding returned debug transcript results into Rust audio transcription state.
 - Remaining work:
   - Harden the first capture/playback path after more real-hardware smoke testing, especially for loopback latency, render-format mismatches, and longer recordings.
   - Replace the current mel-preview visualization with the same log-mel feature data that will be sent to Python.
-  - Connect the Python daemon scaffold to the live named-pipe transport for request/result/slot release.
+  - Connect returned daemon results to the microphone transcript island state.
   - Add the Teamy-owned Python WhisperX daemon project and validation path.
   - Feed returned transcript chunks into the hosted transcript island without sending them to the OS focus target.
 - Next step:
-  - Add a Python daemon pipe loop that connects to Rust's named pipe, validates the shared-memory slot named in each request, and returns a debug transcript result.
+  - Add the Rust runtime plumbing that consumes a returned daemon result, releases the slot, and stages transcript text in the microphone transcript island.
 
 ## Why This Slice
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 import mmap
+import time
 
 
 CONTROL_PROTOCOL_VERSION = 1
@@ -141,3 +142,28 @@ def debug_result_for_request(request: ControlRequest, text: str = "") -> Control
         transcript_text=text,
         error=None,
     )
+
+
+def run_debug_pipe_once(
+    pipe_path: str,
+    *,
+    validate_slot: bool = False,
+    retry_seconds: float = 5.0,
+) -> None:
+    deadline = time.monotonic() + retry_seconds
+    while True:
+        try:
+            pipe = open(pipe_path, "r+b", buffering=0)
+            break
+        except FileNotFoundError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(0.01)
+
+    with pipe:
+        request_line = pipe.readline().decode("utf-8")
+        request = parse_control_request_line(request_line)
+        if validate_slot:
+            validate_shared_memory_slot(request)
+        pipe.write(encode_control_result_line(debug_result_for_request(request)).encode("utf-8"))
+        pipe.flush()

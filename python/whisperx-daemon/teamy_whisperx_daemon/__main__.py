@@ -9,6 +9,7 @@ from .protocol import (
     default_tensor_contract,
     encode_control_result_line,
     parse_control_request_line,
+    run_debug_pipe_once,
     validate_shared_memory_slot,
     validate_tensor_payload,
 )
@@ -35,9 +36,20 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="map and validate the shared-memory slot named by --validate-control-request",
     )
+    parser.add_argument(
+        "--connect-pipe-once",
+        help="connect to a Rust-owned named pipe, handle one debug request, then exit",
+    )
     args = parser.parse_args(argv)
 
     contract = default_tensor_contract()
+    if args.connect_pipe_once:
+        run_debug_pipe_once(
+            args.connect_pipe_once,
+            validate_slot=args.validate_shared_memory_slot,
+        )
+        return 0
+
     if args.validate_control_request:
         request = parse_control_request_line(args.validate_control_request)
         if args.validate_shared_memory_slot:

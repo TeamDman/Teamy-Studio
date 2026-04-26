@@ -689,4 +689,60 @@ mod tests {
             assert!(result.release_slot);
         });
     }
+
+    #[test]
+    // audio[verify transcription.live-named-pipe-transport]
+    fn python_debug_daemon_roundtrip_validates_real_shared_memory_slot() {
+        let python_daemon_dir = std::env::current_dir()
+            .expect("current dir should be readable")
+            .join("python")
+            .join("whisperx-daemon");
+        if !python_daemon_dir.exists() {
+            return;
+        }
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .enable_time()
+            .build()
+            .expect("tokio runtime should start");
+        runtime.block_on(async {
+            let pipe_path = audio_transcription_named_pipe_path(&format!(
+                "TeamyStudioAudioTranscriptionPythonTest-{}",
+                std::process::id()
+            ));
+            let mut pool = AudioTranscriptionSharedMemorySlotPool::new(1)
+                .expect("shared-memory pool should be created");
+            pool.enqueue_tensor(23, &WhisperLogMel80x3000::zeros())
+                .expect("tensor should enqueue into shared memory");
+            let queued = pool
+                .next_ready_request()
+                .expect("queued request should be available");
+            let request = audio_transcription_control_request_for_queued_request(&queued);
+
+            let roundtrip = audio_transcription_named_pipe_request_roundtrip(&pipe_path, &request);
+            let mut child = std::process::Command::new("python")
+                .arg("-m")
+                .arg("teamy_whisperx_daemon")
+                .arg("--connect-pipe-once")
+                .arg(&pipe_path)
+                .arg("--validate-shared-memory-slot")
+                .current_dir(&python_daemon_dir)
+                .spawn()
+                .expect("python daemon smoke process should start");
+
+            let result = tokio::time::timeout(std::time::Duration::from_secs(10), roundtrip)
+                .await
+                .expect("python daemon pipe smoke should not time out")
+                .expect("python daemon pipe smoke should finish");
+            let child_status = child.wait().expect("python daemon process should finish");
+
+            assert!(child_status.success());
+            assert_eq!(result.request_id, 23);
+            assert_eq!(result.slot_id, queued.slot_id);
+            assert!(result.release_slot);
+            pool.release_slot(result.slot_id);
+            assert_eq!(pool.status().queued_request_count, 0);
+        });
+    }
 }
