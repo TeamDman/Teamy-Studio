@@ -80,6 +80,12 @@ impl AudioTranscribeArgs {
         app_home: &crate::paths::AppHome,
         cache_home: &crate::paths::CacheHome,
     ) -> eyre::Result<CliOutput> {
+        let _span = tracing::info_span!(
+            "audio_transcribe_command",
+            demo = self.demo,
+            model = %self.model,
+        )
+        .entered();
         let command_started_at = Instant::now();
         tracing::debug!(demo = self.demo, model = %self.model, ?self.model_dir, "Starting audio transcribe command");
         let max_decode_tokens = self
@@ -107,25 +113,30 @@ impl AudioTranscribeArgs {
         }
 
         let explicit_model_dir = self.model_dir.as_deref().map(PathBuf::from);
-        let model_dir = crate::model::resolve_transcription_model_dir(
-            app_home,
-            cache_home,
-            Some(&self.model),
-            explicit_model_dir.as_deref(),
-        )?;
+        let model_dir = tracing::info_span!("resolve_transcription_model").in_scope(|| {
+            crate::model::resolve_transcription_model_dir(
+                app_home,
+                cache_home,
+                Some(&self.model),
+                explicit_model_dir.as_deref(),
+            )
+        })?;
         tracing::debug!(model_dir = %model_dir.display(), "Resolved Burn Whisper model directory");
         let model_load_started_at = Instant::now();
-        let model = crate::model::inspect_model_dir(&model_dir).wrap_err_with(|| {
-            format!(
-                "failed to load Burn Whisper model from {}. Run `teamy-studio audio model prepare {}` first, or pass --model-dir <dir>.",
-                model_dir.display(),
-                self.model,
-            )
+        let model = tracing::info_span!("inspect_transcription_model").in_scope(|| {
+            crate::model::inspect_model_dir(&model_dir).wrap_err_with(|| {
+                format!(
+                    "failed to load Burn Whisper model from {}. Run `teamy-studio audio model prepare {}` first, or pass --model-dir <dir>.",
+                    model_dir.display(),
+                    self.model,
+                )
+            })
         })?;
         tracing::debug!(elapsed_ms = model_load_started_at.elapsed().as_millis(), layout = ?model.layout, "Inspected Burn Whisper model directory");
         let decode_workers = self.effective_decode_workers(model.dims.as_ref(), usize::MAX)?;
-        let decoder =
-            crate::whisper::LoadedWhisperGreedyDecoder::load(model.clone(), max_decode_tokens)?;
+        let decoder = tracing::info_span!("load_transcription_decoder").in_scope(|| {
+            crate::whisper::LoadedWhisperGreedyDecoder::load(model.clone(), max_decode_tokens)
+        })?;
         let result = transcribe_one_input(
             &input_path,
             metadata,
@@ -158,6 +169,12 @@ impl AudioTranscribeArgs {
         max_decode_tokens: usize,
         command_started_at: Instant,
     ) -> eyre::Result<CliOutput> {
+        let _span = tracing::info_span!(
+            "audio_transcribe_demo_batch",
+            demo_count,
+            model = %self.model,
+        )
+        .entered();
         if demo_count > 1 && self.prepared_output.is_some() {
             bail!("--prepared-output cannot be used with --demo counts greater than 1");
         }
@@ -169,23 +186,28 @@ impl AudioTranscribeArgs {
             .collect::<eyre::Result<Vec<_>>>()?;
 
         let explicit_model_dir = self.model_dir.as_deref().map(PathBuf::from);
-        let model_dir = crate::model::resolve_transcription_model_dir(
-            app_home,
-            cache_home,
-            Some(&self.model),
-            explicit_model_dir.as_deref(),
-        )?;
-        tracing::debug!(model_dir = %model_dir.display(), "Resolved Burn Whisper model directory for demo batch");
-        let model = crate::model::inspect_model_dir(&model_dir).wrap_err_with(|| {
-            format!(
-                "failed to load Burn Whisper model from {}. Run `teamy-studio audio model prepare {}` first, or pass --model-dir <dir>.",
-                model_dir.display(),
-                self.model,
+        let model_dir = tracing::info_span!("resolve_transcription_model").in_scope(|| {
+            crate::model::resolve_transcription_model_dir(
+                app_home,
+                cache_home,
+                Some(&self.model),
+                explicit_model_dir.as_deref(),
             )
         })?;
+        tracing::debug!(model_dir = %model_dir.display(), "Resolved Burn Whisper model directory for demo batch");
+        let model = tracing::info_span!("inspect_transcription_model").in_scope(|| {
+            crate::model::inspect_model_dir(&model_dir).wrap_err_with(|| {
+                format!(
+                    "failed to load Burn Whisper model from {}. Run `teamy-studio audio model prepare {}` first, or pass --model-dir <dir>.",
+                    model_dir.display(),
+                    self.model,
+                )
+            })
+        })?;
         let decode_workers = self.effective_decode_workers(model.dims.as_ref(), items.len())?;
-        let decoder =
-            crate::whisper::LoadedWhisperGreedyDecoder::load(model.clone(), max_decode_tokens)?;
+        let decoder = tracing::info_span!("load_transcription_decoder").in_scope(|| {
+            crate::whisper::LoadedWhisperGreedyDecoder::load(model.clone(), max_decode_tokens)
+        })?;
         if demo_count > 1 {
             tracing::info!(
                 samples = items.len(),
@@ -627,21 +649,33 @@ struct TranscribeOneContext<'a> {
     decode_workers: usize,
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "input transcription coordinates audio loading, chunking, progress, streaming, and timing"
+)]
 fn transcribe_one_input(
     input_path: &Path,
     metadata: crate::audio::AudioMetadata,
     context: TranscribeOneContext<'_>,
 ) -> eyre::Result<TranscribedInput> {
+    let _span = tracing::info_span!(
+        "transcribe_audio_input",
+        is_demo = context.is_demo,
+        decode_workers = context.decode_workers,
+    )
+    .entered();
     let bytes = std::fs::metadata(input_path)
         .wrap_err_with(|| format!("failed to stat {}", input_path.display()))?
         .len();
     let original_duration_seconds = metadata.duration_seconds;
-    let effective_audio = load_effective_transcription_audio(input_path, metadata, &context)?;
+    let effective_audio = tracing::info_span!("load_transcription_audio")
+        .in_scope(|| load_effective_transcription_audio(input_path, metadata, &context))?;
 
     let audio_seconds =
         original_duration_seconds.unwrap_or_else(|| effective_audio.duration_seconds());
     // audio[impl cli.transcribe-long-input-chunks]
-    let chunks = audio_chunks(&effective_audio.samples);
+    let chunks = tracing::info_span!("split_transcription_audio")
+        .in_scope(|| audio_chunks(&effective_audio.samples));
     // audio[impl cli.transcribe-progress-tracing]
     tracing::info!(
         path = %input_path.display(),
@@ -667,21 +701,27 @@ fn transcribe_one_input(
     let mut transcript_streamer = (!context.is_demo).then(OrderedTranscriptStreamer::new);
     let chunk_count = chunks.len();
     let chunk_results = if context.decode_workers > 1 && chunk_count > 1 {
-        transcribe_audio_chunks_batched(
-            &effective_audio,
-            &chunks,
-            context.decoder,
-            context.decode_workers,
-            ChunkProgressContext {
-                input_path,
-                bytes,
-                progress: &mut progress,
-                transcript_streamer: transcript_streamer.as_mut(),
+        tracing::info_span!("transcribe_audio_chunks_batched", chunks = chunk_count).in_scope(
+            || {
+                transcribe_audio_chunks_batched(
+                    &effective_audio,
+                    &chunks,
+                    context.decoder,
+                    context.decode_workers,
+                    ChunkProgressContext {
+                        input_path,
+                        bytes,
+                        progress: &mut progress,
+                        transcript_streamer: transcript_streamer.as_mut(),
+                    },
+                )
             },
         )?
     } else {
         let mut chunk_results = Vec::with_capacity(chunks.len());
         for chunk in &chunks {
+            #[cfg(feature = "tracy")]
+            let _span = tracing::debug_span!("transcribe_audio_chunk").entered();
             let chunk_result = transcribe_audio_chunk(
                 &effective_audio,
                 *chunk,
@@ -767,7 +807,8 @@ fn load_effective_transcription_audio(
 ) -> eyre::Result<crate::transcription::ValidatedAudio> {
     let issues = crate::audio::validate_for_transcription(&metadata);
     if issues.is_empty() {
-        return crate::transcription::load_validated_audio(input_path, metadata);
+        return tracing::info_span!("load_validated_transcription_audio")
+            .in_scope(|| crate::transcription::load_validated_audio(input_path, metadata));
     }
 
     let prepared_output = context.args.prepared_output.as_deref().map_or_else(
@@ -776,15 +817,20 @@ fn load_effective_transcription_audio(
     );
 
     let prepared = if prepared_output.exists() && !context.args.overwrite {
-        crate::audio::PreparedAudio {
-            metadata: crate::audio::inspect_audio(&prepared_output)?,
-            path: prepared_output,
-        }
+        tracing::info_span!("reuse_prepared_transcription_audio").in_scope(|| {
+            eyre::Ok(crate::audio::PreparedAudio {
+                metadata: crate::audio::inspect_audio(&prepared_output)?,
+                path: prepared_output,
+            })
+        })?
     } else {
         tracing::info!(input = %input_path.display(), output = %prepared_output.display(), "Preparing audio for transcription");
-        crate::audio::prepare_audio(input_path, &prepared_output, context.args.overwrite)?
+        tracing::info_span!("prepare_transcription_audio").in_scope(|| {
+            crate::audio::prepare_audio(input_path, &prepared_output, context.args.overwrite)
+        })?
     };
-    crate::transcription::load_validated_audio(&prepared.path, prepared.metadata)
+    tracing::info_span!("load_validated_transcription_audio")
+        .in_scope(|| crate::transcription::load_validated_audio(&prepared.path, prepared.metadata))
 }
 
 fn chunk_audio_bytes(total_bytes: u64, chunk: AudioChunk<'_>) -> u64 {
@@ -827,6 +873,8 @@ fn transcribe_audio_chunks_batched(
     let mut results = Vec::with_capacity(chunks.len());
     let batch_total = chunks.len().div_ceil(batch_size);
     for (batch_index, batch) in chunks.chunks(batch_size).enumerate() {
+        #[cfg(feature = "tracy")]
+        let _span = tracing::debug_span!("transcribe_audio_chunk_batch").entered();
         let batch_number = batch_index + 1;
         log_overall_progress(
             input_path,
@@ -840,25 +888,33 @@ fn transcribe_audio_chunks_batched(
         );
         let mut features = Vec::with_capacity(batch.len());
         let mut frontend_elapsed_ms = Vec::with_capacity(batch.len());
-        for chunk in batch {
-            let request_started_at = Instant::now();
-            features.push(crate::frontend::whisper_log_mel_spectrogram(chunk.samples));
-            frontend_elapsed_ms.push(request_started_at.elapsed().as_millis());
-        }
+        let () = {
+            #[cfg(feature = "tracy")]
+            let _span = tracing::debug_span!("prepare_whisper_batch_features").entered();
+            for chunk in batch {
+                let request_started_at = Instant::now();
+                features.push(crate::frontend::whisper_log_mel_spectrogram(chunk.samples));
+                frontend_elapsed_ms.push(request_started_at.elapsed().as_millis());
+            }
+        };
 
         let decode_started_at = Instant::now();
-        let summaries = decoder.decode_batch_with_progress(&features, |decode_progress| {
-            if should_log_batch_token_progress(decode_progress) {
-                log_batch_decode_progress(
-                    input_path,
-                    batch,
-                    progress,
-                    batch_number,
-                    batch_total,
-                    decode_progress,
-                );
-            }
-        })?;
+        let summaries = {
+            #[cfg(feature = "tracy")]
+            let _span = tracing::debug_span!("decode_whisper_chunk_batch").entered();
+            decoder.decode_batch_with_progress(&features, |decode_progress| {
+                if should_log_batch_token_progress(decode_progress) {
+                    log_batch_decode_progress(
+                        input_path,
+                        batch,
+                        progress,
+                        batch_number,
+                        batch_total,
+                        decode_progress,
+                    );
+                }
+            })?
+        };
         let decode_elapsed_ms = decode_started_at.elapsed().as_millis();
         for ((chunk, summary), frontend_elapsed_ms) in batch
             .iter()

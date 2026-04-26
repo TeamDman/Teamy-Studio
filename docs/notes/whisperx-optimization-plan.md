@@ -46,11 +46,15 @@ The target is not to copy WhisperX line for line. The target is to identify the 
   - Added an incremental cached decoder path for batched Burn Whisper decode. The batch decoder pre-fills the prompt once, stores self-attention and cross-attention key/value state per decoder layer, then feeds only the newest token for each following greedy step.
   - Smoke-tested `cargo run -- audio transcribe --demo 4 --max-decode-tokens 8 --timing-jsonl target\tmp\demo4-cached-decode-smoke.jsonl`; the run produced four ordered transcript lines and four timing records without runtime errors.
   - Compared the cached batched demo output with the existing full-prefix single-file decode path on the same four prepared WAVs; all four emitted transcript lines matched exactly.
+  - Added Tracy spans for the long-media `audio transcribe <wav>` flow so captures distinguish command setup, model resolution/loading, audio preparation, chunk splitting, batch feature extraction, encoder forward, decoder prefill, decoder token steps, greedy token selection, and decoder self-attention/cross-attention/MLP work.
 - Current focus:
-  - Validate the cached batched decoder with full `./check-all.ps1`, then move from quiet-boundary snapping toward a WhisperX-like segmentation policy: VAD or stronger energy segmentation, speech-region merge up to a model window, ordered segment timestamps, and reference comparisons against WhisperX/faster-whisper.
+  - Use the new Tracy spans on the Clay long-media capture to decide whether the next performance slice should be frontend CPU feature extraction, Burn encoder/decoder GPU work, batch sizing, or transcription policy.
 - Remaining work:
   - Compare Rust/Burn stage timings against Python OpenAI Whisper and WhisperX/faster-whisper on the same samples.
   - Measure cached batched decoder performance against the earlier full-prefix batched decode on longer decode limits and representative long media.
+  - Add WhisperX-style VAD segment merge so Teamy batches speech regions instead of fixed windows with only quiet-boundary snapping.
+  - Add Whisper decode policy controls from faster-whisper/WhisperX: no-speech thresholding, compression-ratio and logprob fallback, temperature fallback, and beam/best-of settings where they improve quality without hiding regressions.
+  - Add timestamp-token or alignment support so chunk boundaries and final transcript segments carry reliable source offsets.
   - Tune true batched chunk inference for independent 30-second windows; the first implementation exists, but batch sizing, feature preparation, and progress timing still need measured improvement.
   - Investigate fp16 or mixed precision inference in Burn/CubeCL for CUDA.
   - Investigate replacing or augmenting the Burn path with faster-whisper/CTranslate2 for the Python daemon path.
@@ -95,6 +99,13 @@ The path to WhisperX-like performance is a sequence of measured improvements:
 5. Reduce unnecessary work by skipping silence or low-speech chunks before decode.
 6. Use lower precision or an optimized backend where it does not break parity.
 7. Preserve a Python daemon route for WhisperX/faster-whisper features that are not worth rebuilding immediately in Burn.
+
+Additional lessons from WhisperX/faster-whisper that remain relevant for Teamy:
+
+- VAD is not just a quality feature; it is a scheduler. It decides which audio regions deserve decode work, merges speech up to the model window, and avoids spending decoder tokens on silence.
+- Decode fallback policy matters for long media. WhisperX/faster-whisper can reject low-confidence or over-compressed outputs and retry with different temperatures, while Teamy's current greedy path accepts the first sequence.
+- Timestamp and alignment data should become first-class outputs. Even if word-level alignment stays in the Python daemon, Rust should preserve segment offsets so the inbox can show where each transcript came from.
+- The optimized backend story is separate from the scheduling story. Teamy can still own capture, VAD, batching, progress, caching, and safety even if a future selectable backend uses CTranslate2/faster-whisper for raw inference.
 
 Whisper is transformer-based, not LSTM-based. Independent audio windows can be processed in parallel or batched once they have been segmented. The decoder's autoregressive tokens within one chunk remain sequential unless the decoding algorithm changes, but decoder KV caching can make each sequential step much cheaper.
 

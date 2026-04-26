@@ -310,6 +310,8 @@ impl<B: Backend> WhisperTextDecoder<B> {
             None
         };
         for (layer_index, block) in self.blocks.iter().enumerate() {
+            #[cfg(feature = "tracy")]
+            let _span = tracing::debug_span!("whisper_decoder_layer").entered();
             let previous_cache = if caches.is_empty() {
                 None
             } else {
@@ -460,19 +462,30 @@ impl<B: Backend> ResidualDecoderAttentionBlock<B> {
         let (self_attn_cache, cross_attn_cache) = cache.map_or((None, None), |cache| {
             (Some(cache.self_attn), Some(cache.cross_attn))
         });
-        let (attn_output, self_attn_cache) = self.attn.forward_with_cache(
-            self.attn_ln.forward(input.clone()),
-            mask,
-            self_attn_cache,
-        );
+        let (attn_output, self_attn_cache) = {
+            #[cfg(feature = "tracy")]
+            let _span = tracing::debug_span!("whisper_decoder_self_attention").entered();
+            self.attn
+                .forward_with_cache(self.attn_ln.forward(input.clone()), mask, self_attn_cache)
+        };
         let input = input + attn_output;
-        let cross_attn_cache =
-            cross_attn_cache.unwrap_or_else(|| self.cross_attn.key_value_cache(encoder_output));
-        let input = input.clone()
-            + self
-                .cross_attn
-                .forward_with_cache(self.cross_attn_ln.forward(input), cross_attn_cache.clone());
-        let input = input.clone() + self.mlp.forward(self.mlp_ln.forward(input));
+        let (input, cross_attn_cache) = {
+            #[cfg(feature = "tracy")]
+            let _span = tracing::debug_span!("whisper_decoder_cross_attention").entered();
+            let cross_attn_cache =
+                cross_attn_cache.unwrap_or_else(|| self.cross_attn.key_value_cache(encoder_output));
+            let input = input.clone()
+                + self.cross_attn.forward_with_cache(
+                    self.cross_attn_ln.forward(input),
+                    cross_attn_cache.clone(),
+                );
+            (input, cross_attn_cache)
+        };
+        let input = {
+            #[cfg(feature = "tracy")]
+            let _span = tracing::debug_span!("whisper_decoder_mlp").entered();
+            input.clone() + self.mlp.forward(self.mlp_ln.forward(input))
+        };
         (
             input,
             DecoderLayerCache {
@@ -1156,6 +1169,12 @@ impl LoadedWhisperGreedyDecoder {
     ) -> eyre::Result<Vec<GreedyDecodeSummary>> {
         // audio[impl cli.transcribe-batched-chunks]
         // audio[impl cli.transcribe-cached-batched-decode]
+        let _span = tracing::info_span!(
+            "decode_whisper_batch",
+            batch_size = features.len(),
+            decode_limit = self.decode_limit(),
+        )
+        .entered();
         if features.is_empty() {
             bail!("Batched greedy decode requires at least one feature tensor");
         }
@@ -1175,10 +1194,10 @@ impl LoadedWhisperGreedyDecoder {
             elapsed_ms: 0,
         });
         let encoder_started_at = Instant::now();
-        let encoder_output = self
-            .model
-            .encoder
-            .forward(features_to_batch_tensor(features, &self.device)?);
+        let feature_tensor = tracing::info_span!("build_whisper_feature_batch_tensor")
+            .in_scope(|| features_to_batch_tensor(features, &self.device))?;
+        let encoder_output = tracing::info_span!("whisper_batch_encoder_forward")
+            .in_scope(|| self.model.encoder.forward(feature_tensor));
         let encoder_elapsed_ms = encoder_started_at.elapsed().as_millis();
         let encoder_output_dims = encoder_output.dims();
         tracing::debug!(elapsed_ms = encoder_elapsed_ms, encoder_output_dims = ?encoder_output_dims, "Finished batched Burn Whisper encoder forward pass");
@@ -1216,99 +1235,116 @@ impl LoadedWhisperGreedyDecoder {
             "Starting cached batched Burn Whisper greedy token loop"
         );
         let decoder_started_at = Instant::now();
-        let (mut decoder_logits, mut caches) =
-            self.model.decoder.forward_incremental_with_layer_progress(
-                token_id_rows_to_tensor(
-                    &vec![self.prompt_token_ids.clone(); batch_size],
-                    &self.device,
-                )?,
-                encoder_output.clone(),
-                None,
-                |decoder_layer_index, decoder_layer_total| {
-                    on_progress(BatchedGreedyDecodeProgress {
-                        phase: BatchedGreedyDecodePhase::DecoderLayer,
-                        token_index: 1,
-                        decode_limit,
-                        batch_size,
-                        active_items: active_count,
-                        decoder_layer_index: Some(decoder_layer_index),
-                        decoder_layer_total: Some(decoder_layer_total),
-                        elapsed_ms: decoder_started_at.elapsed().as_millis(),
-                    });
-                },
-            );
-        for token_index in 0..decode_limit {
-            if active_count == 0 {
-                break;
-            }
-            let token_started_at = Instant::now();
-            last_decoder_logits_dims = decoder_logits.dims();
-            let next_token_ids =
-                greedy_next_token_ids(&decoder_logits, &self.suppressed_token_ids)?;
-            tracing::debug!(token_index, elapsed_ms = token_started_at.elapsed().as_millis(), decoder_logits_dims = ?last_decoder_logits_dims, "Finished batched Burn Whisper decoder token step");
-
-            let mut next_token_rows = Vec::with_capacity(batch_size);
-            for (item_index, next_token_id) in next_token_ids.into_iter().enumerate() {
-                if !active[item_index] {
-                    next_token_rows.push(vec![self.end_of_text]);
-                    continue;
-                }
-
-                if next_token_id == self.end_of_text {
-                    terminated_on_end_of_text[item_index] = true;
-                    stop_reasons[item_index] = DecodeStopReason::EndOfText;
-                    active[item_index] = false;
-                    active_count = active_count.saturating_sub(1);
-                    next_token_rows.push(vec![next_token_id]);
-                    continue;
-                }
-
-                next_token_rows.push(vec![next_token_id]);
-                generated_token_ids[item_index].push(next_token_id);
-
-                if has_repeated_token_collapse(
-                    &generated_token_ids[item_index],
-                    RUST_ONLY_REPEAT_TOKEN_LIMIT,
-                ) {
-                    stop_reasons[item_index] = DecodeStopReason::RepeatedTokenCollapse;
-                    active[item_index] = false;
-                    active_count = active_count.saturating_sub(1);
-                }
-            }
-            on_progress(BatchedGreedyDecodeProgress {
-                phase: BatchedGreedyDecodePhase::TokenComplete,
-                token_index: token_index + 1,
-                decode_limit,
-                batch_size,
-                active_items: active_count,
-                decoder_layer_index: None,
-                decoder_layer_total: None,
-                elapsed_ms: decoder_started_at.elapsed().as_millis(),
+        let prompt_token_rows = token_id_rows_to_tensor(
+            &vec![self.prompt_token_ids.clone(); batch_size],
+            &self.device,
+        )?;
+        let (mut decoder_logits, mut caches) = tracing::info_span!("whisper_batch_decoder_prefill")
+            .in_scope(|| {
+                self.model.decoder.forward_incremental_with_layer_progress(
+                    prompt_token_rows,
+                    encoder_output.clone(),
+                    None,
+                    |decoder_layer_index, decoder_layer_total| {
+                        on_progress(BatchedGreedyDecodeProgress {
+                            phase: BatchedGreedyDecodePhase::DecoderLayer,
+                            token_index: 1,
+                            decode_limit,
+                            batch_size,
+                            active_items: active_count,
+                            decoder_layer_index: Some(decoder_layer_index),
+                            decoder_layer_total: Some(decoder_layer_total),
+                            elapsed_ms: decoder_started_at.elapsed().as_millis(),
+                        });
+                    },
+                )
             });
+        tracing::info_span!("whisper_batch_decoder_loop").in_scope(|| -> eyre::Result<()> {
+            for token_index in 0..decode_limit {
+                #[cfg(feature = "tracy")]
+                let _span = tracing::debug_span!("whisper_batch_decoder_token_step").entered();
+                if active_count == 0 {
+                    break;
+                }
+                let token_started_at = Instant::now();
+                last_decoder_logits_dims = decoder_logits.dims();
+                let next_token_ids = {
+                    #[cfg(feature = "tracy")]
+                    let _span = tracing::debug_span!("whisper_greedy_select_next_tokens").entered();
+                    greedy_next_token_ids(&decoder_logits, &self.suppressed_token_ids)?
+                };
+                tracing::debug!(token_index, elapsed_ms = token_started_at.elapsed().as_millis(), decoder_logits_dims = ?last_decoder_logits_dims, "Finished batched Burn Whisper decoder token step");
 
-            if token_index + 1 == decode_limit || active_count == 0 {
-                break;
+                let mut next_token_rows = Vec::with_capacity(batch_size);
+                for (item_index, next_token_id) in next_token_ids.into_iter().enumerate() {
+                    if !active[item_index] {
+                        next_token_rows.push(vec![self.end_of_text]);
+                        continue;
+                    }
+
+                    if next_token_id == self.end_of_text {
+                        terminated_on_end_of_text[item_index] = true;
+                        stop_reasons[item_index] = DecodeStopReason::EndOfText;
+                        active[item_index] = false;
+                        active_count = active_count.saturating_sub(1);
+                        next_token_rows.push(vec![next_token_id]);
+                        continue;
+                    }
+
+                    next_token_rows.push(vec![next_token_id]);
+                    generated_token_ids[item_index].push(next_token_id);
+
+                    if has_repeated_token_collapse(
+                        &generated_token_ids[item_index],
+                        RUST_ONLY_REPEAT_TOKEN_LIMIT,
+                    ) {
+                        stop_reasons[item_index] = DecodeStopReason::RepeatedTokenCollapse;
+                        active[item_index] = false;
+                        active_count = active_count.saturating_sub(1);
+                    }
+                }
+                on_progress(BatchedGreedyDecodeProgress {
+                    phase: BatchedGreedyDecodePhase::TokenComplete,
+                    token_index: token_index + 1,
+                    decode_limit,
+                    batch_size,
+                    active_items: active_count,
+                    decoder_layer_index: None,
+                    decoder_layer_total: None,
+                    elapsed_ms: decoder_started_at.elapsed().as_millis(),
+                });
+
+                if token_index + 1 == decode_limit || active_count == 0 {
+                    break;
+                }
+
+                let next_token_index = token_index + 2;
+                let next_token_rows = token_id_rows_to_tensor(&next_token_rows, &self.device)?;
+                (decoder_logits, caches) = {
+                    #[cfg(feature = "tracy")]
+                    let _span =
+                        tracing::debug_span!("whisper_batch_decoder_incremental_forward").entered();
+                    self.model.decoder.forward_incremental_with_layer_progress(
+                        next_token_rows,
+                        encoder_output.clone(),
+                        Some(caches),
+                        |decoder_layer_index, decoder_layer_total| {
+                            on_progress(BatchedGreedyDecodeProgress {
+                                phase: BatchedGreedyDecodePhase::DecoderLayer,
+                                token_index: next_token_index,
+                                decode_limit,
+                                batch_size,
+                                active_items: active_count,
+                                decoder_layer_index: Some(decoder_layer_index),
+                                decoder_layer_total: Some(decoder_layer_total),
+                                elapsed_ms: decoder_started_at.elapsed().as_millis(),
+                            });
+                        },
+                    )
+                };
             }
-
-            let next_token_index = token_index + 2;
-            (decoder_logits, caches) = self.model.decoder.forward_incremental_with_layer_progress(
-                token_id_rows_to_tensor(&next_token_rows, &self.device)?,
-                encoder_output.clone(),
-                Some(caches),
-                |decoder_layer_index, decoder_layer_total| {
-                    on_progress(BatchedGreedyDecodeProgress {
-                        phase: BatchedGreedyDecodePhase::DecoderLayer,
-                        token_index: next_token_index,
-                        decode_limit,
-                        batch_size,
-                        active_items: active_count,
-                        decoder_layer_index: Some(decoder_layer_index),
-                        decoder_layer_total: Some(decoder_layer_total),
-                        elapsed_ms: decoder_started_at.elapsed().as_millis(),
-                    });
-                },
-            );
-        }
+            Ok(())
+        })?;
         let decoder_elapsed_ms = decoder_started_at.elapsed().as_millis();
         let total_elapsed_ms = total_started_at.elapsed().as_millis();
 
