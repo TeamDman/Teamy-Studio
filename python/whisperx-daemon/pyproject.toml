@@ -6,7 +6,8 @@ requires-python = ">=3.11"
 dependencies = []
 
 [project.optional-dependencies]
-whisperx = ["whisperx"]
+transcription = ["numpy", "openai-whisper"]
+whisperx = ["numpy", "whisperx"]
 
 [project.scripts]
 teamy-whisperx-daemon = "teamy_whisperx_daemon.__main__:main"

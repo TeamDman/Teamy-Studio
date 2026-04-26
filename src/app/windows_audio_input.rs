@@ -33,8 +33,7 @@ use windows::core::{GUID, PCWSTR};
 
 use super::audio_transcription::{
     AudioTranscriptionControlResult, AudioTranscriptionSharedMemorySlotPool,
-    audio_transcription_prepare_handoff_tensor_from_samples,
-    audio_transcription_run_python_debug_request_once_with_tensor,
+    audio_transcription_run_python_transcription_request_once_from_samples,
 };
 use crate::win32_support::string::EasyPCWSTR;
 
@@ -196,28 +195,27 @@ impl AudioInputDeviceWindowState {
         let chunk_seconds = self.runtime.transcription.chunk_seconds;
         let energy = self.runtime.transcription.energy_rms;
         let (chunk_samples, sample_rate_hz) = self.runtime.transcription_chunk_samples();
-        let transcript_text = if flush_requested {
-            format!(
-                "manual flush request {request_id}; chunk {chunk_seconds:.2}s; energy {energy:.3}"
-            )
-        } else {
-            format!(
-                "debug transcript request {request_id}; chunk {chunk_seconds:.2}s; energy {energy:.3}"
-            )
-        };
+        if !flush_requested
+            && chunk_samples.len() < usize::try_from(sample_rate_hz / 2).unwrap_or(0)
+        {
+            self.transcription_worker.request_in_flight = false;
+            self.runtime.transcription.last_sent_reason =
+                Some("waiting for audio chunk".to_owned());
+            return;
+        }
         let _ = thread::Builder::new()
-            .name("teamy-studio-debug-transcription".to_owned())
+            .name("teamy-studio-transcription".to_owned())
             .spawn(move || {
-                let tensor = audio_transcription_prepare_handoff_tensor_from_samples(
-                    &chunk_samples,
-                    sample_rate_hz,
-                );
-                let result = audio_transcription_run_python_debug_request_once_with_tensor(
-                    request_id,
-                    &tensor,
-                    &transcript_text,
-                )
-                .map_err(|error| error.to_string());
+                let _ = flush_requested;
+                let _ = chunk_seconds;
+                let _ = energy;
+                let result =
+                    audio_transcription_run_python_transcription_request_once_from_samples(
+                        request_id,
+                        &chunk_samples,
+                        sample_rate_hz,
+                    )
+                    .map_err(|error| error.to_string());
                 let _ = sender.send(result);
             });
     }
@@ -231,10 +229,21 @@ impl AudioInputDeviceWindowState {
                 self.transcription_worker.request_in_flight = false;
                 self.transcription_worker.debug_request_completed = true;
                 self.runtime.transcription.last_completed_request_id = Some(result.request_id);
-                if self.runtime.transcription.enabled && result.ok {
-                    self.runtime
-                        .transcription
-                        .stage_transcript_text(&result.transcript_text);
+                if self.runtime.transcription.enabled {
+                    if result.ok {
+                        self.runtime
+                            .transcription
+                            .stage_transcript_text(&result.transcript_text);
+                    } else {
+                        let error = result
+                            .error
+                            .clone()
+                            .unwrap_or_else(|| "transcription daemon returned an error".to_owned());
+                        self.runtime.transcription.last_error = Some(error.clone());
+                        self.runtime
+                            .transcription
+                            .stage_transcript_text(&format!("transcription failed: {error}"));
+                    }
                 }
             }
             Ok(Err(error)) => {
@@ -242,9 +251,9 @@ impl AudioInputDeviceWindowState {
                 self.transcription_worker.debug_request_completed = true;
                 self.runtime.transcription.last_error = Some(error.clone());
                 if self.runtime.transcription.enabled {
-                    self.runtime.transcription.stage_transcript_text(&format!(
-                        "transcription debug path failed: {error}"
-                    ));
+                    self.runtime
+                        .transcription
+                        .stage_transcript_text(&format!("transcription failed: {error}"));
                 }
             }
             Err(TryRecvError::Empty) => {
@@ -253,11 +262,12 @@ impl AudioInputDeviceWindowState {
             Err(TryRecvError::Disconnected) => {
                 self.transcription_worker.request_in_flight = false;
                 self.transcription_worker.debug_request_completed = true;
-                self.runtime.transcription.last_error = Some("debug path disconnected".to_owned());
+                self.runtime.transcription.last_error =
+                    Some("transcription path disconnected".to_owned());
                 if self.runtime.transcription.enabled {
                     self.runtime
                         .transcription
-                        .stage_transcript_text("transcription debug path disconnected");
+                        .stage_transcript_text("transcription path disconnected");
                 }
             }
         }

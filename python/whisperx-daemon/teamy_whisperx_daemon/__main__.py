@@ -10,6 +10,7 @@ from .protocol import (
     encode_control_result_line,
     parse_control_request_line,
     run_debug_pipe_once,
+    transcribe_shared_memory_audio,
     validate_shared_memory_slot,
     validate_tensor_payload,
 )
@@ -45,6 +46,22 @@ def main(argv: list[str] | None = None) -> int:
         default="",
         help="transcript text to return from --connect-pipe-once",
     )
+    parser.add_argument(
+        "--transcribe-shared-memory-slot",
+        action="store_true",
+        help="run real transcription for a transcribe-audio-f32 request",
+    )
+    parser.add_argument(
+        "--model",
+        default="small.en",
+        help="Whisper/WhisperX model name for --transcribe-shared-memory-slot",
+    )
+    parser.add_argument(
+        "--backend",
+        default="auto",
+        choices=("auto", "whisperx", "whisper"),
+        help="transcription backend preference",
+    )
     args = parser.parse_args(argv)
 
     contract = default_tensor_contract()
@@ -53,6 +70,9 @@ def main(argv: list[str] | None = None) -> int:
             args.connect_pipe_once,
             validate_slot=args.validate_shared_memory_slot,
             transcript_text=args.debug_transcript_text,
+            transcribe_slot=args.transcribe_shared_memory_slot,
+            model_name=args.model,
+            backend=args.backend,
         )
         return 0
 
@@ -60,6 +80,18 @@ def main(argv: list[str] | None = None) -> int:
         request = parse_control_request_line(args.validate_control_request)
         if args.validate_shared_memory_slot:
             validate_shared_memory_slot(request)
+        if args.transcribe_shared_memory_slot:
+            print(
+                encode_control_result_line(
+                    transcribe_shared_memory_audio(
+                        request,
+                        model_name=args.model,
+                        backend=args.backend,
+                    )
+                ),
+                end="",
+            )
+            return 0
         print(encode_control_result_line(debug_result_for_request(request)), end="")
         return 0
 

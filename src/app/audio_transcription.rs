@@ -23,6 +23,8 @@ pub const WHISPER_LOG_MEL_VALUE_COUNT: usize = WHISPER_LOG_MEL_BINS * WHISPER_LO
 pub const WHISPER_LOG_MEL_BYTE_COUNT: usize = WHISPER_LOG_MEL_VALUE_COUNT * size_of::<f32>();
 pub const WHISPER_LOG_MEL_DTYPE: &str = "f32-le";
 pub const WHISPER_LOG_MEL_WINDOW_SECONDS: u32 = 30;
+pub const WHISPER_AUDIO_SAMPLE_RATE_HZ: u32 = 16_000;
+pub const WHISPER_AUDIO_DTYPE: &str = "f32-le";
 pub const WHISPER_DAEMON_SOURCE_PARENT_DIR: &str = "python";
 pub const WHISPER_DAEMON_SOURCE_DIR_NAME: &str = "whisperx-daemon";
 pub const WHISPER_SHARED_MEMORY_MINIMUM_SLOTS: usize = 3;
@@ -93,6 +95,53 @@ fn chunk_rms(samples: &[f32]) -> f32 {
         .map(|sample| sample.clamp(-1.0, 1.0).powi(2))
         .sum::<f32>();
     (sum / samples.len() as f32).sqrt()
+}
+
+#[must_use]
+#[expect(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "audio resampling maps bounded sample-rate ratios into sample indices"
+)]
+// audio[impl transcription.real-python-inference]
+pub fn audio_transcription_resample_mono_to_16khz(
+    samples: &[f32],
+    sample_rate_hz: u32,
+) -> Vec<f32> {
+    if samples.is_empty() || sample_rate_hz == 0 {
+        return Vec::new();
+    }
+    if sample_rate_hz == WHISPER_AUDIO_SAMPLE_RATE_HZ {
+        return samples
+            .iter()
+            .map(|sample| sample.clamp(-1.0, 1.0))
+            .collect();
+    }
+    let output_len = ((samples.len() as u64) * u64::from(WHISPER_AUDIO_SAMPLE_RATE_HZ)
+        / u64::from(sample_rate_hz))
+    .max(1) as usize;
+    let mut output = Vec::with_capacity(output_len);
+    for output_index in 0..output_len {
+        let source_position = output_index as f64 * f64::from(sample_rate_hz)
+            / f64::from(WHISPER_AUDIO_SAMPLE_RATE_HZ);
+        let source_index = source_position.floor() as usize;
+        let next_index = (source_index + 1).min(samples.len() - 1);
+        let fraction = (source_position - source_index as f64) as f32;
+        let sample = samples[source_index].mul_add(1.0 - fraction, samples[next_index] * fraction);
+        output.push(sample.clamp(-1.0, 1.0));
+    }
+    output
+}
+
+#[must_use]
+// audio[impl transcription.real-python-inference]
+pub fn audio_transcription_f32_samples_to_little_endian_bytes(samples: &[f32]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(samples.len().saturating_mul(size_of::<f32>()));
+    for sample in samples.iter().copied() {
+        bytes.extend_from_slice(&sample.clamp(-1.0, 1.0).to_le_bytes());
+    }
+    bytes
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -233,6 +282,24 @@ pub fn audio_transcription_control_request_for_queued_request(
         tensor_dtype: WHISPER_LOG_MEL_DTYPE.to_owned(),
         tensor_mel_bins: WHISPER_LOG_MEL_BINS,
         tensor_frames: WHISPER_LOG_MEL_FRAMES,
+    }
+}
+
+#[must_use]
+// audio[impl transcription.real-python-inference]
+pub fn audio_transcription_control_request_for_queued_audio_request(
+    request: &AudioTranscriptionQueuedRequest,
+) -> AudioTranscriptionControlRequest {
+    AudioTranscriptionControlRequest {
+        protocol_version: WHISPER_CONTROL_PROTOCOL_VERSION,
+        kind: "transcribe-audio-f32".to_owned(),
+        request_id: request.request_id,
+        slot_id: request.slot_id,
+        slot_name: request.slot_name.clone(),
+        byte_len: request.byte_len,
+        tensor_dtype: WHISPER_AUDIO_DTYPE.to_owned(),
+        tensor_mel_bins: 1,
+        tensor_frames: request.byte_len / size_of::<f32>(),
     }
 }
 
@@ -387,6 +454,84 @@ pub fn audio_transcription_run_python_debug_request_once_with_tensor(
     Ok(result)
 }
 
+/// # Errors
+///
+/// Returns an error if no audio samples are available, the shared-memory slot cannot be created,
+/// the managed Python daemon cannot be launched, or the transcription request times out.
+#[expect(
+    clippy::duration_suboptimal_units,
+    reason = "the first real transcription run may install dependencies and download a model"
+)]
+// audio[impl transcription.real-python-inference]
+pub fn audio_transcription_run_python_transcription_request_once_from_samples(
+    request_id: u64,
+    samples: &[f32],
+    sample_rate_hz: u32,
+) -> eyre::Result<AudioTranscriptionControlResult> {
+    let resampled_samples = audio_transcription_resample_mono_to_16khz(samples, sample_rate_hz);
+    if resampled_samples.is_empty() {
+        eyre::bail!("no audio samples are available for transcription");
+    }
+    let payload = audio_transcription_f32_samples_to_little_endian_bytes(&resampled_samples);
+    let daemon_source_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join(WHISPER_DAEMON_SOURCE_PARENT_DIR)
+        .join(WHISPER_DAEMON_SOURCE_DIR_NAME);
+    let pipe_path = audio_transcription_named_pipe_path(&format!(
+        "TeamyStudioAudioTranscription-{}-{request_id}",
+        std::process::id()
+    ));
+    let mut slot = AudioTranscriptionSharedMemorySlot::new_with_byte_len(
+        request_id,
+        "AudioF32",
+        payload.len(),
+    )?;
+    slot.write_payload(&payload)?;
+    slot.queued_at = Some(Instant::now());
+    let queued_request = AudioTranscriptionQueuedRequest {
+        request_id,
+        slot_id: slot.id,
+        slot_name: slot.name.clone(),
+        byte_len: slot.byte_len,
+    };
+    let control_request =
+        audio_transcription_control_request_for_queued_audio_request(&queued_request);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .enable_time()
+        .build()
+        .wrap_err("failed to start transcription runtime")?;
+    let roundtrip = audio_transcription_named_pipe_request_roundtrip(&pipe_path, &control_request);
+    let mut child = Command::new("uv")
+        .arg("run")
+        .arg("--no-project")
+        .arg("--with")
+        .arg("numpy")
+        .arg("--with")
+        .arg("openai-whisper")
+        .arg("python")
+        .arg("-m")
+        .arg("teamy_whisperx_daemon")
+        .arg("--connect-pipe-once")
+        .arg(&pipe_path)
+        .arg("--validate-shared-memory-slot")
+        .arg("--transcribe-shared-memory-slot")
+        .arg("--model")
+        .arg(std::env::var("TEAMY_WHISPER_MODEL").unwrap_or_else(|_| "small.en".to_owned()))
+        .current_dir(&daemon_source_dir)
+        .spawn()
+        .wrap_err("failed to launch transcription daemon through uv")?;
+    let result = runtime
+        .block_on(async { tokio::time::timeout(Duration::from_secs(900), roundtrip).await })
+        .wrap_err("transcription daemon timed out")??;
+    let child_status = child
+        .wait()
+        .wrap_err("failed to wait for transcription daemon")?;
+    if !child_status.success() {
+        eyre::bail!("transcription daemon exited with {child_status}");
+    }
+    Ok(result)
+}
+
 #[derive(Debug)]
 // audio[impl transcription.shared-memory-slot-pool]
 pub struct AudioTranscriptionSharedMemorySlotPool {
@@ -497,12 +642,15 @@ struct AudioTranscriptionSharedMemorySlot {
 
 impl AudioTranscriptionSharedMemorySlot {
     fn new(id: u64) -> eyre::Result<Self> {
+        Self::new_with_byte_len(id, "WhisperLogMel", WHISPER_LOG_MEL_BYTE_COUNT)
+    }
+
+    fn new_with_byte_len(id: u64, name_prefix: &str, byte_len: usize) -> eyre::Result<Self> {
         let name = format!(
-            "Local\\TeamyStudioWhisperLogMel-{}-{id}",
+            "Local\\TeamyStudio{name_prefix}-{}-{id}",
             std::process::id()
         );
         let wide_name = name.as_str().easy_pcwstr()?;
-        let byte_len = WHISPER_LOG_MEL_BYTE_COUNT;
         let low_size = u32::try_from(byte_len)
             .wrap_err("Whisper shared-memory slot is too large for Win32 mapping size")?;
         // Safety: this creates a page-file-backed mapping with a valid UTF-16 name.
@@ -533,6 +681,10 @@ impl AudioTranscriptionSharedMemorySlot {
 
     fn write_tensor(&mut self, tensor: &WhisperLogMel80x3000) -> eyre::Result<()> {
         let payload = tensor.to_little_endian_bytes();
+        self.write_payload(&payload)
+    }
+
+    fn write_payload(&mut self, payload: &[u8]) -> eyre::Result<()> {
         if payload.len() != self.byte_len {
             eyre::bail!(
                 "Whisper payload was {} bytes, expected {}",
@@ -542,7 +694,7 @@ impl AudioTranscriptionSharedMemorySlot {
         }
         self.view
             .as_mut_slice(self.byte_len)
-            .copy_from_slice(&payload);
+            .copy_from_slice(payload);
         Ok(())
     }
 }
@@ -765,6 +917,46 @@ mod tests {
         assert!(line.ends_with('\n'));
         assert!(line.contains("\"kind\":\"transcribe-log-mel\""));
         assert!(line.contains("\"slot_name\":\"Local\\\\TeamyStudioWhisperLogMel-test\""));
+    }
+
+    #[test]
+    // audio[verify transcription.real-python-inference]
+    fn audio_control_request_reports_16khz_f32_payload_shape() {
+        let queued = AudioTranscriptionQueuedRequest {
+            request_id: 17,
+            slot_id: 2,
+            slot_name: "Local\\TeamyStudioAudioF32-test".to_owned(),
+            byte_len: 32_000 * size_of::<f32>(),
+        };
+
+        let request = audio_transcription_control_request_for_queued_audio_request(&queued);
+
+        assert_eq!(request.kind, "transcribe-audio-f32");
+        assert_eq!(request.tensor_dtype, WHISPER_AUDIO_DTYPE);
+        assert_eq!(request.tensor_mel_bins, 1);
+        assert_eq!(request.tensor_frames, 32_000);
+    }
+
+    #[test]
+    fn audio_resampler_outputs_16khz_mono_samples() {
+        let samples = vec![0.25_f32; 48_000];
+
+        let resampled = audio_transcription_resample_mono_to_16khz(&samples, 48_000);
+
+        assert_eq!(resampled.len(), 16_000);
+        assert!(
+            resampled
+                .iter()
+                .all(|sample| (*sample - 0.25).abs() < f32::EPSILON)
+        );
+    }
+
+    #[test]
+    fn audio_sample_payload_is_little_endian_f32() {
+        let payload = audio_transcription_f32_samples_to_little_endian_bytes(&[1.0, -0.5]);
+
+        assert_eq!(&payload[0..4], &1.0_f32.to_le_bytes());
+        assert_eq!(&payload[4..8], &(-0.5_f32).to_le_bytes());
     }
 
     #[test]

@@ -46,7 +46,10 @@ audio[transcription.result-staging]
 Rust must consume transcription daemon results by releasing returned shared-memory slots and staging successful transcript text in the microphone transcript island state.
 
 audio[transcription.debug-runtime-tick]
-When transcription is enabled in the microphone window, Rust must be able to run a nonblocking debug transcription tick that submits a placeholder log-mel tensor to the Python pipe path and stages the returned text in the transcript island.
+When transcription is enabled in the microphone window, Rust must be able to run a nonblocking transcription tick that submits the current captured chunk to the Python pipe path and stages the returned text in the transcript island.
+
+audio[transcription.real-python-inference]
+The Python daemon must support a real transcription request that reads a Rust-owned shared-memory slot containing 16 kHz mono little-endian `f32` audio samples, runs an installed Whisper-compatible backend, and returns the transcript through the named-pipe result protocol.
 
 audio[transcription.cached-preview]
 The microphone transcription preview must cache spectrogram intensity and energy calculations outside the render-only path so focused-frame redraws can reuse the latest computed preview.

@@ -56,16 +56,18 @@ The product rule is simple: dictated text must never be sprayed into whichever e
   - Added the first app-side debug transcription tick: when transcription is enabled in the mic window, a focused-frame tick starts a nonblocking worker that submits a placeholder log-mel tensor through the Python pipe path and stages the returned debug transcript text.
   - Moved the transcription preview's spectrogram/energy work out of the render-only path and into a cached runtime preview, added a Tracy-gated span around refreshes, and added a manual `Flush chunk` control with chunk duration, RMS energy, send state, and completed request feedback.
   - Replaced the all-zero placeholder handoff in the debug transcription worker with a Rust-prepared fixed 80 x 3000 handoff tensor derived from the recorded microphone samples ahead of the transcription head.
+  - Added a real one-shot transcription lane: Rust resamples the current microphone chunk to 16 kHz mono `f32`, sends it through a Rust-owned shared-memory slot as `transcribe-audio-f32`, launches the Python daemon through `uv run --no-project --with numpy --with openai-whisper`, and stages Whisper transcript results in the microphone transcript island.
+  - Prewarmed the managed `uv` transcription environment and `small.en` model on 2026-04-26, then verified the shared-memory Python path against the local VCTK `p230_397.wav` sample. The daemon returned `Is there a waiting list?` for the expected `Is there a waiting list ?` transcript.
 - Current focus:
-  - Continue from Rust-prepared sample-derived handoff tensors toward a longer-lived daemon loop and real WhisperX inference.
+  - Continue from working one-shot Whisper transcription toward a longer-lived daemon loop and eventual WhisperX-specific inference.
 - Remaining work:
   - Harden the first capture/playback path after more real-hardware smoke testing, especially for loopback latency, render-format mismatches, and longer recordings.
   - Replace the current mel-preview visualization with the same log-mel feature data that will be sent to Python.
-  - Replace the one-shot Python debug process with a longer-lived daemon loop that can accept repeated prepared tensors.
-  - Add the Teamy-owned Python WhisperX daemon project and validation path.
+  - Replace the one-shot Python transcription process with a longer-lived daemon loop that keeps the model hot across repeated chunks.
+  - Add the Teamy-owned Python WhisperX daemon project setup/doctor path for CUDA/model readiness.
   - Feed returned transcript chunks into the hosted transcript island without sending them to the OS focus target.
 - Next step:
-  - Keep the Python daemon process alive across transcription requests, then swap its debug transcript result for WhisperX inference over the prepared shared-memory tensor.
+  - Keep the Python daemon process alive across transcription requests so the model is not reloaded for every manual flush, then add a full `audio daemon doctor` path for environment/model readiness.
 
 ## Why This Slice
 
