@@ -1345,31 +1345,41 @@ impl LoadedWhisperGreedyDecoder {
             }
             Ok(())
         })?;
-        let decoder_elapsed_ms = decoder_started_at.elapsed().as_millis();
-        let total_elapsed_ms = total_started_at.elapsed().as_millis();
+        tracing::info_span!("whisper_batch_decode_finalize").in_scope(|| {
+            let decoder_elapsed_ms = tracing::info_span!("whisper_batch_decode_record_timing")
+                .in_scope(|| decoder_started_at.elapsed().as_millis());
+            let total_elapsed_ms = total_started_at.elapsed().as_millis();
+            let tokenizer = tracing::info_span!("load_whisper_tokenizer_for_batch_decode")
+                .in_scope(|| load_tokenizer(&self.artifacts))?;
 
-        generated_token_ids
-            .into_iter()
-            .zip(terminated_on_end_of_text)
-            .zip(stop_reasons)
-            .map(
-                |((generated_token_ids, terminated_on_end_of_text), stop_reason)| {
-                    let text = decode_token_ids(&self.artifacts, &generated_token_ids, true)?;
-                    Ok(GreedyDecodeSummary {
-                        prompt_token_ids: self.prompt_token_ids.clone(),
-                        generated_token_ids,
-                        encoder_output_dims,
-                        last_decoder_logits_dims,
-                        total_elapsed_ms,
-                        encoder_elapsed_ms,
-                        decoder_elapsed_ms,
-                        terminated_on_end_of_text,
-                        stop_reason,
-                        text,
-                    })
-                },
-            )
-            .collect()
+            generated_token_ids
+                .into_iter()
+                .zip(terminated_on_end_of_text)
+                .zip(stop_reasons)
+                .map(
+                    |((generated_token_ids, terminated_on_end_of_text), stop_reason)| {
+                        let text = {
+                            #[cfg(feature = "tracy")]
+                            let _span =
+                                tracing::debug_span!("decode_whisper_generated_tokens").entered();
+                            decode_token_ids_with_tokenizer(&tokenizer, &generated_token_ids, true)?
+                        };
+                        Ok(GreedyDecodeSummary {
+                            prompt_token_ids: self.prompt_token_ids.clone(),
+                            generated_token_ids,
+                            encoder_output_dims,
+                            last_decoder_logits_dims,
+                            total_elapsed_ms,
+                            encoder_elapsed_ms,
+                            decoder_elapsed_ms,
+                            terminated_on_end_of_text,
+                            stop_reason,
+                            text,
+                        })
+                    },
+                )
+                .collect()
+        })
     }
 }
 
@@ -1461,6 +1471,14 @@ pub fn decode_token_ids(
     skip_special_tokens: bool,
 ) -> eyre::Result<String> {
     let tokenizer = load_tokenizer(artifacts)?;
+    decode_token_ids_with_tokenizer(&tokenizer, token_ids, skip_special_tokens)
+}
+
+fn decode_token_ids_with_tokenizer(
+    tokenizer: &tokenizers::Tokenizer,
+    token_ids: &[usize],
+    skip_special_tokens: bool,
+) -> eyre::Result<String> {
     let token_ids = token_ids
         .iter()
         .map(|token_id| u32::try_from(*token_id))
