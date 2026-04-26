@@ -1,8 +1,18 @@
+use std::collections::VecDeque;
 use std::path::PathBuf;
+use std::ptr::NonNull;
+use std::time::Instant;
 
+use eyre::Context;
 use facet::Facet;
+use windows::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
+use windows::Win32::System::Memory::{
+    CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile, PAGE_READWRITE,
+    UnmapViewOfFile,
+};
 
 use crate::paths::CacheHome;
+use crate::win32_support::string::EasyPCWSTR;
 
 pub const WHISPER_LOG_MEL_BINS: usize = 80;
 pub const WHISPER_LOG_MEL_FRAMES: usize = 3_000;
@@ -11,6 +21,7 @@ pub const WHISPER_LOG_MEL_BYTE_COUNT: usize = WHISPER_LOG_MEL_VALUE_COUNT * size
 pub const WHISPER_LOG_MEL_DTYPE: &str = "f32-le";
 pub const WHISPER_DAEMON_SOURCE_PARENT_DIR: &str = "python";
 pub const WHISPER_DAEMON_SOURCE_DIR_NAME: &str = "whisperx-daemon";
+pub const WHISPER_SHARED_MEMORY_MINIMUM_SLOTS: usize = 3;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct WhisperLogMel80x3000 {
@@ -80,12 +91,247 @@ pub struct AudioTranscriptionDaemonStatusReport {
     pub python_entrypoint: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AudioTranscriptionSharedMemorySlotPoolStatus {
+    pub slot_count: usize,
+    pub total_bytes: usize,
+    pub queued_request_count: usize,
+    pub oldest_queued_age_ms: u64,
+    pub python_lag_ms: u64,
+}
+
+impl AudioTranscriptionSharedMemorySlotPoolStatus {
+    #[must_use]
+    pub const fn initial() -> Self {
+        Self {
+            slot_count: WHISPER_SHARED_MEMORY_MINIMUM_SLOTS,
+            total_bytes: WHISPER_LOG_MEL_BYTE_COUNT * WHISPER_SHARED_MEMORY_MINIMUM_SLOTS,
+            queued_request_count: 0,
+            oldest_queued_age_ms: 0,
+            python_lag_ms: 0,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AudioTranscriptionQueuedRequest {
+    pub request_id: u64,
+    pub slot_id: u64,
+    pub slot_name: String,
+    pub byte_len: usize,
+}
+
+#[derive(Debug)]
+// audio[impl transcription.shared-memory-slot-pool]
+pub struct AudioTranscriptionSharedMemorySlotPool {
+    slots: Vec<AudioTranscriptionSharedMemorySlot>,
+    ready_queue: VecDeque<AudioTranscriptionQueuedRequest>,
+    next_slot_id: u64,
+}
+
+impl AudioTranscriptionSharedMemorySlotPool {
+    /// # Errors
+    ///
+    /// Returns an error if Windows cannot create or map the initial shared-memory slots.
+    // audio[impl transcription.shared-memory-slot-pool]
+    pub fn new(minimum_slots: usize) -> eyre::Result<Self> {
+        let minimum_slots = minimum_slots.max(WHISPER_SHARED_MEMORY_MINIMUM_SLOTS);
+        let mut pool = Self {
+            slots: Vec::with_capacity(minimum_slots),
+            ready_queue: VecDeque::new(),
+            next_slot_id: 0,
+        };
+        for _ in 0..minimum_slots {
+            pool.allocate_slot()?;
+        }
+        Ok(pool)
+    }
+
+    /// # Errors
+    ///
+    /// Returns an error if an elastic slot must be allocated and Windows cannot create or map it.
+    // audio[impl transcription.shared-memory-slot-pool]
+    pub fn enqueue_tensor(
+        &mut self,
+        request_id: u64,
+        tensor: &WhisperLogMel80x3000,
+    ) -> eyre::Result<AudioTranscriptionQueuedRequest> {
+        let slot_index = self.next_available_slot_index()?;
+        let slot = &mut self.slots[slot_index];
+        slot.write_tensor(tensor)?;
+        slot.queued_at = Some(Instant::now());
+        let request = AudioTranscriptionQueuedRequest {
+            request_id,
+            slot_id: slot.id,
+            slot_name: slot.name.clone(),
+            byte_len: slot.byte_len,
+        };
+        self.ready_queue.push_back(request.clone());
+        Ok(request)
+    }
+
+    #[must_use]
+    pub fn next_ready_request(&self) -> Option<&AudioTranscriptionQueuedRequest> {
+        self.ready_queue.front()
+    }
+
+    #[must_use]
+    // audio[impl transcription.shared-memory-pool-status]
+    pub fn status(&self) -> AudioTranscriptionSharedMemorySlotPoolStatus {
+        let now = Instant::now();
+        let oldest_queued_age_ms = self
+            .slots
+            .iter()
+            .filter_map(|slot| slot.queued_at)
+            .map(|queued_at| duration_millis_u64(now.duration_since(queued_at)))
+            .max()
+            .unwrap_or_default();
+        AudioTranscriptionSharedMemorySlotPoolStatus {
+            slot_count: self.slots.len(),
+            total_bytes: self.slots.iter().map(|slot| slot.byte_len).sum(),
+            queued_request_count: self.ready_queue.len(),
+            oldest_queued_age_ms,
+            python_lag_ms: oldest_queued_age_ms,
+        }
+    }
+
+    pub fn release_slot(&mut self, slot_id: u64) {
+        self.ready_queue
+            .retain(|request| request.slot_id != slot_id);
+        if let Some(slot) = self.slots.iter_mut().find(|slot| slot.id == slot_id) {
+            slot.queued_at = None;
+        }
+    }
+
+    fn next_available_slot_index(&mut self) -> eyre::Result<usize> {
+        if let Some(index) = self.slots.iter().position(|slot| slot.queued_at.is_none()) {
+            return Ok(index);
+        }
+        self.allocate_slot()?;
+        Ok(self.slots.len() - 1)
+    }
+
+    fn allocate_slot(&mut self) -> eyre::Result<()> {
+        let slot = AudioTranscriptionSharedMemorySlot::new(self.next_slot_id)?;
+        self.next_slot_id += 1;
+        self.slots.push(slot);
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct AudioTranscriptionSharedMemorySlot {
+    id: u64,
+    name: String,
+    byte_len: usize,
+    _mapping: FileMappingHandle,
+    view: MappedView,
+    queued_at: Option<Instant>,
+}
+
+impl AudioTranscriptionSharedMemorySlot {
+    fn new(id: u64) -> eyre::Result<Self> {
+        let name = format!(
+            "Local\\TeamyStudioWhisperLogMel-{}-{id}",
+            std::process::id()
+        );
+        let wide_name = name.as_str().easy_pcwstr()?;
+        let byte_len = WHISPER_LOG_MEL_BYTE_COUNT;
+        let low_size = u32::try_from(byte_len)
+            .wrap_err("Whisper shared-memory slot is too large for Win32 mapping size")?;
+        // Safety: this creates a page-file-backed mapping with a valid UTF-16 name.
+        let handle = unsafe {
+            CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                None,
+                PAGE_READWRITE,
+                0,
+                low_size,
+                wide_name.as_ref(),
+            )
+        }
+        .wrap_err("failed to create Whisper shared-memory slot")?;
+        let mapping = FileMappingHandle(handle);
+        // Safety: the mapping handle is valid and the requested view length matches the slot size.
+        let view = unsafe { MapViewOfFile(mapping.0, FILE_MAP_WRITE, 0, 0, byte_len) };
+        let view = MappedView::new(view).wrap_err("failed to map Whisper shared-memory slot")?;
+        Ok(Self {
+            id,
+            name,
+            byte_len,
+            _mapping: mapping,
+            view,
+            queued_at: None,
+        })
+    }
+
+    fn write_tensor(&mut self, tensor: &WhisperLogMel80x3000) -> eyre::Result<()> {
+        let payload = tensor.to_little_endian_bytes();
+        if payload.len() != self.byte_len {
+            eyre::bail!(
+                "Whisper payload was {} bytes, expected {}",
+                payload.len(),
+                self.byte_len
+            );
+        }
+        self.view
+            .as_mut_slice(self.byte_len)
+            .copy_from_slice(&payload);
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct FileMappingHandle(HANDLE);
+
+impl Drop for FileMappingHandle {
+    fn drop(&mut self) {
+        // Safety: this handle is owned by `FileMappingHandle` and is closed exactly once here.
+        let _ = unsafe { CloseHandle(self.0) };
+    }
+}
+
+#[derive(Debug)]
+struct MappedView(MEMORY_MAPPED_VIEW_ADDRESS);
+
+impl MappedView {
+    fn new(address: MEMORY_MAPPED_VIEW_ADDRESS) -> eyre::Result<Self> {
+        NonNull::new(address.Value).map_or_else(
+            || Err(windows::core::Error::from_thread()).wrap_err("MapViewOfFile returned null"),
+            |_| Ok(Self(address)),
+        )
+    }
+
+    fn as_mut_slice(&mut self, byte_len: usize) -> &mut [u8] {
+        // Safety: `MappedView` owns a live writable view of at least `byte_len` bytes.
+        unsafe { std::slice::from_raw_parts_mut(self.0.Value.cast::<u8>(), byte_len) }
+    }
+}
+
+impl Drop for MappedView {
+    fn drop(&mut self) {
+        // Safety: this view is owned by `MappedView` and is unmapped exactly once here.
+        let _ = unsafe { UnmapViewOfFile(self.0) };
+    }
+}
+
 #[must_use]
 // audio[impl cli.daemon-status]
 // audio[impl python.daemon-project]
 // audio[impl transcription.shared-memory-payload]
 pub fn audio_transcription_daemon_status(
     cache_home: &CacheHome,
+) -> AudioTranscriptionDaemonStatusReport {
+    audio_transcription_daemon_status_with_pool_status(
+        cache_home,
+        &AudioTranscriptionSharedMemorySlotPoolStatus::initial(),
+    )
+}
+
+#[must_use]
+pub fn audio_transcription_daemon_status_with_pool_status(
+    cache_home: &CacheHome,
+    pool_status: &AudioTranscriptionSharedMemorySlotPoolStatus,
 ) -> AudioTranscriptionDaemonStatusReport {
     let daemon_source_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join(WHISPER_DAEMON_SOURCE_PARENT_DIR)
@@ -106,15 +352,19 @@ pub fn audio_transcription_daemon_status(
         tensor_bytes: WHISPER_LOG_MEL_BYTE_COUNT,
         shared_memory_slot_bytes: WHISPER_LOG_MEL_BYTE_COUNT,
         // audio[impl transcription.shared-memory-pool-status]
-        shared_memory_minimum_slots: 3,
-        shared_memory_total_bytes: WHISPER_LOG_MEL_BYTE_COUNT * 3,
-        queued_request_count: 0,
-        oldest_queued_age_ms: 0,
-        python_lag_ms: 0,
+        shared_memory_minimum_slots: pool_status.slot_count,
+        shared_memory_total_bytes: pool_status.total_bytes,
+        queued_request_count: pool_status.queued_request_count,
+        oldest_queued_age_ms: pool_status.oldest_queued_age_ms,
+        python_lag_ms: pool_status.python_lag_ms,
         control_transport: "windows named pipe".to_owned(),
         payload_transport: "rust-owned shared-memory slot".to_owned(),
         python_entrypoint: "teamy_whisperx_daemon".to_owned(),
     }
+}
+
+fn duration_millis_u64(duration: std::time::Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 #[cfg(test)]
@@ -158,12 +408,51 @@ mod tests {
     fn daemon_status_reports_initial_shared_memory_pool_metrics() {
         let report = audio_transcription_daemon_status(&CacheHome(PathBuf::from("cache")));
 
-        assert_eq!(report.shared_memory_minimum_slots, 3);
+        assert_eq!(
+            report.shared_memory_minimum_slots,
+            WHISPER_SHARED_MEMORY_MINIMUM_SLOTS
+        );
         assert_eq!(report.shared_memory_slot_bytes, WHISPER_LOG_MEL_BYTE_COUNT);
         assert_eq!(
             report.shared_memory_total_bytes,
-            WHISPER_LOG_MEL_BYTE_COUNT * 3
+            WHISPER_LOG_MEL_BYTE_COUNT * WHISPER_SHARED_MEMORY_MINIMUM_SLOTS
         );
         assert_eq!(report.queued_request_count, 0);
+    }
+
+    #[test]
+    // audio[verify transcription.shared-memory-slot-pool]
+    fn shared_memory_slot_pool_queues_and_releases_tensor_payloads() {
+        let mut pool = AudioTranscriptionSharedMemorySlotPool::new(3)
+            .expect("shared-memory pool should initialize");
+        let request = pool
+            .enqueue_tensor(42, &WhisperLogMel80x3000::zeros())
+            .expect("tensor should enqueue into a shared-memory slot");
+
+        assert_eq!(request.request_id, 42);
+        assert_eq!(request.byte_len, WHISPER_LOG_MEL_BYTE_COUNT);
+        assert_eq!(pool.next_ready_request(), Some(&request));
+        assert_eq!(pool.status().queued_request_count, 1);
+
+        pool.release_slot(request.slot_id);
+
+        assert_eq!(pool.next_ready_request(), None);
+        assert_eq!(pool.status().queued_request_count, 0);
+    }
+
+    #[test]
+    fn shared_memory_slot_pool_grows_when_all_slots_are_queued() {
+        let mut pool = AudioTranscriptionSharedMemorySlotPool::new(3)
+            .expect("shared-memory pool should initialize");
+        for request_id in 0..4 {
+            pool.enqueue_tensor(request_id, &WhisperLogMel80x3000::zeros())
+                .expect("tensor should enqueue into a shared-memory slot");
+        }
+
+        let status = pool.status();
+
+        assert_eq!(status.slot_count, 4);
+        assert_eq!(status.queued_request_count, 4);
+        assert_eq!(status.total_bytes, WHISPER_LOG_MEL_BYTE_COUNT * 4);
     }
 }

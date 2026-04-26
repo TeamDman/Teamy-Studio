@@ -48,16 +48,17 @@ The product rule is simple: dictated text must never be sprayed into whichever e
   - Validated the transcription UI shell with `./check-all.ps1`: format, clippy, build, tests, and Tracey passed. Tracey reported `teamy-studio-audio-input/rust: 26 of 26 requirements are covered. 14 of 26 have a verification reference.`
   - Started the Python integration slice: added a Rust `WhisperLogMel80x3000` payload contract, exposed `audio daemon status`, added a Teamy-owned `python/whisperx-daemon` scaffold, and changed the default Teamy window size to 1300x900.
   - Added the first daemon GUI surface: the main menu now has an `Audio Daemon` card, the daemon opens as a dedicated scene window, and diagnostics mode renders a ratatui status view over the Python entrypoint, cache paths, tensor payload contract, shared-memory slot-pool sizing, and queue counters.
+  - Added the first real Rust-side shared-memory slot pool: it creates Windows file mappings, writes fixed `WhisperLogMel80x3000` payloads, queues ready requests for Python, elastically allocates an extra slot when every slot is queued, and releases slots for reuse.
 - Current focus:
-  - Continue from the visible daemon dashboard into real Windows shared-memory slot allocation and named-pipe request/result messages.
+  - Continue from the Rust-owned shared-memory slot pool into named-pipe request/result messages and Python daemon slot validation.
 - Remaining work:
   - Harden the first capture/playback path after more real-hardware smoke testing, especially for loopback latency, render-format mismatches, and longer recordings.
   - Replace the current mel-preview visualization with the same log-mel feature data that will be sent to Python.
-  - Add Rust-owned shared-memory slot allocation for Whisper feature tensors and named-pipe control messages for request/result/slot release.
+  - Add named-pipe control messages for request/result/slot release.
   - Add the Teamy-owned Python WhisperX daemon project and validation path.
   - Feed returned transcript chunks into the hosted transcript island without sending them to the OS focus target.
 - Next step:
-  - Replace the static daemon slot-pool metrics with a real Rust-owned shared-memory slot pool that writes `WhisperLogMel80x3000` byte payloads and updates `audio daemon status` plus the daemon GUI as requests move through the queue.
+  - Add a named-pipe control protocol that sends queued shared-memory slot requests to Python and accepts result/slot-release responses.
 
 ## Why This Slice
 

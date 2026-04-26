@@ -30,6 +30,9 @@ Rust must represent the Whisper transcription handoff as a fixed 80 x 3000 littl
 audio[transcription.shared-memory-payload]
 The Python transcription boundary must treat each inference request payload as a Rust-owned shared-memory slot containing exactly one fixed-shape log-mel tensor.
 
+audio[transcription.shared-memory-slot-pool]
+Rust must manage an elastic shared-memory slot pool that writes fixed log-mel tensor payloads, queues ready requests for Python, and releases slots for reuse after Python returns ownership.
+
 audio[transcription.shared-memory-pool-status]
 Rust must expose the initial shared-memory slot-pool sizing and live queue counters that the CLI and GUI can report before Python inference is started.
 

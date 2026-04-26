@@ -25,7 +25,10 @@ use eyre::Context;
 use facet::Facet;
 
 pub use audio_transcription::{
-    AudioTranscriptionDaemonStatusReport, WhisperLogMel80x3000, audio_transcription_daemon_status,
+    AudioTranscriptionDaemonStatusReport, AudioTranscriptionQueuedRequest,
+    AudioTranscriptionSharedMemorySlotPool, AudioTranscriptionSharedMemorySlotPoolStatus,
+    WhisperLogMel80x3000, audio_transcription_daemon_status,
+    audio_transcription_daemon_status_with_pool_status,
 };
 pub use render_verification::{RenderOffscreenFixtureListReport, RenderOffscreenSelfTestReport};
 pub use windows_app::TerminalThroughputBenchmarkResultsReport;
