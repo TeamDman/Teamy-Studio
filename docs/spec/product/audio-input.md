@@ -70,6 +70,9 @@ When `audio transcribe` chooses a decode worker count automatically, it must use
 audio[cli.transcribe-batched-chunks]
 The `audio transcribe` command must be able to submit multiple long-input chunks through one loaded Burn Whisper model as bounded tensor batches while preserving ordered transcript and timing output.
 
+audio[cli.transcribe-cached-batched-decode]
+The batched Burn Whisper decoder should reuse decoder attention key/value state across generated token steps instead of rerunning the full token prefix through every decoder layer for every token.
+
 audio[cli.transcribe-timing-jsonl]
 The `audio transcribe` command must be able to write ordered per-chunk timing diagnostics as JSON Lines to a user-selected file without mixing benchmark data into transcript stdout.
 

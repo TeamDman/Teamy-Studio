@@ -273,6 +273,65 @@ impl<B: Backend> WhisperTextDecoder<B> {
                 .unsqueeze::<3>(),
         )
     }
+
+    fn forward_incremental_with_layer_progress(
+        &self,
+        tokens: Tensor<B, 2, Int>,
+        encoder_output: Tensor<B, 3>,
+        caches: Option<Vec<DecoderLayerCache<B>>>,
+        mut on_layer: impl FnMut(usize, usize),
+    ) -> (Tensor<B, 3>, Vec<DecoderLayerCache<B>>) {
+        let [_batch, seq_len] = tokens.dims();
+        let position_offset = caches
+            .as_ref()
+            .and_then(|caches| caches.first())
+            .map_or(0, |cache| cache.self_attn.key.dims()[1]);
+        assert!(
+            position_offset + seq_len <= self.n_text_ctx,
+            "token sequence length {} with offset {} exceeded decoder context {}",
+            seq_len,
+            position_offset,
+            self.n_text_ctx
+        );
+
+        let mut x = self.token_embedding.forward(tokens)
+            + self
+                .positional_embedding
+                .val()
+                .slice([position_offset..position_offset + seq_len])
+                .unsqueeze::<3>();
+
+        let layer_total = self.blocks.len();
+        let mut next_caches = Vec::with_capacity(layer_total);
+        let mut caches = caches.map_or_else(Vec::new, |caches| caches);
+        let mask = if position_offset == 0 {
+            Some(self.mask.val())
+        } else {
+            None
+        };
+        for (layer_index, block) in self.blocks.iter().enumerate() {
+            let previous_cache = if caches.is_empty() {
+                None
+            } else {
+                Some(caches.remove(0))
+            };
+            let (next_x, next_cache) =
+                block.forward_with_cache(x, encoder_output.clone(), mask.clone(), previous_cache);
+            x = next_x;
+            next_caches.push(next_cache);
+            on_layer(layer_index + 1, layer_total);
+        }
+
+        let x = self.ln.forward(x);
+        let logits = x.matmul(
+            self.token_embedding
+                .weight
+                .val()
+                .transpose()
+                .unsqueeze::<3>(),
+        );
+        (logits, next_caches)
+    }
 }
 
 #[derive(Config, Debug)]
@@ -364,6 +423,18 @@ pub struct ResidualDecoderAttentionBlock<B: Backend> {
     pub mlp_ln: nn::LayerNorm<B>,
 }
 
+#[derive(Clone, Debug)]
+struct AttentionKeyValueCache<B: Backend> {
+    key: Tensor<B, 3>,
+    value: Tensor<B, 3>,
+}
+
+#[derive(Clone, Debug)]
+struct DecoderLayerCache<B: Backend> {
+    self_attn: AttentionKeyValueCache<B>,
+    cross_attn: AttentionKeyValueCache<B>,
+}
+
 impl<B: Backend> ResidualDecoderAttentionBlock<B> {
     pub fn forward(
         &self,
@@ -377,6 +448,38 @@ impl<B: Backend> ResidualDecoderAttentionBlock<B> {
                 .cross_attn
                 .forward(self.cross_attn_ln.forward(input), encoder_output);
         input.clone() + self.mlp.forward(self.mlp_ln.forward(input))
+    }
+
+    fn forward_with_cache(
+        &self,
+        input: Tensor<B, 3>,
+        encoder_output: Tensor<B, 3>,
+        mask: Option<Tensor<B, 2>>,
+        cache: Option<DecoderLayerCache<B>>,
+    ) -> (Tensor<B, 3>, DecoderLayerCache<B>) {
+        let (self_attn_cache, cross_attn_cache) = cache.map_or((None, None), |cache| {
+            (Some(cache.self_attn), Some(cache.cross_attn))
+        });
+        let (attn_output, self_attn_cache) = self.attn.forward_with_cache(
+            self.attn_ln.forward(input.clone()),
+            mask,
+            self_attn_cache,
+        );
+        let input = input + attn_output;
+        let cross_attn_cache =
+            cross_attn_cache.unwrap_or_else(|| self.cross_attn.key_value_cache(encoder_output));
+        let input = input.clone()
+            + self
+                .cross_attn
+                .forward_with_cache(self.cross_attn_ln.forward(input), cross_attn_cache.clone());
+        let input = input.clone() + self.mlp.forward(self.mlp_ln.forward(input));
+        (
+            input,
+            DecoderLayerCache {
+                self_attn: self_attn_cache,
+                cross_attn: cross_attn_cache,
+            },
+        )
     }
 }
 
@@ -452,6 +555,33 @@ impl<B: Backend> MultiHeadSelfAttention<B> {
         let v = self.value.forward(input);
         self.out.forward(qkv_attention(q, k, v, mask, self.n_head))
     }
+
+    fn forward_with_cache(
+        &self,
+        input: Tensor<B, 3>,
+        mask: Option<Tensor<B, 2>>,
+        cache: Option<AttentionKeyValueCache<B>>,
+    ) -> (Tensor<B, 3>, AttentionKeyValueCache<B>) {
+        let q = self.query.forward(input.clone());
+        let new_cache = AttentionKeyValueCache {
+            key: self.key.forward(input.clone()),
+            value: self.value.forward(input),
+        };
+        let cache = cache.map_or(new_cache.clone(), |cache| AttentionKeyValueCache {
+            key: Tensor::cat(vec![cache.key, new_cache.key], 1),
+            value: Tensor::cat(vec![cache.value, new_cache.value], 1),
+        });
+        (
+            self.out.forward(qkv_attention(
+                q,
+                cache.key.clone(),
+                cache.value.clone(),
+                mask,
+                self.n_head,
+            )),
+            cache,
+        )
+    }
 }
 
 #[derive(Config, Debug)]
@@ -495,6 +625,23 @@ impl<B: Backend> MultiHeadCrossAttention<B> {
         let k = self.key.forward(encoder_output.clone());
         let v = self.value.forward(encoder_output);
         self.out.forward(qkv_attention(q, k, v, None, self.n_head))
+    }
+
+    fn key_value_cache(&self, encoder_output: Tensor<B, 3>) -> AttentionKeyValueCache<B> {
+        AttentionKeyValueCache {
+            key: self.key.forward(encoder_output.clone()),
+            value: self.value.forward(encoder_output),
+        }
+    }
+
+    fn forward_with_cache(
+        &self,
+        input: Tensor<B, 3>,
+        cache: AttentionKeyValueCache<B>,
+    ) -> Tensor<B, 3> {
+        let q = self.query.forward(input);
+        self.out
+            .forward(qkv_attention(q, cache.key, cache.value, None, self.n_head))
     }
 }
 
@@ -1008,6 +1155,7 @@ impl LoadedWhisperGreedyDecoder {
         mut on_progress: impl FnMut(BatchedGreedyDecodeProgress),
     ) -> eyre::Result<Vec<GreedyDecodeSummary>> {
         // audio[impl cli.transcribe-batched-chunks]
+        // audio[impl cli.transcribe-cached-batched-decode]
         if features.is_empty() {
             bail!("Batched greedy decode requires at least one feature tensor");
         }
@@ -1050,7 +1198,6 @@ impl LoadedWhisperGreedyDecoder {
             .decoder
             .n_text_ctx
             .saturating_sub(self.prompt_token_ids.len());
-        let mut all_token_ids = vec![self.prompt_token_ids.clone(); batch_size];
         let mut generated_token_ids = vec![Vec::new(); batch_size];
         let mut terminated_on_end_of_text = vec![false; batch_size];
         let mut stop_reasons = vec![DecodeStopReason::MaxDecodeTokens; batch_size];
@@ -1066,21 +1213,21 @@ impl LoadedWhisperGreedyDecoder {
             batch_size,
             decode_limit,
             remaining_ctx,
-            "Starting batched Burn Whisper greedy token loop"
+            "Starting cached batched Burn Whisper greedy token loop"
         );
         let decoder_started_at = Instant::now();
-        for token_index in 0..decode_limit {
-            if active_count == 0 {
-                break;
-            }
-            let token_started_at = Instant::now();
-            let decoder_logits = self.model.decoder.forward_with_layer_progress(
-                token_id_rows_to_tensor(&all_token_ids, &self.device)?,
+        let (mut decoder_logits, mut caches) =
+            self.model.decoder.forward_incremental_with_layer_progress(
+                token_id_rows_to_tensor(
+                    &vec![self.prompt_token_ids.clone(); batch_size],
+                    &self.device,
+                )?,
                 encoder_output.clone(),
+                None,
                 |decoder_layer_index, decoder_layer_total| {
                     on_progress(BatchedGreedyDecodeProgress {
                         phase: BatchedGreedyDecodePhase::DecoderLayer,
-                        token_index: token_index + 1,
+                        token_index: 1,
                         decode_limit,
                         batch_size,
                         active_items: active_count,
@@ -1090,14 +1237,20 @@ impl LoadedWhisperGreedyDecoder {
                     });
                 },
             );
+        for token_index in 0..decode_limit {
+            if active_count == 0 {
+                break;
+            }
+            let token_started_at = Instant::now();
             last_decoder_logits_dims = decoder_logits.dims();
             let next_token_ids =
                 greedy_next_token_ids(&decoder_logits, &self.suppressed_token_ids)?;
             tracing::debug!(token_index, elapsed_ms = token_started_at.elapsed().as_millis(), decoder_logits_dims = ?last_decoder_logits_dims, "Finished batched Burn Whisper decoder token step");
 
+            let mut next_token_rows = Vec::with_capacity(batch_size);
             for (item_index, next_token_id) in next_token_ids.into_iter().enumerate() {
                 if !active[item_index] {
-                    all_token_ids[item_index].push(self.end_of_text);
+                    next_token_rows.push(vec![self.end_of_text]);
                     continue;
                 }
 
@@ -1106,11 +1259,11 @@ impl LoadedWhisperGreedyDecoder {
                     stop_reasons[item_index] = DecodeStopReason::EndOfText;
                     active[item_index] = false;
                     active_count = active_count.saturating_sub(1);
-                    all_token_ids[item_index].push(next_token_id);
+                    next_token_rows.push(vec![next_token_id]);
                     continue;
                 }
 
-                all_token_ids[item_index].push(next_token_id);
+                next_token_rows.push(vec![next_token_id]);
                 generated_token_ids[item_index].push(next_token_id);
 
                 if has_repeated_token_collapse(
@@ -1132,6 +1285,29 @@ impl LoadedWhisperGreedyDecoder {
                 decoder_layer_total: None,
                 elapsed_ms: decoder_started_at.elapsed().as_millis(),
             });
+
+            if token_index + 1 == decode_limit || active_count == 0 {
+                break;
+            }
+
+            let next_token_index = token_index + 2;
+            (decoder_logits, caches) = self.model.decoder.forward_incremental_with_layer_progress(
+                token_id_rows_to_tensor(&next_token_rows, &self.device)?,
+                encoder_output.clone(),
+                Some(caches),
+                |decoder_layer_index, decoder_layer_total| {
+                    on_progress(BatchedGreedyDecodeProgress {
+                        phase: BatchedGreedyDecodePhase::DecoderLayer,
+                        token_index: next_token_index,
+                        decode_limit,
+                        batch_size,
+                        active_items: active_count,
+                        decoder_layer_index: Some(decoder_layer_index),
+                        decoder_layer_total: Some(decoder_layer_total),
+                        elapsed_ms: decoder_started_at.elapsed().as_millis(),
+                    });
+                },
+            );
         }
         let decoder_elapsed_ms = decoder_started_at.elapsed().as_millis();
         let total_elapsed_ms = total_started_at.elapsed().as_millis();

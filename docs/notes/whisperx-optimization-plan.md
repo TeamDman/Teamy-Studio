@@ -43,11 +43,14 @@ The target is not to copy WhisperX line for line. The target is to identify the 
   - Added the first speech-aware chunking slice. Long inputs still respect the 30-second Whisper frontend window, but chunk boundaries now prefer the quietest 50 ms frame in the last two seconds before the hard window limit. Synthetic tests cover short inputs, quiet-boundary snapping, and the invariant that no chunk exceeds the Whisper window. Smoke-tested the Clay prepared WAV with `--decode-workers 4 --max-decode-tokens 3 --timing-jsonl target\tmp\clay-speech-aware-smoke.jsonl`; the run wrote 90 ordered timing records, with early boundaries at 28.27s, 57.90s, 86.08s, and 114.40s rather than exact 30-second cuts, and redirected stdout remained transcript-only.
   - Added an estimated decode-work progress axis for batched long-input transcription. Progress now reports batch position, total work units, remaining work units, percent complete, work units per second, clock ETA, countdown, and VRAM based on `chunks * decode_limit * decoder_layers`, while byte/audio/item throughput fields are omitted from transcription progress because most visible work happens inside batched model execution. Batched decode progress is phase-tagged so logs can distinguish encoder start/finish from decoder layer/token progress instead of looking idle until a whole batch completes. Batched completion logging is collapsed to one progress update per batch so completed chunks do not flood several near-identical ETA blocks after the decoder returns.
   - Moved multi-sample `audio transcribe --demo <count>` away from per-worker model copies and onto the one-model batched decoder path. Demo clips are prepared/validated first, split into decode units, then submitted through bounded `decode_batch_with_progress` calls while preserving ordered transcript and timing output.
+  - Added an incremental cached decoder path for batched Burn Whisper decode. The batch decoder pre-fills the prompt once, stores self-attention and cross-attention key/value state per decoder layer, then feeds only the newest token for each following greedy step.
+  - Smoke-tested `cargo run -- audio transcribe --demo 4 --max-decode-tokens 8 --timing-jsonl target\tmp\demo4-cached-decode-smoke.jsonl`; the run produced four ordered transcript lines and four timing records without runtime errors.
+  - Compared the cached batched demo output with the existing full-prefix single-file decode path on the same four prepared WAVs; all four emitted transcript lines matched exactly.
 - Current focus:
-  - Move from quiet-boundary snapping toward a WhisperX-like segmentation policy: VAD or stronger energy segmentation, speech-region merge up to a model window, ordered segment timestamps, and reference comparisons against WhisperX/faster-whisper.
+  - Validate the cached batched decoder with full `./check-all.ps1`, then move from quiet-boundary snapping toward a WhisperX-like segmentation policy: VAD or stronger energy segmentation, speech-region merge up to a model window, ordered segment timestamps, and reference comparisons against WhisperX/faster-whisper.
 - Remaining work:
   - Compare Rust/Burn stage timings against Python OpenAI Whisper and WhisperX/faster-whisper on the same samples.
-  - Add decoder key/value cache support or an equivalent incremental decoder path.
+  - Measure cached batched decoder performance against the earlier full-prefix batched decode on longer decode limits and representative long media.
   - Tune true batched chunk inference for independent 30-second windows; the first implementation exists, but batch sizing, feature preparation, and progress timing still need measured improvement.
   - Investigate fp16 or mixed precision inference in Burn/CubeCL for CUDA.
   - Investigate replacing or augmenting the Burn path with faster-whisper/CTranslate2 for the Python daemon path.
@@ -63,11 +66,11 @@ The target is not to copy WhisperX line for line. The target is to identify the 
 - `./check-all.ps1` is the required validation command.
 - stdout from transcription commands should stay transcript-only so shell redirection can capture clean text.
 - progress, probe, and throughput diagnostics should use tracing, which is already configured to write logs to stderr.
-- Current Rust/Burn inference can run independent demo samples across multiple decoder workers. Long-input chunks now use one loaded decoder and batched feature/token tensors, but the decoder remains full-prefix greedy decoding and still needs batch-size tuning.
+- Current Rust/Burn inference can run independent demo samples through one loaded batched decoder. Long-input chunks now use one loaded decoder and batched feature/token tensors, and the batched decoder reuses decoder key/value cache state between greedy token steps. It still needs batch-size tuning and broader timing comparison.
 - The older worker approach remains a useful baseline for demo samples and timing comparison, but long-input optimization should move toward one scheduler that accepts many prepared 16 kHz mono slices, chunks them internally, batches work against one model, and returns ordered rough chunk timestamps.
 - Whisper chunks are currently bounded to the 30-second frontend contract and use a cheap quiet-boundary snap near the hard limit, but they are not yet true VAD-derived speech segments.
 - The first optimization target is `tiny.en`, but the design must not hard-code assumptions that prevent larger or multilingual models later.
-- The current greedy decoder does not implement timestamp recovery, word-level alignment, beam search, VAD, or decoder KV caching. Batched inference exists for long-input chunks, but it is a first slice rather than a tuned final scheduler.
+- The current greedy decoder does not implement timestamp recovery, word-level alignment, beam search, or VAD. Batched inference and decoder KV caching exist for long-input chunks, but they are first slices rather than a tuned final scheduler.
 
 ## Product Requirements
 
