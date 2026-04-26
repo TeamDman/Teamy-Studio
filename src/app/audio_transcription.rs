@@ -70,6 +70,11 @@ pub struct AudioTranscriptionDaemonStatusReport {
     pub tensor_values: usize,
     pub tensor_bytes: usize,
     pub shared_memory_slot_bytes: usize,
+    pub shared_memory_minimum_slots: usize,
+    pub shared_memory_total_bytes: usize,
+    pub queued_request_count: usize,
+    pub oldest_queued_age_ms: u64,
+    pub python_lag_ms: u64,
     pub control_transport: String,
     pub payload_transport: String,
     pub python_entrypoint: String,
@@ -100,6 +105,12 @@ pub fn audio_transcription_daemon_status(
         tensor_values: WHISPER_LOG_MEL_VALUE_COUNT,
         tensor_bytes: WHISPER_LOG_MEL_BYTE_COUNT,
         shared_memory_slot_bytes: WHISPER_LOG_MEL_BYTE_COUNT,
+        // audio[impl transcription.shared-memory-pool-status]
+        shared_memory_minimum_slots: 3,
+        shared_memory_total_bytes: WHISPER_LOG_MEL_BYTE_COUNT * 3,
+        queued_request_count: 0,
+        oldest_queued_age_ms: 0,
+        python_lag_ms: 0,
         control_transport: "windows named pipe".to_owned(),
         payload_transport: "rust-owned shared-memory slot".to_owned(),
         python_entrypoint: "teamy_whisperx_daemon".to_owned(),
@@ -140,5 +151,19 @@ mod tests {
             WhisperLogMel80x3000::from_vec(vec![0.0; 12]).expect_err("wrong length should fail");
 
         assert!(error.to_string().contains("expected 240000"));
+    }
+
+    #[test]
+    // audio[verify transcription.shared-memory-pool-status]
+    fn daemon_status_reports_initial_shared_memory_pool_metrics() {
+        let report = audio_transcription_daemon_status(&CacheHome(PathBuf::from("cache")));
+
+        assert_eq!(report.shared_memory_minimum_slots, 3);
+        assert_eq!(report.shared_memory_slot_bytes, WHISPER_LOG_MEL_BYTE_COUNT);
+        assert_eq!(
+            report.shared_memory_total_bytes,
+            WHISPER_LOG_MEL_BYTE_COUNT * 3
+        );
+        assert_eq!(report.queued_request_count, 0);
     }
 }

@@ -3817,6 +3817,16 @@ fn render_scene_window_frame(
             state.diagnostic_cell_height,
             scramble_input_device_identifiers,
         )
+    } else if state.diagnostics_visible && state.scene_kind == SceneWindowKind::AudioDaemon {
+        let daemon_status = super::audio_transcription_daemon_status(&crate::paths::CACHE_DIR);
+        windows_scene::build_audio_daemon_diagnostic_render_scene(
+            layout,
+            window_chrome_buttons_state,
+            &daemon_status,
+            state.diagnostic_selection,
+            state.diagnostic_cell_width,
+            state.diagnostic_cell_height,
+        )
     } else if state.diagnostics_visible {
         windows_scene::build_scene_diagnostic_render_scene(
             layout,
@@ -3843,6 +3853,13 @@ fn render_scene_window_frame(
             audio_input_device_detail_visual_state(state, layout),
             scramble_input_device_identifiers,
             state.diagnostic_selection,
+        )
+    } else if state.scene_kind == SceneWindowKind::AudioDaemon {
+        let daemon_status = super::audio_transcription_daemon_status(&crate::paths::CACHE_DIR);
+        windows_scene::build_audio_daemon_render_scene(
+            layout,
+            window_chrome_buttons_state,
+            &daemon_status,
         )
     } else if state.scene_kind == SceneWindowKind::CursorGallery {
         windows_scene::build_cursor_gallery_render_scene(
@@ -4064,61 +4081,13 @@ fn build_scene_diagnostic_text(state: &SceneAppState) -> String {
             ));
         }
     } else if let Some(device_window) = &state.audio_input_device_window {
-        lines.push(format!(
-            "audio-input-selected-device\t{}",
-            device_window.device.name
-        ));
-        lines.push(format!(
-            "audio-input-endpoint-id\t{}",
-            windows_scene::input_device_identifier_display_text(
-                &device_window.device.id,
-                scramble_input_device_identifiers,
-            )
-        ));
-        lines.push(format!(
-            "audio-input-sample-rate\t{}",
-            device_window
-                .device
-                .sample_rate_hz
-                .map_or_else(|| "unknown".to_owned(), |rate| rate.to_string())
-        ));
-        lines.push(format!(
-            "audio-input-armed-for-record\t{}",
-            device_window.armed_for_record
-        ));
-        lines.push(format!(
-            "audio-input-recording\t{}",
-            device_window.is_recording()
-        ));
-        lines.push(format!(
-            "audio-input-playing\t{}",
-            device_window.is_playing()
-        ));
-        lines.push(format!(
-            "audio-input-buffer-duration\t{:.3}",
-            device_window.runtime.duration_seconds()
-        ));
-        lines.push(format!(
-            "audio-input-recording-head\t{:.3}",
-            device_window.runtime.recording_head_seconds
-        ));
-        lines.push(format!(
-            "audio-input-playback-head\t{:.3}",
-            device_window.runtime.playback.head_seconds
-        ));
-        lines.push(format!(
-            "audio-input-transcription-head\t{:.3}",
-            device_window.runtime.transcription_head_seconds
-        ));
-        if let Some(selection) = device_window.runtime.selection {
-            lines.push(format!(
-                "audio-input-selection\t{:.3}\t{:.3}",
-                selection.begin_seconds, selection.end_seconds
-            ));
-        }
-        if let Some(error) = device_window.runtime.last_error() {
-            lines.push(format!("audio-input-error\t{error}"));
-        }
+        push_audio_input_device_window_diagnostic_text(
+            &mut lines,
+            device_window,
+            scramble_input_device_identifiers,
+        );
+    } else if state.scene_kind == SceneWindowKind::AudioDaemon {
+        push_audio_daemon_diagnostic_text(&mut lines);
     }
 
     lines.push(String::new());
@@ -4133,6 +4102,109 @@ fn build_scene_diagnostic_text(state: &SceneAppState) -> String {
     }
 
     lines.join("\n")
+}
+
+fn push_audio_input_device_window_diagnostic_text(
+    lines: &mut Vec<String>,
+    device_window: &AudioInputDeviceWindowState,
+    scramble_input_device_identifiers: bool,
+) {
+    lines.push(format!(
+        "audio-input-selected-device\t{}",
+        device_window.device.name
+    ));
+    lines.push(format!(
+        "audio-input-endpoint-id\t{}",
+        windows_scene::input_device_identifier_display_text(
+            &device_window.device.id,
+            scramble_input_device_identifiers,
+        )
+    ));
+    lines.push(format!(
+        "audio-input-sample-rate\t{}",
+        device_window
+            .device
+            .sample_rate_hz
+            .map_or_else(|| "unknown".to_owned(), |rate| rate.to_string())
+    ));
+    lines.push(format!(
+        "audio-input-armed-for-record\t{}",
+        device_window.armed_for_record
+    ));
+    lines.push(format!(
+        "audio-input-recording\t{}",
+        device_window.is_recording()
+    ));
+    lines.push(format!(
+        "audio-input-playing\t{}",
+        device_window.is_playing()
+    ));
+    lines.push(format!(
+        "audio-input-buffer-duration\t{:.3}",
+        device_window.runtime.duration_seconds()
+    ));
+    lines.push(format!(
+        "audio-input-recording-head\t{:.3}",
+        device_window.runtime.recording_head_seconds
+    ));
+    lines.push(format!(
+        "audio-input-playback-head\t{:.3}",
+        device_window.runtime.playback.head_seconds
+    ));
+    lines.push(format!(
+        "audio-input-transcription-head\t{:.3}",
+        device_window.runtime.transcription_head_seconds
+    ));
+    if let Some(selection) = device_window.runtime.selection {
+        lines.push(format!(
+            "audio-input-selection\t{:.3}\t{:.3}",
+            selection.begin_seconds, selection.end_seconds
+        ));
+    }
+    if let Some(error) = device_window.runtime.last_error() {
+        lines.push(format!("audio-input-error\t{error}"));
+    }
+}
+
+fn push_audio_daemon_diagnostic_text(lines: &mut Vec<String>) {
+    let daemon_status = super::audio_transcription_daemon_status(&crate::paths::CACHE_DIR);
+    lines.push(format!(
+        "audio-daemon-entrypoint\t{}",
+        daemon_status.python_entrypoint
+    ));
+    lines.push(format!(
+        "audio-daemon-control-transport\t{}",
+        daemon_status.control_transport
+    ));
+    lines.push(format!(
+        "audio-daemon-payload-transport\t{}",
+        daemon_status.payload_transport
+    ));
+    lines.push(format!(
+        "audio-daemon-tensor\t{}x{}\t{}\t{} bytes",
+        daemon_status.tensor_mel_bins,
+        daemon_status.tensor_frames,
+        daemon_status.tensor_dtype,
+        daemon_status.tensor_bytes
+    ));
+    lines.push(format!(
+        "audio-daemon-shared-memory-pool\t{} slots\t{} bytes",
+        daemon_status.shared_memory_minimum_slots, daemon_status.shared_memory_total_bytes
+    ));
+    lines.push(format!(
+        "audio-daemon-queue\t{} requests\t{} ms oldest\t{} ms python lag",
+        daemon_status.queued_request_count,
+        daemon_status.oldest_queued_age_ms,
+        daemon_status.python_lag_ms
+    ));
+    lines.push(format!(
+        "audio-daemon-source\t{}",
+        daemon_status.daemon_source_dir
+    ));
+    lines.push(format!(
+        "audio-daemon-model-cache\t{}",
+        daemon_status.model_cache_dir
+    ));
 }
 
 fn scene_action_active(action: SceneAction) -> bool {
@@ -4882,6 +4954,21 @@ fn perform_scene_action(
                     }
                 })
                 .wrap_err("failed to spawn Teamy Studio audio picker thread")?;
+            Ok(SceneActionDisposition::KeepOpen)
+        }
+        SceneAction::OpenAudioDaemon => {
+            // audio[impl gui.daemon-window]
+            let app_home = app_home.clone();
+            thread::Builder::new()
+                .name("teamy-studio-audio-daemon".to_owned())
+                .spawn(move || {
+                    if let Err(error) =
+                        run_scene_window(&app_home, SceneWindowKind::AudioDaemon, vt_engine, None)
+                    {
+                        error!(?error, "failed to open audio daemon window");
+                    }
+                })
+                .wrap_err("failed to spawn Teamy Studio audio daemon thread")?;
             Ok(SceneActionDisposition::KeepOpen)
         }
         SceneAction::OpenAudioInputDevices => {

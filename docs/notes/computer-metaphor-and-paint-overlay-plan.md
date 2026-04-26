@@ -47,8 +47,9 @@ The guiding idea from the source note is that Teamy Studio should not merely mim
   - Validated the microphone playback/scene-shortcut slice with `./check-all.ps1`: format, clippy, build, tests, and Tracey status passed. Tracey reported `teamy-studio-windowing/rust: 37 of 37 requirements are covered. 30 of 37 have a verification reference.`
   - Redirected the immediate next work from paint chrome to transcription: the selected microphone window now hosts a transcription toggle, mel-preview region, and terminal-styled transcript island below the audio buffer.
   - Started Python transcription integration with a Rust fixed-shape log-mel tensor contract, `audio daemon status`, and a Teamy-owned Python daemon scaffold.
+  - Added a visible `Audio Daemon` main-menu entry and daemon scene window, including a full ratatui diagnostics view for paths, transports, payload shape, shared-memory pool sizing, and queue counters.
 - Current focus:
-  - Use the microphone timeline as the first real proving ground for Rust-owned feature preparation, shared-memory Python handoff, and staged transcript results.
+  - Use the microphone timeline and daemon dashboard as the first real proving ground for Rust-owned feature preparation, shared-memory Python handoff, and staged transcript results.
 - Remaining work:
   - Add Tracey requirements for each new behavior area before implementation lands.
   - Add shallow launcher stubs for the new surfaces.
@@ -57,7 +58,7 @@ The guiding idea from the source note is that Teamy Studio should not merely mim
   - Add application-window inspection using the Cursor Hero lessons.
   - Add environment variable, input-device, file-extension, shape, SDF, and timeline explorer surfaces as progressively richer windows.
 - Next step:
-  - Continue in `docs/notes/audio-input-inbox-plan.md` with the shared-memory slot pool and named-pipe daemon request/result protocol before returning to paint chrome.
+  - Continue in `docs/notes/audio-input-inbox-plan.md` by replacing the daemon dashboard's static slot-pool counters with a real shared-memory slot pool and named-pipe daemon request/result protocol before returning to paint chrome.
 
 ## Source Ideas Extracted
 

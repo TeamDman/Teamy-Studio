@@ -12,6 +12,7 @@ use ratatui::widgets::{
 };
 use windows::Win32::Foundation::RECT;
 
+use super::AudioTranscriptionDaemonStatusReport;
 use super::cell_grid;
 use super::spatial::{ClientPoint, ClientRect, TerminalCellPoint};
 use super::windows_audio_input::{
@@ -46,6 +47,7 @@ const DIAGNOSTIC_SELECTION_BACKGROUND: [f32; 4] = [0.42, 0.67, 0.98, 1.0];
 pub enum SceneWindowKind {
     Launcher,
     AudioPicker,
+    AudioDaemon,
     AudioInputDevicePicker,
     AudioInputDeviceDetails,
     CursorGallery,
@@ -58,6 +60,7 @@ impl SceneWindowKind {
         match self {
             Self::Launcher => "Teamy Studio",
             Self::AudioPicker => "Audio Sources",
+            Self::AudioDaemon => "Audio Daemon",
             Self::AudioInputDevicePicker => "Audio Devices",
             Self::AudioInputDeviceDetails => "Microphone",
             Self::CursorGallery => "Cursor Gallery",
@@ -76,6 +79,7 @@ pub enum SceneAction {
     OpenEnvironmentVariables,
     OpenApplicationWindows,
     OpenAudioPicker,
+    OpenAudioDaemon,
     OpenAudioInputDevices,
     SelectWindowsBell,
     SelectFileBell,
@@ -347,6 +351,7 @@ pub fn build_scene_render_scene(
 // windowing[impl launcher.buttons.application-windows-placeholder]
 // windowing[impl launcher.buttons.audio-picker]
 // windowing[impl launcher.buttons.cursor-gallery]
+// audio[impl gui.daemon-button]
 // windowing[impl audio-picker.buttons.windows]
 // windowing[impl audio-picker.buttons.file]
 pub fn scene_button_specs(scene_kind: SceneWindowKind) -> &'static [SceneButtonSpec] {
@@ -410,6 +415,14 @@ pub fn scene_button_specs(scene_kind: SceneWindowKind) -> &'static [SceneButtonS
                 color: [0.25, 0.21, 0.11, 1.0],
             },
             SceneButtonSpec {
+                // audio[impl gui.daemon-button]
+                action: SceneAction::OpenAudioDaemon,
+                label: "Audio Daemon",
+                tooltip: "Inspect transcription daemon status",
+                sprite: SpriteId::Terminal,
+                color: [0.24, 0.18, 0.30, 1.0],
+            },
+            SceneButtonSpec {
                 // audio[impl gui.launcher-button]
                 action: SceneAction::OpenAudioInputDevices,
                 label: "Audio Devices",
@@ -436,9 +449,144 @@ pub fn scene_button_specs(scene_kind: SceneWindowKind) -> &'static [SceneButtonS
         ],
         SceneWindowKind::CursorGallery
         | SceneWindowKind::DemoMode
+        | SceneWindowKind::AudioDaemon
         | SceneWindowKind::AudioInputDevicePicker
         | SceneWindowKind::AudioInputDeviceDetails => &[],
     }
+}
+
+#[must_use]
+// audio[impl gui.daemon-window]
+pub fn build_audio_daemon_render_scene(
+    layout: TerminalLayout,
+    window_chrome_buttons_state: WindowChromeButtonsState,
+    status: &AudioTranscriptionDaemonStatusReport,
+) -> RenderScene {
+    let mut scene = build_scene_shell(
+        layout,
+        SceneWindowKind::AudioDaemon,
+        window_chrome_buttons_state,
+    );
+    let body_rect = layout.terminal_panel_rect().inset(24);
+    push_panel(
+        &mut scene,
+        body_rect.to_win32_rect(),
+        [0.10, 0.11, 0.15, 1.0],
+        PanelEffect::SceneBody,
+    );
+
+    let title_rect = ClientRect::new(
+        body_rect.left() + 18,
+        body_rect.top() + 18,
+        body_rect.right() - 18,
+        body_rect.top() + 58,
+    );
+    push_title_text(
+        &mut scene,
+        title_rect.to_win32_rect(),
+        "Audio Daemon",
+        [0.98, 0.96, 1.0, 1.0],
+    );
+
+    let contract_rect = ClientRect::new(
+        body_rect.left() + 18,
+        title_rect.bottom() + 18,
+        body_rect.right() - 18,
+        title_rect.bottom() + 180,
+    );
+    push_panel(
+        &mut scene,
+        contract_rect.to_win32_rect(),
+        [0.13, 0.15, 0.19, 1.0],
+        PanelEffect::SceneButtonCard,
+    );
+    push_text_block(
+        &mut scene,
+        contract_rect.inset(16).to_win32_rect(),
+        &audio_daemon_contract_text(status),
+        9,
+        16,
+        [0.92, 0.94, 0.98, 1.0],
+    );
+
+    let paths_rect = ClientRect::new(
+        body_rect.left() + 18,
+        contract_rect.bottom() + 16,
+        body_rect.right() - 18,
+        contract_rect.bottom() + 164,
+    );
+    push_panel(
+        &mut scene,
+        paths_rect.to_win32_rect(),
+        [0.11, 0.14, 0.17, 1.0],
+        PanelEffect::SceneButtonCard,
+    );
+    push_text_block(
+        &mut scene,
+        paths_rect.inset(16).to_win32_rect(),
+        &audio_daemon_paths_text(status),
+        9,
+        16,
+        [0.84, 0.90, 0.88, 1.0],
+    );
+
+    let controls_rect = ClientRect::new(
+        body_rect.left() + 18,
+        paths_rect.bottom() + 16,
+        body_rect.right() - 18,
+        body_rect.bottom() - 18,
+    );
+    push_panel(
+        &mut scene,
+        controls_rect.to_win32_rect(),
+        [0.15, 0.12, 0.18, 1.0],
+        PanelEffect::TerminalPanel,
+    );
+    push_text_block(
+        &mut scene,
+        controls_rect.inset(16).to_win32_rect(),
+        &audio_daemon_control_text(status),
+        9,
+        16,
+        [0.93, 0.88, 0.98, 1.0],
+    );
+
+    scene
+}
+
+fn audio_daemon_contract_text(status: &AudioTranscriptionDaemonStatusReport) -> String {
+    format!(
+        "Tensor contract\nshape: {} x {}\ndtype: {}\nvalues: {}\nbytes: {}\nslot bytes: {}\nslot pool: {} slots / {} bytes",
+        status.tensor_mel_bins,
+        status.tensor_frames,
+        status.tensor_dtype,
+        status.tensor_values,
+        status.tensor_bytes,
+        status.shared_memory_slot_bytes,
+        status.shared_memory_minimum_slots,
+        status.shared_memory_total_bytes,
+    )
+}
+
+fn audio_daemon_paths_text(status: &AudioTranscriptionDaemonStatusReport) -> String {
+    format!(
+        "Paths\ndaemon source: {}\nuv venv: {}\nmodel cache: {}\npython entrypoint: {}",
+        status.daemon_source_dir,
+        status.uv_venv_dir,
+        status.model_cache_dir,
+        status.python_entrypoint,
+    )
+}
+
+fn audio_daemon_control_text(status: &AudioTranscriptionDaemonStatusReport) -> String {
+    format!(
+        "Transports\ncontrol: {}\npayload: {}\nqueued requests: {}\noldest queued: {} ms\npython lag: {} ms\n\nAlt+X opens the full diagnostics TUI.",
+        status.control_transport,
+        status.payload_transport,
+        status.queued_request_count,
+        status.oldest_queued_age_ms,
+        status.python_lag_ms,
+    )
 }
 
 #[must_use]
@@ -2157,6 +2305,36 @@ pub fn build_audio_input_device_diagnostic_render_scene(
 }
 
 #[must_use]
+// audio[impl gui.daemon-diagnostics-tui]
+pub fn build_audio_daemon_diagnostic_render_scene(
+    layout: TerminalLayout,
+    window_chrome_buttons_state: WindowChromeButtonsState,
+    status: &AudioTranscriptionDaemonStatusReport,
+    selection: Option<TerminalSelection>,
+    cell_width: i32,
+    cell_height: i32,
+) -> RenderScene {
+    let mut scene = build_scene_shell(
+        layout,
+        SceneWindowKind::AudioDaemon,
+        window_chrome_buttons_state,
+    );
+    let body_rect = layout.terminal_panel_rect().inset(20);
+    let diagnostic_scene = build_audio_daemon_diagnostic_body_scene(
+        body_rect,
+        status,
+        selection,
+        cell_width,
+        cell_height,
+    );
+    scene.panels.extend(diagnostic_scene.panels);
+    scene.glyphs.extend(diagnostic_scene.glyphs);
+    scene.sprites.extend(diagnostic_scene.sprites);
+    scene.overlay_panels.extend(diagnostic_scene.overlay_panels);
+    scene
+}
+
+#[must_use]
 // audio[impl gui.selected-device-diagnostics-tui]
 pub fn build_audio_input_device_detail_diagnostic_render_scene(
     layout: TerminalLayout,
@@ -2186,6 +2364,163 @@ pub fn build_audio_input_device_detail_diagnostic_render_scene(
     scene.sprites.extend(diagnostic_scene.sprites);
     scene.overlay_panels.extend(diagnostic_scene.overlay_panels);
     scene
+}
+
+fn build_audio_daemon_diagnostic_body_scene(
+    body_rect: ClientRect,
+    status: &AudioTranscriptionDaemonStatusReport,
+    selection: Option<TerminalSelection>,
+    cell_width: i32,
+    cell_height: i32,
+) -> RenderScene {
+    let columns = u16::try_from((body_rect.width() / cell_width.max(1)).max(0)).unwrap_or_default();
+    let rows = u16::try_from((body_rect.height() / cell_height.max(1)).max(0)).unwrap_or_default();
+    if columns == 0 || rows == 0 {
+        return empty_render_scene();
+    }
+
+    let area = RatatuiRect::new(0, 0, columns, rows);
+    let mut buffer = Buffer::empty(area);
+    render_audio_daemon_diagnostic_buffer(&mut buffer, area, status);
+    ratatui_buffer_to_scene(body_rect, &buffer, selection, cell_width, cell_height)
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "the daemon diagnostics TUI composes transport, payload, paths, and queue state"
+)]
+fn render_audio_daemon_diagnostic_buffer(
+    buffer: &mut Buffer,
+    area: RatatuiRect,
+    status: &AudioTranscriptionDaemonStatusReport,
+) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(7),
+            Constraint::Length(9),
+            Constraint::Min(8),
+            Constraint::Length(7),
+        ])
+        .split(area);
+
+    Paragraph::new(vec![
+        Line::from(vec![
+            Span::styled("Mode ", Style::new().fg(Color::DarkGray)),
+            Span::styled(
+                "daemon diagnostics",
+                Style::new()
+                    .fg(Color::LightCyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("Control ", Style::new().fg(Color::DarkGray)),
+            Span::styled(
+                status.control_transport.as_str(),
+                Style::new().fg(Color::LightGreen),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("Payload ", Style::new().fg(Color::DarkGray)),
+            Span::styled(
+                status.payload_transport.as_str(),
+                Style::new().fg(Color::LightYellow),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("Entrypoint ", Style::new().fg(Color::DarkGray)),
+            Span::styled(
+                status.python_entrypoint.as_str(),
+                Style::new().fg(Color::White),
+            ),
+        ]),
+    ])
+    .block(
+        Block::default()
+            .title(" Audio Daemon ")
+            .borders(Borders::ALL)
+            .border_style(Style::new().fg(Color::Cyan)),
+    )
+    .render(chunks[0], buffer);
+
+    let tensor_items = vec![
+        ListItem::new(format!("dtype: {}", status.tensor_dtype)),
+        ListItem::new(format!(
+            "shape: {} x {}",
+            status.tensor_mel_bins, status.tensor_frames
+        )),
+        ListItem::new(format!("values: {}", status.tensor_values)),
+        ListItem::new(format!("bytes: {}", status.tensor_bytes)),
+        ListItem::new(format!("slot bytes: {}", status.shared_memory_slot_bytes)),
+        ListItem::new(format!(
+            "pool floor: {} slots / {} bytes",
+            status.shared_memory_minimum_slots, status.shared_memory_total_bytes
+        )),
+    ];
+    List::new(tensor_items)
+        .block(
+            Block::default()
+                .title(" Log-Mel Payload Contract ")
+                .borders(Borders::ALL)
+                .border_style(Style::new().fg(Color::Blue)),
+        )
+        .style(Style::new().fg(Color::White))
+        .render(chunks[1], buffer);
+
+    Paragraph::new(vec![
+        Line::from(vec![
+            Span::styled("daemon source ", Style::new().fg(Color::DarkGray)),
+            Span::raw(status.daemon_source_dir.as_str()),
+        ]),
+        Line::from(vec![
+            Span::styled("uv venv ", Style::new().fg(Color::DarkGray)),
+            Span::raw(status.uv_venv_dir.as_str()),
+        ]),
+        Line::from(vec![
+            Span::styled("model cache ", Style::new().fg(Color::DarkGray)),
+            Span::raw(status.model_cache_dir.as_str()),
+        ]),
+    ])
+    .block(
+        Block::default()
+            .title(" Filesystem ")
+            .borders(Borders::ALL)
+            .border_style(Style::new().fg(Color::Green)),
+    )
+    .wrap(Wrap { trim: false })
+    .render(chunks[2], buffer);
+
+    Paragraph::new(vec![
+        Line::from(vec![
+            Span::styled("queue ", Style::new().fg(Color::DarkGray)),
+            Span::styled(
+                status.queued_request_count.to_string(),
+                Style::new().fg(Color::LightMagenta),
+            ),
+            Span::raw(" requests  "),
+            Span::styled("oldest ", Style::new().fg(Color::DarkGray)),
+            Span::styled(
+                format!("{} ms", status.oldest_queued_age_ms),
+                Style::new().fg(Color::LightMagenta),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("python lag ", Style::new().fg(Color::DarkGray)),
+            Span::styled(
+                format!("{} ms", status.python_lag_ms),
+                Style::new().fg(Color::LightMagenta),
+            ),
+        ]),
+        Line::from("Alt+X pretty view   Ctrl+C copy selection   Ctrl+D close window"),
+    ])
+    .block(
+        Block::default()
+            .title(" Live Flow ")
+            .borders(Borders::ALL)
+            .border_style(Style::new().fg(Color::Magenta)),
+    )
+    .render(chunks[3], buffer);
 }
 
 fn build_audio_input_device_detail_diagnostic_body_scene(
@@ -3145,6 +3480,28 @@ mod tests {
         AudioInputDeviceWindowState::new(device)
     }
 
+    fn sample_audio_daemon_status() -> AudioTranscriptionDaemonStatusReport {
+        AudioTranscriptionDaemonStatusReport {
+            daemon_source_dir: "python/whisperx-daemon".to_owned(),
+            uv_venv_dir: "cache/python/whisperx-daemon/.venv".to_owned(),
+            model_cache_dir: "cache/models/whisperx".to_owned(),
+            tensor_dtype: "f32le".to_owned(),
+            tensor_mel_bins: 80,
+            tensor_frames: 3_000,
+            tensor_values: 240_000,
+            tensor_bytes: 960_000,
+            shared_memory_slot_bytes: 960_000,
+            shared_memory_minimum_slots: 3,
+            shared_memory_total_bytes: 2_880_000,
+            queued_request_count: 0,
+            oldest_queued_age_ms: 0,
+            python_lag_ms: 0,
+            control_transport: "windows named pipe".to_owned(),
+            payload_transport: "rust-owned shared-memory slot".to_owned(),
+            python_entrypoint: "teamy_whisperx_daemon".to_owned(),
+        }
+    }
+
     #[test]
     fn scene_button_layouts_center_buttons_in_the_body() {
         let layouts =
@@ -3223,6 +3580,7 @@ mod tests {
     // windowing[verify launcher.buttons.cursor-gallery]
     // windowing[verify launcher.buttons.demo-mode]
     // windowing[verify launcher.buttons.audio-picker]
+    // audio[verify gui.daemon-button]
     #[test]
     fn launcher_scene_specs_expose_primary_actions() {
         let specs = scene_button_specs(SceneWindowKind::Launcher);
@@ -3267,6 +3625,11 @@ mod tests {
                 .iter()
                 .any(|spec| spec.action == SceneAction::OpenAudioPicker)
         );
+        assert!(
+            specs
+                .iter()
+                .any(|spec| spec.action == SceneAction::OpenAudioDaemon)
+        );
     }
 
     // windowing[verify audio-picker.buttons.windows]
@@ -3306,8 +3669,37 @@ mod tests {
             .filter(|panel| matches!(panel.effect, PanelEffect::SceneButtonCard))
             .count();
 
-        assert_eq!(card_count, 9);
-        assert_eq!(scene.sprites.len(), 9);
+        assert_eq!(card_count, 10);
+        assert_eq!(scene.sprites.len(), 10);
+    }
+
+    #[test]
+    // audio[verify gui.daemon-window]
+    fn audio_daemon_scene_draws_status_dashboard() {
+        let scene = build_audio_daemon_render_scene(
+            sample_layout(),
+            WindowChromeButtonsState::default(),
+            &sample_audio_daemon_status(),
+        );
+
+        assert!(scene.panels.len() >= 4);
+        assert!(scene.glyphs.len() > 40);
+    }
+
+    #[test]
+    // audio[verify gui.daemon-diagnostics-tui]
+    fn audio_daemon_diagnostics_scene_draws_full_tui() {
+        let scene = build_audio_daemon_diagnostic_render_scene(
+            sample_layout(),
+            WindowChromeButtonsState::default(),
+            &sample_audio_daemon_status(),
+            None,
+            8,
+            16,
+        );
+
+        assert!(scene.panels.len() >= 4);
+        assert!(scene.glyphs.len() > 80);
     }
 
     // windowing[verify demo-mode.window]

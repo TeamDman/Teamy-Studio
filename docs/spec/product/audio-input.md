@@ -30,6 +30,9 @@ Rust must represent the Whisper transcription handoff as a fixed 80 x 3000 littl
 audio[transcription.shared-memory-payload]
 The Python transcription boundary must treat each inference request payload as a Rust-owned shared-memory slot containing exactly one fixed-shape log-mel tensor.
 
+audio[transcription.shared-memory-pool-status]
+Rust must expose the initial shared-memory slot-pool sizing and live queue counters that the CLI and GUI can report before Python inference is started.
+
 ## Windows Device Enumeration
 
 audio[enumerate.active-windows-recording]
@@ -48,6 +51,15 @@ Each audio input device entry must include the Windows device icon resource path
 
 audio[gui.launcher-button]
 The launcher must expose an `Audio Devices` image button.
+
+audio[gui.daemon-button]
+The launcher must expose an `Audio Daemon` image button for inspecting the local transcription backend.
+
+audio[gui.daemon-window]
+The `Audio Daemon` button must open a dedicated GUI window that shows the daemon source, cache paths, transport contract, and shared-memory slot-pool status.
+
+audio[gui.daemon-diagnostics-tui]
+The audio daemon diagnostics mode must render as a full ratatui view with transport, payload, filesystem, and live-flow sections.
 
 audio[gui.picker-window]
 The `Audio Devices` button must open a dedicated microphone picker window.
