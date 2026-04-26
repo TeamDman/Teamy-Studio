@@ -803,6 +803,129 @@ pub enum DecodeStopReason {
     RepeatedTokenCollapse,
 }
 
+#[derive(Debug)]
+pub struct LoadedWhisperGreedyDecoder {
+    artifacts: WhisperModelArtifacts,
+    model: WhisperModel<WhisperInferenceBackend>,
+    device: CudaDevice,
+    prompt_token_ids: Vec<usize>,
+    end_of_text: usize,
+    suppressed_token_ids: Vec<usize>,
+    max_decode_tokens: usize,
+}
+
+impl LoadedWhisperGreedyDecoder {
+    /// Load a BurnPack Whisper model once so callers can decode many feature tensors.
+    ///
+    /// # Errors
+    ///
+    /// This function will return an error if the model artifacts cannot be loaded or required
+    /// tokenizer control tokens are missing.
+    pub fn load(artifacts: WhisperModelArtifacts, max_decode_tokens: usize) -> eyre::Result<Self> {
+        let device = whisper_inference_device();
+        tracing::debug!(model_root = %artifacts.root.display(), max_decode_tokens, device = ?device, backend = "burn-cuda", "Loading Burn Whisper model for reusable greedy decoder");
+        let model_load_started_at = Instant::now();
+        let model =
+            load_whisper_model_from_burnpack::<WhisperInferenceBackend>(&artifacts, &device)?;
+        tracing::debug!(
+            elapsed_ms = model_load_started_at.elapsed().as_millis(),
+            "Loaded reusable Burn Whisper model"
+        );
+        let prompt_token_ids = default_decoder_prompt_token_ids(&artifacts)?;
+        let end_of_text = special_token_id(&artifacts, "<|endoftext|>")?;
+        let suppressed_token_ids = default_suppressed_token_ids(&artifacts, end_of_text)?;
+        Ok(Self {
+            artifacts,
+            model,
+            device,
+            prompt_token_ids,
+            end_of_text,
+            suppressed_token_ids,
+            max_decode_tokens,
+        })
+    }
+
+    /// Decode one Whisper feature tensor with the already-loaded model.
+    ///
+    /// # Errors
+    ///
+    /// This function will return an error if Burn inference or tokenizer decoding fails.
+    pub fn decode(&self, features: &WhisperLogMelSpectrogram) -> eyre::Result<GreedyDecodeSummary> {
+        let total_started_at = Instant::now();
+        tracing::debug!(prompt_tokens = ?self.prompt_token_ids, suppressed_tokens = self.suppressed_token_ids.len(), "Starting Burn Whisper encoder forward pass");
+        let encoder_started_at = Instant::now();
+        let encoder_output = self
+            .model
+            .encoder
+            .forward(features_to_tensor(features, &self.device));
+        let encoder_output_dims = encoder_output.dims();
+        tracing::debug!(elapsed_ms = encoder_started_at.elapsed().as_millis(), encoder_output_dims = ?encoder_output_dims, "Finished Burn Whisper encoder forward pass");
+
+        let remaining_ctx = self
+            .model
+            .decoder
+            .n_text_ctx
+            .saturating_sub(self.prompt_token_ids.len());
+        let decode_limit = self.max_decode_tokens.min(remaining_ctx);
+        let mut all_token_ids = self.prompt_token_ids.clone();
+        let mut generated_token_ids = Vec::new();
+        let mut last_decoder_logits_dims =
+            [1, self.prompt_token_ids.len(), self.model.decoder.n_vocab];
+        let mut terminated_on_end_of_text = false;
+        let mut stop_reason = DecodeStopReason::MaxDecodeTokens;
+
+        tracing::debug!(
+            decode_limit,
+            remaining_ctx,
+            "Starting Burn Whisper greedy token loop"
+        );
+        for token_index in 0..decode_limit {
+            let token_started_at = Instant::now();
+            tracing::debug!(
+                token_index,
+                context_tokens = all_token_ids.len(),
+                "Starting Burn Whisper decoder token step"
+            );
+            let decoder_logits = self.model.decoder.forward(
+                token_ids_to_tensor(&all_token_ids, &self.device),
+                encoder_output.clone(),
+            );
+            last_decoder_logits_dims = decoder_logits.dims();
+            let next_token_id = greedy_next_token_id(&decoder_logits, &self.suppressed_token_ids)?;
+            tracing::debug!(token_index, next_token_id, elapsed_ms = token_started_at.elapsed().as_millis(), decoder_logits_dims = ?last_decoder_logits_dims, "Finished Burn Whisper decoder token step");
+            if next_token_id == self.end_of_text {
+                terminated_on_end_of_text = true;
+                stop_reason = DecodeStopReason::EndOfText;
+                break;
+            }
+
+            all_token_ids.push(next_token_id);
+            generated_token_ids.push(next_token_id);
+
+            // RUST-ONLY GUARD:
+            // WhisperX does not expose an equivalent explicit repeated-token cut-off in its
+            // Python batching loop. This is a local safeguard for the current naive greedy path.
+            if has_repeated_token_collapse(&generated_token_ids, RUST_ONLY_REPEAT_TOKEN_LIMIT) {
+                stop_reason = DecodeStopReason::RepeatedTokenCollapse;
+                break;
+            }
+        }
+
+        let text = decode_token_ids(&self.artifacts, &generated_token_ids, true)?;
+        tracing::debug!(elapsed_ms = total_started_at.elapsed().as_millis(), generated_tokens = generated_token_ids.len(), stop_reason = ?stop_reason, text = %text, "Finished Burn Whisper greedy decode");
+
+        Ok(GreedyDecodeSummary {
+            prompt_token_ids: self.prompt_token_ids.clone(),
+            generated_token_ids,
+            encoder_output_dims,
+            last_decoder_logits_dims,
+            terminated_on_end_of_text,
+            stop_reason,
+            text,
+        })
+    }
+}
+
 pub fn run_prompt_forward_pass(
     artifacts: &WhisperModelArtifacts,
     features: &WhisperLogMelSpectrogram,
@@ -829,87 +952,7 @@ pub fn greedy_decode_with_model(
     features: &WhisperLogMelSpectrogram,
     max_decode_tokens: usize,
 ) -> eyre::Result<GreedyDecodeSummary> {
-    let total_started_at = Instant::now();
-    let device = whisper_inference_device();
-    tracing::debug!(model_root = %artifacts.root.display(), max_decode_tokens, device = ?device, backend = "burn-cuda", "Loading Burn Whisper model for greedy decode");
-    let model_load_started_at = Instant::now();
-    let model = load_whisper_model_from_burnpack::<WhisperInferenceBackend>(artifacts, &device)?;
-    tracing::debug!(
-        elapsed_ms = model_load_started_at.elapsed().as_millis(),
-        "Loaded Burn Whisper model"
-    );
-    let prompt_token_ids = default_decoder_prompt_token_ids(artifacts)?;
-    let end_of_text = special_token_id(artifacts, "<|endoftext|>")?;
-    // WHISPERX-PARITY GUARD:
-    // WhisperX forwards `suppress_tokens` into faster-whisper generation.
-    // This Rust greedy loop mirrors that intent by masking obvious control tokens.
-    let suppressed_token_ids = default_suppressed_token_ids(artifacts, end_of_text)?;
-    tracing::debug!(prompt_tokens = ?prompt_token_ids, suppressed_tokens = suppressed_token_ids.len(), "Starting Burn Whisper encoder forward pass");
-    let encoder_started_at = Instant::now();
-    let encoder_output = model.encoder.forward(features_to_tensor(features, &device));
-    let encoder_output_dims = encoder_output.dims();
-    tracing::debug!(elapsed_ms = encoder_started_at.elapsed().as_millis(), encoder_output_dims = ?encoder_output_dims, "Finished Burn Whisper encoder forward pass");
-
-    let remaining_ctx = model
-        .decoder
-        .n_text_ctx
-        .saturating_sub(prompt_token_ids.len());
-    let decode_limit = max_decode_tokens.min(remaining_ctx);
-    let mut all_token_ids = prompt_token_ids.clone();
-    let mut generated_token_ids = Vec::new();
-    let mut last_decoder_logits_dims = [1, prompt_token_ids.len(), model.decoder.n_vocab];
-    let mut terminated_on_end_of_text = false;
-    let mut stop_reason = DecodeStopReason::MaxDecodeTokens;
-
-    tracing::debug!(
-        decode_limit,
-        remaining_ctx,
-        "Starting Burn Whisper greedy token loop"
-    );
-    for token_index in 0..decode_limit {
-        let token_started_at = Instant::now();
-        tracing::debug!(
-            token_index,
-            context_tokens = all_token_ids.len(),
-            "Starting Burn Whisper decoder token step"
-        );
-        let decoder_logits = model.decoder.forward(
-            token_ids_to_tensor(&all_token_ids, &device),
-            encoder_output.clone(),
-        );
-        last_decoder_logits_dims = decoder_logits.dims();
-        let next_token_id = greedy_next_token_id(&decoder_logits, &suppressed_token_ids)?;
-        tracing::debug!(token_index, next_token_id, elapsed_ms = token_started_at.elapsed().as_millis(), decoder_logits_dims = ?last_decoder_logits_dims, "Finished Burn Whisper decoder token step");
-        if next_token_id == end_of_text {
-            terminated_on_end_of_text = true;
-            stop_reason = DecodeStopReason::EndOfText;
-            break;
-        }
-
-        all_token_ids.push(next_token_id);
-        generated_token_ids.push(next_token_id);
-
-        // RUST-ONLY GUARD:
-        // WhisperX does not expose an equivalent explicit repeated-token cut-off in its
-        // Python batching loop. This is a local safeguard for the current naive greedy path.
-        if has_repeated_token_collapse(&generated_token_ids, RUST_ONLY_REPEAT_TOKEN_LIMIT) {
-            stop_reason = DecodeStopReason::RepeatedTokenCollapse;
-            break;
-        }
-    }
-
-    let text = decode_token_ids(artifacts, &generated_token_ids, true)?;
-    tracing::debug!(elapsed_ms = total_started_at.elapsed().as_millis(), generated_tokens = generated_token_ids.len(), stop_reason = ?stop_reason, text = %text, "Finished Burn Whisper greedy decode");
-
-    Ok(GreedyDecodeSummary {
-        prompt_token_ids,
-        generated_token_ids,
-        encoder_output_dims,
-        last_decoder_logits_dims,
-        terminated_on_end_of_text,
-        stop_reason,
-        text,
-    })
+    LoadedWhisperGreedyDecoder::load(artifacts.clone(), max_decode_tokens)?.decode(features)
 }
 
 pub fn encode_features_with_model(

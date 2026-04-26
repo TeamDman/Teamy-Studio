@@ -2,6 +2,7 @@ use arbitrary::Arbitrary;
 use eyre::Context;
 use facet::Facet;
 use figue as args;
+use std::fs;
 use std::path::PathBuf;
 
 use crate::cli::output::CliOutput;
@@ -63,26 +64,132 @@ impl AudioModelListArgs {
     ) -> eyre::Result<CliOutput> {
         let _ = self;
         println!(
-            "Managed model root: {}",
-            crate::model::managed_models_dir(cache_home).display()
+            "managed_model_root: {}",
+            color_blue(
+                &crate::model::managed_models_dir(cache_home)
+                    .display()
+                    .to_string()
+            )
         );
-        println!("Known models:");
+        println!("known_models:");
         for known in &crate::model::KNOWN_WHISPER_MODELS {
             let managed = crate::model::managed_model_dir(cache_home, known.name);
-            let status = if managed.is_dir() {
-                "prepared"
+            let (status, status_color) = if managed.is_dir() {
+                ("prepared", Color::Green)
             } else {
-                "missing"
+                ("missing", Color::Red)
             };
-            println!("- {}: {} ({})", known.name, managed.display(), status);
+            let size = if managed.is_dir() {
+                directory_size_bytes(&managed)
+                    .ok()
+                    .map_or_else(|| "size unknown".to_owned(), human_size)
+            } else {
+                "not downloaded".to_owned()
+            };
+            println!("  {}:", known.name);
+            println!(
+                "    local: {}",
+                colorize(
+                    &format!("{} ({status}) ({size})", managed.display()),
+                    status_color,
+                )
+            );
+            println!("    checkpoint_url: {}", color_blue(known.checkpoint_url));
+            println!(
+                "    hugging_face_model_id: {}",
+                color_blue(known.hugging_face_model_id)
+            );
+            println!(
+                "    estimate: {}",
+                color_yellow(&format!(
+                    "parameters: {}; vram: {}",
+                    known.parameter_count, known.vram_estimate
+                ))
+            );
         }
-        println!(
-            "Registered model directories:\n{}",
-            crate::model::render_registered_model_dirs(&crate::model::list_registered_model_dirs(
-                app_home
-            )?)
-        );
+        println!("registered_model_directories:");
+        let registered = crate::model::list_registered_model_dirs(app_home)?;
+        if registered.is_empty() {
+            println!("  []");
+        } else {
+            for (index, path) in registered.iter().enumerate() {
+                let suffix = if index == 0 { " (default)" } else { "" };
+                println!(
+                    "  - {}",
+                    color_green(&format!("{}{suffix}", path.display()))
+                );
+            }
+        }
         Ok(CliOutput::none())
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Color {
+    Green,
+    Red,
+    Blue,
+    Yellow,
+}
+
+fn color_green(text: &str) -> String {
+    colorize(text, Color::Green)
+}
+
+fn color_blue(text: &str) -> String {
+    colorize(text, Color::Blue)
+}
+
+fn color_yellow(text: &str) -> String {
+    colorize(text, Color::Yellow)
+}
+
+fn colorize(text: &str, color: Color) -> String {
+    let code = match color {
+        Color::Green => 32,
+        Color::Red => 31,
+        Color::Blue => 34,
+        Color::Yellow => 33,
+    };
+    format!("\x1b[{code}m{text}\x1b[0m")
+}
+
+fn directory_size_bytes(path: &std::path::Path) -> std::io::Result<u64> {
+    let metadata = fs::metadata(path)?;
+    if metadata.is_file() {
+        return Ok(metadata.len());
+    }
+    if !metadata.is_dir() {
+        return Ok(0);
+    }
+
+    let mut total = 0_u64;
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        total = total.saturating_add(directory_size_bytes(&entry.path())?);
+    }
+    Ok(total)
+}
+
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "model list renders human-readable approximate file sizes"
+)]
+fn human_size(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut unit = UNITS[0];
+    for candidate in &UNITS[1..] {
+        if value < 1024.0 {
+            break;
+        }
+        value /= 1024.0;
+        unit = candidate;
+    }
+    if unit == "B" {
+        format!("{bytes} {unit}")
+    } else {
+        format!("{value:.2} {unit}")
     }
 }
 
