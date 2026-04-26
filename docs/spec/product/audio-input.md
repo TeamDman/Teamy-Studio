@@ -37,6 +37,9 @@ The `audio` command group must expose a `transcribe` subcommand that accepts a W
 audio[cli.transcribe-demo]
 The `audio transcribe` command must expose a demo mode that finds a local VCTK WAV clip and matching transcript text, prepares the audio if needed, runs the Burn transcription path, and emits the transcript text on stdout.
 
+audio[cli.transcribe-demo-batched]
+When `audio transcribe --demo <count>` processes multiple demo samples, it must use one loaded Burn Whisper decoder with bounded tensor batches rather than loading a separate model copy per worker.
+
 audio[cli.transcribe-long-input-chunks]
 The `audio transcribe` command must process long inputs as a sequence of Whisper-sized chunks rather than silently trimming transcription to the first chunk.
 

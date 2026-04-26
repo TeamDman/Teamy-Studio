@@ -3,11 +3,10 @@ use eyre::{Context, bail};
 use facet::Facet;
 use figue as args;
 use serde::Serialize;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::BTreeMap;
 use std::io::{Write, stdout};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use crate::cli::output::CliOutput;
@@ -168,7 +167,6 @@ impl AudioTranscribeArgs {
             .into_iter()
             .map(DemoBatchItem::inspect)
             .collect::<eyre::Result<Vec<_>>>()?;
-        let totals = DemoBatchTotals::from_items(&items);
 
         let explicit_model_dir = self.model_dir.as_deref().map(PathBuf::from);
         let model_dir = crate::model::resolve_transcription_model_dir(
@@ -188,8 +186,6 @@ impl AudioTranscribeArgs {
         let decode_workers = self.effective_decode_workers(model.dims.as_ref(), items.len())?;
         let decoder =
             crate::whisper::LoadedWhisperGreedyDecoder::load(model.clone(), max_decode_tokens)?;
-        let mut progress = DemoBatchProgress::new(totals);
-
         if demo_count > 1 {
             tracing::info!(
                 samples = items.len(),
@@ -197,14 +193,14 @@ impl AudioTranscribeArgs {
             );
         }
 
-        let results = if decode_workers > 1 && items.len() > 1 {
-            transcribe_demo_items_parallel(
+        let results = if items.len() > 1 {
+            transcribe_demo_items_batched(
                 items,
                 cache_home,
                 self,
-                &model,
-                max_decode_tokens,
+                &decoder,
                 decode_workers,
+                max_decode_tokens,
             )?
         } else {
             let mut results = Vec::new();
@@ -231,22 +227,9 @@ impl AudioTranscribeArgs {
         };
 
         let mut timing_records = Vec::new();
-        for (index, (clip, result)) in results.into_iter().enumerate() {
+        for (_clip, result) in results {
             println!("{}", result.text);
             timing_records.extend(result.timing_records.iter().cloned());
-            progress.record(&result);
-            if demo_count > 1 {
-                tracing::info!(
-                    "{}",
-                    progress.render(
-                        "demo_metrics",
-                        index + 1,
-                        &clip.wav_path.display().to_string(),
-                        query_gpu_memory(),
-                        &[],
-                    )
-                );
-            }
         }
 
         tracing::debug!(
@@ -305,6 +288,22 @@ struct DemoBatchItem {
     audio_seconds: f64,
 }
 
+struct DemoPreparedInput {
+    clip: VctkDemoClip,
+    audio: crate::transcription::ValidatedAudio,
+    bytes: u64,
+    audio_seconds: f64,
+    chunk_boundaries: Vec<(usize, usize)>,
+}
+
+#[derive(Clone, Copy)]
+struct DemoDecodeUnit<'a> {
+    input_index: usize,
+    global_index: usize,
+    global_total: usize,
+    chunk: AudioChunk<'a>,
+}
+
 impl DemoBatchItem {
     fn inspect(clip: VctkDemoClip) -> eyre::Result<Self> {
         let metadata = crate::audio::inspect_audio(&clip.wav_path)?;
@@ -326,16 +325,6 @@ struct DemoBatchTotals {
     items: usize,
     bytes: u64,
     audio_seconds: f64,
-}
-
-impl DemoBatchTotals {
-    fn from_items(items: &[DemoBatchItem]) -> Self {
-        Self {
-            items: items.len(),
-            bytes: items.iter().map(|item| item.bytes).sum(),
-            audio_seconds: items.iter().map(|item| item.audio_seconds).sum(),
-        }
-    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -490,10 +479,6 @@ impl DemoBatchProgress {
         self.estimated_decode_work_completed_units = self
             .estimated_decode_work_completed_units
             .max(completed_units);
-    }
-
-    fn record(&mut self, input: &TranscribedInput) {
-        self.record_values(input.bytes, input.audio_seconds, input.words);
     }
 
     fn record_values(&mut self, bytes: u64, audio_seconds: f64, words: usize) {
@@ -1082,74 +1067,260 @@ fn batch_progress_line(
     format!("batch: {batch_number} of {batch_total} ({completed_items} of {total_items} items)")
 }
 
-fn transcribe_demo_items_parallel(
+fn demo_batch_progress_line(
+    batch: &[DemoDecodeUnit<'_>],
+    batch_number: usize,
+    batch_total: usize,
+) -> String {
+    let completed_items = batch.last().map_or(0, |unit| unit.global_index);
+    let total_items = batch.last().map_or(0, |unit| unit.global_total);
+    format!("batch: {batch_number} of {batch_total} ({completed_items} of {total_items} items)")
+}
+
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "batch progress diagnostics are approximate human-scale values"
+)]
+fn log_demo_batch_decode_progress(
+    input_path: &Path,
+    batch: &[DemoDecodeUnit<'_>],
+    progress: &DemoBatchProgress,
+    batch_number: usize,
+    batch_total: usize,
+    decode_progress: crate::whisper::BatchedGreedyDecodeProgress,
+) {
+    let first_item = batch.first().map_or(0, |unit| unit.global_index);
+    let last_item = batch.last().map_or(first_item, |unit| unit.global_index);
+    let token_steps_per_second = per_second(
+        decode_progress.token_index as f64,
+        decode_progress.elapsed_ms,
+    );
+    let layer = match (
+        decode_progress.decoder_layer_index,
+        decode_progress.decoder_layer_total,
+    ) {
+        (Some(index), Some(total)) => format!("decoder_layer: {index}/{total}"),
+        _ => "decoder_layer: complete".to_owned(),
+    };
+    log_overall_progress(
+        input_path,
+        progress,
+        &format!("decoding demo items {first_item}..{last_item}"),
+        &[
+            demo_batch_progress_line(batch, batch_number, batch_total),
+            format!("decode_phase: {:?}", decode_progress.phase),
+            format!(
+                "token_step: {}/{}",
+                decode_progress.token_index, decode_progress.decode_limit
+            ),
+            layer,
+            format!(
+                "active_items: {}/{}",
+                decode_progress.active_items, decode_progress.batch_size
+            ),
+            format!("token_steps_per_second: {token_steps_per_second:.3}"),
+        ],
+    );
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "demo batching coordinates preparation, decode progress, and ordered result assembly"
+)]
+fn transcribe_demo_items_batched(
     items: Vec<DemoBatchItem>,
     cache_home: &crate::paths::CacheHome,
     args: &AudioTranscribeArgs,
-    model: &crate::model::WhisperModelArtifacts,
-    max_decode_tokens: usize,
+    decoder: &crate::whisper::LoadedWhisperGreedyDecoder,
     decode_workers: usize,
+    max_decode_tokens: usize,
 ) -> eyre::Result<Vec<(VctkDemoClip, TranscribedInput)>> {
     // audio[impl cli.transcribe-decode-workers]
+    // audio[impl cli.transcribe-demo-batched]
     tracing::info!(
-        decode_workers,
+        batch_size = decode_workers,
         items = items.len(),
-        "Starting parallel demo transcription workers"
+        "Starting batched demo transcription"
     );
-    let work = Mutex::new(
-        items
-            .into_iter()
-            .enumerate()
-            .collect::<VecDeque<(usize, DemoBatchItem)>>(),
+
+    let mut prepared_inputs = Vec::with_capacity(items.len());
+    for item in items {
+        tracing::info!(path = %item.clip.wav_path.display(), expected_text = %item.clip.expected_text, "Preparing demo transcription sample");
+        if args.compare_python {
+            print_python_reference_comparison(&item.clip.wav_path, &args.model)?;
+        }
+
+        let original_duration_seconds = item.metadata.duration_seconds;
+        let audio = load_effective_transcription_audio(
+            &item.clip.wav_path,
+            item.metadata,
+            &TranscribeOneContext {
+                cache_home,
+                args,
+                decoder,
+                is_demo: true,
+                max_decode_tokens,
+                decode_workers: 1,
+            },
+        )?;
+        let audio_seconds = original_duration_seconds.unwrap_or_else(|| audio.duration_seconds());
+        let chunk_boundaries = speech_aware_chunk_boundaries(&audio.samples);
+        prepared_inputs.push(DemoPreparedInput {
+            clip: item.clip,
+            audio,
+            bytes: item.bytes,
+            audio_seconds,
+            chunk_boundaries,
+        });
+    }
+
+    let total_decode_units = prepared_inputs
+        .iter()
+        .map(|input| input.chunk_boundaries.len().max(1))
+        .sum::<usize>();
+    let mut decode_units = Vec::with_capacity(total_decode_units);
+    for (input_index, input) in prepared_inputs.iter().enumerate() {
+        let total = input.chunk_boundaries.len().max(1);
+        for (offset, (start_sample, end_sample)) in
+            input.chunk_boundaries.iter().copied().enumerate()
+        {
+            let global_index = decode_units.len() + 1;
+            decode_units.push(DemoDecodeUnit {
+                input_index,
+                global_index,
+                global_total: total_decode_units,
+                chunk: AudioChunk {
+                    index: offset + 1,
+                    total,
+                    total_samples: input.audio.samples.len(),
+                    start_sample,
+                    end_sample,
+                    samples: &input.audio.samples[start_sample..end_sample],
+                },
+            });
+        }
+    }
+
+    let totals = DemoBatchTotals {
+        items: total_decode_units,
+        bytes: prepared_inputs.iter().map(|input| input.bytes).sum(),
+        audio_seconds: prepared_inputs
+            .iter()
+            .map(|input| input.audio_seconds)
+            .sum(),
+    };
+    let mut progress = DemoBatchProgress::new(totals);
+    progress.configure_estimated_decode_work(
+        total_decode_units,
+        estimated_decode_work_units_per_item(decoder),
     );
-    let mut results = Vec::new();
-    std::thread::scope(|scope| -> eyre::Result<()> {
-        let mut handles = Vec::new();
-        for worker_index in 0..decode_workers {
-            let work = &work;
-            handles.push(scope.spawn(move || -> eyre::Result<Vec<(usize, VctkDemoClip, TranscribedInput)>> {
-                let decoder = crate::whisper::LoadedWhisperGreedyDecoder::load(
-                    model.clone(),
-                    max_decode_tokens,
-                )?;
-                let mut worker_results = Vec::new();
-                loop {
-                    let Some((index, item)) = work.lock().expect("demo work queue lock should not be poisoned").pop_front() else {
-                        break;
-                    };
-                    tracing::info!(worker_index, path = %item.clip.wav_path.display(), expected_text = %item.clip.expected_text, "Starting demo transcription sample");
-                    if args.compare_python {
-                        print_python_reference_comparison(&item.clip.wav_path, &args.model)?;
-                    }
-                    let result = transcribe_one_input(
-                        &item.clip.wav_path,
-                        item.metadata,
-                        TranscribeOneContext {
-                            cache_home,
-                            args,
-                            decoder: &decoder,
-                            is_demo: true,
-                            max_decode_tokens,
-                            decode_workers: 1,
-                        },
-                    )?;
-                    worker_results.push((index, item.clip, result));
+    let mut chunk_results = (0..prepared_inputs.len())
+        .map(|_| Vec::new())
+        .collect::<Vec<Vec<TranscriptionChunkResult>>>();
+
+    let batch_size = decode_workers.min(decode_units.len().max(1));
+    let batch_total = decode_units.len().div_ceil(batch_size);
+    for (batch_index, batch) in decode_units.chunks(batch_size).enumerate() {
+        let batch_number = batch_index + 1;
+        log_overall_progress(
+            &prepared_inputs[batch[0].input_index].audio.path,
+            &progress,
+            "preparing demo batch",
+            &[demo_batch_progress_line(batch, batch_number, batch_total)],
+        );
+        let mut features = Vec::with_capacity(batch.len());
+        let mut frontend_elapsed_ms = Vec::with_capacity(batch.len());
+        for unit in batch {
+            let request_started_at = Instant::now();
+            features.push(crate::frontend::whisper_log_mel_spectrogram(
+                unit.chunk.samples,
+            ));
+            frontend_elapsed_ms.push(request_started_at.elapsed().as_millis());
+        }
+
+        let decode_started_at = Instant::now();
+        let summaries = decoder.decode_batch_with_progress(&features, |decode_progress| {
+            if should_log_batch_token_progress(decode_progress) {
+                if let Some(units_per_item) = progress.estimated_decode_work_units_per_item() {
+                    let completed_before_batch =
+                        usize_to_u64_saturating(batch[0].global_index.saturating_sub(1))
+                            .saturating_mul(units_per_item);
+                    let completed_in_batch = estimated_decode_work_completed_in_batch(
+                        batch.len(),
+                        units_per_item,
+                        decode_progress,
+                    );
+                    progress.record_estimated_decode_work(
+                        completed_before_batch.saturating_add(completed_in_batch),
+                    );
                 }
-                Ok(worker_results)
-            }));
+                log_demo_batch_decode_progress(
+                    &prepared_inputs[batch[0].input_index].audio.path,
+                    batch,
+                    &progress,
+                    batch_number,
+                    batch_total,
+                    decode_progress,
+                );
+            }
+        })?;
+        let decode_elapsed_ms = decode_started_at.elapsed().as_millis();
+        for ((unit, summary), frontend_elapsed_ms) in batch
+            .iter()
+            .copied()
+            .zip(summaries)
+            .zip(frontend_elapsed_ms)
+        {
+            let input = &prepared_inputs[unit.input_index];
+            let result = transcription_chunk_result_from_summary(
+                &input.audio,
+                unit.chunk,
+                frontend_elapsed_ms,
+                decode_elapsed_ms,
+                summary,
+            );
+            progress.record_values(
+                chunk_audio_bytes(input.bytes, unit.chunk),
+                result.audio_seconds,
+                result.words,
+            );
+            chunk_results[unit.input_index].push(result);
         }
-        for handle in handles {
-            let worker_results = handle
-                .join()
-                .map_err(|_panic| eyre::eyre!("parallel demo transcription worker panicked"))??;
-            results.extend(worker_results);
-        }
-        Ok(())
-    })?;
-    results.sort_by_key(|(index, _, _)| *index);
-    Ok(results
+        log_overall_progress(
+            &prepared_inputs[batch[0].input_index].audio.path,
+            &progress,
+            "completed demo batch",
+            &[demo_batch_progress_line(batch, batch_number, batch_total)],
+        );
+    }
+
+    Ok(prepared_inputs
         .into_iter()
-        .map(|(_, clip, result)| (clip, result))
+        .zip(chunk_results)
+        .map(|(input, chunk_results)| {
+            let text = chunk_results
+                .iter()
+                .map(|chunk| chunk.text.trim())
+                .filter(|text| !text.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ");
+            let words = chunk_results.iter().map(|chunk| chunk.words).sum();
+            let timing_records = chunk_results
+                .iter()
+                .map(|chunk| chunk.timing_record.clone())
+                .collect();
+            (
+                input.clip,
+                TranscribedInput {
+                    text,
+                    bytes: input.bytes,
+                    audio_seconds: input.audio_seconds,
+                    words,
+                    timing_records,
+                    streamed_stdout: false,
+                },
+            )
+        })
         .collect())
 }
 
