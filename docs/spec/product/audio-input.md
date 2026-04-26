@@ -36,6 +36,9 @@ Rust must manage an elastic shared-memory slot pool that writes fixed log-mel te
 audio[transcription.named-pipe-control-protocol]
 Rust and Python must share a versioned JSONL control-message protocol for named-pipe requests and results, including the shared-memory slot name, tensor contract, request id, result text, and slot-release instruction.
 
+audio[transcription.live-named-pipe-transport]
+Rust must provide a live Windows named-pipe transport that sends one queued transcription control request to the daemon and validates one returned result line.
+
 audio[transcription.shared-memory-pool-status]
 Rust must expose the initial shared-memory slot-pool sizing and live queue counters that the CLI and GUI can report before Python inference is started.
 

@@ -5,6 +5,8 @@ use std::time::Instant;
 
 use eyre::Context;
 use facet::Facet;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::windows::named_pipe::{PipeMode, ServerOptions};
 use windows::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
 use windows::Win32::System::Memory::{
     CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile, PAGE_READWRITE,
@@ -23,6 +25,11 @@ pub const WHISPER_DAEMON_SOURCE_PARENT_DIR: &str = "python";
 pub const WHISPER_DAEMON_SOURCE_DIR_NAME: &str = "whisperx-daemon";
 pub const WHISPER_SHARED_MEMORY_MINIMUM_SLOTS: usize = 3;
 pub const WHISPER_CONTROL_PROTOCOL_VERSION: u32 = 1;
+
+#[must_use]
+pub fn audio_transcription_named_pipe_path(pipe_name: &str) -> String {
+    format!(r"\\.\pipe\{pipe_name}")
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct WhisperLogMel80x3000 {
@@ -207,6 +214,45 @@ fn validate_audio_transcription_control_result(
         );
     }
     Ok(())
+}
+
+/// # Errors
+///
+/// Returns an error if the pipe cannot be created, the daemon does not connect, or the daemon
+/// returns an invalid result line.
+// audio[impl transcription.live-named-pipe-transport]
+pub async fn audio_transcription_named_pipe_request_roundtrip(
+    pipe_path: &str,
+    request: &AudioTranscriptionControlRequest,
+) -> eyre::Result<AudioTranscriptionControlResult> {
+    let mut server = ServerOptions::new()
+        .pipe_mode(PipeMode::Byte)
+        .create(pipe_path)
+        .wrap_err_with(|| format!("failed to create audio transcription named pipe {pipe_path}"))?;
+    server
+        .connect()
+        .await
+        .wrap_err("failed to accept audio transcription daemon pipe client")?;
+    let request_line = encode_audio_transcription_control_request_line(request)?;
+    server
+        .write_all(request_line.as_bytes())
+        .await
+        .wrap_err("failed to write transcription control request")?;
+    server
+        .flush()
+        .await
+        .wrap_err("failed to flush transcription control request")?;
+
+    let mut reader = BufReader::new(server);
+    let mut result_line = String::new();
+    reader
+        .read_line(&mut result_line)
+        .await
+        .wrap_err("failed to read transcription control result")?;
+    if result_line.is_empty() {
+        eyre::bail!("audio transcription daemon closed the named pipe without a result");
+    }
+    decode_audio_transcription_control_result_line(&result_line)
 }
 
 #[derive(Debug)]
@@ -573,5 +619,74 @@ mod tests {
         assert_eq!(result.request_id, 7);
         assert!(result.release_slot);
         assert_eq!(result.transcript_text, "hello");
+    }
+
+    #[test]
+    // audio[verify transcription.live-named-pipe-transport]
+    fn named_pipe_roundtrip_exchanges_request_and_result_lines() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .build()
+            .expect("tokio runtime should start");
+        runtime.block_on(async {
+            use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
+            use tokio::net::windows::named_pipe::ClientOptions;
+
+            let pipe_path = audio_transcription_named_pipe_path(&format!(
+                "TeamyStudioAudioTranscriptionTest-{}",
+                std::process::id()
+            ));
+            let queued = AudioTranscriptionQueuedRequest {
+                request_id: 11,
+                slot_id: 5,
+                slot_name: "Local\\TeamyStudioWhisperLogMel-test".to_owned(),
+                byte_len: WHISPER_LOG_MEL_BYTE_COUNT,
+            };
+            let request = audio_transcription_control_request_for_queued_request(&queued);
+            let client_pipe_path = pipe_path.clone();
+            let client_task = tokio::spawn(async move {
+                let client = loop {
+                    match ClientOptions::new().open(&client_pipe_path) {
+                        Ok(client) => break client,
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                            tokio::task::yield_now().await;
+                        }
+                        Err(error) => return Err(eyre::Report::new(error)),
+                    }
+                };
+                let mut reader = BufReader::new(client);
+                let mut request_line = String::new();
+                reader.read_line(&mut request_line).await?;
+                assert!(request_line.contains("\"request_id\":11"));
+                let result = AudioTranscriptionControlResult {
+                    protocol_version: WHISPER_CONTROL_PROTOCOL_VERSION,
+                    kind: "transcription-result".to_owned(),
+                    request_id: 11,
+                    slot_id: 5,
+                    release_slot: true,
+                    ok: true,
+                    transcript_text: "pipe ok".to_owned(),
+                    error: None,
+                };
+                let mut client = reader.into_inner();
+                client
+                    .write_all(facet_json::to_string(&result)?.as_bytes())
+                    .await?;
+                client.write_all(b"\n").await?;
+                client.flush().await?;
+                Ok::<(), eyre::Report>(())
+            });
+
+            let result = audio_transcription_named_pipe_request_roundtrip(&pipe_path, &request)
+                .await
+                .expect("named-pipe roundtrip should finish");
+            client_task
+                .await
+                .expect("client task should join")
+                .expect("client task should succeed");
+
+            assert_eq!(result.transcript_text, "pipe ok");
+            assert!(result.release_slot);
+        });
     }
 }
