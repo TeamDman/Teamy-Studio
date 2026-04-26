@@ -12,6 +12,8 @@ use ratatui::widgets::{
 };
 use windows::Win32::Foundation::RECT;
 
+use crate::timeline::TimelineDocument;
+
 use super::AudioTranscriptionDaemonStatusReport;
 use super::cell_grid;
 use super::spatial::{ClientPoint, ClientRect, TerminalCellPoint};
@@ -511,6 +513,7 @@ pub fn scene_button_specs(scene_kind: SceneWindowKind) -> &'static [SceneButtonS
 pub fn build_blank_timeline_render_scene(
     layout: TerminalLayout,
     window_chrome_buttons_state: WindowChromeButtonsState,
+    document: Option<&TimelineDocument>,
 ) -> RenderScene {
     let mut scene = build_scene_shell(
         layout,
@@ -577,10 +580,13 @@ pub fn build_blank_timeline_render_scene(
         [0.12, 0.13, 0.16, 1.0],
         PanelEffect::TerminalPanel,
     );
+    let ruler_label = document.map_or("0 ns".to_owned(), |document| {
+        format!("{} ns", document.viewport().origin().as_i64())
+    });
     push_centered_text(
         &mut scene,
         ruler_rect.to_win32_rect(),
-        "0 ns",
+        &ruler_label,
         [0.74, 0.78, 0.84, 1.0],
     );
     push_panel(
@@ -589,10 +595,13 @@ pub fn build_blank_timeline_render_scene(
         [0.07, 0.08, 0.10, 1.0],
         PanelEffect::TerminalFill,
     );
+    let content_label = document.map_or("Blank timeline".to_owned(), |document| {
+        format!("Blank timeline - {} tracks", document.tracks().len())
+    });
     push_centered_text(
         &mut scene,
         content_rect.to_win32_rect(),
-        "Blank timeline",
+        &content_label,
         [0.68, 0.72, 0.78, 1.0],
     );
 
@@ -3965,8 +3974,11 @@ mod tests {
     // timeline[verify blank.add-track-placeholder]
     #[test]
     fn blank_timeline_render_scene_has_track_ruler_and_content_regions() {
-        let scene =
-            build_blank_timeline_render_scene(sample_layout(), WindowChromeButtonsState::default());
+        let scene = build_blank_timeline_render_scene(
+            sample_layout(),
+            WindowChromeButtonsState::default(),
+            None,
+        );
 
         assert!(scene.panels.len() >= 7);
         assert!(scene.glyphs.len() >= "Add TrackBlank timeline".chars().count());
@@ -3982,6 +3994,19 @@ mod tests {
                 .iter()
                 .any(|panel| matches!(panel.effect, PanelEffect::TerminalFill))
         );
+    }
+
+    // timeline[verify document.window-state]
+    #[test]
+    fn blank_timeline_render_scene_accepts_document_state() {
+        let document = TimelineDocument::blank();
+        let scene = build_blank_timeline_render_scene(
+            sample_layout(),
+            WindowChromeButtonsState::default(),
+            Some(&document),
+        );
+
+        assert!(scene.glyphs.len() >= "Blank timeline - 0 tracks".chars().count());
     }
 
     // windowing[verify audio-picker.buttons.windows]

@@ -29,6 +29,9 @@ A blank timeline document must reserve an add-track affordance area so microphon
 timeline[document.blank-model]
 A blank timeline document must have a stable identity, no tracks, and a viewport initialized at zero nanoseconds.
 
+timeline[document.window-state]
+Creating a blank timeline from the start window must store the timeline document in the window state used for rendering.
+
 timeline[viewport.nanoseconds]
 Timeline document and viewport positions must store time as integer nanoseconds instead of floating-point seconds.
 

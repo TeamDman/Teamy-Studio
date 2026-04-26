@@ -57,6 +57,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::core::{BOOL, PCWSTR, w};
 
 use crate::paths::{AppHome, CacheHome};
+use crate::timeline::TimelineDocument;
 use crate::win32_support::clipboard::{read_clipboard, write_clipboard};
 use crate::win32_support::module::get_current_module;
 use crate::win32_support::string::{EasyPCWSTR, PWSTRBuffer};
@@ -435,6 +436,7 @@ struct SceneAppState {
     vt_engine: VtEngineChoice,
     audio_input_picker: AudioInputPickerState,
     audio_input_device_window: Option<AudioInputDeviceWindowState>,
+    timeline_document: Option<TimelineDocument>,
     demo_mode_scramble_input_device_identifiers: DemoModeInputDeviceIdentifierScramble,
     demo_mode_scramble_toggle_last_changed_at: Option<Instant>,
     scene_action_selected_index: usize,
@@ -1345,6 +1347,7 @@ fn run_scene_window(
             vt_engine,
             audio_input_picker,
             audio_input_device_window,
+            timeline_document: None,
             demo_mode_scramble_input_device_identifiers:
                 DemoModeInputDeviceIdentifierScramble::from_enabled(
                     current_demo_mode_state().scramble_input_device_identifiers,
@@ -3949,7 +3952,11 @@ fn render_scene_window_frame(
             demo_mode_visual_state(state, layout),
         )
     } else if state.scene_kind == SceneWindowKind::Timeline {
-        windows_scene::build_blank_timeline_render_scene(layout, window_chrome_buttons_state)
+        windows_scene::build_blank_timeline_render_scene(
+            layout,
+            window_chrome_buttons_state,
+            state.timeline_document.as_ref(),
+        )
     } else {
         windows_scene::build_scene_render_scene(
             layout,
@@ -5004,7 +5011,9 @@ fn invoke_scene_action(
     if action == SceneAction::CreateBlankTimeline {
         return with_scene_app_state(|state| {
             // timeline[impl start-window.new-blank]
+            // timeline[impl document.window-state]
             state.scene_kind = SceneWindowKind::Timeline;
+            state.timeline_document = Some(TimelineDocument::blank());
             state.scene_action_selected_index = 0;
             state.scene_virtual_cursor = None;
             render_scene_window_frame(state, hwnd, None, false)?;
@@ -8224,6 +8233,7 @@ mod tests {
             vt_engine: VtEngineChoice::default(),
             audio_input_picker: AudioInputPickerState::default(),
             audio_input_device_window: None,
+            timeline_document: None,
             demo_mode_scramble_input_device_identifiers:
                 DemoModeInputDeviceIdentifierScramble::default(),
             demo_mode_scramble_toggle_last_changed_at: None,
@@ -8286,6 +8296,7 @@ mod tests {
             vt_engine: VtEngineChoice::default(),
             audio_input_picker: AudioInputPickerState::default(),
             audio_input_device_window: None,
+            timeline_document: None,
             demo_mode_scramble_input_device_identifiers:
                 DemoModeInputDeviceIdentifierScramble::default(),
             demo_mode_scramble_toggle_last_changed_at: None,
