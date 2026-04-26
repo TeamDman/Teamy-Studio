@@ -6,8 +6,16 @@ requires-python = ">=3.11"
 dependencies = []
 
 [project.optional-dependencies]
-transcription = ["numpy", "openai-whisper"]
-whisperx = ["numpy", "whisperx"]
+transcription = ["numpy", "openai-whisper", "torch"]
+whisperx = ["numpy", "whisperx", "torch"]
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu128" }
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
 
 [project.scripts]
 teamy-whisperx-daemon = "teamy_whisperx_daemon.__main__:main"

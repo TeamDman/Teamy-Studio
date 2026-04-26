@@ -30,6 +30,7 @@ pub const WHISPER_DAEMON_SOURCE_PARENT_DIR: &str = "python";
 pub const WHISPER_DAEMON_SOURCE_DIR_NAME: &str = "whisperx-daemon";
 pub const WHISPER_SHARED_MEMORY_MINIMUM_SLOTS: usize = 3;
 pub const WHISPER_CONTROL_PROTOCOL_VERSION: u32 = 1;
+pub const PYTORCH_CUDA_INDEX_URL: &str = "https://download.pytorch.org/whl/cu128";
 pub const WHISPER_TRANSCRIPTION_MODELS: [&str; 6] = [
     "large-v3",
     "large-v2",
@@ -548,6 +549,8 @@ pub fn audio_transcription_run_python_transcription_request_once_from_samples(
     let mut child = Command::new("uv")
         .arg("run")
         .arg("--no-project")
+        .arg("--index")
+        .arg(PYTORCH_CUDA_INDEX_URL)
         .arg("--with")
         .arg("numpy")
         .arg("--with")
@@ -587,6 +590,8 @@ pub fn audio_transcription_run_python_cuda_check() -> eyre::Result<String> {
     let output = Command::new("uv")
         .arg("run")
         .arg("--no-project")
+        .arg("--index")
+        .arg(PYTORCH_CUDA_INDEX_URL)
         .arg("--with")
         .arg("torch")
         .arg("--with")

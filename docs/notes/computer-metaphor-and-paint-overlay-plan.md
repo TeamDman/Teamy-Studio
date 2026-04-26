@@ -58,6 +58,7 @@ The guiding idea from the source note is that Teamy Studio should not merely mim
   - Replaced the debug transcription worker's all-zero placeholder payload with a Rust-prepared 80 x 3000 handoff tensor derived from recorded microphone samples ahead of the transcription head.
   - Added the first real speech-to-text path: the mic window sends captured audio chunks to Python as 16 kHz mono `f32` shared-memory payloads, Python runs Whisper through the managed `uv` environment, and returned text is staged in the transcript island.
   - Added model-selection and CUDA-check controls to the audio-daemon window, and smoothed transcription preview refresh work so focused frames spend less time in preview cache rebuilds.
+  - Updated the daemon Python environment to install CUDA-enabled PyTorch from the PyTorch `cu128` wheel index instead of resolving CPU-only Torch from the default index.
 - Current focus:
   - Use the microphone timeline, shared-memory slot pool, named-pipe Python handoff, and daemon dashboard as the first real proving ground for keeping the selected transcription model hot across repeated chunks.
 - Remaining work:

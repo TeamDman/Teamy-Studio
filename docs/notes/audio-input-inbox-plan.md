@@ -60,6 +60,7 @@ The product rule is simple: dictated text must never be sprayed into whichever e
   - Prewarmed the managed `uv` transcription environment and `small.en` model on 2026-04-26, then verified the shared-memory Python path against the local VCTK `p230_397.wav` sample. The daemon returned `Is there a waiting list?` for the expected `Is there a waiting list ?` transcript.
   - Reduced transcription-preview stutter by shortening the shared-buffer lock scope, throttling preview refreshes more aggressively, and capping pseudo-spectrogram sampling per display cell. Successful transcription results now advance the transcription head to the end of the submitted chunk.
   - Added audio-daemon window controls for model selection, defaulting to `large-v3`, and a `CUDA Check` button that runs `torch.cuda.is_available()` through the managed Python daemon environment and shows the JSON result in a message box.
+  - Fixed the managed Python daemon environment to resolve PyTorch from the CUDA `cu128` wheel index. On 2026-04-26, both the no-project app launch shape and the daemon project's `uv run --extra transcription` path reported CUDA-enabled Torch on the local RTX 4090.
 - Current focus:
   - Continue from working one-shot Whisper transcription with selectable models toward a longer-lived daemon loop and eventual WhisperX-specific inference.
 - Remaining work:
