@@ -101,12 +101,15 @@ pub struct AudioInputDeviceDetailLayout {
     pub icon_rect: ClientRect,
     pub info_rect: ClientRect,
     pub arm_button_rect: ClientRect,
+    pub transcription_button_rect: ClientRect,
     pub play_pause_button_rect: ClientRect,
     pub loopback_button_rect: ClientRect,
     pub arm_status_rect: ClientRect,
     pub legacy_recording_button_rect: ClientRect,
     pub buffer_section_rect: ClientRect,
     pub waveform_rect: ClientRect,
+    pub mel_spectrogram_rect: ClientRect,
+    pub transcript_terminal_rect: ClientRect,
     pub timeline_label_rect: ClientRect,
 }
 
@@ -122,6 +125,8 @@ pub struct AudioInputTimelineHeadGrabberLayout {
 )]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct AudioInputDeviceDetailVisualState {
+    pub transcription_hovered: bool,
+    pub transcription_pressed: bool,
     pub playback_hovered: bool,
     pub playback_pressed: bool,
     pub loopback_hovered: bool,
@@ -1201,6 +1206,35 @@ pub fn build_audio_input_device_detail_render_scene(
     );
     push_panel_with_data(
         &mut scene,
+        detail_layout.transcription_button_rect.to_win32_rect(),
+        if device_state.runtime.transcription.enabled {
+            [0.70, 0.45, 0.18, 1.0]
+        } else {
+            [0.26, 0.18, 0.14, 1.0]
+        },
+        // audio[impl gui.transcription-toggle]
+        PanelEffect::TranscriptionToggle,
+        [
+            if device_state.runtime.transcription.enabled {
+                1.0
+            } else {
+                0.0
+            },
+            if visual_state.transcription_hovered {
+                1.0
+            } else {
+                0.0
+            },
+            if visual_state.transcription_pressed {
+                1.0
+            } else {
+                0.0
+            },
+            0.0,
+        ],
+    );
+    push_panel_with_data(
+        &mut scene,
         detail_layout.play_pause_button_rect.to_win32_rect(),
         if device_state.is_playing() {
             [0.20, 0.56, 0.86, 1.0]
@@ -1354,10 +1388,17 @@ pub fn audio_input_device_detail_layout(body_rect: ClientRect) -> AudioInputDevi
         loopback_button_rect.left() - 24,
         arm_button_rect.top() + 5 + play_pause_button_size,
     );
+    let transcription_button_size = 64;
+    let transcription_button_rect = ClientRect::new(
+        play_pause_button_rect.left() - 24 - transcription_button_size,
+        arm_button_rect.top() + 5,
+        play_pause_button_rect.left() - 24,
+        arm_button_rect.top() + 5 + transcription_button_size,
+    );
     let arm_status_rect = ClientRect::new(
         arm_button_rect.right() + 18,
         arm_button_rect.top() + 14,
-        play_pause_button_rect.left() - 18,
+        transcription_button_rect.left() - 18,
         arm_button_rect.bottom() - 10,
     );
     let info_rect = ClientRect::new(
@@ -1388,6 +1429,18 @@ pub fn audio_input_device_detail_layout(body_rect: ClientRect) -> AudioInputDevi
         buffer_section_rect.left() + 16,
         timeline_label_rect.bottom() + 10,
         buffer_section_rect.right() - 16,
+        timeline_label_rect.bottom() + 132,
+    );
+    let mel_spectrogram_rect = ClientRect::new(
+        buffer_section_rect.left() + 16,
+        waveform_rect.bottom() + 10,
+        buffer_section_rect.right() - 16,
+        waveform_rect.bottom() + 98,
+    );
+    let transcript_terminal_rect = ClientRect::new(
+        buffer_section_rect.left() + 16,
+        mel_spectrogram_rect.bottom() + 10,
+        buffer_section_rect.right() - 16,
         buffer_section_rect.bottom() - 16,
     );
 
@@ -1395,12 +1448,15 @@ pub fn audio_input_device_detail_layout(body_rect: ClientRect) -> AudioInputDevi
         icon_rect,
         info_rect,
         arm_button_rect,
+        transcription_button_rect,
         play_pause_button_rect,
         loopback_button_rect,
         arm_status_rect,
         legacy_recording_button_rect,
         buffer_section_rect,
         waveform_rect,
+        mel_spectrogram_rect,
+        transcript_terminal_rect,
         timeline_label_rect,
     }
 }
@@ -1451,6 +1507,10 @@ fn push_audio_input_buffer_section(
         device_state,
         visual_state,
     );
+    // audio[impl gui.mel-spectrogram-preview]
+    push_mel_spectrogram(scene, detail_layout.mel_spectrogram_rect, device_state);
+    // audio[impl gui.transcription-terminal-island]
+    push_transcript_terminal_island(scene, detail_layout.transcript_terminal_rect, device_state);
 }
 
 fn push_waveform(
@@ -1575,6 +1635,173 @@ fn push_waveform_bars(scene: &mut RenderScene, waveform_rect: ClientRect, sample
     }
 }
 
+fn push_mel_spectrogram(
+    scene: &mut RenderScene,
+    spectrogram_rect: ClientRect,
+    device_state: &AudioInputDeviceWindowState,
+) {
+    push_panel(
+        scene,
+        spectrogram_rect.to_win32_rect(),
+        [0.035, 0.045, 0.052, 1.0],
+        PanelEffect::TerminalFill,
+    );
+    let inner_rect = spectrogram_rect.inset(8);
+    if !device_state.runtime.transcription.enabled {
+        push_text_block(
+            scene,
+            inner_rect.to_win32_rect(),
+            "transcription disabled",
+            9,
+            16,
+            [0.46, 0.50, 0.54, 1.0],
+        );
+        return;
+    }
+
+    let samples = device_state.runtime.samples();
+    if samples.is_empty() {
+        push_text_block(
+            scene,
+            inner_rect.to_win32_rect(),
+            "waiting for recorded audio",
+            9,
+            16,
+            [0.72, 0.66, 0.58, 1.0],
+        );
+        return;
+    }
+
+    push_mel_spectrogram_tiles(
+        scene,
+        inner_rect,
+        &samples,
+        device_state.runtime.sample_rate_hz(),
+        device_state.runtime.transcription_head_seconds,
+    );
+}
+
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    reason = "audio sample indices and preview amplitudes are clamped to display dimensions"
+)]
+fn push_mel_spectrogram_tiles(
+    scene: &mut RenderScene,
+    rect: ClientRect,
+    samples: &[f32],
+    sample_rate_hz: u32,
+    head_seconds: f64,
+) {
+    let start_index = ((head_seconds.max(0.0) * f64::from(sample_rate_hz)) as usize)
+        .min(samples.len().saturating_sub(1));
+    let lookahead = &samples[start_index..];
+    if lookahead.is_empty() {
+        return;
+    }
+
+    let columns = (rect.width() / 10).clamp(18, 72);
+    let bins = (rect.height() / 8).clamp(8, 18);
+    let columns_usize = usize::try_from(columns).unwrap_or(1);
+    let bins_usize = usize::try_from(bins).unwrap_or(1);
+    let peak = lookahead
+        .iter()
+        .map(|sample| sample.abs())
+        .fold(0.0_f32, f32::max)
+        .max(0.015);
+
+    for column in 0..columns_usize {
+        let start = (column * lookahead.len()) / columns_usize;
+        let end = (((column + 1) * lookahead.len()) / columns_usize)
+            .max(start + 1)
+            .min(lookahead.len());
+        let chunk = &lookahead[start..end];
+        for bin in 0..bins_usize {
+            let mel_position = (bin + 1) as f32 / bins_usize as f32;
+            let folded_energy = chunk
+                .iter()
+                .enumerate()
+                .map(|(index, sample)| {
+                    let phase = (index as f32 * (bin + 1) as f32 * 0.071).sin().abs();
+                    sample.abs() * (0.34 + phase * 0.66) * mel_position.sqrt()
+                })
+                .sum::<f32>()
+                / chunk.len().max(1) as f32;
+            let intensity = (folded_energy / peak).clamp(0.0, 1.0);
+            let color = mel_spectrogram_color(intensity);
+            let left =
+                rect.left() + (i32::try_from(column).unwrap_or_default() * rect.width()) / columns;
+            let right = rect.left()
+                + (i32::try_from(column + 1).unwrap_or_default() * rect.width()) / columns;
+            let bottom =
+                rect.bottom() - (i32::try_from(bin).unwrap_or_default() * rect.height()) / bins;
+            let top =
+                rect.bottom() - (i32::try_from(bin + 1).unwrap_or_default() * rect.height()) / bins;
+            push_panel(
+                scene,
+                ClientRect::new(left, top, right.max(left + 1), bottom.max(top + 1))
+                    .to_win32_rect(),
+                color,
+                PanelEffect::TerminalFill,
+            );
+        }
+    }
+}
+
+fn mel_spectrogram_color(intensity: f32) -> [f32; 4] {
+    let low = [0.05, 0.08, 0.11];
+    let mid = [0.10, 0.58, 0.54];
+    let high = [1.00, 0.64, 0.24];
+    let (from, to, local) = if intensity < 0.55 {
+        (low, mid, intensity / 0.55)
+    } else {
+        (mid, high, (intensity - 0.55) / 0.45)
+    };
+    [
+        from[0] + ((to[0] - from[0]) * local),
+        from[1] + ((to[1] - from[1]) * local),
+        from[2] + ((to[2] - from[2]) * local),
+        1.0,
+    ]
+}
+
+fn push_transcript_terminal_island(
+    scene: &mut RenderScene,
+    terminal_rect: ClientRect,
+    device_state: &AudioInputDeviceWindowState,
+) {
+    push_panel(
+        scene,
+        terminal_rect.to_win32_rect(),
+        [0.035, 0.04, 0.048, 1.0],
+        PanelEffect::TerminalPanel,
+    );
+    let text = if device_state.runtime.transcription.staged_text.is_empty() {
+        transcription_terminal_status_text(device_state)
+    } else {
+        device_state.runtime.transcription.staged_text.clone()
+    };
+    push_text_block(
+        scene,
+        terminal_rect.inset(12).to_win32_rect(),
+        &text,
+        9,
+        16,
+        [0.84, 0.90, 0.88, 1.0],
+    );
+}
+
+fn transcription_terminal_status_text(device_state: &AudioInputDeviceWindowState) -> String {
+    if !device_state.runtime.transcription.enabled {
+        return "transcript island idle".to_owned();
+    }
+    if device_state.runtime.samples().is_empty() {
+        return "transcription enabled; waiting for audio ahead of the head".to_owned();
+    }
+    "transcription enabled; mel preview ready for Python handoff".to_owned()
+}
+
 fn push_timeline_head(
     scene: &mut RenderScene,
     waveform_rect: ClientRect,
@@ -1602,7 +1829,7 @@ fn push_timeline_head_grabbers(
         let active = match grabber.kind {
             AudioInputTimelineHeadKind::Recording => device_state.is_recording(),
             AudioInputTimelineHeadKind::Playback => device_state.is_playing(),
-            AudioInputTimelineHeadKind::Transcription => false,
+            AudioInputTimelineHeadKind::Transcription => device_state.runtime.transcription.enabled,
         };
         push_panel_with_data(
             scene,
@@ -3218,6 +3445,9 @@ mod tests {
     // audio[verify gui.selected-device-window]
     // audio[verify gui.arm-for-record]
     // audio[verify gui.playback-transport]
+    // audio[verify gui.transcription-toggle]
+    // audio[verify gui.mel-spectrogram-preview]
+    // audio[verify gui.transcription-terminal-island]
     // audio[verify gui.legacy-recording-dialog]
     fn audio_input_device_detail_render_shows_device_and_arm_button() {
         let state = sample_audio_input_device_window();
@@ -3251,8 +3481,17 @@ mod tests {
             == detail_layout.loopback_button_rect.to_win32_rect()
             && matches!(panel.effect, PanelEffect::LoopbackButton)));
         assert!(scene.panels.iter().any(|panel| panel.rect
+            == detail_layout.transcription_button_rect.to_win32_rect()
+            && matches!(panel.effect, PanelEffect::TranscriptionToggle)));
+        assert!(scene.panels.iter().any(|panel| panel.rect
             == detail_layout.play_pause_button_rect.to_win32_rect()
             && matches!(panel.effect, PanelEffect::PlaybackButton)));
+        assert!(scene.panels.iter().any(|panel| panel.rect
+            == detail_layout.mel_spectrogram_rect.to_win32_rect()
+            && matches!(panel.effect, PanelEffect::TerminalFill)));
+        assert!(scene.panels.iter().any(|panel| panel.rect
+            == detail_layout.transcript_terminal_rect.to_win32_rect()
+            && matches!(panel.effect, PanelEffect::TerminalPanel)));
         assert!(!scene.glyphs.is_empty());
     }
 

@@ -71,6 +71,15 @@ The selected-device window must render the recorded audio buffer as a waveform w
 audio[gui.playback-transport]
 The selected-device window must expose a shader-rendered play/pause button and let Space play or pause the recorded buffer, K pause playback, repeated J/L adjust backward or forward shuttle speed, and forward or reverse playback must behave sensibly when the playback head is already at the end of the buffer.
 
+audio[gui.transcription-toggle]
+The selected-device window must expose a shader-rendered transcription toggle that can enable or disable staged transcription preparation without automatically sending text to another application.
+
+audio[gui.mel-spectrogram-preview]
+When transcription preparation is enabled, the selected-device window must render a mel-spectrogram preview surface derived from recorded audio ahead of the transcription head.
+
+audio[gui.transcription-terminal-island]
+The selected-device window must reserve a terminal-styled island below the audio buffer and mel preview where staged transcript text appears.
+
 audio[gui.waveform-selection]
 Clicking the waveform without meaningful drag must place the playback head, dragging past a small pixel tolerance must create a visible selection range, and the recording, playback, and transcription heads must also expose draggable grabbers that preserve grab offset, stack when they overlap, and show hover tooltips.
 

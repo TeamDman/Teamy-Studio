@@ -142,6 +142,11 @@ impl AudioInputDeviceWindowState {
         self.start_playback(1.0)
     }
 
+    // audio[impl gui.transcription-toggle]
+    pub fn toggle_transcription(&mut self) {
+        self.runtime.transcription.enabled = !self.runtime.transcription.enabled;
+    }
+
     pub fn pause_playback(&mut self) {
         self.sync_playback_head();
         stop_windows_playback();
@@ -420,6 +425,7 @@ impl Drop for AudioInputDeviceWindowState {
 pub struct AudioInputRuntimeState {
     shared: Arc<Mutex<AudioInputSharedBuffer>>,
     pub playback: AudioInputPlaybackState,
+    pub transcription: AudioInputTranscriptionState,
     pub transcription_head_seconds: f64,
     pub recording_head_seconds: f64,
     pub selection: Option<AudioInputSelection>,
@@ -431,12 +437,19 @@ impl Default for AudioInputRuntimeState {
         Self {
             shared: Arc::new(Mutex::new(AudioInputSharedBuffer::default())),
             playback: AudioInputPlaybackState::default(),
+            transcription: AudioInputTranscriptionState::default(),
             transcription_head_seconds: 0.0,
             recording_head_seconds: 0.0,
             selection: None,
             timeline_drag: None,
         }
     }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AudioInputTranscriptionState {
+    pub enabled: bool,
+    pub staged_text: String,
 }
 
 impl AudioInputRuntimeState {

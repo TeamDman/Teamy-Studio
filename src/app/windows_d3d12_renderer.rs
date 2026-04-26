@@ -257,6 +257,7 @@ pub enum PanelEffect {
     TimelineHeadGrabber = 25,
     DemoToggle = 26,
     PlaybackButton = 27,
+    TranscriptionToggle = 28,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]

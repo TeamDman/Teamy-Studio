@@ -355,6 +355,38 @@ float4 apply_playback_button(float2 uv, float4 color, float4 state) {
     return float4(shaded, alpha * color.a);
 }
 
+float transcription_icon(float2 uv) {
+    float stem = line_segment_mask(uv, float2(0.50, 0.22), float2(0.50, 0.78), 0.030);
+    float left_wave = line_segment_mask(uv, float2(0.28, 0.62), float2(0.42, 0.50), 0.028)
+        + line_segment_mask(uv, float2(0.28, 0.38), float2(0.42, 0.50), 0.028);
+    float right_wave = line_segment_mask(uv, float2(0.58, 0.50), float2(0.74, 0.34), 0.028)
+        + line_segment_mask(uv, float2(0.58, 0.50), float2(0.74, 0.66), 0.028);
+    float spark = ring_mask(uv, float2(0.50, 0.50), 0.12, 0.030);
+    return saturate(stem + left_wave + right_wave + spark);
+}
+
+float4 apply_transcription_toggle(float2 uv, float4 color, float4 state) {
+    float enabled = state.x;
+    float hover = state.y;
+    float pressed = state.z;
+    float t = PanelTime();
+    float2 p = uv - 0.5;
+    float radius = length(p);
+    float plate = 1.0 - smoothstep(0.42, 0.50, radius);
+    float rim = 1.0 - smoothstep(0.31, 0.45, radius);
+    float swirl = 0.5 + (0.5 * sin((atan2(p.y, p.x) * 4.0) - (t * (1.2 + enabled * 2.0))));
+    float pulse = 0.5 + (0.5 * sin(t * (2.0 + enabled * 2.8)));
+    float heat = exp(-pow(max(radius - 0.14, 0.0) / 0.24, 2.0)) * enabled;
+    float3 offColor = float3(0.25, 0.17, 0.12);
+    float3 onColor = float3(0.76, 0.45, 0.16);
+    float3 shaded = lerp(offColor, onColor, enabled) * (0.78 + hover * 0.12 + swirl * 0.07 + pulse * enabled * 0.10 - pressed * 0.10);
+    shaded += float3(1.00, 0.78, 0.42) * (rim * (0.10 + hover * 0.08 + enabled * 0.16) + heat * 0.20);
+    float icon = transcription_icon(uv);
+    shaded = lerp(shaded, float3(1.00, 0.96, 0.82), icon * (0.78 + hover * 0.12));
+    float alpha = saturate((plate * 0.96) + (rim * 0.18) + heat * 0.08);
+    return float4(shaded, alpha * color.a);
+}
+
 float4 apply_timeline_head_grabber(float2 uv, float4 color, float4 state) {
     float active = state.x;
     float hover = state.y;

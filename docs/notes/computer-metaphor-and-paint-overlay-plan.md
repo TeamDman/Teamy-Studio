@@ -45,8 +45,9 @@ The guiding idea from the source note is that Teamy Studio should not merely mim
   - Began extending selectable text beyond diagnostics by making the selected microphone details render through the same text-grid selection model used for copyable diagnostics text.
   - Finished and validated the microphone transport polish slice: the selected microphone window now has a shader-rendered play/pause button, scene-window Ctrl+C copies active selectable text, and scene-window Ctrl+D closes the window.
   - Validated the microphone playback/scene-shortcut slice with `./check-all.ps1`: format, clippy, build, tests, and Tracey status passed. Tracey reported `teamy-studio-windowing/rust: 37 of 37 requirements are covered. 30 of 37 have a verification reference.`
+  - Redirected the immediate next work from paint chrome to transcription: the selected microphone window now hosts a transcription toggle, mel-preview region, and terminal-styled transcript island below the audio buffer.
 - Current focus:
-  - Continue the plan with the first shared paint-mode chrome button, keeping it small: button state, hit testing, tooltip, and visible active/inactive rendering before overlay drawing grows larger.
+  - Use the microphone timeline as the first real proving ground for Rust-owned feature preparation, shared-memory Python handoff, and staged transcript results.
 - Remaining work:
   - Add Tracey requirements for each new behavior area before implementation lands.
   - Add shallow launcher stubs for the new surfaces.
@@ -55,7 +56,7 @@ The guiding idea from the source note is that Teamy Studio should not merely mim
   - Add application-window inspection using the Cursor Hero lessons.
   - Add environment variable, input-device, file-extension, shape, SDF, and timeline explorer surfaces as progressively richer windows.
 - Next step:
-  - Add the first shared paint-mode chrome button beside diagnostics, with Tracey requirements and tests, while keeping actual overlay drawing deferred unless the button path is stable.
+  - Continue in `docs/notes/audio-input-inbox-plan.md` with the `WhisperLogMel80x3000` newtype and shared-memory slot contract before returning to paint chrome.
 
 ## Source Ideas Extracted
 
