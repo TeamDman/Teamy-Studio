@@ -105,4 +105,16 @@ specs (
             }
         )
     }
+    {
+        name teamy-studio-timeline
+        source_url https://github.com/TeamDman/Teamy-Studio
+        include (docs/spec/product/timeline.md)
+        impls (
+            {
+                name rust
+                include (src/**/*.rs)
+                test_include (tests/**/*.rs)
+            }
+        )
+    }
 )

@@ -2285,7 +2285,10 @@ fn handle_scene_key_down_message(
             }
         }
 
-        if state.scene_kind == SceneWindowKind::Launcher {
+        if matches!(
+            state.scene_kind,
+            SceneWindowKind::Launcher | SceneWindowKind::TimelineStart
+        ) {
             // windowing[impl launcher.keyboard-navigation]
             if let Some(navigation) =
                 launcher_menu_navigation_from_virtual_key(virtual_key, shift_key_is_down())
@@ -2416,17 +2419,7 @@ fn handle_scene_key_down_message(
             LRESULT(0)
         }
         Ok(SceneKeyAction::InvokeSceneAction(action)) => {
-            let result =
-                with_scene_app_state(|state| Ok((state.app_home.clone(), state.vt_engine)))
-                    .and_then(|(app_home, vt_engine)| {
-                        perform_scene_action(&app_home, vt_engine, action)
-                    })
-                    .and_then(|disposition| {
-                        with_scene_app_state(|state| {
-                            render_scene_window_frame(state, hwnd, None, false)
-                        })?;
-                        Ok(disposition)
-                    });
+            let result = invoke_scene_action(hwnd, action);
             match result {
                 Ok(SceneActionDisposition::KeepOpen) => LRESULT(0),
                 Ok(SceneActionDisposition::CloseWindow) => {
@@ -2800,10 +2793,7 @@ fn handle_scene_left_button_down(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Re
             Ok(true)
         }
         ScenePointerAction::Invoke(action) => {
-            let (app_home, vt_engine) =
-                with_scene_app_state(|state| Ok((state.app_home.clone(), state.vt_engine)))?;
-            let disposition = perform_scene_action(&app_home, vt_engine, action)?;
-            with_scene_app_state(|state| render_scene_window_frame(state, hwnd, None, false))?;
+            let disposition = invoke_scene_action(hwnd, action)?;
             if disposition == SceneActionDisposition::CloseWindow {
                 hwnd.post_close();
             }
@@ -3958,6 +3948,8 @@ fn render_scene_window_frame(
             scramble_input_device_identifiers,
             demo_mode_visual_state(state, layout),
         )
+    } else if state.scene_kind == SceneWindowKind::Timeline {
+        windows_scene::build_blank_timeline_render_scene(layout, window_chrome_buttons_state)
     } else {
         windows_scene::build_scene_render_scene(
             layout,
@@ -4055,8 +4047,10 @@ fn scene_button_visual_states(
         .enumerate()
         .map(|(index, (spec, button_layout))| {
             let pressed = state.pressed_target == Some(ScenePressedTarget::Action(spec.action));
-            let selected = state.scene_kind == SceneWindowKind::Launcher
-                && index == state.scene_action_selected_index;
+            let selected = matches!(
+                state.scene_kind,
+                SceneWindowKind::Launcher | SceneWindowKind::TimelineStart
+            ) && index == state.scene_action_selected_index;
             let last_clicked = state
                 .last_clicked_action
                 .filter(|click| click.action == spec.action)
@@ -5003,6 +4997,28 @@ fn selected_scene_action(state: &SceneAppState) -> Option<SceneAction> {
         .map(|spec| spec.action)
 }
 
+fn invoke_scene_action(
+    hwnd: WindowHandle,
+    action: SceneAction,
+) -> eyre::Result<SceneActionDisposition> {
+    if action == SceneAction::CreateBlankTimeline {
+        return with_scene_app_state(|state| {
+            // timeline[impl start-window.new-blank]
+            state.scene_kind = SceneWindowKind::Timeline;
+            state.scene_action_selected_index = 0;
+            state.scene_virtual_cursor = None;
+            render_scene_window_frame(state, hwnd, None, false)?;
+            Ok(SceneActionDisposition::KeepOpen)
+        });
+    }
+
+    let (app_home, vt_engine) =
+        with_scene_app_state(|state| Ok((state.app_home.clone(), state.vt_engine)))?;
+    let disposition = perform_scene_action(&app_home, vt_engine, action)?;
+    with_scene_app_state(|state| render_scene_window_frame(state, hwnd, None, false))?;
+    Ok(disposition)
+}
+
 #[expect(
     clippy::too_many_lines,
     reason = "scene action dispatch is intentionally centralized for small launcher actions"
@@ -5160,6 +5176,32 @@ fn perform_scene_action(
                     }
                 })
                 .wrap_err("failed to spawn Teamy Studio audio input device picker thread")?;
+            Ok(SceneActionDisposition::KeepOpen)
+        }
+        SceneAction::OpenTimeline => {
+            // timeline[impl launcher.button]
+            let app_home = app_home.clone();
+            thread::Builder::new()
+                .name("teamy-studio-timeline".to_owned())
+                .spawn(move || {
+                    if let Err(error) =
+                        run_scene_window(&app_home, SceneWindowKind::TimelineStart, vt_engine, None)
+                    {
+                        error!(?error, "failed to open timeline window");
+                    }
+                })
+                .wrap_err("failed to spawn Teamy Studio timeline thread")?;
+            Ok(SceneActionDisposition::KeepOpen)
+        }
+        SceneAction::CreateBlankTimeline => Ok(SceneActionDisposition::KeepOpen),
+        SceneAction::ImportTimeline => {
+            // timeline[impl start-window.import-placeholder]
+            let _ = MessageDialog::new()
+                .set_level(MessageLevel::Info)
+                .set_title("Import Timeline")
+                .set_description("Tracy capture import is not implemented yet.")
+                .set_buttons(MessageButtons::Ok)
+                .show();
             Ok(SceneActionDisposition::KeepOpen)
         }
         SceneAction::SelectWindowsBell => {

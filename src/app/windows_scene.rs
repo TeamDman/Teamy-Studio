@@ -52,6 +52,8 @@ pub enum SceneWindowKind {
     AudioInputDeviceDetails,
     CursorGallery,
     DemoMode,
+    TimelineStart,
+    Timeline,
 }
 
 impl SceneWindowKind {
@@ -65,6 +67,7 @@ impl SceneWindowKind {
             Self::AudioInputDeviceDetails => "Microphone",
             Self::CursorGallery => "Cursor Gallery",
             Self::DemoMode => "Demo Mode",
+            Self::TimelineStart | Self::Timeline => "Timeline",
         }
     }
 }
@@ -81,6 +84,9 @@ pub enum SceneAction {
     OpenAudioPicker,
     OpenAudioDaemon,
     OpenAudioInputDevices,
+    OpenTimeline,
+    CreateBlankTimeline,
+    ImportTimeline,
     SelectWindowsBell,
     SelectFileBell,
 }
@@ -356,12 +362,17 @@ pub fn build_scene_render_scene(
 }
 
 #[must_use]
+#[expect(
+    clippy::too_many_lines,
+    reason = "launcher and auxiliary scene card specifications are intentionally centralized"
+)]
 // windowing[impl launcher.buttons.terminal]
 // windowing[impl launcher.buttons.storage-placeholder]
 // windowing[impl launcher.buttons.environment-variables-placeholder]
 // windowing[impl launcher.buttons.application-windows-placeholder]
 // windowing[impl launcher.buttons.audio-picker]
 // windowing[impl launcher.buttons.cursor-gallery]
+// timeline[impl launcher.button]
 // audio[impl gui.daemon-button]
 // windowing[impl audio-picker.buttons.windows]
 // windowing[impl audio-picker.buttons.file]
@@ -441,6 +452,33 @@ pub fn scene_button_specs(scene_kind: SceneWindowKind) -> &'static [SceneButtonS
                 sprite: SpriteId::Audio,
                 color: [0.13, 0.25, 0.32, 1.0],
             },
+            SceneButtonSpec {
+                action: SceneAction::OpenTimeline,
+                label: "Timeline",
+                tooltip: "Open timeline workspace",
+                sprite: SpriteId::Terminal,
+                color: [0.15, 0.23, 0.27, 1.0],
+            },
+        ],
+        SceneWindowKind::TimelineStart => &[
+            SceneButtonSpec {
+                // timeline[impl start-window.create-or-import]
+                // timeline[impl start-window.new-blank]
+                action: SceneAction::CreateBlankTimeline,
+                label: "New",
+                tooltip: "Create a blank timeline",
+                sprite: SpriteId::Terminal,
+                color: [0.14, 0.28, 0.24, 1.0],
+            },
+            SceneButtonSpec {
+                // timeline[impl start-window.create-or-import]
+                // timeline[impl start-window.import-placeholder]
+                action: SceneAction::ImportTimeline,
+                label: "Import",
+                tooltip: "Import a Tracy capture",
+                sprite: SpriteId::FileAudio,
+                color: [0.23, 0.19, 0.30, 1.0],
+            },
         ],
         SceneWindowKind::AudioPicker => &[
             SceneButtonSpec {
@@ -459,11 +497,106 @@ pub fn scene_button_specs(scene_kind: SceneWindowKind) -> &'static [SceneButtonS
             },
         ],
         SceneWindowKind::CursorGallery
+        | SceneWindowKind::Timeline
         | SceneWindowKind::DemoMode
         | SceneWindowKind::AudioDaemon
         | SceneWindowKind::AudioInputDevicePicker
         | SceneWindowKind::AudioInputDeviceDetails => &[],
     }
+}
+
+#[must_use]
+// timeline[impl blank.track-list]
+// timeline[impl blank.add-track-placeholder]
+pub fn build_blank_timeline_render_scene(
+    layout: TerminalLayout,
+    window_chrome_buttons_state: WindowChromeButtonsState,
+) -> RenderScene {
+    let mut scene = build_scene_shell(
+        layout,
+        SceneWindowKind::Timeline,
+        window_chrome_buttons_state,
+    );
+    let body_rect = layout.terminal_panel_rect().inset(24);
+    push_panel(
+        &mut scene,
+        body_rect.to_win32_rect(),
+        [0.08, 0.09, 0.11, 1.0],
+        PanelEffect::SceneBody,
+    );
+
+    let track_list_width = (body_rect.width() / 4).clamp(180, 300);
+    let ruler_height = 54;
+    let gap = 12;
+    let track_list_rect = ClientRect::new(
+        body_rect.left(),
+        body_rect.top(),
+        body_rect.left() + track_list_width,
+        body_rect.bottom(),
+    );
+    let add_track_rect = ClientRect::new(
+        track_list_rect.left() + 14,
+        track_list_rect.top() + 14,
+        track_list_rect.right() - 14,
+        track_list_rect.top() + 58,
+    );
+    let ruler_rect = ClientRect::new(
+        track_list_rect.right() + gap,
+        body_rect.top(),
+        body_rect.right(),
+        body_rect.top() + ruler_height,
+    );
+    let content_rect = ClientRect::new(
+        ruler_rect.left(),
+        ruler_rect.bottom() + gap,
+        body_rect.right(),
+        body_rect.bottom(),
+    );
+
+    push_panel(
+        &mut scene,
+        track_list_rect.to_win32_rect(),
+        [0.11, 0.12, 0.15, 1.0],
+        PanelEffect::SceneButtonCard,
+    );
+    push_panel(
+        &mut scene,
+        add_track_rect.to_win32_rect(),
+        [0.15, 0.18, 0.20, 1.0],
+        PanelEffect::SceneButtonCard,
+    );
+    push_centered_text(
+        &mut scene,
+        add_track_rect.to_win32_rect(),
+        "Add Track",
+        [0.82, 0.86, 0.90, 1.0],
+    );
+    push_panel(
+        &mut scene,
+        ruler_rect.to_win32_rect(),
+        [0.12, 0.13, 0.16, 1.0],
+        PanelEffect::TerminalPanel,
+    );
+    push_centered_text(
+        &mut scene,
+        ruler_rect.to_win32_rect(),
+        "0 ns",
+        [0.74, 0.78, 0.84, 1.0],
+    );
+    push_panel(
+        &mut scene,
+        content_rect.to_win32_rect(),
+        [0.07, 0.08, 0.10, 1.0],
+        PanelEffect::TerminalFill,
+    );
+    push_centered_text(
+        &mut scene,
+        content_rect.to_win32_rect(),
+        "Blank timeline",
+        [0.68, 0.72, 0.78, 1.0],
+    );
+
+    scene
 }
 
 #[must_use]
@@ -3756,6 +3889,7 @@ mod tests {
     // windowing[verify launcher.buttons.cursor-gallery]
     // windowing[verify launcher.buttons.demo-mode]
     // windowing[verify launcher.buttons.audio-picker]
+    // timeline[verify launcher.button]
     // audio[verify gui.daemon-button]
     #[test]
     fn launcher_scene_specs_expose_primary_actions() {
@@ -3806,6 +3940,48 @@ mod tests {
                 .iter()
                 .any(|spec| spec.action == SceneAction::OpenAudioDaemon)
         );
+        assert!(
+            specs
+                .iter()
+                .any(|spec| spec.action == SceneAction::OpenTimeline)
+        );
+    }
+
+    // timeline[verify start-window.create-or-import]
+    // timeline[verify start-window.new-blank]
+    // timeline[verify start-window.import-placeholder]
+    #[test]
+    fn timeline_start_scene_specs_expose_new_and_import() {
+        let specs = scene_button_specs(SceneWindowKind::TimelineStart);
+
+        assert_eq!(specs.len(), 2);
+        assert_eq!(specs[0].action, SceneAction::CreateBlankTimeline);
+        assert_eq!(specs[0].label, "New");
+        assert_eq!(specs[1].action, SceneAction::ImportTimeline);
+        assert_eq!(specs[1].label, "Import");
+    }
+
+    // timeline[verify blank.track-list]
+    // timeline[verify blank.add-track-placeholder]
+    #[test]
+    fn blank_timeline_render_scene_has_track_ruler_and_content_regions() {
+        let scene =
+            build_blank_timeline_render_scene(sample_layout(), WindowChromeButtonsState::default());
+
+        assert!(scene.panels.len() >= 7);
+        assert!(scene.glyphs.len() >= "Add TrackBlank timeline".chars().count());
+        assert!(
+            scene
+                .panels
+                .iter()
+                .any(|panel| matches!(panel.effect, PanelEffect::TerminalPanel))
+        );
+        assert!(
+            scene
+                .panels
+                .iter()
+                .any(|panel| matches!(panel.effect, PanelEffect::TerminalFill))
+        );
     }
 
     // windowing[verify audio-picker.buttons.windows]
@@ -3830,6 +4006,7 @@ mod tests {
     // windowing[verify launcher.keyboard-navigation]
     #[test]
     // audio[verify gui.launcher-button]
+    // timeline[verify launcher.button]
     fn launcher_scene_uses_card_panels_for_primary_actions() {
         let scene = build_scene_render_scene(
             sample_layout(),
@@ -3844,9 +4021,10 @@ mod tests {
             .iter()
             .filter(|panel| matches!(panel.effect, PanelEffect::SceneButtonCard))
             .count();
+        let expected_count = scene_button_specs(SceneWindowKind::Launcher).len();
 
-        assert_eq!(card_count, 10);
-        assert_eq!(scene.sprites.len(), 10);
+        assert_eq!(card_count, expected_count);
+        assert_eq!(scene.sprites.len(), expected_count);
     }
 
     #[test]
