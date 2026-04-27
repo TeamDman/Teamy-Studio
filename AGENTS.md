@@ -6,3 +6,5 @@ Tracey spec is located [here](.config\tracey\config.styx), this is where the obs
 Additional documentation that captures historical decision making is located [here](docs/notes).
 
 Use [.\check-all.ps1](check-all.ps1) instead of `cargo check`
+
+You MUST NOT use alternate $env:CARGO_TARGET_DIR values. If a build or something fails because a `.exe` is locked because the user has it open, you should run `.\stop.ps1` which will terminate the program so you may continue; we are in building phase, no important data will be lost.
