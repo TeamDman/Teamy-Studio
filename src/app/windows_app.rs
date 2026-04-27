@@ -59,7 +59,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::core::{BOOL, PCWSTR, w};
 
 use crate::paths::{AppHome, CacheHome};
-use crate::timeline::{TimelineDocument, TimelineTimeNs, TimelineTimeRangeNs, TimelineViewport};
+use crate::timeline::{
+    TimelineDocument, TimelineTimeNs, TimelineTimeRangeNs, TimelineTrackId, TimelineViewport,
+};
 use crate::win32_support::clipboard::{read_clipboard, write_clipboard};
 use crate::win32_support::module::get_current_module;
 use crate::win32_support::string::{EasyPCWSTR, PWSTRBuffer};
@@ -414,6 +416,10 @@ enum ScenePressedTarget {
     Action(SceneAction),
     TimelineTransportPlayPause,
     TimelineTrackRecord(usize),
+    TimelineTrackPlayback(usize),
+    TimelineTrackLoopback(usize),
+    TimelineTrackTranscriptionToggle(usize),
+    TimelineTrackTranscriptionSettings(usize),
     TimelineAudioHead(AudioInputTimelineHeadKind),
     AudioInputDevice(usize),
     AudioInputDeviceArm,
@@ -430,6 +436,20 @@ enum ScenePressedTarget {
     DemoModeScrambleToggle,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum AudioInputPickerCompletion {
+    #[default]
+    OpenDeviceWindow,
+    TimelineMicrophoneTrack,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum TimelineInteractionTool {
+    #[default]
+    Select,
+    Brush,
+}
+
 #[expect(
     clippy::struct_excessive_bools,
     reason = "window interaction state is tracked independently for input routing"
@@ -441,10 +461,13 @@ struct SceneAppState {
     scene_kind: SceneWindowKind,
     vt_engine: VtEngineChoice,
     audio_input_picker: AudioInputPickerState,
+    audio_input_picker_completion: AudioInputPickerCompletion,
     audio_input_device_window: Option<AudioInputDeviceWindowState>,
     timeline_document: Option<TimelineDocument>,
+    timeline_tool: TimelineInteractionTool,
     timeline_selection: Option<windows_scene::TimelineRectSelection>,
     pending_timeline_selection: Option<PendingTimelineSelection>,
+    pending_timeline_text_block: Option<PendingTimelineTextBlock>,
     timeline_pan_drag: Option<TimelinePanDrag>,
     timeline_zoom_animation: Option<TimelineZoomAnimation>,
     timeline_vertical_scroll_offset: i32,
@@ -925,6 +948,14 @@ struct PendingTimelineSelection {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
+struct PendingTimelineTextBlock {
+    origin: ClientPoint,
+    anchor_time: TimelineTimeNs,
+    track_index: usize,
+    track_id: TimelineTrackId,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
 struct TimelinePanDrag {
     origin: ClientPoint,
     origin_viewport: TimelineViewport,
@@ -1030,7 +1061,7 @@ enum SceneKeyAction {
     NotHandled,
     Handled,
     CloseWindow,
-    OpenAudioInputDeviceWindow(Option<AudioInputDeviceSummary>),
+    CommitAudioInputPickerSelection(Option<AudioInputDeviceSummary>),
     InvokeSceneAction(SceneAction),
     CopySelectedText(String),
     ToggleAudioInputRecording,
@@ -1385,10 +1416,13 @@ fn run_scene_window(
             scene_kind,
             vt_engine,
             audio_input_picker,
+            audio_input_picker_completion: AudioInputPickerCompletion::default(),
             audio_input_device_window,
             timeline_document: None,
+            timeline_tool: TimelineInteractionTool::default(),
             timeline_selection: None,
             pending_timeline_selection: None,
+            pending_timeline_text_block: None,
             timeline_pan_drag: None,
             timeline_zoom_animation: None,
             timeline_vertical_scroll_offset: 0,
@@ -2466,13 +2500,27 @@ fn handle_scene_key_down_message(
             AudioInputPickerKeyResult::Choose => {
                 let description = state.audio_input_picker.selected_device().cloned();
                 render_scene_window_frame(state, hwnd, None, false)?;
-                Ok(SceneKeyAction::OpenAudioInputDeviceWindow(description))
+                Ok(SceneKeyAction::CommitAudioInputPickerSelection(description))
             }
             AudioInputPickerKeyResult::OpenLegacyRecordingDevices => {
                 render_scene_window_frame(state, hwnd, None, false)?;
                 Ok(SceneKeyAction::OpenLegacyRecordingDevices)
             }
-            AudioInputPickerKeyResult::Close => Ok(SceneKeyAction::CloseWindow),
+            AudioInputPickerKeyResult::Close => {
+                if state.audio_input_picker_completion
+                    == AudioInputPickerCompletion::TimelineMicrophoneTrack
+                {
+                    state.audio_input_picker_completion =
+                        AudioInputPickerCompletion::OpenDeviceWindow;
+                    state.scene_kind = SceneWindowKind::TimelineAddTrack;
+                    state.scene_action_selected_index = 0;
+                    state.scene_virtual_cursor = None;
+                    render_scene_window_frame(state, hwnd, None, false)?;
+                    Ok(SceneKeyAction::Handled)
+                } else {
+                    Ok(SceneKeyAction::CloseWindow)
+                }
+            }
         }
     });
 
@@ -2496,8 +2544,8 @@ fn handle_scene_key_down_message(
             hwnd.post_close();
             LRESULT(0)
         }
-        Ok(SceneKeyAction::OpenAudioInputDeviceWindow(device)) => {
-            open_audio_input_device_window_from_scene(hwnd, device);
+        Ok(SceneKeyAction::CommitAudioInputPickerSelection(device)) => {
+            commit_audio_input_picker_selection_from_scene(hwnd, device);
             LRESULT(0)
         }
         Ok(SceneKeyAction::InvokeSceneAction(action)) => {
@@ -2655,6 +2703,7 @@ fn handle_scene_left_button_down(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Re
         state.pressed_target = None;
         state.diagnostic_selection_drag_point = None;
         state.pending_timeline_selection = None;
+        state.pending_timeline_text_block = None;
         state.timeline_pan_drag = None;
         let layout = scene_client_layout(hwnd, state)?;
 
@@ -2724,6 +2773,42 @@ fn handle_scene_left_button_down(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Re
             return Ok(ScenePointerAction::ToggleAudioInputPlayback);
         }
 
+        if let Some(track_index) = timeline_track_playback_button_at_point(state, layout, point) {
+            state.pending_diagnostic_selection = None;
+            state.pressed_target = Some(ScenePressedTarget::TimelineTrackPlayback(track_index));
+            hwnd.capture_mouse();
+            return Ok(ScenePointerAction::ToggleAudioInputPlayback);
+        }
+
+        if let Some(track_index) = timeline_track_loopback_button_at_point(state, layout, point) {
+            state.pending_diagnostic_selection = None;
+            state.pressed_target = Some(ScenePressedTarget::TimelineTrackLoopback(track_index));
+            hwnd.capture_mouse();
+            return Ok(ScenePointerAction::ToggleAudioInputLoopback);
+        }
+
+        if let Some(track_index) =
+            timeline_track_transcription_toggle_button_at_point(state, layout, point)
+        {
+            state.pending_diagnostic_selection = None;
+            state.pressed_target = Some(ScenePressedTarget::TimelineTrackTranscriptionToggle(
+                track_index,
+            ));
+            hwnd.capture_mouse();
+            return Ok(ScenePointerAction::ToggleAudioInputTranscription);
+        }
+
+        if let Some(track_index) =
+            timeline_track_transcription_settings_button_at_point(state, layout, point)
+        {
+            state.pending_diagnostic_selection = None;
+            state.pressed_target = Some(ScenePressedTarget::TimelineTrackTranscriptionSettings(
+                track_index,
+            ));
+            hwnd.capture_mouse();
+            return Ok(ScenePointerAction::Invoke(SceneAction::OpenAudioDaemon));
+        }
+
         if let Some(track_index) = timeline_track_record_button_at_point(state, layout, point) {
             // timeline[impl recording.append-live]
             state.pending_diagnostic_selection = None;
@@ -2739,6 +2824,29 @@ fn handle_scene_left_button_down(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Re
             if let Some(device_window) = state.audio_input_device_window.as_mut() {
                 device_window.begin_head_interaction(head, seconds);
             }
+            hwnd.capture_mouse();
+            return Ok(ScenePointerAction::RenderOnly);
+        }
+
+        if state.timeline_tool == TimelineInteractionTool::Brush
+            && let Some((track_index, track_id)) =
+                timeline_text_track_at_point(state, layout, point)
+        {
+            state.pending_diagnostic_selection = None;
+            state.diagnostic_selection = None;
+            state.timeline_selection = Some(windows_scene::TimelineRectSelection::new(
+                TimelineTimeRangeNs::new(
+                    timeline_time_from_client_point(state, layout, point),
+                    timeline_time_from_client_point(state, layout, point),
+                ),
+                windows_scene::timeline_track_vertical_range(track_index),
+            ));
+            state.pending_timeline_text_block = Some(PendingTimelineTextBlock {
+                origin: point,
+                anchor_time: timeline_time_from_client_point(state, layout, point),
+                track_index,
+                track_id,
+            });
             hwnd.capture_mouse();
             return Ok(ScenePointerAction::RenderOnly);
         }
@@ -2953,7 +3061,7 @@ fn handle_scene_left_button_down(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Re
             let device = with_scene_app_state(|state| {
                 Ok(state.audio_input_picker.devices.get(index).cloned())
             })?;
-            open_audio_input_device_window_from_scene(hwnd, device);
+            commit_audio_input_picker_selection_from_scene(hwnd, device);
             with_scene_app_state(|state| render_scene_window_frame(state, hwnd, None, false))?;
             Ok(true)
         }
@@ -3065,6 +3173,21 @@ fn handle_scene_left_button_up(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Resu
             return Ok(ScenePointerAction::RenderOnly);
         }
 
+        if let Some(pending_text_block) = state.pending_timeline_text_block.take() {
+            let layout = scene_client_layout(hwnd, state)?;
+            state.timeline_selection = None;
+            let end_time = timeline_time_from_client_point(state, layout, point);
+            if point != pending_text_block.origin
+                && let Some(document) = state.timeline_document.as_mut()
+            {
+                let _ = document.append_empty_text_block(
+                    pending_text_block.track_id,
+                    TimelineTimeRangeNs::new(pending_text_block.anchor_time, end_time),
+                );
+            }
+            return Ok(ScenePointerAction::RenderOnly);
+        }
+
         if let Some(pending_selection) = state.pending_timeline_selection.take() {
             let layout = scene_client_layout(hwnd, state)?;
             state.timeline_selection =
@@ -3156,7 +3279,7 @@ fn handle_scene_left_button_up(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Resu
             let device = with_scene_app_state(|state| {
                 Ok(state.audio_input_picker.devices.get(index).cloned())
             })?;
-            open_audio_input_device_window_from_scene(hwnd, device);
+            commit_audio_input_picker_selection_from_scene(hwnd, device);
             with_scene_app_state(|state| render_scene_window_frame(state, hwnd, None, false))?;
             Ok(true)
         }
@@ -3291,6 +3414,32 @@ fn handle_scene_mouse_move(
         Ok(true)
     })?;
     if timeline_selection_dragging {
+        with_scene_app_state(|state| render_scene_window_frame(state, hwnd, None, false))?;
+        return Ok(true);
+    }
+
+    let timeline_text_block_dragging = with_scene_app_state(|state| {
+        let Some(pending_text_block) = state.pending_timeline_text_block else {
+            return Ok(false);
+        };
+
+        if (wparam.0 & 0x0001) == 0 {
+            state.pending_timeline_text_block = None;
+            state.timeline_selection = None;
+            return Ok(true);
+        }
+
+        let layout = scene_client_layout(hwnd, state)?;
+        state.timeline_selection = Some(windows_scene::TimelineRectSelection::new(
+            TimelineTimeRangeNs::new(
+                pending_text_block.anchor_time,
+                timeline_time_from_client_point(state, layout, point),
+            ),
+            windows_scene::timeline_track_vertical_range(pending_text_block.track_index),
+        ));
+        Ok(true)
+    })?;
+    if timeline_text_block_dragging {
         with_scene_app_state(|state| render_scene_window_frame(state, hwnd, None, false))?;
         return Ok(true);
     }
@@ -4419,12 +4568,18 @@ fn scene_button_visual_states(
         .collect()
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "timeline visual-state assembly keeps the row-control hover and pressed wiring localized to the owning timeline scene state"
+)]
 fn timeline_document_visual_state(
     state: &SceneAppState,
     layout: TerminalLayout,
 ) -> windows_scene::TimelineDocumentVisualState {
     let point = state.pointer_position;
     let timeline_layout = timeline_layout(layout);
+    let live_audio_track_index = timeline_live_audio_track_index(state);
+    let live_transcription_track_index = timeline_live_transcription_track_index(state);
     let vertical_scroll_offset = windows_scene::timeline_clamp_vertical_scroll_offset(
         timeline_layout,
         timeline_track_count(state),
@@ -4474,7 +4629,7 @@ fn timeline_document_visual_state(
             false,
             Instant::now(),
         ),
-        microphone_record_button: timeline_live_audio_track_index(state)
+        microphone_record_button: live_audio_track_index
             .and_then(|row_index| {
                 windows_scene::timeline_track_record_button_rect(timeline_layout, row_index)
             })
@@ -4483,17 +4638,84 @@ fn timeline_document_visual_state(
                     rect,
                     point,
                     state.pressed_target
-                        == timeline_live_audio_track_index(state)
-                            .map(ScenePressedTarget::TimelineTrackRecord),
+                        == live_audio_track_index.map(ScenePressedTarget::TimelineTrackRecord),
                     None,
                     false,
                     Instant::now(),
                 )
             }),
+        microphone_playback_hovered: live_audio_track_index
+            .and_then(|row_index| {
+                windows_scene::timeline_track_playback_button_rect(timeline_layout, row_index)
+            })
+            .is_some_and(|rect| point.is_some_and(|point| rect.contains(point))),
+        microphone_playback_pressed: state.pressed_target
+            == live_audio_track_index.map(ScenePressedTarget::TimelineTrackPlayback),
+        microphone_loopback_hovered: live_audio_track_index
+            .and_then(|row_index| {
+                windows_scene::timeline_track_loopback_button_rect(timeline_layout, row_index)
+            })
+            .is_some_and(|rect| point.is_some_and(|point| rect.contains(point))),
+        microphone_loopback_pressed: state.pressed_target
+            == live_audio_track_index.map(ScenePressedTarget::TimelineTrackLoopback),
+        transcription_toggle_hovered: live_transcription_track_index
+            .and_then(|row_index| {
+                windows_scene::timeline_track_transcription_toggle_button_rect(
+                    timeline_layout,
+                    row_index,
+                )
+            })
+            .is_some_and(|rect| point.is_some_and(|point| rect.contains(point))),
+        transcription_toggle_pressed: state.pressed_target
+            == live_transcription_track_index
+                .map(ScenePressedTarget::TimelineTrackTranscriptionToggle),
+        transcription_settings_hovered: live_transcription_track_index
+            .and_then(|row_index| {
+                windows_scene::timeline_track_transcription_settings_button_rect(
+                    timeline_layout,
+                    row_index,
+                )
+            })
+            .is_some_and(|rect| point.is_some_and(|point| rect.contains(point))),
+        transcription_settings_pressed: state.pressed_target
+            == live_transcription_track_index
+                .map(ScenePressedTarget::TimelineTrackTranscriptionSettings),
         pan_left_button: control_visual_state(SceneAction::PanTimelineLeft),
         pan_right_button: control_visual_state(SceneAction::PanTimelineRight),
         zoom_in_button: control_visual_state(SceneAction::ZoomTimelineIn),
         zoom_out_button: control_visual_state(SceneAction::ZoomTimelineOut),
+        select_tool_button: windows_scene::compute_button_visual_state(
+            windows_scene::timeline_viewport_control_rect(
+                timeline_layout,
+                SceneAction::SelectTimelineTool,
+            )
+            .unwrap_or(timeline_layout.viewport_controls_rect),
+            point,
+            state.pressed_target
+                == Some(ScenePressedTarget::Action(SceneAction::SelectTimelineTool)),
+            state
+                .last_clicked_action
+                .filter(|click| click.action == SceneAction::SelectTimelineTool)
+                .map(|click| click.clicked_at),
+            state.timeline_tool == TimelineInteractionTool::Select,
+            Instant::now(),
+        ),
+        brush_tool_button: windows_scene::compute_button_visual_state(
+            windows_scene::timeline_viewport_control_rect(
+                timeline_layout,
+                SceneAction::SelectTimelineBrush,
+            )
+            .unwrap_or(timeline_layout.viewport_controls_rect),
+            point,
+            state.pressed_target
+                == Some(ScenePressedTarget::Action(SceneAction::SelectTimelineBrush)),
+            state
+                .last_clicked_action
+                .filter(|click| click.action == SceneAction::SelectTimelineBrush)
+                .map(|click| click.clicked_at),
+            state.timeline_tool == TimelineInteractionTool::Brush,
+            Instant::now(),
+        ),
         hovered_head: point.and_then(|point| timeline_audio_head_at_point(state, layout, point)),
         grabbed_head: match state.pressed_target {
             Some(ScenePressedTarget::TimelineAudioHead(kind)) => Some(kind),
@@ -4801,6 +5023,8 @@ fn timeline_viewport_control_at_point(
         SceneAction::PanTimelineRight,
         SceneAction::ZoomTimelineIn,
         SceneAction::ZoomTimelineOut,
+        SceneAction::SelectTimelineTool,
+        SceneAction::SelectTimelineBrush,
     ]
     .into_iter()
     .find(|action| {
@@ -4816,6 +5040,82 @@ fn timeline_live_audio_track_index(state: &SceneAppState) -> Option<usize> {
         .tracks()
         .iter()
         .position(|track| track.kind() == crate::timeline::TimelineTrackKind::Audio)
+}
+
+fn timeline_live_transcription_track_index(state: &SceneAppState) -> Option<usize> {
+    state
+        .timeline_document
+        .as_ref()?
+        .tracks()
+        .iter()
+        .position(|track| track.kind() == crate::timeline::TimelineTrackKind::Transcription)
+}
+
+fn timeline_text_track_at_point(
+    state: &SceneAppState,
+    layout: TerminalLayout,
+    point: ClientPoint,
+) -> Option<(usize, TimelineTrackId)> {
+    let document = state.timeline_document.as_ref()?;
+    let timeline_layout = timeline_layout(layout);
+    let row_index = windows_scene::timeline_track_index_at_point(
+        timeline_layout,
+        timeline_current_vertical_scroll_offset(state, layout),
+        document.tracks().len(),
+        point,
+    )?;
+    let track = document.tracks().get(row_index)?;
+    (track.kind() == crate::timeline::TimelineTrackKind::Text).then_some((row_index, track.id()))
+}
+
+fn timeline_text_block_tooltip_at_point(
+    state: &SceneAppState,
+    layout: TerminalLayout,
+    point: ClientPoint,
+) -> Option<(String, ClientRect)> {
+    let document = state.timeline_document.as_ref()?;
+    let timeline_layout = timeline_layout(layout);
+    let vertical_scroll_offset = timeline_current_vertical_scroll_offset(state, layout);
+    let viewport = current_timeline_zoom_viewport(state);
+
+    for (row_index, track) in document.tracks().iter().enumerate() {
+        if track.kind() != crate::timeline::TimelineTrackKind::Text {
+            continue;
+        }
+        let Some(row_rect) = windows_scene::timeline_track_row_rect(
+            timeline_layout.scrollport_rect,
+            row_index,
+            vertical_scroll_offset,
+        ) else {
+            continue;
+        };
+
+        for block in document
+            .text_blocks()
+            .iter()
+            .filter(|block| block.track_id() == track.id())
+        {
+            let Some(rect) = windows_scene::timeline_time_range_clip_rect(
+                row_rect,
+                timeline_layout.scrollport_rect,
+                viewport,
+                block.time_range(),
+                28,
+            ) else {
+                continue;
+            };
+            if rect.contains(point) {
+                let text = if block.text().is_empty() {
+                    "Empty text block".to_owned()
+                } else {
+                    block.text().to_owned()
+                };
+                return Some((text, rect));
+            }
+        }
+    }
+
+    None
 }
 
 fn timeline_transport_play_button_at_point(
@@ -4839,6 +5139,56 @@ fn timeline_track_record_button_at_point(
     windows_scene::timeline_track_record_button_rect(timeline_layout(layout), row_index)
         .filter(|rect| rect.contains(point))
         .map(|_| row_index)
+}
+
+fn timeline_track_playback_button_at_point(
+    state: &SceneAppState,
+    layout: TerminalLayout,
+    point: ClientPoint,
+) -> Option<usize> {
+    let row_index = timeline_live_audio_track_index(state)?;
+    windows_scene::timeline_track_playback_button_rect(timeline_layout(layout), row_index)
+        .filter(|rect| rect.contains(point))
+        .map(|_| row_index)
+}
+
+fn timeline_track_loopback_button_at_point(
+    state: &SceneAppState,
+    layout: TerminalLayout,
+    point: ClientPoint,
+) -> Option<usize> {
+    let row_index = timeline_live_audio_track_index(state)?;
+    windows_scene::timeline_track_loopback_button_rect(timeline_layout(layout), row_index)
+        .filter(|rect| rect.contains(point))
+        .map(|_| row_index)
+}
+
+fn timeline_track_transcription_toggle_button_at_point(
+    state: &SceneAppState,
+    layout: TerminalLayout,
+    point: ClientPoint,
+) -> Option<usize> {
+    let row_index = timeline_live_transcription_track_index(state)?;
+    windows_scene::timeline_track_transcription_toggle_button_rect(
+        timeline_layout(layout),
+        row_index,
+    )
+    .filter(|rect| rect.contains(point))
+    .map(|_| row_index)
+}
+
+fn timeline_track_transcription_settings_button_at_point(
+    state: &SceneAppState,
+    layout: TerminalLayout,
+    point: ClientPoint,
+) -> Option<usize> {
+    let row_index = timeline_live_transcription_track_index(state)?;
+    windows_scene::timeline_track_transcription_settings_button_rect(
+        timeline_layout(layout),
+        row_index,
+    )
+    .filter(|rect| rect.contains(point))
+    .map(|_| row_index)
 }
 
 fn timeline_audio_head_at_point(
@@ -4960,33 +5310,6 @@ fn timeline_selection_from_pending(
         time_range,
         track_y_range,
     ))
-}
-
-fn timeline_bind_audio_input_device(state: &mut SceneAppState) -> Option<AudioInputDeviceSummary> {
-    if let Some(device) = state
-        .audio_input_device_window
-        .as_ref()
-        .map(|window| window.device.clone())
-    {
-        return Some(device);
-    }
-
-    if state.audio_input_picker.devices.is_empty() {
-        state.audio_input_picker =
-            AudioInputPickerState::new(list_active_audio_input_devices().unwrap_or_default());
-    }
-
-    let device = state
-        .audio_input_picker
-        .devices
-        .iter()
-        .find(|device| device.is_default)
-        .cloned()
-        .or_else(|| state.audio_input_picker.selected_device().cloned());
-    if let Some(device) = device.clone() {
-        state.audio_input_device_window = Some(AudioInputDeviceWindowState::new(device.clone()));
-    }
-    device
 }
 
 fn current_timeline_zoom_viewport(state: &SceneAppState) -> TimelineViewport {
@@ -5500,6 +5823,47 @@ fn open_audio_input_device_window_from_scene(
     }
 }
 
+fn commit_audio_input_picker_selection_from_scene(
+    hwnd: WindowHandle,
+    device: Option<AudioInputDeviceSummary>,
+) {
+    let Some(device) = device else {
+        return;
+    };
+
+    let completion = with_scene_app_state(|state| Ok(state.audio_input_picker_completion));
+    match completion {
+        Ok(AudioInputPickerCompletion::OpenDeviceWindow) => {
+            open_audio_input_device_window_from_scene(hwnd, Some(device));
+        }
+        Ok(AudioInputPickerCompletion::TimelineMicrophoneTrack) => {
+            let result = with_scene_app_state(|state| {
+                let document = state
+                    .timeline_document
+                    .get_or_insert_with(TimelineDocument::blank);
+                let _ = document.append_microphone_track_for_device(device.name.clone());
+                state.audio_input_device_window = Some(AudioInputDeviceWindowState::new(device));
+                state.audio_input_picker_completion = AudioInputPickerCompletion::OpenDeviceWindow;
+                state.scene_kind = SceneWindowKind::Timeline;
+                state.scene_action_selected_index = 0;
+                state.scene_virtual_cursor = None;
+                render_scene_window_frame(state, hwnd, None, false)
+            });
+            if let Err(error) = result {
+                error!(
+                    ?error,
+                    "failed to commit selected microphone into the timeline"
+                );
+                hwnd.post_close();
+            }
+        }
+        Err(error) => {
+            error!(?error, "failed to read audio picker completion state");
+            hwnd.post_close();
+        }
+    }
+}
+
 fn audio_input_picker_key_from_virtual_key(virtual_key: u32) -> Option<AudioInputPickerKey> {
     if virtual_key == u32::from(VK_UP.0) {
         return Some(AudioInputPickerKey::Up);
@@ -6002,18 +6366,60 @@ fn perform_scene_action(
             })?;
             Ok(SceneActionDisposition::KeepOpen)
         }
+        SceneAction::SelectTimelineTool => {
+            with_scene_app_state(|state| {
+                state.timeline_tool = TimelineInteractionTool::Select;
+                Ok(())
+            })?;
+            Ok(SceneActionDisposition::KeepOpen)
+        }
+        SceneAction::SelectTimelineBrush => {
+            with_scene_app_state(|state| {
+                state.timeline_tool = TimelineInteractionTool::Brush;
+                Ok(())
+            })?;
+            Ok(SceneActionDisposition::KeepOpen)
+        }
         SceneAction::AppendMicrophoneTrack => {
             with_scene_app_state(|state| {
                 // timeline[impl add-track.microphone-live-device]
-                let device = timeline_bind_audio_input_device(state);
+                let mut picker = AudioInputPickerState::new(
+                    list_active_audio_input_devices().unwrap_or_default(),
+                );
+                if let Some(default_index) =
+                    picker.devices.iter().position(|device| device.is_default)
+                {
+                    picker.select_index(default_index);
+                }
+                state.audio_input_picker = picker;
+                state.audio_input_picker_completion =
+                    AudioInputPickerCompletion::TimelineMicrophoneTrack;
+                state.scene_kind = SceneWindowKind::AudioInputDevicePicker;
+                state.scene_action_selected_index = 0;
+                state.scene_virtual_cursor = None;
+                Ok(())
+            })?;
+            Ok(SceneActionDisposition::KeepOpen)
+        }
+        SceneAction::AppendTranscriptionTrack => {
+            with_scene_app_state(|state| {
                 let document = state
                     .timeline_document
                     .get_or_insert_with(TimelineDocument::blank);
-                if let Some(device) = device {
-                    let _ = document.append_microphone_track_for_device(device.name);
-                } else {
-                    let _ = document.append_microphone_track();
-                }
+                let _ = document.append_transcription_track();
+                state.scene_kind = SceneWindowKind::Timeline;
+                state.scene_action_selected_index = 0;
+                state.scene_virtual_cursor = None;
+                Ok(())
+            })?;
+            Ok(SceneActionDisposition::KeepOpen)
+        }
+        SceneAction::AppendTextTrack => {
+            with_scene_app_state(|state| {
+                let document = state
+                    .timeline_document
+                    .get_or_insert_with(TimelineDocument::blank);
+                let _ = document.append_text_track();
                 state.scene_kind = SceneWindowKind::Timeline;
                 state.scene_action_selected_index = 0;
                 state.scene_virtual_cursor = None;
@@ -8221,6 +8627,10 @@ fn scene_cursor_for_point(
     }
 
     if timeline_transport_play_button_at_point(state, layout, point)
+        || timeline_track_playback_button_at_point(state, layout, point).is_some()
+        || timeline_track_loopback_button_at_point(state, layout, point).is_some()
+        || timeline_track_transcription_toggle_button_at_point(state, layout, point).is_some()
+        || timeline_track_transcription_settings_button_at_point(state, layout, point).is_some()
         || timeline_track_record_button_at_point(state, layout, point).is_some()
     {
         return Some(IDC_HAND);
@@ -8228,6 +8638,10 @@ fn scene_cursor_for_point(
 
     if timeline_audio_head_at_point(state, layout, point).is_some() {
         return Some(IDC_SIZEWE);
+    }
+
+    if timeline_text_block_tooltip_at_point(state, layout, point).is_some() {
+        return Some(IDC_HAND);
     }
 
     if state.timeline_pan_drag.is_some() {
@@ -8398,6 +8812,10 @@ fn update_terminal_chrome_tooltip(
     Ok(())
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "scene tooltip routing intentionally centralizes the ordered hit-test precedence for timeline, audio, and chrome controls"
+)]
 fn update_scene_chrome_tooltip(
     state: &mut SceneAppState,
     hwnd: WindowHandle,
@@ -8441,6 +8859,34 @@ fn update_scene_chrome_tooltip(
     }
 
     if let Some((tooltip_text, anchor_rect)) =
+        timeline_track_playback_button_tooltip(state, layout, point)
+    {
+        show_scene_tooltip(state, hwnd, point, tooltip_text, anchor_rect)?;
+        return Ok(());
+    }
+
+    if let Some((tooltip_text, anchor_rect)) =
+        timeline_track_loopback_button_tooltip(state, layout, point)
+    {
+        show_scene_tooltip(state, hwnd, point, tooltip_text, anchor_rect)?;
+        return Ok(());
+    }
+
+    if let Some((tooltip_text, anchor_rect)) =
+        timeline_track_transcription_toggle_tooltip(state, layout, point)
+    {
+        show_scene_tooltip(state, hwnd, point, tooltip_text, anchor_rect)?;
+        return Ok(());
+    }
+
+    if let Some((tooltip_text, anchor_rect)) =
+        timeline_track_transcription_settings_tooltip(state, layout, point)
+    {
+        show_scene_tooltip(state, hwnd, point, tooltip_text, anchor_rect)?;
+        return Ok(());
+    }
+
+    if let Some((tooltip_text, anchor_rect)) =
         timeline_track_record_button_tooltip(state, layout, point)
     {
         show_scene_tooltip(state, hwnd, point, tooltip_text, anchor_rect)?;
@@ -8449,6 +8895,13 @@ fn update_scene_chrome_tooltip(
 
     if let Some((tooltip_text, anchor_rect)) = timeline_audio_head_tooltip(state, layout, point) {
         show_scene_tooltip(state, hwnd, point, tooltip_text, anchor_rect)?;
+        return Ok(());
+    }
+
+    if let Some((tooltip_text, anchor_rect)) =
+        timeline_text_block_tooltip_at_point(state, layout, point)
+    {
+        show_scene_tooltip(state, hwnd, point, &tooltip_text, anchor_rect)?;
         return Ok(());
     }
 
@@ -8679,6 +9132,87 @@ fn timeline_track_record_button_tooltip(
         },
         rect,
     ))
+}
+
+fn timeline_track_playback_button_tooltip(
+    state: &SceneAppState,
+    layout: TerminalLayout,
+    point: ClientPoint,
+) -> Option<(&'static str, ClientRect)> {
+    let row_index = timeline_track_playback_button_at_point(state, layout, point)?;
+    let rect =
+        windows_scene::timeline_track_playback_button_rect(timeline_layout(layout), row_index)?;
+    Some((
+        if state
+            .audio_input_device_window
+            .as_ref()
+            .is_some_and(AudioInputDeviceWindowState::is_playing)
+        {
+            "Pause playback"
+        } else {
+            "Play recorded buffer"
+        },
+        rect,
+    ))
+}
+
+fn timeline_track_loopback_button_tooltip(
+    state: &SceneAppState,
+    layout: TerminalLayout,
+    point: ClientPoint,
+) -> Option<(&'static str, ClientRect)> {
+    let row_index = timeline_track_loopback_button_at_point(state, layout, point)?;
+    let rect =
+        windows_scene::timeline_track_loopback_button_rect(timeline_layout(layout), row_index)?;
+    Some((
+        if state
+            .audio_input_device_window
+            .as_ref()
+            .is_some_and(|window| window.loopback_enabled)
+        {
+            "Disable microphone loopback"
+        } else {
+            "Enable microphone loopback"
+        },
+        rect,
+    ))
+}
+
+fn timeline_track_transcription_toggle_tooltip(
+    state: &SceneAppState,
+    layout: TerminalLayout,
+    point: ClientPoint,
+) -> Option<(&'static str, ClientRect)> {
+    let row_index = timeline_track_transcription_toggle_button_at_point(state, layout, point)?;
+    let rect = windows_scene::timeline_track_transcription_toggle_button_rect(
+        timeline_layout(layout),
+        row_index,
+    )?;
+    Some((
+        if state
+            .audio_input_device_window
+            .as_ref()
+            .is_some_and(|window| window.runtime.transcription.enabled)
+        {
+            "Pause transcription observation"
+        } else {
+            "Resume transcription observation"
+        },
+        rect,
+    ))
+}
+
+fn timeline_track_transcription_settings_tooltip(
+    state: &SceneAppState,
+    layout: TerminalLayout,
+    point: ClientPoint,
+) -> Option<(&'static str, ClientRect)> {
+    let row_index = timeline_track_transcription_settings_button_at_point(state, layout, point)?;
+    let rect = windows_scene::timeline_track_transcription_settings_button_rect(
+        timeline_layout(layout),
+        row_index,
+    )?;
+    Some(("Open transcription settings window", rect))
 }
 
 fn timeline_audio_head_tooltip(
@@ -9234,10 +9768,13 @@ mod tests {
             scene_kind: SceneWindowKind::Launcher,
             vt_engine: VtEngineChoice::default(),
             audio_input_picker: AudioInputPickerState::default(),
+            audio_input_picker_completion: AudioInputPickerCompletion::default(),
             audio_input_device_window: None,
             timeline_document: None,
+            timeline_tool: TimelineInteractionTool::default(),
             timeline_selection: None,
             pending_timeline_selection: None,
+            pending_timeline_text_block: None,
             timeline_pan_drag: None,
             timeline_zoom_animation: None,
             timeline_vertical_scroll_offset: 0,
@@ -9302,10 +9839,13 @@ mod tests {
             scene_kind: SceneWindowKind::DemoMode,
             vt_engine: VtEngineChoice::default(),
             audio_input_picker: AudioInputPickerState::default(),
+            audio_input_picker_completion: AudioInputPickerCompletion::default(),
             audio_input_device_window: None,
             timeline_document: None,
+            timeline_tool: TimelineInteractionTool::default(),
             timeline_selection: None,
             pending_timeline_selection: None,
+            pending_timeline_text_block: None,
             timeline_pan_drag: None,
             timeline_zoom_animation: None,
             timeline_vertical_scroll_offset: 0,
@@ -9361,10 +9901,13 @@ mod tests {
             scene_kind: SceneWindowKind::Timeline,
             vt_engine: VtEngineChoice::default(),
             audio_input_picker: AudioInputPickerState::default(),
+            audio_input_picker_completion: AudioInputPickerCompletion::default(),
             audio_input_device_window: None,
             timeline_document: Some(TimelineDocument::blank()),
+            timeline_tool: TimelineInteractionTool::default(),
             timeline_selection: None,
             pending_timeline_selection: None,
+            pending_timeline_text_block: None,
             timeline_pan_drag: None,
             timeline_zoom_animation: None,
             timeline_vertical_scroll_offset: 0,

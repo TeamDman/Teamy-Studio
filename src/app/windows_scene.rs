@@ -58,6 +58,8 @@ const TIMELINE_SELECTION_BORDER: [f32; 4] = [0.76, 0.86, 0.98, 0.92];
 const TIMELINE_SELECTION_INTERSECTION: [f32; 4] = [0.95, 0.86, 0.30, 0.36];
 const TIMELINE_SCROLLBAR_TRACK: [f32; 4] = [0.16, 0.18, 0.22, 0.92];
 const TIMELINE_SCROLLBAR_THUMB: [f32; 4] = [0.48, 0.56, 0.66, 0.94];
+const TIMELINE_TRANSCRIPTION_MAX_CHUNK_SECONDS: f64 = 30.0;
+const TIMELINE_TRANSCRIPTION_INACTIVITY_SECONDS: f64 = 3.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SceneWindowKind {
@@ -109,22 +111,40 @@ pub enum SceneAction {
     PanTimelineRight,
     ZoomTimelineIn,
     ZoomTimelineOut,
+    SelectTimelineTool,
+    SelectTimelineBrush,
     AppendMicrophoneTrack,
+    AppendTranscriptionTrack,
+    AppendTextTrack,
     CloseTimelineTrackMenu,
     ImportTimeline,
     SelectWindowsBell,
     SelectFileBell,
 }
 
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "timeline document visual state keeps independent hover and press flags for distinct shader-driven controls"
+)]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct TimelineDocumentVisualState {
     pub add_track_button: ButtonVisualState,
     pub transport_play_button: ButtonVisualState,
     pub microphone_record_button: ButtonVisualState,
+    pub microphone_playback_hovered: bool,
+    pub microphone_playback_pressed: bool,
+    pub microphone_loopback_hovered: bool,
+    pub microphone_loopback_pressed: bool,
+    pub transcription_toggle_hovered: bool,
+    pub transcription_toggle_pressed: bool,
+    pub transcription_settings_hovered: bool,
+    pub transcription_settings_pressed: bool,
     pub pan_left_button: ButtonVisualState,
     pub pan_right_button: ButtonVisualState,
     pub zoom_in_button: ButtonVisualState,
     pub zoom_out_button: ButtonVisualState,
+    pub select_tool_button: ButtonVisualState,
+    pub brush_tool_button: ButtonVisualState,
     pub hovered_head: Option<AudioInputTimelineHeadKind>,
     pub grabbed_head: Option<AudioInputTimelineHeadKind>,
     pub vertical_scroll_offset: i32,
@@ -253,7 +273,7 @@ pub fn timeline_document_layout(body_rect: ClientRect) -> TimelineDocumentLayout
         ruler_rect.bottom() - 8,
     );
     let viewport_controls_rect = ClientRect::new(
-        ruler_rect.right() - 216,
+        ruler_rect.right() - 304,
         ruler_rect.top() + 8,
         ruler_rect.right() - 12,
         ruler_rect.bottom() - 8,
@@ -373,13 +393,41 @@ pub fn timeline_track_world_y_from_client_point(
 }
 
 #[must_use]
+pub fn timeline_track_index_at_point(
+    layout: TimelineDocumentLayout,
+    vertical_scroll_offset: i32,
+    track_count: usize,
+    point: ClientPoint,
+) -> Option<usize> {
+    if !layout.scrollport_rect.contains(point) {
+        return None;
+    }
+
+    let row_pitch = TIMELINE_TRACK_ROW_HEIGHT + TIMELINE_TRACK_ROW_GAP;
+    if row_pitch <= 0 {
+        return None;
+    }
+
+    let world_y = timeline_track_world_y_from_client_point(layout, vertical_scroll_offset, point);
+    let row_index = usize::try_from(world_y / row_pitch).ok()?;
+    let row_offset = world_y.rem_euclid(row_pitch);
+    (row_index < track_count && row_offset < TIMELINE_TRACK_ROW_HEIGHT).then_some(row_index)
+}
+
+#[must_use]
+pub fn timeline_track_vertical_range(row_index: usize) -> TimelineTrackVerticalRange {
+    let top = timeline_track_row_world_top(row_index);
+    TimelineTrackVerticalRange::new(top, top.saturating_add(TIMELINE_TRACK_ROW_HEIGHT))
+}
+
+#[must_use]
 pub fn timeline_viewport_control_rect(
     layout: TimelineDocumentLayout,
     action: SceneAction,
 ) -> Option<ClientRect> {
     let controls_rect = layout.viewport_controls_rect;
     let gap = 8;
-    let button_width = ((controls_rect.width() - (gap * 3)) / 4).max(36);
+    let button_width = ((controls_rect.width() - (gap * 5)) / 6).max(28);
     let top = controls_rect.top();
     let bottom = controls_rect.bottom();
 
@@ -388,6 +436,8 @@ pub fn timeline_viewport_control_rect(
         SceneAction::PanTimelineRight,
         SceneAction::ZoomTimelineIn,
         SceneAction::ZoomTimelineOut,
+        SceneAction::SelectTimelineTool,
+        SceneAction::SelectTimelineBrush,
     ]
     .into_iter()
     .enumerate()
@@ -412,6 +462,8 @@ pub const fn timeline_viewport_control_label(action: SceneAction) -> Option<&'st
         SceneAction::PanTimelineRight => Some("->"),
         SceneAction::ZoomTimelineIn => Some("+"),
         SceneAction::ZoomTimelineOut => Some("-"),
+        SceneAction::SelectTimelineTool => Some("Sel"),
+        SceneAction::SelectTimelineBrush => Some("Box"),
         _ => None,
     }
 }
@@ -423,6 +475,8 @@ pub const fn timeline_viewport_control_tooltip(action: SceneAction) -> Option<&'
         SceneAction::PanTimelineRight => Some("Pan timeline later"),
         SceneAction::ZoomTimelineIn => Some("Zoom timeline in"),
         SceneAction::ZoomTimelineOut => Some("Zoom timeline out"),
+        SceneAction::SelectTimelineTool => Some("Use the selection tool"),
+        SceneAction::SelectTimelineBrush => Some("Draw empty text boxes on text tracks"),
         _ => None,
     }
 }
@@ -833,6 +887,22 @@ pub fn scene_button_specs(scene_kind: SceneWindowKind) -> &'static [SceneButtonS
             },
             SceneButtonSpec {
                 // timeline[impl add-track.workflow]
+                action: SceneAction::AppendTranscriptionTrack,
+                label: "Transcription",
+                tooltip: "Add a transcription observer track",
+                sprite: SpriteId::Transcription,
+                color: [0.30, 0.19, 0.28, 1.0],
+            },
+            SceneButtonSpec {
+                // timeline[impl add-track.workflow]
+                action: SceneAction::AppendTextTrack,
+                label: "Text",
+                tooltip: "Add a manual text track",
+                sprite: SpriteId::Terminal,
+                color: [0.24, 0.22, 0.14, 1.0],
+            },
+            SceneButtonSpec {
+                // timeline[impl add-track.workflow]
                 // timeline[impl add-track.tracy]
                 action: SceneAction::ImportTimeline,
                 label: "Tracing",
@@ -845,7 +915,7 @@ pub fn scene_button_specs(scene_kind: SceneWindowKind) -> &'static [SceneButtonS
                 action: SceneAction::CloseTimelineTrackMenu,
                 label: "Back",
                 tooltip: "Return to the timeline document",
-                sprite: SpriteId::Terminal,
+                sprite: SpriteId::Back,
                 color: [0.18, 0.18, 0.22, 1.0],
             },
         ],
@@ -1070,6 +1140,11 @@ fn push_timeline_track_preview_rows(
             [0.80, 0.84, 0.90, 1.0],
         );
 
+        if track.kind() == TimelineTrackKind::Text {
+            push_timeline_text_blocks(scene, row_rect, layout.scrollport_rect, document, track);
+            continue;
+        }
+
         if let Some(preview_rect) = timeline_track_preview_clip_rect(
             row_rect,
             layout.scrollport_rect,
@@ -1083,12 +1158,31 @@ fn push_timeline_track_preview_rows(
                 timeline_track_preview_color(track.kind()),
                 PanelEffect::TerminalFill,
             );
-            if preview_rect.width() >= 72 {
+            if track.kind() == TimelineTrackKind::Audio
+                && let Some(audio_input_state) = audio_input_state
+                && !audio_input_state.runtime.samples().is_empty()
+            {
+                push_waveform_bars(
+                    scene,
+                    preview_rect.inset(4),
+                    &audio_input_state.runtime.samples(),
+                );
+            } else if track.kind() == TimelineTrackKind::Transcription
+                && let Some(audio_input_state) = audio_input_state
+            {
+                push_timeline_transcription_preview(
+                    scene,
+                    preview_rect.inset(4),
+                    audio_input_state,
+                );
+            } else if preview_rect.width() >= 72 {
                 push_centered_text(
                     scene,
                     preview_rect.to_win32_rect(),
                     match track.kind() {
                         TimelineTrackKind::Audio => "Audio",
+                        TimelineTrackKind::Transcription => "Transcription",
+                        TimelineTrackKind::Text => "Text",
                         TimelineTrackKind::TracingSpans => "Tracing",
                     },
                     [0.96, 0.98, 1.0, 1.0],
@@ -1110,6 +1204,101 @@ fn push_timeline_track_preview_rows(
     }
 }
 
+fn push_timeline_text_blocks(
+    scene: &mut RenderScene,
+    row_rect: ClientRect,
+    content_rect: ClientRect,
+    document: &TimelineDocument,
+    track: &TimelineTrack,
+) {
+    for block in document
+        .text_blocks()
+        .iter()
+        .filter(|block| block.track_id() == track.id())
+    {
+        let Some(block_rect) = timeline_time_range_clip_rect(
+            row_rect,
+            content_rect,
+            document.viewport(),
+            block.time_range(),
+            28,
+        ) else {
+            continue;
+        };
+
+        push_panel(
+            scene,
+            block_rect.to_win32_rect(),
+            [0.76, 0.63, 0.20, 0.94],
+            PanelEffect::SceneButtonCard,
+        );
+
+        if block_rect.width() >= 36 {
+            let preview_text = if block.text().is_empty() {
+                "Empty text"
+            } else {
+                block.text().lines().next().unwrap_or("Text")
+            };
+            push_text_block(
+                scene,
+                block_rect.inset(6).to_win32_rect(),
+                preview_text,
+                8,
+                14,
+                [0.14, 0.11, 0.05, 1.0],
+            );
+        }
+    }
+}
+
+fn push_timeline_transcription_preview(
+    scene: &mut RenderScene,
+    preview_rect: ClientRect,
+    audio_input_state: &AudioInputDeviceWindowState,
+) {
+    if preview_rect.width() <= 0 || preview_rect.height() <= 0 {
+        return;
+    }
+
+    let samples = audio_input_state.runtime.samples();
+    if !samples.is_empty() {
+        push_waveform_bars(scene, preview_rect, &samples);
+    }
+
+    let duration_seconds = timeline_audio_preview_duration_seconds(audio_input_state);
+    let transcription_head_seconds = audio_input_state.runtime.transcription_head_seconds;
+    let max_chunk_end_seconds = (transcription_head_seconds
+        + TIMELINE_TRANSCRIPTION_MAX_CHUNK_SECONDS)
+        .min(duration_seconds);
+    let inactivity_end_seconds = (transcription_head_seconds
+        + TIMELINE_TRANSCRIPTION_INACTIVITY_SECONDS)
+        .min(duration_seconds);
+
+    push_head_region(
+        scene,
+        preview_rect,
+        duration_seconds,
+        transcription_head_seconds,
+        max_chunk_end_seconds,
+        [0.72, 0.44, 1.0, 0.18],
+    );
+    push_head_region(
+        scene,
+        preview_rect,
+        duration_seconds,
+        transcription_head_seconds,
+        inactivity_end_seconds,
+        [0.96, 0.72, 1.0, 0.30],
+    );
+    push_timeline_head(
+        scene,
+        preview_rect,
+        duration_seconds,
+        transcription_head_seconds,
+        [0.85, 0.56, 1.0, 1.0],
+    );
+}
+
 fn push_timeline_transport_panel(
     scene: &mut RenderScene,
     layout: TimelineDocumentLayout,
@@ -1125,24 +1314,33 @@ fn push_timeline_transport_panel(
         } else {
             [0.13, 0.21, 0.28, 1.0]
         },
-        PanelEffect::SceneButtonCard,
-        visual_state.transport_play_button.shader_data(),
-    );
-    push_centered_text(
-        scene,
-        rect.to_win32_rect(),
-        if audio_input_state.is_some_and(AudioInputDeviceWindowState::is_playing) {
-            "Pause"
-        } else {
-            "Play"
-        },
-        [0.92, 0.95, 0.98, 1.0],
+        PanelEffect::PlaybackButton,
+        [
+            if audio_input_state.is_some_and(AudioInputDeviceWindowState::is_playing) {
+                1.0
+            } else {
+                0.0
+            },
+            if visual_state.transport_play_button.hovered {
+                1.0
+            } else {
+                0.0
+            },
+            if visual_state.transport_play_button.pressed {
+                1.0
+            } else {
+                0.0
+            },
+            audio_input_state.map_or(1.0_f32, |state| {
+                playback_speed_shader_value(state.runtime.playback.speed)
+            }),
+        ],
     );
 }
 
 #[expect(
     clippy::too_many_lines,
-    reason = "the timeline track-list tool panel builds row cards, metadata, and the record button together so the layout stays local"
+    reason = "the timeline track-list panel keeps row-specific icon, metadata, and per-track controls together so the new text-track wiring stays local"
 )]
 fn push_timeline_track_list_panel(
     scene: &mut RenderScene,
@@ -1199,41 +1397,35 @@ fn push_timeline_track_list_panel(
             scene,
             icon_rect.to_win32_rect(),
             [0.92, 0.95, 0.98, 1.0],
-            if track.kind() == TimelineTrackKind::Audio {
-                SpriteId::WindowsAudio
-            } else {
-                SpriteId::FileAudio
+            match track.kind() {
+                TimelineTrackKind::Audio => SpriteId::WindowsAudio,
+                TimelineTrackKind::Transcription => SpriteId::Transcription,
+                TimelineTrackKind::Text => SpriteId::Terminal,
+                TimelineTrackKind::TracingSpans => SpriteId::FileAudio,
             },
         );
 
-        let button_rect = timeline_track_record_button_rect(layout, index);
-        if track.kind() == TimelineTrackKind::Audio
-            && let Some(button_rect) = button_rect
-        {
-            push_panel_with_data(
+        let detail_right = if track.kind() == TimelineTrackKind::Audio {
+            push_timeline_audio_track_controls(
                 scene,
-                button_rect.to_win32_rect(),
-                if audio_input_state.is_some_and(AudioInputDeviceWindowState::is_recording) {
-                    [0.72, 0.10, 0.10, 1.0]
-                } else {
-                    [0.28, 0.10, 0.10, 1.0]
-                },
-                PanelEffect::SceneButtonCard,
-                visual_state.microphone_record_button.shader_data(),
-            );
-            push_centered_text(
+                layout,
+                index,
+                audio_input_state,
+                visual_state,
+            )
+            .map_or(row_rect.right() - 12, |rect| rect.left() - 10)
+        } else if track.kind() == TimelineTrackKind::Transcription {
+            push_timeline_transcription_track_controls(
                 scene,
-                button_rect.to_win32_rect(),
-                if audio_input_state.is_some_and(AudioInputDeviceWindowState::is_recording) {
-                    "Stop"
-                } else {
-                    "Rec"
-                },
-                [0.98, 0.92, 0.92, 1.0],
-            );
-        }
-
-        let detail_right = button_rect.map_or(row_rect.right() - 12, |rect| rect.left() - 10);
+                layout,
+                index,
+                audio_input_state,
+                visual_state,
+            )
+            .map_or(row_rect.right() - 12, |rect| rect.left() - 10)
+        } else {
+            row_rect.right() - 12
+        };
         push_text_block(
             scene,
             ClientRect::new(
@@ -1257,7 +1449,7 @@ fn push_timeline_track_list_panel(
                 row_rect.bottom() - 10,
             )
             .to_win32_rect(),
-            &timeline_track_row_detail_text(track, audio_input_state),
+            &timeline_track_row_detail_text(document, track, audio_input_state),
             8,
             14,
             [0.68, 0.74, 0.80, 1.0],
@@ -1266,9 +1458,19 @@ fn push_timeline_track_list_panel(
 }
 
 fn timeline_track_row_detail_text(
+    document: &TimelineDocument,
     track: &TimelineTrack,
     audio_input_state: Option<&AudioInputDeviceWindowState>,
 ) -> String {
+    if track.kind() == TimelineTrackKind::Text {
+        let block_count = document_text_block_count(document, track.id());
+        return format!(
+            "{} block{} · hover to preview",
+            block_count,
+            if block_count == 1 { "" } else { "s" }
+        );
+    }
+
     if track.kind() != TimelineTrackKind::Audio {
         return track.detail_line();
     }
@@ -1277,8 +1479,21 @@ fn timeline_track_row_detail_text(
         return track.detail_line();
     };
 
+    if track.kind() == TimelineTrackKind::Transcription {
+        return format!(
+            "chunk {:.1}s  head {:.2}s{}",
+            audio_input_state.runtime.transcription.chunk_seconds,
+            audio_input_state.runtime.transcription_head_seconds,
+            if audio_input_state.runtime.transcription.enabled {
+                "  enabled"
+            } else {
+                "  paused"
+            }
+        );
+    }
+
     format!(
-        "{}  rec {:.2}s  play {:.2}s{}",
+        "{}  rec {:.2}s  play {:.2}s{}{}",
         audio_input_state.device.state,
         audio_input_state.runtime.recording_head_seconds,
         audio_input_state.runtime.playback.head_seconds,
@@ -1286,8 +1501,174 @@ fn timeline_track_row_detail_text(
             "  recording"
         } else {
             ""
+        },
+        if audio_input_state.loopback_enabled {
+            "  loopback"
+        } else {
+            ""
         }
     )
+}
+
+fn push_timeline_audio_track_controls(
+    scene: &mut RenderScene,
+    layout: TimelineDocumentLayout,
+    row_index: usize,
+    audio_input_state: Option<&AudioInputDeviceWindowState>,
+    visual_state: TimelineDocumentVisualState,
+) -> Option<ClientRect> {
+    let playback_rect = timeline_track_playback_button_rect(layout, row_index)?;
+    let loopback_rect = timeline_track_loopback_button_rect(layout, row_index)?;
+    let record_rect = timeline_track_record_button_rect(layout, row_index)?;
+
+    push_panel_with_data(
+        scene,
+        playback_rect.to_win32_rect(),
+        if audio_input_state.is_some_and(AudioInputDeviceWindowState::is_playing) {
+            [0.20, 0.56, 0.86, 1.0]
+        } else {
+            [0.14, 0.28, 0.38, 1.0]
+        },
+        PanelEffect::PlaybackButton,
+        [
+            if audio_input_state.is_some_and(AudioInputDeviceWindowState::is_playing) {
+                1.0
+            } else {
+                0.0
+            },
+            if visual_state.microphone_playback_hovered {
+                1.0
+            } else {
+                0.0
+            },
+            if visual_state.microphone_playback_pressed {
+                1.0
+            } else {
+                0.0
+            },
+            audio_input_state.map_or(1.0_f32, |state| {
+                playback_speed_shader_value(state.runtime.playback.speed)
+            }),
+        ],
+    );
+    push_panel_with_data(
+        scene,
+        loopback_rect.to_win32_rect(),
+        if audio_input_state.is_some_and(|state| state.loopback_enabled) {
+            [0.20, 0.54, 0.46, 1.0]
+        } else {
+            [0.13, 0.24, 0.22, 1.0]
+        },
+        PanelEffect::LoopbackButton,
+        [
+            if audio_input_state.is_some_and(|state| state.loopback_enabled) {
+                1.0
+            } else {
+                0.0
+            },
+            if visual_state.microphone_loopback_hovered {
+                1.0
+            } else {
+                0.0
+            },
+            if visual_state.microphone_loopback_pressed {
+                1.0
+            } else {
+                0.0
+            },
+            0.0,
+        ],
+    );
+    push_panel_with_data(
+        scene,
+        record_rect.to_win32_rect(),
+        if audio_input_state.is_some_and(AudioInputDeviceWindowState::is_recording) {
+            [0.92, 0.09, 0.07, 1.0]
+        } else if audio_input_state.is_some_and(|state| state.armed_for_record) {
+            [0.44, 0.05, 0.05, 1.0]
+        } else {
+            [0.18, 0.05, 0.05, 1.0]
+        },
+        PanelEffect::RecordArmButton,
+        [
+            if audio_input_state.is_some_and(AudioInputDeviceWindowState::is_recording) {
+                1.0
+            } else {
+                0.0
+            },
+            if audio_input_state.is_some_and(|state| state.armed_for_record) {
+                1.0
+            } else {
+                0.0
+            },
+            0.0,
+            0.0,
+        ],
+    );
+
+    Some(playback_rect)
+}
+
+fn push_timeline_transcription_track_controls(
+    scene: &mut RenderScene,
+    layout: TimelineDocumentLayout,
+    row_index: usize,
+    audio_input_state: Option<&AudioInputDeviceWindowState>,
+    visual_state: TimelineDocumentVisualState,
+) -> Option<ClientRect> {
+    let toggle_rect = timeline_track_transcription_toggle_button_rect(layout, row_index)?;
+    let settings_rect = timeline_track_transcription_settings_button_rect(layout, row_index)?;
+
+    push_panel_with_data(
+        scene,
+        settings_rect.to_win32_rect(),
+        [0.18, 0.22, 0.28, 1.0],
+        PanelEffect::GearButton,
+        [
+            if visual_state.transcription_settings_hovered {
+                1.0
+            } else {
+                0.0
+            },
+            if visual_state.transcription_settings_pressed {
+                1.0
+            } else {
+                0.0
+            },
+            0.0,
+            0.0,
+        ],
+    );
+    push_panel_with_data(
+        scene,
+        toggle_rect.to_win32_rect(),
+        if audio_input_state.is_some_and(|state| state.runtime.transcription.enabled) {
+            [0.70, 0.45, 0.18, 1.0]
+        } else {
+            [0.26, 0.18, 0.14, 1.0]
+        },
+        PanelEffect::TranscriptionToggle,
+        [
+            if audio_input_state.is_some_and(|state| state.runtime.transcription.enabled) {
+                1.0
+            } else {
+                0.0
+            },
+            if visual_state.transcription_toggle_hovered {
+                1.0
+            } else {
+                0.0
+            },
+            if visual_state.transcription_toggle_pressed {
+                1.0
+            } else {
+                0.0
+            },
+            0.0,
+        ],
+    );
+
+    Some(toggle_rect)
 }
 
 fn push_timeline_viewport_controls(
@@ -1316,6 +1697,16 @@ fn push_timeline_viewport_controls(
             visual_state.zoom_out_button,
             [0.34, 0.22, 0.22, 1.0],
         ),
+        (
+            SceneAction::SelectTimelineTool,
+            visual_state.select_tool_button,
+            [0.38, 0.30, 0.16, 1.0],
+        ),
+        (
+            SceneAction::SelectTimelineBrush,
+            visual_state.brush_tool_button,
+            [0.44, 0.30, 0.10, 1.0],
+        ),
     ];
 
     for (action, button_state, color) in controls {
@@ -1336,7 +1727,7 @@ fn push_timeline_viewport_controls(
     }
 }
 
-fn timeline_track_row_rect(
+pub fn timeline_track_row_rect(
     scrollport_rect: ClientRect,
     row_index: usize,
     vertical_scroll_offset: i32,
@@ -1383,13 +1774,52 @@ pub fn timeline_track_record_button_rect(
     layout: TimelineDocumentLayout,
     row_index: usize,
 ) -> Option<ClientRect> {
+    timeline_track_control_button_rect(layout, row_index, 0)
+}
+
+#[must_use]
+pub fn timeline_track_loopback_button_rect(
+    layout: TimelineDocumentLayout,
+    row_index: usize,
+) -> Option<ClientRect> {
+    timeline_track_control_button_rect(layout, row_index, 1)
+}
+
+#[must_use]
+pub fn timeline_track_playback_button_rect(
+    layout: TimelineDocumentLayout,
+    row_index: usize,
+) -> Option<ClientRect> {
+    timeline_track_control_button_rect(layout, row_index, 2)
+}
+
+#[must_use]
+pub fn timeline_track_transcription_toggle_button_rect(
+    layout: TimelineDocumentLayout,
+    row_index: usize,
+) -> Option<ClientRect> {
+    timeline_track_control_button_rect(layout, row_index, 1)
+}
+
+#[must_use]
+pub fn timeline_track_transcription_settings_button_rect(
+    layout: TimelineDocumentLayout,
+    row_index: usize,
+) -> Option<ClientRect> {
+    timeline_track_control_button_rect(layout, row_index, 0)
+}
+
+fn timeline_track_control_button_rect(
+    layout: TimelineDocumentLayout,
+    row_index: usize,
+    slot_from_right: i32,
+) -> Option<ClientRect> {
     timeline_track_list_row_rect(layout, row_index).map(|row_rect| {
-        ClientRect::new(
-            row_rect.right() - 46,
-            row_rect.top() + 12,
-            row_rect.right() - 12,
-            (row_rect.top() + 46).min(row_rect.bottom() - 12),
-        )
+        let button_size = (row_rect.height() - 24).clamp(28, 40);
+        let gap = 8;
+        let right = row_rect.right() - 12 - (slot_from_right * (button_size + gap));
+        let top = row_rect.top() + ((row_rect.height() - button_size) / 2);
+        ClientRect::new(right - button_size, top, right, top + button_size)
     })
 }
 
@@ -1400,12 +1830,23 @@ fn timeline_track_preview_clip_rect(
     track: &TimelineTrack,
     audio_input_state: Option<&AudioInputDeviceWindowState>,
 ) -> Option<ClientRect> {
-    let preview_range = if track.kind() == TimelineTrackKind::Audio {
-        audio_input_state.map_or(track.preview_range(), timeline_audio_preview_range)
-    } else {
-        track.preview_range()
+    let preview_range = match track.kind() {
+        TimelineTrackKind::Audio | TimelineTrackKind::Transcription | TimelineTrackKind::Text => {
+            audio_input_state.map_or(track.preview_range(), timeline_audio_preview_range)
+        }
+        TimelineTrackKind::TracingSpans => track.preview_range(),
     };
-    let projected = viewport.project_range(preview_range);
+    timeline_time_range_clip_rect(row_rect, content_rect, viewport, preview_range, 8)
+}
+
+pub fn timeline_time_range_clip_rect(
+    row_rect: ClientRect,
+    content_rect: ClientRect,
+    viewport: TimelineViewport,
+    time_range: TimelineTimeRangeNs,
+    min_visible_width: i32,
+) -> Option<ClientRect> {
+    let projected = viewport.project_range(time_range);
     let content_width_pixels = content_rect.width().max(0);
     let start_pixels = projected.start().pixels();
     let end_pixels = projected.end().pixels();
@@ -1419,11 +1860,19 @@ fn timeline_track_preview_clip_rect(
         return None;
     }
 
-    let clip_left =
-        content_rect.left() + f64_to_i32_clamped(start_pixels.round(), 0, content_width_pixels);
-    let clip_right =
-        content_rect.left() + f64_to_i32_clamped(end_pixels.round(), 0, content_width_pixels);
-    let clip_right = (clip_right.max(clip_left + 8)).min(content_rect.right());
+    let unclipped_left = content_rect
+        .left()
+        .saturating_add(f64_to_i32_saturating(start_pixels));
+    let unclipped_right = content_rect
+        .left()
+        .saturating_add(f64_to_i32_saturating(end_pixels));
+    let clip_left = unclipped_left.clamp(content_rect.left(), content_rect.right());
+    let mut clip_right = unclipped_right.clamp(content_rect.left(), content_rect.right());
+    let clipped_by_viewport =
+        unclipped_left < content_rect.left() || unclipped_right > content_rect.right();
+    if !clipped_by_viewport && clip_right < clip_left + min_visible_width {
+        clip_right = (clip_left + min_visible_width).min(content_rect.right());
+    }
     if clip_right <= clip_left {
         return None;
     }
@@ -1436,24 +1885,42 @@ fn timeline_track_preview_clip_rect(
     ))
 }
 
+fn document_text_block_count(
+    document: &TimelineDocument,
+    track_id: crate::timeline::TimelineTrackId,
+) -> usize {
+    document
+        .text_blocks()
+        .iter()
+        .filter(|block| block.track_id() == track_id)
+        .count()
+}
+
 fn timeline_audio_preview_range(
     audio_input_state: &AudioInputDeviceWindowState,
 ) -> TimelineTimeRangeNs {
-    let duration_seconds = audio_input_state
-        .runtime
-        .duration_seconds()
-        .max(audio_input_state.runtime.recording_head_seconds)
-        .max(audio_input_state.runtime.playback.head_seconds)
-        .max(0.0);
+    let duration_seconds = timeline_audio_preview_duration_seconds(audio_input_state);
     TimelineTimeRangeNs::new(
         TimelineTimeNs::ZERO,
         TimelineTimeNs::from_duration(Time::new::<second>(duration_seconds)),
     )
 }
 
+fn timeline_audio_preview_duration_seconds(audio_input_state: &AudioInputDeviceWindowState) -> f64 {
+    audio_input_state
+        .runtime
+        .duration_seconds()
+        .max(audio_input_state.runtime.recording_head_seconds)
+        .max(audio_input_state.runtime.playback.head_seconds)
+        .max(audio_input_state.runtime.transcription_head_seconds)
+        .max(0.0)
+}
+
 fn timeline_track_preview_color(kind: TimelineTrackKind) -> [f32; 4] {
     match kind {
         TimelineTrackKind::Audio => [0.19, 0.55, 0.44, 0.95],
+        TimelineTrackKind::Transcription => [0.45, 0.28, 0.66, 0.90],
+        TimelineTrackKind::Text => [0.76, 0.63, 0.20, 0.94],
         TimelineTrackKind::TracingSpans => [0.70, 0.47, 0.26, 0.95],
     }
 }
@@ -1495,6 +1962,14 @@ pub fn timeline_audio_head_grabbers(
                 layout,
                 viewport,
                 audio_input_state.runtime.playback.head_seconds,
+            ),
+        ),
+        (
+            AudioInputTimelineHeadKind::Transcription,
+            timeline_audio_head_x(
+                layout,
+                viewport,
+                audio_input_state.runtime.transcription_head_seconds,
             ),
         ),
     ];
@@ -1540,6 +2015,11 @@ fn push_timeline_audio_heads(
             AudioInputTimelineHeadKind::Playback,
             audio_input_state.runtime.playback.head_seconds,
             timeline_head_color(AudioInputTimelineHeadKind::Playback),
+        ),
+        (
+            AudioInputTimelineHeadKind::Transcription,
+            audio_input_state.runtime.transcription_head_seconds,
+            timeline_head_color(AudioInputTimelineHeadKind::Transcription),
         ),
     ] {
         let x = timeline_audio_head_x(layout, viewport, seconds);
@@ -1935,6 +2415,22 @@ fn timeline_tick_pixel_offset(tick: &TimelineRulerTick, ruler_width_pixels: i32)
 )]
 fn f64_to_i32_clamped(value: f64, min: i32, max: i32) -> i32 {
     value.clamp(f64::from(min), f64::from(max)) as i32
+}
+
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "timeline preview projection rounds block edges into client pixels before clipping"
+)]
+fn f64_to_i32_saturating(value: f64) -> i32 {
+    if value.is_nan() {
+        0
+    } else if value >= f64::from(i32::MAX) {
+        i32::MAX
+    } else if value <= f64::from(i32::MIN) {
+        i32::MIN
+    } else {
+        value.round() as i32
+    }
 }
 
 #[must_use]
@@ -5394,6 +5890,30 @@ mod tests {
     }
 
     #[test]
+    fn timeline_track_preview_clip_rect_clips_partially_visible_blocks_without_compressing_them() {
+        let mut document = TimelineDocument::blank();
+        let _ = document.append_microphone_track();
+        document.set_viewport(TimelineViewport::new(
+            TimelineTimeNs::from_duration(Time::new::<second>(0.2)),
+            Time::new::<uom::si::time::millisecond>(1.0),
+        ));
+        let layout = timeline_document_layout(sample_layout().terminal_panel_rect().inset(24));
+        let row_rect = timeline_track_row_rect(layout.scrollport_rect, 0, 0).expect("row rect");
+
+        let preview_rect = timeline_track_preview_clip_rect(
+            row_rect,
+            layout.scrollport_rect,
+            document.viewport(),
+            &document.tracks()[0],
+            None,
+        )
+        .expect("preview rect");
+
+        assert_eq!(preview_rect.left(), layout.scrollport_rect.left());
+        assert_eq!(preview_rect.right(), layout.scrollport_rect.left() + 120);
+    }
+
+    #[test]
     // timeline[verify viewport.scrollbars]
     fn timeline_render_scene_draws_scrollbar_thumbs() {
         let mut document = TimelineDocument::blank();
@@ -5479,13 +5999,50 @@ mod tests {
 
     // timeline[verify add-track.workflow]
     #[test]
-    fn timeline_add_track_scene_specs_expose_microphone_tracing_and_back() {
+    fn timeline_add_track_scene_specs_expose_microphone_text_tracing_and_back() {
         let specs = scene_button_specs(SceneWindowKind::TimelineAddTrack);
 
-        assert_eq!(specs.len(), 3);
+        assert_eq!(specs.len(), 5);
         assert_eq!(specs[0].action, SceneAction::AppendMicrophoneTrack);
-        assert_eq!(specs[1].action, SceneAction::ImportTimeline);
-        assert_eq!(specs[2].action, SceneAction::CloseTimelineTrackMenu);
+        assert_eq!(specs[1].action, SceneAction::AppendTranscriptionTrack);
+        assert_eq!(specs[1].sprite, SpriteId::Transcription);
+        assert_eq!(specs[2].action, SceneAction::AppendTextTrack);
+        assert_eq!(specs[2].sprite, SpriteId::Terminal);
+        assert_eq!(specs[3].action, SceneAction::ImportTimeline);
+        assert_eq!(specs[4].action, SceneAction::CloseTimelineTrackMenu);
+        assert_eq!(specs[4].sprite, SpriteId::Back);
+    }
+
+    #[test]
+    fn timeline_audio_track_panel_uses_record_playback_and_loopback_effects() {
+        let mut document = TimelineDocument::blank();
+        let _ = document.append_microphone_track();
+        let state = sample_audio_input_device_window();
+        let layout = timeline_document_layout(sample_layout().terminal_panel_rect().inset(24));
+        let playback_rect = timeline_track_playback_button_rect(layout, 0).expect("playback rect");
+        let loopback_rect = timeline_track_loopback_button_rect(layout, 0).expect("loopback rect");
+        let record_rect = timeline_track_record_button_rect(layout, 0).expect("record rect");
+
+        let scene = build_blank_timeline_render_scene(
+            sample_layout(),
+            WindowChromeButtonsState::default(),
+            Some(&document),
+            Some(&state),
+            TimelineDocumentVisualState::default(),
+        );
+
+        assert!(scene.panels.iter().any(|panel| {
+            panel.rect == playback_rect.to_win32_rect()
+                && matches!(panel.effect, PanelEffect::PlaybackButton)
+        }));
+        assert!(scene.panels.iter().any(|panel| {
+            panel.rect == loopback_rect.to_win32_rect()
+                && matches!(panel.effect, PanelEffect::LoopbackButton)
+        }));
+        assert!(scene.panels.iter().any(|panel| {
+            panel.rect == record_rect.to_win32_rect()
+                && matches!(panel.effect, PanelEffect::RecordArmButton)
+        }));
     }
 
     #[test]

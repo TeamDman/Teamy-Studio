@@ -91,7 +91,7 @@ const TEAMY_D3D12_OFFSCREEN_ADAPTER_ENV: &str = "TEAMY_D3D12_OFFSCREEN_ADAPTER";
 const SPRITE_SLOT_SIZE: u32 = 320;
 const SPRITE_TARGET_SIZE: u32 = 256;
 const SPRITE_ATLAS_COLUMNS: u32 = 4;
-const SPRITE_ATLAS_ROWS: u32 = 3;
+const SPRITE_ATLAS_ROWS: u32 = 4;
 
 static TERMINAL_FONT_CACHE: OnceLock<Result<Arc<LoadedTerminalFont>, String>> = OnceLock::new();
 static SPRITE_ATLAS_CACHE: OnceLock<Result<Arc<SpriteAtlas>, String>> = OnceLock::new();
@@ -143,6 +143,8 @@ struct SpriteAtlas {
     audio: AtlasSprite,
     windows_audio: AtlasSprite,
     file_audio: AtlasSprite,
+    back: AtlasSprite,
+    transcription: AtlasSprite,
     cursor_arrow: AtlasSprite,
     cursor_hand: AtlasSprite,
     cursor_ibeam: AtlasSprite,
@@ -160,6 +162,8 @@ impl SpriteAtlas {
             SpriteId::Audio => self.audio,
             SpriteId::WindowsAudio => self.windows_audio,
             SpriteId::FileAudio => self.file_audio,
+            SpriteId::Back => self.back,
+            SpriteId::Transcription => self.transcription,
             SpriteId::CursorArrow => self.cursor_arrow,
             SpriteId::CursorHand => self.cursor_hand,
             SpriteId::CursorIBeam => self.cursor_ibeam,
@@ -282,6 +286,8 @@ pub enum SpriteId {
     Audio,
     WindowsAudio,
     FileAudio,
+    Back,
+    Transcription,
     CursorArrow,
     CursorHand,
     CursorIBeam,
@@ -4637,46 +4643,35 @@ fn create_shader_param_buffer(device: &ID3D12Device) -> eyre::Result<ID3D12Resou
     Ok(shader_param_buffer.expect("shader parameter buffer should be initialized"))
 }
 
-fn build_sprite_atlas() -> eyre::Result<SpriteAtlas> {
+fn build_sprite_atlas() -> SpriteAtlas {
     let width = SPRITE_SLOT_SIZE * SPRITE_ATLAS_COLUMNS;
     let height = SPRITE_SLOT_SIZE * SPRITE_ATLAS_ROWS;
     let mut atlas = RgbaImage::new(width, height);
 
-    let terminal = blit_sprite_into_slot(
-        &mut atlas,
-        0,
-        &decode_embedded_sprite(include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/resources/main.png"
-        )))?,
-    );
-    let storage = blit_sprite_into_slot(
-        &mut atlas,
-        1,
-        &decode_embedded_sprite(include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/resources/storage.png"
-        )))?,
-    );
+    let terminal = blit_sprite_into_slot(&mut atlas, 0, &generate_terminal_sprite());
+    let storage = blit_sprite_into_slot(&mut atlas, 1, &generate_storage_sprite());
     let audio = blit_sprite_into_slot(&mut atlas, 2, &generate_audio_sprite());
     let windows_audio = blit_sprite_into_slot(&mut atlas, 3, &generate_windows_audio_sprite());
     let file_audio = blit_sprite_into_slot(&mut atlas, 4, &generate_file_audio_sprite());
+    let back = blit_sprite_into_slot(&mut atlas, 5, &generate_back_sprite());
+    let transcription = blit_sprite_into_slot(&mut atlas, 6, &generate_transcription_sprite());
     // windowing[impl cursor-gallery.stock-os-cursors]
     // windowing[impl virtual-cursor.sdf-shader-roadmap]
     let cursor_arrow =
-        blit_sprite_into_slot(&mut atlas, 5, &generate_stock_cursor_sprite(IDC_ARROW));
-    let cursor_hand = blit_sprite_into_slot(&mut atlas, 6, &generate_stock_cursor_sprite(IDC_HAND));
+        blit_sprite_into_slot(&mut atlas, 7, &generate_stock_cursor_sprite(IDC_ARROW));
+    let cursor_hand = blit_sprite_into_slot(&mut atlas, 8, &generate_stock_cursor_sprite(IDC_HAND));
     let cursor_ibeam =
-        blit_sprite_into_slot(&mut atlas, 7, &generate_stock_cursor_sprite(IDC_IBEAM));
+        blit_sprite_into_slot(&mut atlas, 9, &generate_stock_cursor_sprite(IDC_IBEAM));
     let cursor_cross =
-        blit_sprite_into_slot(&mut atlas, 8, &generate_stock_cursor_sprite(IDC_CROSS));
-    let cursor_wait = blit_sprite_into_slot(&mut atlas, 9, &generate_stock_cursor_sprite(IDC_WAIT));
+        blit_sprite_into_slot(&mut atlas, 10, &generate_stock_cursor_sprite(IDC_CROSS));
+    let cursor_wait =
+        blit_sprite_into_slot(&mut atlas, 11, &generate_stock_cursor_sprite(IDC_WAIT));
     let cursor_size_all =
-        blit_sprite_into_slot(&mut atlas, 10, &generate_stock_cursor_sprite(IDC_SIZEALL));
+        blit_sprite_into_slot(&mut atlas, 12, &generate_stock_cursor_sprite(IDC_SIZEALL));
     let cursor_help =
-        blit_sprite_into_slot(&mut atlas, 11, &generate_stock_cursor_sprite(IDC_HELP));
+        blit_sprite_into_slot(&mut atlas, 13, &generate_stock_cursor_sprite(IDC_HELP));
 
-    Ok(SpriteAtlas {
+    SpriteAtlas {
         width,
         height,
         pixels: atlas.pixels().map(|pixel| pack_rgba8(pixel.0)).collect(),
@@ -4685,6 +4680,8 @@ fn build_sprite_atlas() -> eyre::Result<SpriteAtlas> {
         audio,
         windows_audio,
         file_audio,
+        back,
+        transcription,
         cursor_arrow,
         cursor_hand,
         cursor_ibeam,
@@ -4692,25 +4689,15 @@ fn build_sprite_atlas() -> eyre::Result<SpriteAtlas> {
         cursor_wait,
         cursor_size_all,
         cursor_help,
-    })
+    }
 }
 
 fn cached_sprite_atlas() -> eyre::Result<Arc<SpriteAtlas>> {
     SPRITE_ATLAS_CACHE
-        .get_or_init(|| {
-            build_sprite_atlas()
-                .map(Arc::new)
-                .map_err(|error| error.to_string())
-        })
+        .get_or_init(|| Ok(Arc::new(build_sprite_atlas())))
         .as_ref()
         .map(Arc::clone)
         .map_err(|error| eyre::eyre!(error.clone()))
-}
-
-fn decode_embedded_sprite(bytes: &[u8]) -> eyre::Result<RgbaImage> {
-    image::load_from_memory(bytes)
-        .wrap_err("failed to decode embedded sprite")
-        .map(|image| image.to_rgba8())
 }
 
 fn blit_sprite_into_slot(
@@ -4770,6 +4757,77 @@ fn fit_sprite_to_target(sprite: &RgbaImage, target_size: u32) -> RgbaImage {
 fn generate_audio_sprite() -> RgbaImage {
     // audio[impl gui.windows-icon-sprite]
     windows_microphone_icon_sprite().unwrap_or_else(generate_fallback_audio_sprite)
+}
+
+fn generate_terminal_sprite() -> RgbaImage {
+    let mut image = RgbaImage::new(SPRITE_TARGET_SIZE, SPRITE_TARGET_SIZE);
+    fill_rect(&mut image, 30, 44, 226, 190, [30, 42, 58, 255]);
+    fill_rect(&mut image, 42, 56, 214, 178, [10, 16, 24, 255]);
+    fill_rect(&mut image, 62, 88, 82, 108, [96, 220, 255, 255]);
+    fill_rect(&mut image, 82, 108, 110, 128, [96, 220, 255, 255]);
+    fill_rect(&mut image, 122, 128, 188, 144, [96, 220, 255, 255]);
+    fill_rect(&mut image, 88, 202, 168, 218, [64, 82, 108, 255]);
+    fill_rect(&mut image, 64, 218, 192, 232, [44, 58, 78, 255]);
+    image
+}
+
+fn generate_storage_sprite() -> RgbaImage {
+    let mut image = RgbaImage::new(SPRITE_TARGET_SIZE, SPRITE_TARGET_SIZE);
+    for offset in [0_u32, 58, 116] {
+        let top = 42 + offset;
+        let bottom = top + 44;
+        fill_rect(&mut image, 36, top, 220, bottom, [74, 120, 92, 255]);
+        fill_rect(
+            &mut image,
+            48,
+            top + 10,
+            208,
+            bottom - 10,
+            [18, 32, 24, 255],
+        );
+        fill_rect(
+            &mut image,
+            64,
+            top + 16,
+            84,
+            bottom - 16,
+            [124, 220, 162, 255],
+        );
+        fill_rect(
+            &mut image,
+            178,
+            top + 16,
+            194,
+            bottom - 16,
+            [96, 164, 122, 255],
+        );
+    }
+    fill_rect(&mut image, 56, 206, 200, 222, [56, 84, 68, 255]);
+    image
+}
+
+fn generate_back_sprite() -> RgbaImage {
+    let mut image = RgbaImage::new(SPRITE_TARGET_SIZE, SPRITE_TARGET_SIZE);
+    fill_rect(&mut image, 62, 118, 198, 142, [226, 236, 248, 255]);
+    fill_rect(&mut image, 62, 118, 110, 166, [226, 236, 248, 255]);
+    fill_rect(&mut image, 62, 94, 110, 142, [226, 236, 248, 255]);
+    fill_rect(&mut image, 38, 118, 86, 142, [166, 206, 255, 255]);
+    fill_rect(&mut image, 62, 94, 86, 118, [166, 206, 255, 255]);
+    fill_rect(&mut image, 62, 142, 86, 166, [166, 206, 255, 255]);
+    image
+}
+
+fn generate_transcription_sprite() -> RgbaImage {
+    let mut image = RgbaImage::new(SPRITE_TARGET_SIZE, SPRITE_TARGET_SIZE);
+    fill_rect(&mut image, 42, 58, 214, 178, [46, 38, 66, 255]);
+    fill_rect(&mut image, 58, 74, 198, 162, [20, 16, 34, 255]);
+    fill_rect(&mut image, 74, 94, 110, 110, [248, 208, 124, 255]);
+    fill_rect(&mut image, 122, 94, 182, 110, [248, 208, 124, 255]);
+    fill_rect(&mut image, 74, 126, 162, 142, [196, 146, 255, 255]);
+    fill_rect(&mut image, 74, 158, 138, 174, [120, 220, 255, 255]);
+    fill_rect(&mut image, 106, 178, 142, 206, [46, 38, 66, 255]);
+    fill_rect(&mut image, 122, 174, 154, 190, [20, 16, 34, 255]);
+    image
 }
 
 fn generate_fallback_audio_sprite() -> RgbaImage {

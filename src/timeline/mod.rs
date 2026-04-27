@@ -204,6 +204,8 @@ pub enum TimelineEdit {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TimelineTrackKind {
     Audio,
+    Transcription,
+    Text,
     TracingSpans,
 }
 
@@ -212,6 +214,8 @@ impl TimelineTrackKind {
     pub const fn label(self) -> &'static str {
         match self {
             Self::Audio => "Audio",
+            Self::Transcription => "Transcription",
+            Self::Text => "Text",
             Self::TracingSpans => "Tracing spans",
         }
     }
@@ -226,6 +230,64 @@ pub struct TimelineAudioTrackProjection {
 impl TimelineAudioTrackProjection {
     #[must_use]
     // timeline[impl track.preview-ranges]
+    pub fn new(source_label: impl Into<String>) -> Self {
+        Self {
+            source_label: source_label.into(),
+            preview_range: TimelineTimeRangeNs::new(
+                TimelineTimeNs::ZERO,
+                TimelineTimeNs::from_duration(Time::new::<millisecond>(320.0)),
+            ),
+        }
+    }
+
+    #[must_use]
+    pub fn source_label(&self) -> &str {
+        &self.source_label
+    }
+
+    #[must_use]
+    pub const fn preview_range(&self) -> TimelineTimeRangeNs {
+        self.preview_range
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TimelineTranscriptionTrackProjection {
+    source_label: String,
+    preview_range: TimelineTimeRangeNs,
+}
+
+impl TimelineTranscriptionTrackProjection {
+    #[must_use]
+    pub fn new(source_label: impl Into<String>) -> Self {
+        Self {
+            source_label: source_label.into(),
+            preview_range: TimelineTimeRangeNs::new(
+                TimelineTimeNs::ZERO,
+                TimelineTimeNs::from_duration(Time::new::<millisecond>(320.0)),
+            ),
+        }
+    }
+
+    #[must_use]
+    pub fn source_label(&self) -> &str {
+        &self.source_label
+    }
+
+    #[must_use]
+    pub const fn preview_range(&self) -> TimelineTimeRangeNs {
+        self.preview_range
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TimelineTextTrackProjection {
+    source_label: String,
+    preview_range: TimelineTimeRangeNs,
+}
+
+impl TimelineTextTrackProjection {
+    #[must_use]
     pub fn new(source_label: impl Into<String>) -> Self {
         Self {
             source_label: source_label.into(),
@@ -369,6 +431,8 @@ impl TimelineTracingTrackProjection {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TimelineTrackProjection {
     Audio(TimelineAudioTrackProjection),
+    Transcription(TimelineTranscriptionTrackProjection),
+    Text(TimelineTextTrackProjection),
     TracingSpans(TimelineTracingTrackProjection),
 }
 
@@ -377,6 +441,8 @@ impl TimelineTrackProjection {
     pub const fn kind(&self) -> TimelineTrackKind {
         match self {
             Self::Audio(_) => TimelineTrackKind::Audio,
+            Self::Transcription(_) => TimelineTrackKind::Transcription,
+            Self::Text(_) => TimelineTrackKind::Text,
             Self::TracingSpans(_) => TimelineTrackKind::TracingSpans,
         }
     }
@@ -385,6 +451,8 @@ impl TimelineTrackProjection {
     pub const fn preview_range(&self) -> TimelineTimeRangeNs {
         match self {
             Self::Audio(projection) => projection.preview_range(),
+            Self::Transcription(projection) => projection.preview_range(),
+            Self::Text(projection) => projection.preview_range(),
             Self::TracingSpans(projection) => projection.preview_range(),
         }
     }
@@ -408,6 +476,36 @@ impl TimelineTrack {
             id,
             name: name.into(),
             projection: TimelineTrackProjection::Audio(TimelineAudioTrackProjection::new(
+                source_label,
+            )),
+        }
+    }
+
+    #[must_use]
+    pub fn new_transcription(
+        id: TimelineTrackId,
+        name: impl Into<String>,
+        source_label: impl Into<String>,
+    ) -> Self {
+        Self {
+            id,
+            name: name.into(),
+            projection: TimelineTrackProjection::Transcription(
+                TimelineTranscriptionTrackProjection::new(source_label),
+            ),
+        }
+    }
+
+    #[must_use]
+    pub fn new_text(
+        id: TimelineTrackId,
+        name: impl Into<String>,
+        source_label: impl Into<String>,
+    ) -> Self {
+        Self {
+            id,
+            name: name.into(),
+            projection: TimelineTrackProjection::Text(TimelineTextTrackProjection::new(
                 source_label,
             )),
         }
@@ -463,6 +561,12 @@ impl TimelineTrack {
             TimelineTrackProjection::Audio(projection) => {
                 format!("{} · {}", self.kind().label(), projection.source_label())
             }
+            TimelineTrackProjection::Transcription(projection) => {
+                format!("{} · {}", self.kind().label(), projection.source_label())
+            }
+            TimelineTrackProjection::Text(projection) => {
+                format!("{} · {}", self.kind().label(), projection.source_label())
+            }
             TimelineTrackProjection::TracingSpans(projection) => {
                 let source = projection.source();
                 format!(
@@ -474,6 +578,43 @@ impl TimelineTrack {
                 )
             }
         }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TimelineTextBlock {
+    track_id: TimelineTrackId,
+    time_range: TimelineTimeRangeNs,
+    text: String,
+}
+
+impl TimelineTextBlock {
+    #[must_use]
+    pub fn new(
+        track_id: TimelineTrackId,
+        time_range: TimelineTimeRangeNs,
+        text: impl Into<String>,
+    ) -> Self {
+        Self {
+            track_id,
+            time_range,
+            text: text.into(),
+        }
+    }
+
+    #[must_use]
+    pub const fn track_id(&self) -> TimelineTrackId {
+        self.track_id
+    }
+
+    #[must_use]
+    pub const fn time_range(&self) -> TimelineTimeRangeNs {
+        self.time_range
+    }
+
+    #[must_use]
+    pub fn text(&self) -> &str {
+        &self.text
     }
 }
 
@@ -692,6 +833,7 @@ pub struct TimelineDocument {
     title: String,
     subtitle: String,
     tracks: Vec<TimelineTrack>,
+    text_blocks: Vec<TimelineTextBlock>,
     viewport: TimelineViewport,
     edits: Vec<TimelineEdit>,
 }
@@ -704,9 +846,10 @@ impl TimelineDocument {
         Self {
             id: TimelineDocumentId::DEFAULT_BLANK,
             title: "Blank timeline".to_owned(),
-            subtitle: "Import a Tracy capture or add audio tracks when recording is wired in."
+            subtitle: "Import a Tracy capture or add audio, transcription, and text tracks."
                 .to_owned(),
             tracks: Vec::new(),
+            text_blocks: Vec::new(),
             viewport: TimelineViewport::default(),
             edits: Vec::new(),
         }
@@ -743,6 +886,7 @@ impl TimelineDocument {
                 track_name,
                 source,
             )],
+            text_blocks: Vec::new(),
             viewport: TimelineViewport::default(),
             edits: Vec::new(),
         })
@@ -766,6 +910,11 @@ impl TimelineDocument {
     #[must_use]
     pub fn tracks(&self) -> &[TimelineTrack] {
         &self.tracks
+    }
+
+    #[must_use]
+    pub fn text_blocks(&self) -> &[TimelineTextBlock] {
+        &self.text_blocks
     }
 
     #[must_use]
@@ -816,6 +965,56 @@ impl TimelineDocument {
     ) -> TimelineTrackId {
         let device_name = device_name.into();
         self.append_audio_track(device_name.clone(), device_name)
+    }
+
+    #[must_use]
+    pub fn append_transcription_track(&mut self) -> TimelineTrackId {
+        let track_number = self
+            .tracks
+            .iter()
+            .filter(|track| track.kind() == TimelineTrackKind::Transcription)
+            .count()
+            + 1;
+        self.append_transcription_track_with_source(format!("Transcription {track_number}"))
+    }
+
+    #[must_use]
+    pub fn append_text_track(&mut self) -> TimelineTrackId {
+        let track_number = self
+            .tracks
+            .iter()
+            .filter(|track| track.kind() == TimelineTrackKind::Text)
+            .count()
+            + 1;
+        self.append_text_track_with_source(format!("Text {track_number}"))
+    }
+
+    #[must_use]
+    pub fn append_empty_text_block(
+        &mut self,
+        track_id: TimelineTrackId,
+        time_range: TimelineTimeRangeNs,
+    ) -> bool {
+        self.append_text_block(track_id, time_range, String::new())
+    }
+
+    #[must_use]
+    pub fn append_text_block(
+        &mut self,
+        track_id: TimelineTrackId,
+        time_range: TimelineTimeRangeNs,
+        text: impl Into<String>,
+    ) -> bool {
+        if !self
+            .tracks
+            .iter()
+            .any(|track| track.id() == track_id && track.kind() == TimelineTrackKind::Text)
+        {
+            return false;
+        }
+        self.text_blocks
+            .push(TimelineTextBlock::new(track_id, time_range, text));
+        true
     }
 
     // timeline[impl viewport.pan-controls]
@@ -869,10 +1068,40 @@ impl TimelineDocument {
         track_id
     }
 
+    fn append_transcription_track_with_source(
+        &mut self,
+        source_label: impl Into<String>,
+    ) -> TimelineTrackId {
+        self.retitle_for_composition_if_blank();
+        let source_label = source_label.into();
+        let track_id = self.next_track_id();
+        self.tracks.push(TimelineTrack::new_transcription(
+            track_id,
+            source_label.clone(),
+            source_label,
+        ));
+        track_id
+    }
+
+    fn append_text_track_with_source(
+        &mut self,
+        source_label: impl Into<String>,
+    ) -> TimelineTrackId {
+        self.retitle_for_composition_if_blank();
+        let source_label = source_label.into();
+        let track_id = self.next_track_id();
+        self.tracks.push(TimelineTrack::new_text(
+            track_id,
+            source_label.clone(),
+            source_label,
+        ));
+        track_id
+    }
+
     fn retitle_for_composition_if_blank(&mut self) {
         if self.id == TimelineDocumentId::DEFAULT_BLANK && self.tracks.is_empty() {
             "Timeline composition".clone_into(&mut self.title);
-            "Mix tracing captures and microphone tracks in one non-destructive document."
+            "Mix tracing captures, live audio, transcription, and text blocks in one non-destructive document."
                 .clone_into(&mut self.subtitle);
         }
     }

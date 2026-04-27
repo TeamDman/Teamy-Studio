@@ -17,16 +17,19 @@ The first proof should let the launcher open a Timeline flow, create an empty ti
   - Added a microphone-backed timeline row that shows the live device name, device icon, and record button in the left tool panel.
   - Added a transport tool panel with a play/pause button, spacebar transport toggle, and visible draggable recording/playback heads aligned to the timeline ruler.
   - Added animated elastic mouse-wheel zoom so the timeline eases between the current and target viewport instead of snapping.
-  - Updated tests and validation so `./check-all.ps1` passes with the timeline microphone/transport slice.
+  - Fixed timeline clip projection so zooming and panning clip partially visible blocks at the viewport edge instead of visually compressing them into the available width.
+  - Added a first text-track milestone: text tracks can be added from the add-track picker, the top toolbar now includes Select and Box tools, drag-brushing on a text track creates empty document-owned text boxes, and hovering a text box shows its current contents in a tooltip.
+  - Updated tests and validation so `./check-all.ps1` passes with the timeline microphone/transport/text-box slice.
 - Current focus:
-  - Convert the current live-runtime timeline integration into a durable document model for recorded clips while preserving the new transport/tool-panel behavior.
+  - Turn the new text-track box workflow into a real editing surface while preparing the shared timeline-session architecture needed for detached tool windows.
 - Remaining work:
+  - Add pinned text editing windows with cursor movement, primitive cell editing, and the requested word-navigation/delete shortcuts instead of the current hover-only tooltip preview.
   - Persist recorded timeline audio as document-owned clip/source state instead of reflecting only the live `AudioInputDeviceWindowState` runtime.
-  - Introduce a shared timeline-session object if detached native tool windows are still desired; the current implementation deliberately uses in-window tool panels because scene windows do not yet share mutable session state.
+  - Introduce a shared timeline-session object so detached toolbar, track-list, and editor windows can bind to one document instead of each scene window owning isolated state.
   - Implement the Rust Tracy capture reader and zone/message rendering path beyond the current file-header/track append workflow.
-  - Extend the timeline model to carry real clip placement, source media references, transcription regions, and later editing primitives.
+  - Extend the timeline model to carry richer text documents, source media references, transcription regions, and later editing primitives.
 - Next step:
-  - Add persisted recorded audio sources/clips to `TimelineDocument`, then bind the existing live microphone transport so recording writes document-visible clip data instead of only advancing runtime heads.
+  - Add a minimal pinned text editor window backed by `TimelineDocument` text blocks, then refactor the timeline surfaces toward a shared session model before splitting the toolbar and track list into detached windows.
 
 ## Constraints And Assumptions
 
@@ -53,6 +56,8 @@ The first proof should let the launcher open a Timeline flow, create an empty ti
 - The track list must support adding a microphone-derived track in a later slice by reusing the existing microphone picker.
 - The current timeline UI should use in-window tool panels for track list, transport, and viewport controls until a shared detached-window session architecture exists.
 - Live microphone tracks must expose device identity, recording control, and draggable transport heads in the timeline itself.
+- Text tracks must support document-owned text boxes with explicit time ranges, hover previews, and later pinned editing.
+- The timeline must support a box-authoring tool that creates empty text boxes by dragging within a text track lane.
 - Recording from the timeline should become durable document state rather than staying a purely live runtime projection.
 - A microphone track must eventually map one source medium, such as a live sample buffer or recorded clip, into one or more track lanes depending on mono/stereo channel count.
 - Audio clips, Tracy zones, transcription work ranges, and user selections should share one interval/marker vocabulary so the timeline can visualize what is being recorded, processed, transcribed, or selected.
@@ -64,7 +69,7 @@ Use three layers and keep them separate:
 1. Timeline document model:
    - `TimelineDocument` owns tracks, sources, clips/events, selections, and metadata.
    - `TimelineTime` stores integer nanoseconds.
-   - Tracks are typed: Tracy thread, Tracy messages, audio channel, transcription work, derived analysis, or placeholder.
+  - Tracks are typed: Tracy thread, Tracy messages, audio channel, transcription work, text documents, derived analysis, or placeholder.
    - Source media is separate from track clips. A clip is a view into source data, so later audio editing can move/slice clips without duplicating the original recording buffer.
 
 2. Import/adapters:
@@ -269,7 +274,30 @@ Status:
 
 - Completed.
 
-### Phase 7: Persist Recorded Audio Into The Timeline Document
+### Phase 7: Text Tracks And Box Authoring
+
+Objective: Make text documents a first-class timeline surface that can later receive transcription output and manual authoring.
+
+Tasks:
+
+- Add a dedicated text track kind and document-owned text-box interval type.
+- Render text boxes as viewport-clipped blocks rather than stretching or compressing them to fit the visible lane.
+- Add a toolbar mode that can brush out empty text boxes by dragging in a text track lane.
+- Show text-box contents via native hover tooltips so the user can inspect off-screen or truncated content.
+- Add focused tests for text-track creation, box projection, and box-authoring interactions where practical.
+
+Definition of done:
+
+- A new empty timeline can add a text track.
+- Dragging in a text track with the box tool enabled creates a document-owned text box.
+- Text boxes stay stable under pan and zoom and clip cleanly at the viewport edge.
+- Hovering a text box exposes its current contents.
+
+Status:
+
+- In progress: add-track, document model, hover tooltip, and drag-box creation are implemented; pinned editing and detached editor windows remain to be built.
+
+### Phase 8: Persist Recorded Audio Into The Timeline Document
 
 Objective: Replace the current runtime-only recording projection with durable document-owned audio source and clip state.
 
@@ -287,7 +315,7 @@ Definition of done:
 - Recorded material remains visible and replayable without depending on a transient live-only projection.
 - The document model still preserves non-destructive clip semantics.
 
-### Phase 8: Shared Timeline Session For Detached Tool Windows
+### Phase 9: Shared Timeline Session For Detached Tool Windows
 
 Objective: Enable true detached timeline tool windows only after the timeline has a shared session layer.
 
@@ -305,7 +333,7 @@ Definition of done:
 - Opening/closing a tool window does not fork timeline state.
 - The main timeline can still fall back to in-window panels when detached windows are disabled or unavailable.
 
-### Phase 9: Transcription Regions And Editing Primitives
+### Phase 10: Transcription Regions And Editing Primitives
 
 Objective: Use the timeline as the control surface for transcription and audio editing.
 
@@ -331,9 +359,10 @@ Definition of done:
 4. Render CPU zones/messages from a local `.tracy` capture.
 5. Profile and index the viewer for pan/zoom performance.
 6. Add microphone-backed tracks using existing audio picker/capture code.
-7. Persist recorded audio as document-owned sources/clips.
-8. Add a shared session layer before detached timeline tool windows.
-9. Add transcription regions and audio clip editing primitives.
+7. Add text tracks and document-owned text-box authoring.
+8. Persist recorded audio as document-owned sources/clips.
+9. Add a shared session layer before detached timeline tool windows.
+10. Add transcription regions and audio clip editing primitives.
 
 ## Open Decisions
 
@@ -348,11 +377,11 @@ Definition of done:
 
 Implement Phase 7 next:
 
-- Extend `TimelineDocument` with durable recorded-audio source/clip types.
-- Decide and document the first persistence boundary for recorded buffers.
-- Bind timeline recording start/stop to clip creation or extension instead of live-only runtime projection.
-- Render recorded clip state from the document so it survives transport changes.
-- Add focused tests for clip append behavior and source-vs-clip invariants.
+- Add a pinned text editor surface that binds to a hovered or clicked text box.
+- Implement primitive cursor movement and text entry over the text-box document model.
+- Support the requested control-word navigation and delete variants before widening into a richer editor.
+- Keep the current in-window toolbar working while designing the shared session boundary for later detached windows.
+- Add focused tests for text-box selection/edit binding and keyboard movement semantics where practical.
 - Run `./check-all.ps1` and `tracey query status`.
 
-This slice keeps momentum on the newly landed timeline microphone workflow by turning it into real timeline document state before taking on the larger shared-session refactor for detached tool windows.
+This slice keeps momentum on the newly landed text-track milestone by making the boxes editable before the larger shared-session refactor that detached toolbar, track-list, and editor windows will require.
