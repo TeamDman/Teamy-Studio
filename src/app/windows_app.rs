@@ -143,6 +143,7 @@ const TERMINAL_THROUGHPUT_RESULTS_DIR: &str = "self-test/terminal-throughput";
 const DEMO_MODE_STATE_CHANGED_MESSAGE: u32 = WM_APP + 0x402;
 const TIMELINE_DOCUMENT_CHANGED_MESSAGE: u32 = WM_APP + 0x403;
 const TIMELINE_DOCUMENT_COMMAND_MESSAGE: u32 = WM_APP + 0x404;
+const TIMELINE_TRANSCRIPTION_WORKER_COMPLETED_MESSAGE: u32 = WM_APP + 0x405;
 
 #[derive(Clone, Debug)]
 enum TimelineDocumentCommand {
@@ -2306,6 +2307,9 @@ extern "system" fn scene_window_proc(
         DEMO_MODE_STATE_CHANGED_MESSAGE => handle_scene_demo_mode_state_changed(hwnd),
         TIMELINE_DOCUMENT_CHANGED_MESSAGE => handle_scene_timeline_document_changed(hwnd),
         TIMELINE_DOCUMENT_COMMAND_MESSAGE => handle_scene_timeline_document_command(hwnd),
+        TIMELINE_TRANSCRIPTION_WORKER_COMPLETED_MESSAGE => {
+            handle_scene_timeline_transcription_worker_completed(hwnd)
+        }
         WM_KEYDOWN | WM_SYSKEYDOWN => handle_scene_key_down_message(hwnd, message, wparam, lparam),
         WM_LBUTTONDOWN => handle_bool_message(hwnd, message, wparam, lparam, |hwnd| {
             handle_scene_left_button_down(hwnd, lparam)
@@ -3021,6 +3025,19 @@ fn handle_scene_timeline_document_command(hwnd: WindowHandle) -> LRESULT {
             changed |= apply_timeline_document_command(state, command);
         }
         if changed {
+            render_scene_window_frame(state, hwnd, None, true)?;
+        }
+        Ok(())
+    }) {
+        Ok(()) => LRESULT(0),
+        Err(error) => fail_and_close(hwnd, &error),
+    }
+}
+
+fn handle_scene_timeline_transcription_worker_completed(hwnd: WindowHandle) -> LRESULT {
+    // timeline[impl transcription.completion-refresh]
+    match with_scene_app_state(|state| {
+        if state.scene_kind == SceneWindowKind::Timeline && state.timeline_document.is_some() {
             render_scene_window_frame(state, hwnd, None, true)?;
         }
         Ok(())
@@ -4370,10 +4387,10 @@ fn handle_scene_right_button_down(hwnd: WindowHandle, lparam: LPARAM) -> eyre::R
             return Ok(false);
         }
 
-        let Some(document) = timeline_document_handle(state) else {
+        if state.timeline_document.is_none() {
             return Ok(false);
-        };
-        let origin_viewport = document.viewport();
+        }
+        let origin_viewport = cancel_timeline_zoom_animation_at_current_viewport(state);
 
         state.pending_timeline_selection = None;
         state.timeline_pan_drag = Some(TimelinePanDrag {
@@ -5087,7 +5104,16 @@ fn render_scene_window_frame(
     apply_timeline_zoom_animation(state);
     sync_timeline_audio_runtime_from_document(state);
 
+    let timeline_transcription_completion_target = (state.scene_kind == SceneWindowKind::Timeline)
+        .then(|| state.hwnd.map(|hwnd| hwnd.raw().0 as isize))
+        .flatten();
     if let Some(device_window) = state.audio_input_device_window.as_mut() {
+        if let Some(target) = timeline_transcription_completion_target {
+            device_window.set_transcription_completion_notification_target(
+                target,
+                TIMELINE_TRANSCRIPTION_WORKER_COMPLETED_MESSAGE,
+            );
+        }
         // timeline[impl recording.append-live]
         device_window.sync_transport();
     }
@@ -7088,6 +7114,17 @@ fn current_timeline_zoom_viewport(state: &SceneAppState) -> TimelineViewport {
                 ease_out_elastic(progress),
             )
         })
+}
+
+fn cancel_timeline_zoom_animation_at_current_viewport(
+    state: &mut SceneAppState,
+) -> TimelineViewport {
+    let viewport = current_timeline_zoom_viewport(state);
+    if let Some(document) = timeline_document_handle_mut(state) {
+        document.set_viewport(viewport);
+    }
+    state.timeline_zoom_animation = None;
+    viewport
 }
 
 fn apply_timeline_zoom_animation(state: &mut SceneAppState) {
@@ -11731,6 +11768,37 @@ mod tests {
         assert_eq!(pan_drag.origin, zoom_point);
         assert_eq!(pan_drag.origin_viewport, target_viewport);
         assert_eq!(pan_drag.origin_vertical_scroll_offset, 48);
+    }
+
+    #[test]
+    // timeline[verify viewport.mouse-pan]
+    // timeline[verify viewport.mouse-zoom-anchor]
+    fn timeline_pan_cancels_zoom_animation_at_current_viewport() {
+        let start_viewport =
+            TimelineViewport::new(TimelineTimeNs::new(1_000), Time::new::<nanosecond>(100.0));
+        let target_viewport =
+            TimelineViewport::new(TimelineTimeNs::new(2_500), Time::new::<nanosecond>(25.0));
+        let mut document = TimelineDocument::blank();
+        document.set_viewport(start_viewport);
+        let mut state = timeline_test_state(document);
+        state.timeline_zoom_animation = Some(TimelineZoomAnimation {
+            start_viewport,
+            target_viewport,
+            started_at: Instant::now() - Duration::from_millis(500),
+        });
+
+        let canceled_viewport = cancel_timeline_zoom_animation_at_current_viewport(&mut state);
+
+        assert_eq!(canceled_viewport, target_viewport);
+        assert_eq!(state.timeline_zoom_animation, None);
+        assert_eq!(
+            state
+                .timeline_document
+                .as_ref()
+                .expect("document should remain available")
+                .viewport(),
+            target_viewport
+        );
     }
 
     #[test]

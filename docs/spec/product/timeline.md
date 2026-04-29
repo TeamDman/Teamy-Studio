@@ -125,3 +125,6 @@ New transcription tracks must default automatic chunk-boundary advancement and a
 
 timeline[transcription.chunk-heads]
 Transcription tracks should render the watched chunk begin, chunk end, and transcription progress heads in the transcription lane so the observed audio range is visible while recording grows the source track.
+
+timeline[transcription.completion-refresh]
+When a transcription worker finishes while another scene window has focus, the owning timeline window must be notified so completed transcript text is committed without waiting for pointer hover or focus changes.

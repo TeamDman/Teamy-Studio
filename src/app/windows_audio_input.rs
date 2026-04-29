@@ -14,7 +14,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use uom::si::f64::Time;
 use uom::si::time::second;
 use windows::Win32::Devices::Properties;
-use windows::Win32::Foundation::{PROPERTYKEY, RPC_E_CHANGED_MODE};
+use windows::Win32::Foundation::{HWND, LPARAM, PROPERTYKEY, RPC_E_CHANGED_MODE, WPARAM};
 use windows::Win32::Media::Audio::{
     AUDCLNT_SHAREMODE_SHARED, DEVICE_STATE_ACTIVE, ERole, IAudioCaptureClient, IAudioClient,
     IAudioRenderClient, IMMDevice, IMMDeviceCollection, IMMDeviceEnumerator, MMDeviceEnumerator,
@@ -29,6 +29,7 @@ use windows::Win32::System::Com::{
 };
 use windows::Win32::System::Variant::VT_LPWSTR;
 use windows::Win32::UI::Shell::PropertiesSystem::IPropertyStore;
+use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
 use windows::core::{GUID, PCWSTR};
 
 use super::audio_transcription::{
@@ -198,6 +199,11 @@ impl AudioInputDeviceWindowState {
         self.runtime.transcription.selected_model_name = Some(model_name.into());
     }
 
+    pub fn set_transcription_completion_notification_target(&mut self, hwnd: isize, message: u32) {
+        self.transcription_worker.completion_notification =
+            Some(AudioInputTranscriptionCompletionNotification { hwnd, message });
+    }
+
     // audio[impl transcription.debug-runtime-tick]
     pub fn tick_debug_transcription_runtime(&mut self) {
         self.drain_debug_transcription_result();
@@ -252,6 +258,7 @@ impl AudioInputDeviceWindowState {
         );
         let (sender, receiver) = mpsc::channel();
         self.transcription_worker.result_receiver = Some(receiver);
+        let completion_notification = self.transcription_worker.completion_notification;
         let _ = thread::Builder::new()
             .name("teamy-studio-rust-transcription".to_owned())
             .spawn(move || {
@@ -263,6 +270,9 @@ impl AudioInputDeviceWindowState {
                 )
                 .map_err(|error| error.to_string());
                 let _ = sender.send(result);
+                if let Some(notification) = completion_notification {
+                    notification.post();
+                }
             });
     }
 
@@ -803,6 +813,21 @@ struct AudioInputTranscriptionWorkerState {
     flush_requested: bool,
     sent_chunk_end_seconds: Option<f64>,
     result_receiver: Option<Receiver<Result<RustTranscriptionResult, String>>>,
+    completion_notification: Option<AudioInputTranscriptionCompletionNotification>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AudioInputTranscriptionCompletionNotification {
+    hwnd: isize,
+    message: u32,
+}
+
+impl AudioInputTranscriptionCompletionNotification {
+    fn post(self) {
+        let hwnd = HWND(self.hwnd as *mut c_void);
+        // Safety: the target is captured from the owning timeline UI window; stale windows are tolerated by PostMessageW.
+        let _ = unsafe { PostMessageW(Some(hwnd), self.message, WPARAM(0), LPARAM(0)) };
+    }
 }
 
 impl Default for AudioInputTranscriptionWorkerState {
@@ -814,6 +839,7 @@ impl Default for AudioInputTranscriptionWorkerState {
             flush_requested: false,
             sent_chunk_end_seconds: None,
             result_receiver: None,
+            completion_notification: None,
         }
     }
 }
@@ -827,6 +853,7 @@ impl std::fmt::Debug for AudioInputTranscriptionWorkerState {
             .field("flush_requested", &self.flush_requested)
             .field("sent_chunk_end_seconds", &self.sent_chunk_end_seconds)
             .field("has_result_receiver", &self.result_receiver.is_some())
+            .field("completion_notification", &self.completion_notification)
             .finish()
     }
 }
@@ -2216,6 +2243,22 @@ mod tests {
         state.drain_debug_transcription_result();
 
         assert_eq!(state.runtime.transcription_head_seconds, 1.7);
+    }
+
+    #[test]
+    // timeline[verify transcription.completion-refresh]
+    fn transcription_completion_notification_target_is_stored_for_worker_requests() {
+        let mut state = AudioInputDeviceWindowState::new(device("endpoint-id", "Studio Mic"));
+
+        state.set_transcription_completion_notification_target(42, 0x405);
+
+        assert_eq!(
+            state.transcription_worker.completion_notification,
+            Some(AudioInputTranscriptionCompletionNotification {
+                hwnd: 42,
+                message: 0x405,
+            })
+        );
     }
 
     #[test]
