@@ -140,6 +140,9 @@ const TERMINAL_THROUGHPUT_BENCHMARK_POLL_INTERVAL: Duration = Duration::from_mil
 const TIMELINE_ZOOM_ANIMATION_DURATION: Duration = Duration::from_millis(220);
 const TERMINAL_THROUGHPUT_RESULTS_DIR: &str = "self-test/terminal-throughput";
 const DEMO_MODE_STATE_CHANGED_MESSAGE: u32 = WM_APP + 0x402;
+const TIMELINE_DOCUMENT_CHANGED_MESSAGE: u32 = WM_APP + 0x403;
+
+type SharedTimelineDocument = Arc<Mutex<TimelineDocument>>;
 
 thread_local! {
     static APP_STATE: RefCell<Option<AppState>> = const { RefCell::new(None) };
@@ -186,6 +189,48 @@ fn broadcast_demo_mode_state_changed() {
             )
         };
     }
+}
+
+fn broadcast_timeline_document_changed() {
+    let Ok(windows) = scene_window_registry().lock() else {
+        return;
+    };
+
+    for raw in windows.iter().copied() {
+        let hwnd = HWND(raw as *mut c_void);
+        // Safety: the registry stores HWND values for live scene windows and stale entries are tolerated by PostMessageW.
+        let _ = unsafe {
+            PostMessageW(
+                Some(hwnd),
+                TIMELINE_DOCUMENT_CHANGED_MESSAGE,
+                WPARAM(0),
+                LPARAM(0),
+            )
+        };
+    }
+}
+
+fn shared_timeline_document(document: TimelineDocument) -> SharedTimelineDocument {
+    Arc::new(Mutex::new(document))
+}
+
+fn lock_shared_timeline_document(
+    document: &SharedTimelineDocument,
+) -> std::sync::MutexGuard<'_, TimelineDocument> {
+    document
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn clone_shared_timeline_document(document: &SharedTimelineDocument) -> TimelineDocument {
+    lock_shared_timeline_document(document).clone()
+}
+
+#[derive(Default)]
+struct SceneWindowInitialization {
+    audio_input_device_window: Option<AudioInputDeviceWindowState>,
+    timeline_document: Option<SharedTimelineDocument>,
+    timeline_transcription_settings: Option<windows_scene::TimelineTranscriptionSettingsViewState>,
 }
 
 #[expect(
@@ -466,7 +511,7 @@ struct SceneAppState {
     audio_input_picker: AudioInputPickerState,
     audio_input_picker_completion: AudioInputPickerCompletion,
     audio_input_device_window: Option<AudioInputDeviceWindowState>,
-    timeline_document: Option<TimelineDocument>,
+    timeline_document: Option<SharedTimelineDocument>,
     timeline_transcription_settings: Option<windows_scene::TimelineTranscriptionSettingsViewState>,
     timeline_tool: TimelineInteractionTool,
     timeline_selection: Option<windows_scene::TimelineRectSelection>,
@@ -1055,6 +1100,7 @@ enum ScenePointerAction {
     Handled,
     RenderOnly,
     Invoke(SceneAction),
+    OpenTimelineTranscriptionSettings(usize),
     ChooseAudioInputDevice(usize),
     ToggleAudioInputRecording,
     ToggleAudioInputTranscription,
@@ -1235,7 +1281,12 @@ pub fn run(
 
 pub fn run_launcher(app_home: &AppHome, vt_engine: VtEngineChoice) -> eyre::Result<()> {
     initialize_bell_source(app_home)?;
-    run_scene_window(app_home, SceneWindowKind::Launcher, vt_engine, None)
+    run_scene_window(
+        app_home,
+        SceneWindowKind::Launcher,
+        vt_engine,
+        SceneWindowInitialization::default(),
+    )
 }
 
 pub fn list_terminal_windows() -> eyre::Result<Vec<TerminalWindowSummary>> {
@@ -1398,7 +1449,7 @@ fn run_scene_window(
     app_home: &AppHome,
     scene_kind: SceneWindowKind,
     vt_engine: VtEngineChoice,
-    audio_input_device_window: Option<AudioInputDeviceWindowState>,
+    initialization: SceneWindowInitialization,
 ) -> eyre::Result<()> {
     initialize_demo_mode_state(app_home)?;
     let window_thread = WindowThread::current();
@@ -1429,9 +1480,9 @@ fn run_scene_window(
             vt_engine,
             audio_input_picker,
             audio_input_picker_completion: AudioInputPickerCompletion::default(),
-            audio_input_device_window,
-            timeline_document: None,
-            timeline_transcription_settings: None,
+            audio_input_device_window: initialization.audio_input_device_window,
+            timeline_document: initialization.timeline_document,
+            timeline_transcription_settings: initialization.timeline_transcription_settings,
             timeline_tool: TimelineInteractionTool::default(),
             timeline_selection: None,
             pending_timeline_selection: None,
@@ -1483,6 +1534,33 @@ fn run_scene_window(
     hwnd.show();
     with_scene_app_state(|state| render_scene_window_frame(state, hwnd, None, false))?;
     message_loop()
+}
+
+fn timeline_document_handle(state: &SceneAppState) -> Option<SharedTimelineDocument> {
+    state.timeline_document.as_ref().map(Arc::clone)
+}
+
+fn ensure_timeline_document_handle(state: &mut SceneAppState) -> SharedTimelineDocument {
+    Arc::clone(
+        state
+            .timeline_document
+            .get_or_insert_with(|| shared_timeline_document(TimelineDocument::blank())),
+    )
+}
+
+fn replace_timeline_document(state: &mut SceneAppState, document: TimelineDocument) {
+    if let Some(existing_document) = state.timeline_document.as_ref() {
+        *lock_shared_timeline_document(existing_document) = document;
+    } else {
+        state.timeline_document = Some(shared_timeline_document(document));
+    }
+}
+
+fn timeline_document_snapshot(state: &SceneAppState) -> Option<TimelineDocument> {
+    state
+        .timeline_document
+        .as_ref()
+        .map(clone_shared_timeline_document)
 }
 
 fn normalize_initial_stdin(text: &str) -> String {
@@ -2193,6 +2271,7 @@ extern "system" fn scene_window_proc(
         WM_SIZE => handle_scene_size(hwnd),
         WM_TIMER if wparam.0 == FOCUSED_RENDER_TIMER_ID => handle_scene_focused_render_timer(hwnd),
         DEMO_MODE_STATE_CHANGED_MESSAGE => handle_scene_demo_mode_state_changed(hwnd),
+        TIMELINE_DOCUMENT_CHANGED_MESSAGE => handle_scene_timeline_document_changed(hwnd),
         WM_KEYDOWN | WM_SYSKEYDOWN => handle_scene_key_down_message(hwnd, message, wparam, lparam),
         WM_LBUTTONDOWN => handle_bool_message(hwnd, message, wparam, lparam, |hwnd| {
             handle_scene_left_button_down(hwnd, lparam)
@@ -2390,8 +2469,14 @@ fn handle_scene_key_down_message(
             if virtual_key == u32::from(VK_ESCAPE.0)
                 && let Some(pending_reorder) = state.pending_timeline_track_reorder.take()
             {
-                if let Some(document) = state.timeline_document.as_mut() {
-                    let _ = document.restore_track_order(&pending_reorder.original_track_order);
+                if let Some(document) = timeline_document_handle(state) {
+                    let restored = {
+                        let mut document = lock_shared_timeline_document(&document);
+                        document.restore_track_order(&pending_reorder.original_track_order)
+                    };
+                    if restored {
+                        broadcast_timeline_document_changed();
+                    }
                 }
                 state.pressed_target = None;
                 render_scene_window_frame(state, hwnd, None, false)?;
@@ -2425,10 +2510,7 @@ fn handle_scene_key_down_message(
 
         if state.scene_kind == SceneWindowKind::TimelineTranscriptionSettings {
             if virtual_key == u32::from(VK_ESCAPE.0) {
-                state.scene_kind = SceneWindowKind::Timeline;
-                state.timeline_transcription_settings = None;
-                render_scene_window_frame(state, hwnd, None, false)?;
-                return Ok(SceneKeyAction::Handled);
+                return Ok(SceneKeyAction::CloseWindow);
             }
 
             let target_row_count = timeline_transcription_settings_target_row_count(state);
@@ -2789,6 +2871,18 @@ fn handle_scene_demo_mode_state_changed(hwnd: WindowHandle) -> LRESULT {
     }
 }
 
+fn handle_scene_timeline_document_changed(hwnd: WindowHandle) -> LRESULT {
+    match with_scene_app_state(|state| {
+        if state.timeline_document.is_some() {
+            render_scene_window_frame(state, hwnd, None, true)?;
+        }
+        Ok(())
+    }) {
+        Ok(()) => LRESULT(0),
+        Err(error) => fail_and_close(hwnd, &error),
+    }
+}
+
 #[expect(
     clippy::too_many_lines,
     reason = "scene pointer dispatch keeps the chrome, diagnostics, launcher, and picker hit paths together"
@@ -2916,6 +3010,13 @@ fn handle_scene_left_button_down(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Re
                 return Ok(ScenePointerAction::RenderOnly);
             }
 
+            if scene_drag_handle_contains(layout, point) {
+                state.diagnostic_selection = None;
+                state.pending_diagnostic_selection = None;
+                begin_system_window_drag(hwnd, point)?;
+                return Ok(ScenePointerAction::Handled);
+            }
+
             return Ok(ScenePointerAction::NotHandled);
         }
 
@@ -2969,18 +3070,15 @@ fn handle_scene_left_button_down(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Re
             state.pressed_target =
                 Some(ScenePressedTarget::TimelineTrackReorderHandle(track_index));
             state.pending_timeline_track_reorder =
-                state
-                    .timeline_document
-                    .as_ref()
-                    .map(|document| PendingTimelineTrackReorder {
-                        source_index: track_index,
-                        current_index: track_index,
-                        original_track_order: document
-                            .tracks()
-                            .iter()
-                            .map(crate::timeline::TimelineTrack::id)
-                            .collect(),
-                    });
+                timeline_document_snapshot(state).map(|document| PendingTimelineTrackReorder {
+                    source_index: track_index,
+                    current_index: track_index,
+                    original_track_order: document
+                        .tracks()
+                        .iter()
+                        .map(crate::timeline::TimelineTrack::id)
+                        .collect(),
+                });
             hwnd.capture_mouse();
             return Ok(ScenePointerAction::RenderOnly);
         }
@@ -3004,8 +3102,9 @@ fn handle_scene_left_button_down(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Re
                 track_index,
             ));
             hwnd.capture_mouse();
-            open_timeline_transcription_settings(state, track_index);
-            return Ok(ScenePointerAction::RenderOnly);
+            return Ok(ScenePointerAction::OpenTimelineTranscriptionSettings(
+                track_index,
+            ));
         }
 
         if let Some(track_index) = timeline_track_record_button_at_point(state, layout, point) {
@@ -3249,6 +3348,17 @@ fn handle_scene_left_button_down(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Re
             execute_window_chrome_button(hwnd, button);
             Ok(true)
         }
+        ScenePointerAction::OpenTimelineTranscriptionSettings(track_index) => {
+            if let Err(error) = open_timeline_transcription_settings_window_from_scene(track_index)
+            {
+                error!(
+                    ?error,
+                    "failed to launch timeline transcription settings window"
+                );
+            }
+            with_scene_app_state(|state| render_scene_window_frame(state, hwnd, None, false))?;
+            Ok(true)
+        }
         ScenePointerAction::Invoke(action) => {
             let disposition = invoke_scene_action(hwnd, action)?;
             if disposition == SceneActionDisposition::CloseWindow {
@@ -3424,9 +3534,9 @@ fn handle_scene_left_button_up(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Resu
             state.timeline_selection = None;
             let end_time = timeline_time_from_client_point(state, layout, point);
             if point != pending_text_block.origin
-                && let Some(document) = state.timeline_document.as_mut()
+                && let Some(document) = timeline_document_handle(state)
             {
-                let _ = document.append_empty_text_block(
+                let _ = lock_shared_timeline_document(&document).append_empty_text_block(
                     pending_text_block.track_id,
                     TimelineTimeRangeNs::new(pending_text_block.anchor_time, end_time),
                 );
@@ -3519,6 +3629,17 @@ fn handle_scene_left_button_up(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Resu
             if disposition == SceneActionDisposition::CloseWindow {
                 hwnd.post_close();
             }
+            Ok(true)
+        }
+        ScenePointerAction::OpenTimelineTranscriptionSettings(track_index) => {
+            if let Err(error) = open_timeline_transcription_settings_window_from_scene(track_index)
+            {
+                error!(
+                    ?error,
+                    "failed to launch timeline transcription settings window"
+                );
+            }
+            with_scene_app_state(|state| render_scene_window_frame(state, hwnd, None, false))?;
             Ok(true)
         }
         ScenePointerAction::ChooseAudioInputDevice(index) => {
@@ -3641,7 +3762,7 @@ fn handle_scene_mouse_move(
         let Some(pan_drag) = state.timeline_pan_drag else {
             return Ok(false);
         };
-        let Some(document) = state.timeline_document.as_mut() else {
+        let Some(document) = timeline_document_handle(state) else {
             state.timeline_pan_drag = None;
             return Ok(true);
         };
@@ -3650,7 +3771,8 @@ fn handle_scene_mouse_move(
         let current = point.to_win32_point()?;
         let delta_x = current.x - origin.x;
         let delta_y = current.y - origin.y;
-        document.set_viewport(pan_drag.origin_viewport.pan_pixels(-delta_x));
+        lock_shared_timeline_document(&document)
+            .set_viewport(pan_drag.origin_viewport.pan_pixels(-delta_x));
 
         let layout = scene_client_layout(hwnd, state)?;
         state.timeline_vertical_scroll_offset =
@@ -3681,17 +3803,24 @@ fn handle_scene_mouse_move(
         let Some(next_index) = timeline_track_reorder_index_at_point(state, layout, point) else {
             return Ok(true);
         };
+        let document = timeline_document_handle(state);
         let Some(pending_reorder) = state.pending_timeline_track_reorder.as_mut() else {
             return Ok(false);
         };
         if next_index != pending_reorder.current_index {
-            let Some(document) = state.timeline_document.as_mut() else {
+            let Some(document) = document else {
                 state.pending_timeline_track_reorder = None;
                 state.pressed_target = None;
                 return Ok(true);
             };
-            let _ = document.move_track(pending_reorder.current_index, next_index);
+            let moved = {
+                let mut document = lock_shared_timeline_document(&document);
+                document.move_track(pending_reorder.current_index, next_index)
+            };
             pending_reorder.current_index = next_index;
+            if moved {
+                broadcast_timeline_document_changed();
+            }
         }
         Ok(true)
     })?;
@@ -3939,14 +4068,14 @@ fn handle_scene_right_button_down(hwnd: WindowHandle, lparam: LPARAM) -> eyre::R
             return Ok(false);
         }
 
-        let Some(document) = state.timeline_document.as_ref() else {
+        let Some(document) = timeline_document_handle(state) else {
             return Ok(false);
         };
 
         state.pending_timeline_selection = None;
         state.timeline_pan_drag = Some(TimelinePanDrag {
             origin: point,
-            origin_viewport: document.viewport(),
+            origin_viewport: lock_shared_timeline_document(&document).viewport(),
             origin_vertical_scroll_offset: timeline_current_vertical_scroll_offset(state, layout),
         });
         Ok(true)
@@ -3982,7 +4111,7 @@ fn handle_scene_mouse_wheel(
         }
 
         let current_viewport = current_timeline_zoom_viewport(state);
-        let Some(document) = state.timeline_document.as_mut() else {
+        let Some(document) = timeline_document_handle(state) else {
             return Ok(false);
         };
 
@@ -4001,7 +4130,7 @@ fn handle_scene_mouse_wheel(
             point,
         );
         let target_viewport = current_viewport.scaled_about(anchor, factor);
-        document.set_viewport(current_viewport);
+        lock_shared_timeline_document(&document).set_viewport(current_viewport);
         state.timeline_zoom_animation = Some(TimelineZoomAnimation {
             start_viewport: current_viewport,
             target_viewport,
@@ -4646,6 +4775,7 @@ fn render_scene_window_frame(
     let scramble_input_device_identifiers = state
         .demo_mode_scramble_input_device_identifiers
         .is_enabled();
+    let timeline_document = timeline_document_snapshot(state);
     let scene = if state.diagnostics_visible && state.scene_kind == SceneWindowKind::Launcher {
         windows_scene::build_launcher_diagnostic_render_scene(
             layout,
@@ -4745,14 +4875,14 @@ fn render_scene_window_frame(
         windows_scene::build_timeline_transcription_settings_render_scene(
             layout,
             window_chrome_buttons_state,
-            state.timeline_document.as_ref(),
+            timeline_document.as_ref(),
             timeline_transcription_settings_view_state(state, layout),
         )
     } else if state.scene_kind == SceneWindowKind::Timeline {
         windows_scene::build_blank_timeline_render_scene(
             layout,
             window_chrome_buttons_state,
-            state.timeline_document.as_ref(),
+            timeline_document.as_ref(),
             state.audio_input_device_window.as_ref(),
             timeline_document_visual_state(state, layout),
         )
@@ -5345,18 +5475,16 @@ fn timeline_viewport_control_at_point(
 }
 
 fn timeline_live_audio_track_index(state: &SceneAppState) -> Option<usize> {
-    state
-        .timeline_document
-        .as_ref()?
+    let document = timeline_document_handle(state)?;
+    lock_shared_timeline_document(&document)
         .tracks()
         .iter()
         .position(|track| track.kind() == crate::timeline::TimelineTrackKind::Audio)
 }
 
 fn timeline_live_transcription_track_index(state: &SceneAppState) -> Option<usize> {
-    state
-        .timeline_document
-        .as_ref()?
+    let document = timeline_document_handle(state)?;
+    lock_shared_timeline_document(&document)
         .tracks()
         .iter()
         .position(|track| track.kind() == crate::timeline::TimelineTrackKind::Transcription)
@@ -5367,11 +5495,12 @@ fn timeline_text_track_at_point(
     layout: TerminalLayout,
     point: ClientPoint,
 ) -> Option<(usize, TimelineTrackId)> {
-    let document = state.timeline_document.as_ref()?;
+    let vertical_scroll_offset = timeline_current_vertical_scroll_offset(state, layout);
+    let document = timeline_document_snapshot(state)?;
     let timeline_layout = timeline_layout(layout);
     let row_index = windows_scene::timeline_track_index_at_point(
         timeline_layout,
-        timeline_current_vertical_scroll_offset(state, layout),
+        vertical_scroll_offset,
         document.tracks().len(),
         point,
     )?;
@@ -5384,7 +5513,7 @@ fn timeline_text_block_tooltip_at_point(
     layout: TerminalLayout,
     point: ClientPoint,
 ) -> Option<(String, ClientRect)> {
-    let document = state.timeline_document.as_ref()?;
+    let document = timeline_document_snapshot(state)?;
     let timeline_layout = timeline_layout(layout);
     let vertical_scroll_offset = timeline_current_vertical_scroll_offset(state, layout);
     let viewport = current_timeline_zoom_viewport(state);
@@ -5528,23 +5657,27 @@ fn select_timeline_transcription_settings_target_track(
 }
 
 fn append_text_track_from_timeline_transcription_settings(state: &mut SceneAppState) {
-    let Some(document) = state.timeline_document.as_mut() else {
+    let Some(document) = timeline_document_handle(state) else {
         return;
     };
-    let track_id = document.append_text_track();
-    let selected_target_index = document
-        .tracks()
-        .iter()
-        .filter(|track| track.kind() == crate::timeline::TimelineTrackKind::Text)
-        .map(crate::timeline::TimelineTrack::id)
-        .position(|candidate| candidate == track_id)
-        .map_or(0, |index| index + 1);
+    let selected_target_index = {
+        let mut document = lock_shared_timeline_document(&document);
+        let track_id = document.append_text_track();
+        document
+            .tracks()
+            .iter()
+            .filter(|track| track.kind() == crate::timeline::TimelineTrackKind::Text)
+            .map(crate::timeline::TimelineTrack::id)
+            .position(|candidate| candidate == track_id)
+            .map_or(0, |index| index + 1)
+    };
     if let Some(settings) = state.timeline_transcription_settings.as_mut() {
         settings.selected_column = windows_scene::TimelineTranscriptionSettingsColumn::TargetTrack;
         settings.selected_target_index = selected_target_index;
         settings.output_target_docked = true;
     }
     apply_timeline_transcription_settings_selection(state);
+    broadcast_timeline_document_changed();
 }
 
 fn timeline_transcription_settings_target_at_point(
@@ -5619,8 +5752,8 @@ fn timeline_transcription_settings_model_row_at_point(
 }
 
 fn timeline_transcription_settings_target_row_count(state: &SceneAppState) -> usize {
-    state.timeline_document.as_ref().map_or(1, |document| {
-        document
+    timeline_document_handle(state).map_or(1, |document| {
+        lock_shared_timeline_document(&document)
             .tracks()
             .iter()
             .filter(|track| track.kind() == crate::timeline::TimelineTrackKind::Text)
@@ -5640,16 +5773,14 @@ fn timeline_transcription_settings_target_row_at_point(
     })
 }
 
-fn open_timeline_transcription_settings(state: &mut SceneAppState, track_index: usize) {
-    let Some(document) = state.timeline_document.as_ref() else {
-        return;
-    };
-    let Some(track) = document.tracks().get(track_index) else {
-        return;
-    };
+fn timeline_transcription_settings_state_for_document(
+    document: &TimelineDocument,
+    track_index: usize,
+) -> Option<windows_scene::TimelineTranscriptionSettingsViewState> {
+    let track = document.tracks().get(track_index)?;
     let crate::timeline::TimelineTrackProjection::Transcription(projection) = track.projection()
     else {
-        return;
+        return None;
     };
     let text_track_ids = document
         .tracks()
@@ -5670,53 +5801,104 @@ fn open_timeline_transcription_settings(state: &mut SceneAppState, track_index: 
         })
         .map_or(0, |index| index + 1);
 
-    state.timeline_transcription_settings =
-        Some(windows_scene::TimelineTranscriptionSettingsViewState {
-            track_id: track.id(),
-            selected_column: windows_scene::TimelineTranscriptionSettingsColumn::Model,
-            selected_model_index,
-            selected_target_index,
-            add_text_track_button_visual_state:
-                crate::app::windows_d3d12_renderer::ButtonVisualState::default(),
-            model_target_docked: false,
-            output_target_docked: false,
-            dragging_target: None,
-            drag_position: None,
-            hovered_model_index: None,
-            hovered_target_index: None,
-            hovered_model_socket: false,
-            hovered_target_socket: false,
-            hovered_model_target: false,
-            hovered_output_target: false,
-            hovered_add_text_track_button: false,
-        });
-    state.scene_kind = SceneWindowKind::TimelineTranscriptionSettings;
-    state.scene_action_selected_index = 0;
-    state.scene_virtual_cursor = None;
+    Some(windows_scene::TimelineTranscriptionSettingsViewState {
+        track_id: track.id(),
+        selected_column: windows_scene::TimelineTranscriptionSettingsColumn::Model,
+        selected_model_index,
+        selected_target_index,
+        add_text_track_button_visual_state:
+            crate::app::windows_d3d12_renderer::ButtonVisualState::default(),
+        model_target_docked: false,
+        output_target_docked: false,
+        dragging_target: None,
+        drag_position: None,
+        hovered_model_index: None,
+        hovered_target_index: None,
+        hovered_model_socket: false,
+        hovered_target_socket: false,
+        hovered_model_target: false,
+        hovered_output_target: false,
+        hovered_add_text_track_button: false,
+    })
+}
+
+fn open_timeline_transcription_settings_window_from_scene(track_index: usize) -> eyre::Result<()> {
+    let Some((app_home, vt_engine, timeline_document, timeline_transcription_settings)) =
+        with_scene_app_state(|state| {
+            let Some(timeline_document) = timeline_document_handle(state) else {
+                return Ok(None);
+            };
+            let document_snapshot = clone_shared_timeline_document(&timeline_document);
+            Ok(
+                timeline_transcription_settings_state_for_document(&document_snapshot, track_index)
+                    .map(|timeline_transcription_settings| {
+                        (
+                            state.app_home.clone(),
+                            state.vt_engine,
+                            timeline_document,
+                            timeline_transcription_settings,
+                        )
+                    }),
+            )
+        })?
+    else {
+        return Ok(());
+    };
+
+    thread::Builder::new()
+        .name("teamy-studio-timeline-transcription-settings".to_owned())
+        .spawn(move || {
+            if let Err(error) = run_scene_window(
+                &app_home,
+                SceneWindowKind::TimelineTranscriptionSettings,
+                vt_engine,
+                SceneWindowInitialization {
+                    timeline_document: Some(timeline_document),
+                    timeline_transcription_settings: Some(timeline_transcription_settings),
+                    ..Default::default()
+                },
+            ) {
+                error!(
+                    ?error,
+                    "failed to open timeline transcription settings window"
+                );
+            }
+        })
+        .wrap_err("failed to spawn Teamy Studio timeline transcription settings window thread")?;
+    Ok(())
 }
 
 fn apply_timeline_transcription_settings_selection(state: &mut SceneAppState) {
     let Some(settings) = state.timeline_transcription_settings else {
         return;
     };
-    let Some(document) = state.timeline_document.as_mut() else {
+    let Some(document) = timeline_document_handle(state) else {
         return;
     };
     let model_name = KNOWN_WHISPER_MODELS
         .get(settings.selected_model_index)
         .map_or(KNOWN_WHISPER_MODELS[0].name, |model| model.name);
-    let text_track_ids = document
-        .tracks()
-        .iter()
-        .filter(|track| track.kind() == crate::timeline::TimelineTrackKind::Text)
-        .map(crate::timeline::TimelineTrack::id)
-        .collect::<Vec<_>>();
-    let target_track_id = settings
-        .selected_target_index
-        .checked_sub(1)
-        .and_then(|index| text_track_ids.get(index).copied());
-    let _ = document.set_transcription_track_model_name(settings.track_id, model_name);
-    let _ = document.set_transcription_track_target_text_track(settings.track_id, target_track_id);
+    let changed = {
+        let mut document = lock_shared_timeline_document(&document);
+        let text_track_ids = document
+            .tracks()
+            .iter()
+            .filter(|track| track.kind() == crate::timeline::TimelineTrackKind::Text)
+            .map(crate::timeline::TimelineTrack::id)
+            .collect::<Vec<_>>();
+        let target_track_id = settings
+            .selected_target_index
+            .checked_sub(1)
+            .and_then(|index| text_track_ids.get(index).copied());
+        let model_changed =
+            document.set_transcription_track_model_name(settings.track_id, model_name);
+        let target_changed =
+            document.set_transcription_track_target_text_track(settings.track_id, target_track_id);
+        model_changed || target_changed
+    };
+    if changed {
+        broadcast_timeline_document_changed();
+    }
 }
 
 fn timeline_track_reorder_handle_at_point(
@@ -5724,7 +5906,8 @@ fn timeline_track_reorder_handle_at_point(
     layout: TerminalLayout,
     point: ClientPoint,
 ) -> Option<usize> {
-    let document = state.timeline_document.as_ref()?;
+    let document = timeline_document_handle(state)?;
+    let document = lock_shared_timeline_document(&document);
     let timeline_layout = timeline_layout(layout);
     (0..document.tracks().len()).find(|index| {
         windows_scene::timeline_track_reorder_handle_rect(timeline_layout, *index)
@@ -5737,7 +5920,8 @@ fn timeline_track_reorder_index_at_point(
     layout: TerminalLayout,
     point: ClientPoint,
 ) -> Option<usize> {
-    let document = state.timeline_document.as_ref()?;
+    let document = timeline_document_handle(state)?;
+    let document = lock_shared_timeline_document(&document);
     if document.tracks().is_empty() {
         return None;
     }
@@ -5848,10 +6032,9 @@ fn timeline_audio_head_at_point(
 }
 
 fn timeline_track_count(state: &SceneAppState) -> usize {
-    state
-        .timeline_document
-        .as_ref()
-        .map_or(0, |document| document.tracks().len())
+    timeline_document_handle(state).map_or(0, |document| {
+        lock_shared_timeline_document(&document).tracks().len()
+    })
 }
 
 fn timeline_layout(layout: TerminalLayout) -> windows_scene::TimelineDocumentLayout {
@@ -5957,7 +6140,9 @@ fn current_timeline_zoom_viewport(state: &SceneAppState) -> TimelineViewport {
     let base_viewport = state
         .timeline_document
         .as_ref()
-        .map_or_else(TimelineViewport::default, TimelineDocument::viewport);
+        .map_or_else(TimelineViewport::default, |document| {
+            lock_shared_timeline_document(document).viewport()
+        });
     state
         .timeline_zoom_animation
         .map_or(base_viewport, |animation| {
@@ -5976,7 +6161,7 @@ fn apply_timeline_zoom_animation(state: &mut SceneAppState) {
     let Some(animation) = state.timeline_zoom_animation else {
         return;
     };
-    let Some(document) = state.timeline_document.as_mut() else {
+    let Some(document) = timeline_document_handle(state) else {
         state.timeline_zoom_animation = None;
         return;
     };
@@ -5985,12 +6170,12 @@ fn apply_timeline_zoom_animation(state: &mut SceneAppState) {
         / TIMELINE_ZOOM_ANIMATION_DURATION.as_secs_f64())
     .clamp(0.0, 1.0);
     if progress >= 1.0 {
-        document.set_viewport(animation.target_viewport);
+        lock_shared_timeline_document(&document).set_viewport(animation.target_viewport);
         state.timeline_zoom_animation = None;
         return;
     }
 
-    document.set_viewport(interpolate_timeline_viewport(
+    lock_shared_timeline_document(&document).set_viewport(interpolate_timeline_viewport(
         animation.start_viewport,
         animation.target_viewport,
         ease_out_elastic(progress),
@@ -6457,7 +6642,10 @@ fn open_audio_input_device_window_from_scene(
                     &app_home,
                     SceneWindowKind::AudioInputDeviceDetails,
                     vt_engine,
-                    Some(device_window),
+                    SceneWindowInitialization {
+                        audio_input_device_window: Some(device_window),
+                        ..Default::default()
+                    },
                 ) {
                     error!(?error, "failed to open selected audio input device window");
                 }
@@ -6489,10 +6677,9 @@ fn commit_audio_input_picker_selection_from_scene(
         }
         Ok(AudioInputPickerCompletion::TimelineMicrophoneTrack) => {
             let result = with_scene_app_state(|state| {
-                let document = state
-                    .timeline_document
-                    .get_or_insert_with(TimelineDocument::blank);
-                let _ = document.append_microphone_track_for_device(device.name.clone());
+                let document = ensure_timeline_document_handle(state);
+                let _ = lock_shared_timeline_document(&document)
+                    .append_microphone_track_for_device(device.name.clone());
                 state.audio_input_device_window = Some(AudioInputDeviceWindowState::new(device));
                 state.audio_input_picker_completion = AudioInputPickerCompletion::OpenDeviceWindow;
                 state.scene_kind = SceneWindowKind::Timeline;
@@ -6506,6 +6693,8 @@ fn commit_audio_input_picker_selection_from_scene(
                     "failed to commit selected microphone into the timeline"
                 );
                 hwnd.post_close();
+            } else {
+                broadcast_timeline_document_changed();
             }
         }
         Err(error) => {
@@ -6781,7 +6970,7 @@ fn invoke_scene_action(
             // timeline[impl start-window.new-blank]
             // timeline[impl document.window-state]
             state.scene_kind = SceneWindowKind::Timeline;
-            state.timeline_document = Some(TimelineDocument::blank());
+            replace_timeline_document(state, TimelineDocument::blank());
             state.scene_action_selected_index = 0;
             state.scene_virtual_cursor = None;
             render_scene_window_frame(state, hwnd, None, false)?;
@@ -6855,9 +7044,12 @@ fn perform_scene_action(
             thread::Builder::new()
                 .name("teamy-studio-cursor-gallery".to_owned())
                 .spawn(move || {
-                    if let Err(error) =
-                        run_scene_window(&app_home, SceneWindowKind::CursorGallery, vt_engine, None)
-                    {
+                    if let Err(error) = run_scene_window(
+                        &app_home,
+                        SceneWindowKind::CursorGallery,
+                        vt_engine,
+                        SceneWindowInitialization::default(),
+                    ) {
                         error!(?error, "failed to open cursor gallery window");
                     }
                 })
@@ -6869,9 +7061,12 @@ fn perform_scene_action(
             thread::Builder::new()
                 .name("teamy-studio-demo-mode".to_owned())
                 .spawn(move || {
-                    if let Err(error) =
-                        run_scene_window(&app_home, SceneWindowKind::DemoMode, vt_engine, None)
-                    {
+                    if let Err(error) = run_scene_window(
+                        &app_home,
+                        SceneWindowKind::DemoMode,
+                        vt_engine,
+                        SceneWindowInitialization::default(),
+                    ) {
                         error!(?error, "failed to open demo mode window");
                     }
                 })
@@ -6913,9 +7108,12 @@ fn perform_scene_action(
             thread::Builder::new()
                 .name("teamy-studio-audio-picker".to_owned())
                 .spawn(move || {
-                    if let Err(error) =
-                        run_scene_window(&app_home, SceneWindowKind::AudioPicker, vt_engine, None)
-                    {
+                    if let Err(error) = run_scene_window(
+                        &app_home,
+                        SceneWindowKind::AudioPicker,
+                        vt_engine,
+                        SceneWindowInitialization::default(),
+                    ) {
                         error!(?error, "failed to open audio picker window");
                     }
                 })
@@ -6928,9 +7126,12 @@ fn perform_scene_action(
             thread::Builder::new()
                 .name("teamy-studio-audio-daemon".to_owned())
                 .spawn(move || {
-                    if let Err(error) =
-                        run_scene_window(&app_home, SceneWindowKind::AudioDaemon, vt_engine, None)
-                    {
+                    if let Err(error) = run_scene_window(
+                        &app_home,
+                        SceneWindowKind::AudioDaemon,
+                        vt_engine,
+                        SceneWindowInitialization::default(),
+                    ) {
                         error!(?error, "failed to open audio daemon window");
                     }
                 })
@@ -6947,7 +7148,7 @@ fn perform_scene_action(
                         &app_home,
                         SceneWindowKind::AudioInputDevicePicker,
                         vt_engine,
-                        None,
+                        SceneWindowInitialization::default(),
                     ) {
                         error!(?error, "failed to open audio input device picker window");
                     }
@@ -6961,9 +7162,12 @@ fn perform_scene_action(
             thread::Builder::new()
                 .name("teamy-studio-timeline".to_owned())
                 .spawn(move || {
-                    if let Err(error) =
-                        run_scene_window(&app_home, SceneWindowKind::TimelineStart, vt_engine, None)
-                    {
+                    if let Err(error) = run_scene_window(
+                        &app_home,
+                        SceneWindowKind::TimelineStart,
+                        vt_engine,
+                        SceneWindowInitialization::default(),
+                    ) {
                         error!(?error, "failed to open timeline window");
                     }
                 })
@@ -6983,8 +7187,8 @@ fn perform_scene_action(
         SceneAction::CreateBlankTimeline => Ok(SceneActionDisposition::KeepOpen),
         SceneAction::PanTimelineLeft => {
             with_scene_app_state(|state| {
-                if let Some(document) = state.timeline_document.as_mut() {
-                    document.pan_viewport_left();
+                if let Some(document) = timeline_document_handle(state) {
+                    lock_shared_timeline_document(&document).pan_viewport_left();
                 }
                 Ok(())
             })?;
@@ -6992,8 +7196,8 @@ fn perform_scene_action(
         }
         SceneAction::PanTimelineRight => {
             with_scene_app_state(|state| {
-                if let Some(document) = state.timeline_document.as_mut() {
-                    document.pan_viewport_right();
+                if let Some(document) = timeline_document_handle(state) {
+                    lock_shared_timeline_document(&document).pan_viewport_right();
                 }
                 Ok(())
             })?;
@@ -7001,8 +7205,8 @@ fn perform_scene_action(
         }
         SceneAction::ZoomTimelineIn => {
             with_scene_app_state(|state| {
-                if let Some(document) = state.timeline_document.as_mut() {
-                    document.zoom_viewport_in();
+                if let Some(document) = timeline_document_handle(state) {
+                    lock_shared_timeline_document(&document).zoom_viewport_in();
                 }
                 Ok(())
             })?;
@@ -7010,8 +7214,8 @@ fn perform_scene_action(
         }
         SceneAction::ZoomTimelineOut => {
             with_scene_app_state(|state| {
-                if let Some(document) = state.timeline_document.as_mut() {
-                    document.zoom_viewport_out();
+                if let Some(document) = timeline_document_handle(state) {
+                    lock_shared_timeline_document(&document).zoom_viewport_out();
                 }
                 Ok(())
             })?;
@@ -7054,28 +7258,26 @@ fn perform_scene_action(
         }
         SceneAction::AppendTranscriptionTrack => {
             with_scene_app_state(|state| {
-                let document = state
-                    .timeline_document
-                    .get_or_insert_with(TimelineDocument::blank);
-                let _ = document.append_transcription_track();
+                let document = ensure_timeline_document_handle(state);
+                let _ = lock_shared_timeline_document(&document).append_transcription_track();
                 state.scene_kind = SceneWindowKind::Timeline;
                 state.scene_action_selected_index = 0;
                 state.scene_virtual_cursor = None;
                 Ok(())
             })?;
+            broadcast_timeline_document_changed();
             Ok(SceneActionDisposition::KeepOpen)
         }
         SceneAction::AppendTextTrack => {
             with_scene_app_state(|state| {
-                let document = state
-                    .timeline_document
-                    .get_or_insert_with(TimelineDocument::blank);
-                let _ = document.append_text_track();
+                let document = ensure_timeline_document_handle(state);
+                let _ = lock_shared_timeline_document(&document).append_text_track();
                 state.scene_kind = SceneWindowKind::Timeline;
                 state.scene_action_selected_index = 0;
                 state.scene_virtual_cursor = None;
                 Ok(())
             })?;
+            broadcast_timeline_document_changed();
             Ok(SceneActionDisposition::KeepOpen)
         }
         SceneAction::CloseTimelineTrackMenu => {
@@ -7108,17 +7310,19 @@ fn perform_scene_action(
                                 SceneWindowKind::Timeline | SceneWindowKind::TimelineAddTrack
                             )
                         {
-                            if let Some(existing_document) = state.timeline_document.as_mut() {
-                                existing_document.append_tracy_capture_track(&path)?;
+                            if let Some(existing_document) = timeline_document_handle(state) {
+                                lock_shared_timeline_document(&existing_document)
+                                    .append_tracy_capture_track(&path)?;
                             }
                         } else {
-                            state.timeline_document = Some(document);
+                            replace_timeline_document(state, document);
                         }
                         state.scene_kind = SceneWindowKind::Timeline;
                         state.scene_action_selected_index = 0;
                         state.scene_virtual_cursor = None;
                         Ok(())
                     })?;
+                    broadcast_timeline_document_changed();
                 }
                 Err(error) => {
                     error!(?error, path = %path.display(), "failed to import Tracy capture");
@@ -10627,7 +10831,7 @@ mod tests {
             audio_input_picker: AudioInputPickerState::default(),
             audio_input_picker_completion: AudioInputPickerCompletion::default(),
             audio_input_device_window: None,
-            timeline_document: Some(TimelineDocument::blank()),
+            timeline_document: Some(shared_timeline_document(TimelineDocument::blank())),
             timeline_transcription_settings: None,
             timeline_tool: TimelineInteractionTool::default(),
             timeline_selection: None,
