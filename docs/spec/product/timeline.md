@@ -111,3 +111,17 @@ Dragging from the timeline ruler should produce a rectangular selection whose ve
 
 timeline[viewport.scrollbars]
 Timeline documents should render horizontal and vertical scrollbar affordances that reflect the current visible time span and track scroll position.
+
+## Transcription Tracks
+
+timeline[transcription.targets]
+Transcription tracks must model three independent targets: the Rust Whisper model to run, the audio track to observe as input, and the text track to receive output blocks.
+
+timeline[transcription.settings]
+Transcription track settings must expose input-audio and output-text target selection, inactivity detection period, activity threshold, a manual flush action, automatic chunk-boundary advancement, and automatic chunk submission.
+
+timeline[transcription.defaults]
+New transcription tracks must default automatic chunk-boundary advancement and automatic chunk submission to enabled.
+
+timeline[transcription.chunk-heads]
+Transcription tracks should render the watched chunk begin, chunk end, and transcription progress heads in the transcription lane so the observed audio range is visible while recording grows the source track.

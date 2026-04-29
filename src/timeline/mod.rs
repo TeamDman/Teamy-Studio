@@ -226,6 +226,7 @@ impl TimelineTrackKind {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TimelineAudioTrackProjection {
     source_label: String,
+    source_device_id: Option<String>,
     preview_range: TimelineTimeRangeNs,
 }
 
@@ -235,6 +236,22 @@ impl TimelineAudioTrackProjection {
     pub fn new(source_label: impl Into<String>) -> Self {
         Self {
             source_label: source_label.into(),
+            source_device_id: None,
+            preview_range: TimelineTimeRangeNs::new(
+                TimelineTimeNs::ZERO,
+                TimelineTimeNs::from_duration(Time::new::<millisecond>(320.0)),
+            ),
+        }
+    }
+
+    #[must_use]
+    pub fn new_microphone(
+        source_label: impl Into<String>,
+        source_device_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            source_label: source_label.into(),
+            source_device_id: Some(source_device_id.into()),
             preview_range: TimelineTimeRangeNs::new(
                 TimelineTimeNs::ZERO,
                 TimelineTimeNs::from_duration(Time::new::<millisecond>(320.0)),
@@ -248,17 +265,32 @@ impl TimelineAudioTrackProjection {
     }
 
     #[must_use]
+    pub fn source_device_id(&self) -> Option<&str> {
+        self.source_device_id.as_deref()
+    }
+
+    #[must_use]
     pub const fn preview_range(&self) -> TimelineTimeRangeNs {
         self.preview_range
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+// timeline[impl transcription.targets]
+// timeline[impl transcription.settings]
+// timeline[impl transcription.defaults]
 pub struct TimelineTranscriptionTrackProjection {
     source_label: String,
     preview_range: TimelineTimeRangeNs,
     model_name: String,
+    target_audio_track_id: Option<TimelineTrackId>,
     target_text_track_id: Option<TimelineTrackId>,
+    inactivity_detection_period: TimelineTimeNs,
+    activity_threshold: u16,
+    chunk_range: TimelineTimeRangeNs,
+    progress_head: TimelineTimeNs,
+    automatically_advance_chunk_boundaries: bool,
+    automatically_submit_chunks: bool,
 }
 
 impl TimelineTranscriptionTrackProjection {
@@ -271,7 +303,17 @@ impl TimelineTranscriptionTrackProjection {
                 TimelineTimeNs::from_duration(Time::new::<millisecond>(320.0)),
             ),
             model_name: DEFAULT_TRANSCRIPTION_MODEL_NAME.to_owned(),
+            target_audio_track_id: None,
             target_text_track_id: None,
+            inactivity_detection_period: TimelineTimeNs::from_duration(Time::new::<second>(3.0)),
+            activity_threshold: 500,
+            chunk_range: TimelineTimeRangeNs::new(
+                TimelineTimeNs::ZERO,
+                TimelineTimeNs::from_duration(Time::new::<second>(30.0)),
+            ),
+            progress_head: TimelineTimeNs::ZERO,
+            automatically_advance_chunk_boundaries: true,
+            automatically_submit_chunks: true,
         }
     }
 
@@ -295,12 +337,56 @@ impl TimelineTranscriptionTrackProjection {
         self.target_text_track_id
     }
 
+    #[must_use]
+    pub const fn target_audio_track_id(&self) -> Option<TimelineTrackId> {
+        self.target_audio_track_id
+    }
+
+    #[must_use]
+    pub const fn inactivity_detection_period(&self) -> TimelineTimeNs {
+        self.inactivity_detection_period
+    }
+
+    #[must_use]
+    pub const fn activity_threshold(&self) -> u16 {
+        self.activity_threshold
+    }
+
+    #[must_use]
+    pub const fn chunk_range(&self) -> TimelineTimeRangeNs {
+        self.chunk_range
+    }
+
+    #[must_use]
+    pub const fn progress_head(&self) -> TimelineTimeNs {
+        self.progress_head
+    }
+
+    #[must_use]
+    pub const fn automatically_advance_chunk_boundaries(&self) -> bool {
+        self.automatically_advance_chunk_boundaries
+    }
+
+    #[must_use]
+    pub const fn automatically_submit_chunks(&self) -> bool {
+        self.automatically_submit_chunks
+    }
+
     fn set_model_name(&mut self, model_name: impl Into<String>) {
         self.model_name = model_name.into();
     }
 
+    fn set_target_audio_track_id(&mut self, target_audio_track_id: Option<TimelineTrackId>) {
+        self.target_audio_track_id = target_audio_track_id;
+    }
+
     fn set_target_text_track_id(&mut self, target_text_track_id: Option<TimelineTrackId>) {
         self.target_text_track_id = target_text_track_id;
+    }
+
+    fn set_automation(&mut self, advance_boundaries: bool, submit_chunks: bool) {
+        self.automatically_advance_chunk_boundaries = advance_boundaries;
+        self.automatically_submit_chunks = submit_chunks;
     }
 }
 
@@ -506,6 +592,22 @@ impl TimelineTrack {
     }
 
     #[must_use]
+    pub fn new_microphone_audio(
+        id: TimelineTrackId,
+        name: impl Into<String>,
+        source_label: impl Into<String>,
+        source_device_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            id,
+            name: name.into(),
+            projection: TimelineTrackProjection::Audio(
+                TimelineAudioTrackProjection::new_microphone(source_label, source_device_id),
+            ),
+        }
+    }
+
+    #[must_use]
     pub fn new_transcription(
         id: TimelineTrackId,
         name: impl Into<String>,
@@ -587,10 +689,16 @@ impl TimelineTrack {
             }
             TimelineTrackProjection::Transcription(projection) => {
                 format!(
-                    "{} · {} · {}",
+                    "{} · {} · {} · in {:?} · out {:?}",
                     self.kind().label(),
                     projection.source_label(),
-                    projection.model_name()
+                    projection.model_name(),
+                    projection
+                        .target_audio_track_id()
+                        .map(TimelineTrackId::as_u64),
+                    projection
+                        .target_text_track_id()
+                        .map(TimelineTrackId::as_u64)
                 )
             }
             TimelineTrackProjection::Text(projection) => {
@@ -997,6 +1105,25 @@ impl TimelineDocument {
     }
 
     #[must_use]
+    pub fn append_microphone_track_for_device_id(
+        &mut self,
+        device_name: impl Into<String>,
+        device_id: impl Into<String>,
+    ) -> TimelineTrackId {
+        let device_name = device_name.into();
+        let device_id = device_id.into();
+        self.retitle_for_composition_if_blank();
+        let track_id = self.next_track_id();
+        self.tracks.push(TimelineTrack::new_microphone_audio(
+            track_id,
+            device_name.clone(),
+            device_name,
+            device_id,
+        ));
+        track_id
+    }
+
+    #[must_use]
     pub fn append_transcription_track(&mut self) -> TimelineTrackId {
         let track_number = self
             .tracks
@@ -1119,6 +1246,47 @@ impl TimelineDocument {
             return false;
         };
         projection.set_target_text_track_id(target_text_track_id);
+        true
+    }
+
+    #[must_use]
+    pub fn set_transcription_track_target_audio_track(
+        &mut self,
+        track_id: TimelineTrackId,
+        target_audio_track_id: Option<TimelineTrackId>,
+    ) -> bool {
+        if let Some(target_audio_track_id) = target_audio_track_id
+            && !self.tracks.iter().any(|track| {
+                track.id() == target_audio_track_id && track.kind() == TimelineTrackKind::Audio
+            })
+        {
+            return false;
+        }
+
+        let Some(track) = self.tracks.iter_mut().find(|track| track.id() == track_id) else {
+            return false;
+        };
+        let TimelineTrackProjection::Transcription(projection) = &mut track.projection else {
+            return false;
+        };
+        projection.set_target_audio_track_id(target_audio_track_id);
+        true
+    }
+
+    #[must_use]
+    pub fn set_transcription_track_automation(
+        &mut self,
+        track_id: TimelineTrackId,
+        advance_boundaries: bool,
+        submit_chunks: bool,
+    ) -> bool {
+        let Some(track) = self.tracks.iter_mut().find(|track| track.id() == track_id) else {
+            return false;
+        };
+        let TimelineTrackProjection::Transcription(projection) = &mut track.projection else {
+            return false;
+        };
+        projection.set_automation(advance_boundaries, submit_chunks);
         true
     }
 
@@ -1429,7 +1597,8 @@ mod tests {
     }
 
     #[test]
-    fn transcription_tracks_start_with_default_model_and_no_text_target() {
+    // timeline[verify transcription.defaults]
+    fn transcription_tracks_start_with_default_model_targets_and_automation() {
         let mut document = TimelineDocument::blank();
         let track_id = document.append_transcription_track();
 
@@ -1444,17 +1613,45 @@ mod tests {
         };
 
         assert_eq!(projection.model_name(), DEFAULT_TRANSCRIPTION_MODEL_NAME);
+        assert_eq!(projection.target_audio_track_id(), None);
         assert_eq!(projection.target_text_track_id(), None);
+        assert_eq!(
+            projection.inactivity_detection_period(),
+            TimelineTimeNs::from_duration(Time::new::<second>(3.0))
+        );
+        assert_eq!(projection.activity_threshold(), 500);
+        assert_eq!(
+            projection.chunk_range(),
+            TimelineTimeRangeNs::new(
+                TimelineTimeNs::ZERO,
+                TimelineTimeNs::from_duration(Time::new::<second>(30.0)),
+            )
+        );
+        assert_eq!(projection.progress_head(), TimelineTimeNs::ZERO);
+        assert!(projection.automatically_advance_chunk_boundaries());
+        assert!(projection.automatically_submit_chunks());
     }
 
     #[test]
-    fn document_updates_transcription_track_settings_against_real_text_tracks() {
+    // timeline[verify transcription.targets]
+    // timeline[verify transcription.settings]
+    fn document_updates_transcription_track_settings_against_real_source_and_output_tracks() {
         let mut document = TimelineDocument::blank();
+        let audio_track_id = document.append_microphone_track();
         let transcription_track_id = document.append_transcription_track();
         let text_track_id = document.append_text_track();
 
         assert!(document.set_transcription_track_model_name(transcription_track_id, "small.en"));
+        assert!(document.set_transcription_track_target_audio_track(
+            transcription_track_id,
+            Some(audio_track_id),
+        ));
         assert!(document.set_transcription_track_target_text_track(
+            transcription_track_id,
+            Some(text_track_id),
+        ));
+        assert!(document.set_transcription_track_automation(transcription_track_id, false, true,));
+        assert!(!document.set_transcription_track_target_audio_track(
             transcription_track_id,
             Some(text_track_id),
         ));
@@ -1474,7 +1671,10 @@ mod tests {
         };
 
         assert_eq!(projection.model_name(), "small.en");
+        assert_eq!(projection.target_audio_track_id(), Some(audio_track_id));
         assert_eq!(projection.target_text_track_id(), Some(text_track_id));
+        assert!(!projection.automatically_advance_chunk_boundaries());
+        assert!(projection.automatically_submit_chunks());
     }
 
     #[test]

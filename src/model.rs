@@ -36,6 +36,35 @@ pub struct KnownWhisperModel {
     pub vram_estimate: &'static str,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WhisperModelPreparationState {
+    Missing,
+    DownloadedUnprocessed,
+    Compatible,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WhisperModelLocationStatus {
+    pub label: String,
+    pub path: PathBuf,
+    pub exists: bool,
+    pub compatible: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WhisperModelPreparationStatus {
+    pub model_name: String,
+    pub state: WhisperModelPreparationState,
+    pub locations: Vec<WhisperModelLocationStatus>,
+}
+
+impl WhisperModelPreparationStatus {
+    #[must_use]
+    pub const fn is_compatible(&self) -> bool {
+        matches!(self.state, WhisperModelPreparationState::Compatible)
+    }
+}
+
 pub const KNOWN_WHISPER_MODELS: [KnownWhisperModel; 14] = [
     KnownWhisperModel {
         name: "tiny.en",
@@ -723,6 +752,60 @@ pub fn resolve_default_model_dir(app_home: &AppHome) -> eyre::Result<Option<Path
 #[must_use]
 pub fn managed_model_dir(cache_home: &CacheHome, model_name: &str) -> PathBuf {
     managed_models_dir(cache_home).join(model_name)
+}
+
+#[must_use]
+pub fn known_model_checkpoint_path(cache_home: &CacheHome, model_name: &str) -> PathBuf {
+    managed_model_downloads_dir(cache_home).join(format!("{model_name}.pt"))
+}
+
+#[must_use]
+pub fn inspect_whisper_model_preparation(
+    app_home: &AppHome,
+    cache_home: &CacheHome,
+    model_name: &str,
+) -> WhisperModelPreparationStatus {
+    let managed_dir = managed_model_dir(cache_home, model_name);
+    let checkpoint_path = known_model_checkpoint_path(cache_home, model_name);
+    let compatible = inspect_model_dir(&managed_dir).is_ok();
+    let checkpoint_exists = checkpoint_path.is_file();
+    let mut locations = vec![
+        WhisperModelLocationStatus {
+            label: "Compatible Teamy model directory".to_owned(),
+            path: managed_dir,
+            exists: compatible || managed_model_dir(cache_home, model_name).exists(),
+            compatible,
+        },
+        WhisperModelLocationStatus {
+            label: "Downloaded Python checkpoint".to_owned(),
+            path: checkpoint_path,
+            exists: checkpoint_exists,
+            compatible: false,
+        },
+    ];
+    if let Ok(registered) = list_registered_model_dirs(app_home) {
+        locations.extend(registered.into_iter().map(|path| {
+            let compatible = inspect_model_dir(&path).is_ok();
+            WhisperModelLocationStatus {
+                label: "Registered model directory".to_owned(),
+                exists: path.exists(),
+                path,
+                compatible,
+            }
+        }));
+    }
+    let state = if compatible {
+        WhisperModelPreparationState::Compatible
+    } else if checkpoint_exists {
+        WhisperModelPreparationState::DownloadedUnprocessed
+    } else {
+        WhisperModelPreparationState::Missing
+    };
+    WhisperModelPreparationStatus {
+        model_name: model_name.to_owned(),
+        state,
+        locations,
+    }
 }
 
 /// Resolve the default model path for transcription.

@@ -1,5 +1,6 @@
 mod audio_transcription;
 mod cell_grid;
+mod jobs;
 mod render_verification;
 mod spatial;
 pub mod teamy_terminal_engine;
@@ -43,6 +44,7 @@ pub use audio_transcription::{
     audio_transcription_selected_model_name, decode_audio_transcription_control_result_line,
     encode_audio_transcription_control_request_line,
 };
+pub use jobs::{JobSnapshot, JobStatus, has_job_snapshots, job_snapshots, running_job_count};
 pub use render_verification::{RenderOffscreenFixtureListReport, RenderOffscreenSelfTestReport};
 pub use windows_app::TerminalThroughputBenchmarkResultsReport;
 pub use windows_audio_input::{

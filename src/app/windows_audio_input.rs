@@ -33,9 +33,13 @@ use windows::core::{GUID, PCWSTR};
 
 use super::audio_transcription::{
     AudioTranscriptionControlResult, AudioTranscriptionSharedMemorySlotPool,
-    audio_transcription_run_python_transcription_request_once_from_samples,
-    audio_transcription_selected_model_name,
+    audio_transcription_resample_mono_to_16khz, audio_transcription_selected_model_name,
 };
+use super::jobs;
+use crate::audio::{AudioMetadata, TRANSCRIPTION_CHANNELS, TRANSCRIPTION_SAMPLE_RATE};
+use crate::model::{WhisperModelArtifacts, inspect_model_dir, managed_model_dir};
+use crate::paths::CacheHome;
+use crate::transcription::{BurnWhisperBackend, TranscriptionBackend, build_transcription_request};
 use crate::win32_support::string::EasyPCWSTR;
 
 const GENERIC_WINDOWS_MIC_ICON_PATH: &str = "@%SystemRoot%\\system32\\mmres.dll,-3012";
@@ -62,6 +66,7 @@ const TRANSCRIPTION_PREVIEW_COLUMNS: usize = 72;
 const TRANSCRIPTION_PREVIEW_BINS: usize = 18;
 const TRANSCRIPTION_PREVIEW_RECOMPUTE_INTERVAL: Duration = Duration::from_millis(250);
 const TRANSCRIPTION_PREVIEW_MAX_SAMPLES_PER_CELL: usize = 12;
+const TRANSCRIPTION_CHUNK_WINDOW_SECONDS: u32 = 30;
 
 #[derive(Clone, Debug, Facet, PartialEq, Eq)]
 pub struct AudioInputDeviceSummary {
@@ -105,6 +110,14 @@ pub struct AudioInputDeviceWindowState {
     monitor_session: Option<AudioInputCaptureSession>,
     playback_file_path: Option<PathBuf>,
     transcription_worker: AudioInputTranscriptionWorkerState,
+}
+
+#[derive(Clone, Debug)]
+pub struct RustTranscriptionResult {
+    pub request_id: u64,
+    pub ok: bool,
+    pub transcript_text: String,
+    pub error: Option<String>,
 }
 
 impl AudioInputDeviceWindowState {
@@ -157,9 +170,18 @@ impl AudioInputDeviceWindowState {
     // audio[impl gui.transcription-toggle]
     pub fn toggle_transcription(&mut self) {
         self.runtime.transcription.enabled = !self.runtime.transcription.enabled;
+        tracing::info!(
+            enabled = self.runtime.transcription.enabled,
+            device = %self.device.name,
+            "Timeline transcription toggled"
+        );
         if self.runtime.transcription.enabled {
             self.transcription_worker.reset_for_enabled_session();
-            self.runtime.transcription.last_sent_reason = None;
+            self.transcription_worker.flush_requested = true;
+            self.runtime.transcription.last_sent_reason =
+                Some("transcription enabled; chunk queued".to_owned());
+        } else {
+            self.runtime.transcription.last_sent_reason = Some("transcription disabled".to_owned());
         }
     }
 
@@ -170,6 +192,10 @@ impl AudioInputDeviceWindowState {
         self.transcription_worker.flush_requested = true;
         self.transcription_worker.debug_request_completed = false;
         self.runtime.transcription.last_sent_reason = Some("manual flush queued".to_owned());
+    }
+
+    pub fn set_transcription_model_name(&mut self, model_name: impl Into<String>) {
+        self.runtime.transcription.selected_model_name = Some(model_name.into());
     }
 
     // audio[impl transcription.debug-runtime-tick]
@@ -187,7 +213,12 @@ impl AudioInputDeviceWindowState {
         self.transcription_worker.request_in_flight = true;
         let flush_requested = self.transcription_worker.flush_requested;
         self.transcription_worker.flush_requested = false;
-        let selected_model = audio_transcription_selected_model_name();
+        let selected_model = self
+            .runtime
+            .transcription
+            .selected_model_name
+            .clone()
+            .unwrap_or_else(audio_transcription_selected_model_name);
         self.runtime.transcription.last_sent_reason = Some(if flush_requested {
             format!("manual flush sent request {request_id} with {selected_model}")
         } else {
@@ -204,20 +235,33 @@ impl AudioInputDeviceWindowState {
             self.transcription_worker.request_in_flight = false;
             self.runtime.transcription.last_sent_reason =
                 Some("waiting for audio chunk".to_owned());
+            tracing::info!(
+                request_id,
+                samples = chunk_samples.len(),
+                sample_rate_hz,
+                "Timeline transcription is waiting for enough audio"
+            );
             return;
         }
+        tracing::info!(
+            request_id,
+            samples = chunk_samples.len(),
+            sample_rate_hz,
+            model = %selected_model,
+            "Spawning Rust transcription worker"
+        );
         let (sender, receiver) = mpsc::channel();
         self.transcription_worker.result_receiver = Some(receiver);
         let _ = thread::Builder::new()
-            .name("teamy-studio-transcription".to_owned())
+            .name("teamy-studio-rust-transcription".to_owned())
             .spawn(move || {
-                let result =
-                    audio_transcription_run_python_transcription_request_once_from_samples(
-                        request_id,
-                        &chunk_samples,
-                        sample_rate_hz,
-                    )
-                    .map_err(|error| error.to_string());
+                let result = run_rust_transcription_request_once_from_samples(
+                    request_id,
+                    selected_model,
+                    chunk_samples,
+                    sample_rate_hz,
+                )
+                .map_err(|error| error.to_string());
                 let _ = sender.send(result);
             });
     }
@@ -228,6 +272,12 @@ impl AudioInputDeviceWindowState {
         };
         match receiver.try_recv() {
             Ok(Ok(result)) => {
+                tracing::info!(
+                    request_id = result.request_id,
+                    ok = result.ok,
+                    transcript_chars = result.transcript_text.chars().count(),
+                    "Rust transcription worker completed"
+                );
                 self.transcription_worker.request_in_flight = false;
                 self.transcription_worker.debug_request_completed = true;
                 self.runtime.transcription.last_completed_request_id = Some(result.request_id);
@@ -257,6 +307,7 @@ impl AudioInputDeviceWindowState {
                 }
             }
             Ok(Err(error)) => {
+                tracing::error!(%error, "Rust transcription worker failed");
                 self.transcription_worker.request_in_flight = false;
                 self.transcription_worker.debug_request_completed = true;
                 self.transcription_worker.sent_chunk_end_seconds = None;
@@ -577,6 +628,111 @@ impl AudioInputDeviceWindowState {
     }
 }
 
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "worker thread owns the sample chunk and model name while the UI thread keeps running"
+)]
+fn run_rust_transcription_request_once_from_samples(
+    request_id: u64,
+    selected_model: String,
+    samples: Vec<f32>,
+    sample_rate_hz: u32,
+) -> eyre::Result<RustTranscriptionResult> {
+    let job = jobs::start_job(
+        "Rust transcription chunk",
+        format!("request {request_id}: resampling audio for {selected_model}"),
+    );
+    let result = run_rust_transcription_request_once_from_samples_inner(
+        request_id,
+        &selected_model,
+        &samples,
+        sample_rate_hz,
+        &job,
+    );
+    match &result {
+        Ok(result) if result.ok => job.complete(format!(
+            "request {request_id}: decoded {} characters with Rust Whisper",
+            result.transcript_text.chars().count()
+        )),
+        Ok(result) => job.fail(result.error.clone().unwrap_or_else(|| {
+            format!("request {request_id}: Rust Whisper returned no transcript")
+        })),
+        Err(error) => job.fail(format!("request {request_id}: {error}")),
+    }
+    result
+}
+
+fn run_rust_transcription_request_once_from_samples_inner(
+    request_id: u64,
+    selected_model: &str,
+    samples: &[f32],
+    sample_rate_hz: u32,
+    job: &jobs::JobHandle,
+) -> eyre::Result<RustTranscriptionResult> {
+    let _span = tracing::info_span!(
+        "rust_live_transcription_chunk",
+        request_id,
+        selected_model,
+        sample_rate_hz,
+        samples = samples.len()
+    )
+    .entered();
+    let resampled_samples = audio_transcription_resample_mono_to_16khz(samples, sample_rate_hz);
+    if resampled_samples.is_empty() {
+        eyre::bail!("no audio samples are available for transcription");
+    }
+
+    job.update(format!(
+        "request {request_id}: loading Rust model artifacts for {selected_model}"
+    ));
+    let model = load_live_transcription_model(selected_model)?;
+
+    job.update(format!(
+        "request {request_id}: building Whisper frontend features"
+    ));
+    let duration_seconds =
+        seconds_from_samples(resampled_samples.len(), TRANSCRIPTION_SAMPLE_RATE).get::<second>();
+    let input = crate::transcription::ValidatedAudio {
+        path: PathBuf::from(format!("live-audio-request-{request_id}.wav")),
+        metadata: AudioMetadata {
+            path: PathBuf::from(format!("live-audio-request-{request_id}.wav")),
+            container: Some("wav".to_owned()),
+            codec: Some("pcm_f32le".to_owned()),
+            sample_rate_hz: Some(TRANSCRIPTION_SAMPLE_RATE),
+            channels: Some(TRANSCRIPTION_CHANNELS),
+            bits_per_sample: Some(32),
+            duration_seconds: Some(duration_seconds),
+        },
+        samples: resampled_samples,
+    };
+    let request = build_transcription_request(input, Some(model), 96);
+
+    job.update(format!(
+        "request {request_id}: sending chunk through the Rust ML pipeline"
+    ));
+    let backend = BurnWhisperBackend::new(96);
+    let result = backend.transcribe(&request)?;
+    Ok(RustTranscriptionResult {
+        request_id,
+        ok: true,
+        transcript_text: result.text,
+        error: None,
+    })
+}
+
+fn load_live_transcription_model(selected_model: &str) -> eyre::Result<WhisperModelArtifacts> {
+    let model_dir = managed_model_dir(
+        &CacheHome(crate::paths::CACHE_DIR.0.clone()),
+        selected_model,
+    );
+    inspect_model_dir(&model_dir).wrap_err_with(|| {
+        format!(
+            "failed to inspect Rust Whisper model directory {}; prepare the model before live transcription",
+            model_dir.display()
+        )
+    })
+}
+
 impl Drop for AudioInputDeviceWindowState {
     fn drop(&mut self) {
         let _ = self.stop_recording();
@@ -612,6 +768,7 @@ impl Default for AudioInputRuntimeState {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct AudioInputTranscriptionState {
     pub enabled: bool,
+    pub selected_model_name: Option<String>,
     pub staged_text: String,
     pub preview: AudioInputMelSpectrogramPreview,
     pub chunk_seconds: f64,
@@ -645,7 +802,7 @@ struct AudioInputTranscriptionWorkerState {
     debug_request_completed: bool,
     flush_requested: bool,
     sent_chunk_end_seconds: Option<f64>,
-    result_receiver: Option<Receiver<Result<AudioTranscriptionControlResult, String>>>,
+    result_receiver: Option<Receiver<Result<RustTranscriptionResult, String>>>,
 }
 
 impl Default for AudioInputTranscriptionWorkerState {
@@ -695,6 +852,10 @@ impl AudioInputTranscriptionState {
         }
         self.staged_text.push_str(text);
     }
+
+    pub fn take_staged_transcript_text(&mut self) -> Option<String> {
+        (!self.staged_text.is_empty()).then(|| std::mem::take(&mut self.staged_text))
+    }
 }
 
 impl AudioInputRuntimeState {
@@ -738,8 +899,13 @@ impl AudioInputRuntimeState {
                 buffer.sample_rate_hz,
                 buffer.samples.len(),
             );
+            let end_index = transcription_chunk_end_index(
+                start_index,
+                buffer.sample_rate_hz,
+                buffer.samples.len(),
+            );
             (
-                buffer.samples[start_index..].to_vec(),
+                buffer.samples[start_index..end_index].to_vec(),
                 buffer.sample_rate_hz,
                 cache_key,
             )
@@ -767,8 +933,10 @@ impl AudioInputRuntimeState {
             buffer.sample_rate_hz,
             buffer.samples.len(),
         );
+        let end_index =
+            transcription_chunk_end_index(start_index, buffer.sample_rate_hz, buffer.samples.len());
         (
-            buffer.samples[start_index..].to_vec(),
+            buffer.samples[start_index..end_index].to_vec(),
             buffer.sample_rate_hz,
         )
     }
@@ -845,6 +1013,19 @@ impl AudioInputRuntimeState {
 )]
 fn sample_index_from_seconds(seconds: f64, sample_rate_hz: u32, sample_count: usize) -> usize {
     ((seconds.max(0.0) * f64::from(sample_rate_hz)) as usize).min(sample_count)
+}
+
+fn transcription_chunk_end_index(
+    start_index: usize,
+    sample_rate_hz: u32,
+    sample_count: usize,
+) -> usize {
+    let max_chunk_samples = usize::try_from(sample_rate_hz)
+        .unwrap_or(48_000)
+        .saturating_mul(usize::try_from(TRANSCRIPTION_CHUNK_WINDOW_SECONDS).unwrap_or(30));
+    start_index
+        .saturating_add(max_chunk_samples)
+        .min(sample_count)
 }
 
 #[expect(
@@ -2009,10 +2190,6 @@ mod tests {
     #[test]
     // audio[verify transcription.head-progress]
     fn successful_transcription_result_advances_transcription_head() {
-        use super::super::audio_transcription::{
-            AudioTranscriptionControlResult, WHISPER_CONTROL_PROTOCOL_VERSION,
-        };
-
         let mut state = AudioInputDeviceWindowState::new(device("endpoint-id", "Studio Mic"));
         state.runtime.transcription.enabled = true;
         {
@@ -2026,12 +2203,8 @@ mod tests {
         }
         let (sender, receiver) = mpsc::channel();
         sender
-            .send(Ok(AudioTranscriptionControlResult {
-                protocol_version: WHISPER_CONTROL_PROTOCOL_VERSION,
-                kind: "transcription-result".to_owned(),
+            .send(Ok(RustTranscriptionResult {
                 request_id: 5,
-                slot_id: 0,
-                release_slot: true,
                 ok: true,
                 transcript_text: "done".to_owned(),
                 error: None,

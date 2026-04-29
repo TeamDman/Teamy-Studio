@@ -1,6 +1,80 @@
 param(
-	[switch]$Full
+	[switch]$Full,
+	[switch]$VerboseBuild
 )
+
+function Invoke-CargoWithOptionalVerbosity {
+	param(
+		[Parameter(Mandatory = $true)]
+		[string[]]$Arguments
+	)
+
+	if ($VerboseBuild) {
+		Write-Host -ForegroundColor DarkGray "> cargo $($Arguments -join ' ')"
+		cargo @Arguments --verbose
+		return
+	}
+
+	cargo @Arguments
+}
+
+function Write-BuildNetworkDiagnostics {
+	if (-not $VerboseBuild) {
+		return
+	}
+
+	Write-Host -ForegroundColor Cyan "Build/network diagnostics"
+	Write-Host "cwd: $(Get-Location)"
+	Write-Host "rustc: $(rustc --version)"
+	Write-Host "cargo: $(cargo --version)"
+	foreach ($name in @(
+		"CARGO_HOME",
+		"CARGO_HTTP_DEBUG",
+		"CARGO_HTTP_MULTIPLEXING",
+		"CARGO_NET_OFFLINE",
+		"CARGO_REGISTRIES_CRATES_IO_PROTOCOL",
+		"HTTPS_PROXY",
+		"HTTP_PROXY"
+	)) {
+		$value = [Environment]::GetEnvironmentVariable($name)
+		if ([string]::IsNullOrWhiteSpace($value)) {
+			$value = "<unset>"
+		}
+		Write-Host "$name=$value"
+	}
+
+	$cargoHome = if ([string]::IsNullOrWhiteSpace($env:CARGO_HOME)) {
+		Join-Path $env:USERPROFILE ".cargo"
+	} else {
+		$env:CARGO_HOME
+	}
+	Write-Host "resolved CARGO_HOME=$cargoHome"
+	foreach ($relativePath in @("registry\index", "registry\cache", "git\db", "git\checkouts")) {
+		$path = Join-Path $cargoHome $relativePath
+		if (Test-Path $path) {
+			$count = (Get-ChildItem -LiteralPath $path -Force -ErrorAction SilentlyContinue | Measure-Object).Count
+			Write-Host "$relativePath entries: $count"
+		} else {
+			Write-Host "$relativePath entries: <missing>"
+		}
+	}
+}
+
+function Write-CargoSourceDiagnostics {
+	if (-not $VerboseBuild) {
+		return
+	}
+
+	Write-Host -ForegroundColor Cyan "Cargo package sources"
+	$cargoMetadata = cargo metadata --format-version 1 --locked | ConvertFrom-Json -AsHashtable
+	$cargoMetadata["packages"] |
+		Where-Object { $_["source"] } |
+		Group-Object { $_["source"] } |
+		Sort-Object Count -Descending |
+		ForEach-Object {
+			Write-Host ("{0,4} {1}" -f $_.Count, $_.Name)
+		}
+}
 
 function Invoke-Step {
 	param(
@@ -27,6 +101,9 @@ function Get-NonTracyTestFeatureArgs {
 	$defaultExcludedFeatures = @("default", "tracy")
 	if (-not $Full) {
 		$defaultExcludedFeatures += "font-snapshot-tests"
+	}
+	if ($VerboseBuild) {
+		Write-Host -ForegroundColor DarkGray "> cargo metadata --no-deps --format-version 1"
 	}
 	$metadata = cargo metadata --no-deps --format-version 1 | ConvertFrom-Json
 	$pkg = if ($metadata.packages.Count -eq 1) {
@@ -60,23 +137,34 @@ function Stop-TeamyStudioProcessIfRunning {
 }
 
 Invoke-Step -Label "format check" -Action {
-	cargo fmt --all
+	Invoke-CargoWithOptionalVerbosity -Arguments @("fmt", "--all")
 }
 
 Invoke-Step -Label "clippy lint check" -Action {
 	# cargo clippy --all-targets --all-features -- -D warnings
-	cargo clippy --all-features -- -D warnings
+	Invoke-CargoWithOptionalVerbosity -Arguments @("clippy", "--all-features", "--", "-D", "warnings")
 }
 
 Invoke-Step -Label "build" -Action {
 	Stop-TeamyStudioProcessIfRunning
-	cargo build --all-features --quiet
+	if ($VerboseBuild) {
+		Write-BuildNetworkDiagnostics
+		Write-CargoSourceDiagnostics
+		Invoke-CargoWithOptionalVerbosity -Arguments @("build", "--all-features", "--locked")
+	} else {
+		cargo build --all-features --quiet
+	}
 }
 
 Invoke-Step -Label "tests" -Action {
 	Stop-TeamyStudioProcessIfRunning
 	$featuresArg = Get-NonTracyTestFeatureArgs -Full:$Full
-	cargo test @featuresArg --quiet
+	if ($VerboseBuild) {
+		$testArguments = @("test") + $featuresArg + @("--locked")
+		Invoke-CargoWithOptionalVerbosity -Arguments $testArguments
+	} else {
+		cargo test @featuresArg --quiet
+	}
 }
 
 Invoke-Step -Label "tracey status" -Action {

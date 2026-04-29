@@ -15,7 +15,7 @@ use facet::Facet;
 use rfd::{FileDialog, MessageButtons, MessageDialog, MessageLevel};
 use tracing::{debug, error, info, info_span, instrument};
 use uom::si::f64::Time;
-use uom::si::time::nanosecond;
+use uom::si::time::{nanosecond, second};
 use widestring::U16CString;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
 use windows::Win32::Graphics::Gdi::{
@@ -138,6 +138,7 @@ const TERMINAL_THROUGHPUT_BENCHMARK_MEASURE_PREFIX: &str =
 const TERMINAL_THROUGHPUT_BENCHMARK_TIMEOUT: Duration = Duration::from_mins(1);
 const TERMINAL_THROUGHPUT_BENCHMARK_POLL_INTERVAL: Duration = Duration::from_millis(1);
 const TIMELINE_ZOOM_ANIMATION_DURATION: Duration = Duration::from_millis(220);
+const MODEL_WARNING_PREPARE_HOLD_DURATION: Duration = Duration::from_millis(1400);
 const TERMINAL_THROUGHPUT_RESULTS_DIR: &str = "self-test/terminal-throughput";
 const DEMO_MODE_STATE_CHANGED_MESSAGE: u32 = WM_APP + 0x402;
 const TIMELINE_DOCUMENT_CHANGED_MESSAGE: u32 = WM_APP + 0x403;
@@ -231,6 +232,7 @@ struct SceneWindowInitialization {
     audio_input_device_window: Option<AudioInputDeviceWindowState>,
     timeline_document: Option<SharedTimelineDocument>,
     timeline_transcription_settings: Option<windows_scene::TimelineTranscriptionSettingsViewState>,
+    model_warning: Option<windows_scene::ModelWarningViewState>,
 }
 
 #[expect(
@@ -462,6 +464,7 @@ enum ScenePressedTarget {
     Action(SceneAction),
     TimelineTransportPlayPause,
     TimelineTranscriptionSettingsTarget(windows_scene::TimelineTranscriptionSettingsTarget),
+    ModelWarningPrepare,
     TimelineTrackReorderHandle(usize),
     TimelineTrackRecord(usize),
     TimelineTrackPlayback(usize),
@@ -489,6 +492,7 @@ enum AudioInputPickerCompletion {
     #[default]
     OpenDeviceWindow,
     TimelineMicrophoneTrack,
+    TimelineTranscriptionInputTrack,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -507,12 +511,15 @@ struct SceneAppState {
     hwnd: Option<WindowHandle>,
     dpi: u32,
     scene_kind: SceneWindowKind,
+    scene_opened_at: Instant,
     vt_engine: VtEngineChoice,
     audio_input_picker: AudioInputPickerState,
     audio_input_picker_completion: AudioInputPickerCompletion,
     audio_input_device_window: Option<AudioInputDeviceWindowState>,
     timeline_document: Option<SharedTimelineDocument>,
     timeline_transcription_settings: Option<windows_scene::TimelineTranscriptionSettingsViewState>,
+    model_warning: Option<windows_scene::ModelWarningViewState>,
+    model_warning_prepare_started_at: Option<Instant>,
     timeline_tool: TimelineInteractionTool,
     timeline_selection: Option<windows_scene::TimelineRectSelection>,
     pending_timeline_selection: Option<PendingTimelineSelection>,
@@ -1477,12 +1484,15 @@ fn run_scene_window(
             hwnd: None,
             dpi,
             scene_kind,
+            scene_opened_at: Instant::now(),
             vt_engine,
             audio_input_picker,
             audio_input_picker_completion: AudioInputPickerCompletion::default(),
             audio_input_device_window: initialization.audio_input_device_window,
             timeline_document: initialization.timeline_document,
             timeline_transcription_settings: initialization.timeline_transcription_settings,
+            model_warning: initialization.model_warning,
+            model_warning_prepare_started_at: None,
             timeline_tool: TimelineInteractionTool::default(),
             timeline_selection: None,
             pending_timeline_selection: None,
@@ -2295,6 +2305,7 @@ extern "system" fn scene_window_proc(
         WM_MOUSEWHEEL => handle_bool_message(hwnd, message, wparam, lparam, |hwnd| {
             handle_scene_mouse_wheel(hwnd, wparam, lparam)
         }),
+        WM_CLOSE => handle_scene_close_message(hwnd),
         WM_SETCURSOR => match handle_scene_set_cursor(hwnd, lparam) {
             Ok(true) => LRESULT(1),
             Ok(false) => def_window_proc(hwnd, message, wparam, lparam),
@@ -2304,6 +2315,25 @@ extern "system" fn scene_window_proc(
         WM_ERASEBKGND => LRESULT(1),
         WM_DESTROY => handle_scene_destroy_message(hwnd),
         _ => def_window_proc(hwnd, message, wparam, lparam),
+    }
+}
+
+fn handle_scene_close_message(hwnd: WindowHandle) -> LRESULT {
+    let close_action = with_scene_app_state(|state| {
+        let warning = (state.scene_kind == SceneWindowKind::TimelineTranscriptionSettings)
+            .then(|| transcription_model_warning_for_selected_settings(state))
+            .flatten();
+        Ok((state.app_home.clone(), state.vt_engine, warning))
+    });
+    match close_action {
+        Ok((app_home, vt_engine, warning)) => {
+            if let Some(warning) = warning {
+                open_model_warning_window(&app_home, vt_engine, warning);
+            }
+            hwnd.destroy();
+            LRESULT(0)
+        }
+        Err(error) => fail_and_close(hwnd, &error),
     }
 }
 
@@ -2364,12 +2394,52 @@ fn handle_scene_focused_render_timer(hwnd: WindowHandle) -> LRESULT {
             return Ok(());
         }
 
+        maybe_complete_model_warning_prepare(state);
+
         render_scene_window_frame(state, hwnd, None, true)?;
         Ok(())
     }) {
         Ok(()) => LRESULT(0),
         Err(error) => fail_and_close(hwnd, &error),
     }
+}
+
+fn maybe_complete_model_warning_prepare(state: &mut SceneAppState) {
+    let Some(started_at) = state.model_warning_prepare_started_at else {
+        return;
+    };
+    if started_at.elapsed() < MODEL_WARNING_PREPARE_HOLD_DURATION {
+        return;
+    }
+    state.model_warning_prepare_started_at = None;
+    let Some(warning) = state.model_warning.as_ref() else {
+        return;
+    };
+    let app_home = state.app_home.clone();
+    let model_name = warning.status.model_name.clone();
+    ring_terminal_bell();
+    let _ = thread::Builder::new()
+        .name("teamy-studio-prepare-warning-model".to_owned())
+        .spawn(move || {
+            let job = super::jobs::start_job(
+                "Prepare Whisper model",
+                format!("Preparing {model_name} for Rust transcription"),
+            );
+            job.update(format!("Downloading or converting {model_name}"));
+            match crate::model::prepare_known_whisper_model(
+                &app_home,
+                &crate::paths::CACHE_DIR,
+                &model_name,
+                false,
+            ) {
+                Ok(prepared) => job.complete(format!(
+                    "Prepared {} at {}",
+                    model_name,
+                    prepared.managed_dir.display()
+                )),
+                Err(error) => job.fail(format!("Failed to prepare {model_name}: {error}")),
+            }
+        });
 }
 
 fn handle_scene_focus_changed(hwnd: WindowHandle, focused: bool) -> LRESULT {
@@ -2513,19 +2583,34 @@ fn handle_scene_key_down_message(
                 return Ok(SceneKeyAction::CloseWindow);
             }
 
-            let target_row_count = timeline_transcription_settings_target_row_count(state);
+            let input_row_count = timeline_transcription_settings_input_row_count(state);
+            let output_row_count = timeline_transcription_settings_output_row_count(state);
             let Some(settings) = state.timeline_transcription_settings.as_mut() else {
                 return Ok(SceneKeyAction::NotHandled);
             };
             let mut changed = false;
             let mut dock_column = None;
             if virtual_key == u32::from(VK_LEFT.0) {
-                settings.selected_column =
-                    windows_scene::TimelineTranscriptionSettingsColumn::Model;
+                settings.selected_column = match settings.selected_column {
+                    windows_scene::TimelineTranscriptionSettingsColumn::Model
+                    | windows_scene::TimelineTranscriptionSettingsColumn::InputAudioTrack => {
+                        windows_scene::TimelineTranscriptionSettingsColumn::Model
+                    }
+                    windows_scene::TimelineTranscriptionSettingsColumn::OutputTextTrack => {
+                        windows_scene::TimelineTranscriptionSettingsColumn::InputAudioTrack
+                    }
+                };
                 changed = true;
             } else if virtual_key == u32::from(VK_RIGHT.0) {
-                settings.selected_column =
-                    windows_scene::TimelineTranscriptionSettingsColumn::TargetTrack;
+                settings.selected_column = match settings.selected_column {
+                    windows_scene::TimelineTranscriptionSettingsColumn::Model => {
+                        windows_scene::TimelineTranscriptionSettingsColumn::InputAudioTrack
+                    }
+                    windows_scene::TimelineTranscriptionSettingsColumn::InputAudioTrack
+                    | windows_scene::TimelineTranscriptionSettingsColumn::OutputTextTrack => {
+                        windows_scene::TimelineTranscriptionSettingsColumn::OutputTextTrack
+                    }
+                };
                 changed = true;
             } else if virtual_key == u32::from(VK_UP.0) {
                 match settings.selected_column {
@@ -2535,11 +2620,19 @@ fn handle_scene_key_down_message(
                         dock_column =
                             Some(windows_scene::TimelineTranscriptionSettingsColumn::Model);
                     }
-                    windows_scene::TimelineTranscriptionSettingsColumn::TargetTrack => {
-                        settings.selected_target_index =
-                            settings.selected_target_index.saturating_sub(1);
-                        dock_column =
-                            Some(windows_scene::TimelineTranscriptionSettingsColumn::TargetTrack);
+                    windows_scene::TimelineTranscriptionSettingsColumn::InputAudioTrack => {
+                        settings.selected_input_audio_track_index =
+                            settings.selected_input_audio_track_index.saturating_sub(1);
+                        dock_column = Some(
+                            windows_scene::TimelineTranscriptionSettingsColumn::InputAudioTrack,
+                        );
+                    }
+                    windows_scene::TimelineTranscriptionSettingsColumn::OutputTextTrack => {
+                        settings.selected_output_text_track_index =
+                            settings.selected_output_text_track_index.saturating_sub(1);
+                        dock_column = Some(
+                            windows_scene::TimelineTranscriptionSettingsColumn::OutputTextTrack,
+                        );
                     }
                 }
                 changed = true;
@@ -2551,11 +2644,21 @@ fn handle_scene_key_down_message(
                         dock_column =
                             Some(windows_scene::TimelineTranscriptionSettingsColumn::Model);
                     }
-                    windows_scene::TimelineTranscriptionSettingsColumn::TargetTrack => {
-                        settings.selected_target_index = (settings.selected_target_index + 1)
-                            .min(target_row_count.saturating_sub(1));
-                        dock_column =
-                            Some(windows_scene::TimelineTranscriptionSettingsColumn::TargetTrack);
+                    windows_scene::TimelineTranscriptionSettingsColumn::InputAudioTrack => {
+                        settings.selected_input_audio_track_index =
+                            (settings.selected_input_audio_track_index + 1)
+                                .min(input_row_count.saturating_sub(1));
+                        dock_column = Some(
+                            windows_scene::TimelineTranscriptionSettingsColumn::InputAudioTrack,
+                        );
+                    }
+                    windows_scene::TimelineTranscriptionSettingsColumn::OutputTextTrack => {
+                        settings.selected_output_text_track_index =
+                            (settings.selected_output_text_track_index + 1)
+                                .min(output_row_count.saturating_sub(1));
+                        dock_column = Some(
+                            windows_scene::TimelineTranscriptionSettingsColumn::OutputTextTrack,
+                        );
                     }
                 }
                 changed = true;
@@ -2571,7 +2674,10 @@ fn handle_scene_key_down_message(
                         windows_scene::TimelineTranscriptionSettingsColumn::Model => {
                             settings.model_target_docked = true;
                         }
-                        windows_scene::TimelineTranscriptionSettingsColumn::TargetTrack => {
+                        windows_scene::TimelineTranscriptionSettingsColumn::InputAudioTrack => {
+                            settings.input_target_docked = true;
+                        }
+                        windows_scene::TimelineTranscriptionSettingsColumn::OutputTextTrack => {
                             settings.output_target_docked = true;
                         }
                     }
@@ -2770,9 +2876,7 @@ fn handle_scene_key_down_message(
         }
         Ok(SceneKeyAction::ToggleAudioInputTranscription) => {
             let result = with_scene_app_state(|state| {
-                if let Some(device_window) = state.audio_input_device_window.as_mut() {
-                    device_window.toggle_transcription();
-                }
+                toggle_audio_input_transcription_from_scene_state(state);
                 render_scene_window_frame(state, hwnd, None, false)
             });
             match result {
@@ -2940,6 +3044,23 @@ fn handle_scene_left_button_down(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Re
             return Ok(ScenePointerAction::RenderOnly);
         }
 
+        if state.scene_kind == SceneWindowKind::ModelWarning {
+            if windows_scene::model_warning_prepare_rect(layout).contains(point) {
+                state.model_warning_prepare_started_at = Some(Instant::now());
+                state.pressed_target = Some(ScenePressedTarget::ModelWarningPrepare);
+                hwnd.capture_mouse();
+                return Ok(ScenePointerAction::RenderOnly);
+            }
+            if let Some(index) = model_warning_open_button_at_point(state, layout, point) {
+                open_model_warning_location(state, index);
+                return Ok(ScenePointerAction::RenderOnly);
+            }
+            if let Some(index) = model_warning_copy_button_at_point(state, layout, point) {
+                copy_model_warning_location(state, index);
+                return Ok(ScenePointerAction::RenderOnly);
+            }
+        }
+
         if state.scene_kind == SceneWindowKind::TimelineTranscriptionSettings {
             if let Some(target) =
                 timeline_transcription_settings_target_at_point(state, layout, point)
@@ -2975,7 +3096,20 @@ fn handle_scene_left_button_down(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Re
                             return Ok(ScenePointerAction::RenderOnly);
                         }
                     }
-                    windows_scene::TimelineTranscriptionSettingsTarget::TargetTrack => {
+                    windows_scene::TimelineTranscriptionSettingsTarget::InputAudioTrack => {
+                        if settings.input_target_docked {
+                            if let Some(target_point) =
+                                timeline_transcription_settings_target_cursor_jump_point(
+                                    state, layout, target,
+                                )
+                            {
+                                move_pointer_to_client_point(hwnd, target_point)?;
+                                state.pointer_position = Some(target_point);
+                            }
+                            return Ok(ScenePointerAction::RenderOnly);
+                        }
+                    }
+                    windows_scene::TimelineTranscriptionSettingsTarget::OutputTextTrack => {
                         if settings.output_target_docked {
                             if let Some(target_point) =
                                 timeline_transcription_settings_target_cursor_jump_point(
@@ -2996,6 +3130,32 @@ fn handle_scene_left_button_down(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Re
                 return Ok(ScenePointerAction::RenderOnly);
             }
 
+            if timeline_transcription_settings_add_audio_track_button_at_point(layout, point) {
+                open_audio_track_picker_from_timeline_transcription_settings(state);
+                return Ok(ScenePointerAction::RenderOnly);
+            }
+
+            if windows_scene::timeline_transcription_settings_advance_boundaries_toggle_rect(layout)
+                .contains(point)
+            {
+                toggle_timeline_transcription_settings_advance_boundaries(state);
+                return Ok(ScenePointerAction::RenderOnly);
+            }
+
+            if windows_scene::timeline_transcription_settings_submit_chunks_toggle_rect(layout)
+                .contains(point)
+            {
+                toggle_timeline_transcription_settings_submit_chunks(state);
+                return Ok(ScenePointerAction::RenderOnly);
+            }
+
+            if windows_scene::timeline_transcription_settings_manual_flush_button_rect(layout)
+                .contains(point)
+            {
+                request_timeline_transcription_manual_flush(state);
+                return Ok(ScenePointerAction::RenderOnly);
+            }
+
             if let Some(model_index) =
                 timeline_transcription_settings_model_row_at_point(layout, point)
             {
@@ -3004,9 +3164,16 @@ fn handle_scene_left_button_down(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Re
             }
 
             if let Some(target_index) =
-                timeline_transcription_settings_target_row_at_point(state, layout, point)
+                timeline_transcription_settings_input_row_at_point(state, layout, point)
             {
-                select_timeline_transcription_settings_target_track(state, target_index, true);
+                select_timeline_transcription_settings_input_audio_track(state, target_index, true);
+                return Ok(ScenePointerAction::RenderOnly);
+            }
+
+            if let Some(target_index) =
+                timeline_transcription_settings_output_row_at_point(state, layout, point)
+            {
+                select_timeline_transcription_settings_output_text_track(state, target_index, true);
                 return Ok(ScenePointerAction::RenderOnly);
             }
 
@@ -3385,9 +3552,7 @@ fn handle_scene_left_button_down(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Re
         }
         ScenePointerAction::ToggleAudioInputTranscription => {
             with_scene_app_state(|state| {
-                if let Some(device_window) = state.audio_input_device_window.as_mut() {
-                    device_window.toggle_transcription();
-                }
+                toggle_audio_input_transcription_from_scene_state(state);
                 render_scene_window_frame(state, hwnd, None, false)
             })?;
             Ok(true)
@@ -3460,6 +3625,14 @@ fn handle_scene_left_button_up(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Resu
         state.pointer_position = Some(point);
         let pressed_target = state.pressed_target.take();
 
+        if matches!(
+            pressed_target,
+            Some(ScenePressedTarget::ModelWarningPrepare)
+        ) {
+            state.model_warning_prepare_started_at = None;
+            return Ok(ScenePointerAction::RenderOnly);
+        }
+
         if let Some(ScenePressedTarget::TimelineTranscriptionSettingsTarget(target)) =
             pressed_target
         {
@@ -3480,21 +3653,39 @@ fn handle_scene_left_button_up(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Resu
                         settings.model_target_docked = false;
                     }
                 }
-                windows_scene::TimelineTranscriptionSettingsTarget::TargetTrack => {
+                windows_scene::TimelineTranscriptionSettingsTarget::InputAudioTrack => {
                     if let Some(target_index) =
-                        timeline_transcription_settings_target_row_at_point(state, layout, point)
+                        timeline_transcription_settings_input_row_at_point(state, layout, point)
                     {
-                        select_timeline_transcription_settings_target_track(
+                        select_timeline_transcription_settings_input_audio_track(
                             state,
                             target_index,
                             true,
                         );
                     } else if timeline_transcription_settings_socket_at_point(layout, point)
-                        == Some(windows_scene::TimelineTranscriptionSettingsTarget::TargetTrack)
+                        == Some(windows_scene::TimelineTranscriptionSettingsTarget::InputAudioTrack)
                         && let Some(settings) = state.timeline_transcription_settings.as_mut()
                     {
                         settings.selected_column =
-                            windows_scene::TimelineTranscriptionSettingsColumn::TargetTrack;
+                            windows_scene::TimelineTranscriptionSettingsColumn::InputAudioTrack;
+                        settings.input_target_docked = false;
+                    }
+                }
+                windows_scene::TimelineTranscriptionSettingsTarget::OutputTextTrack => {
+                    if let Some(target_index) =
+                        timeline_transcription_settings_output_row_at_point(state, layout, point)
+                    {
+                        select_timeline_transcription_settings_output_text_track(
+                            state,
+                            target_index,
+                            true,
+                        );
+                    } else if timeline_transcription_settings_socket_at_point(layout, point)
+                        == Some(windows_scene::TimelineTranscriptionSettingsTarget::OutputTextTrack)
+                        && let Some(settings) = state.timeline_transcription_settings.as_mut()
+                    {
+                        settings.selected_column =
+                            windows_scene::TimelineTranscriptionSettingsColumn::OutputTextTrack;
                         settings.output_target_docked = false;
                     }
                 }
@@ -3661,9 +3852,7 @@ fn handle_scene_left_button_up(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Resu
         }
         ScenePointerAction::ToggleAudioInputTranscription => {
             with_scene_app_state(|state| {
-                if let Some(device_window) = state.audio_input_device_window.as_mut() {
-                    device_window.toggle_transcription();
-                }
+                toggle_audio_input_transcription_from_scene_state(state);
                 render_scene_window_frame(state, hwnd, None, false)
             })?;
             Ok(true)
@@ -3988,7 +4177,11 @@ fn handle_scene_right_button_up(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Res
 
     let released_timeline_pan = with_scene_app_state(|state| {
         state.pointer_position = Some(point);
-        Ok(state.timeline_pan_drag.take().is_some())
+        let released = state.timeline_pan_drag.take().is_some();
+        if released {
+            trace!(?point, "timeline right-button pan released");
+        }
+        Ok(released)
     })?;
     if released_timeline_pan {
         hwnd.release_mouse_capture();
@@ -4064,7 +4257,11 @@ fn handle_scene_right_button_down(hwnd: WindowHandle, lparam: LPARAM) -> eyre::R
         state.pointer_position = Some(point);
         state.chrome_tooltip.hide(hwnd);
         let layout = scene_client_layout(hwnd, state)?;
-        if !timeline_scroll_interaction_at_point(state, layout, point) {
+        if !timeline_pan_interaction_at_point(state, layout, point) {
+            trace!(
+                ?point,
+                "timeline right-button pan ignored outside track content"
+            );
             return Ok(false);
         }
 
@@ -4078,6 +4275,7 @@ fn handle_scene_right_button_down(hwnd: WindowHandle, lparam: LPARAM) -> eyre::R
             origin_viewport: lock_shared_timeline_document(&document).viewport(),
             origin_vertical_scroll_offset: timeline_current_vertical_scroll_offset(state, layout),
         });
+        trace!(?point, "timeline right-button pan started");
         Ok(true)
     })?;
 
@@ -4130,12 +4328,28 @@ fn handle_scene_mouse_wheel(
             point,
         );
         let target_viewport = current_viewport.scaled_about(anchor, factor);
-        lock_shared_timeline_document(&document).set_viewport(current_viewport);
-        state.timeline_zoom_animation = Some(TimelineZoomAnimation {
-            start_viewport: current_viewport,
-            target_viewport,
-            started_at: Instant::now(),
-        });
+        let current_vertical_scroll_offset = timeline_current_vertical_scroll_offset(state, layout);
+        if let Some(pan_drag) = state.timeline_pan_drag.as_mut() {
+            trace!(
+                wheel_delta,
+                steps,
+                ?point,
+                "timeline wheel zoom while right-button pan is active"
+            );
+            lock_shared_timeline_document(&document).set_viewport(target_viewport);
+            state.timeline_zoom_animation = None;
+            pan_drag.origin = point;
+            pan_drag.origin_viewport = target_viewport;
+            pan_drag.origin_vertical_scroll_offset = current_vertical_scroll_offset;
+        } else {
+            trace!(wheel_delta, steps, ?point, "timeline wheel zoom");
+            lock_shared_timeline_document(&document).set_viewport(current_viewport);
+            state.timeline_zoom_animation = Some(TimelineZoomAnimation {
+                start_viewport: current_viewport,
+                target_viewport,
+                started_at: Instant::now(),
+            });
+        }
         render_scene_window_frame(state, hwnd, None, false)?;
         Ok(true)
     })
@@ -4758,10 +4972,15 @@ fn render_scene_window_frame(
 ) -> eyre::Result<()> {
     sync_demo_mode_state(state);
     apply_timeline_zoom_animation(state);
+    sync_timeline_audio_runtime_from_document(state);
 
     if let Some(device_window) = state.audio_input_device_window.as_mut() {
         // timeline[impl recording.append-live]
         device_window.sync_transport();
+    }
+    sync_timeline_transcription_text_blocks(state);
+    if super::has_job_snapshots() && super::jobs::mark_jobs_window_auto_opened() {
+        open_jobs_window_from_scene_state(state);
     }
 
     if let Some((width, height)) = resize
@@ -4856,6 +5075,25 @@ fn render_scene_window_frame(
             &daemon_status,
             audio_daemon_visual_state(state, layout),
         )
+    } else if state.scene_kind == SceneWindowKind::Jobs {
+        let jobs = super::job_snapshots();
+        windows_scene::build_jobs_render_scene(layout, window_chrome_buttons_state, &jobs)
+    } else if state.scene_kind == SceneWindowKind::ModelWarning {
+        let progress = (state.scene_opened_at.elapsed().as_secs_f32() / 0.28).clamp(0.0, 1.0);
+        let prepare_hold_progress = state
+            .model_warning_prepare_started_at
+            .map_or(0.0, |started| {
+                (started.elapsed().as_secs_f32()
+                    / MODEL_WARNING_PREPARE_HOLD_DURATION.as_secs_f32())
+                .clamp(0.0, 1.0)
+            });
+        windows_scene::build_model_warning_render_scene(
+            layout,
+            window_chrome_buttons_state,
+            state.model_warning.as_ref(),
+            progress,
+            prepare_hold_progress,
+        )
     } else if state.scene_kind == SceneWindowKind::CursorGallery {
         windows_scene::build_cursor_gallery_render_scene(
             layout,
@@ -4923,6 +5161,104 @@ fn render_scene_window_frame(
     }
 
     Ok(())
+}
+
+fn sync_timeline_audio_runtime_from_document(state: &mut SceneAppState) {
+    if state.scene_kind != SceneWindowKind::Timeline || state.audio_input_device_window.is_some() {
+        return;
+    }
+    let Some(document) = timeline_document_handle(state) else {
+        return;
+    };
+    let microphone = {
+        let document = lock_shared_timeline_document(&document);
+        document.tracks().iter().find_map(|track| {
+            let crate::timeline::TimelineTrackProjection::Audio(projection) = track.projection()
+            else {
+                return None;
+            };
+            let device_id = projection.source_device_id()?;
+            Some((device_id.to_owned(), projection.source_label().to_owned()))
+        })
+    };
+    let Some((device_id, fallback_name)) = microphone else {
+        return;
+    };
+    let device = list_active_audio_input_devices()
+        .unwrap_or_default()
+        .into_iter()
+        .find(|device| device.id == device_id)
+        .unwrap_or(AudioInputDeviceSummary {
+            id: device_id,
+            name: fallback_name,
+            is_default: false,
+            state: "unknown".to_owned(),
+            icon: String::new(),
+            sample_rate_hz: None,
+        });
+    info!(device = %device.name, "attached timeline microphone runtime from audio track");
+    state.audio_input_device_window = Some(AudioInputDeviceWindowState::new(device));
+}
+
+fn sync_timeline_transcription_text_blocks(state: &mut SceneAppState) {
+    let Some(document) = timeline_document_handle(state) else {
+        return;
+    };
+    let target_text_track_id = {
+        let document = lock_shared_timeline_document(&document);
+        document.tracks().iter().find_map(|track| {
+            let crate::timeline::TimelineTrackProjection::Transcription(projection) =
+                track.projection()
+            else {
+                return None;
+            };
+            projection.target_text_track_id()
+        })
+    };
+    let Some(target_text_track_id) = target_text_track_id else {
+        if state
+            .audio_input_device_window
+            .as_ref()
+            .is_some_and(|device_window| {
+                !device_window.runtime.transcription.staged_text.is_empty()
+            })
+        {
+            info!("staged transcription text is waiting for an output text track target");
+        }
+        return;
+    };
+    let Some((text, start_seconds, end_seconds)) = state
+        .audio_input_device_window
+        .as_mut()
+        .and_then(|device_window| {
+            let text = device_window
+                .runtime
+                .transcription
+                .take_staged_transcript_text()?;
+            let end_seconds = device_window.runtime.transcription_head_seconds;
+            let start_seconds = (end_seconds - device_window.runtime.transcription.chunk_seconds)
+                .max(0.0)
+                .min(end_seconds);
+            Some((text, start_seconds, end_seconds))
+        })
+    else {
+        return;
+    };
+    let appended = lock_shared_timeline_document(&document).append_text_block(
+        target_text_track_id,
+        TimelineTimeRangeNs::new(
+            TimelineTimeNs::from_duration(Time::new::<second>(start_seconds)),
+            TimelineTimeNs::from_duration(Time::new::<second>(end_seconds)),
+        ),
+        text,
+    );
+    if appended {
+        info!(
+            start_seconds,
+            end_seconds, "committed transcription result into timeline text track"
+        );
+        broadcast_timeline_document_changed();
+    }
 }
 
 fn demo_mode_visual_state(
@@ -5441,11 +5777,17 @@ fn timeline_add_track_button_at_point(
     layout: TerminalLayout,
     point: ClientPoint,
 ) -> bool {
-    state.scene_kind == SceneWindowKind::Timeline
-        && !state.diagnostics_visible
-        && windows_scene::timeline_document_layout(layout.terminal_panel_rect().inset(24))
-            .add_track_rect
-            .contains(point)
+    state.scene_kind == SceneWindowKind::Timeline && !state.diagnostics_visible && {
+        let timeline_layout =
+            windows_scene::timeline_document_layout(layout.terminal_panel_rect().inset(24));
+        timeline_layout.add_track_rect.contains(point)
+            || windows_scene::timeline_add_track_list_item_rect(
+                timeline_layout,
+                timeline_track_count(state),
+                timeline_current_vertical_scroll_offset(state, layout),
+            )
+            .is_some_and(|rect| rect.contains(point))
+    }
 }
 
 fn timeline_viewport_control_at_point(
@@ -5558,6 +5900,10 @@ fn timeline_text_block_tooltip_at_point(
     None
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "transcription settings hover and shader state are centralized for matching controls"
+)]
 fn timeline_transcription_settings_view_state(
     state: &SceneAppState,
     layout: TerminalLayout,
@@ -5572,15 +5918,52 @@ fn timeline_transcription_settings_view_state(
         false,
         Instant::now(),
     );
+    settings.add_audio_track_button_visual_state = windows_scene::compute_button_visual_state(
+        windows_scene::timeline_transcription_settings_add_audio_track_button_rect(layout),
+        point,
+        false,
+        None,
+        false,
+        Instant::now(),
+    );
+    settings.advance_boundaries_toggle_visual_state = windows_scene::compute_button_visual_state(
+        windows_scene::timeline_transcription_settings_advance_boundaries_toggle_rect(layout),
+        point,
+        false,
+        None,
+        false,
+        Instant::now(),
+    );
+    settings.submit_chunks_toggle_visual_state = windows_scene::compute_button_visual_state(
+        windows_scene::timeline_transcription_settings_submit_chunks_toggle_rect(layout),
+        point,
+        false,
+        None,
+        false,
+        Instant::now(),
+    );
+    settings.manual_flush_button_visual_state = windows_scene::compute_button_visual_state(
+        windows_scene::timeline_transcription_settings_manual_flush_button_rect(layout),
+        point,
+        false,
+        None,
+        false,
+        Instant::now(),
+    );
     settings.hovered_model_index =
         point.and_then(|point| timeline_transcription_settings_model_row_at_point(layout, point));
-    settings.hovered_target_index = point.and_then(|point| {
-        timeline_transcription_settings_target_row_at_point(state, layout, point)
+    settings.hovered_input_audio_track_index = point
+        .and_then(|point| timeline_transcription_settings_input_row_at_point(state, layout, point));
+    settings.hovered_output_text_track_index = point.and_then(|point| {
+        timeline_transcription_settings_output_row_at_point(state, layout, point)
     });
     settings.hovered_model_socket = point.is_some_and(|point| {
         windows_scene::timeline_transcription_settings_model_socket_rect(layout).contains(point)
     });
-    settings.hovered_target_socket = point.is_some_and(|point| {
+    settings.hovered_input_socket = point.is_some_and(|point| {
+        windows_scene::timeline_transcription_settings_input_socket_rect(layout).contains(point)
+    });
+    settings.hovered_output_socket = point.is_some_and(|point| {
         windows_scene::timeline_transcription_settings_output_socket_rect(layout).contains(point)
     });
     settings.hovered_model_target = point.is_some_and(|point| {
@@ -5591,16 +5974,40 @@ fn timeline_transcription_settings_view_state(
         )
         .is_some_and(|rect| rect.contains(point))
     });
+    settings.hovered_input_target = point.is_some_and(|point| {
+        windows_scene::timeline_transcription_settings_target_puck_rect(
+            layout,
+            settings,
+            windows_scene::TimelineTranscriptionSettingsTarget::InputAudioTrack,
+        )
+        .is_some_and(|rect| rect.contains(point))
+    });
     settings.hovered_output_target = point.is_some_and(|point| {
         windows_scene::timeline_transcription_settings_target_puck_rect(
             layout,
             settings,
-            windows_scene::TimelineTranscriptionSettingsTarget::TargetTrack,
+            windows_scene::TimelineTranscriptionSettingsTarget::OutputTextTrack,
         )
         .is_some_and(|rect| rect.contains(point))
     });
     settings.hovered_add_text_track_button = point.is_some_and(|point| {
         windows_scene::timeline_transcription_settings_add_text_track_button_rect(layout)
+            .contains(point)
+    });
+    settings.hovered_add_audio_track_button = point.is_some_and(|point| {
+        windows_scene::timeline_transcription_settings_add_audio_track_button_rect(layout)
+            .contains(point)
+    });
+    settings.hovered_advance_boundaries_toggle = point.is_some_and(|point| {
+        windows_scene::timeline_transcription_settings_advance_boundaries_toggle_rect(layout)
+            .contains(point)
+    });
+    settings.hovered_submit_chunks_toggle = point.is_some_and(|point| {
+        windows_scene::timeline_transcription_settings_submit_chunks_toggle_rect(layout)
+            .contains(point)
+    });
+    settings.hovered_manual_flush_button = point.is_some_and(|point| {
+        windows_scene::timeline_transcription_settings_manual_flush_button_rect(layout)
             .contains(point)
     });
     Some(settings)
@@ -5613,8 +6020,11 @@ fn timeline_transcription_settings_target_column(
         windows_scene::TimelineTranscriptionSettingsTarget::Model => {
             windows_scene::TimelineTranscriptionSettingsColumn::Model
         }
-        windows_scene::TimelineTranscriptionSettingsTarget::TargetTrack => {
-            windows_scene::TimelineTranscriptionSettingsColumn::TargetTrack
+        windows_scene::TimelineTranscriptionSettingsTarget::InputAudioTrack => {
+            windows_scene::TimelineTranscriptionSettingsColumn::InputAudioTrack
+        }
+        windows_scene::TimelineTranscriptionSettingsTarget::OutputTextTrack => {
+            windows_scene::TimelineTranscriptionSettingsColumn::OutputTextTrack
         }
     }
 }
@@ -5641,14 +6051,31 @@ fn select_timeline_transcription_settings_model(
     apply_timeline_transcription_settings_selection(state);
 }
 
-fn select_timeline_transcription_settings_target_track(
+fn select_timeline_transcription_settings_input_audio_track(
     state: &mut SceneAppState,
     target_index: usize,
     dock_target: bool,
 ) {
     if let Some(settings) = state.timeline_transcription_settings.as_mut() {
-        settings.selected_column = windows_scene::TimelineTranscriptionSettingsColumn::TargetTrack;
-        settings.selected_target_index = target_index;
+        settings.selected_column =
+            windows_scene::TimelineTranscriptionSettingsColumn::InputAudioTrack;
+        settings.selected_input_audio_track_index = target_index;
+        if dock_target {
+            settings.input_target_docked = true;
+        }
+    }
+    apply_timeline_transcription_settings_selection(state);
+}
+
+fn select_timeline_transcription_settings_output_text_track(
+    state: &mut SceneAppState,
+    target_index: usize,
+    dock_target: bool,
+) {
+    if let Some(settings) = state.timeline_transcription_settings.as_mut() {
+        settings.selected_column =
+            windows_scene::TimelineTranscriptionSettingsColumn::OutputTextTrack;
+        settings.selected_output_text_track_index = target_index;
         if dock_target {
             settings.output_target_docked = true;
         }
@@ -5672,12 +6099,151 @@ fn append_text_track_from_timeline_transcription_settings(state: &mut SceneAppSt
             .map_or(0, |index| index + 1)
     };
     if let Some(settings) = state.timeline_transcription_settings.as_mut() {
-        settings.selected_column = windows_scene::TimelineTranscriptionSettingsColumn::TargetTrack;
-        settings.selected_target_index = selected_target_index;
+        settings.selected_column =
+            windows_scene::TimelineTranscriptionSettingsColumn::OutputTextTrack;
+        settings.selected_output_text_track_index = selected_target_index;
         settings.output_target_docked = true;
     }
     apply_timeline_transcription_settings_selection(state);
     broadcast_timeline_document_changed();
+}
+
+fn open_audio_track_picker_from_timeline_transcription_settings(state: &mut SceneAppState) {
+    let mut picker =
+        AudioInputPickerState::new(list_active_audio_input_devices().unwrap_or_default());
+    if let Some(default_index) = picker.devices.iter().position(|device| device.is_default) {
+        picker.select_index(default_index);
+    }
+    state.audio_input_picker = picker;
+    state.audio_input_picker_completion =
+        AudioInputPickerCompletion::TimelineTranscriptionInputTrack;
+    state.scene_kind = SceneWindowKind::AudioInputDevicePicker;
+    state.scene_action_selected_index = 0;
+    state.scene_virtual_cursor = None;
+}
+
+fn toggle_timeline_transcription_settings_advance_boundaries(state: &mut SceneAppState) {
+    update_timeline_transcription_settings_automation(state, |advance, submit| (!advance, submit));
+}
+
+fn toggle_timeline_transcription_settings_submit_chunks(state: &mut SceneAppState) {
+    update_timeline_transcription_settings_automation(state, |advance, submit| (advance, !submit));
+}
+
+fn update_timeline_transcription_settings_automation(
+    state: &mut SceneAppState,
+    update: impl FnOnce(bool, bool) -> (bool, bool),
+) {
+    let Some(settings) = state.timeline_transcription_settings else {
+        return;
+    };
+    let Some(document) = timeline_document_handle(state) else {
+        return;
+    };
+    let changed = {
+        let mut document = lock_shared_timeline_document(&document);
+        let Some(track) = document
+            .tracks()
+            .iter()
+            .find(|track| track.id() == settings.track_id)
+        else {
+            return;
+        };
+        let crate::timeline::TimelineTrackProjection::Transcription(projection) =
+            track.projection()
+        else {
+            return;
+        };
+        let (advance, submit) = update(
+            projection.automatically_advance_chunk_boundaries(),
+            projection.automatically_submit_chunks(),
+        );
+        document.set_transcription_track_automation(settings.track_id, advance, submit)
+    };
+    if changed {
+        broadcast_timeline_document_changed();
+    }
+}
+
+fn request_timeline_transcription_manual_flush(state: &mut SceneAppState) {
+    let Some(model_name) = selected_timeline_transcription_model_name(state) else {
+        super::jobs::record_failed_job(
+            "Timeline transcription manual flush",
+            "No transcription track is attached. Select a transcription track before manually flushing a chunk.",
+        );
+        return;
+    };
+    if let Some(device_window) = state.audio_input_device_window.as_mut() {
+        device_window.set_transcription_model_name(model_name);
+        device_window.flush_transcription_chunk();
+        return;
+    }
+
+    super::jobs::record_failed_job(
+        "Timeline transcription manual flush",
+        "No live input audio track is attached. Target an audio track before manually flushing a transcription chunk.",
+    );
+}
+
+fn model_warning_open_button_at_point(
+    state: &SceneAppState,
+    layout: TerminalLayout,
+    point: ClientPoint,
+) -> Option<usize> {
+    let warning = state.model_warning.as_ref()?;
+    (0..warning.status.locations.len()).find(|index| {
+        windows_scene::model_warning_location_open_rect(layout, *index)
+            .is_some_and(|rect| rect.contains(point))
+    })
+}
+
+fn model_warning_copy_button_at_point(
+    state: &SceneAppState,
+    layout: TerminalLayout,
+    point: ClientPoint,
+) -> Option<usize> {
+    let warning = state.model_warning.as_ref()?;
+    (0..warning.status.locations.len()).find(|index| {
+        windows_scene::model_warning_location_copy_rect(layout, *index)
+            .is_some_and(|rect| rect.contains(point))
+    })
+}
+
+fn open_model_warning_location(state: &SceneAppState, index: usize) {
+    let Some(location) = state
+        .model_warning
+        .as_ref()
+        .and_then(|warning| warning.status.locations.get(index))
+    else {
+        return;
+    };
+    let path = if location.path.is_dir() {
+        location.path.clone()
+    } else {
+        location
+            .path
+            .parent()
+            .map_or_else(|| location.path.clone(), Path::to_path_buf)
+    };
+    if let Err(error) = std::process::Command::new("explorer.exe")
+        .arg(&path)
+        .spawn()
+    {
+        error!(?error, path = %path.display(), "failed to open model warning location");
+    }
+}
+
+fn copy_model_warning_location(state: &SceneAppState, index: usize) {
+    let Some(location) = state
+        .model_warning
+        .as_ref()
+        .and_then(|warning| warning.status.locations.get(index))
+    else {
+        return;
+    };
+    if let Err(error) = write_clipboard(location.path.display().to_string()) {
+        error!(?error, path = %location.path.display(), "failed to copy model warning location");
+    }
 }
 
 fn timeline_transcription_settings_target_at_point(
@@ -5688,7 +6254,8 @@ fn timeline_transcription_settings_target_at_point(
     let settings = state.timeline_transcription_settings?;
     [
         windows_scene::TimelineTranscriptionSettingsTarget::Model,
-        windows_scene::TimelineTranscriptionSettingsTarget::TargetTrack,
+        windows_scene::TimelineTranscriptionSettingsTarget::InputAudioTrack,
+        windows_scene::TimelineTranscriptionSettingsTarget::OutputTextTrack,
     ]
     .into_iter()
     .find(|target| {
@@ -5704,8 +6271,11 @@ fn timeline_transcription_settings_socket_at_point(
     if windows_scene::timeline_transcription_settings_model_socket_rect(layout).contains(point) {
         return Some(windows_scene::TimelineTranscriptionSettingsTarget::Model);
     }
+    if windows_scene::timeline_transcription_settings_input_socket_rect(layout).contains(point) {
+        return Some(windows_scene::TimelineTranscriptionSettingsTarget::InputAudioTrack);
+    }
     if windows_scene::timeline_transcription_settings_output_socket_rect(layout).contains(point) {
-        return Some(windows_scene::TimelineTranscriptionSettingsTarget::TargetTrack);
+        return Some(windows_scene::TimelineTranscriptionSettingsTarget::OutputTextTrack);
     }
     None
 }
@@ -5732,6 +6302,14 @@ fn timeline_transcription_settings_add_text_track_button_at_point(
         .contains(point)
 }
 
+fn timeline_transcription_settings_add_audio_track_button_at_point(
+    layout: TerminalLayout,
+    point: ClientPoint,
+) -> bool {
+    windows_scene::timeline_transcription_settings_add_audio_track_button_rect(layout)
+        .contains(point)
+}
+
 fn timeline_transcription_settings_add_text_track_tooltip(
     layout: TerminalLayout,
     point: ClientPoint,
@@ -5751,7 +6329,18 @@ fn timeline_transcription_settings_model_row_at_point(
     })
 }
 
-fn timeline_transcription_settings_target_row_count(state: &SceneAppState) -> usize {
+fn timeline_transcription_settings_input_row_count(state: &SceneAppState) -> usize {
+    timeline_document_handle(state).map_or(1, |document| {
+        lock_shared_timeline_document(&document)
+            .tracks()
+            .iter()
+            .filter(|track| track.kind() == crate::timeline::TimelineTrackKind::Audio)
+            .count()
+            + 1
+    })
+}
+
+fn timeline_transcription_settings_output_row_count(state: &SceneAppState) -> usize {
     timeline_document_handle(state).map_or(1, |document| {
         lock_shared_timeline_document(&document)
             .tracks()
@@ -5762,13 +6351,24 @@ fn timeline_transcription_settings_target_row_count(state: &SceneAppState) -> us
     })
 }
 
-fn timeline_transcription_settings_target_row_at_point(
+fn timeline_transcription_settings_input_row_at_point(
     state: &SceneAppState,
     layout: TerminalLayout,
     point: ClientPoint,
 ) -> Option<usize> {
-    (0..timeline_transcription_settings_target_row_count(state)).find(|index| {
-        windows_scene::timeline_transcription_settings_target_row_rect(layout, *index)
+    (0..timeline_transcription_settings_input_row_count(state)).find(|index| {
+        windows_scene::timeline_transcription_settings_input_row_rect(layout, *index)
+            .is_some_and(|rect| rect.contains(point))
+    })
+}
+
+fn timeline_transcription_settings_output_row_at_point(
+    state: &SceneAppState,
+    layout: TerminalLayout,
+    point: ClientPoint,
+) -> Option<usize> {
+    (0..timeline_transcription_settings_output_row_count(state)).find(|index| {
+        windows_scene::timeline_transcription_settings_output_row_rect(layout, *index)
             .is_some_and(|rect| rect.contains(point))
     })
 }
@@ -5788,11 +6388,25 @@ fn timeline_transcription_settings_state_for_document(
         .filter(|track| track.kind() == crate::timeline::TimelineTrackKind::Text)
         .map(crate::timeline::TimelineTrack::id)
         .collect::<Vec<_>>();
+    let audio_track_ids = document
+        .tracks()
+        .iter()
+        .filter(|track| track.kind() == crate::timeline::TimelineTrackKind::Audio)
+        .map(crate::timeline::TimelineTrack::id)
+        .collect::<Vec<_>>();
     let selected_model_index = KNOWN_WHISPER_MODELS
         .iter()
         .position(|model| model.name == projection.model_name())
         .unwrap_or_default();
-    let selected_target_index = projection
+    let selected_input_audio_track_index = projection
+        .target_audio_track_id()
+        .and_then(|track_id| {
+            audio_track_ids
+                .iter()
+                .position(|candidate| *candidate == track_id)
+        })
+        .map_or(0, |index| index + 1);
+    let selected_output_text_track_index = projection
         .target_text_track_id()
         .and_then(|track_id| {
             text_track_ids
@@ -5805,20 +6419,37 @@ fn timeline_transcription_settings_state_for_document(
         track_id: track.id(),
         selected_column: windows_scene::TimelineTranscriptionSettingsColumn::Model,
         selected_model_index,
-        selected_target_index,
+        selected_input_audio_track_index,
+        selected_output_text_track_index,
         add_text_track_button_visual_state:
             crate::app::windows_d3d12_renderer::ButtonVisualState::default(),
-        model_target_docked: false,
-        output_target_docked: false,
+        add_audio_track_button_visual_state:
+            crate::app::windows_d3d12_renderer::ButtonVisualState::default(),
+        advance_boundaries_toggle_visual_state:
+            crate::app::windows_d3d12_renderer::ButtonVisualState::default(),
+        submit_chunks_toggle_visual_state:
+            crate::app::windows_d3d12_renderer::ButtonVisualState::default(),
+        manual_flush_button_visual_state:
+            crate::app::windows_d3d12_renderer::ButtonVisualState::default(),
+        model_target_docked: true,
+        input_target_docked: projection.target_audio_track_id().is_some(),
+        output_target_docked: projection.target_text_track_id().is_some(),
         dragging_target: None,
         drag_position: None,
         hovered_model_index: None,
-        hovered_target_index: None,
+        hovered_input_audio_track_index: None,
+        hovered_output_text_track_index: None,
         hovered_model_socket: false,
-        hovered_target_socket: false,
+        hovered_input_socket: false,
+        hovered_output_socket: false,
         hovered_model_target: false,
+        hovered_input_target: false,
         hovered_output_target: false,
         hovered_add_text_track_button: false,
+        hovered_add_audio_track_button: false,
+        hovered_advance_boundaries_toggle: false,
+        hovered_submit_chunks_toggle: false,
+        hovered_manual_flush_button: false,
     })
 }
 
@@ -5868,6 +6499,135 @@ fn open_timeline_transcription_settings_window_from_scene(track_index: usize) ->
     Ok(())
 }
 
+fn open_jobs_window_from_scene_state(state: &SceneAppState) {
+    let app_home = state.app_home.clone();
+    let vt_engine = state.vt_engine;
+    let spawn_result = thread::Builder::new()
+        .name("teamy-studio-jobs".to_owned())
+        .spawn(move || {
+            if let Err(error) = run_scene_window(
+                &app_home,
+                SceneWindowKind::Jobs,
+                vt_engine,
+                SceneWindowInitialization::default(),
+            ) {
+                error!(?error, "failed to open jobs window");
+            }
+        });
+    if let Err(error) = spawn_result {
+        error!(?error, "failed to spawn Teamy Studio jobs thread");
+    }
+}
+
+fn open_model_warning_window_from_scene_state(
+    state: &SceneAppState,
+    warning: windows_scene::ModelWarningViewState,
+) {
+    let app_home = state.app_home.clone();
+    let vt_engine = state.vt_engine;
+    open_model_warning_window(&app_home, vt_engine, warning);
+}
+
+fn open_model_warning_window(
+    app_home: &AppHome,
+    vt_engine: VtEngineChoice,
+    warning: windows_scene::ModelWarningViewState,
+) {
+    ring_terminal_bell();
+    let app_home = app_home.clone();
+    let spawn_result = thread::Builder::new()
+        .name("teamy-studio-model-warning".to_owned())
+        .spawn(move || {
+            if let Err(error) = run_scene_window(
+                &app_home,
+                SceneWindowKind::ModelWarning,
+                vt_engine,
+                SceneWindowInitialization {
+                    model_warning: Some(warning),
+                    ..Default::default()
+                },
+            ) {
+                error!(?error, "failed to open model warning window");
+            }
+        });
+    if let Err(error) = spawn_result {
+        error!(?error, "failed to spawn Teamy Studio model warning thread");
+    }
+}
+
+fn transcription_model_warning_for_selected_settings(
+    state: &SceneAppState,
+) -> Option<windows_scene::ModelWarningViewState> {
+    let settings = state.timeline_transcription_settings?;
+    let model_name = KNOWN_WHISPER_MODELS
+        .get(settings.selected_model_index)
+        .map_or(KNOWN_WHISPER_MODELS[0].name, |model| model.name);
+    let status = crate::model::inspect_whisper_model_preparation(
+        &state.app_home,
+        &crate::paths::CACHE_DIR,
+        model_name,
+    );
+    (!status.is_compatible()).then_some(windows_scene::ModelWarningViewState { status })
+}
+
+fn toggle_audio_input_transcription_from_scene_state(state: &mut SceneAppState) {
+    let selected_model_name = selected_timeline_transcription_model_name(state);
+    if state
+        .audio_input_device_window
+        .as_ref()
+        .is_some_and(|device_window| !device_window.runtime.transcription.enabled)
+        && let Some(warning) = transcription_model_warning_for_timeline(state)
+    {
+        if let Some(device_window) = state.audio_input_device_window.as_mut() {
+            device_window.runtime.transcription.enabled = false;
+        }
+        open_model_warning_window_from_scene_state(state, warning);
+        return;
+    }
+
+    if let Some(device_window) = state.audio_input_device_window.as_mut() {
+        if let Some(model_name) = selected_model_name {
+            device_window.set_transcription_model_name(model_name);
+        }
+        device_window.toggle_transcription();
+        return;
+    }
+
+    tracing::warn!(
+        scene_kind = ?state.scene_kind,
+        "Timeline transcription toggle ignored because no live audio device is attached"
+    );
+    super::jobs::record_failed_job(
+        "Timeline transcription",
+        "No live microphone track is attached. Add a Microphone track and select an input device before enabling transcription.",
+    );
+}
+
+fn selected_timeline_transcription_model_name(state: &SceneAppState) -> Option<String> {
+    let document = timeline_document_handle(state)?;
+    let document = lock_shared_timeline_document(&document);
+    document.tracks().iter().find_map(|track| {
+        let crate::timeline::TimelineTrackProjection::Transcription(projection) =
+            track.projection()
+        else {
+            return None;
+        };
+        Some(projection.model_name().to_owned())
+    })
+}
+
+fn transcription_model_warning_for_timeline(
+    state: &SceneAppState,
+) -> Option<windows_scene::ModelWarningViewState> {
+    let model_name = selected_timeline_transcription_model_name(state)?;
+    let status = crate::model::inspect_whisper_model_preparation(
+        &state.app_home,
+        &crate::paths::CACHE_DIR,
+        &model_name,
+    );
+    (!status.is_compatible()).then_some(windows_scene::ModelWarningViewState { status })
+}
+
 fn apply_timeline_transcription_settings_selection(state: &mut SceneAppState) {
     let Some(settings) = state.timeline_transcription_settings else {
         return;
@@ -5886,15 +6646,27 @@ fn apply_timeline_transcription_settings_selection(state: &mut SceneAppState) {
             .filter(|track| track.kind() == crate::timeline::TimelineTrackKind::Text)
             .map(crate::timeline::TimelineTrack::id)
             .collect::<Vec<_>>();
+        let audio_track_ids = document
+            .tracks()
+            .iter()
+            .filter(|track| track.kind() == crate::timeline::TimelineTrackKind::Audio)
+            .map(crate::timeline::TimelineTrack::id)
+            .collect::<Vec<_>>();
+        let target_audio_track_id = settings
+            .selected_input_audio_track_index
+            .checked_sub(1)
+            .and_then(|index| audio_track_ids.get(index).copied());
         let target_track_id = settings
-            .selected_target_index
+            .selected_output_text_track_index
             .checked_sub(1)
             .and_then(|index| text_track_ids.get(index).copied());
         let model_changed =
             document.set_transcription_track_model_name(settings.track_id, model_name);
+        let input_changed = document
+            .set_transcription_track_target_audio_track(settings.track_id, target_audio_track_id);
         let target_changed =
             document.set_transcription_track_target_text_track(settings.track_id, target_track_id);
-        model_changed || target_changed
+        model_changed || input_changed || target_changed
     };
     if changed {
         broadcast_timeline_document_changed();
@@ -6061,6 +6833,17 @@ fn timeline_scroll_interaction_at_point(
         && windows_scene::timeline_scroll_interaction_contains(timeline_layout(layout), point)
 }
 
+fn timeline_pan_interaction_at_point(
+    state: &SceneAppState,
+    layout: TerminalLayout,
+    point: ClientPoint,
+) -> bool {
+    state.scene_kind == SceneWindowKind::Timeline
+        && !state.diagnostics_visible
+        && timeline_track_count(state) > 0
+        && timeline_layout(layout).scrollport_rect.contains(point)
+}
+
 fn timeline_current_vertical_scroll_offset(state: &SceneAppState, layout: TerminalLayout) -> i32 {
     windows_scene::timeline_clamp_vertical_scroll_offset(
         timeline_layout(layout),
@@ -6184,14 +6967,13 @@ fn apply_timeline_zoom_animation(state: &mut SceneAppState) {
 
 #[expect(
     clippy::cast_precision_loss,
-    reason = "elastic zoom interpolation needs floating-point math even though the stored viewport origin is integer nanoseconds"
+    reason = "timeline zoom animation interpolates integer nanosecond origins through display-scale f64 progress"
 )]
 fn interpolate_timeline_viewport(
     start: TimelineViewport,
     target: TimelineViewport,
     progress: f64,
 ) -> TimelineViewport {
-    let progress = progress.clamp(0.0, 1.15);
     let origin = lerp_f64(
         start.origin().as_i64() as f64,
         target.origin().as_i64() as f64,
@@ -6378,7 +7160,9 @@ fn scene_interactive_region_contains(
                 && audio_input_device_detail_legacy_recording_button_at_point(state, layout, point))
             || (state.scene_kind == SceneWindowKind::TimelineTranscriptionSettings
                 && (timeline_transcription_settings_model_row_at_point(layout, point).is_some()
-                    || timeline_transcription_settings_target_row_at_point(state, layout, point)
+                    || timeline_transcription_settings_input_row_at_point(state, layout, point)
+                        .is_some()
+                    || timeline_transcription_settings_output_row_at_point(state, layout, point)
                         .is_some()
                     || timeline_transcription_settings_target_at_point(state, layout, point)
                         .is_some()
@@ -6679,7 +7463,7 @@ fn commit_audio_input_picker_selection_from_scene(
             let result = with_scene_app_state(|state| {
                 let document = ensure_timeline_document_handle(state);
                 let _ = lock_shared_timeline_document(&document)
-                    .append_microphone_track_for_device(device.name.clone());
+                    .append_microphone_track_for_device_id(device.name.clone(), device.id.clone());
                 state.audio_input_device_window = Some(AudioInputDeviceWindowState::new(device));
                 state.audio_input_picker_completion = AudioInputPickerCompletion::OpenDeviceWindow;
                 state.scene_kind = SceneWindowKind::Timeline;
@@ -6691,6 +7475,43 @@ fn commit_audio_input_picker_selection_from_scene(
                 error!(
                     ?error,
                     "failed to commit selected microphone into the timeline"
+                );
+                hwnd.post_close();
+            } else {
+                broadcast_timeline_document_changed();
+            }
+        }
+        Ok(AudioInputPickerCompletion::TimelineTranscriptionInputTrack) => {
+            let result = with_scene_app_state(|state| {
+                let document = ensure_timeline_document_handle(state);
+                let selected_target_index = {
+                    let mut document = lock_shared_timeline_document(&document);
+                    let track_id = document.append_microphone_track_for_device_id(
+                        device.name.clone(),
+                        device.id.clone(),
+                    );
+                    document
+                        .tracks()
+                        .iter()
+                        .filter(|track| track.kind() == crate::timeline::TimelineTrackKind::Audio)
+                        .map(crate::timeline::TimelineTrack::id)
+                        .position(|candidate| candidate == track_id)
+                        .map_or(0, |index| index + 1)
+                };
+                state.audio_input_device_window = Some(AudioInputDeviceWindowState::new(device));
+                state.audio_input_picker_completion = AudioInputPickerCompletion::OpenDeviceWindow;
+                state.scene_kind = SceneWindowKind::TimelineTranscriptionSettings;
+                select_timeline_transcription_settings_input_audio_track(
+                    state,
+                    selected_target_index,
+                    true,
+                );
+                render_scene_window_frame(state, hwnd, None, false)
+            });
+            if let Err(error) = result {
+                error!(
+                    ?error,
+                    "failed to commit selected microphone into transcription settings"
                 );
                 hwnd.post_close();
             } else {
@@ -7138,6 +7959,23 @@ fn perform_scene_action(
                 .wrap_err("failed to spawn Teamy Studio audio daemon thread")?;
             Ok(SceneActionDisposition::KeepOpen)
         }
+        SceneAction::OpenJobs => {
+            let app_home = app_home.clone();
+            thread::Builder::new()
+                .name("teamy-studio-jobs".to_owned())
+                .spawn(move || {
+                    if let Err(error) = run_scene_window(
+                        &app_home,
+                        SceneWindowKind::Jobs,
+                        vt_engine,
+                        SceneWindowInitialization::default(),
+                    ) {
+                        error!(?error, "failed to open jobs window");
+                    }
+                })
+                .wrap_err("failed to spawn Teamy Studio jobs thread")?;
+            Ok(SceneActionDisposition::KeepOpen)
+        }
         SceneAction::OpenAudioInputDevices => {
             // audio[impl gui.picker-window]
             let app_home = app_home.clone();
@@ -7257,15 +8095,24 @@ fn perform_scene_action(
             Ok(SceneActionDisposition::KeepOpen)
         }
         SceneAction::AppendTranscriptionTrack => {
+            let mut new_track_index = None;
             with_scene_app_state(|state| {
                 let document = ensure_timeline_document_handle(state);
-                let _ = lock_shared_timeline_document(&document).append_transcription_track();
+                let mut document = lock_shared_timeline_document(&document);
+                let track_id = document.append_transcription_track();
+                new_track_index = document
+                    .tracks()
+                    .iter()
+                    .position(|track| track.id() == track_id);
                 state.scene_kind = SceneWindowKind::Timeline;
                 state.scene_action_selected_index = 0;
                 state.scene_virtual_cursor = None;
                 Ok(())
             })?;
             broadcast_timeline_document_changed();
+            if let Some(track_index) = new_track_index {
+                open_timeline_transcription_settings_window_from_scene(track_index)?;
+            }
             Ok(SceneActionDisposition::KeepOpen)
         }
         SceneAction::AppendTextTrack => {
@@ -9488,10 +10335,19 @@ fn scene_cursor_for_point(
 
     if state.scene_kind == SceneWindowKind::TimelineTranscriptionSettings
         && (timeline_transcription_settings_model_row_at_point(layout, point).is_some()
-            || timeline_transcription_settings_target_row_at_point(state, layout, point).is_some()
+            || timeline_transcription_settings_input_row_at_point(state, layout, point).is_some()
+            || timeline_transcription_settings_output_row_at_point(state, layout, point).is_some()
             || timeline_transcription_settings_target_at_point(state, layout, point).is_some()
             || timeline_transcription_settings_socket_at_point(layout, point).is_some()
             || timeline_transcription_settings_add_text_track_button_at_point(layout, point))
+    {
+        return Some(IDC_HAND);
+    }
+
+    if state.scene_kind == SceneWindowKind::ModelWarning
+        && (model_warning_open_button_at_point(state, layout, point).is_some()
+            || model_warning_copy_button_at_point(state, layout, point).is_some()
+            || windows_scene::model_warning_prepare_rect(layout).contains(point))
     {
         return Some(IDC_HAND);
     }
@@ -10690,12 +11546,15 @@ mod tests {
             hwnd: None,
             dpi: USER_DEFAULT_SCREEN_DPI,
             scene_kind: SceneWindowKind::Launcher,
+            scene_opened_at: Instant::now(),
             vt_engine: VtEngineChoice::default(),
             audio_input_picker: AudioInputPickerState::default(),
             audio_input_picker_completion: AudioInputPickerCompletion::default(),
             audio_input_device_window: None,
             timeline_document: None,
             timeline_transcription_settings: None,
+            model_warning: None,
+            model_warning_prepare_started_at: None,
             timeline_tool: TimelineInteractionTool::default(),
             timeline_selection: None,
             pending_timeline_selection: None,
@@ -10763,12 +11622,15 @@ mod tests {
             hwnd: None,
             dpi: USER_DEFAULT_SCREEN_DPI,
             scene_kind: SceneWindowKind::DemoMode,
+            scene_opened_at: Instant::now(),
             vt_engine: VtEngineChoice::default(),
             audio_input_picker: AudioInputPickerState::default(),
             audio_input_picker_completion: AudioInputPickerCompletion::default(),
             audio_input_device_window: None,
             timeline_document: None,
             timeline_transcription_settings: None,
+            model_warning: None,
+            model_warning_prepare_started_at: None,
             timeline_tool: TimelineInteractionTool::default(),
             timeline_selection: None,
             pending_timeline_selection: None,
@@ -10827,12 +11689,15 @@ mod tests {
             hwnd: None,
             dpi: USER_DEFAULT_SCREEN_DPI,
             scene_kind: SceneWindowKind::Timeline,
+            scene_opened_at: Instant::now(),
             vt_engine: VtEngineChoice::default(),
             audio_input_picker: AudioInputPickerState::default(),
             audio_input_picker_completion: AudioInputPickerCompletion::default(),
             audio_input_device_window: None,
             timeline_document: Some(shared_timeline_document(TimelineDocument::blank())),
             timeline_transcription_settings: None,
+            model_warning: None,
+            model_warning_prepare_started_at: None,
             timeline_tool: TimelineInteractionTool::default(),
             timeline_selection: None,
             pending_timeline_selection: None,
