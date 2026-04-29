@@ -423,6 +423,40 @@ float4 apply_target_marker(float2 uv, float4 color, float4 state) {
     return float4((rgb * color.rgb) * glow, color.a * alpha);
 }
 
+float4 apply_timeline_add_text_track_button(float2 uv, float4 color, float4 state) {
+    float t = PanelTime();
+    float near = saturate(state.x);
+    float hover = saturate(state.y);
+    float pressed = saturate(state.z);
+    float click = saturate(state.w);
+    float edgeDistance = abs((uv.x - 0.5) * 2.0);
+    float verticalArc = 1.0 - smoothstep(0.10, 0.96, abs((uv.y - 0.48) * 2.0));
+    float topRim = 1.0 - smoothstep(0.04, 0.28, uv.y);
+    float engage = saturate(max(hover, near * 0.82));
+    float bouncePhase = sin((t * 6.8) + ((1.0 - edgeDistance) * 8.0));
+    float bounce = bouncePhase * (0.05 + (0.03 * hover));
+    float greenFront = smoothstep(1.0 - engage - 0.14, 1.0 - engage + 0.02, edgeDistance + bounce);
+    float greenFill = saturate(greenFront * engage);
+    float frontBand =
+        (1.0 - smoothstep(0.00, 0.08, abs(edgeDistance - (1.0 - engage + (bounce * 0.45)))))
+        * engage;
+    float sheen = 0.5 + (0.5 * sin((uv.x * 11.0) - (t * (1.9 + (hover * 0.8)))));
+    float grain = 0.5 + (0.5 * sin((uv.x * 18.0) + (uv.y * 24.0) + (t * 1.4)));
+    float idleGlow = 0.92 + (0.05 * sin((uv.x * 9.0) + (t * 0.9))) + (0.03 * sin((uv.y * 13.0) - (t * 1.1)));
+    float settle = saturate(greenFill + (hover * 0.22) + (click * 0.18));
+    float3 baseSteel = color.rgb * lerp(float3(0.92, 0.97, 1.02), float3(1.02, 1.04, 1.08), sheen * 0.45);
+    float3 emeraldShadow = float3(0.08, 0.34, 0.19);
+    float3 emeraldMid = float3(0.20, 0.64, 0.34);
+    float3 emeraldHighlight = float3(0.58, 0.96, 0.66);
+    float3 mint = float3(0.88, 1.00, 0.91);
+    float3 greenTint = lerp(emeraldShadow, emeraldMid, 0.42 + (0.32 * verticalArc) + (0.18 * sheen));
+    greenTint = lerp(greenTint, emeraldHighlight, (0.24 * topRim) + (0.12 * grain));
+    greenTint += mint * ((frontBand * (0.18 + (0.14 * hover))) + (topRim * 0.08));
+    float glow = idleGlow + (verticalArc * (0.06 + (0.06 * near))) + (topRim * (0.08 + (0.10 * settle))) + (frontBand * 0.20) - (pressed * 0.08);
+    float3 rgb = lerp(baseSteel, greenTint, settle);
+    return float4(rgb * glow, color.a);
+}
+
 float4 PSMain(PsInput input) : SV_TARGET {
     if (input.effect > 11.5 && input.effect < 12.5) {
         float coverage = slug_coverage(input.uv, input.glyph, input.glyphData, input.banding);
@@ -439,7 +473,9 @@ float4 PSMain(PsInput input) : SV_TARGET {
     }
 
     float4 shaded = input.color;
-    if (input.effect > 28.5) {
+    if (input.effect > 29.5) {
+        shaded = apply_timeline_add_text_track_button(input.uv, input.color, input.glyphData);
+    } else if (input.effect > 28.5) {
         shaded = apply_target_marker(input.uv, input.color, input.glyphData);
     } else if (input.effect > 27.5) {
         shaded = apply_transcription_toggle(input.uv, input.color, input.glyphData);

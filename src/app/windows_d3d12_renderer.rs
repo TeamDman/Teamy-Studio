@@ -263,6 +263,7 @@ pub enum PanelEffect {
     PlaybackButton = 27,
     TranscriptionToggle = 28,
     TargetMarker = 29,
+    TimelineAddTextTrackButton = 30,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]

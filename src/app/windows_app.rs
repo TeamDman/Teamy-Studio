@@ -48,13 +48,13 @@ use windows::Win32::UI::WindowsAndMessaging::{
     PostMessageW, PostQuitMessage, RegisterClassExW, SM_CXPADDEDBORDER, SM_CXSCREEN,
     SM_CXSIZEFRAME, SM_CYSCREEN, SM_CYSIZEFRAME, SW_MAXIMIZE, SW_MINIMIZE, SW_RESTORE, SW_SHOW,
     SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SYSTEM_METRICS_INDEX, SendMessageW, SetCursor,
-    SetTimer, SetWindowPos, SetWindowTextW, ShowWindow, TranslateMessage, WINDOW_EX_STYLE,
-    WINDOW_STYLE, WM_APP, WM_CHAR, WM_CLOSE, WM_DESTROY, WM_DPICHANGED, WM_ENTERSIZEMOVE,
-    WM_ERASEBKGND, WM_EXITSIZEMOVE, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS, WM_LBUTTONDOWN,
-    WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCALCSIZE, WM_NCHITTEST, WM_NCLBUTTONDOWN,
-    WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SETFOCUS, WM_SIZE, WM_SYSKEYDOWN,
-    WM_SYSKEYUP, WM_TIMER, WNDCLASSEXW, WS_EX_APPWINDOW, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOPMOST,
-    WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP, WS_THICKFRAME, WS_VISIBLE,
+    SetCursorPos, SetTimer, SetWindowPos, SetWindowTextW, ShowWindow, TranslateMessage,
+    WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CHAR, WM_CLOSE, WM_DESTROY, WM_DPICHANGED,
+    WM_ENTERSIZEMOVE, WM_ERASEBKGND, WM_EXITSIZEMOVE, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCALCSIZE, WM_NCHITTEST,
+    WM_NCLBUTTONDOWN, WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SETFOCUS, WM_SIZE,
+    WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WNDCLASSEXW, WS_EX_APPWINDOW, WS_EX_NOREDIRECTIONBITMAP,
+    WS_EX_TOPMOST, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP, WS_THICKFRAME, WS_VISIBLE,
 };
 use windows::core::{BOOL, PCWSTR, w};
 
@@ -2870,13 +2870,27 @@ fn handle_scene_left_button_down(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Re
                 match target {
                     windows_scene::TimelineTranscriptionSettingsTarget::Model => {
                         if settings.model_target_docked {
-                            settings.model_target_docked = false;
+                            if let Some(target_point) =
+                                timeline_transcription_settings_target_cursor_jump_point(
+                                    state, layout, target,
+                                )
+                            {
+                                move_pointer_to_client_point(hwnd, target_point)?;
+                                state.pointer_position = Some(target_point);
+                            }
                             return Ok(ScenePointerAction::RenderOnly);
                         }
                     }
                     windows_scene::TimelineTranscriptionSettingsTarget::TargetTrack => {
                         if settings.output_target_docked {
-                            settings.output_target_docked = false;
+                            if let Some(target_point) =
+                                timeline_transcription_settings_target_cursor_jump_point(
+                                    state, layout, target,
+                                )
+                            {
+                                move_pointer_to_client_point(hwnd, target_point)?;
+                                state.pointer_position = Some(target_point);
+                            }
                             return Ok(ScenePointerAction::RenderOnly);
                         }
                     }
@@ -5421,6 +5435,14 @@ fn timeline_transcription_settings_view_state(
 ) -> Option<windows_scene::TimelineTranscriptionSettingsViewState> {
     let mut settings = state.timeline_transcription_settings?;
     let point = state.pointer_position;
+    settings.add_text_track_button_visual_state = windows_scene::compute_button_visual_state(
+        windows_scene::timeline_transcription_settings_add_text_track_button_rect(layout),
+        point,
+        false,
+        None,
+        false,
+        Instant::now(),
+    );
     settings.hovered_model_index =
         point.and_then(|point| timeline_transcription_settings_model_row_at_point(layout, point));
     settings.hovered_target_index = point.and_then(|point| {
@@ -5555,12 +5577,35 @@ fn timeline_transcription_settings_socket_at_point(
     None
 }
 
+fn timeline_transcription_settings_target_cursor_jump_point(
+    state: &SceneAppState,
+    layout: TerminalLayout,
+    target: windows_scene::TimelineTranscriptionSettingsTarget,
+) -> Option<ClientPoint> {
+    let settings = state.timeline_transcription_settings?;
+    let puck_rect =
+        windows_scene::timeline_transcription_settings_target_puck_rect(layout, settings, target)?;
+    Some(ClientPoint::new(
+        puck_rect.left() + (puck_rect.width() / 2),
+        puck_rect.top() + (puck_rect.height() / 2),
+    ))
+}
+
 fn timeline_transcription_settings_add_text_track_button_at_point(
     layout: TerminalLayout,
     point: ClientPoint,
 ) -> bool {
     windows_scene::timeline_transcription_settings_add_text_track_button_rect(layout)
         .contains(point)
+}
+
+fn timeline_transcription_settings_add_text_track_tooltip(
+    layout: TerminalLayout,
+    point: ClientPoint,
+) -> Option<(&'static str, ClientRect)> {
+    let rect = windows_scene::timeline_transcription_settings_add_text_track_button_rect(layout);
+    rect.contains(point)
+        .then_some(("Add a new text track for transcription output", rect))
 }
 
 fn timeline_transcription_settings_model_row_at_point(
@@ -5631,6 +5676,8 @@ fn open_timeline_transcription_settings(state: &mut SceneAppState, track_index: 
             selected_column: windows_scene::TimelineTranscriptionSettingsColumn::Model,
             selected_model_index,
             selected_target_index,
+            add_text_track_button_visual_state:
+                crate::app::windows_d3d12_renderer::ButtonVisualState::default(),
             model_target_docked: false,
             output_target_docked: false,
             dragging_target: None,
@@ -9535,6 +9582,13 @@ fn update_scene_chrome_tooltip(
     }
 
     if let Some((tooltip_text, anchor_rect)) =
+        timeline_transcription_settings_add_text_track_tooltip(layout, point)
+    {
+        show_scene_tooltip(state, hwnd, point, tooltip_text, anchor_rect)?;
+        return Ok(());
+    }
+
+    if let Some((tooltip_text, anchor_rect)) =
         timeline_text_block_tooltip_at_point(state, layout, point)
     {
         show_scene_tooltip(state, hwnd, point, &tooltip_text, anchor_rect)?;
@@ -10122,6 +10176,14 @@ fn client_rect_to_screen_rect(hwnd: WindowHandle, rect: ClientRect) -> eyre::Res
     ))
 }
 
+fn move_pointer_to_client_point(hwnd: WindowHandle, point: ClientPoint) -> eyre::Result<()> {
+    let point = client_to_screen_point(hwnd, point)?.to_win32_point()?;
+    // Safety: setting the OS cursor to a valid screen coordinate is permitted for the active UI interaction.
+    unsafe { SetCursorPos(point.x, point.y) }
+        .wrap_err("failed to move cursor to transcription settings target")?;
+    Ok(())
+}
+
 fn pointer_cursor_screen_rect(hwnd: WindowHandle, point: ClientPoint) -> eyre::Result<ScreenRect> {
     const CURSOR_WIDTH: i32 = 24;
     const CURSOR_HEIGHT: i32 = 24;
@@ -10393,6 +10455,28 @@ mod tests {
         assert!(origin.y >= anchor.bottom());
         assert!(origin.x + width <= bounds.right());
         assert!(origin.y + height <= bounds.bottom());
+    }
+
+    #[test]
+    fn transcription_settings_add_text_track_tooltip_uses_button_rect() {
+        let layout = TerminalLayout {
+            client_width: 1040,
+            client_height: 680,
+            cell_width: 8,
+            cell_height: 16,
+            diagnostic_panel_visible: true,
+        };
+        let rect =
+            windows_scene::timeline_transcription_settings_add_text_track_button_rect(layout);
+
+        let tooltip = timeline_transcription_settings_add_text_track_tooltip(
+            layout,
+            ClientPoint::new(rect.left() + 4, rect.top() + 4),
+        )
+        .expect("hovering the add text track button should produce a tooltip");
+
+        assert_eq!(tooltip.0, "Add a new text track for transcription output");
+        assert_eq!(tooltip.1, rect);
     }
 
     #[test]

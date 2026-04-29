@@ -122,6 +122,7 @@ pub struct TimelineTranscriptionSettingsViewState {
     pub selected_column: TimelineTranscriptionSettingsColumn,
     pub selected_model_index: usize,
     pub selected_target_index: usize,
+    pub add_text_track_button_visual_state: ButtonVisualState,
     pub model_target_docked: bool,
     pub output_target_docked: bool,
     pub dragging_target: Option<TimelineTranscriptionSettingsTarget>,
@@ -1431,15 +1432,14 @@ pub fn build_timeline_transcription_settings_render_scene(
         );
     }
 
-    push_panel(
+    push_panel_with_data(
         &mut scene,
         settings_layout.add_text_track_button_rect.to_win32_rect(),
-        if settings_state.hovered_add_text_track_button {
-            [0.21, 0.29, 0.37, 1.0]
-        } else {
-            [0.14, 0.18, 0.23, 1.0]
-        },
-        PanelEffect::SceneButtonCard,
+        [0.17, 0.23, 0.28, 1.0],
+        PanelEffect::TimelineAddTextTrackButton,
+        settings_state
+            .add_text_track_button_visual_state
+            .shader_data(),
     );
     push_text_block(
         &mut scene,
@@ -1483,7 +1483,7 @@ pub fn build_timeline_transcription_settings_render_scene(
     push_text_block(
         &mut scene,
         settings_layout.footer_rect.to_win32_rect(),
-        "Drag a target onto a row, use arrows to move the active list target, click an empty socket to recall its puck, and use Esc to return to the timeline.",
+        "Drag a target onto a row, use arrows to move the active list target, click an empty socket to jump the cursor to its puck, and use Esc to return to the timeline.",
         8,
         14,
         [0.70, 0.74, 0.80, 1.0],
@@ -7096,6 +7096,57 @@ mod tests {
 
         assert_eq!(card_count, expected_count);
         assert_eq!(scene.sprites.len(), expected_count);
+    }
+
+    #[test]
+    fn transcription_settings_scene_uses_dedicated_add_text_track_button_shader() {
+        let mut document = TimelineDocument::blank();
+        let track_id = document.append_transcription_track();
+        let settings_layout = timeline_transcription_settings_layout(sample_layout());
+        let scene = build_timeline_transcription_settings_render_scene(
+            sample_layout(),
+            WindowChromeButtonsState::default(),
+            Some(&document),
+            Some(TimelineTranscriptionSettingsViewState {
+                track_id,
+                selected_column: TimelineTranscriptionSettingsColumn::TargetTrack,
+                selected_model_index: 0,
+                selected_target_index: 0,
+                add_text_track_button_visual_state: compute_button_visual_state(
+                    settings_layout.add_text_track_button_rect,
+                    Some(ClientPoint::new(
+                        settings_layout.add_text_track_button_rect.left() + 6,
+                        settings_layout.add_text_track_button_rect.top() + 6,
+                    )),
+                    false,
+                    None,
+                    false,
+                    Instant::now(),
+                ),
+                model_target_docked: false,
+                output_target_docked: false,
+                dragging_target: None,
+                drag_position: None,
+                hovered_model_index: None,
+                hovered_target_index: None,
+                hovered_model_socket: false,
+                hovered_target_socket: false,
+                hovered_model_target: false,
+                hovered_output_target: false,
+                hovered_add_text_track_button: true,
+            }),
+        );
+        let add_button_panel = scene
+            .panels
+            .iter()
+            .find(|panel| {
+                panel.rect == settings_layout.add_text_track_button_rect.to_win32_rect()
+                    && panel.effect == PanelEffect::TimelineAddTextTrackButton
+            })
+            .expect("transcription settings scene should include the add text track button panel");
+
+        assert!(add_button_panel.data[0] > 0.0);
+        assert_eq!(add_button_panel.data[1], 1.0);
     }
 
     #[test]

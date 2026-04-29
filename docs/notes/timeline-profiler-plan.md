@@ -22,7 +22,7 @@ The first proof should let the launcher open a Timeline flow, create an empty ti
   - Fixed audio and transcription waveform previews so pan/zoom now redraw the visible sample slice instead of squeezing the entire buffer into the clipped preview rect.
   - Added document-backed transcription track settings with an in-window settings scene that selects a Rust Whisper model and a target text track rather than opening the old Python daemon window.
   - Added a three-dot grab handle to timeline track rows and in-window drag reordering with live row movement plus `Esc` cancel-to-restore behavior.
-  - Reworked the transcription settings window into a horizontal target/socket layout with shader-driven red/white target pucks, click-drag docking to model/text-track rows, keyboard teleport-to-selection behavior, socket recall, and an in-window `Add Text Track` action.
+  - Reworked the transcription settings window into a horizontal target/socket layout with shader-driven red/white target pucks, click-drag docking to model/text-track rows, keyboard teleport-to-selection behavior, empty-socket cursor jumps to the live puck, and an in-window `Add Text Track` action with explicit hover affordance.
   - Updated tests and validation so `./check-all.ps1` passes with the timeline microphone/transport/text-box/settings/reorder slice.
 - Current focus:
   - Turn the new text-track box workflow into a real editing surface, connect the transcription settings target/socket affordances to fuller editing flows, and prepare the shared timeline-session architecture needed for detached rope/socket tool windows.
