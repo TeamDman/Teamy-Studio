@@ -15,6 +15,7 @@ use uom::si::f64::Time;
 use uom::si::time::second;
 use windows::Win32::Foundation::RECT;
 
+use crate::logs::LogRecordLevel;
 use crate::model::{
     KNOWN_WHISPER_MODELS, WhisperModelPreparationState, WhisperModelPreparationStatus,
 };
@@ -75,6 +76,7 @@ pub enum SceneWindowKind {
     AudioPicker,
     AudioDaemon,
     Jobs,
+    Logs,
     AudioInputDevicePicker,
     AudioInputDeviceDetails,
     CursorGallery,
@@ -94,6 +96,7 @@ impl SceneWindowKind {
             Self::AudioPicker => "Audio Sources",
             Self::AudioDaemon => "Audio Daemon",
             Self::Jobs => "Jobs",
+            Self::Logs => "Logs",
             Self::AudioInputDevicePicker => "Audio Devices",
             Self::AudioInputDeviceDetails => "Microphone",
             Self::CursorGallery => "Cursor Gallery",
@@ -170,6 +173,7 @@ pub enum SceneAction {
     OpenAudioPicker,
     OpenAudioDaemon,
     OpenJobs,
+    OpenLogs,
     OpenAudioInputDevices,
     OpenTimeline,
     OpenTimelineTrackMenu,
@@ -192,6 +196,49 @@ pub enum SceneAction {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ModelWarningViewState {
     pub status: WhisperModelPreparationStatus,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LogsWindowControl {
+    ToBottom,
+    Clear,
+    Settings,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct LogsWindowVisualState {
+    pub to_bottom: ButtonVisualState,
+    pub clear: ButtonVisualState,
+    pub settings: ButtonVisualState,
+}
+
+impl LogsWindowVisualState {
+    #[must_use]
+    pub const fn control_state(self, control: LogsWindowControl) -> ButtonVisualState {
+        match control {
+            LogsWindowControl::ToBottom => self.to_bottom,
+            LogsWindowControl::Clear => self.clear,
+            LogsWindowControl::Settings => self.settings,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LogRowView {
+    pub time: String,
+    pub level: LogRecordLevel,
+    pub target: String,
+    pub message: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ToastViewState {
+    pub level: LogRecordLevel,
+    pub message: String,
+    pub progress_remaining: f32,
+    pub opacity: f32,
+    pub translate_x: i32,
+    pub translate_y: i32,
 }
 
 #[expect(
@@ -1203,6 +1250,14 @@ pub fn scene_button_specs(scene_kind: SceneWindowKind) -> &'static [SceneButtonS
                 color: [0.18, 0.27, 0.28, 1.0],
             },
             SceneButtonSpec {
+                // observability[impl logs.launcher-button]
+                action: SceneAction::OpenLogs,
+                label: "Logs",
+                tooltip: "Inspect application logs",
+                sprite: SpriteId::Terminal,
+                color: [0.20, 0.22, 0.30, 1.0],
+            },
+            SceneButtonSpec {
                 // audio[impl gui.launcher-button]
                 action: SceneAction::OpenAudioInputDevices,
                 label: "Audio Devices",
@@ -1302,6 +1357,7 @@ pub fn scene_button_specs(scene_kind: SceneWindowKind) -> &'static [SceneButtonS
         | SceneWindowKind::Timeline
         | SceneWindowKind::DemoMode
         | SceneWindowKind::Jobs
+        | SceneWindowKind::Logs
         | SceneWindowKind::AudioDaemon
         | SceneWindowKind::AudioInputDevicePicker
         | SceneWindowKind::AudioInputDeviceDetails
@@ -4326,6 +4382,430 @@ pub fn build_jobs_render_scene(
 }
 
 #[must_use]
+// observability[impl logs.table]
+// observability[impl logs.severity-colors]
+// observability[impl logs.virtual-scroll]
+// observability[impl logs.controls]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the logs scene receives chrome, data, selection, and font inputs explicitly from the window state"
+)]
+pub fn build_logs_render_scene(
+    layout: TerminalLayout,
+    window_chrome_buttons_state: WindowChromeButtonsState,
+    logs_text: &str,
+    rows: &[LogRowView],
+    visual_state: LogsWindowVisualState,
+    selection: Option<TerminalSelection>,
+    cell_width: i32,
+    cell_height: i32,
+) -> RenderScene {
+    let mut scene = build_scene_shell(layout, SceneWindowKind::Logs, window_chrome_buttons_state);
+    let body_rect = logs_body_rect(layout);
+    push_panel(
+        &mut scene,
+        body_rect.to_win32_rect(),
+        [0.08, 0.10, 0.13, 1.0],
+        PanelEffect::SceneBody,
+    );
+
+    for control in [
+        LogsWindowControl::ToBottom,
+        LogsWindowControl::Clear,
+        LogsWindowControl::Settings,
+    ] {
+        let rect = logs_control_rect(layout, control);
+        let effect = if control == LogsWindowControl::Settings {
+            PanelEffect::GearButton
+        } else {
+            PanelEffect::SceneButtonCard
+        };
+        push_panel_with_data(
+            &mut scene,
+            rect.to_win32_rect(),
+            [0.13, 0.16, 0.20, 0.98],
+            effect,
+            visual_state.control_state(control).shader_data(),
+        );
+        match control {
+            LogsWindowControl::ToBottom => {
+                let center =
+                    ClientRect::new(rect.left(), rect.top(), rect.right(), rect.bottom() - 5);
+                push_centered_text(
+                    &mut scene,
+                    center.to_win32_rect(),
+                    "v",
+                    [0.92, 0.97, 1.0, 1.0],
+                );
+                let line = ClientRect::new(
+                    rect.left() + 10,
+                    rect.bottom() - 12,
+                    rect.right() - 10,
+                    rect.bottom() - 9,
+                );
+                push_panel(
+                    &mut scene,
+                    line.to_win32_rect(),
+                    [0.92, 0.97, 1.0, 1.0],
+                    PanelEffect::TerminalFill,
+                );
+            }
+            LogsWindowControl::Clear => {
+                push_centered_text(
+                    &mut scene,
+                    rect.to_win32_rect(),
+                    "///",
+                    [0.92, 0.97, 1.0, 1.0],
+                );
+            }
+            LogsWindowControl::Settings => {}
+        }
+    }
+
+    let table_rect = logs_table_text_rect(layout);
+    push_panel(
+        &mut scene,
+        table_rect.to_win32_rect(),
+        [0.11, 0.13, 0.16, 1.0],
+        PanelEffect::SceneButtonCard,
+    );
+    push_selectable_text_block(
+        &mut scene,
+        table_rect.inset(10),
+        logs_text,
+        cell_width,
+        cell_height,
+        [0.0, 0.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0, 0.0],
+        selection,
+    );
+    push_log_table_rows(
+        &mut scene,
+        logs_selectable_text_rect(layout),
+        rows,
+        cell_width,
+        cell_height,
+    );
+
+    scene
+}
+
+// observability[impl logs.severity-colors]
+fn push_log_table_rows(
+    scene: &mut RenderScene,
+    rect: ClientRect,
+    rows: &[LogRowView],
+    cell_width: i32,
+    cell_height: i32,
+) {
+    push_log_table_header(scene, rect, cell_width, cell_height);
+    for (index, row) in rows.iter().enumerate() {
+        let row_index = i32::try_from(index + 1).unwrap_or(i32::MAX);
+        push_log_table_row(scene, rect, row, row_index, cell_width, cell_height, false);
+    }
+}
+
+fn push_log_table_header(
+    scene: &mut RenderScene,
+    rect: ClientRect,
+    cell_width: i32,
+    cell_height: i32,
+) {
+    let row_rect = ClientRect::new(
+        rect.left(),
+        rect.top(),
+        rect.right(),
+        rect.top() + cell_height,
+    );
+    push_panel(
+        scene,
+        row_rect.to_win32_rect(),
+        [0.17, 0.20, 0.25, 0.80],
+        PanelEffect::TerminalFill,
+    );
+    push_log_text_at(
+        scene,
+        rect.left(),
+        rect.top(),
+        "TIME",
+        cell_width,
+        cell_height,
+        [0.84, 0.89, 0.94, 1.0],
+    );
+    push_log_text_at(
+        scene,
+        rect.left() + 13 * cell_width,
+        rect.top(),
+        "LEVEL",
+        cell_width,
+        cell_height,
+        [0.84, 0.89, 0.94, 1.0],
+    );
+    push_log_text_at(
+        scene,
+        rect.left() + 19 * cell_width,
+        rect.top(),
+        "TARGET",
+        cell_width,
+        cell_height,
+        [0.84, 0.89, 0.94, 1.0],
+    );
+    push_log_text_at(
+        scene,
+        rect.left() + 54 * cell_width,
+        rect.top(),
+        "MESSAGE",
+        cell_width,
+        cell_height,
+        [0.84, 0.89, 0.94, 1.0],
+    );
+}
+
+fn push_log_table_row(
+    scene: &mut RenderScene,
+    rect: ClientRect,
+    row: &LogRowView,
+    row_index: i32,
+    cell_width: i32,
+    cell_height: i32,
+    header: bool,
+) {
+    let row_top = rect.top() + row_index * cell_height;
+    if row_top + cell_height > rect.bottom() {
+        return;
+    }
+    let row_rect = ClientRect::new(rect.left(), row_top, rect.right(), row_top + cell_height);
+    let band_color = if header {
+        [0.17, 0.20, 0.25, 0.80]
+    } else {
+        log_level_band_color(row.level)
+    };
+    push_panel(
+        scene,
+        row_rect.to_win32_rect(),
+        band_color,
+        PanelEffect::TerminalFill,
+    );
+    let text_y = row_top;
+    push_log_text_at(
+        scene,
+        rect.left(),
+        text_y,
+        &row.time,
+        cell_width,
+        cell_height,
+        [0.84, 0.89, 0.94, 1.0],
+    );
+    push_log_text_at(
+        scene,
+        rect.left() + 13 * cell_width,
+        text_y,
+        row.level.label(),
+        cell_width,
+        cell_height,
+        log_level_text_color(row.level),
+    );
+    push_log_text_at(
+        scene,
+        rect.left() + 19 * cell_width,
+        text_y,
+        &row.target,
+        cell_width,
+        cell_height,
+        [0.75, 0.82, 0.88, 1.0],
+    );
+    push_log_text_at(
+        scene,
+        rect.left() + 54 * cell_width,
+        text_y,
+        &row.message,
+        cell_width,
+        cell_height,
+        [0.90, 0.94, 0.97, 1.0],
+    );
+}
+
+fn push_log_text_at(
+    scene: &mut RenderScene,
+    left: i32,
+    top: i32,
+    text: &str,
+    glyph_width: i32,
+    glyph_height: i32,
+    color: [f32; 4],
+) {
+    let mut cursor_x = left;
+    for character in text.chars() {
+        if character != ' ' {
+            push_glyph(
+                scene,
+                RECT {
+                    left: cursor_x,
+                    top,
+                    right: cursor_x + glyph_width,
+                    bottom: top + glyph_height,
+                },
+                character,
+                color,
+            );
+        }
+        cursor_x += glyph_width;
+    }
+}
+
+#[must_use]
+pub const fn log_level_text_color(level: LogRecordLevel) -> [f32; 4] {
+    match level {
+        LogRecordLevel::Trace => [1.0, 0.48, 0.78, 1.0],
+        LogRecordLevel::Debug => [0.24, 0.42, 0.82, 1.0],
+        LogRecordLevel::Info => [0.36, 0.92, 0.62, 1.0],
+        LogRecordLevel::Warn => [1.0, 0.66, 0.26, 1.0],
+        LogRecordLevel::Error => [1.0, 0.35, 0.35, 1.0],
+    }
+}
+
+#[must_use]
+pub const fn log_level_band_color(level: LogRecordLevel) -> [f32; 4] {
+    match level {
+        LogRecordLevel::Trace => [0.08, 0.09, 0.11, 0.22],
+        LogRecordLevel::Debug => [0.10, 0.12, 0.18, 0.26],
+        LogRecordLevel::Info => [0.06, 0.19, 0.12, 0.34],
+        LogRecordLevel::Warn => [0.25, 0.15, 0.05, 0.42],
+        LogRecordLevel::Error => [0.27, 0.06, 0.07, 0.46],
+    }
+}
+
+#[must_use]
+pub fn logs_body_rect(layout: TerminalLayout) -> ClientRect {
+    layout.terminal_panel_rect().inset(24)
+}
+
+#[must_use]
+pub fn logs_table_text_rect(layout: TerminalLayout) -> ClientRect {
+    let body_rect = logs_body_rect(layout);
+    ClientRect::new(
+        body_rect.left() + 18,
+        body_rect.top() + 66,
+        body_rect.right() - 18,
+        body_rect.bottom() - 18,
+    )
+}
+
+#[must_use]
+pub fn logs_selectable_text_rect(layout: TerminalLayout) -> ClientRect {
+    logs_table_text_rect(layout).inset(10)
+}
+
+#[must_use]
+pub fn logs_visible_data_row_count(layout: TerminalLayout, cell_height: i32) -> usize {
+    let row_count = logs_selectable_text_rect(layout).height() / cell_height.max(1);
+    usize::try_from(row_count.saturating_sub(1).max(1)).unwrap_or(1)
+}
+
+#[must_use]
+pub fn logs_control_rect(layout: TerminalLayout, control: LogsWindowControl) -> ClientRect {
+    let body_rect = logs_body_rect(layout);
+    let size = 38;
+    let gap = 10;
+    let index = match control {
+        LogsWindowControl::ToBottom => 0,
+        LogsWindowControl::Clear => 1,
+        LogsWindowControl::Settings => 2,
+    };
+    let right = body_rect.right() - 18 - (index * (size + gap));
+    ClientRect::new(
+        right - size,
+        body_rect.top() + 18,
+        right,
+        body_rect.top() + 18 + size,
+    )
+}
+
+#[must_use]
+pub fn logs_control_at_point(
+    layout: TerminalLayout,
+    point: ClientPoint,
+) -> Option<LogsWindowControl> {
+    [
+        LogsWindowControl::ToBottom,
+        LogsWindowControl::Clear,
+        LogsWindowControl::Settings,
+    ]
+    .into_iter()
+    .find(|control| logs_control_rect(layout, *control).contains(point))
+}
+
+#[must_use]
+pub const fn logs_control_tooltip(control: LogsWindowControl) -> &'static str {
+    match control {
+        LogsWindowControl::ToBottom => "Scroll logs to bottom",
+        LogsWindowControl::Clear => "Clear logs",
+        LogsWindowControl::Settings => "Log settings",
+    }
+}
+
+// observability[impl toasts.levels]
+// observability[impl toasts.progress]
+// observability[impl toasts.animation]
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    reason = "toast progress bars convert bounded pixel widths through normalized animation progress"
+)]
+pub fn push_info_toasts(
+    scene: &mut RenderScene,
+    layout: TerminalLayout,
+    toasts: &[ToastViewState],
+) {
+    let body_rect = layout.full_client_rect().inset(10);
+    let width = body_rect.width().clamp(260, 420);
+    let height = 60;
+    let gap = 10;
+    for (index, toast) in toasts.iter().rev().take(5).enumerate() {
+        let index = i32::try_from(index).unwrap_or_default();
+        let bottom = body_rect.bottom() - index * (height + gap) + toast.translate_y;
+        let rect = ClientRect::new(
+            body_rect.right() - width + toast.translate_x,
+            bottom - height,
+            body_rect.right() + toast.translate_x,
+            bottom,
+        );
+        let mut panel_color = log_level_band_color(toast.level);
+        panel_color[3] = (0.95 * toast.opacity).clamp(0.0, 0.95);
+        push_panel(
+            scene,
+            rect.to_win32_rect(),
+            panel_color,
+            PanelEffect::SceneButtonCard,
+        );
+        let bar_width =
+            ((rect.width() - 4) as f32 * toast.progress_remaining.clamp(0.0, 1.0)) as i32;
+        let bar_rect = ClientRect::new(
+            rect.left() + 2,
+            rect.bottom() - 5,
+            rect.left() + 2 + bar_width,
+            rect.bottom() - 2,
+        );
+        let mut bar_color = log_level_text_color(toast.level);
+        bar_color[3] = toast.opacity.clamp(0.0, 1.0);
+        push_panel(
+            scene,
+            bar_rect.to_win32_rect(),
+            bar_color,
+            PanelEffect::TerminalFill,
+        );
+        push_text_block(
+            scene,
+            rect.inset(12).to_win32_rect(),
+            &toast.message,
+            9,
+            16,
+            [0.90, 0.98, 1.0, toast.opacity.clamp(0.0, 1.0)],
+        );
+    }
+}
+
+#[must_use]
 // audio[impl transcription.model-selection]
 pub fn audio_daemon_model_button_rect(
     body_rect: ClientRect,
@@ -5066,6 +5546,7 @@ pub fn build_audio_input_device_detail_render_scene(
             AUDIO_INPUT_DEVICE_DETAIL_TEXT_CELL_WIDTH,
             AUDIO_INPUT_DEVICE_DETAIL_TEXT_CELL_HEIGHT,
             [0.92, 0.93, 0.95, 1.0],
+            [0.06, 0.07, 0.09, 1.0],
             text_selection,
         );
         return scene;
@@ -5094,6 +5575,7 @@ pub fn build_audio_input_device_detail_render_scene(
         AUDIO_INPUT_DEVICE_DETAIL_TEXT_CELL_WIDTH,
         AUDIO_INPUT_DEVICE_DETAIL_TEXT_CELL_HEIGHT,
         [0.95, 0.96, 0.98, 1.0],
+        [0.06, 0.07, 0.09, 1.0],
         text_selection,
     );
     push_legacy_recording_dialog_button(&mut scene, detail_layout.legacy_recording_button_rect);
@@ -5995,6 +6477,10 @@ fn push_legacy_recording_dialog_button(scene: &mut RenderScene, rect: ClientRect
     );
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "selectable text blocks pass geometry, palette, and selection state explicitly at render call sites"
+)]
 fn push_selectable_text_block(
     scene: &mut RenderScene,
     rect: ClientRect,
@@ -6002,6 +6488,7 @@ fn push_selectable_text_block(
     cell_width: i32,
     cell_height: i32,
     color: [f32; 4],
+    selection_foreground: [f32; 4],
     selection: Option<TerminalSelection>,
 ) {
     let text_scene = cell_grid::build_text_grid_scene_with_palette(
@@ -6011,7 +6498,7 @@ fn push_selectable_text_block(
         cell_height,
         selection,
         color,
-        [0.06, 0.07, 0.09, 1.0],
+        selection_foreground,
         [0.42, 0.67, 0.98, 1.0],
     );
     scene.panels.extend(text_scene.panels);

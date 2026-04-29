@@ -6,6 +6,7 @@ pub mod audio;
 pub mod cli;
 pub mod frontend;
 pub mod logging_init;
+pub mod logs;
 pub mod model;
 pub mod paths;
 pub mod shell_default;

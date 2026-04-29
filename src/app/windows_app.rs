@@ -43,21 +43,24 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, EnumWindows, GetClassNameW,
     GetClientRect, GetCursorPos, GetMessageW, GetSystemMetrics, GetWindowRect,
     GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, HTCAPTION, HTCLIENT,
-    HWND_NOTOPMOST, HWND_TOPMOST, IDC_ARROW, IDC_CROSS, IDC_HAND, IDC_HELP, IDC_IBEAM, IDC_SIZEALL,
-    IDC_SIZEWE, IDC_WAIT, IsWindowVisible, IsZoomed, KillTimer, LoadCursorW, MSG, MoveWindow,
-    PostMessageW, PostQuitMessage, RegisterClassExW, SM_CXPADDEDBORDER, SM_CXSCREEN,
-    SM_CXSIZEFRAME, SM_CYSCREEN, SM_CYSIZEFRAME, SW_MAXIMIZE, SW_MINIMIZE, SW_RESTORE, SW_SHOW,
-    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SYSTEM_METRICS_INDEX, SendMessageW, SetCursor,
-    SetCursorPos, SetTimer, SetWindowPos, SetWindowTextW, ShowWindow, TranslateMessage,
-    WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CHAR, WM_CLOSE, WM_DESTROY, WM_DPICHANGED,
-    WM_ENTERSIZEMOVE, WM_ERASEBKGND, WM_EXITSIZEMOVE, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCALCSIZE, WM_NCHITTEST,
-    WM_NCLBUTTONDOWN, WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SETFOCUS, WM_SIZE,
-    WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WNDCLASSEXW, WS_EX_APPWINDOW, WS_EX_NOREDIRECTIONBITMAP,
-    WS_EX_TOPMOST, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP, WS_THICKFRAME, WS_VISIBLE,
+    HTTRANSPARENT, HWND_NOTOPMOST, HWND_TOPMOST, IDC_ARROW, IDC_CROSS, IDC_HAND, IDC_HELP,
+    IDC_IBEAM, IDC_SIZEALL, IDC_SIZEWE, IDC_WAIT, IsWindowVisible, IsZoomed, KillTimer,
+    LoadCursorW, MSG, MoveWindow, PostMessageW, PostQuitMessage, RegisterClassExW,
+    SM_CXPADDEDBORDER, SM_CXSCREEN, SM_CXSIZEFRAME, SM_CXVIRTUALSCREEN, SM_CYSCREEN,
+    SM_CYSIZEFRAME, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SW_HIDE, SW_MAXIMIZE,
+    SW_MINIMIZE, SW_RESTORE, SW_SHOW, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+    SYSTEM_METRICS_INDEX, SendMessageW, SetCursor, SetCursorPos, SetTimer, SetWindowPos,
+    SetWindowTextW, ShowWindow, TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CHAR,
+    WM_CLOSE, WM_DESTROY, WM_DPICHANGED, WM_ENTERSIZEMOVE, WM_ERASEBKGND, WM_EXITSIZEMOVE,
+    WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
+    WM_NCCALCSIZE, WM_NCHITTEST, WM_NCLBUTTONDOWN, WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP,
+    WM_SETCURSOR, WM_SETFOCUS, WM_SIZE, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WNDCLASSEXW,
+    WS_EX_APPWINDOW, WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+    WS_EX_TRANSPARENT, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP, WS_THICKFRAME, WS_VISIBLE,
 };
 use windows::core::{BOOL, PCWSTR, w};
 
+use crate::logs::{self, LogRecordSnapshot, ThreadBuilderSpanExt};
 use crate::model::KNOWN_WHISPER_MODELS;
 use crate::paths::{AppHome, CacheHome};
 use crate::timeline::{
@@ -84,8 +87,8 @@ use super::windows_audio_input::{
 };
 use super::windows_cursor_info::{CursorInfoConfig, CursorInfoVirtualSession};
 use super::windows_d3d12_renderer::{
-    ButtonVisualState, RenderFrameModel, RenderThreadProxy, RendererTerminalVisualState,
-    WindowChromeButtonsState,
+    ButtonVisualState, RenderFrameModel, RenderScene, RenderThreadProxy,
+    RendererTerminalVisualState, WindowChromeButtonsState,
 };
 use super::windows_demo_mode::{
     current_demo_mode_state, initialize_demo_mode_state, set_scramble_input_device_identifiers,
@@ -111,6 +114,7 @@ const TERMINAL_WINDOW_CLASS_NAME: &str = "TeamyStudioTerminalWindow";
 const WINDOW_CLASS_NAME: PCWSTR = w!("TeamyStudioTerminalWindow");
 const SCENE_WINDOW_CLASS_NAME: PCWSTR = w!("TeamyStudioSceneWindow");
 const BENCHMARK_WINDOW_CLASS_NAME: PCWSTR = w!("TeamyStudioTerminalBenchmarkWindow");
+const TOAST_WINDOW_CLASS_NAME: PCWSTR = w!("TeamyStudioToastWindow");
 const WINDOW_TITLE: &str = "Teamy Studio Terminal";
 const TERMINAL_FONT_HEIGHT: i32 = -16;
 const DIAGNOSTIC_FONT_HEIGHT: i32 = -16;
@@ -130,6 +134,8 @@ const MOUSE_WHEEL_DELTA: i16 = 120;
 const TERMINAL_WHEEL_SCROLL_LINES: isize = 3;
 const SELECTION_AUTO_SCROLL_MAX_LINES: isize = 12;
 const FOCUSED_RENDER_TIMER_ID: usize = 2;
+const TOAST_RENDER_TIMER_ID: usize = 3;
+const TOAST_RENDER_INTERVAL_MS: u32 = 16;
 const USER_DEFAULT_SCREEN_DPI: u32 = 96;
 const TERMINAL_THROUGHPUT_BENCHMARK_START_MARKER: &str = "__TEAMY_TERMINAL_THROUGHPUT_START__";
 const TERMINAL_THROUGHPUT_BENCHMARK_DONE_MARKER: &str = "__TEAMY_TERMINAL_THROUGHPUT_DONE__";
@@ -139,6 +145,12 @@ const TERMINAL_THROUGHPUT_BENCHMARK_TIMEOUT: Duration = Duration::from_mins(1);
 const TERMINAL_THROUGHPUT_BENCHMARK_POLL_INTERVAL: Duration = Duration::from_millis(1);
 const TIMELINE_ZOOM_ANIMATION_DURATION: Duration = Duration::from_millis(220);
 const MODEL_WARNING_PREPARE_HOLD_DURATION: Duration = Duration::from_millis(1400);
+const LOG_TOAST_DURATION: Duration = Duration::from_secs(5);
+const LOG_TOAST_FADE_DURATION: Duration = Duration::from_millis(260);
+const LOG_TOAST_WIDTH: i32 = 420;
+const LOG_TOAST_HEIGHT: i32 = 60;
+const LOG_TOAST_GAP: i32 = 10;
+const LOG_TOAST_HOST_PADDING: i32 = 10;
 const TERMINAL_THROUGHPUT_RESULTS_DIR: &str = "self-test/terminal-throughput";
 const DEMO_MODE_STATE_CHANGED_MESSAGE: u32 = WM_APP + 0x402;
 const TIMELINE_DOCUMENT_CHANGED_MESSAGE: u32 = WM_APP + 0x403;
@@ -489,6 +501,7 @@ enum ScenePressedTarget {
     AudioInputTimeline,
     DemoModeButton,
     DemoModeScrambleToggle,
+    LogsControl(windows_scene::LogsWindowControl),
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -556,6 +569,8 @@ struct SceneAppState {
     terminal_cell_height: i32,
     diagnostic_cell_width: i32,
     diagnostic_cell_height: i32,
+    logs_scroll_offset: usize,
+    logs_follow_tail: bool,
     chrome_tooltip: ChromeTooltipController,
     renderer: Option<RenderThreadProxy>,
 }
@@ -790,6 +805,18 @@ impl WindowHandle {
         let _ = unsafe { ShowWindow(self.hwnd, SW_SHOW) };
     }
 
+    fn show_no_activate(self) {
+        self.window_thread.assert_window_thread();
+        // Safety: `self.hwnd` is a live top-level window owned by this process on `self.window_thread`.
+        let _ = unsafe { ShowWindow(self.hwnd, SW_SHOWNOACTIVATE) };
+    }
+
+    fn hide(self) {
+        self.window_thread.assert_window_thread();
+        // Safety: `self.hwnd` is a live top-level window owned by this process on `self.window_thread`.
+        let _ = unsafe { ShowWindow(self.hwnd, SW_HIDE) };
+    }
+
     fn minimize(self) {
         self.window_thread.assert_window_thread();
         // Safety: `self.hwnd` is a live top-level window owned by this process on `self.window_thread`.
@@ -842,6 +869,23 @@ impl WindowHandle {
             )
         }
         .wrap_err("failed to update window pin state")
+    }
+
+    fn set_position_no_activate(self, rect: ScreenRect) -> eyre::Result<()> {
+        self.window_thread.assert_window_thread();
+        // Safety: SetWindowPos moves and sizes this live top-level window without activating it.
+        unsafe {
+            SetWindowPos(
+                self.hwnd,
+                Some(HWND_TOPMOST),
+                rect.left(),
+                rect.top(),
+                rect.width(),
+                rect.height(),
+                SWP_NOACTIVATE,
+            )
+        }
+        .wrap_err("failed to position toast window")
     }
 
     fn destroy(self) {
@@ -1045,6 +1089,32 @@ struct SceneSelectableTextTarget {
     text: String,
     cell_width: i32,
     cell_height: i32,
+}
+
+static TOAST_HOST_STARTED: OnceLock<()> = OnceLock::new();
+
+struct ToastHostState {
+    hwnd: WindowHandle,
+    renderer: RenderThreadProxy,
+    last_seen_log_id: u64,
+    toasts: Vec<FloatingToast>,
+    terminal_cell_width: i32,
+    terminal_cell_height: i32,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct FloatingToast {
+    id: u64,
+    level: logs::LogRecordLevel,
+    message: String,
+    source_hwnd: Option<isize>,
+    created_at: Instant,
+    expires_at: Instant,
+    visual_y: f32,
+}
+
+thread_local! {
+    static TOAST_HOST_STATE: RefCell<Option<ToastHostState>> = const { RefCell::new(None) };
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1367,6 +1437,7 @@ fn run_with_terminal_session(
     title: Option<&str>,
 ) -> eyre::Result<()> {
     let _ = launch_command_argc;
+    ensure_toast_host_started();
     let window_thread = WindowThread::current();
     let dpi = system_dpi();
     let terminal_font_height = scaled_font_height(TERMINAL_FONT_HEIGHT, dpi);
@@ -1455,16 +1526,22 @@ fn run_with_terminal_session(
 
     with_app_state(|state| render_current_frame(state, hwnd, None))?;
 
+    let _window_span = info_span!("terminal_window", source_hwnd = hwnd.raw().0 as isize).entered();
     info!("Teamy Studio terminal window shown");
     message_loop()
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "scene window startup centralizes state initialization, native window creation, and first render"
+)]
 fn run_scene_window(
     app_home: &AppHome,
     scene_kind: SceneWindowKind,
     vt_engine: VtEngineChoice,
     mut initialization: SceneWindowInitialization,
 ) -> eyre::Result<()> {
+    ensure_toast_host_started();
     initialize_demo_mode_state(app_home)?;
     let window_thread = WindowThread::current();
     let dpi = system_dpi();
@@ -1540,6 +1617,8 @@ fn run_scene_window(
             terminal_cell_height,
             diagnostic_cell_width,
             diagnostic_cell_height,
+            logs_scroll_offset: 0,
+            logs_follow_tail: true,
             chrome_tooltip: ChromeTooltipController::default(),
             renderer: None,
         });
@@ -1563,6 +1642,12 @@ fn run_scene_window(
 
     hwnd.show();
     with_scene_app_state(|state| render_scene_window_frame(state, hwnd, None, false))?;
+    let _window_span = info_span!(
+        "scene_window",
+        source_hwnd = hwnd.raw().0 as isize,
+        scene_kind = scene_kind.title(),
+    )
+    .entered();
     message_loop()
 }
 
@@ -2158,6 +2243,356 @@ fn create_scene_window(
     Ok(WindowHandle::new(window_thread, hwnd))
 }
 
+fn ensure_toast_host_started() {
+    TOAST_HOST_STARTED.get_or_init(|| {
+        if let Err(error) = thread::Builder::new()
+            .name("teamy-studio-toast-host".to_owned())
+            .spawn_with_current_span(|| {
+                if let Err(error) = run_toast_host_window() {
+                    error!(?error, "toast host window failed");
+                }
+            })
+        {
+            error!(?error, "failed to spawn Teamy Studio toast host thread");
+        }
+    });
+}
+
+fn run_toast_host_window() -> eyre::Result<()> {
+    let window_thread = WindowThread::current();
+    let hwnd = create_toast_window(window_thread)?;
+    let renderer = RenderThreadProxy::new(hwnd.raw())?;
+    hwnd.set_timer(TOAST_RENDER_TIMER_ID, TOAST_RENDER_INTERVAL_MS)?;
+    hwnd.hide();
+    TOAST_HOST_STATE.with(|state| {
+        *state.borrow_mut() = Some(ToastHostState {
+            hwnd,
+            renderer,
+            last_seen_log_id: logs::latest_log_id(),
+            toasts: Vec::new(),
+            terminal_cell_width: 9,
+            terminal_cell_height: 16,
+        });
+    });
+    message_loop()
+}
+
+fn create_toast_window(window_thread: WindowThread) -> eyre::Result<WindowHandle> {
+    let instance = get_current_module().wrap_err("failed to get module handle")?;
+    let class = WNDCLASSEXW {
+        cbSize: u32::try_from(std::mem::size_of::<WNDCLASSEXW>())
+            .expect("WNDCLASSEXW size must fit in u32"),
+        hInstance: instance.into(),
+        lpszClassName: TOAST_WINDOW_CLASS_NAME,
+        lpfnWndProc: Some(toast_window_proc),
+        hCursor: load_cursor(IDC_ARROW),
+        ..Default::default()
+    };
+    let atom = register_window_class(&class);
+    if atom == 0 {
+        debug!("toast window class already registered or registration deferred");
+    }
+
+    let title = "Teamy Studio Toasts".easy_pcwstr()?;
+    // Safety: all pointers and handles passed to CreateWindowExW are valid for the duration of the call.
+    let hwnd = unsafe {
+        CreateWindowExW(
+            toast_window_ex_style(),
+            TOAST_WINDOW_CLASS_NAME,
+            title.as_ref(),
+            WS_POPUP,
+            0,
+            0,
+            1,
+            1,
+            None,
+            None,
+            Some(instance.into()),
+            None,
+        )
+    }
+    .wrap_err("failed to create toast window")?;
+    Ok(WindowHandle::new(window_thread, hwnd))
+}
+
+fn toast_window_ex_style() -> WINDOW_EX_STYLE {
+    WS_EX_TOPMOST
+        | WS_EX_TOOLWINDOW
+        | WS_EX_NOACTIVATE
+        | WS_EX_TRANSPARENT
+        | WS_EX_NOREDIRECTIONBITMAP
+}
+
+extern "system" fn toast_window_proc(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    let hwnd = WindowHandle::new(WindowThread::current(), hwnd);
+    match message {
+        WM_TIMER if wparam.0 == TOAST_RENDER_TIMER_ID => handle_toast_render_timer(hwnd),
+        WM_NCHITTEST => LRESULT(isize::try_from(HTTRANSPARENT).unwrap_or_default()),
+        WM_ERASEBKGND => LRESULT(1),
+        WM_DESTROY => {
+            TOAST_HOST_STATE.with(|state| *state.borrow_mut() = None);
+            hwnd.post_quit_message();
+            LRESULT(0)
+        }
+        _ => def_window_proc(hwnd, message, wparam, lparam),
+    }
+}
+
+fn handle_toast_render_timer(hwnd: WindowHandle) -> LRESULT {
+    match TOAST_HOST_STATE.with(|state| {
+        let mut state = state.borrow_mut();
+        let Some(state) = state.as_mut() else {
+            return Ok(());
+        };
+        sync_floating_toasts(state);
+        if state.toasts.is_empty() {
+            hwnd.hide();
+            return Ok(());
+        }
+        render_toast_host(state)
+    }) {
+        Ok(()) => LRESULT(0),
+        Err(error) => fail_and_close(hwnd, &error),
+    }
+}
+
+fn sync_floating_toasts(state: &mut ToastHostState) {
+    let now = Instant::now();
+    for record in logs::toast_log_snapshots_after(state.last_seen_log_id) {
+        state.toasts.push(FloatingToast {
+            id: record.id,
+            level: record.level,
+            message: log_single_line(&record.message),
+            source_hwnd: record.source_hwnd,
+            created_at: now,
+            expires_at: now + LOG_TOAST_DURATION,
+            visual_y: 0.0,
+        });
+    }
+    state.last_seen_log_id = logs::latest_log_id();
+    state
+        .toasts
+        .retain(|toast| now < toast.expires_at + LOG_TOAST_FADE_DURATION);
+    let overflow = state.toasts.len().saturating_sub(5);
+    if overflow > 0 {
+        state.toasts.drain(0..overflow);
+    }
+}
+
+// observability[impl toasts.floating-source]
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    reason = "toast host height tracks bounded animated stack offsets in pixels"
+)]
+fn render_toast_host(state: &mut ToastHostState) -> eyre::Result<()> {
+    let width = LOG_TOAST_WIDTH + LOG_TOAST_HOST_PADDING * 2;
+    let toast_height = LOG_TOAST_HEIGHT;
+    let gap = LOG_TOAST_GAP;
+    let visible_count = state.toasts.len().min(5);
+    let visible_count_i32 = i32::try_from(visible_count).unwrap_or_default();
+    let stack_step = (toast_height + gap) as f32;
+    let animated_stack_offset = state
+        .toasts
+        .iter()
+        .rev()
+        .take(visible_count)
+        .enumerate()
+        .map(|(index, toast)| {
+            let target_y = index as f32 * stack_step;
+            toast.visual_y.max(target_y)
+        })
+        .fold(0.0_f32, f32::max);
+    let stack_height = (toast_height + animated_stack_offset.ceil() as i32)
+        .max(visible_count_i32 * toast_height + visible_count_i32.saturating_sub(1) * gap);
+    let height = stack_height + LOG_TOAST_HOST_PADDING * 2;
+    let source_hwnd = state.toasts.last().and_then(|toast| toast.source_hwnd);
+    let rect = toast_window_rect(source_hwnd, width, height);
+    state.hwnd.set_position_no_activate(rect)?;
+    state.hwnd.show_no_activate();
+    state.renderer.resize(
+        u32::try_from(width.max(1)).unwrap_or(1),
+        u32::try_from(height.max(1)).unwrap_or(1),
+    )?;
+
+    let layout = TerminalLayout {
+        client_width: width,
+        client_height: height,
+        cell_width: state.terminal_cell_width,
+        cell_height: state.terminal_cell_height,
+        diagnostic_panel_visible: false,
+    };
+    let now = Instant::now();
+    let mut scene = RenderScene {
+        panels: Vec::new(),
+        glyphs: Vec::new(),
+        sprites: Vec::new(),
+        overlay_panels: Vec::new(),
+    };
+    windows_scene::push_info_toasts(&mut scene, layout, &toast_view_states(state, now));
+    let frame = RenderFrameModel {
+        layout,
+        title: None,
+        diagnostic_text: String::new(),
+        diagnostic_selection: None,
+        window_chrome_buttons_state: WindowChromeButtonsState::default(),
+        diagnostic_cell_width: state.terminal_cell_width,
+        diagnostic_cell_height: state.terminal_cell_height,
+        scene: Some(scene),
+        terminal_cell_width: state.terminal_cell_width,
+        terminal_cell_height: state.terminal_cell_height,
+        terminal_display: Arc::new(TerminalDisplayState::default()),
+        terminal_visual_state: RendererTerminalVisualState::default(),
+    };
+    state.renderer.render_frame_model_force_redraw(frame)
+}
+
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    reason = "toast animation offsets are small pixel values bounded by the visible toast count"
+)]
+// observability[impl toasts.animation]
+fn toast_view_states(
+    state: &mut ToastHostState,
+    now: Instant,
+) -> Vec<windows_scene::ToastViewState> {
+    let toast_height = 60.0_f32;
+    let gap = 10.0_f32;
+    let total_toasts = state.toasts.len();
+    state
+        .toasts
+        .iter_mut()
+        .enumerate()
+        .map(|(index, toast)| {
+            let target_y = (total_toasts - 1 - index) as f32 * (toast_height + gap);
+            toast.visual_y += (target_y - toast.visual_y) * 0.32;
+            let age = now.duration_since(toast.created_at);
+            let appear = (age.as_secs_f32() / 0.22).clamp(0.0, 1.0);
+            let fade = if now > toast.expires_at {
+                1.0 - (now.duration_since(toast.expires_at).as_secs_f32()
+                    / LOG_TOAST_FADE_DURATION.as_secs_f32())
+                .clamp(0.0, 1.0)
+            } else {
+                1.0
+            };
+            let progress_remaining = if now >= toast.expires_at {
+                0.0
+            } else {
+                (toast.expires_at.duration_since(now).as_secs_f32()
+                    / LOG_TOAST_DURATION.as_secs_f32())
+                .clamp(0.0, 1.0)
+            };
+            windows_scene::ToastViewState {
+                level: toast.level,
+                message: toast.message.clone(),
+                progress_remaining,
+                opacity: (appear * fade).clamp(0.0, 1.0),
+                translate_x: ((1.0 - appear) * 28.0) as i32,
+                translate_y: (target_y - toast.visual_y) as i32,
+            }
+        })
+        .collect()
+}
+
+// observability[impl toasts.floating-source]
+fn toast_window_rect(source_hwnd: Option<isize>, width: i32, height: i32) -> ScreenRect {
+    let virtual_bounds = virtual_screen_rect();
+    let margin = 12;
+    let Some(source_rect) = source_hwnd.and_then(window_rect_from_raw_hwnd) else {
+        return ScreenRect::new(
+            virtual_bounds.right() - width - margin,
+            virtual_bounds.bottom() - height - margin,
+            virtual_bounds.right() - margin,
+            virtual_bounds.bottom() - margin,
+        );
+    };
+    let bounds = monitor_work_rect_for_raw_hwnd(source_hwnd).unwrap_or(virtual_bounds);
+    let top = (source_rect.bottom() - height)
+        .clamp(bounds.top() + margin, bounds.bottom() - height - margin);
+    let right_side = ScreenRect::new(
+        source_rect.right() + margin,
+        top,
+        source_rect.right() + margin + width,
+        top + height,
+    );
+    if right_side.right() <= bounds.right() {
+        return right_side;
+    }
+    let left_side = ScreenRect::new(
+        source_rect.left() - margin - width,
+        top,
+        source_rect.left() - margin,
+        top + height,
+    );
+    if left_side.left() >= bounds.left() {
+        return left_side;
+    }
+    let overflow_right = ScreenRect::new(
+        source_rect.right() + margin,
+        top,
+        source_rect.right() + margin + width,
+        top + height,
+    );
+    if overflow_right.right() <= virtual_bounds.right() {
+        return overflow_right;
+    }
+    ScreenRect::new(
+        virtual_bounds.right() - width - margin,
+        (source_rect.bottom() - height).clamp(
+            virtual_bounds.top() + margin,
+            virtual_bounds.bottom() - height - margin,
+        ),
+        virtual_bounds.right() - margin,
+        (source_rect.bottom()).clamp(
+            virtual_bounds.top() + height + margin,
+            virtual_bounds.bottom() - margin,
+        ),
+    )
+}
+
+fn window_rect_from_raw_hwnd(raw_hwnd: isize) -> Option<ScreenRect> {
+    let hwnd = HWND(raw_hwnd as *mut c_void);
+    // Safety: this only queries visibility for a raw HWND captured from a tracing field.
+    if hwnd.0.is_null() || !unsafe { IsWindowVisible(hwnd) }.as_bool() {
+        return None;
+    }
+    let mut rect = RECT::default();
+    // Safety: `rect` is writable storage and the raw HWND is checked by the OS during the query.
+    unsafe { GetWindowRect(hwnd, &raw mut rect) }.ok()?;
+    Some(ScreenRect::from_win32_rect(rect))
+}
+
+fn monitor_work_rect_for_raw_hwnd(raw_hwnd: Option<isize>) -> Option<ScreenRect> {
+    let hwnd = HWND(raw_hwnd? as *mut c_void);
+    // Safety: resolving the nearest monitor for a raw HWND is a read-only OS query.
+    let monitor = unsafe { MonitorFromWindow(hwnd, MONITOR_FROM_FLAGS(2)) };
+    if monitor.0.is_null() {
+        return None;
+    }
+    let mut info = MONITORINFO {
+        cbSize: u32::try_from(std::mem::size_of::<MONITORINFO>()).ok()?,
+        ..Default::default()
+    };
+    // Safety: `info` is valid writable storage for the monitor handle returned above.
+    unsafe { GetMonitorInfoW(monitor, &raw mut info) }
+        .as_bool()
+        .then_some(ScreenRect::from_win32_rect(info.rcWork))
+}
+
+fn virtual_screen_rect() -> ScreenRect {
+    let left = system_metric(SM_XVIRTUALSCREEN);
+    let top = system_metric(SM_YVIRTUALSCREEN);
+    let width = system_metric(SM_CXVIRTUALSCREEN);
+    let height = system_metric(SM_CYVIRTUALSCREEN);
+    ScreenRect::new(left, top, left + width, top + height)
+}
+
 #[instrument(level = "info", skip_all)]
 fn create_benchmark_window(window_thread: WindowThread) -> eyre::Result<WindowHandle> {
     let instance = get_current_module().wrap_err("failed to get module handle")?;
@@ -2448,7 +2883,7 @@ fn maybe_complete_model_warning_prepare(state: &mut SceneAppState) {
     ring_terminal_bell();
     let _ = thread::Builder::new()
         .name("teamy-studio-prepare-warning-model".to_owned())
-        .spawn(move || {
+        .spawn_with_current_span(move || {
             let job = super::jobs::start_job(
                 "Prepare Whisper model",
                 format!("Preparing {model_name} for Rust transcription"),
@@ -3185,6 +3620,15 @@ fn handle_scene_left_button_down(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Re
             }
         }
 
+        if state.scene_kind == SceneWindowKind::Logs
+            && !state.diagnostics_visible
+            && let Some(control) = windows_scene::logs_control_at_point(layout, point)
+        {
+            state.pressed_target = Some(ScenePressedTarget::LogsControl(control));
+            hwnd.capture_mouse();
+            return Ok(ScenePointerAction::RenderOnly);
+        }
+
         if state.scene_kind == SceneWindowKind::TimelineTranscriptionSettings {
             if let Some(target) =
                 timeline_transcription_settings_target_at_point(state, layout, point)
@@ -3918,6 +4362,17 @@ fn handle_scene_left_button_up(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Resu
             return Ok(ScenePointerAction::RenderOnly);
         }
 
+        if let Some(ScenePressedTarget::LogsControl(control)) = pressed_target {
+            let layout = scene_client_layout(hwnd, state)?;
+            if state.scene_kind == SceneWindowKind::Logs
+                && !state.diagnostics_visible
+                && windows_scene::logs_control_at_point(layout, point) == Some(control)
+            {
+                apply_logs_control(state, hwnd, layout, control);
+            }
+            return Ok(ScenePointerAction::RenderOnly);
+        }
+
         if pressed_target.is_some() {
             return Ok(ScenePointerAction::RenderOnly);
         }
@@ -4422,6 +4877,13 @@ fn handle_scene_mouse_wheel(
 
     with_scene_app_state(|state| {
         let layout = scene_client_layout(hwnd, state)?;
+        if state.scene_kind == SceneWindowKind::Logs && !state.diagnostics_visible {
+            let wheel_delta = high_word_i16(wparam.0);
+            scroll_logs_by_wheel(state, layout, wheel_delta);
+            render_scene_window_frame(state, hwnd, None, false)?;
+            return Ok(true);
+        }
+
         if !timeline_selection_surface_at_point(state, layout, point) {
             return Ok(false);
         }
@@ -5103,7 +5565,6 @@ fn render_scene_window_frame(
     sync_demo_mode_state(state);
     apply_timeline_zoom_animation(state);
     sync_timeline_audio_runtime_from_document(state);
-
     let timeline_transcription_completion_target = (state.scene_kind == SceneWindowKind::Timeline)
         .then(|| state.hwnd.map(|hwnd| hwnd.raw().0 as isize))
         .flatten();
@@ -5129,6 +5590,9 @@ fn render_scene_window_frame(
     }
 
     let layout = scene_client_layout(hwnd, state)?;
+    if state.scene_kind == SceneWindowKind::Logs && !state.diagnostics_visible {
+        sync_logs_scroll_offset(state, layout);
+    }
     let window_chrome_buttons_state = scene_window_chrome_buttons_state(state, hwnd, layout);
     let scramble_input_device_identifiers = state
         .demo_mode_scramble_input_device_identifiers
@@ -5179,6 +5643,16 @@ fn render_scene_window_frame(
             state.diagnostic_cell_width,
             state.diagnostic_cell_height,
         )
+    } else if state.diagnostics_visible && state.scene_kind == SceneWindowKind::Logs {
+        windows_scene::build_scene_diagnostic_render_scene(
+            layout,
+            state.scene_kind,
+            window_chrome_buttons_state,
+            &logs_diagnostic_text(),
+            state.diagnostic_selection,
+            state.diagnostic_cell_width,
+            state.diagnostic_cell_height,
+        )
     } else if state.diagnostics_visible {
         windows_scene::build_scene_diagnostic_render_scene(
             layout,
@@ -5217,6 +5691,17 @@ fn render_scene_window_frame(
     } else if state.scene_kind == SceneWindowKind::Jobs {
         let jobs = super::job_snapshots();
         windows_scene::build_jobs_render_scene(layout, window_chrome_buttons_state, &jobs)
+    } else if state.scene_kind == SceneWindowKind::Logs {
+        windows_scene::build_logs_render_scene(
+            layout,
+            window_chrome_buttons_state,
+            &logs_window_text(state, layout),
+            &logs_window_rows(state, layout),
+            logs_window_visual_state(state, layout),
+            state.diagnostic_selection,
+            state.diagnostic_cell_width,
+            state.diagnostic_cell_height,
+        )
     } else if state.scene_kind == SceneWindowKind::ModelWarning {
         let progress = (state.scene_opened_at.elapsed().as_secs_f32() / 0.28).clamp(0.0, 1.0);
         let prepare_hold_progress = state
@@ -5690,6 +6175,7 @@ fn audio_daemon_visual_state(
 fn scene_selected_text_for_copy(state: &SceneAppState, layout: TerminalLayout) -> Option<String> {
     let selection = state.diagnostic_selection?;
 
+    // observability[impl logs.copy]
     if state.diagnostics_visible {
         return Some(cell_grid::extract_selected_text(
             scene_diagnostic_text_rect(layout),
@@ -5709,6 +6195,174 @@ fn scene_selected_text_for_copy(state: &SceneAppState, layout: TerminalLayout) -
         target.cell_height,
         selection,
     ))
+}
+
+fn logs_window_text(state: &SceneAppState, layout: TerminalLayout) -> String {
+    let snapshots = logs::log_snapshots();
+    let visible_rows =
+        windows_scene::logs_visible_data_row_count(layout, state.diagnostic_cell_height);
+    let start = logs_effective_scroll_offset(state, snapshots.len(), visible_rows);
+    let end = start.saturating_add(visible_rows).min(snapshots.len());
+    log_table_text_for_records(&snapshots[start..end])
+}
+
+fn logs_diagnostic_text() -> String {
+    log_table_text_for_records(&logs::log_snapshots())
+}
+
+fn logs_window_rows(
+    state: &SceneAppState,
+    layout: TerminalLayout,
+) -> Vec<windows_scene::LogRowView> {
+    let snapshots = logs::log_snapshots();
+    let visible_rows =
+        windows_scene::logs_visible_data_row_count(layout, state.diagnostic_cell_height);
+    let start = logs_effective_scroll_offset(state, snapshots.len(), visible_rows);
+    let end = start.saturating_add(visible_rows).min(snapshots.len());
+    snapshots[start..end].iter().map(log_row_view).collect()
+}
+
+fn log_row_view(record: &LogRecordSnapshot) -> windows_scene::LogRowView {
+    windows_scene::LogRowView {
+        time: record.time_text(),
+        level: record.level,
+        target: fit_log_column(&record.target, 34),
+        message: log_single_line(&record.message),
+    }
+}
+
+fn log_table_text_for_records(records: &[LogRecordSnapshot]) -> String {
+    let mut lines = vec![format!(
+        "{:<12} {:<5} {:<34} {}",
+        "TIME", "LEVEL", "TARGET", "MESSAGE"
+    )];
+    if records.is_empty() {
+        lines.push("no logs captured".to_owned());
+    } else {
+        lines.extend(records.iter().map(|record| {
+            format!(
+                "{:<12} {:<5} {:<34} {}",
+                record.time_text(),
+                record.level.label(),
+                fit_log_column(&record.target, 34),
+                log_single_line(&record.message)
+            )
+        }));
+    }
+    lines.join("\n")
+}
+
+fn log_single_line(text: &str) -> String {
+    text.chars()
+        .map(|character| match character {
+            '\r' | '\n' | '\t' => ' ',
+            character => character,
+        })
+        .collect()
+}
+
+fn fit_log_column(text: &str, width: usize) -> String {
+    let text = log_single_line(text);
+    if text.chars().count() <= width {
+        return text;
+    }
+    let mut fitted = text
+        .chars()
+        .take(width.saturating_sub(1))
+        .collect::<String>();
+    fitted.push('~');
+    fitted
+}
+
+fn logs_effective_scroll_offset(
+    state: &SceneAppState,
+    record_count: usize,
+    visible_rows: usize,
+) -> usize {
+    let max_offset = logs_max_scroll_offset(record_count, visible_rows);
+    if state.logs_follow_tail {
+        max_offset
+    } else {
+        state.logs_scroll_offset.min(max_offset)
+    }
+}
+
+fn logs_max_scroll_offset(record_count: usize, visible_rows: usize) -> usize {
+    record_count.saturating_sub(visible_rows.max(1))
+}
+
+fn sync_logs_scroll_offset(state: &mut SceneAppState, layout: TerminalLayout) {
+    let visible_rows =
+        windows_scene::logs_visible_data_row_count(layout, state.diagnostic_cell_height);
+    let record_count = logs::log_snapshots().len();
+    state.logs_scroll_offset = logs_effective_scroll_offset(state, record_count, visible_rows);
+}
+
+fn scroll_logs_by_wheel(state: &mut SceneAppState, layout: TerminalLayout, wheel_delta: i16) {
+    if wheel_delta == 0 {
+        return;
+    }
+    let visible_rows =
+        windows_scene::logs_visible_data_row_count(layout, state.diagnostic_cell_height);
+    let record_count = logs::log_snapshots().len();
+    let max_offset = logs_max_scroll_offset(record_count, visible_rows);
+    let steps = if wheel_delta.unsigned_abs() < MOUSE_WHEEL_DELTA.unsigned_abs() {
+        isize::from(wheel_delta.signum())
+    } else {
+        isize::from(wheel_delta / MOUSE_WHEEL_DELTA)
+    };
+    let base = logs_effective_scroll_offset(state, record_count, visible_rows);
+    let next = base.saturating_add_signed(-steps * 3).min(max_offset);
+    state.logs_scroll_offset = next;
+    state.logs_follow_tail = next == max_offset;
+}
+
+fn logs_window_visual_state(
+    state: &SceneAppState,
+    layout: TerminalLayout,
+) -> windows_scene::LogsWindowVisualState {
+    let now = Instant::now();
+    let button_state = |control| {
+        windows_scene::compute_button_visual_state(
+            windows_scene::logs_control_rect(layout, control),
+            state.pointer_position,
+            state.pressed_target == Some(ScenePressedTarget::LogsControl(control)),
+            None,
+            false,
+            now,
+        )
+    };
+    windows_scene::LogsWindowVisualState {
+        to_bottom: button_state(windows_scene::LogsWindowControl::ToBottom),
+        clear: button_state(windows_scene::LogsWindowControl::Clear),
+        settings: button_state(windows_scene::LogsWindowControl::Settings),
+    }
+}
+
+fn apply_logs_control(
+    state: &mut SceneAppState,
+    hwnd: WindowHandle,
+    layout: TerminalLayout,
+    control: windows_scene::LogsWindowControl,
+) {
+    match control {
+        windows_scene::LogsWindowControl::ToBottom => {
+            state.logs_follow_tail = true;
+            sync_logs_scroll_offset(state, layout);
+        }
+        windows_scene::LogsWindowControl::Clear => {
+            logs::clear_logs();
+            state.logs_scroll_offset = 0;
+            state.logs_follow_tail = true;
+            state.diagnostic_selection = None;
+        }
+        windows_scene::LogsWindowControl::Settings => {
+            info!(
+                source_hwnd = hwnd.raw().0 as isize,
+                "Log settings are not implemented yet"
+            );
+        }
+    }
 }
 
 fn build_scene_diagnostic_text(state: &SceneAppState) -> String {
@@ -5754,6 +6408,9 @@ fn build_scene_diagnostic_text(state: &SceneAppState) -> String {
         );
     } else if state.scene_kind == SceneWindowKind::AudioDaemon {
         push_audio_daemon_diagnostic_text(&mut lines);
+    } else if state.scene_kind == SceneWindowKind::Logs {
+        lines.push(String::new());
+        lines.push(logs_diagnostic_text());
     }
 
     lines.push(String::new());
@@ -6642,7 +7299,7 @@ fn open_timeline_transcription_settings_window_from_scene(track_index: usize) ->
 
     thread::Builder::new()
         .name("teamy-studio-timeline-transcription-settings".to_owned())
-        .spawn(move || {
+        .spawn_with_current_span(move || {
             if let Err(error) = run_scene_window(
                 &app_home,
                 SceneWindowKind::TimelineTranscriptionSettings,
@@ -6670,7 +7327,7 @@ fn open_jobs_window_from_scene_state(state: &SceneAppState) {
     let vt_engine = state.vt_engine;
     let spawn_result = thread::Builder::new()
         .name("teamy-studio-jobs".to_owned())
-        .spawn(move || {
+        .spawn_with_current_span(move || {
             if let Err(error) = run_scene_window(
                 &app_home,
                 SceneWindowKind::Jobs,
@@ -6703,7 +7360,7 @@ fn open_model_warning_window(
     let app_home = app_home.clone();
     let spawn_result = thread::Builder::new()
         .name("teamy-studio-model-warning".to_owned())
-        .spawn(move || {
+        .spawn_with_current_span(move || {
             if let Err(error) = run_scene_window(
                 &app_home,
                 SceneWindowKind::ModelWarning,
@@ -7313,6 +7970,9 @@ fn scene_interactive_region_contains(
                 && timeline_selection_surface_at_point(state, layout, point))
             || (!state.diagnostics_visible
                 && timeline_scroll_interaction_at_point(state, layout, point))
+            || (state.scene_kind == SceneWindowKind::Logs
+                && !state.diagnostics_visible
+                && windows_scene::logs_control_at_point(layout, point).is_some())
             || (!state.diagnostics_visible
                 && scene_pretty_text_target(state, layout)
                     .is_some_and(|target| target.rect.contains(point)))
@@ -7607,7 +8267,7 @@ fn open_audio_input_device_window_from_scene(
         let vt_engine = state.vt_engine;
         thread::Builder::new()
             .name("teamy-studio-audio-input-device".to_owned())
-            .spawn(move || {
+            .spawn_with_current_span(move || {
                 let device_window = AudioInputDeviceWindowState::new(device);
                 if let Err(error) = run_scene_window(
                     &app_home,
@@ -8029,7 +8689,7 @@ fn perform_scene_action(
             let app_home = app_home.clone();
             thread::Builder::new()
                 .name("teamy-studio-launcher-terminal".to_owned())
-                .spawn(move || {
+                .spawn_with_current_span(move || {
                     if let Err(error) =
                         super::open_terminal_window(&app_home, None, None, None, vt_engine)
                     {
@@ -8043,7 +8703,7 @@ fn perform_scene_action(
             let app_home = app_home.clone();
             thread::Builder::new()
                 .name("teamy-studio-launcher-cursor-info".to_owned())
-                .spawn(move || {
+                .spawn_with_current_span(move || {
                     let _ = (app_home, vt_engine);
                     let terminal =
                         match HostedTerminalSession::new_cursor_info_virtual(CursorInfoConfig {
@@ -8073,7 +8733,7 @@ fn perform_scene_action(
             let app_home = app_home.clone();
             thread::Builder::new()
                 .name("teamy-studio-cursor-gallery".to_owned())
-                .spawn(move || {
+                .spawn_with_current_span(move || {
                     if let Err(error) = run_scene_window(
                         &app_home,
                         SceneWindowKind::CursorGallery,
@@ -8090,7 +8750,7 @@ fn perform_scene_action(
             let app_home = app_home.clone();
             thread::Builder::new()
                 .name("teamy-studio-demo-mode".to_owned())
-                .spawn(move || {
+                .spawn_with_current_span(move || {
                     if let Err(error) = run_scene_window(
                         &app_home,
                         SceneWindowKind::DemoMode,
@@ -8137,7 +8797,7 @@ fn perform_scene_action(
             let app_home = app_home.clone();
             thread::Builder::new()
                 .name("teamy-studio-audio-picker".to_owned())
-                .spawn(move || {
+                .spawn_with_current_span(move || {
                     if let Err(error) = run_scene_window(
                         &app_home,
                         SceneWindowKind::AudioPicker,
@@ -8155,7 +8815,7 @@ fn perform_scene_action(
             let app_home = app_home.clone();
             thread::Builder::new()
                 .name("teamy-studio-audio-daemon".to_owned())
-                .spawn(move || {
+                .spawn_with_current_span(move || {
                     if let Err(error) = run_scene_window(
                         &app_home,
                         SceneWindowKind::AudioDaemon,
@@ -8172,7 +8832,7 @@ fn perform_scene_action(
             let app_home = app_home.clone();
             thread::Builder::new()
                 .name("teamy-studio-jobs".to_owned())
-                .spawn(move || {
+                .spawn_with_current_span(move || {
                     if let Err(error) = run_scene_window(
                         &app_home,
                         SceneWindowKind::Jobs,
@@ -8185,12 +8845,30 @@ fn perform_scene_action(
                 .wrap_err("failed to spawn Teamy Studio jobs thread")?;
             Ok(SceneActionDisposition::KeepOpen)
         }
+        SceneAction::OpenLogs => {
+            // observability[impl logs.launcher-button]
+            let app_home = app_home.clone();
+            thread::Builder::new()
+                .name("teamy-studio-logs".to_owned())
+                .spawn_with_current_span(move || {
+                    if let Err(error) = run_scene_window(
+                        &app_home,
+                        SceneWindowKind::Logs,
+                        vt_engine,
+                        SceneWindowInitialization::default(),
+                    ) {
+                        error!(?error, "failed to open logs window");
+                    }
+                })
+                .wrap_err("failed to spawn Teamy Studio logs thread")?;
+            Ok(SceneActionDisposition::KeepOpen)
+        }
         SceneAction::OpenAudioInputDevices => {
             // audio[impl gui.picker-window]
             let app_home = app_home.clone();
             thread::Builder::new()
                 .name("teamy-studio-audio-input-devices".to_owned())
-                .spawn(move || {
+                .spawn_with_current_span(move || {
                     if let Err(error) = run_scene_window(
                         &app_home,
                         SceneWindowKind::AudioInputDevicePicker,
@@ -8208,7 +8886,7 @@ fn perform_scene_action(
             let app_home = app_home.clone();
             thread::Builder::new()
                 .name("teamy-studio-timeline".to_owned())
-                .spawn(move || {
+                .spawn_with_current_span(move || {
                     if let Err(error) = run_scene_window(
                         &app_home,
                         SceneWindowKind::TimelineStart,
@@ -10347,7 +11025,20 @@ fn scene_pretty_text_target(
     state: &SceneAppState,
     layout: TerminalLayout,
 ) -> Option<SceneSelectableTextTarget> {
-    if state.diagnostics_visible || state.scene_kind != SceneWindowKind::AudioInputDeviceDetails {
+    if state.diagnostics_visible {
+        return None;
+    }
+
+    if state.scene_kind == SceneWindowKind::Logs {
+        return Some(SceneSelectableTextTarget {
+            rect: windows_scene::logs_selectable_text_rect(layout),
+            text: logs_window_text(state, layout),
+            cell_width: state.diagnostic_cell_width,
+            cell_height: state.diagnostic_cell_height,
+        });
+    }
+
+    if state.scene_kind != SceneWindowKind::AudioInputDeviceDetails {
         return None;
     }
 
@@ -10529,6 +11220,15 @@ fn scene_cursor_for_point(
 
     if state.diagnostics_visible && scene_diagnostic_text_rect(layout).contains(point) {
         return Some(IDC_IBEAM);
+    }
+
+    if state.scene_kind == SceneWindowKind::Logs && !state.diagnostics_visible {
+        if windows_scene::logs_control_at_point(layout, point).is_some() {
+            return Some(IDC_HAND);
+        }
+        if windows_scene::logs_selectable_text_rect(layout).contains(point) {
+            return Some(IDC_IBEAM);
+        }
     }
 
     if state.scene_kind == SceneWindowKind::TimelineTranscriptionSettings
@@ -10794,6 +11494,11 @@ fn update_scene_chrome_tooltip(
         return Ok(());
     }
 
+    if let Some((tooltip_text, anchor_rect)) = logs_control_tooltip(state, layout, point) {
+        show_scene_tooltip(state, hwnd, point, tooltip_text, anchor_rect)?;
+        return Ok(());
+    }
+
     if let Some((tooltip_text, anchor_rect)) =
         timeline_viewport_control_tooltip(state, layout, point)
     {
@@ -10915,6 +11620,21 @@ fn update_scene_chrome_tooltip(
 
     state.chrome_tooltip.hide(hwnd);
     Ok(())
+}
+
+fn logs_control_tooltip(
+    state: &SceneAppState,
+    layout: TerminalLayout,
+    point: ClientPoint,
+) -> Option<(&'static str, ClientRect)> {
+    if state.scene_kind != SceneWindowKind::Logs || state.diagnostics_visible {
+        return None;
+    }
+    let control = windows_scene::logs_control_at_point(layout, point)?;
+    Some((
+        windows_scene::logs_control_tooltip(control),
+        windows_scene::logs_control_rect(layout, control),
+    ))
 }
 
 fn show_scene_tooltip(
@@ -11653,6 +12373,8 @@ mod tests {
             terminal_cell_height: 16,
             diagnostic_cell_width: 8,
             diagnostic_cell_height: 16,
+            logs_scroll_offset: 0,
+            logs_follow_tail: true,
             chrome_tooltip: ChromeTooltipController::default(),
             renderer: None,
         }
@@ -11949,6 +12671,8 @@ mod tests {
             terminal_cell_height: 16,
             diagnostic_cell_width: 8,
             diagnostic_cell_height: 16,
+            logs_scroll_offset: 0,
+            logs_follow_tail: true,
             chrome_tooltip: ChromeTooltipController::default(),
             renderer: None,
         };
@@ -12028,6 +12752,8 @@ mod tests {
             terminal_cell_height: 16,
             diagnostic_cell_width: 8,
             diagnostic_cell_height: 16,
+            logs_scroll_offset: 0,
+            logs_follow_tail: true,
             chrome_tooltip: ChromeTooltipController::default(),
             renderer: None,
         };
@@ -12098,6 +12824,8 @@ mod tests {
             terminal_cell_height: 16,
             diagnostic_cell_width: 8,
             diagnostic_cell_height: 16,
+            logs_scroll_offset: 0,
+            logs_follow_tail: true,
             chrome_tooltip: ChromeTooltipController::default(),
             renderer: None,
         };

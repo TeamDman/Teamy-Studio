@@ -117,4 +117,16 @@ specs (
             }
         )
     }
+    {
+        name teamy-studio-observability
+        source_url https://github.com/TeamDman/Teamy-Studio
+        include (docs/spec/product/observability.md)
+        impls (
+            {
+                name rust
+                include (src/**/*.rs)
+                test_include (tests/**/*.rs)
+            }
+        )
+    }
 )

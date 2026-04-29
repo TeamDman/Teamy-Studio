@@ -38,6 +38,7 @@ use super::audio_transcription::{
 };
 use super::jobs;
 use crate::audio::{AudioMetadata, TRANSCRIPTION_CHANNELS, TRANSCRIPTION_SAMPLE_RATE};
+use crate::logs::ThreadBuilderSpanExt;
 use crate::model::{WhisperModelArtifacts, inspect_model_dir, managed_model_dir};
 use crate::paths::CacheHome;
 use crate::transcription::{BurnWhisperBackend, TranscriptionBackend, build_transcription_request};
@@ -261,7 +262,7 @@ impl AudioInputDeviceWindowState {
         let completion_notification = self.transcription_worker.completion_notification;
         let _ = thread::Builder::new()
             .name("teamy-studio-rust-transcription".to_owned())
-            .spawn(move || {
+            .spawn_with_current_span(move || {
                 let result = run_rust_transcription_request_once_from_samples(
                     request_id,
                     selected_model,
@@ -1222,7 +1223,7 @@ impl AudioInputCaptureSession {
         let capture_stop_requested = Arc::clone(&stop_requested);
         let thread = thread::Builder::new()
             .name("teamy-studio-audio-input-capture".to_owned())
-            .spawn(move || {
+            .spawn_with_current_span(move || {
                 if let Err(error) = capture_audio_input(
                     endpoint_id,
                     &shared,

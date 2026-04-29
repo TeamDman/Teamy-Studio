@@ -150,6 +150,8 @@ pub fn init_logging(global_args: &GlobalArgs) -> eyre::Result<()> {
     };
     let subscriber = subscriber.with(json_layer);
 
+    let subscriber = subscriber.with(crate::logs::LogCollectorLayer);
+
     #[cfg(all(feature = "tracy", not(test)))]
     let subscriber = subscriber.with(tracing_tracy::TracyLayer::default());
 
