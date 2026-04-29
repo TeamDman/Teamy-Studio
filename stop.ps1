@@ -1,0 +1,1 @@
+Get-Process teamy-studio | Stop-Process

@@ -11,6 +11,8 @@ use uom::si::f64::{Length, Time};
 use uom::si::length::meter;
 use uom::si::time::{millisecond, nanosecond, second};
 
+use crate::model::DEFAULT_TRANSCRIPTION_MODEL_NAME;
+
 sguaba::system!(pub struct TimelineViewportSpace using right-handed XYZ);
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
@@ -255,6 +257,8 @@ impl TimelineAudioTrackProjection {
 pub struct TimelineTranscriptionTrackProjection {
     source_label: String,
     preview_range: TimelineTimeRangeNs,
+    model_name: String,
+    target_text_track_id: Option<TimelineTrackId>,
 }
 
 impl TimelineTranscriptionTrackProjection {
@@ -266,6 +270,8 @@ impl TimelineTranscriptionTrackProjection {
                 TimelineTimeNs::ZERO,
                 TimelineTimeNs::from_duration(Time::new::<millisecond>(320.0)),
             ),
+            model_name: DEFAULT_TRANSCRIPTION_MODEL_NAME.to_owned(),
+            target_text_track_id: None,
         }
     }
 
@@ -277,6 +283,24 @@ impl TimelineTranscriptionTrackProjection {
     #[must_use]
     pub const fn preview_range(&self) -> TimelineTimeRangeNs {
         self.preview_range
+    }
+
+    #[must_use]
+    pub fn model_name(&self) -> &str {
+        &self.model_name
+    }
+
+    #[must_use]
+    pub const fn target_text_track_id(&self) -> Option<TimelineTrackId> {
+        self.target_text_track_id
+    }
+
+    fn set_model_name(&mut self, model_name: impl Into<String>) {
+        self.model_name = model_name.into();
+    }
+
+    fn set_target_text_track_id(&mut self, target_text_track_id: Option<TimelineTrackId>) {
+        self.target_text_track_id = target_text_track_id;
     }
 }
 
@@ -562,7 +586,12 @@ impl TimelineTrack {
                 format!("{} · {}", self.kind().label(), projection.source_label())
             }
             TimelineTrackProjection::Transcription(projection) => {
-                format!("{} · {}", self.kind().label(), projection.source_label())
+                format!(
+                    "{} · {} · {}",
+                    self.kind().label(),
+                    projection.source_label(),
+                    projection.model_name()
+                )
             }
             TimelineTrackProjection::Text(projection) => {
                 format!("{} · {}", self.kind().label(), projection.source_label())
@@ -1017,6 +1046,82 @@ impl TimelineDocument {
         true
     }
 
+    #[must_use]
+    pub fn move_track(&mut self, from_index: usize, to_index: usize) -> bool {
+        if from_index >= self.tracks.len()
+            || to_index >= self.tracks.len()
+            || from_index == to_index
+        {
+            return from_index < self.tracks.len() && to_index < self.tracks.len();
+        }
+
+        let track = self.tracks.remove(from_index);
+        self.tracks.insert(to_index, track);
+        true
+    }
+
+    #[must_use]
+    pub fn restore_track_order(&mut self, track_order: &[TimelineTrackId]) -> bool {
+        if track_order.len() != self.tracks.len() {
+            return false;
+        }
+
+        let original_tracks = self.tracks.clone();
+        let mut remaining = original_tracks.clone();
+        let mut reordered = Vec::with_capacity(remaining.len());
+        for track_id in track_order {
+            let Some(index) = remaining.iter().position(|track| track.id() == *track_id) else {
+                return false;
+            };
+            reordered.push(remaining.remove(index));
+        }
+        if !remaining.is_empty() {
+            return false;
+        }
+        self.tracks = reordered;
+        true
+    }
+
+    #[must_use]
+    pub fn set_transcription_track_model_name(
+        &mut self,
+        track_id: TimelineTrackId,
+        model_name: impl Into<String>,
+    ) -> bool {
+        let Some(track) = self.tracks.iter_mut().find(|track| track.id() == track_id) else {
+            return false;
+        };
+        let TimelineTrackProjection::Transcription(projection) = &mut track.projection else {
+            return false;
+        };
+        projection.set_model_name(model_name);
+        true
+    }
+
+    #[must_use]
+    pub fn set_transcription_track_target_text_track(
+        &mut self,
+        track_id: TimelineTrackId,
+        target_text_track_id: Option<TimelineTrackId>,
+    ) -> bool {
+        if let Some(target_text_track_id) = target_text_track_id
+            && !self.tracks.iter().any(|track| {
+                track.id() == target_text_track_id && track.kind() == TimelineTrackKind::Text
+            })
+        {
+            return false;
+        }
+
+        let Some(track) = self.tracks.iter_mut().find(|track| track.id() == track_id) else {
+            return false;
+        };
+        let TimelineTrackProjection::Transcription(projection) = &mut track.projection else {
+            return false;
+        };
+        projection.set_target_text_track_id(target_text_track_id);
+        true
+    }
+
     // timeline[impl viewport.pan-controls]
     pub fn pan_viewport_left(&mut self) {
         self.viewport = self.viewport.pan_pixels(-TIMELINE_VIEWPORT_PAN_STEP_PIXELS);
@@ -1320,6 +1425,87 @@ mod tests {
         assert!(
             zoomed.duration_per_pixel().get::<nanosecond>()
                 < viewport.duration_per_pixel().get::<nanosecond>()
+        );
+    }
+
+    #[test]
+    fn transcription_tracks_start_with_default_model_and_no_text_target() {
+        let mut document = TimelineDocument::blank();
+        let track_id = document.append_transcription_track();
+
+        let TimelineTrackProjection::Transcription(projection) = document
+            .tracks()
+            .iter()
+            .find(|track| track.id() == track_id)
+            .expect("transcription track")
+            .projection()
+        else {
+            panic!("expected transcription track projection");
+        };
+
+        assert_eq!(projection.model_name(), DEFAULT_TRANSCRIPTION_MODEL_NAME);
+        assert_eq!(projection.target_text_track_id(), None);
+    }
+
+    #[test]
+    fn document_updates_transcription_track_settings_against_real_text_tracks() {
+        let mut document = TimelineDocument::blank();
+        let transcription_track_id = document.append_transcription_track();
+        let text_track_id = document.append_text_track();
+
+        assert!(document.set_transcription_track_model_name(transcription_track_id, "small.en"));
+        assert!(document.set_transcription_track_target_text_track(
+            transcription_track_id,
+            Some(text_track_id),
+        ));
+        assert!(!document.set_transcription_track_target_text_track(
+            transcription_track_id,
+            Some(transcription_track_id),
+        ));
+
+        let TimelineTrackProjection::Transcription(projection) = document
+            .tracks()
+            .iter()
+            .find(|track| track.id() == transcription_track_id)
+            .expect("transcription track")
+            .projection()
+        else {
+            panic!("expected transcription track projection");
+        };
+
+        assert_eq!(projection.model_name(), "small.en");
+        assert_eq!(projection.target_text_track_id(), Some(text_track_id));
+    }
+
+    #[test]
+    fn document_can_move_and_restore_track_order() {
+        let mut document = TimelineDocument::blank();
+        let first_track_id = document.append_microphone_track();
+        let transcription_track_id = document.append_transcription_track();
+        let text_track_id = document.append_text_track();
+        let original_order = document
+            .tracks()
+            .iter()
+            .map(TimelineTrack::id)
+            .collect::<Vec<_>>();
+
+        assert!(document.move_track(0, 2));
+        assert_eq!(
+            document
+                .tracks()
+                .iter()
+                .map(TimelineTrack::id)
+                .collect::<Vec<_>>(),
+            vec![transcription_track_id, text_track_id, first_track_id]
+        );
+        assert!(document.restore_track_order(&original_order));
+        assert_eq!(
+            document
+                .tracks()
+                .iter()
+                .map(TimelineTrack::id)
+                .collect::<Vec<_>>(),
+            original_order
         );
     }
 }

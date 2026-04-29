@@ -1,4 +1,5 @@
 use std::fmt::Write as _;
+use std::ops::Range;
 use std::time::{Duration, Instant};
 
 use arbitrary::Arbitrary;
@@ -14,9 +15,10 @@ use uom::si::f64::Time;
 use uom::si::time::second;
 use windows::Win32::Foundation::RECT;
 
+use crate::model::KNOWN_WHISPER_MODELS;
 use crate::timeline::{
     TimelineDocument, TimelineRulerTick, TimelineTimeNs, TimelineTimeRangeNs, TimelineTrack,
-    TimelineTrackKind, TimelineViewport, TimelineViewportPoint,
+    TimelineTrackId, TimelineTrackKind, TimelineViewport, TimelineViewportPoint,
 };
 
 use super::AudioTranscriptionDaemonStatusReport;
@@ -60,6 +62,9 @@ const TIMELINE_SCROLLBAR_TRACK: [f32; 4] = [0.16, 0.18, 0.22, 0.92];
 const TIMELINE_SCROLLBAR_THUMB: [f32; 4] = [0.48, 0.56, 0.66, 0.94];
 const TIMELINE_TRANSCRIPTION_MAX_CHUNK_SECONDS: f64 = 30.0;
 const TIMELINE_TRANSCRIPTION_INACTIVITY_SECONDS: f64 = 3.0;
+const TIMELINE_TRANSCRIPTION_SETTINGS_TARGET_COLUMN_WIDTH: i32 = 92;
+const TIMELINE_TRANSCRIPTION_SETTINGS_TARGET_SOCKET_SIZE: i32 = 40;
+const TIMELINE_TRANSCRIPTION_SETTINGS_TARGET_PUCK_SIZE: i32 = 30;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SceneWindowKind {
@@ -73,6 +78,7 @@ pub enum SceneWindowKind {
     TimelineStart,
     TimelineAddTrack,
     Timeline,
+    TimelineTranscriptionSettings,
 }
 
 impl SceneWindowKind {
@@ -88,8 +94,45 @@ impl SceneWindowKind {
             Self::DemoMode => "Demo Mode",
             Self::TimelineStart | Self::Timeline => "Timeline",
             Self::TimelineAddTrack => "Add Track",
+            Self::TimelineTranscriptionSettings => "Transcription Track",
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TimelineTranscriptionSettingsColumn {
+    #[default]
+    Model,
+    TargetTrack,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TimelineTranscriptionSettingsTarget {
+    Model,
+    TargetTrack,
+}
+
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "the settings view state keeps independent hover and dock flags for the two target widgets"
+)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TimelineTranscriptionSettingsViewState {
+    pub track_id: TimelineTrackId,
+    pub selected_column: TimelineTranscriptionSettingsColumn,
+    pub selected_model_index: usize,
+    pub selected_target_index: usize,
+    pub model_target_docked: bool,
+    pub output_target_docked: bool,
+    pub dragging_target: Option<TimelineTranscriptionSettingsTarget>,
+    pub drag_position: Option<ClientPoint>,
+    pub hovered_model_index: Option<usize>,
+    pub hovered_target_index: Option<usize>,
+    pub hovered_model_socket: bool,
+    pub hovered_target_socket: bool,
+    pub hovered_model_target: bool,
+    pub hovered_output_target: bool,
+    pub hovered_add_text_track_button: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -940,7 +983,8 @@ pub fn scene_button_specs(scene_kind: SceneWindowKind) -> &'static [SceneButtonS
         | SceneWindowKind::DemoMode
         | SceneWindowKind::AudioDaemon
         | SceneWindowKind::AudioInputDevicePicker
-        | SceneWindowKind::AudioInputDeviceDetails => &[],
+        | SceneWindowKind::AudioInputDeviceDetails
+        | SceneWindowKind::TimelineTranscriptionSettings => &[],
     }
 }
 
@@ -1099,6 +1143,755 @@ pub fn build_blank_timeline_render_scene(
     scene
 }
 
+#[expect(
+    clippy::struct_field_names,
+    reason = "the settings layout keeps explicit rect names so hit-testing helpers stay obvious"
+)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TimelineTranscriptionSettingsLayout {
+    body_rect: ClientRect,
+    title_rect: ClientRect,
+    subtitle_rect: ClientRect,
+    model_target_column_rect: ClientRect,
+    model_socket_rect: ClientRect,
+    model_card_rect: ClientRect,
+    model_list_rect: ClientRect,
+    target_card_rect: ClientRect,
+    target_list_rect: ClientRect,
+    add_text_track_button_rect: ClientRect,
+    output_target_column_rect: ClientRect,
+    output_socket_rect: ClientRect,
+    footer_rect: ClientRect,
+}
+
+#[must_use]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the transcription settings scene keeps both list columns and their selection rendering localized"
+)]
+pub fn build_timeline_transcription_settings_render_scene(
+    layout: TerminalLayout,
+    window_chrome_buttons_state: WindowChromeButtonsState,
+    document: Option<&TimelineDocument>,
+    settings_state: Option<TimelineTranscriptionSettingsViewState>,
+) -> RenderScene {
+    let mut scene = build_scene_shell(
+        layout,
+        SceneWindowKind::TimelineTranscriptionSettings,
+        window_chrome_buttons_state,
+    );
+    let settings_layout = timeline_transcription_settings_layout(layout);
+    push_panel(
+        &mut scene,
+        settings_layout.body_rect.to_win32_rect(),
+        [0.09, 0.10, 0.13, 1.0],
+        PanelEffect::SceneBody,
+    );
+    push_title_text(
+        &mut scene,
+        settings_layout.title_rect.to_win32_rect(),
+        "Transcription Track Settings",
+        [0.98, 0.97, 1.0, 1.0],
+    );
+    push_text_block(
+        &mut scene,
+        settings_layout.subtitle_rect.to_win32_rect(),
+        "Choose a Rust Whisper model and the text track that should receive transcription output.",
+        9,
+        16,
+        [0.72, 0.76, 0.82, 1.0],
+    );
+    push_panel(
+        &mut scene,
+        settings_layout.model_target_column_rect.to_win32_rect(),
+        [0.11, 0.13, 0.17, 1.0],
+        PanelEffect::SceneBody,
+    );
+    push_panel(
+        &mut scene,
+        settings_layout.model_card_rect.to_win32_rect(),
+        [0.12, 0.14, 0.18, 1.0],
+        PanelEffect::SceneButtonCard,
+    );
+    push_panel(
+        &mut scene,
+        settings_layout.target_card_rect.to_win32_rect(),
+        [0.12, 0.14, 0.18, 1.0],
+        PanelEffect::SceneButtonCard,
+    );
+    push_panel(
+        &mut scene,
+        settings_layout.output_target_column_rect.to_win32_rect(),
+        [0.11, 0.13, 0.17, 1.0],
+        PanelEffect::SceneBody,
+    );
+    push_text_block(
+        &mut scene,
+        ClientRect::new(
+            settings_layout.model_target_column_rect.left() + 8,
+            settings_layout.model_target_column_rect.top() + 10,
+            settings_layout.model_target_column_rect.right() - 8,
+            settings_layout.model_target_column_rect.top() + 42,
+        )
+        .to_win32_rect(),
+        "Active Model Target",
+        8,
+        14,
+        [0.92, 0.94, 0.98, 1.0],
+    );
+    push_text_block(
+        &mut scene,
+        ClientRect::new(
+            settings_layout.model_card_rect.left() + 16,
+            settings_layout.model_card_rect.top() + 12,
+            settings_layout.model_card_rect.right() - 16,
+            settings_layout.model_card_rect.top() + 34,
+        )
+        .to_win32_rect(),
+        "Rust Whisper Model",
+        9,
+        16,
+        [0.92, 0.94, 0.98, 1.0],
+    );
+    push_text_block(
+        &mut scene,
+        ClientRect::new(
+            settings_layout.target_card_rect.left() + 16,
+            settings_layout.target_card_rect.top() + 12,
+            settings_layout.target_card_rect.right() - 16,
+            settings_layout.target_card_rect.top() + 34,
+        )
+        .to_win32_rect(),
+        "Text Track List",
+        9,
+        16,
+        [0.92, 0.94, 0.98, 1.0],
+    );
+    push_text_block(
+        &mut scene,
+        ClientRect::new(
+            settings_layout.output_target_column_rect.left() + 8,
+            settings_layout.output_target_column_rect.top() + 10,
+            settings_layout.output_target_column_rect.right() - 8,
+            settings_layout.output_target_column_rect.top() + 42,
+        )
+        .to_win32_rect(),
+        "Output Track Target",
+        8,
+        14,
+        [0.92, 0.94, 0.98, 1.0],
+    );
+
+    let Some(document) = document else {
+        push_text_block(
+            &mut scene,
+            settings_layout.body_rect.inset(36).to_win32_rect(),
+            "Open a timeline document before configuring transcription settings.",
+            10,
+            18,
+            [0.86, 0.88, 0.92, 1.0],
+        );
+        return scene;
+    };
+    let Some(settings_state) = settings_state else {
+        push_text_block(
+            &mut scene,
+            settings_layout.body_rect.inset(36).to_win32_rect(),
+            "Select a transcription track from the timeline to edit its settings.",
+            10,
+            18,
+            [0.86, 0.88, 0.92, 1.0],
+        );
+        return scene;
+    };
+
+    let text_tracks = document
+        .tracks()
+        .iter()
+        .filter(|track| track.kind() == TimelineTrackKind::Text)
+        .collect::<Vec<_>>();
+    let Some(track_name) = document
+        .tracks()
+        .iter()
+        .find(|track| track.id() == settings_state.track_id)
+        .map(TimelineTrack::name)
+    else {
+        push_text_block(
+            &mut scene,
+            settings_layout.body_rect.inset(36).to_win32_rect(),
+            "The selected transcription track no longer exists.",
+            10,
+            18,
+            [0.86, 0.88, 0.92, 1.0],
+        );
+        return scene;
+    };
+    push_text_block(
+        &mut scene,
+        ClientRect::new(
+            settings_layout.title_rect.left(),
+            settings_layout.title_rect.bottom() + 4,
+            settings_layout.title_rect.right(),
+            settings_layout.title_rect.bottom() + 26,
+        )
+        .to_win32_rect(),
+        track_name,
+        9,
+        16,
+        [0.90, 0.86, 0.70, 1.0],
+    );
+
+    for (index, model) in KNOWN_WHISPER_MODELS.iter().enumerate() {
+        let Some(row_rect) = timeline_transcription_settings_model_row_rect(layout, index) else {
+            break;
+        };
+        let selected = settings_state.selected_column == TimelineTranscriptionSettingsColumn::Model
+            && settings_state.selected_model_index == index;
+        let hovered = settings_state.hovered_model_index == Some(index);
+        push_panel(
+            &mut scene,
+            row_rect.to_win32_rect(),
+            if selected {
+                [0.24, 0.35, 0.42, 1.0]
+            } else if hovered {
+                [0.18, 0.24, 0.30, 1.0]
+            } else {
+                [0.10, 0.12, 0.16, 1.0]
+            },
+            PanelEffect::SceneButtonCard,
+        );
+        push_text_block(
+            &mut scene,
+            ClientRect::new(
+                row_rect.left() + 44,
+                row_rect.top() + 6,
+                row_rect.right() - 10,
+                row_rect.top() + 24,
+            )
+            .to_win32_rect(),
+            model.name,
+            9,
+            16,
+            [0.94, 0.95, 0.98, 1.0],
+        );
+        push_text_block(
+            &mut scene,
+            ClientRect::new(
+                row_rect.left() + 44,
+                row_rect.top() + 22,
+                row_rect.right() - 10,
+                row_rect.bottom() - 6,
+            )
+            .to_win32_rect(),
+            model.parameter_count,
+            8,
+            14,
+            [0.68, 0.74, 0.80, 1.0],
+        );
+    }
+
+    for index in 0..=text_tracks.len() {
+        let Some(row_rect) = timeline_transcription_settings_target_row_rect(layout, index) else {
+            break;
+        };
+        let selected = settings_state.selected_column
+            == TimelineTranscriptionSettingsColumn::TargetTrack
+            && settings_state.selected_target_index == index;
+        let hovered = settings_state.hovered_target_index == Some(index);
+        push_panel(
+            &mut scene,
+            row_rect.to_win32_rect(),
+            if selected {
+                [0.40, 0.30, 0.14, 1.0]
+            } else if hovered {
+                [0.26, 0.20, 0.10, 1.0]
+            } else {
+                [0.11, 0.12, 0.16, 1.0]
+            },
+            PanelEffect::SceneButtonCard,
+        );
+        let label = if index == 0 {
+            "Unassigned"
+        } else {
+            text_tracks[index - 1].name()
+        };
+        push_text_block(
+            &mut scene,
+            ClientRect::new(
+                row_rect.left() + 10,
+                row_rect.top() + 8,
+                row_rect.right() - 44,
+                row_rect.bottom() - 8,
+            )
+            .to_win32_rect(),
+            label,
+            9,
+            16,
+            [0.94, 0.95, 0.98, 1.0],
+        );
+    }
+
+    push_panel(
+        &mut scene,
+        settings_layout.add_text_track_button_rect.to_win32_rect(),
+        if settings_state.hovered_add_text_track_button {
+            [0.21, 0.29, 0.37, 1.0]
+        } else {
+            [0.14, 0.18, 0.23, 1.0]
+        },
+        PanelEffect::SceneButtonCard,
+    );
+    push_text_block(
+        &mut scene,
+        settings_layout
+            .add_text_track_button_rect
+            .inset(12)
+            .to_win32_rect(),
+        "Add Text Track",
+        9,
+        16,
+        [0.96, 0.97, 1.0, 1.0],
+    );
+
+    let model_target_rect = timeline_transcription_settings_target_puck_rect(
+        layout,
+        settings_state,
+        TimelineTranscriptionSettingsTarget::Model,
+    );
+    let output_target_rect = timeline_transcription_settings_target_puck_rect(
+        layout,
+        settings_state,
+        TimelineTranscriptionSettingsTarget::TargetTrack,
+    );
+    push_timeline_transcription_target_widget(
+        &mut scene,
+        settings_layout.model_socket_rect,
+        model_target_rect,
+        settings_state.hovered_model_socket,
+        settings_state.hovered_model_target,
+        settings_state.dragging_target == Some(TimelineTranscriptionSettingsTarget::Model),
+    );
+    push_timeline_transcription_target_widget(
+        &mut scene,
+        settings_layout.output_socket_rect,
+        output_target_rect,
+        settings_state.hovered_target_socket,
+        settings_state.hovered_output_target,
+        settings_state.dragging_target == Some(TimelineTranscriptionSettingsTarget::TargetTrack),
+    );
+
+    push_text_block(
+        &mut scene,
+        settings_layout.footer_rect.to_win32_rect(),
+        "Drag a target onto a row, use arrows to move the active list target, click an empty socket to recall its puck, and use Esc to return to the timeline.",
+        8,
+        14,
+        [0.70, 0.74, 0.80, 1.0],
+    );
+    scene
+}
+
+fn push_timeline_transcription_target_widget(
+    scene: &mut RenderScene,
+    socket_rect: ClientRect,
+    puck_rect: Option<ClientRect>,
+    hovered_socket: bool,
+    hovered_target: bool,
+    dragging: bool,
+) {
+    if let Some(puck_rect) = puck_rect {
+        push_timeline_transcription_target_rope(scene, socket_rect, puck_rect, dragging);
+        push_panel_with_data(
+            scene,
+            puck_rect.to_win32_rect(),
+            [1.0, 0.98, 0.96, 1.0],
+            PanelEffect::TargetMarker,
+            [1.0, f32::from(hovered_target), f32::from(dragging), 0.0],
+        );
+    }
+
+    push_panel_with_data(
+        scene,
+        socket_rect.to_win32_rect(),
+        [1.0, 0.98, 0.96, 1.0],
+        PanelEffect::TargetMarker,
+        [0.0, f32::from(hovered_socket), f32::from(dragging), 0.0],
+    );
+}
+
+fn push_timeline_transcription_target_rope(
+    scene: &mut RenderScene,
+    socket_rect: ClientRect,
+    puck_rect: ClientRect,
+    dragging: bool,
+) {
+    let socket_center = rect_center_point(socket_rect);
+    let puck_center = rect_center_point(puck_rect);
+    if socket_center == puck_center {
+        return;
+    }
+
+    let Some(socket_center) = socket_center.to_win32_point().ok() else {
+        return;
+    };
+    let Some(puck_center) = puck_center.to_win32_point().ok() else {
+        return;
+    };
+
+    let thickness = 3;
+    let midpoint_x = i32::midpoint(socket_center.x, puck_center.x);
+    let socket_y = socket_center.y;
+    let puck_y = puck_center.y;
+    let rope_color = if dragging {
+        [0.90, 0.22, 0.18, 0.46]
+    } else {
+        [0.82, 0.20, 0.17, 0.34]
+    };
+
+    push_timeline_transcription_target_rope_segment(
+        scene,
+        socket_center.x,
+        socket_y,
+        midpoint_x,
+        socket_y,
+        thickness,
+        rope_color,
+    );
+    push_timeline_transcription_target_rope_segment(
+        scene, midpoint_x, socket_y, midpoint_x, puck_y, thickness, rope_color,
+    );
+    push_timeline_transcription_target_rope_segment(
+        scene,
+        midpoint_x,
+        puck_y,
+        puck_center.x,
+        puck_y,
+        thickness,
+        rope_color,
+    );
+}
+
+fn push_timeline_transcription_target_rope_segment(
+    scene: &mut RenderScene,
+    start_x: i32,
+    start_y: i32,
+    end_x: i32,
+    end_y: i32,
+    thickness: i32,
+    color: [f32; 4],
+) {
+    let left = start_x.min(end_x);
+    let right = start_x.max(end_x);
+    let top = start_y.min(end_y);
+    let bottom = start_y.max(end_y);
+    let rect = if left == right {
+        ClientRect::new(
+            left - (thickness / 2),
+            top,
+            left + (thickness / 2) + 1,
+            bottom + 1,
+        )
+    } else {
+        ClientRect::new(
+            left,
+            top - (thickness / 2),
+            right + 1,
+            top + (thickness / 2) + 1,
+        )
+    };
+    push_panel(
+        scene,
+        rect.to_win32_rect(),
+        color,
+        PanelEffect::TerminalFill,
+    );
+}
+
+fn rect_center_point(rect: ClientRect) -> ClientPoint {
+    ClientPoint::new(
+        rect.left() + (rect.width() / 2),
+        rect.top() + (rect.height() / 2),
+    )
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "the transcription settings layout keeps all horizontal target/socket geometry in one place"
+)]
+fn timeline_transcription_settings_layout(
+    layout: TerminalLayout,
+) -> TimelineTranscriptionSettingsLayout {
+    let body_rect = layout.terminal_panel_rect().inset(24);
+    let title_rect = ClientRect::new(
+        body_rect.left() + 18,
+        body_rect.top() + 18,
+        body_rect.right() - 18,
+        body_rect.top() + 52,
+    );
+    let subtitle_rect = ClientRect::new(
+        title_rect.left(),
+        title_rect.bottom() + 6,
+        title_rect.right(),
+        title_rect.bottom() + 38,
+    );
+    let column_gap = 16;
+    let card_top = subtitle_rect.bottom() + 22;
+    let footer_rect = ClientRect::new(
+        body_rect.left() + 18,
+        body_rect.bottom() - 34,
+        body_rect.right() - 18,
+        body_rect.bottom() - 12,
+    );
+    let card_bottom = footer_rect.top() - 14;
+    let inner_left = body_rect.left() + 18;
+    let inner_right = body_rect.right() - 18;
+    let column_width = ((inner_right
+        - inner_left
+        - (TIMELINE_TRANSCRIPTION_SETTINGS_TARGET_COLUMN_WIDTH * 2)
+        - (column_gap * 3))
+        / 2)
+    .max(160);
+    let model_target_column_rect = ClientRect::new(
+        inner_left,
+        card_top,
+        inner_left + TIMELINE_TRANSCRIPTION_SETTINGS_TARGET_COLUMN_WIDTH,
+        card_bottom,
+    );
+    let model_card_rect = ClientRect::new(
+        model_target_column_rect.right() + column_gap,
+        card_top,
+        model_target_column_rect.right() + column_gap + column_width,
+        card_bottom,
+    );
+    let target_card_rect = ClientRect::new(
+        model_card_rect.right() + column_gap,
+        card_top,
+        model_card_rect.right() + column_gap + column_width,
+        card_bottom,
+    );
+    let output_target_column_rect = ClientRect::new(
+        target_card_rect.right() + column_gap,
+        card_top,
+        inner_right,
+        card_bottom,
+    );
+    let model_socket_rect = centered_rect_in_rect(
+        ClientRect::new(
+            model_target_column_rect.left() + 8,
+            model_target_column_rect.top() + 56,
+            model_target_column_rect.right() - 8,
+            model_target_column_rect.bottom() - 16,
+        ),
+        TIMELINE_TRANSCRIPTION_SETTINGS_TARGET_SOCKET_SIZE,
+    );
+    let output_socket_rect = centered_rect_in_rect(
+        ClientRect::new(
+            output_target_column_rect.left() + 8,
+            output_target_column_rect.top() + 56,
+            output_target_column_rect.right() - 8,
+            output_target_column_rect.bottom() - 16,
+        ),
+        TIMELINE_TRANSCRIPTION_SETTINGS_TARGET_SOCKET_SIZE,
+    );
+    let model_list_rect = ClientRect::new(
+        model_card_rect.left() + 12,
+        model_card_rect.top() + 44,
+        model_card_rect.right() - 12,
+        model_card_rect.bottom() - 12,
+    );
+    let add_text_track_button_rect = ClientRect::new(
+        target_card_rect.left() + 12,
+        target_card_rect.bottom() - 46,
+        target_card_rect.right() - 12,
+        target_card_rect.bottom() - 12,
+    );
+    let target_list_rect = ClientRect::new(
+        target_card_rect.left() + 12,
+        target_card_rect.top() + 44,
+        target_card_rect.right() - 12,
+        add_text_track_button_rect.top() - 12,
+    );
+    TimelineTranscriptionSettingsLayout {
+        body_rect,
+        title_rect,
+        subtitle_rect,
+        model_target_column_rect,
+        model_socket_rect,
+        model_card_rect,
+        model_list_rect,
+        target_card_rect,
+        target_list_rect,
+        add_text_track_button_rect,
+        output_target_column_rect,
+        output_socket_rect,
+        footer_rect,
+    }
+}
+
+fn centered_rect_in_rect(rect: ClientRect, size: i32) -> ClientRect {
+    let left = rect.left() + ((rect.width() - size).max(0) / 2);
+    let top = rect.top() + ((rect.height() - size).max(0) / 2);
+    ClientRect::new(left, top, left + size, top + size)
+}
+
+fn centered_rect_at_point(point: ClientPoint, size: i32) -> Option<ClientRect> {
+    let point = point.to_win32_point().ok()?;
+    let half = size / 2;
+    Some(ClientRect::new(
+        point.x - half,
+        point.y - half,
+        point.x - half + size,
+        point.y - half + size,
+    ))
+}
+
+fn timeline_transcription_settings_model_row_rect_from_layout(
+    settings_layout: TimelineTranscriptionSettingsLayout,
+    row_index: usize,
+) -> Option<ClientRect> {
+    timeline_transcription_settings_list_row_rect(settings_layout.model_list_rect, row_index)
+}
+
+fn timeline_transcription_settings_target_row_rect_from_layout(
+    settings_layout: TimelineTranscriptionSettingsLayout,
+    row_index: usize,
+) -> Option<ClientRect> {
+    timeline_transcription_settings_list_row_rect(settings_layout.target_list_rect, row_index)
+}
+
+#[must_use]
+pub fn timeline_transcription_settings_model_row_rect(
+    layout: TerminalLayout,
+    row_index: usize,
+) -> Option<ClientRect> {
+    let settings_layout = timeline_transcription_settings_layout(layout);
+    timeline_transcription_settings_model_row_rect_from_layout(settings_layout, row_index)
+}
+
+#[must_use]
+pub fn timeline_transcription_settings_target_row_rect(
+    layout: TerminalLayout,
+    row_index: usize,
+) -> Option<ClientRect> {
+    let settings_layout = timeline_transcription_settings_layout(layout);
+    timeline_transcription_settings_target_row_rect_from_layout(settings_layout, row_index)
+}
+
+#[must_use]
+pub fn timeline_transcription_settings_model_socket_rect(layout: TerminalLayout) -> ClientRect {
+    timeline_transcription_settings_layout(layout).model_socket_rect
+}
+
+#[must_use]
+pub fn timeline_transcription_settings_output_socket_rect(layout: TerminalLayout) -> ClientRect {
+    timeline_transcription_settings_layout(layout).output_socket_rect
+}
+
+#[must_use]
+pub fn timeline_transcription_settings_add_text_track_button_rect(
+    layout: TerminalLayout,
+) -> ClientRect {
+    timeline_transcription_settings_layout(layout).add_text_track_button_rect
+}
+
+#[must_use]
+pub fn timeline_transcription_settings_target_puck_rect(
+    layout: TerminalLayout,
+    settings_state: TimelineTranscriptionSettingsViewState,
+    target: TimelineTranscriptionSettingsTarget,
+) -> Option<ClientRect> {
+    let settings_layout = timeline_transcription_settings_layout(layout);
+    timeline_transcription_settings_target_puck_rect_from_layout(
+        settings_layout,
+        settings_state,
+        target,
+    )
+}
+
+fn timeline_transcription_settings_target_puck_rect_from_layout(
+    settings_layout: TimelineTranscriptionSettingsLayout,
+    settings_state: TimelineTranscriptionSettingsViewState,
+    target: TimelineTranscriptionSettingsTarget,
+) -> Option<ClientRect> {
+    if settings_state.dragging_target == Some(target)
+        && let Some(point) = settings_state.drag_position
+    {
+        return centered_rect_at_point(point, TIMELINE_TRANSCRIPTION_SETTINGS_TARGET_PUCK_SIZE);
+    }
+
+    match target {
+        TimelineTranscriptionSettingsTarget::Model => {
+            if settings_state.model_target_docked {
+                timeline_transcription_settings_model_row_rect_from_layout(
+                    settings_layout,
+                    settings_state.selected_model_index,
+                )
+                .map(|row_rect| {
+                    ClientRect::new(
+                        row_rect.left() + 10,
+                        row_rect.top()
+                            + ((row_rect.height()
+                                - TIMELINE_TRANSCRIPTION_SETTINGS_TARGET_PUCK_SIZE)
+                                / 2),
+                        row_rect.left() + 10 + TIMELINE_TRANSCRIPTION_SETTINGS_TARGET_PUCK_SIZE,
+                        row_rect.top()
+                            + ((row_rect.height()
+                                - TIMELINE_TRANSCRIPTION_SETTINGS_TARGET_PUCK_SIZE)
+                                / 2)
+                            + TIMELINE_TRANSCRIPTION_SETTINGS_TARGET_PUCK_SIZE,
+                    )
+                })
+            } else {
+                Some(centered_rect_in_rect(
+                    settings_layout.model_socket_rect,
+                    TIMELINE_TRANSCRIPTION_SETTINGS_TARGET_PUCK_SIZE,
+                ))
+            }
+        }
+        TimelineTranscriptionSettingsTarget::TargetTrack => {
+            if settings_state.output_target_docked {
+                timeline_transcription_settings_target_row_rect_from_layout(
+                    settings_layout,
+                    settings_state.selected_target_index,
+                )
+                .map(|row_rect| {
+                    let left =
+                        row_rect.right() - 10 - TIMELINE_TRANSCRIPTION_SETTINGS_TARGET_PUCK_SIZE;
+                    let top = row_rect.top()
+                        + ((row_rect.height() - TIMELINE_TRANSCRIPTION_SETTINGS_TARGET_PUCK_SIZE)
+                            / 2);
+                    ClientRect::new(
+                        left,
+                        top,
+                        left + TIMELINE_TRANSCRIPTION_SETTINGS_TARGET_PUCK_SIZE,
+                        top + TIMELINE_TRANSCRIPTION_SETTINGS_TARGET_PUCK_SIZE,
+                    )
+                })
+            } else {
+                Some(centered_rect_in_rect(
+                    settings_layout.output_socket_rect,
+                    TIMELINE_TRANSCRIPTION_SETTINGS_TARGET_PUCK_SIZE,
+                ))
+            }
+        }
+    }
+}
+
+fn timeline_transcription_settings_list_row_rect(
+    list_rect: ClientRect,
+    row_index: usize,
+) -> Option<ClientRect> {
+    let row_height = 38;
+    let row_gap = 8;
+    let top = list_rect.top()
+        + i32::try_from(row_index)
+            .unwrap_or_default()
+            .saturating_mul(row_height + row_gap);
+    let bottom = top + row_height;
+    (bottom <= list_rect.bottom())
+        .then(|| ClientRect::new(list_rect.left(), top, list_rect.right(), bottom))
+}
+
 // timeline[impl content.preview-lanes]
 fn push_timeline_track_preview_rows(
     scene: &mut RenderScene,
@@ -1145,12 +1938,12 @@ fn push_timeline_track_preview_rows(
             continue;
         }
 
+        let preview_range = timeline_track_preview_time_range(track, audio_input_state);
         if let Some(preview_rect) = timeline_track_preview_clip_rect(
             row_rect,
             layout.scrollport_rect,
             document.viewport(),
-            track,
-            audio_input_state,
+            preview_range,
         ) {
             push_panel(
                 scene,
@@ -1166,6 +1959,12 @@ fn push_timeline_track_preview_rows(
                     scene,
                     preview_rect.inset(4),
                     &audio_input_state.runtime.samples(),
+                    timeline_waveform_sample_range(
+                        layout.scrollport_rect,
+                        document.viewport(),
+                        preview_range,
+                        audio_input_state.runtime.samples().len(),
+                    ),
                 );
             } else if track.kind() == TimelineTrackKind::Transcription
                 && let Some(audio_input_state) = audio_input_state
@@ -1173,6 +1972,8 @@ fn push_timeline_track_preview_rows(
                 push_timeline_transcription_preview(
                     scene,
                     preview_rect.inset(4),
+                    layout.scrollport_rect,
+                    document.viewport(),
                     audio_input_state,
                 );
             } else if preview_rect.width() >= 72 {
@@ -1254,6 +2055,8 @@ fn push_timeline_text_blocks(
 fn push_timeline_transcription_preview(
     scene: &mut RenderScene,
     preview_rect: ClientRect,
+    content_rect: ClientRect,
+    viewport: TimelineViewport,
     audio_input_state: &AudioInputDeviceWindowState,
 ) {
     if preview_rect.width() <= 0 || preview_rect.height() <= 0 {
@@ -1262,7 +2065,17 @@ fn push_timeline_transcription_preview(
 
     let samples = audio_input_state.runtime.samples();
     if !samples.is_empty() {
-        push_waveform_bars(scene, preview_rect, &samples);
+        push_waveform_bars(
+            scene,
+            preview_rect,
+            &samples,
+            timeline_waveform_sample_range(
+                content_rect,
+                viewport,
+                timeline_audio_preview_range(audio_input_state),
+                samples.len(),
+            ),
+        );
     }
 
     let duration_seconds = timeline_audio_preview_duration_seconds(audio_input_state);
@@ -1387,10 +2200,14 @@ fn push_timeline_track_list_panel(
             PanelEffect::SceneButtonCard,
         );
 
+        if let Some(handle_rect) = timeline_track_reorder_handle_rect(layout, index) {
+            push_track_reorder_handle(scene, handle_rect);
+        }
+
         let icon_rect = ClientRect::new(
-            row_rect.left() + 10,
+            row_rect.left() + 34,
             row_rect.top() + 12,
-            row_rect.left() + 38,
+            row_rect.left() + 62,
             row_rect.top() + 40,
         );
         push_sprite(
@@ -1809,6 +2626,20 @@ pub fn timeline_track_transcription_settings_button_rect(
     timeline_track_control_button_rect(layout, row_index, 0)
 }
 
+#[must_use]
+pub fn timeline_track_reorder_handle_rect(
+    layout: TimelineDocumentLayout,
+    row_index: usize,
+) -> Option<ClientRect> {
+    timeline_track_list_row_rect(layout, row_index).map(|row_rect| {
+        let handle_width = 16;
+        let handle_height = (row_rect.height() - 22).clamp(28, 38);
+        let left = row_rect.left() + 12;
+        let top = row_rect.top() + ((row_rect.height() - handle_height) / 2);
+        ClientRect::new(left, top, left + handle_width, top + handle_height)
+    })
+}
+
 fn timeline_track_control_button_rect(
     layout: TimelineDocumentLayout,
     row_index: usize,
@@ -1823,20 +2654,43 @@ fn timeline_track_control_button_rect(
     })
 }
 
+fn push_track_reorder_handle(scene: &mut RenderScene, handle_rect: ClientRect) {
+    for offset in [0, 1, 2] {
+        let top = handle_rect.top() + 6 + (offset * 8);
+        push_panel(
+            scene,
+            ClientRect::new(
+                handle_rect.left() + 4,
+                top,
+                handle_rect.right() - 4,
+                top + 3,
+            )
+            .to_win32_rect(),
+            [0.62, 0.68, 0.74, 0.95],
+            PanelEffect::SceneButtonCard,
+        );
+    }
+}
+
 fn timeline_track_preview_clip_rect(
     row_rect: ClientRect,
     content_rect: ClientRect,
     viewport: TimelineViewport,
+    preview_range: TimelineTimeRangeNs,
+) -> Option<ClientRect> {
+    timeline_time_range_clip_rect(row_rect, content_rect, viewport, preview_range, 8)
+}
+
+fn timeline_track_preview_time_range(
     track: &TimelineTrack,
     audio_input_state: Option<&AudioInputDeviceWindowState>,
-) -> Option<ClientRect> {
-    let preview_range = match track.kind() {
+) -> TimelineTimeRangeNs {
+    match track.kind() {
         TimelineTrackKind::Audio | TimelineTrackKind::Transcription | TimelineTrackKind::Text => {
             audio_input_state.map_or(track.preview_range(), timeline_audio_preview_range)
         }
         TimelineTrackKind::TracingSpans => track.preview_range(),
-    };
-    timeline_time_range_clip_rect(row_rect, content_rect, viewport, preview_range, 8)
+    }
 }
 
 pub fn timeline_time_range_clip_rect(
@@ -1904,6 +2758,72 @@ fn timeline_audio_preview_range(
         TimelineTimeNs::ZERO,
         TimelineTimeNs::from_duration(Time::new::<second>(duration_seconds)),
     )
+}
+
+fn timeline_viewport_visible_time_range(
+    content_rect: ClientRect,
+    viewport: TimelineViewport,
+) -> TimelineTimeRangeNs {
+    TimelineTimeRangeNs::new(
+        viewport.origin(),
+        viewport.x_to_time(TimelineViewportPoint::new_pixels(f64::from(
+            content_rect.width().max(0),
+        ))),
+    )
+}
+
+fn timeline_time_range_intersection(
+    left: TimelineTimeRangeNs,
+    right: TimelineTimeRangeNs,
+) -> Option<TimelineTimeRangeNs> {
+    let start = left.start().max(right.start());
+    let end = left.end().min(right.end());
+    (start < end).then_some(TimelineTimeRangeNs::new(start, end))
+}
+
+fn timeline_waveform_sample_range(
+    content_rect: ClientRect,
+    viewport: TimelineViewport,
+    preview_range: TimelineTimeRangeNs,
+    sample_count: usize,
+) -> Range<usize> {
+    let visible_range = timeline_time_range_intersection(
+        preview_range,
+        timeline_viewport_visible_time_range(content_rect, viewport),
+    )
+    .unwrap_or(preview_range);
+    waveform_visible_sample_range(sample_count, preview_range, visible_range)
+}
+
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    reason = "waveform sample windows are proportional projections from typed time ranges into sample indices"
+)]
+fn waveform_visible_sample_range(
+    sample_count: usize,
+    full_range: TimelineTimeRangeNs,
+    visible_range: TimelineTimeRangeNs,
+) -> Range<usize> {
+    if sample_count == 0 {
+        return 0..0;
+    }
+
+    let full_duration_i64 = full_range
+        .end()
+        .as_i64()
+        .saturating_sub(full_range.start().as_i64());
+    let full_duration = full_duration_i64.max(1) as f64;
+    let start_offset = (visible_range.start().as_i64() - full_range.start().as_i64())
+        .clamp(0, full_duration_i64) as f64;
+    let end_offset = (visible_range.end().as_i64() - full_range.start().as_i64())
+        .clamp(0, full_duration_i64) as f64;
+    let start = ((start_offset / full_duration) * sample_count as f64).floor() as usize;
+    let end = (((end_offset / full_duration) * sample_count as f64).ceil() as usize)
+        .max(start.saturating_add(1))
+        .min(sample_count);
+    start.min(end)..end
 }
 
 fn timeline_audio_preview_duration_seconds(audio_input_state: &AudioInputDeviceWindowState) -> f64 {
@@ -3826,7 +4746,7 @@ fn push_waveform(
             [0.52, 0.56, 0.60, 1.0],
         );
     } else {
-        push_waveform_bars(scene, waveform_rect, &samples);
+        push_waveform_bars(scene, waveform_rect, &samples, 0..samples.len());
     }
     push_timeline_head(
         scene,
@@ -3873,7 +4793,20 @@ fn push_waveform(
     clippy::cast_precision_loss,
     reason = "waveform amplitudes are deliberately converted to integer pixel bar heights"
 )]
-fn push_waveform_bars(scene: &mut RenderScene, waveform_rect: ClientRect, samples: &[f32]) {
+fn push_waveform_bars(
+    scene: &mut RenderScene,
+    waveform_rect: ClientRect,
+    samples: &[f32],
+    sample_range: Range<usize>,
+) {
+    if waveform_rect.width() <= 0
+        || waveform_rect.height() <= 0
+        || sample_range.start >= sample_range.end
+        || sample_range.end > samples.len()
+    {
+        return;
+    }
+
     let width = waveform_rect.width().max(1);
     let mid_y = waveform_rect.top() + waveform_rect.height() / 2;
     let half_height = (waveform_rect.height() / 2 - 6).max(2);
@@ -3883,13 +4816,16 @@ fn push_waveform_bars(scene: &mut RenderScene, waveform_rect: ClientRect, sample
         .map(|sample| sample.abs())
         .fold(0.0_f32, f32::max)
         .max(0.015);
+    let visible_sample_count = sample_range.end - sample_range.start;
     for bar_index in 0..bars {
-        let start = (usize::try_from(bar_index).unwrap_or_default() * samples.len())
-            / usize::try_from(bars).unwrap_or(1);
-        let end = ((usize::try_from(bar_index + 1).unwrap_or_default() * samples.len())
-            / usize::try_from(bars).unwrap_or(1))
+        let start = sample_range.start
+            + (usize::try_from(bar_index).unwrap_or_default() * visible_sample_count)
+                / usize::try_from(bars).unwrap_or(1);
+        let end = (sample_range.start
+            + (usize::try_from(bar_index + 1).unwrap_or_default() * visible_sample_count)
+                / usize::try_from(bars).unwrap_or(1))
         .max(start + 1)
-        .min(samples.len());
+        .min(sample_range.end);
         let amplitude = samples[start..end]
             .iter()
             .map(|sample| sample.abs())
@@ -5869,8 +6805,7 @@ mod tests {
             row_rect,
             layout.scrollport_rect,
             document.viewport(),
-            &document.tracks()[0],
-            None,
+            timeline_track_preview_time_range(&document.tracks()[0], None),
         )
         .expect("preview rect");
 
@@ -5904,13 +6839,44 @@ mod tests {
             row_rect,
             layout.scrollport_rect,
             document.viewport(),
-            &document.tracks()[0],
-            None,
+            timeline_track_preview_time_range(&document.tracks()[0], None),
         )
         .expect("preview rect");
 
         assert_eq!(preview_rect.left(), layout.scrollport_rect.left());
         assert_eq!(preview_rect.right(), layout.scrollport_rect.left() + 120);
+    }
+
+    #[test]
+    fn waveform_visible_sample_range_tracks_zoomed_visible_slice() {
+        let full_range = TimelineTimeRangeNs::new(
+            TimelineTimeNs::ZERO,
+            TimelineTimeNs::from_duration(Time::new::<second>(1.0)),
+        );
+        let visible_range = TimelineTimeRangeNs::new(
+            TimelineTimeNs::from_duration(Time::new::<second>(0.25)),
+            TimelineTimeNs::from_duration(Time::new::<second>(0.5)),
+        );
+
+        let sample_range = waveform_visible_sample_range(10, full_range, visible_range);
+
+        assert_eq!(sample_range, 2..5);
+    }
+
+    #[test]
+    fn waveform_visible_sample_range_clamps_when_preview_is_partially_offscreen() {
+        let full_range = TimelineTimeRangeNs::new(
+            TimelineTimeNs::ZERO,
+            TimelineTimeNs::from_duration(Time::new::<second>(1.0)),
+        );
+        let visible_range = TimelineTimeRangeNs::new(
+            TimelineTimeNs::from_duration(Time::new::<second>(-0.2)),
+            TimelineTimeNs::from_duration(Time::new::<second>(0.3)),
+        );
+
+        let sample_range = waveform_visible_sample_range(10, full_range, visible_range);
+
+        assert_eq!(sample_range, 0..3);
     }
 
     #[test]

@@ -262,6 +262,7 @@ pub enum PanelEffect {
     DemoToggle = 26,
     PlaybackButton = 27,
     TranscriptionToggle = 28,
+    TargetMarker = 29,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]

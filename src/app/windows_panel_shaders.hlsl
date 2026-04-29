@@ -383,6 +383,46 @@ float4 apply_terminal_scrollbar_thumb(float2 uv, float4 color) {
     return float4(tint * intensity, color.a);
 }
 
+float4 apply_target_marker(float2 uv, float4 color, float4 state) {
+    float t = PanelTime();
+    float isPuck = step(0.5, state.x);
+    float hover = saturate(state.y);
+    float dragging = saturate(state.z);
+    float2 markerCoord = (uv - 0.5) * 2.0;
+    float radius = length(markerCoord);
+    float edge = 1.0 - smoothstep(0.90, 1.0, radius);
+    float ring0 = smoothstep(0.94, 0.82, radius) - smoothstep(0.76, 0.66, radius);
+    float ring1 = smoothstep(0.66, 0.56, radius) - smoothstep(0.48, 0.38, radius);
+    float center = 1.0 - smoothstep(0.24, 0.34, radius);
+    float stripeAngle = atan2(markerCoord.y, markerCoord.x);
+    float stripeWave = 0.5 + (0.5 * sin((stripeAngle * 6.0) + (t * (1.4 + dragging))));
+    float stripe = smoothstep(0.42, 0.58, stripeWave);
+    float3 red = lerp(float3(0.72, 0.12, 0.10), float3(0.94, 0.22, 0.18), hover + (dragging * 0.5));
+    float3 white = lerp(float3(0.86, 0.86, 0.86), float3(1.00, 0.98, 0.96), hover);
+    float3 puckColor =
+        (red * ring0)
+        + (white * ring1)
+        + (lerp(red, white, stripe * 0.35) * center);
+    float puckAlpha = edge;
+
+    float socketOuter = smoothstep(0.94, 0.84, radius) - smoothstep(0.84, 0.70, radius);
+    float socketInner = smoothstep(0.52, 0.44, radius) - smoothstep(0.34, 0.26, radius);
+    float socketCross =
+        (1.0 - smoothstep(0.00, 0.08, abs(markerCoord.x))) * smoothstep(0.08, 0.40, abs(markerCoord.y));
+    socketCross +=
+        (1.0 - smoothstep(0.00, 0.08, abs(markerCoord.y))) * smoothstep(0.08, 0.40, abs(markerCoord.x));
+    float3 socketColor =
+        (float3(0.82, 0.22, 0.18) * socketOuter)
+        + (float3(0.92, 0.92, 0.92) * socketInner)
+        + (float3(0.86, 0.24, 0.20) * socketCross * 0.22);
+    float socketAlpha = saturate((socketOuter * 0.75) + (socketInner * 0.55) + (socketCross * 0.10));
+
+    float3 rgb = lerp(socketColor, puckColor, isPuck);
+    float alpha = lerp(socketAlpha, puckAlpha, isPuck);
+    float glow = 0.94 + (hover * 0.12) + (dragging * 0.14) + (0.04 * sin((radius * 18.0) - (t * 2.2)));
+    return float4((rgb * color.rgb) * glow, color.a * alpha);
+}
+
 float4 PSMain(PsInput input) : SV_TARGET {
     if (input.effect > 11.5 && input.effect < 12.5) {
         float coverage = slug_coverage(input.uv, input.glyph, input.glyphData, input.banding);
@@ -399,7 +439,9 @@ float4 PSMain(PsInput input) : SV_TARGET {
     }
 
     float4 shaded = input.color;
-    if (input.effect > 27.5) {
+    if (input.effect > 28.5) {
+        shaded = apply_target_marker(input.uv, input.color, input.glyphData);
+    } else if (input.effect > 27.5) {
         shaded = apply_transcription_toggle(input.uv, input.color, input.glyphData);
     } else if (input.effect > 26.5) {
         shaded = apply_playback_button(input.uv, input.color, input.glyphData);

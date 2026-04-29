@@ -19,17 +19,22 @@ The first proof should let the launcher open a Timeline flow, create an empty ti
   - Added animated elastic mouse-wheel zoom so the timeline eases between the current and target viewport instead of snapping.
   - Fixed timeline clip projection so zooming and panning clip partially visible blocks at the viewport edge instead of visually compressing them into the available width.
   - Added a first text-track milestone: text tracks can be added from the add-track picker, the top toolbar now includes Select and Box tools, drag-brushing on a text track creates empty document-owned text boxes, and hovering a text box shows its current contents in a tooltip.
-  - Updated tests and validation so `./check-all.ps1` passes with the timeline microphone/transport/text-box slice.
+  - Fixed audio and transcription waveform previews so pan/zoom now redraw the visible sample slice instead of squeezing the entire buffer into the clipped preview rect.
+  - Added document-backed transcription track settings with an in-window settings scene that selects a Rust Whisper model and a target text track rather than opening the old Python daemon window.
+  - Added a three-dot grab handle to timeline track rows and in-window drag reordering with live row movement plus `Esc` cancel-to-restore behavior.
+  - Reworked the transcription settings window into a horizontal target/socket layout with shader-driven red/white target pucks, click-drag docking to model/text-track rows, keyboard teleport-to-selection behavior, socket recall, and an in-window `Add Text Track` action.
+  - Updated tests and validation so `./check-all.ps1` passes with the timeline microphone/transport/text-box/settings/reorder slice.
 - Current focus:
-  - Turn the new text-track box workflow into a real editing surface while preparing the shared timeline-session architecture needed for detached tool windows.
+  - Turn the new text-track box workflow into a real editing surface, connect the transcription settings target/socket affordances to fuller editing flows, and prepare the shared timeline-session architecture needed for detached rope/socket tool windows.
 - Remaining work:
   - Add pinned text editing windows with cursor movement, primitive cell editing, and the requested word-navigation/delete shortcuts instead of the current hover-only tooltip preview.
+  - Add track-name editing, richer keyboard navigation across timeline controls/track rows, and the matching handle/socket affordances inside the timeline lane view.
   - Persist recorded timeline audio as document-owned clip/source state instead of reflecting only the live `AudioInputDeviceWindowState` runtime.
   - Introduce a shared timeline-session object so detached toolbar, track-list, and editor windows can bind to one document instead of each scene window owning isolated state.
   - Implement the Rust Tracy capture reader and zone/message rendering path beyond the current file-header/track append workflow.
   - Extend the timeline model to carry richer text documents, source media references, transcription regions, and later editing primitives.
 - Next step:
-  - Add a minimal pinned text editor window backed by `TimelineDocument` text blocks, then refactor the timeline surfaces toward a shared session model before splitting the toolbar and track list into detached windows.
+  - Add a minimal pinned text editor surface backed by `TimelineDocument` text blocks and track names, then widen keyboard navigation and settings-window follow-through before refactoring the timeline surfaces toward the shared session model required by detached rope/socket windows.
 
 ## Constraints And Assumptions
 
@@ -58,6 +63,8 @@ The first proof should let the launcher open a Timeline flow, create an empty ti
 - Live microphone tracks must expose device identity, recording control, and draggable transport heads in the timeline itself.
 - Text tracks must support document-owned text boxes with explicit time ranges, hover previews, and later pinned editing.
 - The timeline must support a box-authoring tool that creates empty text boxes by dragging within a text track lane.
+- Transcription tracks must let the user pick a Rust Whisper model and route output into a chosen text track.
+- Track rows must expose a grab handle for local reordering before detached pop-out windows exist.
 - Recording from the timeline should become durable document state rather than staying a purely live runtime projection.
 - A microphone track must eventually map one source medium, such as a live sample buffer or recorded clip, into one or more track lanes depending on mono/stereo channel count.
 - Audio clips, Tracy zones, transcription work ranges, and user selections should share one interval/marker vocabulary so the timeline can visualize what is being recorded, processed, transcribed, or selected.
@@ -284,6 +291,9 @@ Tasks:
 - Render text boxes as viewport-clipped blocks rather than stretching or compressing them to fit the visible lane.
 - Add a toolbar mode that can brush out empty text boxes by dragging in a text track lane.
 - Show text-box contents via native hover tooltips so the user can inspect off-screen or truncated content.
+- Keep waveform previews aligned with the visible timeline slice under pan and zoom.
+- Add a transcription settings surface that picks a Rust model and a target text track.
+- Add local track-list reordering via a grab handle with cancel-to-restore semantics.
 - Add focused tests for text-track creation, box projection, and box-authoring interactions where practical.
 
 Definition of done:
@@ -292,10 +302,13 @@ Definition of done:
 - Dragging in a text track with the box tool enabled creates a document-owned text box.
 - Text boxes stay stable under pan and zoom and clip cleanly at the viewport edge.
 - Hovering a text box exposes its current contents.
+- Audio and transcription waveform previews zoom into the visible time slice instead of staying compressed to the full source duration.
+- Transcription tracks can be configured against a Rust model and a destination text track without leaving the timeline flow.
+- Track-list rows can be reordered locally before detached windows exist.
 
 Status:
 
-- In progress: add-track, document model, hover tooltip, and drag-box creation are implemented; pinned editing and detached editor windows remain to be built.
+- In progress: add-track, document model, hover tooltip, drag-box creation, waveform viewport fixes, transcription settings, and local track reordering are implemented; pinned editing, richer keyboard navigation, and detached editor windows remain to be built.
 
 ### Phase 8: Persist Recorded Audio Into The Timeline Document
 
@@ -377,11 +390,11 @@ Definition of done:
 
 Implement Phase 7 next:
 
-- Add a pinned text editor surface that binds to a hovered or clicked text box.
-- Implement primitive cursor movement and text entry over the text-box document model.
-- Support the requested control-word navigation and delete variants before widening into a richer editor.
-- Keep the current in-window toolbar working while designing the shared session boundary for later detached windows.
-- Add focused tests for text-box selection/edit binding and keyboard movement semantics where practical.
+- Add a pinned text editor surface that binds to a hovered or clicked text box and reuse that editor for track-title editing.
+- Implement primitive cursor movement and text entry over the text-box/track-name document model.
+- Add the requested keyboard navigation across track rows and per-track controls before widening into detached windows.
+- Keep the current in-window toolbar/settings flow working while designing the shared session boundary for later rope/socket tool windows.
+- Add focused tests for text-box selection/edit binding, track renaming, and keyboard movement semantics where practical.
 - Run `./check-all.ps1` and `tracey query status`.
 
-This slice keeps momentum on the newly landed text-track milestone by making the boxes editable before the larger shared-session refactor that detached toolbar, track-list, and editor windows will require.
+This slice keeps momentum on the newly landed text-track/settings/reorder milestone by making the boxes and track titles editable before the larger shared-session refactor that detached toolbar, track-list, and editor windows will require.
