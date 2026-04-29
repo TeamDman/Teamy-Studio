@@ -11,6 +11,25 @@ use uom::si::f64::{Length, Time};
 use uom::si::length::meter;
 use uom::si::time::{millisecond, nanosecond, second};
 
+pub mod dataset;
+pub mod query;
+pub mod synthetic;
+pub mod time;
+
+pub use dataset::{
+    TimelineCompactionReport, TimelineDataset, TimelineDatasetRevision, TimelineEventItem,
+    TimelineField, TimelineFieldInputValue, TimelineFieldValue, TimelineInternedStringId,
+    TimelineItem, TimelineItemId, TimelineItemInput, TimelineItemKind, TimelineItemSequence,
+    TimelineObjectRef, TimelineSpanItem, TimelineWriteLogEntry,
+};
+pub use query::{
+    TimelineGroupingMode, TimelineRenderCluster, TimelineRenderEvent, TimelineRenderItem,
+    TimelineRenderPlan, TimelineRenderRow, TimelineRenderRowId, TimelineRenderRowKey,
+    TimelineRenderSpan, TimelineViewportQuery,
+};
+pub use synthetic::{TimelineSyntheticConfig, generate_synthetic_timeline_dataset};
+pub use time::{TimelineDurationNs, TimelineInstantNs, TimelineRangeNs};
+
 use crate::model::DEFAULT_TRANSCRIPTION_MODEL_NAME;
 
 sguaba::system!(pub struct TimelineViewportSpace using right-handed XYZ);

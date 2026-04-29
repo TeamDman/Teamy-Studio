@@ -41,6 +41,9 @@ Importing a Tracy capture from the Add Track workflow must append a tracing-span
 timeline[add-track.microphone-live-device]
 Choosing Microphone from the Add Track workflow must create an audio track backed by the selected or default live audio input device when one is available, and otherwise fall back to a generic microphone track.
 
+timeline[add-track.microphone-placeholder]
+Timeline documents must be able to create a generic microphone placeholder track when no concrete live input device has been selected yet.
+
 timeline[track.microphone-row]
 Live microphone tracks must render their device icon, device name, and a record control in the left track-list panel.
 
@@ -111,6 +114,38 @@ Dragging from the timeline ruler should produce a rectangular selection whose ve
 
 timeline[viewport.scrollbars]
 Timeline documents should render horizontal and vertical scrollbar affordances that reflect the current visible time span and track scroll position.
+
+## Reusable Display Model
+
+timeline[display.time-strict]
+Reusable timeline display-model ranges must reject reversed start and end times instead of silently normalizing them.
+
+timeline[display.dataset-owned-ids]
+Reusable timeline datasets must assign internal item IDs and insertion sequences independently from source-specific job, tracing, Tracy, or calendar identifiers.
+
+timeline[display.dataset-checked-mutation]
+Reusable timeline datasets must mutate raw span and event items only through checked APIs that preserve time-range and item-kind invariants.
+
+timeline[display.dataset-index-compaction]
+Reusable timeline dataset compaction must update query indexes and clear pending writes without discarding raw timeline items.
+
+timeline[display.object-refs]
+Reusable timeline items must support lightweight object references and primitive object fields so future typed object inspection can be connected without storing large payloads in timeline items.
+
+timeline[display.query-explicit-now]
+Reusable timeline viewport queries must carry an explicit `now` value so open spans can be rendered deterministically without reading ambient wall-clock time.
+
+timeline[display.query-derived-rows]
+Reusable timeline render plans must derive compact rows from grouping settings rather than treating sparse source IDs as fixed row numbers.
+
+timeline[display.query-render-items]
+Reusable timeline render plans must expose explicit render item variants for spans, instant events, folded span clusters, and folded event clusters.
+
+timeline[display.query-folding]
+Reusable timeline render projection must fold dense spans and events into viewport-dependent clusters without mutating raw timeline items.
+
+timeline[display.synthetic-data]
+Reusable timeline synthetic data generation must be available outside test-only code and must create valid renderable datasets with dense spans, event bursts, open spans, sparse group keys, repeated metadata, and object-reference-bearing items.
 
 ## Transcription Tracks
 
