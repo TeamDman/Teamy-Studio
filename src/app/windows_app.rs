@@ -2,7 +2,7 @@ use std::cell::RefCell;
 use std::ffi::c_void;
 use std::marker::PhantomData;
 use std::path::Path;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 #[cfg(feature = "tracy")]
@@ -142,8 +142,25 @@ const MODEL_WARNING_PREPARE_HOLD_DURATION: Duration = Duration::from_millis(1400
 const TERMINAL_THROUGHPUT_RESULTS_DIR: &str = "self-test/terminal-throughput";
 const DEMO_MODE_STATE_CHANGED_MESSAGE: u32 = WM_APP + 0x402;
 const TIMELINE_DOCUMENT_CHANGED_MESSAGE: u32 = WM_APP + 0x403;
+const TIMELINE_DOCUMENT_COMMAND_MESSAGE: u32 = WM_APP + 0x404;
 
-type SharedTimelineDocument = Arc<Mutex<TimelineDocument>>;
+#[derive(Clone, Debug)]
+enum TimelineDocumentCommand {
+    ApplyTranscriptionSettings(windows_scene::TimelineTranscriptionSettingsViewState),
+    AppendTextTrackForTranscriptionSettings {
+        track_id: TimelineTrackId,
+    },
+    AppendMicrophoneTrackForTranscriptionSettings {
+        track_id: TimelineTrackId,
+        device_name: String,
+        device_id: String,
+    },
+    SetTranscriptionAutomation {
+        track_id: TimelineTrackId,
+        advance_boundaries: bool,
+        submit_chunks: bool,
+    },
+}
 
 thread_local! {
     static APP_STATE: RefCell<Option<AppState>> = const { RefCell::new(None) };
@@ -211,28 +228,14 @@ fn broadcast_timeline_document_changed() {
     }
 }
 
-fn shared_timeline_document(document: TimelineDocument) -> SharedTimelineDocument {
-    Arc::new(Mutex::new(document))
-}
-
-fn lock_shared_timeline_document(
-    document: &SharedTimelineDocument,
-) -> std::sync::MutexGuard<'_, TimelineDocument> {
-    document
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
-fn clone_shared_timeline_document(document: &SharedTimelineDocument) -> TimelineDocument {
-    lock_shared_timeline_document(document).clone()
-}
-
 #[derive(Default)]
 struct SceneWindowInitialization {
     audio_input_device_window: Option<AudioInputDeviceWindowState>,
-    timeline_document: Option<SharedTimelineDocument>,
+    timeline_document: Option<TimelineDocument>,
     timeline_transcription_settings: Option<windows_scene::TimelineTranscriptionSettingsViewState>,
     model_warning: Option<windows_scene::ModelWarningViewState>,
+    timeline_document_command_sender: Option<mpsc::Sender<TimelineDocumentCommand>>,
+    timeline_document_command_target: Option<isize>,
 }
 
 #[expect(
@@ -516,8 +519,11 @@ struct SceneAppState {
     audio_input_picker: AudioInputPickerState,
     audio_input_picker_completion: AudioInputPickerCompletion,
     audio_input_device_window: Option<AudioInputDeviceWindowState>,
-    timeline_document: Option<SharedTimelineDocument>,
+    timeline_document: Option<TimelineDocument>,
     timeline_transcription_settings: Option<windows_scene::TimelineTranscriptionSettingsViewState>,
+    timeline_document_command_sender: Option<mpsc::Sender<TimelineDocumentCommand>>,
+    timeline_document_command_receiver: Option<mpsc::Receiver<TimelineDocumentCommand>>,
+    timeline_document_command_target: Option<isize>,
     model_warning: Option<windows_scene::ModelWarningViewState>,
     model_warning_prepare_started_at: Option<Instant>,
     timeline_tool: TimelineInteractionTool,
@@ -1456,7 +1462,7 @@ fn run_scene_window(
     app_home: &AppHome,
     scene_kind: SceneWindowKind,
     vt_engine: VtEngineChoice,
-    initialization: SceneWindowInitialization,
+    mut initialization: SceneWindowInitialization,
 ) -> eyre::Result<()> {
     initialize_demo_mode_state(app_home)?;
     let window_thread = WindowThread::current();
@@ -1477,6 +1483,11 @@ fn run_scene_window(
     } else {
         AudioInputPickerState::default()
     };
+    let (local_timeline_command_sender, local_timeline_command_receiver) = mpsc::channel();
+    let timeline_document_command_sender = initialization
+        .timeline_document_command_sender
+        .take()
+        .or_else(|| Some(local_timeline_command_sender.clone()));
 
     SCENE_APP_STATE.with(|state| {
         *state.borrow_mut() = Some(SceneAppState {
@@ -1491,6 +1502,9 @@ fn run_scene_window(
             audio_input_device_window: initialization.audio_input_device_window,
             timeline_document: initialization.timeline_document,
             timeline_transcription_settings: initialization.timeline_transcription_settings,
+            timeline_document_command_sender,
+            timeline_document_command_receiver: Some(local_timeline_command_receiver),
+            timeline_document_command_target: initialization.timeline_document_command_target,
             model_warning: initialization.model_warning,
             model_warning_prepare_started_at: None,
             timeline_tool: TimelineInteractionTool::default(),
@@ -1536,6 +1550,11 @@ fn run_scene_window(
     let chrome_tooltip = ChromeTooltipController::create(hwnd)?;
     with_scene_app_state(|state| {
         state.hwnd = Some(hwnd);
+        if state.timeline_document_command_target.is_none()
+            && scene_kind_owns_timeline_document_commands(state.scene_kind)
+        {
+            state.timeline_document_command_target = Some(hwnd.raw().0 as isize);
+        }
         state.chrome_tooltip = chrome_tooltip;
         state.renderer = Some(renderer);
         Ok(())
@@ -1546,31 +1565,35 @@ fn run_scene_window(
     message_loop()
 }
 
-fn timeline_document_handle(state: &SceneAppState) -> Option<SharedTimelineDocument> {
-    state.timeline_document.as_ref().map(Arc::clone)
+fn timeline_document_handle(state: &SceneAppState) -> Option<&TimelineDocument> {
+    state.timeline_document.as_ref()
 }
 
-fn ensure_timeline_document_handle(state: &mut SceneAppState) -> SharedTimelineDocument {
-    Arc::clone(
-        state
-            .timeline_document
-            .get_or_insert_with(|| shared_timeline_document(TimelineDocument::blank())),
+fn scene_kind_owns_timeline_document_commands(scene_kind: SceneWindowKind) -> bool {
+    matches!(
+        scene_kind,
+        SceneWindowKind::Timeline
+            | SceneWindowKind::TimelineStart
+            | SceneWindowKind::TimelineAddTrack
     )
 }
 
+fn timeline_document_handle_mut(state: &mut SceneAppState) -> Option<&mut TimelineDocument> {
+    state.timeline_document.as_mut()
+}
+
+fn ensure_timeline_document_handle(state: &mut SceneAppState) -> &mut TimelineDocument {
+    state
+        .timeline_document
+        .get_or_insert_with(TimelineDocument::blank)
+}
+
 fn replace_timeline_document(state: &mut SceneAppState, document: TimelineDocument) {
-    if let Some(existing_document) = state.timeline_document.as_ref() {
-        *lock_shared_timeline_document(existing_document) = document;
-    } else {
-        state.timeline_document = Some(shared_timeline_document(document));
-    }
+    state.timeline_document = Some(document);
 }
 
 fn timeline_document_snapshot(state: &SceneAppState) -> Option<TimelineDocument> {
-    state
-        .timeline_document
-        .as_ref()
-        .map(clone_shared_timeline_document)
+    state.timeline_document.clone()
 }
 
 fn normalize_initial_stdin(text: &str) -> String {
@@ -2282,6 +2305,7 @@ extern "system" fn scene_window_proc(
         WM_TIMER if wparam.0 == FOCUSED_RENDER_TIMER_ID => handle_scene_focused_render_timer(hwnd),
         DEMO_MODE_STATE_CHANGED_MESSAGE => handle_scene_demo_mode_state_changed(hwnd),
         TIMELINE_DOCUMENT_CHANGED_MESSAGE => handle_scene_timeline_document_changed(hwnd),
+        TIMELINE_DOCUMENT_COMMAND_MESSAGE => handle_scene_timeline_document_command(hwnd),
         WM_KEYDOWN | WM_SYSKEYDOWN => handle_scene_key_down_message(hwnd, message, wparam, lparam),
         WM_LBUTTONDOWN => handle_bool_message(hwnd, message, wparam, lparam, |hwnd| {
             handle_scene_left_button_down(hwnd, lparam)
@@ -2539,11 +2563,9 @@ fn handle_scene_key_down_message(
             if virtual_key == u32::from(VK_ESCAPE.0)
                 && let Some(pending_reorder) = state.pending_timeline_track_reorder.take()
             {
-                if let Some(document) = timeline_document_handle(state) {
-                    let restored = {
-                        let mut document = lock_shared_timeline_document(&document);
-                        document.restore_track_order(&pending_reorder.original_track_order)
-                    };
+                if let Some(document) = timeline_document_handle_mut(state) {
+                    let restored =
+                        document.restore_track_order(&pending_reorder.original_track_order);
                     if restored {
                         broadcast_timeline_document_changed();
                     }
@@ -2984,6 +3006,91 @@ fn handle_scene_timeline_document_changed(hwnd: WindowHandle) -> LRESULT {
     }) {
         Ok(()) => LRESULT(0),
         Err(error) => fail_and_close(hwnd, &error),
+    }
+}
+
+fn handle_scene_timeline_document_command(hwnd: WindowHandle) -> LRESULT {
+    match with_scene_app_state(|state| {
+        let commands = state
+            .timeline_document_command_receiver
+            .as_ref()
+            .map(|receiver| receiver.try_iter().collect::<Vec<_>>())
+            .unwrap_or_default();
+        let mut changed = false;
+        for command in commands {
+            changed |= apply_timeline_document_command(state, command);
+        }
+        if changed {
+            render_scene_window_frame(state, hwnd, None, true)?;
+        }
+        Ok(())
+    }) {
+        Ok(()) => LRESULT(0),
+        Err(error) => fail_and_close(hwnd, &error),
+    }
+}
+
+fn post_timeline_document_command(target: isize) {
+    let hwnd = HWND(target as *mut c_void);
+    // Safety: the target value comes from a live scene HWND; stale windows are tolerated by PostMessageW.
+    let _ = unsafe {
+        PostMessageW(
+            Some(hwnd),
+            TIMELINE_DOCUMENT_COMMAND_MESSAGE,
+            WPARAM(0),
+            LPARAM(0),
+        )
+    };
+}
+
+fn send_timeline_document_command(state: &SceneAppState, command: TimelineDocumentCommand) -> bool {
+    let Some(sender) = state.timeline_document_command_sender.as_ref() else {
+        return false;
+    };
+    let Some(target) = state.timeline_document_command_target else {
+        return false;
+    };
+    if sender.send(command).is_err() {
+        return false;
+    }
+    post_timeline_document_command(target);
+    true
+}
+
+fn apply_timeline_document_command(
+    state: &mut SceneAppState,
+    command: TimelineDocumentCommand,
+) -> bool {
+    match command {
+        TimelineDocumentCommand::ApplyTranscriptionSettings(settings) => {
+            apply_timeline_transcription_settings_to_document(state, settings)
+        }
+        TimelineDocumentCommand::AppendTextTrackForTranscriptionSettings { track_id } => {
+            let Some(document) = timeline_document_handle_mut(state) else {
+                return false;
+            };
+            let text_track_id = document.append_text_track();
+            document.set_transcription_track_target_text_track(track_id, Some(text_track_id))
+        }
+        TimelineDocumentCommand::AppendMicrophoneTrackForTranscriptionSettings {
+            track_id,
+            device_name,
+            device_id,
+        } => {
+            let Some(document) = timeline_document_handle_mut(state) else {
+                return false;
+            };
+            let audio_track_id =
+                document.append_microphone_track_for_device_id(device_name, device_id);
+            document.set_transcription_track_target_audio_track(track_id, Some(audio_track_id))
+        }
+        TimelineDocumentCommand::SetTranscriptionAutomation {
+            track_id,
+            advance_boundaries,
+            submit_chunks,
+        } => timeline_document_handle_mut(state).is_some_and(|document| {
+            document.set_transcription_track_automation(track_id, advance_boundaries, submit_chunks)
+        }),
     }
 }
 
@@ -3725,9 +3832,9 @@ fn handle_scene_left_button_up(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Resu
             state.timeline_selection = None;
             let end_time = timeline_time_from_client_point(state, layout, point);
             if point != pending_text_block.origin
-                && let Some(document) = timeline_document_handle(state)
+                && let Some(document) = timeline_document_handle_mut(state)
             {
-                let _ = lock_shared_timeline_document(&document).append_empty_text_block(
+                let _ = document.append_empty_text_block(
                     pending_text_block.track_id,
                     TimelineTimeRangeNs::new(pending_text_block.anchor_time, end_time),
                 );
@@ -3951,7 +4058,7 @@ fn handle_scene_mouse_move(
         let Some(pan_drag) = state.timeline_pan_drag else {
             return Ok(false);
         };
-        let Some(document) = timeline_document_handle(state) else {
+        let Some(document) = timeline_document_handle_mut(state) else {
             state.timeline_pan_drag = None;
             return Ok(true);
         };
@@ -3960,8 +4067,7 @@ fn handle_scene_mouse_move(
         let current = point.to_win32_point()?;
         let delta_x = current.x - origin.x;
         let delta_y = current.y - origin.y;
-        lock_shared_timeline_document(&document)
-            .set_viewport(pan_drag.origin_viewport.pan_pixels(-delta_x));
+        document.set_viewport(pan_drag.origin_viewport.pan_pixels(-delta_x));
 
         let layout = scene_client_layout(hwnd, state)?;
         state.timeline_vertical_scroll_offset =
@@ -3992,20 +4098,19 @@ fn handle_scene_mouse_move(
         let Some(next_index) = timeline_track_reorder_index_at_point(state, layout, point) else {
             return Ok(true);
         };
-        let document = timeline_document_handle(state);
+        let has_document = state.timeline_document.is_some();
         let Some(pending_reorder) = state.pending_timeline_track_reorder.as_mut() else {
             return Ok(false);
         };
         if next_index != pending_reorder.current_index {
-            let Some(document) = document else {
+            if !has_document {
                 state.pending_timeline_track_reorder = None;
                 state.pressed_target = None;
                 return Ok(true);
-            };
-            let moved = {
-                let mut document = lock_shared_timeline_document(&document);
+            }
+            let moved = state.timeline_document.as_mut().is_some_and(|document| {
                 document.move_track(pending_reorder.current_index, next_index)
-            };
+            });
             pending_reorder.current_index = next_index;
             if moved {
                 broadcast_timeline_document_changed();
@@ -4268,11 +4373,12 @@ fn handle_scene_right_button_down(hwnd: WindowHandle, lparam: LPARAM) -> eyre::R
         let Some(document) = timeline_document_handle(state) else {
             return Ok(false);
         };
+        let origin_viewport = document.viewport();
 
         state.pending_timeline_selection = None;
         state.timeline_pan_drag = Some(TimelinePanDrag {
             origin: point,
-            origin_viewport: lock_shared_timeline_document(&document).viewport(),
+            origin_viewport,
             origin_vertical_scroll_offset: timeline_current_vertical_scroll_offset(state, layout),
         });
         trace!(?point, "timeline right-button pan started");
@@ -4309,9 +4415,9 @@ fn handle_scene_mouse_wheel(
         }
 
         let current_viewport = current_timeline_zoom_viewport(state);
-        let Some(document) = timeline_document_handle(state) else {
+        if state.timeline_document.is_none() {
             return Ok(false);
-        };
+        }
 
         let steps = if wheel_delta.abs() < MOUSE_WHEEL_DELTA {
             i32::from(wheel_delta.signum())
@@ -4336,7 +4442,6 @@ fn handle_scene_mouse_wheel(
                 ?point,
                 "timeline wheel zoom while right-button pan is active"
             );
-            lock_shared_timeline_document(&document).set_viewport(target_viewport);
             state.timeline_zoom_animation = None;
             rebase_timeline_pan_drag_after_zoom(
                 pan_drag,
@@ -4344,9 +4449,14 @@ fn handle_scene_mouse_wheel(
                 target_viewport,
                 current_vertical_scroll_offset,
             );
+            if let Some(document) = timeline_document_handle_mut(state) {
+                document.set_viewport(target_viewport);
+            }
         } else {
             trace!(wheel_delta, steps, ?point, "timeline wheel zoom");
-            lock_shared_timeline_document(&document).set_viewport(current_viewport);
+            if let Some(document) = timeline_document_handle_mut(state) {
+                document.set_viewport(current_viewport);
+            }
             state.timeline_zoom_animation = Some(TimelineZoomAnimation {
                 start_viewport: current_viewport,
                 target_viewport,
@@ -5173,17 +5283,13 @@ fn sync_timeline_audio_runtime_from_document(state: &mut SceneAppState) {
     let Some(document) = timeline_document_handle(state) else {
         return;
     };
-    let microphone = {
-        let document = lock_shared_timeline_document(&document);
-        document.tracks().iter().find_map(|track| {
-            let crate::timeline::TimelineTrackProjection::Audio(projection) = track.projection()
-            else {
-                return None;
-            };
-            let device_id = projection.source_device_id()?;
-            Some((device_id.to_owned(), projection.source_label().to_owned()))
-        })
-    };
+    let microphone = document.tracks().iter().find_map(|track| {
+        let crate::timeline::TimelineTrackProjection::Audio(projection) = track.projection() else {
+            return None;
+        };
+        let device_id = projection.source_device_id()?;
+        Some((device_id.to_owned(), projection.source_label().to_owned()))
+    });
     let Some((device_id, fallback_name)) = microphone else {
         return;
     };
@@ -5207,17 +5313,14 @@ fn sync_timeline_transcription_text_blocks(state: &mut SceneAppState) {
     let Some(document) = timeline_document_handle(state) else {
         return;
     };
-    let target_text_track_id = {
-        let document = lock_shared_timeline_document(&document);
-        document.tracks().iter().find_map(|track| {
-            let crate::timeline::TimelineTrackProjection::Transcription(projection) =
-                track.projection()
-            else {
-                return None;
-            };
-            projection.target_text_track_id()
-        })
-    };
+    let target_text_track_id = document.tracks().iter().find_map(|track| {
+        let crate::timeline::TimelineTrackProjection::Transcription(projection) =
+            track.projection()
+        else {
+            return None;
+        };
+        projection.target_text_track_id()
+    });
     let Some(target_text_track_id) = target_text_track_id else {
         if state
             .audio_input_device_window
@@ -5247,7 +5350,10 @@ fn sync_timeline_transcription_text_blocks(state: &mut SceneAppState) {
     else {
         return;
     };
-    let appended = lock_shared_timeline_document(&document).append_text_block(
+    let Some(document) = timeline_document_handle_mut(state) else {
+        return;
+    };
+    let appended = document.append_text_block(
         target_text_track_id,
         TimelineTimeRangeNs::new(
             TimelineTimeNs::from_duration(Time::new::<second>(start_seconds)),
@@ -5821,7 +5927,7 @@ fn timeline_viewport_control_at_point(
 
 fn timeline_live_audio_track_index(state: &SceneAppState) -> Option<usize> {
     let document = timeline_document_handle(state)?;
-    lock_shared_timeline_document(&document)
+    document
         .tracks()
         .iter()
         .position(|track| track.kind() == crate::timeline::TimelineTrackKind::Audio)
@@ -5829,7 +5935,7 @@ fn timeline_live_audio_track_index(state: &SceneAppState) -> Option<usize> {
 
 fn timeline_live_transcription_track_index(state: &SceneAppState) -> Option<usize> {
     let document = timeline_document_handle(state)?;
-    lock_shared_timeline_document(&document)
+    document
         .tracks()
         .iter()
         .position(|track| track.kind() == crate::timeline::TimelineTrackKind::Transcription)
@@ -6087,11 +6193,13 @@ fn select_timeline_transcription_settings_output_text_track(
 }
 
 fn append_text_track_from_timeline_transcription_settings(state: &mut SceneAppState) {
-    let Some(document) = timeline_document_handle(state) else {
+    let Some(settings) = state.timeline_transcription_settings else {
+        return;
+    };
+    let Some(document) = timeline_document_handle_mut(state) else {
         return;
     };
     let selected_target_index = {
-        let mut document = lock_shared_timeline_document(&document);
         let track_id = document.append_text_track();
         document
             .tracks()
@@ -6101,6 +6209,15 @@ fn append_text_track_from_timeline_transcription_settings(state: &mut SceneAppSt
             .position(|candidate| candidate == track_id)
             .map_or(0, |index| index + 1)
     };
+    let _ = document.set_transcription_track_target_text_track(
+        settings.track_id,
+        document
+            .tracks()
+            .iter()
+            .filter(|track| track.kind() == crate::timeline::TimelineTrackKind::Text)
+            .map(crate::timeline::TimelineTrack::id)
+            .nth(selected_target_index.saturating_sub(1)),
+    );
     if let Some(settings) = state.timeline_transcription_settings.as_mut() {
         settings.selected_column =
             windows_scene::TimelineTranscriptionSettingsColumn::OutputTextTrack;
@@ -6108,7 +6225,12 @@ fn append_text_track_from_timeline_transcription_settings(state: &mut SceneAppSt
         settings.output_target_docked = true;
     }
     apply_timeline_transcription_settings_selection(state);
-    broadcast_timeline_document_changed();
+    let _ = send_timeline_document_command(
+        state,
+        TimelineDocumentCommand::AppendTextTrackForTranscriptionSettings {
+            track_id: settings.track_id,
+        },
+    );
 }
 
 fn open_audio_track_picker_from_timeline_transcription_settings(state: &mut SceneAppState) {
@@ -6143,28 +6265,33 @@ fn update_timeline_transcription_settings_automation(
     let Some(document) = timeline_document_handle(state) else {
         return;
     };
-    let changed = {
-        let mut document = lock_shared_timeline_document(&document);
-        let Some(track) = document
-            .tracks()
-            .iter()
-            .find(|track| track.id() == settings.track_id)
-        else {
-            return;
-        };
-        let crate::timeline::TimelineTrackProjection::Transcription(projection) =
-            track.projection()
-        else {
-            return;
-        };
-        let (advance, submit) = update(
-            projection.automatically_advance_chunk_boundaries(),
-            projection.automatically_submit_chunks(),
-        );
-        document.set_transcription_track_automation(settings.track_id, advance, submit)
+    let Some(track) = document
+        .tracks()
+        .iter()
+        .find(|track| track.id() == settings.track_id)
+    else {
+        return;
     };
+    let crate::timeline::TimelineTrackProjection::Transcription(projection) = track.projection()
+    else {
+        return;
+    };
+    let (advance, submit) = update(
+        projection.automatically_advance_chunk_boundaries(),
+        projection.automatically_submit_chunks(),
+    );
+    let changed = timeline_document_handle_mut(state).is_some_and(|document| {
+        document.set_transcription_track_automation(settings.track_id, advance, submit)
+    });
     if changed {
-        broadcast_timeline_document_changed();
+        let _ = send_timeline_document_command(
+            state,
+            TimelineDocumentCommand::SetTranscriptionAutomation {
+                track_id: settings.track_id,
+                advance_boundaries: advance,
+                submit_chunks: submit,
+            },
+        );
     }
 }
 
@@ -6334,7 +6461,7 @@ fn timeline_transcription_settings_model_row_at_point(
 
 fn timeline_transcription_settings_input_row_count(state: &SceneAppState) -> usize {
     timeline_document_handle(state).map_or(1, |document| {
-        lock_shared_timeline_document(&document)
+        document
             .tracks()
             .iter()
             .filter(|track| track.kind() == crate::timeline::TimelineTrackKind::Audio)
@@ -6345,7 +6472,7 @@ fn timeline_transcription_settings_input_row_count(state: &SceneAppState) -> usi
 
 fn timeline_transcription_settings_output_row_count(state: &SceneAppState) -> usize {
     timeline_document_handle(state).map_or(1, |document| {
-        lock_shared_timeline_document(&document)
+        document
             .tracks()
             .iter()
             .filter(|track| track.kind() == crate::timeline::TimelineTrackKind::Text)
@@ -6457,24 +6584,32 @@ fn timeline_transcription_settings_state_for_document(
 }
 
 fn open_timeline_transcription_settings_window_from_scene(track_index: usize) -> eyre::Result<()> {
-    let Some((app_home, vt_engine, timeline_document, timeline_transcription_settings)) =
-        with_scene_app_state(|state| {
-            let Some(timeline_document) = timeline_document_handle(state) else {
-                return Ok(None);
-            };
-            let document_snapshot = clone_shared_timeline_document(&timeline_document);
-            Ok(
-                timeline_transcription_settings_state_for_document(&document_snapshot, track_index)
-                    .map(|timeline_transcription_settings| {
-                        (
-                            state.app_home.clone(),
-                            state.vt_engine,
-                            timeline_document,
-                            timeline_transcription_settings,
-                        )
-                    }),
-            )
-        })?
+    let Some((
+        app_home,
+        vt_engine,
+        timeline_document,
+        timeline_document_command_sender,
+        timeline_document_command_target,
+        timeline_transcription_settings,
+    )) = with_scene_app_state(|state| {
+        let Some(timeline_document) = timeline_document_handle(state) else {
+            return Ok(None);
+        };
+        Ok(
+            timeline_transcription_settings_state_for_document(timeline_document, track_index).map(
+                |timeline_transcription_settings| {
+                    (
+                        state.app_home.clone(),
+                        state.vt_engine,
+                        timeline_document.clone(),
+                        state.timeline_document_command_sender.clone(),
+                        state.timeline_document_command_target,
+                        timeline_transcription_settings,
+                    )
+                },
+            ),
+        )
+    })?
     else {
         return Ok(());
     };
@@ -6488,6 +6623,8 @@ fn open_timeline_transcription_settings_window_from_scene(track_index: usize) ->
                 vt_engine,
                 SceneWindowInitialization {
                     timeline_document: Some(timeline_document),
+                    timeline_document_command_sender,
+                    timeline_document_command_target,
                     timeline_transcription_settings: Some(timeline_transcription_settings),
                     ..Default::default()
                 },
@@ -6608,7 +6745,6 @@ fn toggle_audio_input_transcription_from_scene_state(state: &mut SceneAppState) 
 
 fn selected_timeline_transcription_model_name(state: &SceneAppState) -> Option<String> {
     let document = timeline_document_handle(state)?;
-    let document = lock_shared_timeline_document(&document);
     document.tracks().iter().find_map(|track| {
         let crate::timeline::TimelineTrackProjection::Transcription(projection) =
             track.projection()
@@ -6635,45 +6771,51 @@ fn apply_timeline_transcription_settings_selection(state: &mut SceneAppState) {
     let Some(settings) = state.timeline_transcription_settings else {
         return;
     };
-    let Some(document) = timeline_document_handle(state) else {
-        return;
+    let changed = apply_timeline_transcription_settings_to_document(state, settings);
+    if changed {
+        let _ = send_timeline_document_command(
+            state,
+            TimelineDocumentCommand::ApplyTranscriptionSettings(settings),
+        );
+    }
+}
+
+fn apply_timeline_transcription_settings_to_document(
+    state: &mut SceneAppState,
+    settings: windows_scene::TimelineTranscriptionSettingsViewState,
+) -> bool {
+    let Some(document) = timeline_document_handle_mut(state) else {
+        return false;
     };
     let model_name = KNOWN_WHISPER_MODELS
         .get(settings.selected_model_index)
         .map_or(KNOWN_WHISPER_MODELS[0].name, |model| model.name);
-    let changed = {
-        let mut document = lock_shared_timeline_document(&document);
-        let text_track_ids = document
-            .tracks()
-            .iter()
-            .filter(|track| track.kind() == crate::timeline::TimelineTrackKind::Text)
-            .map(crate::timeline::TimelineTrack::id)
-            .collect::<Vec<_>>();
-        let audio_track_ids = document
-            .tracks()
-            .iter()
-            .filter(|track| track.kind() == crate::timeline::TimelineTrackKind::Audio)
-            .map(crate::timeline::TimelineTrack::id)
-            .collect::<Vec<_>>();
-        let target_audio_track_id = settings
-            .selected_input_audio_track_index
-            .checked_sub(1)
-            .and_then(|index| audio_track_ids.get(index).copied());
-        let target_track_id = settings
-            .selected_output_text_track_index
-            .checked_sub(1)
-            .and_then(|index| text_track_ids.get(index).copied());
-        let model_changed =
-            document.set_transcription_track_model_name(settings.track_id, model_name);
-        let input_changed = document
-            .set_transcription_track_target_audio_track(settings.track_id, target_audio_track_id);
-        let target_changed =
-            document.set_transcription_track_target_text_track(settings.track_id, target_track_id);
-        model_changed || input_changed || target_changed
-    };
-    if changed {
-        broadcast_timeline_document_changed();
-    }
+    let text_track_ids = document
+        .tracks()
+        .iter()
+        .filter(|track| track.kind() == crate::timeline::TimelineTrackKind::Text)
+        .map(crate::timeline::TimelineTrack::id)
+        .collect::<Vec<_>>();
+    let audio_track_ids = document
+        .tracks()
+        .iter()
+        .filter(|track| track.kind() == crate::timeline::TimelineTrackKind::Audio)
+        .map(crate::timeline::TimelineTrack::id)
+        .collect::<Vec<_>>();
+    let target_audio_track_id = settings
+        .selected_input_audio_track_index
+        .checked_sub(1)
+        .and_then(|index| audio_track_ids.get(index).copied());
+    let target_track_id = settings
+        .selected_output_text_track_index
+        .checked_sub(1)
+        .and_then(|index| text_track_ids.get(index).copied());
+    let model_changed = document.set_transcription_track_model_name(settings.track_id, model_name);
+    let input_changed = document
+        .set_transcription_track_target_audio_track(settings.track_id, target_audio_track_id);
+    let target_changed =
+        document.set_transcription_track_target_text_track(settings.track_id, target_track_id);
+    model_changed || input_changed || target_changed
 }
 
 fn timeline_track_reorder_handle_at_point(
@@ -6682,7 +6824,6 @@ fn timeline_track_reorder_handle_at_point(
     point: ClientPoint,
 ) -> Option<usize> {
     let document = timeline_document_handle(state)?;
-    let document = lock_shared_timeline_document(&document);
     let timeline_layout = timeline_layout(layout);
     (0..document.tracks().len()).find(|index| {
         windows_scene::timeline_track_reorder_handle_rect(timeline_layout, *index)
@@ -6696,7 +6837,6 @@ fn timeline_track_reorder_index_at_point(
     point: ClientPoint,
 ) -> Option<usize> {
     let document = timeline_document_handle(state)?;
-    let document = lock_shared_timeline_document(&document);
     if document.tracks().is_empty() {
         return None;
     }
@@ -6807,9 +6947,7 @@ fn timeline_audio_head_at_point(
 }
 
 fn timeline_track_count(state: &SceneAppState) -> usize {
-    timeline_document_handle(state).map_or(0, |document| {
-        lock_shared_timeline_document(&document).tracks().len()
-    })
+    timeline_document_handle(state).map_or(0, |document| document.tracks().len())
 }
 
 fn timeline_layout(layout: TerminalLayout) -> windows_scene::TimelineDocumentLayout {
@@ -6937,9 +7075,7 @@ fn current_timeline_zoom_viewport(state: &SceneAppState) -> TimelineViewport {
     let base_viewport = state
         .timeline_document
         .as_ref()
-        .map_or_else(TimelineViewport::default, |document| {
-            lock_shared_timeline_document(document).viewport()
-        });
+        .map_or_else(TimelineViewport::default, TimelineDocument::viewport);
     state
         .timeline_zoom_animation
         .map_or(base_viewport, |animation| {
@@ -6958,7 +7094,7 @@ fn apply_timeline_zoom_animation(state: &mut SceneAppState) {
     let Some(animation) = state.timeline_zoom_animation else {
         return;
     };
-    let Some(document) = timeline_document_handle(state) else {
+    let Some(document) = timeline_document_handle_mut(state) else {
         state.timeline_zoom_animation = None;
         return;
     };
@@ -6967,12 +7103,12 @@ fn apply_timeline_zoom_animation(state: &mut SceneAppState) {
         / TIMELINE_ZOOM_ANIMATION_DURATION.as_secs_f64())
     .clamp(0.0, 1.0);
     if progress >= 1.0 {
-        lock_shared_timeline_document(&document).set_viewport(animation.target_viewport);
+        document.set_viewport(animation.target_viewport);
         state.timeline_zoom_animation = None;
         return;
     }
 
-    lock_shared_timeline_document(&document).set_viewport(interpolate_timeline_viewport(
+    document.set_viewport(interpolate_timeline_viewport(
         animation.start_viewport,
         animation.target_viewport,
         ease_out_elastic(progress),
@@ -7476,7 +7612,7 @@ fn commit_audio_input_picker_selection_from_scene(
         Ok(AudioInputPickerCompletion::TimelineMicrophoneTrack) => {
             let result = with_scene_app_state(|state| {
                 let document = ensure_timeline_document_handle(state);
-                let _ = lock_shared_timeline_document(&document)
+                let _ = document
                     .append_microphone_track_for_device_id(device.name.clone(), device.id.clone());
                 state.audio_input_device_window = Some(AudioInputDeviceWindowState::new(device));
                 state.audio_input_picker_completion = AudioInputPickerCompletion::OpenDeviceWindow;
@@ -7497,9 +7633,11 @@ fn commit_audio_input_picker_selection_from_scene(
         }
         Ok(AudioInputPickerCompletion::TimelineTranscriptionInputTrack) => {
             let result = with_scene_app_state(|state| {
+                let settings_track_id = state
+                    .timeline_transcription_settings
+                    .map(|settings| settings.track_id);
                 let document = ensure_timeline_document_handle(state);
                 let selected_target_index = {
-                    let mut document = lock_shared_timeline_document(&document);
                     let track_id = document.append_microphone_track_for_device_id(
                         device.name.clone(),
                         device.id.clone(),
@@ -7512,6 +7650,26 @@ fn commit_audio_input_picker_selection_from_scene(
                         .position(|candidate| candidate == track_id)
                         .map_or(0, |index| index + 1)
                 };
+                if let Some(settings_track_id) = settings_track_id {
+                    let audio_track_id = document
+                        .tracks()
+                        .iter()
+                        .filter(|track| track.kind() == crate::timeline::TimelineTrackKind::Audio)
+                        .map(crate::timeline::TimelineTrack::id)
+                        .nth(selected_target_index.saturating_sub(1));
+                    let _ = document.set_transcription_track_target_audio_track(
+                        settings_track_id,
+                        audio_track_id,
+                    );
+                    let _ = send_timeline_document_command(
+                        state,
+                        TimelineDocumentCommand::AppendMicrophoneTrackForTranscriptionSettings {
+                            track_id: settings_track_id,
+                            device_name: device.name.clone(),
+                            device_id: device.id.clone(),
+                        },
+                    );
+                }
                 state.audio_input_device_window = Some(AudioInputDeviceWindowState::new(device));
                 state.audio_input_picker_completion = AudioInputPickerCompletion::OpenDeviceWindow;
                 state.scene_kind = SceneWindowKind::TimelineTranscriptionSettings;
@@ -8039,8 +8197,8 @@ fn perform_scene_action(
         SceneAction::CreateBlankTimeline => Ok(SceneActionDisposition::KeepOpen),
         SceneAction::PanTimelineLeft => {
             with_scene_app_state(|state| {
-                if let Some(document) = timeline_document_handle(state) {
-                    lock_shared_timeline_document(&document).pan_viewport_left();
+                if let Some(document) = timeline_document_handle_mut(state) {
+                    document.pan_viewport_left();
                 }
                 Ok(())
             })?;
@@ -8048,8 +8206,8 @@ fn perform_scene_action(
         }
         SceneAction::PanTimelineRight => {
             with_scene_app_state(|state| {
-                if let Some(document) = timeline_document_handle(state) {
-                    lock_shared_timeline_document(&document).pan_viewport_right();
+                if let Some(document) = timeline_document_handle_mut(state) {
+                    document.pan_viewport_right();
                 }
                 Ok(())
             })?;
@@ -8057,8 +8215,8 @@ fn perform_scene_action(
         }
         SceneAction::ZoomTimelineIn => {
             with_scene_app_state(|state| {
-                if let Some(document) = timeline_document_handle(state) {
-                    lock_shared_timeline_document(&document).zoom_viewport_in();
+                if let Some(document) = timeline_document_handle_mut(state) {
+                    document.zoom_viewport_in();
                 }
                 Ok(())
             })?;
@@ -8066,8 +8224,8 @@ fn perform_scene_action(
         }
         SceneAction::ZoomTimelineOut => {
             with_scene_app_state(|state| {
-                if let Some(document) = timeline_document_handle(state) {
-                    lock_shared_timeline_document(&document).zoom_viewport_out();
+                if let Some(document) = timeline_document_handle_mut(state) {
+                    document.zoom_viewport_out();
                 }
                 Ok(())
             })?;
@@ -8112,7 +8270,6 @@ fn perform_scene_action(
             let mut new_track_index = None;
             with_scene_app_state(|state| {
                 let document = ensure_timeline_document_handle(state);
-                let mut document = lock_shared_timeline_document(&document);
                 let track_id = document.append_transcription_track();
                 new_track_index = document
                     .tracks()
@@ -8132,7 +8289,7 @@ fn perform_scene_action(
         SceneAction::AppendTextTrack => {
             with_scene_app_state(|state| {
                 let document = ensure_timeline_document_handle(state);
-                let _ = lock_shared_timeline_document(&document).append_text_track();
+                let _ = document.append_text_track();
                 state.scene_kind = SceneWindowKind::Timeline;
                 state.scene_action_selected_index = 0;
                 state.scene_virtual_cursor = None;
@@ -8171,9 +8328,8 @@ fn perform_scene_action(
                                 SceneWindowKind::Timeline | SceneWindowKind::TimelineAddTrack
                             )
                         {
-                            if let Some(existing_document) = timeline_document_handle(state) {
-                                lock_shared_timeline_document(&existing_document)
-                                    .append_tracy_capture_track(&path)?;
+                            if let Some(existing_document) = timeline_document_handle_mut(state) {
+                                existing_document.append_tracy_capture_track(&path)?;
                             }
                         } else {
                             replace_timeline_document(state, document);
@@ -11423,8 +11579,11 @@ mod tests {
             audio_input_picker: AudioInputPickerState::default(),
             audio_input_picker_completion: AudioInputPickerCompletion::default(),
             audio_input_device_window: None,
-            timeline_document: Some(shared_timeline_document(document)),
+            timeline_document: Some(document),
             timeline_transcription_settings: None,
+            timeline_document_command_sender: None,
+            timeline_document_command_receiver: None,
+            timeline_document_command_target: None,
             model_warning: None,
             model_warning_prepare_started_at: None,
             timeline_tool: TimelineInteractionTool::default(),
@@ -11687,6 +11846,9 @@ mod tests {
             audio_input_device_window: None,
             timeline_document: None,
             timeline_transcription_settings: None,
+            timeline_document_command_sender: None,
+            timeline_document_command_receiver: None,
+            timeline_document_command_target: None,
             model_warning: None,
             model_warning_prepare_started_at: None,
             timeline_tool: TimelineInteractionTool::default(),
@@ -11763,6 +11925,9 @@ mod tests {
             audio_input_device_window: None,
             timeline_document: None,
             timeline_transcription_settings: None,
+            timeline_document_command_sender: None,
+            timeline_document_command_receiver: None,
+            timeline_document_command_target: None,
             model_warning: None,
             model_warning_prepare_started_at: None,
             timeline_tool: TimelineInteractionTool::default(),
@@ -11828,8 +11993,11 @@ mod tests {
             audio_input_picker: AudioInputPickerState::default(),
             audio_input_picker_completion: AudioInputPickerCompletion::default(),
             audio_input_device_window: None,
-            timeline_document: Some(shared_timeline_document(TimelineDocument::blank())),
+            timeline_document: Some(TimelineDocument::blank()),
             timeline_transcription_settings: None,
+            timeline_document_command_sender: None,
+            timeline_document_command_receiver: None,
+            timeline_document_command_target: None,
             model_warning: None,
             model_warning_prepare_started_at: None,
             timeline_tool: TimelineInteractionTool::default(),
