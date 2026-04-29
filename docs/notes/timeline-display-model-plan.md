@@ -27,17 +27,25 @@ The first implementation slice is model-first and tests-first. It should create 
   - Implemented Phase 5 by extending `docs/spec/product/timeline.md` with reusable display-model requirements and mapping the new `time`, `dataset`, `query`, and `synthetic` modules/tests to those requirements.
   - Added the missing existing `timeline[add-track.microphone-placeholder]` requirement because `tracey query validate --deny warnings` found old implementation/test references to it.
   - Validated Phase 5 with `tracey query uncovered`, `tracey query validate --deny warnings`, and `./check-all.ps1`. Tracey status reports `teamy-studio-timeline/rust` at 50 of 50 requirements covered, with 41 verification references.
+  - Started Phase 6 by making existing editor `TimelineTimeRangeNs::new` strict, adding `TimelineTimeRangeNs::try_new`, and moving pointer-drag boundaries to explicit `TimelineTimeRangeNs::from_unordered` calls.
+  - Validated the first Phase 6 migration step with `cargo test editor_time_range` and `./check-all.ps1`.
+  - Implemented the first visible synthetic Timeline Playground: launcher entry, synthetic render-plan scene, grouping/folding/regenerate/pan/zoom controls, hover hit testing, pooled sidecar hover details, click-to-pin detail windows, and resolved `facet-pretty` detail output.
+  - Added Tracey requirements and focused tests for the playground launcher, controls, synthetic render-plan hit targets, and detail output.
+  - Validated the playground slice with `cargo test timeline::playground`, `cargo test timeline_playground`, `tracey query validate --deny warnings`, `tracey query uncovered`, and `./check-all.ps1`. Tracey status reports `teamy-studio-timeline/rust` at 57 of 57 requirements covered, with 48 verification references.
+  - Polished the playground interaction slice by adding top ruler tick marks and labels, cursor-anchored mouse-wheel zoom, ease-in-out zoom transitions, and VT-aware rendering for styled `facet-pretty` detail text.
+  - Validated the polish pass with `cargo test timeline_playground`, `tracey query validate --deny warnings`, and `./check-all.ps1`. Tracey status reports `teamy-studio-timeline/rust` at 61 of 61 requirements covered, with 52 verification references.
+  - Fixed live playground regressions found during manual play: hover detail windows are now created as non-activating tool windows so first hover does not steal focus from the playground, and right-drag panning now has a playground-specific drag path over the ruler/content surface instead of reusing the main timeline document pan gate.
+  - Added `timeline[playground.hover-detail-no-activate]` plus focused tests for non-activating detail-window styles and playground right-drag pan hit testing/range movement.
+  - Validated the regression fixes with `cargo test timeline_playground`, `tracey query validate --deny warnings`, and `./check-all.ps1`. Tracey status reports `teamy-studio-timeline/rust` at 62 of 62 requirements covered, with 53 verification references.
 - Current focus:
-  - Plan Phase 6 migration from the existing editor timeline model toward the strict display-model primitives without breaking current timeline UI behavior.
+  - Decide the next slice after playing with the synthetic Timeline Playground, likely either UX polish for the playground or the first live log/job adapter into the reusable display model.
 - Remaining work:
-  - Add strict timeline submodules under `src/timeline/`.
-  - Add Facet and Arbitrary-backed model types with manual Arbitrary implementations where invariants require coordination.
-  - Add query/render-plan projection tests, including aggregation/folding and row compaction.
-  - Add synthetic production data generation for tests and the later playground window.
-  - Add Tracey spec requirements and implementation mappings as code lands.
+  - Try the Timeline Playground manually and tune first-slice usability issues that are easier to judge in the live UI than in tests.
+  - Decide whether the sidecar detail-window pool needs stronger lifetime/ownership handling before broader use, because the first slice intentionally uses a simple shared handle.
+  - Consider adding richer synthetic controls later, such as item count, burst density, open-span ratio, and time range presets.
   - Migrate the existing timeline editor model to the new strict types in phases, then delete old normalizing range semantics.
 - Next step:
-  - Identify current `TimelineTimeNs` and `TimelineTimeRangeNs::new` call sites that rely on normalization, then choose explicit interaction-boundary handling before migrating any existing editor code.
+  - Open the Timeline Playground from the launcher and play with grouping, folding, pan/zoom, hover details, and pinned details to choose the next implementation slice.
 
 ## Constraints And Assumptions
 
@@ -56,6 +64,14 @@ The first implementation slice is model-first and tests-first. It should create 
 ## Product Requirements
 
 - The intermediary playground must eventually display synthetic randomized timeline data generated from the same production module used by tests.
+- The first visible playground slice should be synthetic-only, source-agnostic, and launcher-accessible.
+- The first visible playground slice should expose seed regeneration, grouping mode, and folding threshold controls so users can directly exercise row derivation and dense-item clustering.
+- The first visible playground slice should support pan and zoom over synthetic timeline data, then recompute the render plan from the updated viewport.
+- Right-drag panning in the playground should work over the ruler/content surface even though the playground does not own a `TimelineDocument`.
+- Hovering a rendered span, event, folded span cluster, or folded event cluster should open or update a pooled sidecar detail window.
+- Hover detail windows should not activate or steal focus from the playground, because focus changes alter the render cadence of the primary window.
+- Left-clicking a rendered span, event, folded span cluster, or folded event cluster should promote the current hover detail into a pinned detail window.
+- Hover and pinned detail windows should display a resolved Facet-derived detail view model with `facet-pretty`, not raw interned IDs alone.
 - The Progress Hub should eventually reuse the display model instead of reviving the hard-coded Jobs window model.
 - A job/progress timeline should display spans as duration clips that grow while open, cap when ended, and support hover details and later pinned detail windows.
 - Instant events should render as markers/carets and fold into clusters when too dense.

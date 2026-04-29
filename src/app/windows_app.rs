@@ -12,6 +12,7 @@ use tracing::trace;
 use chrono::Utc;
 use eyre::Context;
 use facet::Facet;
+use facet_pretty::FacetPretty;
 use rfd::{FileDialog, MessageButtons, MessageDialog, MessageLevel};
 use tracing::{debug, error, info, info_span, instrument};
 use uom::si::f64::Time;
@@ -64,7 +65,10 @@ use crate::logs::{self, LogRecordSnapshot, ThreadBuilderSpanExt};
 use crate::model::KNOWN_WHISPER_MODELS;
 use crate::paths::{AppHome, CacheHome};
 use crate::timeline::{
-    TimelineDocument, TimelineTimeNs, TimelineTimeRangeNs, TimelineTrackId, TimelineViewport,
+    TimelineDataset, TimelineDocument, TimelineGroupingMode, TimelineInstantNs,
+    TimelinePlaygroundDetail, TimelineSyntheticConfig, TimelineTimeNs, TimelineTimeRangeNs,
+    TimelineTrackId, TimelineViewport, TimelineViewportQuery, generate_synthetic_timeline_dataset,
+    timeline_playground_detail_for_render_item,
 };
 use crate::win32_support::clipboard::{read_clipboard, write_clipboard};
 use crate::win32_support::module::get_current_module;
@@ -156,6 +160,7 @@ const DEMO_MODE_STATE_CHANGED_MESSAGE: u32 = WM_APP + 0x402;
 const TIMELINE_DOCUMENT_CHANGED_MESSAGE: u32 = WM_APP + 0x403;
 const TIMELINE_DOCUMENT_COMMAND_MESSAGE: u32 = WM_APP + 0x404;
 const TIMELINE_TRANSCRIPTION_WORKER_COMPLETED_MESSAGE: u32 = WM_APP + 0x405;
+const TIMELINE_PLAYGROUND_DETAIL_CHANGED_MESSAGE: u32 = WM_APP + 0x406;
 
 #[derive(Clone, Debug)]
 enum TimelineDocumentCommand {
@@ -247,8 +252,237 @@ struct SceneWindowInitialization {
     timeline_document: Option<TimelineDocument>,
     timeline_transcription_settings: Option<windows_scene::TimelineTranscriptionSettingsViewState>,
     model_warning: Option<windows_scene::ModelWarningViewState>,
+    timeline_playground_detail: Option<TimelinePlaygroundDetailWindowHandle>,
+    initial_position: Option<ScreenRect>,
     timeline_document_command_sender: Option<mpsc::Sender<TimelineDocumentCommand>>,
     timeline_document_command_target: Option<isize>,
+}
+
+#[derive(Clone, Debug)]
+struct TimelinePlaygroundDetailWindowHandle {
+    shared: Arc<Mutex<TimelinePlaygroundDetailWindowState>>,
+    hwnd: Arc<Mutex<Option<isize>>>,
+}
+
+impl TimelinePlaygroundDetailWindowHandle {
+    fn new(detail: TimelinePlaygroundDetail, pinned: bool) -> Self {
+        Self {
+            shared: Arc::new(Mutex::new(TimelinePlaygroundDetailWindowState {
+                detail: Some(detail),
+                pinned,
+            })),
+            hwnd: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    fn update(&self, detail: TimelinePlaygroundDetail) {
+        if let Ok(mut state) = self.shared.lock() {
+            state.detail = Some(detail);
+        }
+        if let Ok(hwnd) = self.hwnd.lock()
+            && let Some(raw) = *hwnd
+        {
+            let hwnd = HWND(raw as *mut c_void);
+            // Safety: the stored HWND belongs to a Teamy scene window; stale handles are tolerated by PostMessageW.
+            let _ = unsafe {
+                PostMessageW(
+                    Some(hwnd),
+                    TIMELINE_PLAYGROUND_DETAIL_CHANGED_MESSAGE,
+                    WPARAM(0),
+                    LPARAM(0),
+                )
+            };
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct TimelinePlaygroundDetailWindowState {
+    detail: Option<TimelinePlaygroundDetail>,
+    pinned: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TimelinePlaygroundZoomAnimation {
+    start_visible_start_ns: i64,
+    start_visible_end_ns: i64,
+    target_visible_start_ns: i64,
+    target_visible_end_ns: i64,
+    started_at: Instant,
+}
+
+#[derive(Debug)]
+struct TimelinePlaygroundState {
+    seed: u64,
+    dataset: TimelineDataset,
+    grouping_mode: TimelineGroupingMode,
+    minimum_visible_pixels: u32,
+    visible_start_ns: i64,
+    visible_end_ns: i64,
+    zoom_animation: Option<TimelinePlaygroundZoomAnimation>,
+    hovered_item: Option<windows_scene::TimelinePlaygroundHitTarget>,
+    hover_detail_window: Option<TimelinePlaygroundDetailWindowHandle>,
+}
+
+impl TimelinePlaygroundState {
+    fn new() -> eyre::Result<Self> {
+        let seed = TimelineSyntheticConfig::default().seed();
+        let dataset = generate_synthetic_timeline_dataset(
+            &TimelineSyntheticConfig::default().with_seed(seed),
+        )?;
+        Ok(Self {
+            seed,
+            dataset,
+            grouping_mode: TimelineGroupingMode::GroupKey,
+            minimum_visible_pixels: 4,
+            visible_start_ns: 0,
+            visible_end_ns: 24_000_000,
+            zoom_animation: None,
+            hovered_item: None,
+            hover_detail_window: None,
+        })
+    }
+
+    fn regenerate(&mut self) -> eyre::Result<()> {
+        self.seed = self.seed.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        self.dataset = generate_synthetic_timeline_dataset(
+            &TimelineSyntheticConfig::default().with_seed(self.seed),
+        )?;
+        self.zoom_animation = None;
+        self.hovered_item = None;
+        Ok(())
+    }
+
+    fn view_state(&self) -> windows_scene::TimelinePlaygroundViewState {
+        windows_scene::TimelinePlaygroundViewState {
+            seed: self.seed,
+            grouping_mode: self.grouping_mode,
+            minimum_visible_pixels: self.minimum_visible_pixels,
+            visible_start_ns: self.visible_start_ns,
+            visible_end_ns: self.visible_end_ns,
+            hovered_item: self.hovered_item,
+        }
+    }
+
+    fn query(&self, viewport_width_pixels: u32) -> eyre::Result<TimelineViewportQuery> {
+        TimelineViewportQuery::try_new(
+            TimelineInstantNs::new(self.visible_start_ns),
+            TimelineInstantNs::new(self.visible_end_ns),
+            TimelineInstantNs::new(self.visible_end_ns),
+            viewport_width_pixels,
+        )
+        .map(|query| {
+            query
+                .with_grouping_mode(self.grouping_mode)
+                .with_minimum_visible_pixels(self.minimum_visible_pixels)
+        })
+    }
+
+    fn pan(&mut self, direction: i64) {
+        self.cancel_zoom_animation_at_current_range();
+        let duration = (self.visible_end_ns - self.visible_start_ns).max(1);
+        let delta = duration / 4 * direction;
+        self.visible_start_ns = (self.visible_start_ns + delta).max(0);
+        self.visible_end_ns = (self.visible_end_ns + delta).max(self.visible_start_ns + 1);
+    }
+
+    fn zoom(&mut self, numerator: i64, denominator: i64) {
+        self.zoom_about_ratio(1, 2, numerator, denominator);
+    }
+
+    fn zoom_about_pixels(
+        &mut self,
+        anchor_x_pixels: i32,
+        viewport_width_pixels: i32,
+        numerator: i64,
+        denominator: i64,
+    ) {
+        self.zoom_about_ratio(
+            i128::from(anchor_x_pixels.clamp(0, viewport_width_pixels.max(1))),
+            i128::from(viewport_width_pixels.max(1)),
+            numerator,
+            denominator,
+        );
+    }
+
+    fn zoom_about_ratio(
+        &mut self,
+        anchor_numerator: i128,
+        anchor_denominator: i128,
+        numerator: i64,
+        denominator: i64,
+    ) {
+        let (visible_start_ns, visible_end_ns) = self.current_visible_range();
+        self.visible_start_ns = visible_start_ns;
+        self.visible_end_ns = visible_end_ns;
+        let current_duration = (self.visible_end_ns - self.visible_start_ns).max(1);
+        let duration = i64::try_from(
+            (i128::from(current_duration) * i128::from(numerator.max(1))
+                / i128::from(denominator.max(1)))
+            .max(1),
+        )
+        .unwrap_or(i64::MAX);
+        let anchor_denominator = anchor_denominator.max(1);
+        let anchor_offset =
+            i64::try_from(i128::from(current_duration) * anchor_numerator / anchor_denominator)
+                .unwrap_or(i64::MAX);
+        let target_anchor_offset =
+            i64::try_from(i128::from(duration) * anchor_numerator / anchor_denominator)
+                .unwrap_or(i64::MAX);
+        let anchor_time = self.visible_start_ns.saturating_add(anchor_offset);
+        let target_start = anchor_time.saturating_sub(target_anchor_offset).max(0);
+        let target_end = target_start.saturating_add(duration).max(target_start + 1);
+        self.zoom_animation = Some(TimelinePlaygroundZoomAnimation {
+            start_visible_start_ns: self.visible_start_ns,
+            start_visible_end_ns: self.visible_end_ns,
+            target_visible_start_ns: target_start,
+            target_visible_end_ns: target_end,
+            started_at: Instant::now(),
+        });
+        self.hovered_item = None;
+    }
+
+    fn current_visible_range(&self) -> (i64, i64) {
+        self.zoom_animation
+            .map_or((self.visible_start_ns, self.visible_end_ns), |animation| {
+                let progress = (animation.started_at.elapsed().as_secs_f64()
+                    / TIMELINE_ZOOM_ANIMATION_DURATION.as_secs_f64())
+                .clamp(0.0, 1.0);
+                if progress >= 1.0 {
+                    return (
+                        animation.target_visible_start_ns,
+                        animation.target_visible_end_ns,
+                    );
+                }
+                interpolate_timeline_playground_range(animation, ease_in_out(progress))
+            })
+    }
+
+    fn apply_zoom_animation(&mut self) {
+        let Some(animation) = self.zoom_animation else {
+            return;
+        };
+        let progress = (animation.started_at.elapsed().as_secs_f64()
+            / TIMELINE_ZOOM_ANIMATION_DURATION.as_secs_f64())
+        .clamp(0.0, 1.0);
+        if progress >= 1.0 {
+            self.visible_start_ns = animation.target_visible_start_ns;
+            self.visible_end_ns = animation.target_visible_end_ns;
+            self.zoom_animation = None;
+            return;
+        }
+        let (visible_start_ns, visible_end_ns) =
+            interpolate_timeline_playground_range(animation, ease_in_out(progress));
+        self.visible_start_ns = visible_start_ns;
+        self.visible_end_ns = visible_end_ns;
+    }
+
+    fn cancel_zoom_animation_at_current_range(&mut self) {
+        let (visible_start_ns, visible_end_ns) = self.current_visible_range();
+        self.visible_start_ns = visible_start_ns;
+        self.visible_end_ns = visible_end_ns;
+        self.zoom_animation = None;
+    }
 }
 
 #[expect(
@@ -540,12 +774,15 @@ struct SceneAppState {
     timeline_document_command_target: Option<isize>,
     model_warning: Option<windows_scene::ModelWarningViewState>,
     model_warning_prepare_started_at: Option<Instant>,
+    timeline_playground: Option<TimelinePlaygroundState>,
+    timeline_playground_detail: Option<TimelinePlaygroundDetailWindowHandle>,
     timeline_tool: TimelineInteractionTool,
     timeline_selection: Option<windows_scene::TimelineRectSelection>,
     pending_timeline_selection: Option<PendingTimelineSelection>,
     pending_timeline_text_block: Option<PendingTimelineTextBlock>,
     pending_timeline_track_reorder: Option<PendingTimelineTrackReorder>,
     timeline_pan_drag: Option<TimelinePanDrag>,
+    timeline_playground_pan_drag: Option<TimelinePlaygroundPanDrag>,
     timeline_zoom_animation: Option<TimelineZoomAnimation>,
     timeline_vertical_scroll_offset: i32,
     demo_mode_scramble_input_device_identifiers: DemoModeInputDeviceIdentifierScramble,
@@ -1078,6 +1315,13 @@ struct TimelinePanDrag {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
+struct TimelinePlaygroundPanDrag {
+    origin: ClientPoint,
+    origin_visible_start_ns: i64,
+    origin_visible_end_ns: i64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
 struct TimelineZoomAnimation {
     start_viewport: TimelineViewport,
     target_viewport: TimelineViewport,
@@ -1566,6 +1810,11 @@ fn run_scene_window(
         .timeline_document_command_sender
         .take()
         .or_else(|| Some(local_timeline_command_sender.clone()));
+    let timeline_playground = if scene_kind == SceneWindowKind::TimelinePlayground {
+        Some(TimelinePlaygroundState::new()?)
+    } else {
+        None
+    };
 
     SCENE_APP_STATE.with(|state| {
         *state.borrow_mut() = Some(SceneAppState {
@@ -1585,12 +1834,15 @@ fn run_scene_window(
             timeline_document_command_target: initialization.timeline_document_command_target,
             model_warning: initialization.model_warning,
             model_warning_prepare_started_at: None,
+            timeline_playground,
+            timeline_playground_detail: initialization.timeline_playground_detail,
             timeline_tool: TimelineInteractionTool::default(),
             timeline_selection: None,
             pending_timeline_selection: None,
             pending_timeline_text_block: None,
             pending_timeline_track_reorder: None,
             timeline_pan_drag: None,
+            timeline_playground_pan_drag: None,
             timeline_zoom_animation: None,
             timeline_vertical_scroll_offset: 0,
             demo_mode_scramble_input_device_identifiers:
@@ -1624,7 +1876,7 @@ fn run_scene_window(
         });
     });
 
-    let hwnd = create_scene_window(window_thread, scene_kind.title())?;
+    let hwnd = create_scene_window(window_thread, scene_kind)?;
     register_scene_window(hwnd);
     let renderer = RenderThreadProxy::new(hwnd.raw())?;
     let chrome_tooltip = ChromeTooltipController::create(hwnd)?;
@@ -1635,12 +1887,22 @@ fn run_scene_window(
         {
             state.timeline_document_command_target = Some(hwnd.raw().0 as isize);
         }
+        if let Some(detail) = &state.timeline_playground_detail
+            && let Ok(mut detail_hwnd) = detail.hwnd.lock()
+        {
+            *detail_hwnd = Some(hwnd.raw().0 as isize);
+        }
         state.chrome_tooltip = chrome_tooltip;
         state.renderer = Some(renderer);
         Ok(())
     })?;
 
-    hwnd.show();
+    if let Some(position) = initialization.initial_position {
+        hwnd.set_position_no_activate(position)?;
+        hwnd.show_no_activate();
+    } else {
+        hwnd.show();
+    }
     with_scene_app_state(|state| render_scene_window_frame(state, hwnd, None, false))?;
     let _window_span = info_span!(
         "scene_window",
@@ -1653,6 +1915,19 @@ fn run_scene_window(
 
 fn timeline_document_handle(state: &SceneAppState) -> Option<&TimelineDocument> {
     state.timeline_document.as_ref()
+}
+
+fn timeline_playground_detail_window_state(
+    state: &SceneAppState,
+) -> TimelinePlaygroundDetailWindowState {
+    state
+        .timeline_playground_detail
+        .as_ref()
+        .and_then(|detail| detail.shared.lock().ok().map(|state| state.clone()))
+        .unwrap_or(TimelinePlaygroundDetailWindowState {
+            detail: None,
+            pinned: false,
+        })
 }
 
 fn scene_kind_owns_timeline_document_commands(scene_kind: SceneWindowKind) -> bool {
@@ -1680,6 +1955,121 @@ fn replace_timeline_document(state: &mut SceneAppState, document: TimelineDocume
 
 fn timeline_document_snapshot(state: &SceneAppState) -> Option<TimelineDocument> {
     state.timeline_document.clone()
+}
+
+fn timeline_playground_target_at_point(
+    state: &SceneAppState,
+    layout: TerminalLayout,
+    point: ClientPoint,
+) -> eyre::Result<Option<windows_scene::TimelinePlaygroundHitTarget>> {
+    let Some(playground) = state.timeline_playground.as_ref() else {
+        return Ok(None);
+    };
+    let playground_layout =
+        windows_scene::timeline_playground_layout(layout.terminal_panel_rect().inset(24));
+    let query = playground
+        .query(u32::try_from(playground_layout.content_rect.width().max(1)).unwrap_or(1))?;
+    let render_plan = playground.dataset.render_plan(&query);
+    Ok(windows_scene::timeline_playground_hit_target_at_point(
+        layout,
+        &render_plan,
+        playground.view_state(),
+        point,
+    ))
+}
+
+fn update_timeline_playground_hover_detail_from_target(
+    state: &mut SceneAppState,
+    hwnd: WindowHandle,
+    target: windows_scene::TimelinePlaygroundHitTarget,
+) -> eyre::Result<()> {
+    let detail = timeline_playground_detail_from_target(state, target)?;
+    if let Some(handle) = state
+        .timeline_playground
+        .as_ref()
+        .and_then(|playground| playground.hover_detail_window.clone())
+    {
+        handle.update(detail);
+        return Ok(());
+    }
+    let handle = TimelinePlaygroundDetailWindowHandle::new(detail, false);
+    open_timeline_playground_detail_window(state, hwnd, handle.clone())?;
+    if let Some(playground) = state.timeline_playground.as_mut() {
+        playground.hover_detail_window = Some(handle);
+    }
+    Ok(())
+}
+
+fn pin_timeline_playground_detail_from_target(
+    state: &mut SceneAppState,
+    hwnd: WindowHandle,
+    target: windows_scene::TimelinePlaygroundHitTarget,
+) -> eyre::Result<()> {
+    let detail = timeline_playground_detail_from_target(state, target)?;
+    let handle = TimelinePlaygroundDetailWindowHandle::new(detail, true);
+    open_timeline_playground_detail_window(state, hwnd, handle)
+}
+
+fn timeline_playground_detail_from_target(
+    state: &SceneAppState,
+    target: windows_scene::TimelinePlaygroundHitTarget,
+) -> eyre::Result<TimelinePlaygroundDetail> {
+    let Some(playground) = state.timeline_playground.as_ref() else {
+        eyre::bail!("timeline playground state is missing");
+    };
+    timeline_playground_detail_for_render_item(&playground.dataset, target.render_item)
+        .ok_or_else(|| eyre::eyre!("timeline playground target no longer resolves"))
+}
+
+fn open_timeline_playground_detail_window(
+    state: &SceneAppState,
+    hwnd: WindowHandle,
+    detail: TimelinePlaygroundDetailWindowHandle,
+) -> eyre::Result<()> {
+    let app_home = state.app_home.clone();
+    let vt_engine = state.vt_engine;
+    let position = timeline_playground_detail_window_position(hwnd).ok();
+    thread::Builder::new()
+        .name("teamy-studio-timeline-playground-detail".to_owned())
+        .spawn_with_current_span(move || {
+            if let Err(error) = run_scene_window(
+                &app_home,
+                SceneWindowKind::TimelinePlaygroundDetail,
+                vt_engine,
+                SceneWindowInitialization {
+                    timeline_playground_detail: Some(detail),
+                    initial_position: position,
+                    ..Default::default()
+                },
+            ) {
+                error!(?error, "failed to open timeline playground detail window");
+            }
+        })
+        .wrap_err("failed to spawn Teamy Studio timeline playground detail thread")?;
+    Ok(())
+}
+
+fn timeline_playground_detail_window_position(hwnd: WindowHandle) -> eyre::Result<ScreenRect> {
+    let owner = hwnd.window_rect()?;
+    let width = 460;
+    let height = owner.height().clamp(360, 760);
+    Ok(ScreenRect::new(
+        owner.right() + 12,
+        owner.top(),
+        owner.right() + 12 + width,
+        owner.top() + height,
+    ))
+}
+
+fn set_timeline_playground_grouping(grouping_mode: TimelineGroupingMode) -> eyre::Result<()> {
+    // timeline[impl playground.query-controls]
+    with_scene_app_state(|state| {
+        if let Some(playground) = state.timeline_playground.as_mut() {
+            playground.grouping_mode = grouping_mode;
+            playground.hovered_item = None;
+        }
+        Ok(())
+    })
 }
 
 fn normalize_initial_stdin(text: &str) -> String {
@@ -2195,7 +2585,7 @@ fn base_custom_window_style() -> WINDOW_STYLE {
 #[instrument(level = "info", skip_all)]
 fn create_scene_window(
     window_thread: WindowThread,
-    window_title: &str,
+    scene_kind: SceneWindowKind,
 ) -> eyre::Result<WindowHandle> {
     let instance = get_current_module().wrap_err("failed to get module handle")?;
 
@@ -2219,12 +2609,12 @@ fn create_scene_window(
     let initial_window_height = scaled_window_dimension(INITIAL_WINDOW_HEIGHT, system_dpi());
     let x = (screen_width - initial_window_width) / 2;
     let y = (screen_height - initial_window_height) / 2;
-    let title = window_title.easy_pcwstr()?;
+    let title = scene_kind.title().easy_pcwstr()?;
 
     // Safety: all pointers and handles passed to CreateWindowExW are valid for the duration of the call.
     let hwnd = unsafe {
         CreateWindowExW(
-            custom_window_ex_style(),
+            scene_window_ex_style(scene_kind),
             SCENE_WINDOW_CLASS_NAME,
             title.as_ref(),
             visible_custom_window_style(),
@@ -2241,6 +2631,15 @@ fn create_scene_window(
     .wrap_err("failed to create scene window")?;
 
     Ok(WindowHandle::new(window_thread, hwnd))
+}
+
+fn scene_window_ex_style(scene_kind: SceneWindowKind) -> WINDOW_EX_STYLE {
+    if scene_kind == SceneWindowKind::TimelinePlaygroundDetail {
+        // timeline[impl playground.hover-detail-no-activate]
+        WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_NOREDIRECTIONBITMAP
+    } else {
+        custom_window_ex_style()
+    }
 }
 
 fn ensure_toast_host_started() {
@@ -2744,6 +3143,9 @@ extern "system" fn scene_window_proc(
         TIMELINE_DOCUMENT_COMMAND_MESSAGE => handle_scene_timeline_document_command(hwnd),
         TIMELINE_TRANSCRIPTION_WORKER_COMPLETED_MESSAGE => {
             handle_scene_timeline_transcription_worker_completed(hwnd)
+        }
+        TIMELINE_PLAYGROUND_DETAIL_CHANGED_MESSAGE => {
+            handle_scene_timeline_playground_detail_changed(hwnd)
         }
         WM_KEYDOWN | WM_SYSKEYDOWN => handle_scene_key_down_message(hwnd, message, wparam, lparam),
         WM_LBUTTONDOWN => handle_bool_message(hwnd, message, wparam, lparam, |hwnd| {
@@ -3546,6 +3948,13 @@ fn apply_timeline_document_command(
     }
 }
 
+fn handle_scene_timeline_playground_detail_changed(hwnd: WindowHandle) -> LRESULT {
+    match with_scene_app_state(|state| render_scene_window_frame(state, hwnd, None, false)) {
+        Ok(()) => LRESULT(0),
+        Err(error) => fail_and_close(hwnd, &error),
+    }
+}
+
 #[expect(
     clippy::too_many_lines,
     reason = "scene pointer dispatch keeps the chrome, diagnostics, launcher, and picker hit paths together"
@@ -3599,6 +4008,18 @@ fn handle_scene_left_button_down(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Re
                 mode: selection_mode,
             });
             state.diagnostic_selection_drag_point = Some(point);
+            hwnd.capture_mouse();
+            return Ok(ScenePointerAction::RenderOnly);
+        }
+
+        if state.scene_kind == SceneWindowKind::TimelinePlayground
+            && !state.diagnostics_visible
+            && let Some(target) = timeline_playground_target_at_point(state, layout, point)?
+        {
+            pin_timeline_playground_detail_from_target(state, hwnd, target)?;
+            state.pressed_target = Some(ScenePressedTarget::Action(
+                SceneAction::OpenTimelinePlayground,
+            ));
             hwnd.capture_mouse();
             return Ok(ScenePointerAction::RenderOnly);
         }
@@ -4297,7 +4718,7 @@ fn handle_scene_left_button_up(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Resu
             {
                 let _ = document.append_empty_text_block(
                     pending_text_block.track_id,
-                    TimelineTimeRangeNs::new(pending_text_block.anchor_time, end_time),
+                    TimelineTimeRangeNs::from_unordered(pending_text_block.anchor_time, end_time),
                 );
             }
             return Ok(ScenePointerAction::RenderOnly);
@@ -4526,6 +4947,56 @@ fn handle_scene_mouse_move(
         return Ok(true);
     }
 
+    let timeline_playground_hover_changed = with_scene_app_state(|state| {
+        if state.scene_kind != SceneWindowKind::TimelinePlayground || state.diagnostics_visible {
+            return Ok(false);
+        }
+        let layout = scene_client_layout(hwnd, state)?;
+        let target = timeline_playground_target_at_point(state, layout, point)?;
+        let Some(playground) = state.timeline_playground.as_mut() else {
+            return Ok(false);
+        };
+        if playground.hovered_item == target {
+            return Ok(false);
+        }
+        playground.hovered_item = target;
+        if let Some(target) = target {
+            update_timeline_playground_hover_detail_from_target(state, hwnd, target)?;
+        }
+        Ok(true)
+    })?;
+    if timeline_playground_hover_changed {
+        with_scene_app_state(|state| render_scene_window_frame(state, hwnd, None, false))?;
+        return Ok(true);
+    }
+
+    let timeline_playground_pan_dragging = with_scene_app_state(|state| {
+        let Some(pan_drag) = state.timeline_playground_pan_drag else {
+            return Ok(false);
+        };
+        let layout = scene_client_layout(hwnd, state)?;
+        let playground_layout =
+            windows_scene::timeline_playground_layout(layout.terminal_panel_rect().inset(24));
+        let origin = pan_drag.origin.to_win32_point()?;
+        let current = point.to_win32_point()?;
+        let delta_x = current.x - origin.x;
+        let Some(playground) = state.timeline_playground.as_mut() else {
+            state.timeline_playground_pan_drag = None;
+            return Ok(true);
+        };
+        apply_timeline_playground_pan_drag(
+            playground,
+            pan_drag,
+            delta_x,
+            playground_layout.content_rect.width(),
+        );
+        Ok(true)
+    })?;
+    if timeline_playground_pan_dragging {
+        with_scene_app_state(|state| render_scene_window_frame(state, hwnd, None, false))?;
+        return Ok(true);
+    }
+
     let timeline_pan_dragging = with_scene_app_state(|state| {
         let Some(pan_drag) = state.timeline_pan_drag else {
             return Ok(false);
@@ -4630,7 +5101,7 @@ fn handle_scene_mouse_move(
 
         let layout = scene_client_layout(hwnd, state)?;
         state.timeline_selection = Some(windows_scene::TimelineRectSelection::new(
-            TimelineTimeRangeNs::new(
+            TimelineTimeRangeNs::from_unordered(
                 pending_text_block.anchor_time,
                 timeline_time_from_client_point(state, layout, point),
             ),
@@ -4754,7 +5225,8 @@ fn handle_scene_right_button_up(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Res
 
     let released_timeline_pan = with_scene_app_state(|state| {
         state.pointer_position = Some(point);
-        let released = state.timeline_pan_drag.take().is_some();
+        let released = state.timeline_pan_drag.take().is_some()
+            || state.timeline_playground_pan_drag.take().is_some();
         if released {
             trace!(?point, "timeline right-button pan released");
         }
@@ -4834,6 +5306,28 @@ fn handle_scene_right_button_down(hwnd: WindowHandle, lparam: LPARAM) -> eyre::R
         state.pointer_position = Some(point);
         state.chrome_tooltip.hide(hwnd);
         let layout = scene_client_layout(hwnd, state)?;
+        if state.scene_kind == SceneWindowKind::TimelinePlayground {
+            if !timeline_playground_pan_interaction_at_point(state, layout, point) {
+                trace!(
+                    ?point,
+                    "timeline playground right-button pan ignored outside pan surface"
+                );
+                return Ok(false);
+            }
+            let Some(playground) = state.timeline_playground.as_mut() else {
+                return Ok(false);
+            };
+            playground.cancel_zoom_animation_at_current_range();
+            state.timeline_playground_pan_drag = Some(TimelinePlaygroundPanDrag {
+                origin: point,
+                origin_visible_start_ns: playground.visible_start_ns,
+                origin_visible_end_ns: playground.visible_end_ns,
+            });
+            playground.hovered_item = None;
+            trace!(?point, "timeline playground right-button pan started");
+            return Ok(true);
+        }
+
         if !timeline_pan_interaction_at_point(state, layout, point) {
             trace!(
                 ?point,
@@ -4880,6 +5374,42 @@ fn handle_scene_mouse_wheel(
         if state.scene_kind == SceneWindowKind::Logs && !state.diagnostics_visible {
             let wheel_delta = high_word_i16(wparam.0);
             scroll_logs_by_wheel(state, layout, wheel_delta);
+            render_scene_window_frame(state, hwnd, None, false)?;
+            return Ok(true);
+        }
+
+        if state.scene_kind == SceneWindowKind::TimelinePlayground && !state.diagnostics_visible {
+            let playground_layout =
+                windows_scene::timeline_playground_layout(layout.terminal_panel_rect().inset(24));
+            if !playground_layout.content_rect.contains(point) {
+                return Ok(false);
+            }
+            let wheel_delta = high_word_i16(wparam.0);
+            if wheel_delta == 0 {
+                return Ok(true);
+            }
+            if let Some(playground) = state.timeline_playground.as_mut() {
+                let anchor_x_pixels = point
+                    .to_win32_point()
+                    .map_or(0, |point| point.x - playground_layout.content_rect.left());
+                // timeline[impl playground.viewport-controls]
+                // timeline[impl playground.mouse-zoom-anchor]
+                if wheel_delta > 0 {
+                    playground.zoom_about_pixels(
+                        anchor_x_pixels,
+                        playground_layout.content_rect.width(),
+                        1,
+                        2,
+                    );
+                } else {
+                    playground.zoom_about_pixels(
+                        anchor_x_pixels,
+                        playground_layout.content_rect.width(),
+                        2,
+                        1,
+                    );
+                }
+            }
             render_scene_window_frame(state, hwnd, None, false)?;
             return Ok(true);
         }
@@ -5564,6 +6094,7 @@ fn render_scene_window_frame(
 ) -> eyre::Result<()> {
     sync_demo_mode_state(state);
     apply_timeline_zoom_animation(state);
+    apply_timeline_playground_zoom_animation(state);
     sync_timeline_audio_runtime_from_document(state);
     let timeline_transcription_completion_target = (state.scene_kind == SceneWindowKind::Timeline)
         .then(|| state.hwnd.map(|hwnd| hwnd.raw().0 as isize))
@@ -5732,6 +6263,38 @@ fn render_scene_window_frame(
             window_chrome_buttons_state,
             scramble_input_device_identifiers,
             demo_mode_visual_state(state, layout),
+        )
+    } else if state.scene_kind == SceneWindowKind::TimelinePlayground {
+        let playground = state
+            .timeline_playground
+            .as_ref()
+            .expect("timeline playground scene has playground state");
+        let playground_layout =
+            windows_scene::timeline_playground_layout(layout.terminal_panel_rect().inset(24));
+        let query = playground
+            .query(u32::try_from(playground_layout.content_rect.width().max(1)).unwrap_or(1))
+            .expect("timeline playground query must be valid");
+        let render_plan = playground.dataset.render_plan(&query);
+        windows_scene::build_timeline_playground_render_scene(
+            layout,
+            window_chrome_buttons_state,
+            &playground.dataset,
+            &render_plan,
+            playground.view_state(),
+            &scene_button_visual_states(state, layout),
+        )
+    } else if state.scene_kind == SceneWindowKind::TimelinePlaygroundDetail {
+        let detail_state = timeline_playground_detail_window_state(state);
+        let pretty_text = detail_state.detail.as_ref().map_or_else(
+            || "No timeline item selected".to_owned(),
+            |detail| format!("{}", detail.pretty()),
+        );
+        windows_scene::build_timeline_playground_detail_render_scene(
+            layout,
+            window_chrome_buttons_state,
+            detail_state.detail.as_ref(),
+            &pretty_text,
+            detail_state.pinned,
         )
     } else if state.scene_kind == SceneWindowKind::TimelineTranscriptionSettings {
         windows_scene::build_timeline_transcription_settings_render_scene(
@@ -5949,7 +6512,9 @@ fn scene_button_visual_states(
                 .last_clicked_action
                 .filter(|click| click.action == spec.action)
                 .map(|click| click.clicked_at);
-            let active = scene_action_active(spec.action) || selected;
+            let active = scene_action_active(spec.action)
+                || selected
+                || timeline_playground_action_active(state, spec.action);
             (
                 spec.action,
                 windows_scene::compute_button_visual_state(
@@ -5963,6 +6528,28 @@ fn scene_button_visual_states(
             )
         })
         .collect()
+}
+
+fn timeline_playground_action_active(state: &SceneAppState, action: SceneAction) -> bool {
+    let Some(playground) = state.timeline_playground.as_ref() else {
+        return false;
+    };
+    matches!(
+        (action, playground.grouping_mode),
+        (
+            SceneAction::TimelinePlaygroundGroupingGroupKey,
+            TimelineGroupingMode::GroupKey
+        ) | (
+            SceneAction::TimelinePlaygroundGroupingSourceKey,
+            TimelineGroupingMode::SourceKey
+        ) | (
+            SceneAction::TimelinePlaygroundGroupingLabel,
+            TimelineGroupingMode::Label
+        ) | (
+            SceneAction::TimelinePlaygroundGroupingAll,
+            TimelineGroupingMode::All
+        )
+    )
 }
 
 #[expect(
@@ -6548,11 +7135,20 @@ fn scene_action_at_point(
     point: ClientPoint,
 ) -> Option<SceneAction> {
     let specs = windows_scene::scene_button_specs(scene_kind);
-    let button_layouts = windows_scene::layout_scene_buttons(
-        layout.terminal_panel_rect(),
-        specs.len(),
-        scaled_scene_button_size(system_dpi()),
-    );
+    let (button_rect, max_button_size) = if scene_kind == SceneWindowKind::TimelinePlayground {
+        (
+            windows_scene::timeline_playground_layout(layout.terminal_panel_rect().inset(24))
+                .controls_rect,
+            76,
+        )
+    } else {
+        (
+            layout.terminal_panel_rect(),
+            scaled_scene_button_size(system_dpi()),
+        )
+    };
+    let button_layouts =
+        windows_scene::layout_scene_buttons(button_rect, specs.len(), max_button_size);
     specs
         .iter()
         .zip(button_layouts)
@@ -7668,6 +8264,46 @@ fn timeline_pan_interaction_at_point(
         && windows_scene::timeline_selection_surface_contains(timeline_layout(layout), point)
 }
 
+fn timeline_playground_pan_interaction_at_point(
+    state: &SceneAppState,
+    layout: TerminalLayout,
+    point: ClientPoint,
+) -> bool {
+    if state.scene_kind != SceneWindowKind::TimelinePlayground || state.diagnostics_visible {
+        return false;
+    }
+    let layout = windows_scene::timeline_playground_layout(layout.terminal_panel_rect().inset(24));
+    layout.ruler_rect.contains(point) || layout.content_rect.contains(point)
+}
+
+fn apply_timeline_playground_pan_drag(
+    playground: &mut TimelinePlaygroundState,
+    pan_drag: TimelinePlaygroundPanDrag,
+    delta_x_pixels: i32,
+    viewport_width_pixels: i32,
+) {
+    let width = i128::from(viewport_width_pixels.max(1));
+    let duration =
+        i128::from((pan_drag.origin_visible_end_ns - pan_drag.origin_visible_start_ns).max(1));
+    let delta_ns =
+        i64::try_from(i128::from(delta_x_pixels) * duration / width).unwrap_or_else(|_| {
+            if delta_x_pixels.is_negative() {
+                i64::MIN
+            } else {
+                i64::MAX
+            }
+        });
+    playground.visible_start_ns = pan_drag
+        .origin_visible_start_ns
+        .saturating_sub(delta_ns)
+        .max(0);
+    playground.visible_end_ns = playground
+        .visible_start_ns
+        .saturating_add(i64::try_from(duration).unwrap_or(i64::MAX))
+        .max(playground.visible_start_ns + 1);
+    playground.zoom_animation = None;
+}
+
 fn rebase_timeline_pan_drag_after_zoom(
     pan_drag: &mut TimelinePanDrag,
     point: ClientPoint,
@@ -7734,7 +8370,7 @@ fn timeline_selection_from_pending(
         return None;
     }
 
-    let time_range = TimelineTimeRangeNs::new(
+    let time_range = TimelineTimeRangeNs::from_unordered(
         pending_selection.anchor_time,
         timeline_time_from_client_point(state, layout, point),
     );
@@ -7768,7 +8404,7 @@ fn current_timeline_zoom_viewport(state: &SceneAppState) -> TimelineViewport {
             interpolate_timeline_viewport(
                 animation.start_viewport,
                 animation.target_viewport,
-                ease_out_elastic(progress),
+                ease_in_out(progress),
             )
         })
 }
@@ -7805,8 +8441,15 @@ fn apply_timeline_zoom_animation(state: &mut SceneAppState) {
     document.set_viewport(interpolate_timeline_viewport(
         animation.start_viewport,
         animation.target_viewport,
-        ease_out_elastic(progress),
+        ease_in_out(progress),
     ));
+}
+
+fn apply_timeline_playground_zoom_animation(state: &mut SceneAppState) {
+    if let Some(playground) = state.timeline_playground.as_mut() {
+        // timeline[impl playground.viewport-transition]
+        playground.apply_zoom_animation();
+    }
 }
 
 #[expect(
@@ -7834,17 +8477,41 @@ fn interpolate_timeline_viewport(
     )
 }
 
-fn ease_out_elastic(progress: f64) -> f64 {
-    if progress <= 0.0 || progress >= 1.0 {
-        return progress.clamp(0.0, 1.0);
+fn ease_in_out(progress: f64) -> f64 {
+    let progress = progress.clamp(0.0, 1.0);
+    if progress < 0.5 {
+        4.0 * progress * progress * progress
+    } else {
+        1.0 - (-2.0 * progress + 2.0).powi(3) / 2.0
     }
-
-    let c4 = (2.0 * std::f64::consts::PI) / 3.0;
-    2.0_f64.powf(-10.0 * progress) * ((progress * 10.0 - 0.75) * c4).sin() + 1.0
 }
 
 fn lerp_f64(start: f64, target: f64, progress: f64) -> f64 {
     start + ((target - start) * progress)
+}
+
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "timeline playground zoom animation interpolates nanosecond ranges through display-scale f64 progress"
+)]
+fn interpolate_timeline_playground_range(
+    animation: TimelinePlaygroundZoomAnimation,
+    progress: f64,
+) -> (i64, i64) {
+    let visible_start_ns = lerp_f64(
+        animation.start_visible_start_ns as f64,
+        animation.target_visible_start_ns as f64,
+        progress,
+    );
+    let visible_end_ns = lerp_f64(
+        animation.start_visible_end_ns as f64,
+        animation.target_visible_end_ns as f64,
+        progress,
+    );
+    (
+        f64_to_i64_saturating(visible_start_ns),
+        f64_to_i64_saturating(visible_end_ns).max(f64_to_i64_saturating(visible_start_ns) + 1),
+    )
 }
 
 #[expect(
@@ -8763,6 +9430,24 @@ fn perform_scene_action(
                 .wrap_err("failed to spawn Teamy Studio demo mode thread")?;
             Ok(SceneActionDisposition::KeepOpen)
         }
+        SceneAction::OpenTimelinePlayground => {
+            // timeline[impl playground.launcher-button]
+            let app_home = app_home.clone();
+            thread::Builder::new()
+                .name("teamy-studio-timeline-playground".to_owned())
+                .spawn_with_current_span(move || {
+                    if let Err(error) = run_scene_window(
+                        &app_home,
+                        SceneWindowKind::TimelinePlayground,
+                        vt_engine,
+                        SceneWindowInitialization::default(),
+                    ) {
+                        error!(?error, "failed to open timeline playground window");
+                    }
+                })
+                .wrap_err("failed to spawn Teamy Studio timeline playground thread")?;
+            Ok(SceneActionDisposition::KeepOpen)
+        }
         SceneAction::OpenStorage => {
             // windowing[impl launcher.buttons.storage-placeholder]
             let _ = MessageDialog::new()
@@ -8912,7 +9597,11 @@ fn perform_scene_action(
         SceneAction::CreateBlankTimeline => Ok(SceneActionDisposition::KeepOpen),
         SceneAction::PanTimelineLeft => {
             with_scene_app_state(|state| {
-                if let Some(document) = timeline_document_handle_mut(state) {
+                if state.scene_kind == SceneWindowKind::TimelinePlayground {
+                    if let Some(playground) = state.timeline_playground.as_mut() {
+                        playground.pan(-1);
+                    }
+                } else if let Some(document) = timeline_document_handle_mut(state) {
                     document.pan_viewport_left();
                 }
                 Ok(())
@@ -8921,7 +9610,11 @@ fn perform_scene_action(
         }
         SceneAction::PanTimelineRight => {
             with_scene_app_state(|state| {
-                if let Some(document) = timeline_document_handle_mut(state) {
+                if state.scene_kind == SceneWindowKind::TimelinePlayground {
+                    if let Some(playground) = state.timeline_playground.as_mut() {
+                        playground.pan(1);
+                    }
+                } else if let Some(document) = timeline_document_handle_mut(state) {
                     document.pan_viewport_right();
                 }
                 Ok(())
@@ -8930,7 +9623,11 @@ fn perform_scene_action(
         }
         SceneAction::ZoomTimelineIn => {
             with_scene_app_state(|state| {
-                if let Some(document) = timeline_document_handle_mut(state) {
+                if state.scene_kind == SceneWindowKind::TimelinePlayground {
+                    if let Some(playground) = state.timeline_playground.as_mut() {
+                        playground.zoom(1, 2);
+                    }
+                } else if let Some(document) = timeline_document_handle_mut(state) {
                     document.zoom_viewport_in();
                 }
                 Ok(())
@@ -8939,8 +9636,60 @@ fn perform_scene_action(
         }
         SceneAction::ZoomTimelineOut => {
             with_scene_app_state(|state| {
-                if let Some(document) = timeline_document_handle_mut(state) {
+                if state.scene_kind == SceneWindowKind::TimelinePlayground {
+                    if let Some(playground) = state.timeline_playground.as_mut() {
+                        playground.zoom(2, 1);
+                    }
+                } else if let Some(document) = timeline_document_handle_mut(state) {
                     document.zoom_viewport_out();
+                }
+                Ok(())
+            })?;
+            Ok(SceneActionDisposition::KeepOpen)
+        }
+        SceneAction::RegenerateTimelinePlayground => {
+            // timeline[impl playground.query-controls]
+            with_scene_app_state(|state| {
+                if let Some(playground) = state.timeline_playground.as_mut() {
+                    playground.regenerate()?;
+                }
+                Ok(())
+            })?;
+            Ok(SceneActionDisposition::KeepOpen)
+        }
+        SceneAction::TimelinePlaygroundGroupingGroupKey => {
+            set_timeline_playground_grouping(TimelineGroupingMode::GroupKey)?;
+            Ok(SceneActionDisposition::KeepOpen)
+        }
+        SceneAction::TimelinePlaygroundGroupingSourceKey => {
+            set_timeline_playground_grouping(TimelineGroupingMode::SourceKey)?;
+            Ok(SceneActionDisposition::KeepOpen)
+        }
+        SceneAction::TimelinePlaygroundGroupingLabel => {
+            set_timeline_playground_grouping(TimelineGroupingMode::Label)?;
+            Ok(SceneActionDisposition::KeepOpen)
+        }
+        SceneAction::TimelinePlaygroundGroupingAll => {
+            set_timeline_playground_grouping(TimelineGroupingMode::All)?;
+            Ok(SceneActionDisposition::KeepOpen)
+        }
+        SceneAction::IncreaseTimelinePlaygroundFolding => {
+            // timeline[impl playground.query-controls]
+            with_scene_app_state(|state| {
+                if let Some(playground) = state.timeline_playground.as_mut() {
+                    playground.minimum_visible_pixels =
+                        playground.minimum_visible_pixels.saturating_add(1).min(32);
+                }
+                Ok(())
+            })?;
+            Ok(SceneActionDisposition::KeepOpen)
+        }
+        SceneAction::DecreaseTimelinePlaygroundFolding => {
+            // timeline[impl playground.query-controls]
+            with_scene_app_state(|state| {
+                if let Some(playground) = state.timeline_playground.as_mut() {
+                    playground.minimum_visible_pixels =
+                        playground.minimum_visible_pixels.saturating_sub(1).max(1);
                 }
                 Ok(())
             })?;
@@ -11703,11 +12452,21 @@ fn scene_action_tooltip(
     }
 
     let specs = windows_scene::scene_button_specs(state.scene_kind);
-    let button_layouts = windows_scene::layout_scene_buttons(
-        layout.terminal_panel_rect(),
-        specs.len(),
-        scaled_scene_button_size(state.dpi),
-    );
+    let (button_rect, max_button_size) = if state.scene_kind == SceneWindowKind::TimelinePlayground
+    {
+        (
+            windows_scene::timeline_playground_layout(layout.terminal_panel_rect().inset(24))
+                .controls_rect,
+            76,
+        )
+    } else {
+        (
+            layout.terminal_panel_rect(),
+            scaled_scene_button_size(state.dpi),
+        )
+    };
+    let button_layouts =
+        windows_scene::layout_scene_buttons(button_rect, specs.len(), max_button_size);
 
     specs
         .iter()
@@ -12343,12 +13102,15 @@ mod tests {
             timeline_document_command_target: None,
             model_warning: None,
             model_warning_prepare_started_at: None,
+            timeline_playground: None,
+            timeline_playground_detail: None,
             timeline_tool: TimelineInteractionTool::default(),
             timeline_selection: None,
             pending_timeline_selection: None,
             pending_timeline_text_block: None,
             pending_timeline_track_reorder: None,
             timeline_pan_drag: None,
+            timeline_playground_pan_drag: None,
             timeline_zoom_animation: None,
             timeline_vertical_scroll_offset: 0,
             demo_mode_scramble_input_device_identifiers:
@@ -12471,6 +13233,63 @@ mod tests {
     }
 
     #[test]
+    // timeline[verify playground.viewport-controls]
+    fn timeline_playground_pan_hit_test_uses_playground_timeline_surface() {
+        let mut state = timeline_test_state(TimelineDocument::blank());
+        state.scene_kind = SceneWindowKind::TimelinePlayground;
+        state.timeline_document = None;
+        state.timeline_playground = Some(TimelinePlaygroundState::new().expect("playground"));
+        let layout = test_scene_layout();
+        let playground_layout =
+            windows_scene::timeline_playground_layout(layout.terminal_panel_rect().inset(24));
+
+        assert!(timeline_playground_pan_interaction_at_point(
+            &state,
+            layout,
+            rect_center(playground_layout.ruler_rect)
+        ));
+        assert!(timeline_playground_pan_interaction_at_point(
+            &state,
+            layout,
+            rect_center(playground_layout.content_rect)
+        ));
+        assert!(!timeline_playground_pan_interaction_at_point(
+            &state,
+            layout,
+            rect_center(playground_layout.controls_rect)
+        ));
+    }
+
+    #[test]
+    // timeline[verify playground.viewport-controls]
+    fn timeline_playground_right_drag_pan_moves_visible_range() {
+        let mut playground = TimelinePlaygroundState::new().expect("playground");
+        playground.visible_start_ns = 1_000;
+        playground.visible_end_ns = 2_000;
+        let pan_drag = TimelinePlaygroundPanDrag {
+            origin: ClientPoint::new(100, 20),
+            origin_visible_start_ns: playground.visible_start_ns,
+            origin_visible_end_ns: playground.visible_end_ns,
+        };
+
+        apply_timeline_playground_pan_drag(&mut playground, pan_drag, 25, 100);
+
+        assert_eq!(playground.visible_start_ns, 750);
+        assert_eq!(playground.visible_end_ns, 1_750);
+        assert_eq!(playground.zoom_animation, None);
+    }
+
+    #[test]
+    // timeline[verify playground.hover-detail-no-activate]
+    fn timeline_playground_detail_window_style_does_not_activate() {
+        let style = scene_window_ex_style(SceneWindowKind::TimelinePlaygroundDetail);
+
+        assert_eq!(style & WS_EX_NOACTIVATE, WS_EX_NOACTIVATE);
+        assert_eq!(style & WS_EX_TOOLWINDOW, WS_EX_TOOLWINDOW);
+        assert_eq!(style & WS_EX_APPWINDOW, WINDOW_EX_STYLE(0));
+    }
+
+    #[test]
     // timeline[verify viewport.mouse-pan]
     // timeline[verify viewport.mouse-zoom-anchor]
     fn wheel_zoom_rebases_active_timeline_pan_drag() {
@@ -12521,6 +13340,46 @@ mod tests {
                 .viewport(),
             target_viewport
         );
+    }
+
+    #[test]
+    // timeline[verify playground.mouse-zoom-anchor]
+    fn timeline_playground_zoom_keeps_anchor_time_under_cursor() {
+        let mut playground = TimelinePlaygroundState::new().expect("playground");
+        playground.visible_start_ns = 0;
+        playground.visible_end_ns = 1_000;
+
+        playground.zoom_about_pixels(75, 100, 1, 2);
+        let animation = playground.zoom_animation.expect("animation");
+
+        assert_eq!(animation.target_visible_start_ns, 375);
+        assert_eq!(animation.target_visible_end_ns, 875);
+    }
+
+    #[test]
+    // timeline[verify playground.viewport-transition]
+    fn timeline_playground_zoom_transition_uses_bounded_ease_in_out() {
+        let mut playground = TimelinePlaygroundState::new().expect("playground");
+        playground.visible_start_ns = 0;
+        playground.visible_end_ns = 1_000;
+        playground.zoom_animation = Some(TimelinePlaygroundZoomAnimation {
+            start_visible_start_ns: 0,
+            start_visible_end_ns: 1_000,
+            target_visible_start_ns: 250,
+            target_visible_end_ns: 750,
+            started_at: Instant::now() - TIMELINE_ZOOM_ANIMATION_DURATION / 2,
+        });
+
+        playground.apply_zoom_animation();
+
+        assert!(playground.zoom_animation.is_some());
+        assert!(playground.visible_start_ns > 0);
+        assert!(playground.visible_start_ns < 250);
+        assert!(playground.visible_end_ns < 1_000);
+        assert!(playground.visible_end_ns > 750);
+        assert_eq!(ease_in_out(0.0), 0.0);
+        assert_eq!(ease_in_out(1.0), 1.0);
+        assert!((ease_in_out(0.5) - 0.5).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -12641,12 +13500,15 @@ mod tests {
             timeline_document_command_target: None,
             model_warning: None,
             model_warning_prepare_started_at: None,
+            timeline_playground: None,
+            timeline_playground_detail: None,
             timeline_tool: TimelineInteractionTool::default(),
             timeline_selection: None,
             pending_timeline_selection: None,
             pending_timeline_text_block: None,
             pending_timeline_track_reorder: None,
             timeline_pan_drag: None,
+            timeline_playground_pan_drag: None,
             timeline_zoom_animation: None,
             timeline_vertical_scroll_offset: 0,
             demo_mode_scramble_input_device_identifiers:
@@ -12722,12 +13584,15 @@ mod tests {
             timeline_document_command_target: None,
             model_warning: None,
             model_warning_prepare_started_at: None,
+            timeline_playground: None,
+            timeline_playground_detail: None,
             timeline_tool: TimelineInteractionTool::default(),
             timeline_selection: None,
             pending_timeline_selection: None,
             pending_timeline_text_block: None,
             pending_timeline_track_reorder: None,
             timeline_pan_drag: None,
+            timeline_playground_pan_drag: None,
             timeline_zoom_animation: None,
             timeline_vertical_scroll_offset: 0,
             demo_mode_scramble_input_device_identifiers:
@@ -12794,12 +13659,15 @@ mod tests {
             timeline_document_command_target: None,
             model_warning: None,
             model_warning_prepare_started_at: None,
+            timeline_playground: None,
+            timeline_playground_detail: None,
             timeline_tool: TimelineInteractionTool::default(),
             timeline_selection: None,
             pending_timeline_selection: None,
             pending_timeline_text_block: None,
             pending_timeline_track_reorder: None,
             timeline_pan_drag: None,
+            timeline_playground_pan_drag: None,
             timeline_zoom_animation: None,
             timeline_vertical_scroll_offset: 0,
             demo_mode_scramble_input_device_identifiers:

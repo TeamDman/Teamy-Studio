@@ -12,6 +12,7 @@ use uom::si::length::meter;
 use uom::si::time::{millisecond, nanosecond, second};
 
 pub mod dataset;
+pub mod playground;
 pub mod query;
 pub mod synthetic;
 pub mod time;
@@ -22,6 +23,7 @@ pub use dataset::{
     TimelineItem, TimelineItemId, TimelineItemInput, TimelineItemKind, TimelineItemSequence,
     TimelineObjectRef, TimelineSpanItem, TimelineWriteLogEntry,
 };
+pub use playground::{TimelinePlaygroundDetail, timeline_playground_detail_for_render_item};
 pub use query::{
     TimelineGroupingMode, TimelineRenderCluster, TimelineRenderEvent, TimelineRenderItem,
     TimelineRenderPlan, TimelineRenderRow, TimelineRenderRowId, TimelineRenderRowKey,
@@ -191,13 +193,40 @@ pub struct TimelineTimeRangeNs {
 
 impl TimelineTimeRangeNs {
     #[must_use]
+    /// # Panics
+    ///
+    /// Panics when `end` is earlier than `start`. Use
+    /// [`TimelineTimeRangeNs::from_unordered`] at pointer-drag boundaries where
+    /// either endpoint may come first.
     pub fn new(start: TimelineTimeNs, end: TimelineTimeNs) -> Self {
-        if start <= end {
-            Self { start, end }
+        Self::try_new(start, end).expect("timeline range end must not be earlier than start")
+    }
+
+    /// # Errors
+    ///
+    /// Returns an error when `end` is earlier than `start`.
+    pub fn try_new(start: TimelineTimeNs, end: TimelineTimeNs) -> eyre::Result<Self> {
+        if end < start {
+            eyre::bail!(
+                "timeline range end {} is earlier than start {}",
+                end.as_i64(),
+                start.as_i64()
+            );
+        }
+        Ok(Self { start, end })
+    }
+
+    #[must_use]
+    pub fn from_unordered(first: TimelineTimeNs, other: TimelineTimeNs) -> Self {
+        if first <= other {
+            Self {
+                start: first,
+                end: other,
+            }
         } else {
             Self {
-                start: end,
-                end: start,
+                start: other,
+                end: first,
             }
         }
     }
@@ -1411,6 +1440,25 @@ fn hashed_non_zero_id(value: impl Hash, salt: u64) -> NonZeroU64 {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    // timeline[verify display.time-strict]
+    fn editor_time_range_rejects_reversed_ordered_construction() {
+        let error = TimelineTimeRangeNs::try_new(TimelineTimeNs::new(20), TimelineTimeNs::new(10))
+            .expect_err("reversed editor range");
+
+        assert!(error.to_string().contains("earlier than start"));
+    }
+
+    #[test]
+    // timeline[verify display.time-strict]
+    fn editor_time_range_keeps_unordered_drag_boundaries_explicit() {
+        let range =
+            TimelineTimeRangeNs::from_unordered(TimelineTimeNs::new(20), TimelineTimeNs::new(10));
+
+        assert_eq!(range.start(), TimelineTimeNs::new(10));
+        assert_eq!(range.end(), TimelineTimeNs::new(20));
+    }
 
     #[test]
     // timeline[verify document.blank-model]

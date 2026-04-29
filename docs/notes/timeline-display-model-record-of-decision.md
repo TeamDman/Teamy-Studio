@@ -225,23 +225,124 @@ Decision:
 - Extend `docs/spec/product/observability.md` for object-ref tracing conventions and future span timeline ingestion.
 - Create a new spec later only if the object store or playground becomes a distinct user-facing subsystem.
 
+### First Visible Playground Slice
+
+Question: Should the first UI consumer of the new timeline model be synthetic, live logs/jobs, or a hybrid?
+
+Response: Synthetic playground first.
+
+Clarification:
+
+- The new timeline model is currently represented in code and tests, not in a visible UI.
+- A synthetic playground lets Teamy play with the new render-plan behavior without first solving live tracing span lifecycle capture or replacing the current Jobs window.
+- The codebase already has launcher-style scene windows and a production synthetic dataset generator, so a launcher-accessible playground is the smallest visible path.
+
+Decision:
+
+- Add a separate Timeline Playground launcher action/window before live logs/jobs ingestion.
+- Keep names source-agnostic so live observability and Progress Hub can reuse the same surface later.
+- Stay synthetic-only in the first implementation, with live logs/jobs deferred until the playground proves the interaction model.
+
+### Playground Controls And Interactions
+
+Question: What makes the first playground playable?
+
+Response: It must include pan, zoom, folding visibility, hover details, pinned details, seed regeneration, grouping controls, and folding-threshold controls.
+
+Clarification:
+
+- The first model already supports grouping modes and minimum visible pixel thresholds, so the UI should expose those knobs instead of hiding them in tests.
+- Synthetic data should be deterministic by default, with a Regenerate button that advances the seed. Full config sliders can come later.
+- Hover details are required in the first slice because visual rendering alone does not let the user inspect whether render items preserve the intended data.
+
+Decision:
+
+- Add a Regenerate control that changes the synthetic seed.
+- Add visible grouping-mode controls for group key, source key, label, and all-items grouping.
+- Add a visible folding-threshold control.
+- Add pan and zoom controls tied to render-plan recomputation.
+- Treat folded clusters as first-class inspectable render items instead of immediately drilling into representative items.
+
+### Hover And Pinned Detail Windows
+
+Question: Should hover details appear in the playground window, near the cursor, or in a separate window?
+
+Response: Use a lazy sidecar detail-window object pool.
+
+Clarification:
+
+- The desired behavior is closer to a separate object/detail window than an in-window inspector.
+- Hover should not spawn unbounded windows. A lazy pool should create or reuse a transient inspector window.
+- Left-clicking a rendered item or cluster should promote the current hover detail into a pinned detail window, then allow a new transient hover inspector to be used.
+- Stable sidecar placement adjacent to the playground window is preferred over cursor-chasing behavior for the first slice.
+
+Decision:
+
+- Implement a lazy detail-window pool, initially with one transient hover inspector plus click-to-pin promotion.
+- Position detail windows adjacent to the playground window, preferring the right side and falling back later when needed.
+- Use left-click on spans, events, folded span clusters, and folded event clusters to pin the current detail.
+- Keep right-drag and mouse wheel available for timeline panning and zooming.
+
+### Detail Window Content
+
+Question: Should detail windows show handcrafted summaries, raw timeline structs, or reflected dumps?
+
+Response: Show reflected dumps using `facet-pretty`, but dump a resolved hover detail view model rather than raw interned timeline structs.
+
+Clarification:
+
+- Raw `TimelineItem` values contain interned string IDs, which are useful internally but not enough for readable inspection.
+- A purpose-built detail model can include both the render item context and resolved label/source/group strings.
+- The first slice should not build the future typed object store, but it should show primitive fields and lightweight object refs.
+
+Decision:
+
+- Add a Facet-derived hover detail view model for playground inspection.
+- Include render item kind, item ID, sequence, resolved label/source/group keys, timing, open state, primitive fields, object refs, and cluster count/range/representative metadata.
+- Render detail content with `facet_pretty::FacetPretty`.
+
+### Playground Focus And Pan Regression Fixes
+
+Question: What did manual playground play reveal after the first visible slice?
+
+Response: First-hover detail window creation appeared to focus the detail window and downgrade playground performance, and right-click drag panning was ignored.
+
+Clarification:
+
+- The log showed `timeline right-button pan ignored outside timeline pan surface` from `src/app/windows_app.rs` while the scene kind was `Timeline Playground`.
+- The old right-button pan gate required `SceneWindowKind::Timeline`, a `TimelineDocument`, and `timeline_selection_surface_contains`, which is correct for the editor timeline but wrong for the synthetic playground.
+- The sidecar hover detail window should behave like an inspector/tool window. It should not take focus from the playground window when it appears on hover.
+
+Decision:
+
+- Create `TimelinePlaygroundDetail` scene windows with `WS_EX_NOACTIVATE` and `WS_EX_TOOLWINDOW` at `CreateWindowExW` time, not only through show-time no-activate calls.
+- Add playground-specific right-drag pan state and hit testing over the playground ruler/content surface.
+- Keep the main timeline document panning code separate from playground panning so the editor timeline keeps its document/track-scroll behavior.
+
+References:
+
+- `docs/spec/product/timeline.md`: `timeline[playground.hover-detail-no-activate]`.
+- `src/app/windows_app.rs`: `scene_window_ex_style`, `TimelinePlaygroundPanDrag`, `timeline_playground_pan_interaction_at_point`, and `apply_timeline_playground_pan_drag`.
+
 ## Current Implementation Commitment
 
-The next implementation should start with Phase 1 from `docs/notes/timeline-display-model-plan.md`:
+The next implementation should add the first visible synthetic Timeline Playground:
 
-- Add `src/timeline/time.rs`.
-- Define strict `TimelineInstantNs`, `TimelineDurationNs`, and `TimelineRangeNs`.
-- Reject reversed ranges through `eyre::Result`.
-- Add tests for strict range creation, rejection, duration, ordering, and Arbitrary validity.
-- Do not migrate the existing timeline editor in the same slice.
+- Add a launcher-accessible Timeline Playground scene window.
+- Generate synthetic timeline data from `src/timeline/synthetic.rs`.
+- Render the dataset through `TimelineViewportQuery` and `TimelineRenderPlan`.
+- Expose regenerate, grouping, folding-threshold, pan, and zoom controls.
+- Add hover hit testing and a lazy sidecar detail-window pool with click-to-pin promotion.
+- Render resolved hover detail view models with `facet-pretty`.
+- Do not wire live logs or jobs in the same slice.
 
 ## Known Non-Decisions
 
 - Exact final names for every type and enum variant remain open.
-- The first render row grouping modes remain open.
+- The first render row grouping modes are GroupKey, SourceKey, Label, and All, matching `TimelineGroupingMode`.
 - Whether to support multiple object refs per item immediately remains open.
 - The future typed object store location and API remain open.
-- The playground launcher exposure remains open: main launcher versus diagnostics/development entry.
+- The playground launcher exposure is the main launcher.
 - The old Jobs system is not removed until Progress Hub has equivalent or better structured observability visibility.
 
 ## Preservation Notes

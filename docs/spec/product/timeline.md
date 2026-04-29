@@ -147,6 +147,42 @@ Reusable timeline render projection must fold dense spans and events into viewpo
 timeline[display.synthetic-data]
 Reusable timeline synthetic data generation must be available outside test-only code and must create valid renderable datasets with dense spans, event bursts, open spans, sparse group keys, repeated metadata, and object-reference-bearing items.
 
+timeline[playground.launcher-button]
+The launcher window must expose a Timeline Playground action that opens a visible synthetic playground for the reusable timeline display model.
+
+timeline[playground.synthetic-render-plan]
+The Timeline Playground must generate synthetic timeline data and render it through `TimelineViewportQuery` and `TimelineRenderPlan` rather than through the older timeline document editor model.
+
+timeline[playground.query-controls]
+The Timeline Playground must expose controls for changing the synthetic seed, grouping mode, and folding threshold so row derivation and dense-item clustering can be exercised interactively.
+
+timeline[playground.viewport-controls]
+The Timeline Playground must support panning and zooming over synthetic timeline data and recompute the render plan from the updated viewport.
+
+timeline[playground.mouse-zoom-anchor]
+Mouse-wheel zooming in the Timeline Playground must keep the time under the mouse cursor stable, matching the main timeline's anchor-aware zoom behavior.
+
+timeline[playground.viewport-transition]
+Timeline Playground zoom changes must animate between visible ranges with a non-bouncy ease-in-out transition.
+
+timeline[playground.ruler-ticks]
+The Timeline Playground must render top ruler tick marks, grid lines, and time labels for the currently visible range.
+
+timeline[playground.hover-detail]
+Hovering a rendered span, event, folded span cluster, or folded event cluster in the Timeline Playground must open or update a sidecar detail window.
+
+timeline[playground.hover-detail-no-activate]
+Timeline Playground hover detail windows must be created and shown without taking focus from the playground window.
+
+timeline[playground.pin-detail]
+Left-clicking a rendered span, event, folded span cluster, or folded event cluster in the Timeline Playground must promote the current hover detail into a pinned detail window.
+
+timeline[playground.detail-facet-pretty]
+Timeline Playground detail windows must render a resolved Facet-derived detail view model with `facet-pretty` so interned labels, source keys, group keys, primitive fields, object references, and cluster metadata are readable.
+
+timeline[playground.detail-vt-text]
+Timeline Playground detail windows must parse VT/ANSI styling in reflected detail text before rendering, so styled `facet-pretty` output becomes colored text instead of visible escape sequences.
+
 ## Transcription Tracks
 
 timeline[transcription.targets]
