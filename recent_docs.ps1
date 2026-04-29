@@ -1,0 +1,1 @@
+eza .\docs\notes\ --sort time --reverse --long | Select-Object -First 5

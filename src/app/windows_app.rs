@@ -4260,7 +4260,7 @@ fn handle_scene_right_button_down(hwnd: WindowHandle, lparam: LPARAM) -> eyre::R
         if !timeline_pan_interaction_at_point(state, layout, point) {
             trace!(
                 ?point,
-                "timeline right-button pan ignored outside track content"
+                "timeline right-button pan ignored outside timeline pan surface"
             );
             return Ok(false);
         }
@@ -4338,9 +4338,12 @@ fn handle_scene_mouse_wheel(
             );
             lock_shared_timeline_document(&document).set_viewport(target_viewport);
             state.timeline_zoom_animation = None;
-            pan_drag.origin = point;
-            pan_drag.origin_viewport = target_viewport;
-            pan_drag.origin_vertical_scroll_offset = current_vertical_scroll_offset;
+            rebase_timeline_pan_drag_after_zoom(
+                pan_drag,
+                point,
+                target_viewport,
+                current_vertical_scroll_offset,
+            );
         } else {
             trace!(wheel_delta, steps, ?point, "timeline wheel zoom");
             lock_shared_timeline_document(&document).set_viewport(current_viewport);
@@ -6840,8 +6843,19 @@ fn timeline_pan_interaction_at_point(
 ) -> bool {
     state.scene_kind == SceneWindowKind::Timeline
         && !state.diagnostics_visible
-        && timeline_track_count(state) > 0
-        && timeline_layout(layout).scrollport_rect.contains(point)
+        && timeline_document_handle(state).is_some()
+        && windows_scene::timeline_selection_surface_contains(timeline_layout(layout), point)
+}
+
+fn rebase_timeline_pan_drag_after_zoom(
+    pan_drag: &mut TimelinePanDrag,
+    point: ClientPoint,
+    target_viewport: TimelineViewport,
+    current_vertical_scroll_offset: i32,
+) {
+    pan_drag.origin = point;
+    pan_drag.origin_viewport = target_viewport;
+    pan_drag.origin_vertical_scroll_offset = current_vertical_scroll_offset;
 }
 
 fn timeline_current_vertical_scroll_offset(state: &SceneAppState, layout: TerminalLayout) -> i32 {
@@ -11398,6 +11412,66 @@ fn rects_intersect(a: ScreenRect, b: ScreenRect) -> bool {
 mod tests {
     use super::*;
 
+    fn timeline_test_state(document: TimelineDocument) -> SceneAppState {
+        SceneAppState {
+            app_home: AppHome(std::path::PathBuf::from(".")),
+            hwnd: None,
+            dpi: USER_DEFAULT_SCREEN_DPI,
+            scene_kind: SceneWindowKind::Timeline,
+            scene_opened_at: Instant::now(),
+            vt_engine: VtEngineChoice::default(),
+            audio_input_picker: AudioInputPickerState::default(),
+            audio_input_picker_completion: AudioInputPickerCompletion::default(),
+            audio_input_device_window: None,
+            timeline_document: Some(shared_timeline_document(document)),
+            timeline_transcription_settings: None,
+            model_warning: None,
+            model_warning_prepare_started_at: None,
+            timeline_tool: TimelineInteractionTool::default(),
+            timeline_selection: None,
+            pending_timeline_selection: None,
+            pending_timeline_text_block: None,
+            pending_timeline_track_reorder: None,
+            timeline_pan_drag: None,
+            timeline_zoom_animation: None,
+            timeline_vertical_scroll_offset: 0,
+            demo_mode_scramble_input_device_identifiers:
+                DemoModeInputDeviceIdentifierScramble::default(),
+            demo_mode_scramble_toggle_last_changed_at: None,
+            scene_action_selected_index: 0,
+            scene_virtual_cursor: None,
+            pointer_position: None,
+            pressed_target: None,
+            pin_button_last_clicked_at: None,
+            pinned_topmost: false,
+            last_clicked_action: None,
+            diagnostics_button_last_clicked_at: None,
+            diagnostics_visible: false,
+            diagnostic_selection: None,
+            pending_diagnostic_selection: None,
+            diagnostic_selection_drag_point: None,
+            in_move_size_loop: false,
+            window_focused: false,
+            focused_render_interval_ms: 16,
+            terminal_cell_width: 8,
+            terminal_cell_height: 16,
+            diagnostic_cell_width: 8,
+            diagnostic_cell_height: 16,
+            chrome_tooltip: ChromeTooltipController::default(),
+            renderer: None,
+        }
+    }
+
+    fn test_scene_layout() -> TerminalLayout {
+        TerminalLayout {
+            client_width: 1040,
+            client_height: 680,
+            cell_width: 8,
+            cell_height: 16,
+            diagnostic_panel_visible: false,
+        }
+    }
+
     #[test]
     fn shortcut_action_requires_control() {
         assert_eq!(
@@ -11438,6 +11512,66 @@ mod tests {
             Some(WindowShortcutAction::WindowResize(ShortcutStep::Decrease))
         );
         assert_eq!(window_resize_direction(ShortcutStep::Decrease), -1);
+    }
+
+    #[test]
+    // timeline[verify viewport.mouse-pan]
+    // timeline[verify viewport.mouse-zoom-anchor]
+    fn timeline_pan_hit_test_matches_wheel_zoom_surface_for_empty_timeline() {
+        let state = timeline_test_state(TimelineDocument::blank());
+        let layout = test_scene_layout();
+        let timeline_layout = timeline_layout(layout);
+        let time_axis_point = rect_center(timeline_layout.time_axis_rect);
+        let scrollport_point = rect_center(timeline_layout.scrollport_rect);
+        let track_list_point = rect_center(timeline_layout.track_list_rect);
+
+        assert!(timeline_selection_surface_at_point(
+            &state,
+            layout,
+            time_axis_point
+        ));
+        assert!(timeline_selection_surface_at_point(
+            &state,
+            layout,
+            scrollport_point
+        ));
+        assert!(timeline_pan_interaction_at_point(
+            &state,
+            layout,
+            time_axis_point
+        ));
+        assert!(timeline_pan_interaction_at_point(
+            &state,
+            layout,
+            scrollport_point
+        ));
+        assert!(!timeline_pan_interaction_at_point(
+            &state,
+            layout,
+            track_list_point
+        ));
+    }
+
+    #[test]
+    // timeline[verify viewport.mouse-pan]
+    // timeline[verify viewport.mouse-zoom-anchor]
+    fn wheel_zoom_rebases_active_timeline_pan_drag() {
+        let original_viewport =
+            TimelineViewport::new(TimelineTimeNs::new(1_000), Time::new::<nanosecond>(100.0));
+        let target_viewport =
+            TimelineViewport::new(TimelineTimeNs::new(2_500), Time::new::<nanosecond>(25.0));
+        let mut pan_drag = TimelinePanDrag {
+            origin: ClientPoint::new(10, 20),
+            origin_viewport: original_viewport,
+            origin_vertical_scroll_offset: 12,
+        };
+        let zoom_point = ClientPoint::new(40, 60);
+
+        rebase_timeline_pan_drag_after_zoom(&mut pan_drag, zoom_point, target_viewport, 48);
+
+        assert_eq!(pan_drag.origin, zoom_point);
+        assert_eq!(pan_drag.origin_viewport, target_viewport);
+        assert_eq!(pan_drag.origin_vertical_scroll_offset, 48);
     }
 
     #[test]
