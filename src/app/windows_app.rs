@@ -675,7 +675,7 @@ impl TimelinePlaygroundState {
                         animation.target_visible_end_ns,
                     );
                 }
-                interpolate_timeline_playground_range(animation, ease_in_out(progress))
+                interpolate_timeline_playground_range(animation, zoom_transition_progress(progress))
             })
     }
 
@@ -693,7 +693,7 @@ impl TimelinePlaygroundState {
             return;
         }
         let (visible_start_ns, visible_end_ns) =
-            interpolate_timeline_playground_range(animation, ease_in_out(progress));
+            interpolate_timeline_playground_range(animation, zoom_transition_progress(progress));
         self.visible_start_ns = visible_start_ns;
         self.visible_end_ns = visible_end_ns;
     }
@@ -8794,7 +8794,7 @@ fn current_timeline_zoom_viewport(state: &SceneAppState) -> TimelineViewport {
             interpolate_timeline_viewport(
                 animation.start_viewport,
                 animation.target_viewport,
-                ease_in_out(progress),
+                zoom_transition_progress(progress),
             )
         })
 }
@@ -8831,7 +8831,7 @@ fn apply_timeline_zoom_animation(state: &mut SceneAppState) {
     document.set_viewport(interpolate_timeline_viewport(
         animation.start_viewport,
         animation.target_viewport,
-        ease_in_out(progress),
+        zoom_transition_progress(progress),
     ));
 }
 
@@ -8874,6 +8874,11 @@ fn ease_in_out(progress: f64) -> f64 {
     } else {
         1.0 - (-2.0 * progress + 2.0).powi(3) / 2.0
     }
+}
+
+fn zoom_transition_progress(progress: f64) -> f64 {
+    let progress = progress.clamp(0.0, 1.0);
+    1.0 - (1.0 - progress).powi(3)
 }
 
 fn lerp_f64(start: f64, target: f64, progress: f64) -> f64 {
@@ -14181,7 +14186,7 @@ mod tests {
 
     #[test]
     // timeline[verify playground.viewport-transition]
-    fn timeline_playground_zoom_transition_uses_bounded_ease_in_out() {
+    fn timeline_playground_zoom_transition_uses_high_energy_start() {
         let mut playground = TimelinePlaygroundState::new().expect("playground");
         playground.visible_start_ns = 0;
         playground.visible_end_ns = 1_000;
@@ -14203,6 +14208,10 @@ mod tests {
         assert_eq!(ease_in_out(0.0), 0.0);
         assert_eq!(ease_in_out(1.0), 1.0);
         assert!((ease_in_out(0.5) - 0.5).abs() < f64::EPSILON);
+        assert_eq!(zoom_transition_progress(0.0), 0.0);
+        assert_eq!(zoom_transition_progress(1.0), 1.0);
+        assert!(zoom_transition_progress(0.25) > ease_in_out(0.25));
+        assert!(zoom_transition_progress(0.5) > 0.5);
     }
 
     #[test]

@@ -60,6 +60,7 @@ pub struct LogRecordSnapshot {
     pub timestamp: DateTime<Local>,
     pub level: LogRecordLevel,
     pub thread_name: String,
+    pub thread_key: String,
     pub target: String,
     pub message: String,
     pub source_hwnd: Option<isize>,
@@ -71,6 +72,7 @@ pub struct LogSpanSnapshot {
     pub start_timestamp: DateTime<Local>,
     pub end_timestamp: DateTime<Local>,
     pub thread_name: String,
+    pub thread_key: String,
     pub target: String,
     pub name: String,
     pub fields: Vec<String>,
@@ -147,6 +149,7 @@ impl ThreadBuilderSpanExt for Builder {
 struct LogSpanFields {
     start_timestamp: DateTime<Local>,
     thread_name: String,
+    thread_key: String,
     target: String,
     name: String,
     fields: Vec<String>,
@@ -167,6 +170,7 @@ where
         span.extensions_mut().replace(LogSpanFields {
             start_timestamp: Local::now(),
             thread_name: current_thread_name(),
+            thread_key: current_thread_key(),
             target: attrs.metadata().target().to_owned(),
             name: attrs.metadata().name().to_owned(),
             fields: visitor.fields,
@@ -192,6 +196,7 @@ where
         let mut extensions = span.extensions_mut();
         if let Some(fields) = extensions.get_mut::<LogSpanFields>() {
             fields.thread_name = current_thread_name();
+            fields.thread_key = current_thread_key();
         }
     }
 
@@ -211,6 +216,7 @@ where
             extensions.replace(LogSpanFields {
                 start_timestamp: Local::now(),
                 thread_name: current_thread_name(),
+                thread_key: current_thread_key(),
                 target: String::new(),
                 name: "span".to_owned(),
                 fields: visitor.fields,
@@ -339,6 +345,7 @@ fn push_log_record(
         timestamp: Local::now(),
         level,
         thread_name: current_thread_name(),
+        thread_key: current_thread_key(),
         target: target.to_owned(),
         message,
         source_hwnd,
@@ -361,6 +368,7 @@ fn push_log_span_record(fields: LogSpanFields, end_timestamp: DateTime<Local>) -
         start_timestamp: fields.start_timestamp,
         end_timestamp: end_timestamp.max(fields.start_timestamp),
         thread_name: fields.thread_name,
+        thread_key: fields.thread_key,
         target: fields.target,
         name: fields.name,
         fields: fields.fields,
@@ -374,6 +382,12 @@ fn current_thread_name() -> String {
         .name()
         .unwrap_or("unnamed thread")
         .to_owned()
+}
+
+fn current_thread_key() -> String {
+    let thread = std::thread::current();
+    let name = thread.name().unwrap_or("unnamed thread");
+    format!("{name} {:?}", thread.id())
 }
 
 #[must_use]
@@ -428,9 +442,10 @@ pub fn tracing_event_timeline_dataset() -> (TimelineDataset, i64) {
             .unwrap_or(start_ns)
             .max(start_ns);
         latest_at_ns = latest_at_ns.max(end_ns);
+        // timeline[impl playground.live-tracing-thread-identity]
         let mut input = TimelineItemInput::new(record.name.clone())
             .with_source_key(record.target.clone())
-            .with_group_key(record.thread_name.clone())
+            .with_group_key(record.thread_key.clone())
             .with_field("span_id", TimelineFieldInputValue::U64(record.id))
             .with_field(
                 "thread",
@@ -462,9 +477,10 @@ pub fn tracing_event_timeline_dataset() -> (TimelineDataset, i64) {
             .unwrap_or(latest_at_ns)
             .max(0);
         latest_at_ns = latest_at_ns.max(at_ns);
+        // timeline[impl playground.live-tracing-thread-identity]
         let input = TimelineItemInput::new(record.message.clone())
             .with_source_key(record.target.clone())
-            .with_group_key(record.thread_name.clone())
+            .with_group_key(record.thread_key.clone())
             .with_field("log_id", TimelineFieldInputValue::U64(record.id))
             .with_field(
                 "timestamp",
@@ -710,13 +726,47 @@ mod tests {
         assert_eq!(logs.len(), 1);
         assert_eq!(logs[0].source_hwnd, Some(456));
         assert_eq!(logs[0].thread_name, "trace-worker");
+        assert!(logs[0].thread_key.starts_with("trace-worker ThreadId("));
 
         let (dataset, _) = tracing_event_timeline_dataset();
         let item = dataset.items().first().expect("timeline item");
-        assert_eq!(
-            dataset.resolve_string(item.group_key()),
-            Some("trace-worker")
+        assert!(
+            dataset
+                .resolve_string(item.group_key())
+                .is_some_and(|group_key| group_key.starts_with("trace-worker ThreadId("))
         );
+    }
+
+    #[test]
+    // timeline[verify playground.live-tracing-thread-identity]
+    fn collector_keeps_same_named_threads_in_distinct_timeline_rows() {
+        let _guard = TEST_LOGS_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear_logs();
+        let subscriber = tracing_subscriber::Registry::default().with(LogCollectorLayer);
+
+        tracing::subscriber::with_default(subscriber, || {
+            let first = std::thread::Builder::new()
+                .name("same-name".to_owned())
+                .spawn_with_current_span(|| tracing::info!("first"))
+                .expect("first thread should spawn");
+            let second = std::thread::Builder::new()
+                .name("same-name".to_owned())
+                .spawn_with_current_span(|| tracing::info!("second"))
+                .expect("second thread should spawn");
+            first.join().expect("first thread should finish");
+            second.join().expect("second thread should finish");
+        });
+
+        let (dataset, _) = tracing_event_timeline_dataset();
+        let row_keys = dataset
+            .items()
+            .iter()
+            .map(|item| item.group_key())
+            .collect::<std::collections::BTreeSet<_>>();
+
+        assert_eq!(row_keys.len(), 2);
     }
 
     #[test]

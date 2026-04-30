@@ -193,7 +193,7 @@ timeline[playground.zoom-compounds]
 Rapid repeated mouse-wheel zoom events in the Timeline Playground must compound against the pending target range instead of restarting each animation from the partially animated range.
 
 timeline[playground.viewport-transition]
-Timeline Playground zoom changes must animate between visible ranges with a non-bouncy ease-in-out transition.
+Timeline Playground zoom changes must animate between visible ranges with a non-bouncy transition that starts with high enough velocity for large zoom changes to feel responsive.
 
 timeline[playground.ruler-ticks]
 The Timeline Playground must render top ruler tick marks, grid lines, and time labels for the currently visible range.
@@ -218,6 +218,9 @@ The Timeline Playground live tracing collector must receive trace-level events i
 
 timeline[playground.live-tracing-spans]
 The Timeline Playground live tracing mode must capture closed tracing span lifecycles as duration spans in addition to instant log events.
+
+timeline[playground.live-tracing-thread-identity]
+The Timeline Playground live tracing mode must keep same-named runtime threads in distinct timeline rows by grouping captured events and spans with stable thread identity rather than display thread name alone.
 
 timeline[playground.span-lanes]
 The Timeline Playground must render overlapping spans in nested lanes within their grouped row so thread timelines can show span nesting and overlap without stacking clips on top of each other.
