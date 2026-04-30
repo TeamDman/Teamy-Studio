@@ -118,6 +118,7 @@ impl TimelineViewportQuery {
     pub const fn with_minimum_visible_pixels(mut self, minimum_visible_pixels: u32) -> Self {
         self.minimum_visible_pixels = minimum_visible_pixels;
         self
+        // timeline[impl playground.minimum-span-marker]
     }
 }
 
@@ -142,6 +143,7 @@ impl<'a> Arbitrary<'a> for TimelineViewportQuery {
 pub struct TimelineRenderSpan {
     item_id: TimelineItemId,
     row_id: TimelineRenderRowId,
+    lane_index: u32,
     range: TimelineRangeNs,
     is_open: bool,
 }
@@ -155,6 +157,11 @@ impl TimelineRenderSpan {
     #[must_use]
     pub const fn row_id(self) -> TimelineRenderRowId {
         self.row_id
+    }
+
+    #[must_use]
+    pub const fn lane_index(self) -> u32 {
+        self.lane_index
     }
 
     #[must_use]
@@ -392,8 +399,9 @@ fn build_render_items(
 ) -> Vec<TimelineRenderItem> {
     candidates.sort_by_key(candidate_sort_key);
     let mut render_items = Vec::new();
-    let mut folded_spans = Vec::new();
+    let mut folded_spans: Vec<(TimelineItemId, TimelineRenderRowId, TimelineRangeNs)> = Vec::new();
     let mut folded_events = Vec::new();
+    let mut span_lanes = BTreeMap::new();
 
     for candidate in candidates {
         let row_id = row_ids[&candidate.row_key];
@@ -401,19 +409,40 @@ fn build_render_items(
             TimelineCandidateKind::Span { range, is_open } => {
                 if projected_width_pixels(range, query) < f64::from(query.minimum_visible_pixels())
                 {
+                    // timeline[impl playground.minimum-span-marker]
+                    // timeline[impl playground.span-cluster-decomposition]
+                    if folded_spans.last().is_some_and(|(_, row, previous_range)| {
+                        *row != row_id
+                            || projected_instant_distance_pixels(
+                                previous_range.end(),
+                                range.start(),
+                                query,
+                            ) >= f64::from(query.minimum_visible_pixels())
+                    }) {
+                        flush_span_cluster(&mut folded_spans, &mut render_items);
+                    }
                     folded_spans.push((candidate.item_id, row_id, range));
                 } else {
                     flush_span_cluster(&mut folded_spans, &mut render_items);
                     flush_event_cluster(&mut folded_events, &mut render_items);
+                    let lane_index = span_lane_index(row_id, range, &mut span_lanes);
                     render_items.push(TimelineRenderItem::Span(TimelineRenderSpan {
                         item_id: candidate.item_id,
                         row_id,
+                        lane_index,
                         range,
                         is_open,
                     }));
                 }
             }
             TimelineCandidateKind::Event { at } => {
+                if folded_events.last().is_some_and(|(_, row, previous_at)| {
+                    *row != row_id
+                        || projected_instant_distance_pixels(*previous_at, at, query)
+                            >= f64::from(query.minimum_visible_pixels())
+                }) {
+                    flush_event_cluster(&mut folded_events, &mut render_items);
+                }
                 folded_events.push((candidate.item_id, row_id, at));
             }
         }
@@ -436,6 +465,7 @@ fn flush_span_cluster(
         render_items.push(TimelineRenderItem::Span(TimelineRenderSpan {
             item_id,
             row_id,
+            lane_index: 0,
             range,
             is_open: false,
         }));
@@ -517,6 +547,23 @@ fn candidate_sort_key(
     (candidate.row_key, at, candidate.item_id)
 }
 
+fn span_lane_index(
+    row_id: TimelineRenderRowId,
+    range: TimelineRangeNs,
+    span_lanes: &mut BTreeMap<TimelineRenderRowId, Vec<TimelineInstantNs>>,
+) -> u32 {
+    // timeline[impl playground.span-lanes]
+    let lanes = span_lanes.entry(row_id).or_default();
+    for (index, lane_end) in lanes.iter_mut().enumerate() {
+        if *lane_end <= range.start() {
+            *lane_end = range.end();
+            return u32::try_from(index).unwrap_or(u32::MAX);
+        }
+    }
+    lanes.push(range.end());
+    u32::try_from(lanes.len() - 1).unwrap_or(u32::MAX)
+}
+
 fn row_key_for_item(
     item: &TimelineItem,
     grouping_mode: TimelineGroupingMode,
@@ -535,6 +582,23 @@ fn ranges_intersect(range: TimelineRangeNs, visible_range: TimelineRangeNs) -> b
 
 fn instant_in_range(at: TimelineInstantNs, visible_range: TimelineRangeNs) -> bool {
     at >= visible_range.start() && at <= visible_range.end()
+}
+
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "query projection converts integer nanoseconds to viewport pixels at the render-plan boundary"
+)]
+fn projected_instant_distance_pixels(
+    previous: TimelineInstantNs,
+    next: TimelineInstantNs,
+    query: &TimelineViewportQuery,
+) -> f64 {
+    let visible_duration_ns = query.visible_range().duration().as_u64();
+    if visible_duration_ns == 0 {
+        return f64::from(query.viewport_width_pixels());
+    }
+    next.as_i64().abs_diff(previous.as_i64()) as f64 * f64::from(query.viewport_width_pixels())
+        / visible_duration_ns as f64
 }
 
 #[expect(
@@ -747,6 +811,135 @@ mod tests {
     }
 
     #[test]
+    // timeline[verify playground.span-lanes]
+    fn overlapping_spans_get_nested_lane_indices_within_row() {
+        let mut dataset = TimelineDataset::new();
+        let first_id = dataset
+            .push_span(
+                TimelineItemInput::new("outer").with_group_key("thread-a"),
+                TimelineInstantNs::new(10),
+                Some(TimelineInstantNs::new(80)),
+            )
+            .expect("span");
+        let nested_id = dataset
+            .push_span(
+                TimelineItemInput::new("inner").with_group_key("thread-a"),
+                TimelineInstantNs::new(20),
+                Some(TimelineInstantNs::new(40)),
+            )
+            .expect("span");
+        let later_id = dataset
+            .push_span(
+                TimelineItemInput::new("later").with_group_key("thread-a"),
+                TimelineInstantNs::new(85),
+                Some(TimelineInstantNs::new(90)),
+            )
+            .expect("span");
+        dataset.compact();
+        let query = TimelineViewportQuery::try_new(
+            TimelineInstantNs::new(0),
+            TimelineInstantNs::new(100),
+            TimelineInstantNs::new(100),
+            1_000,
+        )
+        .expect("query")
+        .with_minimum_visible_pixels(1);
+
+        let plan = dataset.render_plan(&query);
+        let span_lane = |id| {
+            plan.items()
+                .iter()
+                .find_map(|item| match item {
+                    TimelineRenderItem::Span(span) if span.item_id() == id => {
+                        Some(span.lane_index())
+                    }
+                    _ => None,
+                })
+                .expect("rendered span")
+        };
+
+        assert_eq!(span_lane(first_id), 0);
+        assert_eq!(span_lane(nested_id), 1);
+        assert_eq!(span_lane(later_id), 0);
+    }
+
+    #[test]
+    // timeline[verify playground.minimum-span-marker]
+    fn tiny_spans_in_different_rows_do_not_fold_into_single_row() {
+        let mut dataset = TimelineDataset::new();
+        dataset
+            .push_span(
+                TimelineItemInput::new("row-a").with_group_key("row-a"),
+                TimelineInstantNs::new(10),
+                Some(TimelineInstantNs::new(11)),
+            )
+            .expect("span");
+        dataset
+            .push_span(
+                TimelineItemInput::new("row-b").with_group_key("row-b"),
+                TimelineInstantNs::new(12),
+                Some(TimelineInstantNs::new(13)),
+            )
+            .expect("span");
+        dataset.compact();
+        let query = TimelineViewportQuery::try_new(
+            TimelineInstantNs::new(0),
+            TimelineInstantNs::new(1_000_000),
+            TimelineInstantNs::new(1_000_000),
+            100,
+        )
+        .expect("query")
+        .with_minimum_visible_pixels(8);
+
+        let plan = dataset.render_plan(&query);
+        let row_ids = plan
+            .items()
+            .iter()
+            .map(|item| match item {
+                TimelineRenderItem::Span(span) => span.row_id(),
+                TimelineRenderItem::FoldedSpanCluster(cluster)
+                | TimelineRenderItem::FoldedEventCluster(cluster) => cluster.row_id(),
+                TimelineRenderItem::Event(event) => event.row_id(),
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+
+        assert_eq!(row_ids.len(), 2);
+    }
+
+    #[test]
+    // timeline[verify playground.span-cluster-decomposition]
+    fn separated_tiny_spans_decompose_into_individual_markers() {
+        let mut dataset = TimelineDataset::new();
+        for start in [10, 50, 90] {
+            dataset
+                .push_span(
+                    TimelineItemInput::new(format!("span-{start}")).with_group_key("dense"),
+                    TimelineInstantNs::new(start),
+                    Some(TimelineInstantNs::new(start + 1)),
+                )
+                .expect("span");
+        }
+        dataset.compact();
+        let query = TimelineViewportQuery::try_new(
+            TimelineInstantNs::new(0),
+            TimelineInstantNs::new(100),
+            TimelineInstantNs::new(100),
+            100,
+        )
+        .expect("query")
+        .with_minimum_visible_pixels(10);
+
+        let plan = dataset.render_plan(&query);
+
+        assert_eq!(plan.items().len(), 3);
+        assert!(
+            plan.items()
+                .iter()
+                .all(|item| matches!(item, TimelineRenderItem::Span(_)))
+        );
+    }
+
+    #[test]
     // timeline[verify display.query-folding]
     fn dense_events_fold_into_cluster() {
         let mut dataset = TimelineDataset::new();
@@ -761,9 +954,10 @@ mod tests {
             TimelineInstantNs::new(0),
             TimelineInstantNs::new(100),
             TimelineInstantNs::new(100),
-            1_000,
+            10,
         )
-        .expect("query");
+        .expect("query")
+        .with_minimum_visible_pixels(2);
 
         let plan = dataset.render_plan(&query);
 
@@ -778,6 +972,36 @@ mod tests {
         assert_eq!(cluster.count(), 3);
         assert_eq!(cluster.range().start(), TimelineInstantNs::new(10));
         assert_eq!(cluster.range().end(), TimelineInstantNs::new(12));
+    }
+
+    #[test]
+    // timeline[verify display.query-folding]
+    fn zooming_in_unfolds_dense_events() {
+        let mut dataset = TimelineDataset::new();
+        for at in [10, 11, 12] {
+            dataset.push_event(
+                TimelineItemInput::new(format!("event-{at}")).with_group_key("dense"),
+                TimelineInstantNs::new(at),
+            );
+        }
+        dataset.compact();
+        let query = TimelineViewportQuery::try_new(
+            TimelineInstantNs::new(0),
+            TimelineInstantNs::new(100),
+            TimelineInstantNs::new(100),
+            1_000,
+        )
+        .expect("query")
+        .with_minimum_visible_pixels(2);
+
+        let plan = dataset.render_plan(&query);
+
+        assert_eq!(plan.items().len(), 3);
+        assert!(
+            plan.items()
+                .iter()
+                .all(|item| matches!(item, TimelineRenderItem::Event(_)))
+        );
     }
 
     #[test]

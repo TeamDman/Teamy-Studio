@@ -138,13 +138,23 @@ pub fn timeline_playground_detail_for_render_item(
                 representative_item: None,
             })
         }
-        TimelineRenderItem::FoldedSpanCluster(cluster)
-        | TimelineRenderItem::FoldedEventCluster(cluster) => {
+        TimelineRenderItem::FoldedSpanCluster(cluster) => {
             let representative_item = dataset
                 .item(cluster.representative_item_id())
                 .map(|item| item_detail(dataset, item));
             Some(TimelinePlaygroundDetail {
                 title: format!("Folded cluster ({} items)", cluster.count()),
+                render_item: render_item_detail,
+                item: None,
+                representative_item,
+            })
+        }
+        TimelineRenderItem::FoldedEventCluster(cluster) => {
+            let representative_item = dataset
+                .item(cluster.representative_item_id())
+                .map(|item| item_detail(dataset, item));
+            Some(TimelinePlaygroundDetail {
+                title: format!("{} messages", cluster.count()),
                 render_item: render_item_detail,
                 item: None,
                 representative_item,
@@ -334,5 +344,37 @@ mod tests {
         assert!(pretty.contains("Transcribe clip"));
         assert!(pretty.contains("synthetic/worker"));
         assert!(pretty.contains("job-1"));
+    }
+
+    #[test]
+    // timeline[verify playground.hover-title-tooltip]
+    fn folded_event_cluster_detail_title_mentions_message_count() {
+        let mut dataset = TimelineDataset::new();
+        for at in [1, 2, 3] {
+            dataset.push_event(
+                TimelineItemInput::new("message"),
+                TimelineInstantNs::new(at),
+            );
+        }
+        dataset.compact();
+        let query = TimelineViewportQuery::try_new(
+            TimelineInstantNs::new(0),
+            TimelineInstantNs::new(100),
+            TimelineInstantNs::new(100),
+            10,
+        )
+        .expect("query")
+        .with_minimum_visible_pixels(4);
+        let plan = dataset.render_plan(&query);
+        let cluster = plan
+            .items()
+            .iter()
+            .copied()
+            .find(|item| matches!(item, TimelineRenderItem::FoldedEventCluster(_)))
+            .expect("folded event cluster");
+
+        let detail = timeline_playground_detail_for_render_item(&dataset, cluster).expect("detail");
+
+        assert_eq!(detail.title(), "3 messages");
     }
 }

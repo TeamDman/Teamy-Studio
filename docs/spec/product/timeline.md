@@ -159,8 +159,38 @@ The Timeline Playground must expose controls for changing the synthetic seed, gr
 timeline[playground.viewport-controls]
 The Timeline Playground must support panning and zooming over synthetic timeline data and recompute the render plan from the updated viewport.
 
+timeline[playground.pan-negative-time]
+The Timeline Playground must allow the visible range to pan before zero so the origin can appear in the middle of the screen instead of being pinned to the left edge.
+
+timeline[playground.fit-content]
+The Timeline Playground must expose a fit-to-content action that sets the visible range to the dataset's content bounds with padding, including near-zero content that benefits from negative-time overscan.
+
+timeline[playground.pan-button-snap-item]
+Timeline Playground pan buttons must bring the nearest offscreen item into view when the current visible range is empty and the user pans back toward existing content.
+
+timeline[playground.data-bounds-dimming]
+The Timeline Playground must dim regions before time zero or the first closed data point, whichever is earlier, and after the last closed data point, ignoring open spans that have not ended when computing those bounds.
+
+timeline[playground.vertical-pan]
+The Timeline Playground must allow right-drag panning to move vertically across grouped rows as well as horizontally across time.
+
+timeline[playground.vertical-pan-clamp]
+The Timeline Playground must reclamp vertical row panning after viewport or grouping changes shrink the rendered row set.
+
+timeline[playground.vertical-render-clip]
+The Timeline Playground must skip fully offscreen rows and items during vertical row panning and clip partially visible row and item geometry to the timeline content surface so it cannot render over the ruler or controls.
+
+timeline[playground.row-transition-animation]
+When zooming or filtering changes the visible row set, Timeline Playground rows that remain visible must animate from their previous row-key position to their new position instead of snapping immediately.
+
+timeline[playground.row-stable-colors]
+Timeline Playground row and span colors must remain tied to stable row identity rather than transient visible row index while rows are added, removed, or repositioned.
+
 timeline[playground.mouse-zoom-anchor]
 Mouse-wheel zooming in the Timeline Playground must keep the time under the mouse cursor stable, matching the main timeline's anchor-aware zoom behavior.
+
+timeline[playground.zoom-compounds]
+Rapid repeated mouse-wheel zoom events in the Timeline Playground must compound against the pending target range instead of restarting each animation from the partially animated range.
 
 timeline[playground.viewport-transition]
 Timeline Playground zoom changes must animate between visible ranges with a non-bouncy ease-in-out transition.
@@ -168,8 +198,59 @@ Timeline Playground zoom changes must animate between visible ranges with a non-
 timeline[playground.ruler-ticks]
 The Timeline Playground must render top ruler tick marks, grid lines, and time labels for the currently visible range.
 
+timeline[playground.ruler-subticks]
+The Timeline Playground ruler must render intermediate subticks between labeled ticks, with a larger midpoint subtick and the labeled major ticks remaining the strongest interval markers.
+
+timeline[playground.cursor-guide]
+The Timeline Playground must render a light vertical guide line at the cursor x-position over the ruler and timeline content surface.
+
+timeline[playground.event-arrows]
+Timeline Playground instant events must render as compact downward markers at their timestamp instead of duration-like clips, while preserving hover and pin hit testing for event details.
+
+timeline[playground.live-tracing-events]
+The Timeline Playground must be able to switch from synthetic data to live tracing events captured by Teamy's tracing subscriber, mapping captured log events into timeline instant-event items as they arrive while preserving user-controlled pan and zoom after the user navigates away from the live tail.
+
+timeline[playground.live-tracing-pan]
+Right-drag panning the Timeline Playground in live tracing mode must count as user navigation and stop live-tail resets immediately.
+
+timeline[playground.live-tracing-unfiltered]
+The Timeline Playground live tracing collector must receive trace-level events independently of console or file log filtering so the timeline can inspect low-level observability events that are intentionally hidden from normal logs.
+
+timeline[playground.live-tracing-spans]
+The Timeline Playground live tracing mode must capture closed tracing span lifecycles as duration spans in addition to instant log events.
+
+timeline[playground.span-lanes]
+The Timeline Playground must render overlapping spans in nested lanes within their grouped row so thread timelines can show span nesting and overlap without stacking clips on top of each other.
+
+timeline[playground.minimum-span-marker]
+The Timeline Playground must preserve an interactive minimum-width marker for visible duration spans when zoomed out, including tiny folded spans in different rows.
+
+timeline[playground.span-cluster-decomposition]
+Folded Timeline Playground span clusters must split as zoom makes adjacent tiny spans visually separable, matching event cluster decomposition instead of shrinking aggregate counts without revealing the separated spans.
+
+timeline[playground.projected-span-width]
+The Timeline Playground must render duration spans at their projected time width whenever that width is greater than the minimum marker width.
+
+timeline[playground.span-clip-readability]
+Timeline Playground span clips must be tall enough for readable in-span labels when the clip is wide enough to show text.
+
+timeline[playground.span-labels]
+The Timeline Playground must render a span's title inside its duration clip when the title fits, center the title around the full projected span when possible, clamp it to the visible span edge when the projected center is offscreen, and leave the clip intact without text when it does not fit.
+
+timeline[playground.span-bevel]
+Timeline Playground span clips must render a subtle bevel or edge treatment so adjacent spans remain visually distinguishable.
+
 timeline[playground.hover-detail]
 Hovering a rendered span, event, folded span cluster, or folded event cluster in the Timeline Playground must open or update a sidecar detail window.
+
+timeline[playground.hover-title-tooltip]
+Hovering a rendered span, event, folded span cluster, or folded event cluster in the Timeline Playground must also show a native tooltip containing the resolved detail title.
+
+timeline[playground.hover-title-tooltip-cursor]
+Timeline Playground item title tooltips must position from the cursor point rather than the hovered item's centroid.
+
+timeline[playground.hover-title-tooltip-stable]
+Timeline Playground item title tooltips must avoid redundant native tooltip updates when the text and position have not changed.
 
 timeline[playground.hover-detail-no-activate]
 Timeline Playground hover detail windows must be created and shown without taking focus from the playground window.
@@ -177,11 +258,23 @@ Timeline Playground hover detail windows must be created and shown without takin
 timeline[playground.pin-detail]
 Left-clicking a rendered span, event, folded span cluster, or folded event cluster in the Timeline Playground must promote the current hover detail into a pinned detail window.
 
+timeline[playground.detail-window-clamped]
+Timeline Playground detail windows must clamp their initial sidecar placement to the available virtual desktop bounds.
+
 timeline[playground.detail-facet-pretty]
 Timeline Playground detail windows must render a resolved Facet-derived detail view model with `facet-pretty` so interned labels, source keys, group keys, primitive fields, object references, and cluster metadata are readable.
 
 timeline[playground.detail-vt-text]
 Timeline Playground detail windows must parse VT/ANSI styling in reflected detail text before rendering, so styled `facet-pretty` output becomes colored text instead of visible escape sequences.
+
+timeline[playground.detail-title-prefix]
+Timeline Playground detail windows must put the selected timeline item's title in the native window title as a prefix before `Timeline Detail`, rather than duplicating that title inside the detail body.
+
+timeline[playground.detail-selectable-text]
+Timeline Playground detail windows must expose reflected detail text through the shared terminal-cell selection and copy path.
+
+timeline[playground.detail-diagnostics-tui]
+Timeline Playground detail windows must provide a diagnostics view rendered as a Ratatui-style terminal UI, matching the existing scene diagnostics pattern.
 
 ## Transcription Tracks
 

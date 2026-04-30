@@ -20,7 +20,7 @@ use crate::model::{
     KNOWN_WHISPER_MODELS, WhisperModelPreparationState, WhisperModelPreparationStatus,
 };
 use crate::timeline::{
-    TimelineDataset, TimelineDocument, TimelineGroupingMode, TimelineInstantNs,
+    TimelineDataset, TimelineDocument, TimelineGroupingMode, TimelineInstantNs, TimelineItemKind,
     TimelinePlaygroundDetail, TimelineRenderItem, TimelineRenderPlan, TimelineRenderRowKey,
     TimelineRulerTick, TimelineTimeNs, TimelineTimeRangeNs, TimelineTrack, TimelineTrackId,
     TimelineTrackKind, TimelineViewport, TimelineViewportPoint,
@@ -68,6 +68,8 @@ const TIMELINE_SELECTION_INTERSECTION: [f32; 4] = [0.95, 0.86, 0.30, 0.36];
 const TIMELINE_SCROLLBAR_TRACK: [f32; 4] = [0.16, 0.18, 0.22, 0.92];
 const TIMELINE_SCROLLBAR_THUMB: [f32; 4] = [0.48, 0.56, 0.66, 0.94];
 const TIMELINE_TRANSCRIPTION_MAX_CHUNK_SECONDS: f64 = 30.0;
+const TIMELINE_PLAYGROUND_ROW_HEIGHT: i32 = 74;
+const TIMELINE_PLAYGROUND_ROW_GAP: i32 = 8;
 const TIMELINE_TRANSCRIPTION_INACTIVITY_SECONDS: f64 = 3.0;
 const TIMELINE_TRANSCRIPTION_SETTINGS_TARGET_COLUMN_WIDTH: i32 = 92;
 const TIMELINE_TRANSCRIPTION_SETTINGS_TARGET_SOCKET_SIZE: i32 = 40;
@@ -200,6 +202,8 @@ pub enum SceneAction {
     SelectWindowsBell,
     SelectFileBell,
     RegenerateTimelinePlayground,
+    ToggleTimelinePlaygroundLiveEvents,
+    FitTimelinePlaygroundToContent,
     TimelinePlaygroundGroupingGroupKey,
     TimelinePlaygroundGroupingSourceKey,
     TimelinePlaygroundGroupingLabel,
@@ -208,14 +212,17 @@ pub enum SceneAction {
     DecreaseTimelinePlaygroundFolding,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TimelinePlaygroundViewState {
+    pub source_label: &'static str,
     pub seed: u64,
     pub grouping_mode: TimelineGroupingMode,
     pub minimum_visible_pixels: u32,
     pub visible_start_ns: i64,
     pub visible_end_ns: i64,
+    pub vertical_scroll_offset: i32,
     pub hovered_item: Option<TimelinePlaygroundHitTarget>,
+    pub cursor_position: Option<ClientPoint>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -224,16 +231,13 @@ pub struct TimelinePlaygroundHitTarget {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[expect(
-    clippy::struct_field_names,
-    reason = "timeline playground layout fields name the stable rectangles used by hit testing and rendering"
-)]
 pub struct TimelinePlaygroundLayout {
     pub body_rect: ClientRect,
     pub controls_rect: ClientRect,
     pub ruler_rect: ClientRect,
     pub row_header_rect: ClientRect,
     pub content_rect: ClientRect,
+    pub vertical_scroll_offset: i32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1076,6 +1080,7 @@ pub fn build_timeline_playground_render_scene(
     dataset: &TimelineDataset,
     render_plan: &TimelineRenderPlan,
     view_state: TimelinePlaygroundViewState,
+    row_visual_positions: &[(TimelineRenderRowKey, i32)],
     button_states: &[(SceneAction, ButtonVisualState)],
 ) -> RenderScene {
     let mut scene = build_scene_shell(
@@ -1083,7 +1088,10 @@ pub fn build_timeline_playground_render_scene(
         SceneWindowKind::TimelinePlayground,
         window_chrome_buttons_state,
     );
-    let playground_layout = timeline_playground_layout(layout.terminal_panel_rect().inset(24));
+    let playground_layout = timeline_playground_layout(
+        layout.terminal_panel_rect().inset(24),
+        view_state.vertical_scroll_offset,
+    );
     push_panel(
         &mut scene,
         playground_layout.body_rect.to_win32_rect(),
@@ -1092,10 +1100,113 @@ pub fn build_timeline_playground_render_scene(
     );
     push_timeline_playground_header(&mut scene, playground_layout, view_state);
     push_timeline_playground_controls(&mut scene, playground_layout, button_states);
-    push_timeline_playground_rows(&mut scene, playground_layout, dataset, render_plan);
+    push_timeline_playground_rows(
+        &mut scene,
+        playground_layout,
+        dataset,
+        render_plan,
+        row_visual_positions,
+    );
     push_timeline_playground_ruler_ticks(&mut scene, playground_layout, view_state);
-    push_timeline_playground_items(&mut scene, playground_layout, render_plan, view_state);
+    push_timeline_playground_data_bounds_dimming(
+        &mut scene,
+        playground_layout,
+        dataset,
+        view_state,
+    );
+    push_timeline_playground_cursor_guide(&mut scene, playground_layout, view_state);
+    push_timeline_playground_items(
+        &mut scene,
+        playground_layout,
+        dataset,
+        render_plan,
+        view_state,
+        row_visual_positions,
+    );
     scene
+}
+
+// timeline[impl playground.data-bounds-dimming]
+fn push_timeline_playground_data_bounds_dimming(
+    scene: &mut RenderScene,
+    layout: TimelinePlaygroundLayout,
+    dataset: &TimelineDataset,
+    view_state: TimelinePlaygroundViewState,
+) {
+    if layout.content_rect.width() <= 0 || layout.content_rect.height() <= 0 {
+        return;
+    }
+    let Some((data_start, data_end)) = timeline_playground_closed_data_bounds(dataset) else {
+        return;
+    };
+    let dim_color = [0.02, 0.025, 0.035, 0.72];
+    let dim_top = layout.ruler_rect.top();
+    let dim_bottom = layout.content_rect.bottom();
+    let data_start_x = clamp_i32_ordered(
+        timeline_playground_time_to_x(layout, view_state, data_start),
+        layout.content_rect.left(),
+        layout.content_rect.right(),
+    );
+    let data_end_x = clamp_i32_ordered(
+        timeline_playground_time_to_x(layout, view_state, data_end),
+        layout.content_rect.left(),
+        layout.content_rect.right(),
+    );
+    if view_state.visible_start_ns < data_start.as_i64()
+        && data_start_x > layout.content_rect.left()
+    {
+        push_panel(
+            scene,
+            ClientRect::new(
+                layout.content_rect.left(),
+                dim_top,
+                data_start_x,
+                dim_bottom,
+            )
+            .to_win32_rect(),
+            dim_color,
+            PanelEffect::TerminalFill,
+        );
+    }
+    if view_state.visible_end_ns > data_end.as_i64() && data_end_x < layout.content_rect.right() {
+        push_panel(
+            scene,
+            ClientRect::new(data_end_x, dim_top, layout.content_rect.right(), dim_bottom)
+                .to_win32_rect(),
+            dim_color,
+            PanelEffect::TerminalFill,
+        );
+    }
+}
+
+// timeline[impl playground.cursor-guide]
+fn push_timeline_playground_cursor_guide(
+    scene: &mut RenderScene,
+    layout: TimelinePlaygroundLayout,
+    view_state: TimelinePlaygroundViewState,
+) {
+    let Some(point) = view_state.cursor_position else {
+        return;
+    };
+    if !layout.ruler_rect.contains(point) && !layout.content_rect.contains(point) {
+        return;
+    }
+    let x = point
+        .to_win32_point()
+        .map_or(layout.content_rect.left(), |point| point.x)
+        .clamp(layout.content_rect.left(), layout.content_rect.right());
+    push_panel(
+        scene,
+        ClientRect::new(
+            x,
+            layout.ruler_rect.top(),
+            x + 1,
+            layout.content_rect.bottom(),
+        )
+        .to_win32_rect(),
+        [0.78, 0.86, 0.96, 0.42],
+        PanelEffect::SceneButtonCard,
+    );
 }
 
 #[must_use]
@@ -1103,9 +1214,9 @@ pub fn build_timeline_playground_render_scene(
 pub fn build_timeline_playground_detail_render_scene(
     layout: TerminalLayout,
     window_chrome_buttons_state: WindowChromeButtonsState,
-    detail: Option<&TimelinePlaygroundDetail>,
     pretty_text: &str,
     pinned: bool,
+    selection: Option<TerminalSelection>,
 ) -> RenderScene {
     let mut scene = build_scene_shell(
         layout,
@@ -1123,27 +1234,14 @@ pub fn build_timeline_playground_detail_render_scene(
         },
         PanelEffect::SceneBody,
     );
-    let title = detail.map_or("Timeline detail", TimelinePlaygroundDetail::title);
-    push_title_text(
-        &mut scene,
-        ClientRect::new(
-            body_rect.left() + 12,
-            body_rect.top() + 10,
-            body_rect.right() - 12,
-            body_rect.top() + 44,
-        )
-        .to_win32_rect(),
-        title,
-        [0.94, 0.96, 0.98, 1.0],
-    );
     let state_label = if pinned { "pinned" } else { "hover" };
     push_text_block(
         &mut scene,
         ClientRect::new(
             body_rect.left() + 12,
-            body_rect.top() + 48,
+            body_rect.top() + 12,
             body_rect.right() - 12,
-            body_rect.top() + 72,
+            body_rect.top() + 36,
         )
         .to_win32_rect(),
         state_label,
@@ -1153,21 +1251,76 @@ pub fn build_timeline_playground_detail_render_scene(
     );
     push_vt_text_block(
         &mut scene,
-        ClientRect::new(
-            body_rect.left() + 12,
-            body_rect.top() + 78,
-            body_rect.right() - 12,
-            body_rect.bottom() - 12,
-        ),
+        timeline_playground_detail_selectable_text_rect(layout),
         pretty_text,
         8,
         15,
+        selection,
     );
     scene
 }
 
 #[must_use]
-pub fn timeline_playground_layout(body_rect: ClientRect) -> TimelinePlaygroundLayout {
+// timeline[impl playground.detail-selectable-text]
+pub fn timeline_playground_detail_selectable_text_rect(layout: TerminalLayout) -> ClientRect {
+    let body_rect = layout.terminal_panel_rect().inset(22);
+    ClientRect::new(
+        body_rect.left() + 12,
+        body_rect.top() + 42,
+        body_rect.right() - 12,
+        body_rect.bottom() - 12,
+    )
+}
+
+#[must_use]
+// timeline[impl playground.detail-selectable-text]
+pub fn timeline_playground_detail_selectable_text(pretty_text: &str) -> String {
+    strip_ansi_escape_sequences(pretty_text)
+}
+
+#[must_use]
+// timeline[impl playground.detail-diagnostics-tui]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the diagnostic scene builder mirrors the existing selectable terminal render entrypoints"
+)]
+pub fn build_timeline_playground_detail_diagnostic_render_scene(
+    layout: TerminalLayout,
+    window_chrome_buttons_state: WindowChromeButtonsState,
+    detail: Option<&TimelinePlaygroundDetail>,
+    pretty_text: &str,
+    pinned: bool,
+    selection: Option<TerminalSelection>,
+    cell_width: i32,
+    cell_height: i32,
+) -> RenderScene {
+    let mut scene = build_scene_shell(
+        layout,
+        SceneWindowKind::TimelinePlaygroundDetail,
+        window_chrome_buttons_state,
+    );
+    let body_rect = layout.terminal_panel_rect().inset(20);
+    let diagnostic_scene = build_timeline_playground_detail_diagnostic_body_scene(
+        body_rect,
+        detail,
+        pretty_text,
+        pinned,
+        selection,
+        cell_width,
+        cell_height,
+    );
+    scene.panels.extend(diagnostic_scene.panels);
+    scene.glyphs.extend(diagnostic_scene.glyphs);
+    scene.sprites.extend(diagnostic_scene.sprites);
+    scene.overlay_panels.extend(diagnostic_scene.overlay_panels);
+    scene
+}
+
+#[must_use]
+pub fn timeline_playground_layout(
+    body_rect: ClientRect,
+    vertical_scroll_offset: i32,
+) -> TimelinePlaygroundLayout {
     let controls_height = 142;
     let ruler_height = 42;
     let header_width = 170;
@@ -1197,6 +1350,7 @@ pub fn timeline_playground_layout(body_rect: ClientRect) -> TimelinePlaygroundLa
             body_rect.right() - 12,
             body_rect.bottom() - 12,
         ),
+        vertical_scroll_offset,
     }
 }
 
@@ -1209,8 +1363,11 @@ pub fn timeline_playground_hit_target_at_point(
     view_state: TimelinePlaygroundViewState,
     point: ClientPoint,
 ) -> Option<TimelinePlaygroundHitTarget> {
-    let playground_layout = timeline_playground_layout(layout.terminal_panel_rect().inset(24));
-    timeline_playground_item_hit_rects(playground_layout, render_plan, view_state)
+    let playground_layout = timeline_playground_layout(
+        layout.terminal_panel_rect().inset(24),
+        view_state.vertical_scroll_offset,
+    );
+    timeline_playground_item_hit_rects(playground_layout, render_plan, view_state, &[])
         .into_iter()
         .find_map(|(rect, target)| rect.contains(point).then_some(target))
 }
@@ -1220,16 +1377,21 @@ pub fn timeline_playground_item_hit_rects(
     layout: TimelinePlaygroundLayout,
     render_plan: &TimelineRenderPlan,
     view_state: TimelinePlaygroundViewState,
+    row_visual_positions: &[(TimelineRenderRowKey, i32)],
 ) -> Vec<(ClientRect, TimelinePlaygroundHitTarget)> {
     render_plan
         .items()
         .iter()
         .copied()
-        .map(|render_item| {
-            (
-                timeline_playground_item_rect(layout, render_item, view_state),
-                TimelinePlaygroundHitTarget { render_item },
+        .filter_map(|render_item| {
+            timeline_playground_item_rect(
+                layout,
+                render_plan,
+                render_item,
+                view_state,
+                row_visual_positions,
             )
+            .map(|rect| (rect, TimelinePlaygroundHitTarget { render_item }))
         })
         .collect()
 }
@@ -1239,20 +1401,9 @@ fn push_timeline_playground_header(
     layout: TimelinePlaygroundLayout,
     view_state: TimelinePlaygroundViewState,
 ) {
-    push_title_text(
-        scene,
-        ClientRect::new(
-            layout.controls_rect.left(),
-            layout.controls_rect.top(),
-            layout.controls_rect.right(),
-            layout.controls_rect.top() + 32,
-        )
-        .to_win32_rect(),
-        "Timeline Playground",
-        [0.96, 0.98, 1.0, 1.0],
-    );
     let summary = format!(
-        "seed: {:#x}   group: {:?}   fold px: {}   visible: {}..{} ns",
+        "source: {}\nseed: {:#x}\ngroup: {:?}\nfold px: {}\nvisible: {}..{} ns",
+        view_state.source_label,
         view_state.seed,
         view_state.grouping_mode,
         view_state.minimum_visible_pixels,
@@ -1263,9 +1414,9 @@ fn push_timeline_playground_header(
         scene,
         ClientRect::new(
             layout.controls_rect.left(),
-            layout.controls_rect.top() + 38,
-            layout.controls_rect.right(),
-            layout.controls_rect.top() + 62,
+            layout.controls_rect.top() + 8,
+            layout.controls_rect.left() + 250,
+            layout.controls_rect.bottom() - 8,
         )
         .to_win32_rect(),
         &summary,
@@ -1309,6 +1460,7 @@ fn push_timeline_playground_rows(
     layout: TimelinePlaygroundLayout,
     dataset: &TimelineDataset,
     render_plan: &TimelineRenderPlan,
+    row_visual_positions: &[(TimelineRenderRowKey, i32)],
 ) {
     push_panel(
         scene,
@@ -1329,10 +1481,23 @@ fn push_timeline_playground_rows(
         PanelEffect::TerminalFill,
     );
     for row in render_plan.rows() {
-        let row_rect = timeline_playground_row_rect(layout, row.id().as_u32());
-        if row_rect.top() >= layout.content_rect.bottom() {
+        let raw_row_rect = timeline_playground_row_unclipped_rect_for_top(
+            layout,
+            timeline_playground_visual_row_world_top(
+                row.key(),
+                row.id().as_u32(),
+                row_visual_positions,
+            ),
+        );
+        let Some(row_rect) = client_rect_intersection(raw_row_rect, layout.content_rect) else {
+            if timeline_playground_row_world_top(row.id().as_u32())
+                .saturating_sub(layout.vertical_scroll_offset)
+                > layout.content_rect.height()
+            {
+                break;
+            }
             continue;
-        }
+        };
         push_panel(
             scene,
             row_rect.to_win32_rect(),
@@ -1340,15 +1505,20 @@ fn push_timeline_playground_rows(
             PanelEffect::TerminalFill,
         );
         let label = timeline_playground_row_label(dataset, row.key());
-        push_text_block(
-            scene,
+        let Some(label_rect) = client_rect_intersection(
             ClientRect::new(
                 layout.row_header_rect.left() + 8,
-                row_rect.top() + 8,
+                raw_row_rect.top() + 8,
                 layout.row_header_rect.right() - 8,
-                row_rect.bottom() - 8,
-            )
-            .to_win32_rect(),
+                raw_row_rect.bottom() - 8,
+            ),
+            layout.row_header_rect,
+        ) else {
+            continue;
+        };
+        push_text_block(
+            scene,
+            label_rect.to_win32_rect(),
             &label,
             8,
             15,
@@ -1365,8 +1535,44 @@ fn push_timeline_playground_ruler_ticks(
 ) {
     let viewport = timeline_playground_viewport(layout, view_state);
     let ruler_ticks = viewport.ruler_ticks(layout.content_rect.width(), 6);
+    push_timeline_playground_ruler_subticks(scene, layout, &ruler_ticks);
     for tick in &ruler_ticks {
         push_timeline_playground_ruler_tick(scene, layout, tick);
+    }
+}
+
+// timeline[impl playground.ruler-subticks]
+fn push_timeline_playground_ruler_subticks(
+    scene: &mut RenderScene,
+    layout: TimelinePlaygroundLayout,
+    ruler_ticks: &[TimelineRulerTick],
+) {
+    for pair in ruler_ticks.windows(2) {
+        let start_x = layout.ruler_rect.left()
+            + timeline_tick_pixel_offset(&pair[0], layout.ruler_rect.width());
+        let end_x = layout.ruler_rect.left()
+            + timeline_tick_pixel_offset(&pair[1], layout.ruler_rect.width());
+        let span = end_x - start_x;
+        if span <= 0 {
+            continue;
+        }
+        for index in 1..10 {
+            let tick_x = start_x + (span * index / 10);
+            let height = if index == 5 { 24 } else { 14 };
+            let alpha = if index == 5 { 0.76 } else { 0.46 };
+            push_panel(
+                scene,
+                ClientRect::new(
+                    tick_x,
+                    layout.ruler_rect.bottom() - 6 - height,
+                    (tick_x + 1).min(layout.ruler_rect.right()),
+                    layout.ruler_rect.bottom() - 6,
+                )
+                .to_win32_rect(),
+                [0.46, 0.51, 0.58, alpha],
+                PanelEffect::SceneButtonCard,
+            );
+        }
     }
 }
 
@@ -1420,29 +1626,44 @@ fn push_timeline_playground_ruler_tick(
 fn push_timeline_playground_items(
     scene: &mut RenderScene,
     layout: TimelinePlaygroundLayout,
+    dataset: &TimelineDataset,
     render_plan: &TimelineRenderPlan,
     view_state: TimelinePlaygroundViewState,
+    row_visual_positions: &[(TimelineRenderRowKey, i32)],
 ) {
-    for (rect, target) in timeline_playground_item_hit_rects(layout, render_plan, view_state) {
+    for (rect, target) in
+        timeline_playground_item_hit_rects(layout, render_plan, view_state, row_visual_positions)
+    {
         let hovered = view_state.hovered_item == Some(target);
+        if matches!(
+            target.render_item,
+            TimelineRenderItem::Event(_) | TimelineRenderItem::FoldedEventCluster(_)
+        ) {
+            push_timeline_playground_event_marker(
+                scene,
+                rect,
+                timeline_playground_render_item_color(render_plan, target.render_item),
+                hovered,
+            );
+            continue;
+        }
         let (color, label) = match target.render_item {
             TimelineRenderItem::Span(span) => (
                 if span.is_open() {
                     [0.28, 0.48, 0.42, 1.0]
                 } else {
-                    [0.26, 0.38, 0.58, 1.0]
+                    timeline_playground_render_item_color(render_plan, target.render_item)
                 },
-                None,
+                timeline_playground_render_item_label(dataset, target.render_item),
             ),
-            TimelineRenderItem::Event(_) => ([0.88, 0.72, 0.30, 1.0], None),
+            TimelineRenderItem::Event(_) => unreachable!("events are rendered as markers"),
             TimelineRenderItem::FoldedSpanCluster(cluster) => (
                 [0.62, 0.42, 0.84, 1.0],
                 Some(format!("x{}", cluster.count())),
             ),
-            TimelineRenderItem::FoldedEventCluster(cluster) => (
-                [0.82, 0.56, 0.28, 1.0],
-                Some(format!("x{}", cluster.count())),
-            ),
+            TimelineRenderItem::FoldedEventCluster(_) => {
+                unreachable!("event clusters are rendered as markers")
+            }
         };
         push_panel_with_data(
             scene,
@@ -1462,9 +1683,215 @@ fn push_timeline_playground_items(
             }
             .shader_data(),
         );
+        push_timeline_playground_span_bevel(scene, rect);
         if let Some(label) = label {
-            push_centered_text(scene, rect.to_win32_rect(), &label, [0.98, 0.98, 1.0, 1.0]);
+            let label_anchor_x = timeline_playground_item_label_anchor_x(
+                layout,
+                target.render_item,
+                view_state,
+                rect,
+            );
+            push_timeline_playground_item_label(scene, rect, label_anchor_x, &label);
         }
+    }
+}
+
+// timeline[impl playground.span-labels]
+fn push_timeline_playground_item_label(
+    scene: &mut RenderScene,
+    visible_rect: ClientRect,
+    anchor_x: i32,
+    label: &str,
+) {
+    let glyph_width = 8;
+    let horizontal_padding = 10;
+    let text_width = i32::try_from(label.chars().count())
+        .unwrap_or(i32::MAX)
+        .saturating_mul(glyph_width);
+    let required_width = text_width.saturating_add(horizontal_padding * 2);
+    if visible_rect.width() < required_width || visible_rect.height() < 16 {
+        return;
+    }
+    let text_left = (anchor_x - (text_width / 2)).clamp(
+        visible_rect.left() + horizontal_padding,
+        (visible_rect.right() - horizontal_padding - text_width)
+            .max(visible_rect.left() + horizontal_padding),
+    );
+    push_text_block(
+        scene,
+        ClientRect::new(
+            text_left,
+            visible_rect.top() + ((visible_rect.height() - 15).max(0) / 2),
+            text_left.saturating_add(text_width),
+            visible_rect.bottom(),
+        )
+        .to_win32_rect(),
+        label,
+        glyph_width,
+        15,
+        [0.98, 0.98, 1.0, 1.0],
+    );
+}
+
+// timeline[impl playground.span-bevel]
+fn push_timeline_playground_span_bevel(scene: &mut RenderScene, rect: ClientRect) {
+    if rect.width() <= 1 || rect.height() <= 1 {
+        return;
+    }
+    let highlight = [1.0, 1.0, 1.0, 0.18];
+    let shadow = [0.0, 0.0, 0.0, 0.30];
+    for (edge, color) in [
+        (
+            ClientRect::new(rect.left(), rect.top(), rect.right(), rect.top() + 1),
+            highlight,
+        ),
+        (
+            ClientRect::new(rect.left(), rect.top(), rect.left() + 1, rect.bottom()),
+            highlight,
+        ),
+        (
+            ClientRect::new(rect.left(), rect.bottom() - 1, rect.right(), rect.bottom()),
+            shadow,
+        ),
+        (
+            ClientRect::new(rect.right() - 1, rect.top(), rect.right(), rect.bottom()),
+            shadow,
+        ),
+    ] {
+        push_panel(
+            scene,
+            edge.to_win32_rect(),
+            color,
+            PanelEffect::SceneButtonCard,
+        );
+    }
+}
+
+fn timeline_playground_item_label_anchor_x(
+    layout: TimelinePlaygroundLayout,
+    render_item: TimelineRenderItem,
+    view_state: TimelinePlaygroundViewState,
+    visible_rect: ClientRect,
+) -> i32 {
+    match render_item {
+        TimelineRenderItem::Span(span) => {
+            let start_x = timeline_playground_time_to_x(layout, view_state, span.range().start());
+            let end_x = timeline_playground_time_to_x(layout, view_state, span.range().end());
+            i32::midpoint(start_x, end_x)
+        }
+        TimelineRenderItem::FoldedSpanCluster(cluster) => {
+            let start_x =
+                timeline_playground_time_to_x(layout, view_state, cluster.range().start());
+            let end_x = timeline_playground_time_to_x(layout, view_state, cluster.range().end());
+            i32::midpoint(start_x, end_x)
+        }
+        TimelineRenderItem::Event(_) | TimelineRenderItem::FoldedEventCluster(_) => {
+            i32::midpoint(visible_rect.left(), visible_rect.right())
+        }
+    }
+}
+
+fn timeline_playground_render_item_label(
+    dataset: &TimelineDataset,
+    render_item: TimelineRenderItem,
+) -> Option<String> {
+    match render_item {
+        TimelineRenderItem::Span(span) => dataset
+            .item(span.item_id())
+            .and_then(|item| dataset.resolve_string(item.label()))
+            .map(str::to_owned),
+        TimelineRenderItem::FoldedSpanCluster(cluster) => Some(format!("x{}", cluster.count())),
+        TimelineRenderItem::Event(_) | TimelineRenderItem::FoldedEventCluster(_) => None,
+    }
+}
+
+// timeline[impl playground.event-arrows]
+fn push_timeline_playground_event_marker(
+    scene: &mut RenderScene,
+    rect: ClientRect,
+    row_color: [f32; 4],
+    hovered: bool,
+) {
+    let color = if hovered {
+        [
+            (row_color[0] + 0.16).min(1.0),
+            (row_color[1] + 0.16).min(1.0),
+            (row_color[2] + 0.16).min(1.0),
+            1.0,
+        ]
+    } else {
+        row_color
+    };
+    let center_x = rect.left() + (rect.width() / 2);
+    let top = rect.top() + 4;
+    for (index, half_width) in [(0, 7), (1, 5), (2, 3), (3, 1)] {
+        push_panel_with_data(
+            scene,
+            ClientRect::new(
+                center_x - half_width,
+                top + (index * 3),
+                center_x + half_width + 1,
+                top + (index * 3) + 3,
+            )
+            .to_win32_rect(),
+            color,
+            PanelEffect::SceneButtonCard,
+            ButtonVisualState {
+                hover_near: if hovered { 1.0 } else { 0.0 },
+                hovered,
+                pressed: false,
+                click_decay: 0.0,
+                active: false,
+            }
+            .shader_data(),
+        );
+    }
+}
+
+fn timeline_playground_render_item_color(
+    render_plan: &TimelineRenderPlan,
+    render_item: TimelineRenderItem,
+) -> [f32; 4] {
+    // timeline[impl playground.row-stable-colors]
+    let row_id = timeline_render_item_row_id(render_item);
+    let Some(row_key) = render_plan
+        .rows()
+        .iter()
+        .find_map(|row| (row.id().as_u32() == row_id).then_some(row.key()))
+    else {
+        return timeline_playground_row_color(row_id);
+    };
+    timeline_playground_row_key_color(row_key)
+}
+
+fn timeline_playground_row_key_color(row_key: TimelineRenderRowKey) -> [f32; 4] {
+    let palette_index = match row_key {
+        TimelineRenderRowKey::Interned(id) => id.as_u32(),
+        TimelineRenderRowKey::All => 0,
+    };
+    timeline_playground_row_color(palette_index)
+}
+
+fn timeline_playground_row_color(row_id: u32) -> [f32; 4] {
+    const PALETTE: [[f32; 4]; 8] = [
+        [0.30, 0.48, 0.72, 1.0],
+        [0.36, 0.56, 0.42, 1.0],
+        [0.66, 0.46, 0.34, 1.0],
+        [0.52, 0.42, 0.70, 1.0],
+        [0.34, 0.58, 0.62, 1.0],
+        [0.68, 0.52, 0.28, 1.0],
+        [0.62, 0.38, 0.48, 1.0],
+        [0.42, 0.50, 0.34, 1.0],
+    ];
+    PALETTE[usize::try_from(row_id).unwrap_or(0) % PALETTE.len()]
+}
+
+fn timeline_render_item_row_id(render_item: TimelineRenderItem) -> u32 {
+    match render_item {
+        TimelineRenderItem::Span(span) => span.row_id().as_u32(),
+        TimelineRenderItem::Event(event) => event.row_id().as_u32(),
+        TimelineRenderItem::FoldedSpanCluster(cluster)
+        | TimelineRenderItem::FoldedEventCluster(cluster) => cluster.row_id().as_u32(),
     }
 }
 
@@ -1479,16 +1906,27 @@ fn timeline_playground_row_label(dataset: &TimelineDataset, key: TimelineRenderR
 
 fn timeline_playground_item_rect(
     layout: TimelinePlaygroundLayout,
+    render_plan: &TimelineRenderPlan,
     render_item: TimelineRenderItem,
     view_state: TimelinePlaygroundViewState,
-) -> ClientRect {
+    row_visual_positions: &[(TimelineRenderRowKey, i32)],
+) -> Option<ClientRect> {
     let row_id = match render_item {
         TimelineRenderItem::Span(span) => span.row_id().as_u32(),
         TimelineRenderItem::Event(event) => event.row_id().as_u32(),
         TimelineRenderItem::FoldedSpanCluster(cluster)
         | TimelineRenderItem::FoldedEventCluster(cluster) => cluster.row_id().as_u32(),
     };
-    let row_rect = timeline_playground_row_rect(layout, row_id).inset(8);
+    let row_key = render_plan
+        .rows()
+        .iter()
+        .find_map(|row| (row.id().as_u32() == row_id).then_some(row.key()))?;
+    let raw_row_rect = timeline_playground_row_unclipped_rect_for_top(
+        layout,
+        timeline_playground_visual_row_world_top(row_key, row_id, row_visual_positions),
+    );
+    client_rect_intersection(raw_row_rect, layout.content_rect)?;
+    let row_rect = raw_row_rect.inset(8);
     let (start, end) = match render_item {
         TimelineRenderItem::Span(span) => (span.range().start(), span.range().end()),
         TimelineRenderItem::Event(event) => (event.at(), event.at()),
@@ -1500,31 +1938,174 @@ fn timeline_playground_item_rect(
     let left = timeline_playground_time_to_x(layout, view_state, start);
     let right = timeline_playground_time_to_x(layout, view_state, end);
     let min_width = if matches!(render_item, TimelineRenderItem::Event(_)) {
-        8
+        12
     } else {
-        6
+        i32::try_from(view_state.minimum_visible_pixels.max(6)).unwrap_or(i32::MAX)
     };
-    ClientRect::new(
-        left.min(right)
-            .clamp(layout.content_rect.left(), layout.content_rect.right()),
-        row_rect.top(),
-        (left.max(right) + min_width)
-            .clamp(layout.content_rect.left(), layout.content_rect.right()),
-        row_rect.bottom(),
+    if matches!(render_item, TimelineRenderItem::Event(_)) {
+        let center_x = left.clamp(layout.content_rect.left(), layout.content_rect.right());
+        return client_rect_intersection(
+            ClientRect::new(
+                (center_x - 8).clamp(layout.content_rect.left(), layout.content_rect.right()),
+                row_rect.top() - 5,
+                (center_x + 8).clamp(layout.content_rect.left(), layout.content_rect.right()),
+                (row_rect.top() + 24).min(row_rect.bottom()),
+            ),
+            layout.content_rect,
+        );
+    }
+    let lane_rect = match render_item {
+        TimelineRenderItem::Span(span) => {
+            timeline_playground_span_lane_rect(row_rect, span.lane_index())
+        }
+        TimelineRenderItem::FoldedSpanCluster(_) => timeline_playground_span_lane_rect(row_rect, 0),
+        TimelineRenderItem::Event(_) | TimelineRenderItem::FoldedEventCluster(_) => row_rect,
+    };
+    let (item_left, item_right) =
+        timeline_playground_item_horizontal_bounds(layout, left, right, min_width);
+    client_rect_intersection(
+        ClientRect::new(item_left, lane_rect.top(), item_right, lane_rect.bottom()),
+        layout.content_rect,
     )
 }
 
-fn timeline_playground_row_rect(layout: TimelinePlaygroundLayout, row_id: u32) -> ClientRect {
-    let row_height = 42;
-    let row_gap = 8;
-    let row_top = layout.content_rect.top()
-        + i32::try_from(row_id).unwrap_or(i32::MAX) * (row_height + row_gap);
+fn timeline_playground_item_horizontal_bounds(
+    layout: TimelinePlaygroundLayout,
+    left: i32,
+    right: i32,
+    min_width: i32,
+) -> (i32, i32) {
+    // timeline[impl playground.projected-span-width]
+    let content_left = layout.content_rect.left();
+    let content_right = layout.content_rect.right();
+    let start = left.min(right).clamp(content_left, content_right);
+    let end = left.max(right).clamp(content_left, content_right);
+    if end.saturating_sub(start) >= min_width {
+        return (start, end);
+    }
+    let center = i32::midpoint(start, end);
+    let item_left = (center - (min_width / 2))
+        .clamp(content_left, (content_right - min_width).max(content_left));
+    (
+        item_left,
+        item_left.saturating_add(min_width).min(content_right),
+    )
+}
+
+#[cfg(test)]
+fn timeline_playground_row_rect(
+    layout: TimelinePlaygroundLayout,
+    row_id: u32,
+) -> Option<ClientRect> {
+    // timeline[impl playground.vertical-render-clip]
+    client_rect_intersection(
+        timeline_playground_row_unclipped_rect(layout, row_id),
+        layout.content_rect,
+    )
+}
+
+#[cfg(test)]
+fn timeline_playground_row_unclipped_rect(
+    layout: TimelinePlaygroundLayout,
+    row_id: u32,
+) -> ClientRect {
+    timeline_playground_row_unclipped_rect_for_top(
+        layout,
+        timeline_playground_row_world_top(row_id),
+    )
+}
+
+fn timeline_playground_row_unclipped_rect_for_top(
+    layout: TimelinePlaygroundLayout,
+    row_world_top: i32,
+) -> ClientRect {
+    let row_top = layout
+        .content_rect
+        .top()
+        .saturating_add(row_world_top)
+        .saturating_sub(layout.vertical_scroll_offset);
     ClientRect::new(
         layout.content_rect.left(),
         row_top,
         layout.content_rect.right(),
-        (row_top + row_height).min(layout.content_rect.bottom()),
+        row_top.saturating_add(TIMELINE_PLAYGROUND_ROW_HEIGHT),
     )
+}
+
+fn timeline_playground_visual_row_world_top(
+    row_key: TimelineRenderRowKey,
+    row_id: u32,
+    row_visual_positions: &[(TimelineRenderRowKey, i32)],
+) -> i32 {
+    row_visual_positions
+        .iter()
+        .find_map(|(key, top)| (*key == row_key).then_some(*top))
+        .unwrap_or_else(|| timeline_playground_row_world_top(row_id))
+}
+
+pub fn timeline_playground_row_world_top(row_id: u32) -> i32 {
+    i32::try_from(row_id)
+        .unwrap_or(i32::MAX)
+        .saturating_mul(TIMELINE_PLAYGROUND_ROW_HEIGHT + TIMELINE_PLAYGROUND_ROW_GAP)
+}
+
+#[must_use]
+// timeline[impl playground.vertical-pan]
+pub fn timeline_playground_clamp_vertical_scroll_offset(
+    layout: TimelinePlaygroundLayout,
+    row_count: usize,
+    offset: i32,
+) -> i32 {
+    let row_count = i32::try_from(row_count).unwrap_or(i32::MAX);
+    let content_height = row_count
+        .saturating_mul(TIMELINE_PLAYGROUND_ROW_HEIGHT + TIMELINE_PLAYGROUND_ROW_GAP)
+        .saturating_sub(TIMELINE_PLAYGROUND_ROW_GAP);
+    offset.clamp(
+        0,
+        content_height
+            .saturating_sub(layout.content_rect.height())
+            .max(0),
+    )
+}
+
+fn timeline_playground_span_lane_rect(row_rect: ClientRect, lane_index: u32) -> ClientRect {
+    // timeline[impl playground.span-clip-readability]
+    let lane_height = 18;
+    let lane_gap = 4;
+    let lane_step = lane_height + lane_gap;
+    let lane_top = row_rect.top().saturating_add(16).saturating_add(
+        i32::try_from(lane_index)
+            .unwrap_or(i32::MAX)
+            .saturating_mul(lane_step),
+    );
+    let max_top = (row_rect.bottom() - lane_height).max(row_rect.top());
+    let lane_top = lane_top.min(max_top);
+    ClientRect::new(
+        row_rect.left(),
+        lane_top,
+        row_rect.right(),
+        lane_top + lane_height,
+    )
+}
+
+fn timeline_playground_closed_data_bounds(
+    dataset: &TimelineDataset,
+) -> Option<(TimelineInstantNs, TimelineInstantNs)> {
+    let mut bounds: Option<(TimelineInstantNs, TimelineInstantNs)> = None;
+    for item in dataset.items() {
+        let item_bounds = match item.kind() {
+            TimelineItemKind::Event(event) => Some((event.at(), event.at())),
+            TimelineItemKind::Span(span) => span.end().map(|end| (span.start(), end)),
+        };
+        let Some((start, end)) = item_bounds else {
+            continue;
+        };
+        bounds = Some(match bounds {
+            Some((current_start, current_end)) => (current_start.min(start), current_end.max(end)),
+            None => (start, end),
+        });
+    }
+    bounds.map(|(start, end)| (start.min(TimelineInstantNs::new(0)), end))
 }
 
 fn timeline_playground_time_to_x(
@@ -1533,8 +2114,8 @@ fn timeline_playground_time_to_x(
     time: TimelineInstantNs,
 ) -> i32 {
     let width = i128::from(layout.content_rect.width().max(1));
-    let duration = i128::from((view_state.visible_end_ns - view_state.visible_start_ns).max(1));
-    let offset = i128::from(time.as_i64() - view_state.visible_start_ns);
+    let duration = timeline_playground_visible_duration_ns(view_state);
+    let offset = i128::from(time.as_i64()) - i128::from(view_state.visible_start_ns);
     let x = i128::from(layout.content_rect.left()) + (offset * width / duration);
     i32::try_from(x).unwrap_or(if x < 0 { i32::MIN } else { i32::MAX })
 }
@@ -1547,12 +2128,16 @@ fn timeline_playground_viewport(
     layout: TimelinePlaygroundLayout,
     view_state: TimelinePlaygroundViewState,
 ) -> TimelineViewport {
-    let duration_ns = (view_state.visible_end_ns - view_state.visible_start_ns).max(1) as f64;
+    let duration_ns = timeline_playground_visible_duration_ns(view_state) as f64;
     let duration_per_pixel_ns = duration_ns / f64::from(layout.content_rect.width().max(1));
     TimelineViewport::new(
         TimelineTimeNs::new(view_state.visible_start_ns),
         Time::new::<nanosecond>(duration_per_pixel_ns),
     )
+}
+
+fn timeline_playground_visible_duration_ns(view_state: TimelinePlaygroundViewState) -> i128 {
+    (i128::from(view_state.visible_end_ns) - i128::from(view_state.visible_start_ns)).max(1)
 }
 
 #[expect(
@@ -1822,6 +2407,22 @@ pub fn scene_button_specs(scene_kind: SceneWindowKind) -> &'static [SceneButtonS
                 tooltip: "Generate a new synthetic timeline seed",
                 sprite: SpriteId::Terminal,
                 color: [0.16, 0.28, 0.24, 1.0],
+            },
+            SceneButtonSpec {
+                // timeline[impl playground.live-tracing-events]
+                action: SceneAction::ToggleTimelinePlaygroundLiveEvents,
+                label: "Live Events",
+                tooltip: "View tracing events captured by the app subscriber",
+                sprite: SpriteId::Terminal,
+                color: [0.26, 0.24, 0.14, 1.0],
+            },
+            SceneButtonSpec {
+                // timeline[impl playground.fit-content]
+                action: SceneAction::FitTimelinePlaygroundToContent,
+                label: "Fit",
+                tooltip: "Fit the playground viewport to visible content",
+                sprite: SpriteId::Terminal,
+                color: [0.18, 0.28, 0.22, 1.0],
             },
             SceneButtonSpec {
                 // timeline[impl playground.query-controls]
@@ -4647,6 +5248,10 @@ fn client_rect_intersection(left: ClientRect, right: ClientRect) -> Option<Clien
         .then_some(intersection)
 }
 
+fn clamp_i32_ordered(value: i32, first: i32, other: i32) -> i32 {
+    value.clamp(first.min(other), first.max(other))
+}
+
 fn timeline_track_list_text(document: Option<&TimelineDocument>) -> String {
     let mut track_text = String::from("Tracks\n\n");
     if let Some(document) = document {
@@ -7146,6 +7751,7 @@ fn push_vt_text_block(
     text: &str,
     cell_width: i32,
     cell_height: i32,
+    selection: Option<TerminalSelection>,
 ) {
     if rect.width() <= 0 || rect.height() <= 0 || cell_width <= 0 || cell_height <= 0 {
         return;
@@ -7153,7 +7759,8 @@ fn push_vt_text_block(
     let columns = u16::try_from((rect.width() / cell_width).max(1)).unwrap_or(u16::MAX);
     let rows = u16::try_from((rect.height() / cell_height).max(1)).unwrap_or(u16::MAX);
     let mut engine = TeamyTerminalEngine::new(columns, rows, 0);
-    engine.vt_write(text.as_bytes());
+    let normalized_text = normalize_line_endings_for_vt(text);
+    engine.vt_write(normalized_text.as_bytes());
 
     for row in 0..u32::from(rows) {
         for cell in engine.screen_row_display_cells(row) {
@@ -7165,14 +7772,161 @@ fn push_vt_text_block(
             .to_win32_rect();
             let (foreground, background) =
                 timeline_detail_vt_cell_colors(cell.foreground, cell.background, cell.inverse);
-            if let Some(background) = background {
+            let terminal_cell = TerminalCellPoint::new(
+                i32::try_from(cell.column).unwrap_or(i32::MAX),
+                i32::try_from(cell.row).unwrap_or(i32::MAX),
+            );
+            let selected = selection.is_some_and(|selection| selection.contains(terminal_cell));
+            if selected {
+                push_panel(
+                    scene,
+                    cell_rect,
+                    DIAGNOSTIC_SELECTION_BACKGROUND,
+                    PanelEffect::TerminalFill,
+                );
+            } else if let Some(background) = background {
                 push_panel(scene, cell_rect, background, PanelEffect::TerminalFill);
             }
             if !cell.character.is_whitespace() {
-                push_glyph(scene, cell_rect, cell.character, foreground);
+                push_glyph(
+                    scene,
+                    cell_rect,
+                    cell.character,
+                    if selected {
+                        DIAGNOSTIC_SELECTION_FOREGROUND
+                    } else {
+                        foreground
+                    },
+                );
             }
         }
     }
+}
+
+fn normalize_line_endings_for_vt(text: &str) -> String {
+    let mut normalized = String::with_capacity(text.len());
+    let mut previous = None;
+    for character in text.chars() {
+        if character == '\n' && previous != Some('\r') {
+            normalized.push('\r');
+        }
+        normalized.push(character);
+        previous = Some(character);
+    }
+    normalized
+}
+
+fn strip_ansi_escape_sequences(text: &str) -> String {
+    let mut stripped = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(character) = chars.next() {
+        if character != '\u{1b}' {
+            stripped.push(character);
+            continue;
+        }
+        if chars.peek() != Some(&'[') {
+            continue;
+        }
+        let _ = chars.next();
+        for sequence_char in chars.by_ref() {
+            if sequence_char.is_ascii_alphabetic() {
+                break;
+            }
+        }
+    }
+    stripped
+}
+
+fn build_timeline_playground_detail_diagnostic_body_scene(
+    body_rect: ClientRect,
+    detail: Option<&TimelinePlaygroundDetail>,
+    pretty_text: &str,
+    pinned: bool,
+    selection: Option<TerminalSelection>,
+    cell_width: i32,
+    cell_height: i32,
+) -> RenderScene {
+    let columns = u16::try_from((body_rect.width() / cell_width.max(1)).max(0)).unwrap_or_default();
+    let rows = u16::try_from((body_rect.height() / cell_height.max(1)).max(0)).unwrap_or_default();
+    if columns == 0 || rows == 0 {
+        return empty_render_scene();
+    }
+
+    let area = RatatuiRect::new(0, 0, columns, rows);
+    let mut buffer = Buffer::empty(area);
+    render_timeline_playground_detail_diagnostic_buffer(
+        &mut buffer,
+        area,
+        detail,
+        pretty_text,
+        pinned,
+    );
+    ratatui_buffer_to_scene(body_rect, &buffer, selection, cell_width, cell_height)
+}
+
+fn render_timeline_playground_detail_diagnostic_buffer(
+    buffer: &mut Buffer,
+    area: RatatuiRect,
+    detail: Option<&TimelinePlaygroundDetail>,
+    pretty_text: &str,
+    pinned: bool,
+) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(7),
+            Constraint::Min(7),
+            Constraint::Length(4),
+        ])
+        .split(area);
+    let title = detail.map_or("No timeline item", TimelinePlaygroundDetail::title);
+    let state_label = if pinned { "pinned" } else { "hover" };
+    Paragraph::new(vec![
+        Line::from(vec![
+            Span::styled("Item ", Style::new().fg(Color::DarkGray)),
+            Span::styled(
+                title,
+                Style::new().fg(Color::White).add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("State ", Style::new().fg(Color::DarkGray)),
+            Span::styled(state_label, Style::new().fg(Color::LightCyan)),
+        ]),
+        Line::from(vec![
+            Span::styled("Mode ", Style::new().fg(Color::DarkGray)),
+            Span::styled(
+                "timeline detail diagnostics",
+                Style::new().fg(Color::LightGreen),
+            ),
+        ]),
+    ])
+    .block(
+        Block::default()
+            .title(" Timeline Detail ")
+            .borders(Borders::ALL)
+            .border_style(Style::new().fg(Color::Cyan)),
+    )
+    .render(chunks[0], buffer);
+
+    Paragraph::new(timeline_playground_detail_selectable_text(pretty_text))
+        .block(
+            Block::default()
+                .title(" Facet Pretty ")
+                .borders(Borders::ALL)
+                .border_style(Style::new().fg(Color::Blue)),
+        )
+        .wrap(Wrap { trim: false })
+        .render(chunks[1], buffer);
+
+    Paragraph::new("Alt+X pretty view   Ctrl+C copy selection   Ctrl+D close window")
+        .block(
+            Block::default()
+                .title(" Controls ")
+                .borders(Borders::ALL)
+                .border_style(Style::new().fg(Color::DarkGray)),
+        )
+        .render(chunks[2], buffer);
 }
 
 fn timeline_detail_vt_cell_colors(
@@ -8745,6 +9499,8 @@ mod tests {
         let actions = specs.iter().map(|spec| spec.action).collect::<Vec<_>>();
 
         assert!(actions.contains(&SceneAction::RegenerateTimelinePlayground));
+        assert!(actions.contains(&SceneAction::ToggleTimelinePlaygroundLiveEvents));
+        assert!(actions.contains(&SceneAction::FitTimelinePlaygroundToContent));
         assert!(actions.contains(&SceneAction::TimelinePlaygroundGroupingGroupKey));
         assert!(actions.contains(&SceneAction::TimelinePlaygroundGroupingSourceKey));
         assert!(actions.contains(&SceneAction::TimelinePlaygroundGroupingLabel));
@@ -8768,14 +9524,18 @@ mod tests {
         )
         .expect("synthetic dataset");
         let layout = sample_layout();
-        let playground_layout = timeline_playground_layout(layout.terminal_panel_rect().inset(24));
+        let playground_layout =
+            timeline_playground_layout(layout.terminal_panel_rect().inset(24), 0);
         let view_state = TimelinePlaygroundViewState {
+            source_label: "synthetic",
             seed: crate::timeline::TimelineSyntheticConfig::default().seed(),
             grouping_mode: crate::timeline::TimelineGroupingMode::GroupKey,
             minimum_visible_pixels: 4,
             visible_start_ns: 0,
             visible_end_ns: 24_000_000,
+            vertical_scroll_offset: 0,
             hovered_item: None,
+            cursor_position: None,
         };
         let query = crate::timeline::TimelineViewportQuery::try_new(
             crate::timeline::TimelineInstantNs::new(view_state.visible_start_ns),
@@ -8795,9 +9555,10 @@ mod tests {
             &render_plan,
             view_state,
             &[],
+            &[],
         );
         let hit_rects =
-            timeline_playground_item_hit_rects(playground_layout, &render_plan, view_state);
+            timeline_playground_item_hit_rects(playground_layout, &render_plan, view_state, &[]);
         let (first_rect, first_target) = hit_rects.first().copied().expect("hit target");
         let hit_point = rect_center_point(first_rect);
 
@@ -8810,15 +9571,483 @@ mod tests {
         );
     }
 
+    #[test]
+    // timeline[verify playground.cursor-guide]
+    fn timeline_playground_scene_draws_cursor_guide_over_timeline_surface() {
+        let dataset = crate::timeline::generate_synthetic_timeline_dataset(
+            &crate::timeline::TimelineSyntheticConfig::default(),
+        )
+        .expect("synthetic dataset");
+        let layout = sample_layout();
+        let playground_layout =
+            timeline_playground_layout(layout.terminal_panel_rect().inset(24), 0);
+        let cursor_position = ClientPoint::new(
+            playground_layout.content_rect.left() + 80,
+            playground_layout.content_rect.top() + 8,
+        );
+        let view_state = TimelinePlaygroundViewState {
+            source_label: "synthetic",
+            seed: crate::timeline::TimelineSyntheticConfig::default().seed(),
+            grouping_mode: crate::timeline::TimelineGroupingMode::GroupKey,
+            minimum_visible_pixels: 4,
+            visible_start_ns: 0,
+            visible_end_ns: 24_000_000,
+            vertical_scroll_offset: 0,
+            hovered_item: None,
+            cursor_position: Some(cursor_position),
+        };
+        let query = crate::timeline::TimelineViewportQuery::try_new(
+            crate::timeline::TimelineInstantNs::new(view_state.visible_start_ns),
+            crate::timeline::TimelineInstantNs::new(view_state.visible_end_ns),
+            crate::timeline::TimelineInstantNs::new(view_state.visible_end_ns),
+            u32::try_from(playground_layout.content_rect.width()).expect("positive viewport"),
+        )
+        .expect("query")
+        .with_grouping_mode(view_state.grouping_mode)
+        .with_minimum_visible_pixels(view_state.minimum_visible_pixels);
+        let render_plan = dataset.render_plan(&query);
+
+        let scene = build_timeline_playground_render_scene(
+            layout,
+            WindowChromeButtonsState::default(),
+            &dataset,
+            &render_plan,
+            view_state,
+            &[],
+            &[],
+        );
+
+        assert!(scene.panels.iter().any(|panel| {
+            panel.color == [0.78, 0.86, 0.96, 0.42]
+                && panel.rect.top == playground_layout.ruler_rect.top()
+                && panel.rect.bottom == playground_layout.content_rect.bottom()
+        }));
+    }
+
+    #[test]
+    // timeline[verify playground.pan-negative-time]
+    fn timeline_playground_scene_handles_extreme_zoom_out_without_overflow() {
+        let dataset = crate::timeline::generate_synthetic_timeline_dataset(
+            &crate::timeline::TimelineSyntheticConfig::default(),
+        )
+        .expect("synthetic dataset");
+        let layout = sample_layout();
+        let playground_layout =
+            timeline_playground_layout(layout.terminal_panel_rect().inset(24), 0);
+        let view_state = TimelinePlaygroundViewState {
+            source_label: "synthetic",
+            seed: crate::timeline::TimelineSyntheticConfig::default().seed(),
+            grouping_mode: crate::timeline::TimelineGroupingMode::GroupKey,
+            minimum_visible_pixels: 4,
+            visible_start_ns: i64::MIN + 1,
+            visible_end_ns: i64::MAX,
+            vertical_scroll_offset: 0,
+            hovered_item: None,
+            cursor_position: None,
+        };
+        let query = crate::timeline::TimelineViewportQuery::try_new(
+            crate::timeline::TimelineInstantNs::new(view_state.visible_start_ns),
+            crate::timeline::TimelineInstantNs::new(view_state.visible_end_ns),
+            crate::timeline::TimelineInstantNs::new(view_state.visible_end_ns),
+            u32::try_from(playground_layout.content_rect.width()).expect("positive viewport"),
+        )
+        .expect("query")
+        .with_grouping_mode(view_state.grouping_mode)
+        .with_minimum_visible_pixels(view_state.minimum_visible_pixels);
+        let render_plan = dataset.render_plan(&query);
+
+        let scene = build_timeline_playground_render_scene(
+            layout,
+            WindowChromeButtonsState::default(),
+            &dataset,
+            &render_plan,
+            view_state,
+            &[],
+            &[],
+        );
+
+        assert!(!scene.panels.is_empty());
+    }
+
+    #[test]
+    // timeline[verify playground.event-arrows]
+    fn timeline_playground_folded_events_render_as_marker_without_count_block() {
+        let mut dataset = crate::timeline::TimelineDataset::new();
+        for at in [10, 11, 12] {
+            dataset.push_event(
+                crate::timeline::TimelineItemInput::new(format!("message-{at}"))
+                    .with_group_key("thread-a"),
+                crate::timeline::TimelineInstantNs::new(at),
+            );
+        }
+        dataset.compact();
+        let layout = sample_layout();
+        let playground_layout =
+            timeline_playground_layout(layout.terminal_panel_rect().inset(24), 0);
+        let view_state = TimelinePlaygroundViewState {
+            source_label: "synthetic",
+            seed: 0,
+            grouping_mode: crate::timeline::TimelineGroupingMode::GroupKey,
+            minimum_visible_pixels: 24,
+            visible_start_ns: 0,
+            visible_end_ns: 100,
+            vertical_scroll_offset: 0,
+            hovered_item: None,
+            cursor_position: None,
+        };
+        let query = crate::timeline::TimelineViewportQuery::try_new(
+            crate::timeline::TimelineInstantNs::new(view_state.visible_start_ns),
+            crate::timeline::TimelineInstantNs::new(view_state.visible_end_ns),
+            crate::timeline::TimelineInstantNs::new(view_state.visible_end_ns),
+            100,
+        )
+        .expect("query")
+        .with_grouping_mode(view_state.grouping_mode)
+        .with_minimum_visible_pixels(view_state.minimum_visible_pixels);
+        let render_plan = dataset.render_plan(&query);
+
+        assert!(matches!(
+            render_plan.items(),
+            [crate::timeline::TimelineRenderItem::FoldedEventCluster(_)]
+        ));
+
+        let scene = build_timeline_playground_render_scene(
+            layout,
+            WindowChromeButtonsState::default(),
+            &dataset,
+            &render_plan,
+            view_state,
+            &[],
+            &[],
+        );
+
+        assert!(scene.panels.iter().any(|panel| {
+            panel.rect.top >= playground_layout.content_rect.top() - 5
+                && panel.rect.bottom <= playground_layout.content_rect.top() + 32
+        }));
+    }
+
+    #[test]
+    // timeline[verify playground.data-bounds-dimming]
+    fn timeline_playground_dims_outside_closed_data_bounds_and_ignores_open_spans() {
+        let mut dataset = crate::timeline::TimelineDataset::new();
+        dataset.push_event(
+            crate::timeline::TimelineItemInput::new("message").with_group_key("thread-a"),
+            crate::timeline::TimelineInstantNs::new(10),
+        );
+        dataset
+            .push_span(
+                crate::timeline::TimelineItemInput::new("open").with_group_key("thread-a"),
+                crate::timeline::TimelineInstantNs::new(90),
+                None,
+            )
+            .expect("open span");
+        dataset.compact();
+        let layout = sample_layout();
+        let view_state = TimelinePlaygroundViewState {
+            source_label: "synthetic",
+            seed: 0,
+            grouping_mode: crate::timeline::TimelineGroupingMode::GroupKey,
+            minimum_visible_pixels: 4,
+            visible_start_ns: -20,
+            visible_end_ns: 120,
+            vertical_scroll_offset: 0,
+            hovered_item: None,
+            cursor_position: None,
+        };
+        let playground_layout =
+            timeline_playground_layout(layout.terminal_panel_rect().inset(24), 0);
+        let query = crate::timeline::TimelineViewportQuery::try_new(
+            crate::timeline::TimelineInstantNs::new(view_state.visible_start_ns),
+            crate::timeline::TimelineInstantNs::new(view_state.visible_end_ns),
+            crate::timeline::TimelineInstantNs::new(view_state.visible_end_ns),
+            u32::try_from(playground_layout.content_rect.width()).expect("positive viewport"),
+        )
+        .expect("query")
+        .with_grouping_mode(view_state.grouping_mode)
+        .with_minimum_visible_pixels(view_state.minimum_visible_pixels);
+        let render_plan = dataset.render_plan(&query);
+
+        let scene = build_timeline_playground_render_scene(
+            layout,
+            WindowChromeButtonsState::default(),
+            &dataset,
+            &render_plan,
+            view_state,
+            &[],
+            &[],
+        );
+
+        let dim_panels = scene
+            .panels
+            .iter()
+            .filter(|panel| panel.color == [0.02, 0.025, 0.035, 0.72])
+            .count();
+        assert_eq!(dim_panels, 2);
+        assert_eq!(
+            timeline_playground_closed_data_bounds(&dataset).map(|(start, _)| start),
+            Some(crate::timeline::TimelineInstantNs::new(0))
+        );
+    }
+
+    #[test]
+    // timeline[verify playground.minimum-span-marker]
+    fn timeline_playground_item_rect_preserves_minimum_width_at_viewport_edge() {
+        let layout = timeline_playground_layout(sample_layout().terminal_panel_rect().inset(24), 0);
+        let view_state = TimelinePlaygroundViewState {
+            source_label: "synthetic",
+            seed: 0,
+            grouping_mode: crate::timeline::TimelineGroupingMode::GroupKey,
+            minimum_visible_pixels: 12,
+            visible_start_ns: 0,
+            visible_end_ns: 100,
+            vertical_scroll_offset: 0,
+            hovered_item: None,
+            cursor_position: None,
+        };
+        let (item_left, item_right) = timeline_playground_item_horizontal_bounds(
+            layout,
+            layout.content_rect.right(),
+            layout.content_rect.right(),
+            i32::try_from(view_state.minimum_visible_pixels).expect("minimum width"),
+        );
+
+        assert_eq!(item_right, layout.content_rect.right());
+        assert_eq!(
+            item_right - item_left,
+            i32::try_from(view_state.minimum_visible_pixels).expect("minimum width")
+        );
+    }
+
+    #[test]
+    // timeline[verify playground.projected-span-width]
+    fn timeline_playground_item_rect_preserves_projected_width_when_wider_than_minimum() {
+        let mut dataset = crate::timeline::TimelineDataset::new();
+        let span_id = dataset
+            .push_span(
+                crate::timeline::TimelineItemInput::new("wide").with_group_key("thread-a"),
+                crate::timeline::TimelineInstantNs::new(25),
+                Some(crate::timeline::TimelineInstantNs::new(75)),
+            )
+            .expect("span");
+        dataset.compact();
+        let layout = timeline_playground_layout(sample_layout().terminal_panel_rect().inset(24), 0);
+        let view_state = TimelinePlaygroundViewState {
+            source_label: "synthetic",
+            seed: 0,
+            grouping_mode: crate::timeline::TimelineGroupingMode::GroupKey,
+            minimum_visible_pixels: 12,
+            visible_start_ns: 0,
+            visible_end_ns: 100,
+            vertical_scroll_offset: 0,
+            hovered_item: None,
+            cursor_position: None,
+        };
+        let query = crate::timeline::TimelineViewportQuery::try_new(
+            crate::timeline::TimelineInstantNs::new(0),
+            crate::timeline::TimelineInstantNs::new(100),
+            crate::timeline::TimelineInstantNs::new(100),
+            u32::try_from(layout.content_rect.width()).expect("positive viewport"),
+        )
+        .expect("query")
+        .with_grouping_mode(view_state.grouping_mode)
+        .with_minimum_visible_pixels(view_state.minimum_visible_pixels);
+        let plan = dataset.render_plan(&query);
+        let render_item = plan
+            .items()
+            .iter()
+            .copied()
+            .find(|item| matches!(item, crate::timeline::TimelineRenderItem::Span(span) if span.item_id() == span_id))
+            .expect("span render item");
+
+        let rect = timeline_playground_item_rect(layout, &plan, render_item, view_state, &[])
+            .expect("visible span rect");
+
+        assert!(
+            rect.width() > i32::try_from(view_state.minimum_visible_pixels).expect("minimum width")
+        );
+        assert_eq!(rect.width(), layout.content_rect.width() / 2);
+    }
+
+    #[test]
+    // timeline[verify playground.vertical-render-clip]
+    fn timeline_playground_row_rect_clips_to_content_surface() {
+        let layout =
+            timeline_playground_layout(sample_layout().terminal_panel_rect().inset(24), 20);
+
+        let row_rect = timeline_playground_row_rect(layout, 0).expect("partially visible row");
+
+        assert_eq!(row_rect.top(), layout.content_rect.top());
+        assert!(row_rect.bottom() <= layout.content_rect.bottom());
+    }
+
+    #[test]
+    // timeline[verify playground.vertical-render-clip]
+    fn timeline_playground_hit_rects_skip_rows_outside_content_surface() {
+        let mut dataset = crate::timeline::TimelineDataset::new();
+        dataset
+            .push_span(
+                crate::timeline::TimelineItemInput::new("above").with_group_key("thread-a"),
+                crate::timeline::TimelineInstantNs::new(0),
+                Some(crate::timeline::TimelineInstantNs::new(10)),
+            )
+            .expect("span");
+        dataset
+            .push_span(
+                crate::timeline::TimelineItemInput::new("visible").with_group_key("thread-b"),
+                crate::timeline::TimelineInstantNs::new(0),
+                Some(crate::timeline::TimelineInstantNs::new(10)),
+            )
+            .expect("span");
+        dataset.compact();
+        let layout = timeline_playground_layout(
+            sample_layout().terminal_panel_rect().inset(24),
+            TIMELINE_PLAYGROUND_ROW_HEIGHT + TIMELINE_PLAYGROUND_ROW_GAP,
+        );
+        let view_state = TimelinePlaygroundViewState {
+            source_label: "synthetic",
+            seed: 0,
+            grouping_mode: crate::timeline::TimelineGroupingMode::GroupKey,
+            minimum_visible_pixels: 6,
+            visible_start_ns: 0,
+            visible_end_ns: 100,
+            vertical_scroll_offset: layout.vertical_scroll_offset,
+            hovered_item: None,
+            cursor_position: None,
+        };
+        let query = crate::timeline::TimelineViewportQuery::try_new(
+            crate::timeline::TimelineInstantNs::new(0),
+            crate::timeline::TimelineInstantNs::new(100),
+            crate::timeline::TimelineInstantNs::new(100),
+            u32::try_from(layout.content_rect.width()).expect("positive viewport"),
+        )
+        .expect("query")
+        .with_grouping_mode(view_state.grouping_mode)
+        .with_minimum_visible_pixels(view_state.minimum_visible_pixels);
+        let plan = dataset.render_plan(&query);
+
+        let hit_rects = timeline_playground_item_hit_rects(layout, &plan, view_state, &[]);
+
+        assert_eq!(hit_rects.len(), 1);
+        assert!(hit_rects[0].0.top() >= layout.content_rect.top());
+        assert!(hit_rects[0].0.bottom() <= layout.content_rect.bottom());
+    }
+
+    #[test]
+    // timeline[verify playground.vertical-render-clip]
+    fn timeline_playground_item_lanes_do_not_stick_to_clipped_row_edge() {
+        let mut dataset = crate::timeline::TimelineDataset::new();
+        dataset
+            .push_span(
+                crate::timeline::TimelineItemInput::new("above").with_group_key("thread-a"),
+                crate::timeline::TimelineInstantNs::new(0),
+                Some(crate::timeline::TimelineInstantNs::new(10)),
+            )
+            .expect("span");
+        dataset.compact();
+        let layout = timeline_playground_layout(
+            sample_layout().terminal_panel_rect().inset(24),
+            TIMELINE_PLAYGROUND_ROW_HEIGHT - 8,
+        );
+        let view_state = TimelinePlaygroundViewState {
+            source_label: "synthetic",
+            seed: 0,
+            grouping_mode: crate::timeline::TimelineGroupingMode::GroupKey,
+            minimum_visible_pixels: 6,
+            visible_start_ns: 0,
+            visible_end_ns: 100,
+            vertical_scroll_offset: layout.vertical_scroll_offset,
+            hovered_item: None,
+            cursor_position: None,
+        };
+        let query = crate::timeline::TimelineViewportQuery::try_new(
+            crate::timeline::TimelineInstantNs::new(0),
+            crate::timeline::TimelineInstantNs::new(100),
+            crate::timeline::TimelineInstantNs::new(100),
+            u32::try_from(layout.content_rect.width()).expect("positive viewport"),
+        )
+        .expect("query")
+        .with_grouping_mode(view_state.grouping_mode)
+        .with_minimum_visible_pixels(view_state.minimum_visible_pixels);
+        let plan = dataset.render_plan(&query);
+
+        let hit_rects = timeline_playground_item_hit_rects(layout, &plan, view_state, &[]);
+
+        assert!(hit_rects.is_empty());
+        assert!(timeline_playground_row_rect(layout, 0).is_some());
+    }
+
+    #[test]
+    // timeline[verify playground.span-clip-readability]
+    fn timeline_playground_span_lanes_are_tall_enough_for_labels() {
+        let layout = timeline_playground_layout(sample_layout().terminal_panel_rect().inset(24), 0);
+        let row_rect = timeline_playground_row_unclipped_rect(layout, 0).inset(8);
+
+        let lane_rect = timeline_playground_span_lane_rect(row_rect, 0);
+
+        assert!(lane_rect.height() >= 16);
+    }
+
+    #[test]
+    // timeline[verify playground.span-labels]
+    fn timeline_playground_span_label_renders_only_when_it_fits() {
+        let mut scene = empty_render_scene();
+        push_timeline_playground_item_label(
+            &mut scene,
+            ClientRect::new(0, 0, 180, 40),
+            90,
+            "load_terminal_font",
+        );
+        let rendered_count = scene.glyphs.len();
+
+        push_timeline_playground_item_label(
+            &mut scene,
+            ClientRect::new(0, 48, 12, 88),
+            6,
+            "load_terminal_font",
+        );
+
+        assert!(rendered_count > 0);
+        assert_eq!(scene.glyphs.len(), rendered_count);
+    }
+
+    #[test]
+    // timeline[verify playground.span-labels]
+    fn timeline_playground_span_label_hugs_visible_edge_when_anchor_is_offscreen() {
+        let mut scene = empty_render_scene();
+        let visible_rect = ClientRect::new(100, 0, 260, 40);
+
+        push_timeline_playground_item_label(&mut scene, visible_rect, -1_000, "font");
+
+        let first_glyph = scene.glyphs.first().expect("label glyph");
+        assert_eq!(first_glyph.rect.left, visible_rect.left() + 10);
+    }
+
+    #[test]
+    // timeline[verify playground.span-bevel]
+    fn timeline_playground_span_bevel_adds_edge_panels() {
+        let mut scene = empty_render_scene();
+
+        push_timeline_playground_span_bevel(&mut scene, ClientRect::new(10, 20, 80, 40));
+
+        assert_eq!(scene.panels.len(), 4);
+        assert!(
+            scene
+                .panels
+                .iter()
+                .any(|panel| panel.rect.right == 80 && panel.rect.left == 79)
+        );
+    }
+
     // timeline[verify playground.detail-vt-text]
     #[test]
     fn timeline_playground_detail_render_scene_parses_vt_colored_text() {
         let scene = build_timeline_playground_detail_render_scene(
             sample_layout(),
             WindowChromeButtonsState::default(),
-            None,
             "plain \x1b[31mred\x1b[0m done",
             false,
+            None,
         );
         assert!(scene.glyphs.iter().all(|glyph| glyph.character != '\u{1b}'));
         assert!(scene.glyphs.iter().any(|glyph| {

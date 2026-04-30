@@ -1,4 +1,5 @@
 use std::cell::RefCell;
+use std::cmp::Ordering;
 use std::ffi::c_void;
 use std::marker::PhantomData;
 use std::path::Path;
@@ -65,10 +66,10 @@ use crate::logs::{self, LogRecordSnapshot, ThreadBuilderSpanExt};
 use crate::model::KNOWN_WHISPER_MODELS;
 use crate::paths::{AppHome, CacheHome};
 use crate::timeline::{
-    TimelineDataset, TimelineDocument, TimelineGroupingMode, TimelineInstantNs,
-    TimelinePlaygroundDetail, TimelineSyntheticConfig, TimelineTimeNs, TimelineTimeRangeNs,
-    TimelineTrackId, TimelineViewport, TimelineViewportQuery, generate_synthetic_timeline_dataset,
-    timeline_playground_detail_for_render_item,
+    TimelineDataset, TimelineDocument, TimelineGroupingMode, TimelineInstantNs, TimelineItemKind,
+    TimelinePlaygroundDetail, TimelineRenderPlan, TimelineRenderRowKey, TimelineSyntheticConfig,
+    TimelineTimeNs, TimelineTimeRangeNs, TimelineTrackId, TimelineViewport, TimelineViewportQuery,
+    generate_synthetic_timeline_dataset, timeline_playground_detail_for_render_item,
 };
 use crate::win32_support::clipboard::{read_clipboard, write_clipboard};
 use crate::win32_support::module::get_current_module;
@@ -148,6 +149,8 @@ const TERMINAL_THROUGHPUT_BENCHMARK_MEASURE_PREFIX: &str =
 const TERMINAL_THROUGHPUT_BENCHMARK_TIMEOUT: Duration = Duration::from_mins(1);
 const TERMINAL_THROUGHPUT_BENCHMARK_POLL_INTERVAL: Duration = Duration::from_millis(1);
 const TIMELINE_ZOOM_ANIMATION_DURATION: Duration = Duration::from_millis(220);
+const TIMELINE_PLAYGROUND_ROW_ANIMATION_DURATION: Duration = Duration::from_millis(180);
+const TIMELINE_PLAYGROUND_LIVE_INITIAL_DURATION_NS: i64 = 30_000_000_000;
 const MODEL_WARNING_PREPARE_HOLD_DURATION: Duration = Duration::from_millis(1400);
 const LOG_TOAST_DURATION: Duration = Duration::from_secs(5);
 const LOG_TOAST_FADE_DURATION: Duration = Duration::from_millis(260);
@@ -311,6 +314,12 @@ struct TimelinePlaygroundZoomAnimation {
     started_at: Instant,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TimelinePlaygroundSourceMode {
+    Synthetic,
+    LiveTracingEvents,
+}
+
 #[derive(Debug)]
 struct TimelinePlaygroundState {
     seed: u64,
@@ -319,9 +328,21 @@ struct TimelinePlaygroundState {
     minimum_visible_pixels: u32,
     visible_start_ns: i64,
     visible_end_ns: i64,
+    vertical_scroll_offset: i32,
+    source_mode: TimelinePlaygroundSourceMode,
+    live_tracing_follow_tail: bool,
     zoom_animation: Option<TimelinePlaygroundZoomAnimation>,
+    row_position_animation: Option<TimelinePlaygroundRowPositionAnimation>,
+    last_row_positions: Vec<(TimelineRenderRowKey, i32)>,
     hovered_item: Option<windows_scene::TimelinePlaygroundHitTarget>,
     hover_detail_window: Option<TimelinePlaygroundDetailWindowHandle>,
+}
+
+#[derive(Clone, Debug)]
+struct TimelinePlaygroundRowPositionAnimation {
+    start_positions: Vec<(TimelineRenderRowKey, i32)>,
+    target_positions: Vec<(TimelineRenderRowKey, i32)>,
+    started_at: Instant,
 }
 
 impl TimelinePlaygroundState {
@@ -337,30 +358,164 @@ impl TimelinePlaygroundState {
             minimum_visible_pixels: 4,
             visible_start_ns: 0,
             visible_end_ns: 24_000_000,
+            vertical_scroll_offset: 0,
+            source_mode: TimelinePlaygroundSourceMode::Synthetic,
+            live_tracing_follow_tail: false,
             zoom_animation: None,
+            row_position_animation: None,
+            last_row_positions: Vec::new(),
             hovered_item: None,
             hover_detail_window: None,
         })
     }
 
     fn regenerate(&mut self) -> eyre::Result<()> {
+        self.source_mode = TimelinePlaygroundSourceMode::Synthetic;
+        self.live_tracing_follow_tail = false;
         self.seed = self.seed.wrapping_add(0x9e37_79b9_7f4a_7c15);
         self.dataset = generate_synthetic_timeline_dataset(
             &TimelineSyntheticConfig::default().with_seed(self.seed),
         )?;
         self.zoom_animation = None;
+        self.row_position_animation = None;
+        self.last_row_positions.clear();
         self.hovered_item = None;
+        self.vertical_scroll_offset = 0;
         Ok(())
     }
 
-    fn view_state(&self) -> windows_scene::TimelinePlaygroundViewState {
+    fn view_state(
+        &self,
+        cursor_position: Option<ClientPoint>,
+    ) -> windows_scene::TimelinePlaygroundViewState {
         windows_scene::TimelinePlaygroundViewState {
+            source_label: match self.source_mode {
+                TimelinePlaygroundSourceMode::Synthetic => "synthetic",
+                TimelinePlaygroundSourceMode::LiveTracingEvents => "live tracing events",
+            },
             seed: self.seed,
             grouping_mode: self.grouping_mode,
             minimum_visible_pixels: self.minimum_visible_pixels,
             visible_start_ns: self.visible_start_ns,
             visible_end_ns: self.visible_end_ns,
+            vertical_scroll_offset: self.vertical_scroll_offset,
             hovered_item: self.hovered_item,
+            cursor_position,
+        }
+    }
+
+    fn toggle_live_tracing_events(&mut self) {
+        match self.source_mode {
+            TimelinePlaygroundSourceMode::Synthetic => {
+                self.source_mode = TimelinePlaygroundSourceMode::LiveTracingEvents;
+                self.live_tracing_follow_tail = true;
+                self.visible_start_ns = 0;
+                self.visible_end_ns = TIMELINE_PLAYGROUND_LIVE_INITIAL_DURATION_NS;
+                self.sync_live_tracing_events();
+            }
+            TimelinePlaygroundSourceMode::LiveTracingEvents => {
+                self.source_mode = TimelinePlaygroundSourceMode::Synthetic;
+                self.live_tracing_follow_tail = false;
+            }
+        }
+        self.hovered_item = None;
+        self.vertical_scroll_offset = 0;
+        self.zoom_animation = None;
+        self.row_position_animation = None;
+        self.last_row_positions.clear();
+    }
+
+    fn sync_live_tracing_events(&mut self) {
+        if self.source_mode != TimelinePlaygroundSourceMode::LiveTracingEvents {
+            return;
+        }
+        let (dataset, latest_at_ns) = logs::tracing_event_timeline_dataset();
+        self.dataset = dataset;
+        if self.live_tracing_follow_tail {
+            let duration = (self.visible_end_ns - self.visible_start_ns).max(1);
+            self.visible_end_ns = latest_at_ns.max(1);
+            self.visible_start_ns = self.visible_end_ns.saturating_sub(duration);
+        }
+    }
+
+    // timeline[impl playground.vertical-pan-clamp]
+    fn clamp_vertical_scroll_offset(
+        &mut self,
+        layout: windows_scene::TimelinePlaygroundLayout,
+        row_count: usize,
+    ) {
+        self.vertical_scroll_offset =
+            windows_scene::timeline_playground_clamp_vertical_scroll_offset(
+                layout,
+                row_count,
+                self.vertical_scroll_offset,
+            );
+    }
+
+    fn update_row_position_animation(&mut self, render_plan: &TimelineRenderPlan) {
+        // timeline[impl playground.row-transition-animation]
+        let target_positions = timeline_playground_row_positions(render_plan);
+        if self.last_row_positions.is_empty() {
+            self.last_row_positions = target_positions;
+            return;
+        }
+        if self.last_row_positions == target_positions {
+            return;
+        }
+        let start_positions = self.row_position_animation.as_ref().map_or_else(
+            || self.last_row_positions.clone(),
+            Self::row_visual_positions_from_animation,
+        );
+        self.row_position_animation = Some(TimelinePlaygroundRowPositionAnimation {
+            start_positions,
+            target_positions: target_positions.clone(),
+            started_at: Instant::now(),
+        });
+        self.last_row_positions = target_positions;
+    }
+
+    fn row_visual_positions(
+        &self,
+        render_plan: &TimelineRenderPlan,
+    ) -> Vec<(TimelineRenderRowKey, i32)> {
+        let Some(animation) = &self.row_position_animation else {
+            return timeline_playground_row_positions(render_plan);
+        };
+        Self::row_visual_positions_from_animation(animation)
+    }
+
+    fn row_visual_positions_from_animation(
+        animation: &TimelinePlaygroundRowPositionAnimation,
+    ) -> Vec<(TimelineRenderRowKey, i32)> {
+        let progress = (animation.started_at.elapsed().as_secs_f64()
+            / TIMELINE_PLAYGROUND_ROW_ANIMATION_DURATION.as_secs_f64())
+        .clamp(0.0, 1.0);
+        if progress >= 1.0 {
+            return animation.target_positions.clone();
+        }
+        let progress = ease_in_out(progress);
+        animation
+            .target_positions
+            .iter()
+            .map(|(key, target_top)| {
+                let start_top = animation
+                    .start_positions
+                    .iter()
+                    .find_map(|(start_key, top)| (*start_key == *key).then_some(*top))
+                    .unwrap_or(*target_top);
+                (*key, interpolate_i32(start_top, *target_top, progress))
+            })
+            .collect()
+    }
+
+    fn apply_row_position_animation(&mut self) {
+        let Some(animation) = &self.row_position_animation else {
+            return;
+        };
+        let progress = animation.started_at.elapsed().as_secs_f64()
+            / TIMELINE_PLAYGROUND_ROW_ANIMATION_DURATION.as_secs_f64();
+        if progress >= 1.0 {
+            self.row_position_animation = None;
         }
     }
 
@@ -379,11 +534,65 @@ impl TimelinePlaygroundState {
     }
 
     fn pan(&mut self, direction: i64) {
+        // timeline[impl playground.pan-negative-time]
+        // timeline[impl playground.pan-button-snap-item]
+        self.live_tracing_follow_tail = false;
         self.cancel_zoom_animation_at_current_range();
-        let duration = (self.visible_end_ns - self.visible_start_ns).max(1);
+        let duration = visible_duration_ns_i64(self.visible_start_ns, self.visible_end_ns);
+        if let Some(target_time_ns) = self.pan_snap_target(direction) {
+            self.center_on_time(target_time_ns, duration);
+            return;
+        }
         let delta = duration / 4 * direction;
-        self.visible_start_ns = (self.visible_start_ns + delta).max(0);
-        self.visible_end_ns = (self.visible_end_ns + delta).max(self.visible_start_ns + 1);
+        self.visible_start_ns = self.visible_start_ns.saturating_add(delta);
+        self.visible_end_ns = self
+            .visible_end_ns
+            .saturating_add(delta)
+            .max(self.visible_start_ns.saturating_add(1));
+    }
+
+    fn fit_to_content(&mut self) {
+        // timeline[impl playground.fit-content]
+        self.live_tracing_follow_tail = false;
+        self.zoom_animation = None;
+        self.hovered_item = None;
+        let Some((start, end)) = timeline_playground_dataset_time_bounds(&self.dataset) else {
+            return;
+        };
+        let content_duration = visible_duration_ns_i64(start, end);
+        let padding = (content_duration / 10).max(1);
+        self.visible_start_ns = start.saturating_sub(padding);
+        self.visible_end_ns = end
+            .saturating_add(padding)
+            .max(self.visible_start_ns.saturating_add(1));
+    }
+
+    fn pan_snap_target(&self, direction: i64) -> Option<i64> {
+        if timeline_playground_dataset_intersects_range(
+            &self.dataset,
+            self.visible_start_ns,
+            self.visible_end_ns,
+        ) {
+            return None;
+        }
+        match direction.cmp(&0) {
+            Ordering::Less => {
+                timeline_playground_nearest_item_at_or_before(&self.dataset, self.visible_start_ns)
+            }
+            Ordering::Greater => {
+                timeline_playground_nearest_item_at_or_after(&self.dataset, self.visible_end_ns)
+            }
+            Ordering::Equal => None,
+        }
+    }
+
+    fn center_on_time(&mut self, time_ns: i64, duration: i64) {
+        let half_duration = duration / 2;
+        self.visible_start_ns = time_ns.saturating_sub(half_duration);
+        self.visible_end_ns = self
+            .visible_start_ns
+            .saturating_add(duration)
+            .max(self.visible_start_ns.saturating_add(1));
     }
 
     fn zoom(&mut self, numerator: i64, denominator: i64) {
@@ -412,10 +621,20 @@ impl TimelinePlaygroundState {
         numerator: i64,
         denominator: i64,
     ) {
-        let (visible_start_ns, visible_end_ns) = self.current_visible_range();
-        self.visible_start_ns = visible_start_ns;
-        self.visible_end_ns = visible_end_ns;
-        let current_duration = (self.visible_end_ns - self.visible_start_ns).max(1);
+        // timeline[impl playground.zoom-compounds]
+        self.live_tracing_follow_tail = false;
+        let (animation_start_ns, animation_end_ns) = self.current_visible_range();
+        let (base_start_ns, base_end_ns) =
+            self.zoom_animation
+                .map_or((self.visible_start_ns, self.visible_end_ns), |animation| {
+                    (
+                        animation.target_visible_start_ns,
+                        animation.target_visible_end_ns,
+                    )
+                });
+        self.visible_start_ns = animation_start_ns;
+        self.visible_end_ns = animation_end_ns;
+        let current_duration = visible_duration_ns_i64(base_start_ns, base_end_ns);
         let duration = i64::try_from(
             (i128::from(current_duration) * i128::from(numerator.max(1))
                 / i128::from(denominator.max(1)))
@@ -429,9 +648,11 @@ impl TimelinePlaygroundState {
         let target_anchor_offset =
             i64::try_from(i128::from(duration) * anchor_numerator / anchor_denominator)
                 .unwrap_or(i64::MAX);
-        let anchor_time = self.visible_start_ns.saturating_add(anchor_offset);
-        let target_start = anchor_time.saturating_sub(target_anchor_offset).max(0);
-        let target_end = target_start.saturating_add(duration).max(target_start + 1);
+        let anchor_time = base_start_ns.saturating_add(anchor_offset);
+        let target_start = anchor_time.saturating_sub(target_anchor_offset);
+        let target_end = target_start
+            .saturating_add(duration)
+            .max(target_start.saturating_add(1));
         self.zoom_animation = Some(TimelinePlaygroundZoomAnimation {
             start_visible_start_ns: self.visible_start_ns,
             start_visible_end_ns: self.visible_end_ns,
@@ -808,6 +1029,7 @@ struct SceneAppState {
     diagnostic_cell_height: i32,
     logs_scroll_offset: usize,
     logs_follow_tail: bool,
+    last_applied_scene_window_title: String,
     chrome_tooltip: ChromeTooltipController,
     renderer: Option<RenderThreadProxy>,
 }
@@ -856,6 +1078,8 @@ fn toggle_demo_mode_scramble_input_device_identifiers(
 struct ChromeTooltipController {
     hwnd: Option<HWND>,
     text: PWSTRBuffer,
+    active_text: String,
+    active_position: Option<ScreenPoint>,
     visible: bool,
 }
 
@@ -885,6 +1109,8 @@ impl ChromeTooltipController {
         let mut controller = Self {
             hwnd: Some(hwnd),
             text: PWSTRBuffer::default(),
+            active_text: String::new(),
+            active_position: None,
             visible: false,
         };
         let tool = controller.tool_info(owner.raw());
@@ -914,6 +1140,10 @@ impl ChromeTooltipController {
         let Some(hwnd) = self.hwnd else {
             return Ok(());
         };
+
+        if self.is_show_request_current(text, position) {
+            return Ok(());
+        }
 
         self.text.set(text)?;
         let tool = self.tool_info(owner.raw());
@@ -946,6 +1176,8 @@ impl ChromeTooltipController {
             );
         }
         self.visible = true;
+        text.clone_into(&mut self.active_text);
+        self.active_position = Some(position);
         Ok(())
     }
 
@@ -969,6 +1201,8 @@ impl ChromeTooltipController {
             );
         }
         self.visible = false;
+        self.active_text.clear();
+        self.active_position = None;
     }
 
     fn destroy(&mut self) {
@@ -979,6 +1213,13 @@ impl ChromeTooltipController {
             }
         }
         self.visible = false;
+        self.active_text.clear();
+        self.active_position = None;
+    }
+
+    // timeline[impl playground.hover-title-tooltip-stable]
+    fn is_show_request_current(&self, text: &str, position: ScreenPoint) -> bool {
+        self.visible && self.active_text == text && self.active_position == Some(position)
     }
 
     fn tool_info(&mut self, owner: HWND) -> TTTOOLINFOW {
@@ -1319,6 +1560,7 @@ struct TimelinePlaygroundPanDrag {
     origin: ClientPoint,
     origin_visible_start_ns: i64,
     origin_visible_end_ns: i64,
+    origin_vertical_scroll_offset: i32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1871,6 +2113,7 @@ fn run_scene_window(
             diagnostic_cell_height,
             logs_scroll_offset: 0,
             logs_follow_tail: true,
+            last_applied_scene_window_title: scene_kind.title().to_owned(),
             chrome_tooltip: ChromeTooltipController::default(),
             renderer: None,
         });
@@ -1965,15 +2208,17 @@ fn timeline_playground_target_at_point(
     let Some(playground) = state.timeline_playground.as_ref() else {
         return Ok(None);
     };
-    let playground_layout =
-        windows_scene::timeline_playground_layout(layout.terminal_panel_rect().inset(24));
+    let playground_layout = windows_scene::timeline_playground_layout(
+        layout.terminal_panel_rect().inset(24),
+        playground.vertical_scroll_offset,
+    );
     let query = playground
         .query(u32::try_from(playground_layout.content_rect.width().max(1)).unwrap_or(1))?;
     let render_plan = playground.dataset.render_plan(&query);
     Ok(windows_scene::timeline_playground_hit_target_at_point(
         layout,
         &render_plan,
-        playground.view_state(),
+        playground.view_state(None),
         point,
     ))
 }
@@ -2053,12 +2298,56 @@ fn timeline_playground_detail_window_position(hwnd: WindowHandle) -> eyre::Resul
     let owner = hwnd.window_rect()?;
     let width = 460;
     let height = owner.height().clamp(360, 760);
-    Ok(ScreenRect::new(
-        owner.right() + 12,
-        owner.top(),
-        owner.right() + 12 + width,
-        owner.top() + height,
+    Ok(timeline_playground_detail_window_position_in_bounds(
+        owner,
+        virtual_screen_rect(),
+        width,
+        height,
     ))
+}
+
+// timeline[impl playground.detail-window-clamped]
+fn timeline_playground_detail_window_position_in_bounds(
+    owner: ScreenRect,
+    bounds: ScreenRect,
+    width: i32,
+    height: i32,
+) -> ScreenRect {
+    let margin = 12;
+    let right_side = ScreenRect::new(
+        owner.right() + margin,
+        owner.top(),
+        owner.right() + margin + width,
+        owner.top() + height,
+    );
+    let left_side = ScreenRect::new(
+        owner.left() - margin - width,
+        owner.top(),
+        owner.left() - margin,
+        owner.top() + height,
+    );
+    let candidate = if right_side.right() <= bounds.right() {
+        right_side
+    } else if left_side.left() >= bounds.left() {
+        left_side
+    } else {
+        right_side
+    };
+    clamp_screen_rect_to_bounds(candidate, bounds, margin)
+}
+
+fn clamp_screen_rect_to_bounds(rect: ScreenRect, bounds: ScreenRect, margin: i32) -> ScreenRect {
+    let width = rect.width().min((bounds.width() - (margin * 2)).max(1));
+    let height = rect.height().min((bounds.height() - (margin * 2)).max(1));
+    let min_left = bounds.left() + margin;
+    let min_top = bounds.top() + margin;
+    let left = rect
+        .left()
+        .clamp(min_left, (bounds.right() - margin - width).max(min_left));
+    let top = rect
+        .top()
+        .clamp(min_top, (bounds.bottom() - margin - height).max(min_top));
+    ScreenRect::new(left, top, left + width, top + height)
 }
 
 fn set_timeline_playground_grouping(grouping_mode: TimelineGroupingMode) -> eyre::Result<()> {
@@ -4975,20 +5264,34 @@ fn handle_scene_mouse_move(
             return Ok(false);
         };
         let layout = scene_client_layout(hwnd, state)?;
-        let playground_layout =
-            windows_scene::timeline_playground_layout(layout.terminal_panel_rect().inset(24));
+        let vertical_scroll_offset = state
+            .timeline_playground
+            .as_ref()
+            .map_or(0, |playground| playground.vertical_scroll_offset);
+        let playground_layout = windows_scene::timeline_playground_layout(
+            layout.terminal_panel_rect().inset(24),
+            vertical_scroll_offset,
+        );
         let origin = pan_drag.origin.to_win32_point()?;
         let current = point.to_win32_point()?;
         let delta_x = current.x - origin.x;
+        let delta_y = current.y - origin.y;
         let Some(playground) = state.timeline_playground.as_mut() else {
             state.timeline_playground_pan_drag = None;
             return Ok(true);
         };
+        let render_plan =
+            playground.dataset.render_plan(&playground.query(
+                u32::try_from(playground_layout.content_rect.width().max(1)).unwrap_or(1),
+            )?);
         apply_timeline_playground_pan_drag(
             playground,
             pan_drag,
             delta_x,
+            delta_y,
             playground_layout.content_rect.width(),
+            playground_layout,
+            render_plan.rows().len(),
         );
         Ok(true)
     })?;
@@ -5322,6 +5625,7 @@ fn handle_scene_right_button_down(hwnd: WindowHandle, lparam: LPARAM) -> eyre::R
                 origin: point,
                 origin_visible_start_ns: playground.visible_start_ns,
                 origin_visible_end_ns: playground.visible_end_ns,
+                origin_vertical_scroll_offset: playground.vertical_scroll_offset,
             });
             playground.hovered_item = None;
             trace!(?point, "timeline playground right-button pan started");
@@ -5362,6 +5666,10 @@ fn handle_scene_right_button_down(hwnd: WindowHandle, lparam: LPARAM) -> eyre::R
 
 // timeline[impl viewport.mouse-zoom-anchor]
 // timeline[impl viewport.mouse-zoom-animation]
+#[expect(
+    clippy::too_many_lines,
+    reason = "scene mouse-wheel dispatch keeps logs, playground, and timeline zoom routing together"
+)]
 fn handle_scene_mouse_wheel(
     hwnd: WindowHandle,
     wparam: WPARAM,
@@ -5379,8 +5687,14 @@ fn handle_scene_mouse_wheel(
         }
 
         if state.scene_kind == SceneWindowKind::TimelinePlayground && !state.diagnostics_visible {
-            let playground_layout =
-                windows_scene::timeline_playground_layout(layout.terminal_panel_rect().inset(24));
+            let vertical_scroll_offset = state
+                .timeline_playground
+                .as_ref()
+                .map_or(0, |playground| playground.vertical_scroll_offset);
+            let playground_layout = windows_scene::timeline_playground_layout(
+                layout.terminal_panel_rect().inset(24),
+                vertical_scroll_offset,
+            );
             if !playground_layout.content_rect.contains(point) {
                 return Ok(false);
             }
@@ -5424,6 +5738,9 @@ fn handle_scene_mouse_wheel(
         }
 
         let current_viewport = current_timeline_zoom_viewport(state);
+        let base_viewport = state
+            .timeline_zoom_animation
+            .map_or(current_viewport, |animation| animation.target_viewport);
         if state.timeline_document.is_none() {
             return Ok(false);
         }
@@ -5442,7 +5759,7 @@ fn handle_scene_mouse_wheel(
             timeline_layout(layout),
             point,
         );
-        let target_viewport = current_viewport.scaled_about(anchor, factor);
+        let target_viewport = base_viewport.scaled_about(anchor, factor);
         let current_vertical_scroll_offset = timeline_current_vertical_scroll_offset(state, layout);
         if let Some(pan_drag) = state.timeline_pan_drag.as_mut() {
             trace!(
@@ -6121,6 +6438,7 @@ fn render_scene_window_frame(
     }
 
     let layout = scene_client_layout(hwnd, state)?;
+    sync_scene_window_title(state, hwnd)?;
     if state.scene_kind == SceneWindowKind::Logs && !state.diagnostics_visible {
         sync_logs_scroll_offset(state, layout);
     }
@@ -6180,6 +6498,21 @@ fn render_scene_window_frame(
             state.scene_kind,
             window_chrome_buttons_state,
             &logs_diagnostic_text(),
+            state.diagnostic_selection,
+            state.diagnostic_cell_width,
+            state.diagnostic_cell_height,
+        )
+    } else if state.diagnostics_visible
+        && state.scene_kind == SceneWindowKind::TimelinePlaygroundDetail
+    {
+        let detail_state = timeline_playground_detail_window_state(state);
+        let pretty_text = timeline_playground_detail_pretty_text(&detail_state);
+        windows_scene::build_timeline_playground_detail_diagnostic_render_scene(
+            layout,
+            window_chrome_buttons_state,
+            detail_state.detail.as_ref(),
+            &pretty_text,
+            detail_state.pinned,
             state.diagnostic_selection,
             state.diagnostic_cell_width,
             state.diagnostic_cell_height,
@@ -6265,36 +6598,43 @@ fn render_scene_window_frame(
             demo_mode_visual_state(state, layout),
         )
     } else if state.scene_kind == SceneWindowKind::TimelinePlayground {
+        let pointer_position = state.pointer_position;
+        let button_visual_states = scene_button_visual_states(state, layout);
         let playground = state
             .timeline_playground
-            .as_ref()
+            .as_mut()
             .expect("timeline playground scene has playground state");
-        let playground_layout =
-            windows_scene::timeline_playground_layout(layout.terminal_panel_rect().inset(24));
+        playground.sync_live_tracing_events();
+        let playground_layout = windows_scene::timeline_playground_layout(
+            layout.terminal_panel_rect().inset(24),
+            playground.vertical_scroll_offset,
+        );
         let query = playground
             .query(u32::try_from(playground_layout.content_rect.width().max(1)).unwrap_or(1))
             .expect("timeline playground query must be valid");
         let render_plan = playground.dataset.render_plan(&query);
+        playground.clamp_vertical_scroll_offset(playground_layout, render_plan.rows().len());
+        playground.update_row_position_animation(&render_plan);
+        let row_visual_positions = playground.row_visual_positions(&render_plan);
+        playground.apply_row_position_animation();
         windows_scene::build_timeline_playground_render_scene(
             layout,
             window_chrome_buttons_state,
             &playground.dataset,
             &render_plan,
-            playground.view_state(),
-            &scene_button_visual_states(state, layout),
+            playground.view_state(pointer_position),
+            &row_visual_positions,
+            &button_visual_states,
         )
     } else if state.scene_kind == SceneWindowKind::TimelinePlaygroundDetail {
         let detail_state = timeline_playground_detail_window_state(state);
-        let pretty_text = detail_state.detail.as_ref().map_or_else(
-            || "No timeline item selected".to_owned(),
-            |detail| format!("{}", detail.pretty()),
-        );
+        let pretty_text = timeline_playground_detail_pretty_text(&detail_state);
         windows_scene::build_timeline_playground_detail_render_scene(
             layout,
             window_chrome_buttons_state,
-            detail_state.detail.as_ref(),
             &pretty_text,
             detail_state.pinned,
+            state.diagnostic_selection,
         )
     } else if state.scene_kind == SceneWindowKind::TimelineTranscriptionSettings {
         windows_scene::build_timeline_transcription_settings_render_scene(
@@ -6534,6 +6874,9 @@ fn timeline_playground_action_active(state: &SceneAppState, action: SceneAction)
     let Some(playground) = state.timeline_playground.as_ref() else {
         return false;
     };
+    if action == SceneAction::ToggleTimelinePlaygroundLiveEvents {
+        return playground.source_mode == TimelinePlaygroundSourceMode::LiveTracingEvents;
+    }
     matches!(
         (action, playground.grouping_mode),
         (
@@ -6998,6 +7341,10 @@ fn build_scene_diagnostic_text(state: &SceneAppState) -> String {
     } else if state.scene_kind == SceneWindowKind::Logs {
         lines.push(String::new());
         lines.push(logs_diagnostic_text());
+    } else if state.scene_kind == SceneWindowKind::TimelinePlaygroundDetail {
+        let detail_state = timeline_playground_detail_window_state(state);
+        lines.push(String::new());
+        lines.push(timeline_playground_detail_pretty_text(&detail_state));
     }
 
     lines.push(String::new());
@@ -7137,7 +7484,7 @@ fn scene_action_at_point(
     let specs = windows_scene::scene_button_specs(scene_kind);
     let (button_rect, max_button_size) = if scene_kind == SceneWindowKind::TimelinePlayground {
         (
-            windows_scene::timeline_playground_layout(layout.terminal_panel_rect().inset(24))
+            windows_scene::timeline_playground_layout(layout.terminal_panel_rect().inset(24), 0)
                 .controls_rect,
             76,
         )
@@ -8272,7 +8619,14 @@ fn timeline_playground_pan_interaction_at_point(
     if state.scene_kind != SceneWindowKind::TimelinePlayground || state.diagnostics_visible {
         return false;
     }
-    let layout = windows_scene::timeline_playground_layout(layout.terminal_panel_rect().inset(24));
+    let vertical_scroll_offset = state
+        .timeline_playground
+        .as_ref()
+        .map_or(0, |playground| playground.vertical_scroll_offset);
+    let layout = windows_scene::timeline_playground_layout(
+        layout.terminal_panel_rect().inset(24),
+        vertical_scroll_offset,
+    );
     layout.ruler_rect.contains(point) || layout.content_rect.contains(point)
 }
 
@@ -8280,11 +8634,18 @@ fn apply_timeline_playground_pan_drag(
     playground: &mut TimelinePlaygroundState,
     pan_drag: TimelinePlaygroundPanDrag,
     delta_x_pixels: i32,
+    vertical_delta_pixels: i32,
     viewport_width_pixels: i32,
+    layout: windows_scene::TimelinePlaygroundLayout,
+    row_count: usize,
 ) {
+    // timeline[impl playground.live-tracing-pan]
+    playground.live_tracing_follow_tail = false;
     let width = i128::from(viewport_width_pixels.max(1));
-    let duration =
-        i128::from((pan_drag.origin_visible_end_ns - pan_drag.origin_visible_start_ns).max(1));
+    let duration = i128::from(visible_duration_ns_i64(
+        pan_drag.origin_visible_start_ns,
+        pan_drag.origin_visible_end_ns,
+    ));
     let delta_ns =
         i64::try_from(i128::from(delta_x_pixels) * duration / width).unwrap_or_else(|_| {
             if delta_x_pixels.is_negative() {
@@ -8293,15 +8654,44 @@ fn apply_timeline_playground_pan_drag(
                 i64::MAX
             }
         });
-    playground.visible_start_ns = pan_drag
-        .origin_visible_start_ns
-        .saturating_sub(delta_ns)
-        .max(0);
+    playground.visible_start_ns = pan_drag.origin_visible_start_ns.saturating_sub(delta_ns);
     playground.visible_end_ns = playground
         .visible_start_ns
         .saturating_add(i64::try_from(duration).unwrap_or(i64::MAX))
-        .max(playground.visible_start_ns + 1);
+        .max(playground.visible_start_ns.saturating_add(1));
+    playground.vertical_scroll_offset =
+        windows_scene::timeline_playground_clamp_vertical_scroll_offset(
+            layout,
+            row_count,
+            pan_drag
+                .origin_vertical_scroll_offset
+                .saturating_sub(vertical_delta_pixels),
+        );
     playground.zoom_animation = None;
+}
+
+fn visible_duration_ns_i64(start_ns: i64, end_ns: i64) -> i64 {
+    i64::try_from((i128::from(end_ns) - i128::from(start_ns)).max(1)).unwrap_or(i64::MAX)
+}
+
+fn timeline_playground_row_positions(
+    render_plan: &TimelineRenderPlan,
+) -> Vec<(TimelineRenderRowKey, i32)> {
+    render_plan
+        .rows()
+        .iter()
+        .map(|row| {
+            (
+                row.key(),
+                windows_scene::timeline_playground_row_world_top(row.id().as_u32()),
+            )
+        })
+        .collect()
+}
+
+fn interpolate_i32(start: i32, end: i32, progress: f64) -> i32 {
+    let value = f64::from(start) + (f64::from(end) - f64::from(start)) * progress;
+    f64_to_i32_saturating(value)
 }
 
 fn rebase_timeline_pan_drag_after_zoom(
@@ -8510,7 +8900,8 @@ fn interpolate_timeline_playground_range(
     );
     (
         f64_to_i64_saturating(visible_start_ns),
-        f64_to_i64_saturating(visible_end_ns).max(f64_to_i64_saturating(visible_start_ns) + 1),
+        f64_to_i64_saturating(visible_end_ns)
+            .max(f64_to_i64_saturating(visible_start_ns).saturating_add(1)),
     )
 }
 
@@ -8526,6 +8917,19 @@ fn f64_to_i64_saturating(value: f64) -> i64 {
         return 0;
     }
     value.round().clamp(I64_MIN_F64, I64_MAX_F64) as i64
+}
+
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "row position animation rounds interpolated pixel offsets back to integer client pixels"
+)]
+fn f64_to_i32_saturating(value: f64) -> i32 {
+    if !value.is_finite() {
+        return 0;
+    }
+    value
+        .round()
+        .clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32
 }
 
 fn window_chrome_button_rect(layout: TerminalLayout, button: WindowChromeButton) -> ClientRect {
@@ -9647,11 +10051,31 @@ fn perform_scene_action(
             })?;
             Ok(SceneActionDisposition::KeepOpen)
         }
+        SceneAction::FitTimelinePlaygroundToContent => {
+            // timeline[impl playground.fit-content]
+            with_scene_app_state(|state| {
+                if let Some(playground) = state.timeline_playground.as_mut() {
+                    playground.fit_to_content();
+                }
+                Ok(())
+            })?;
+            Ok(SceneActionDisposition::KeepOpen)
+        }
         SceneAction::RegenerateTimelinePlayground => {
             // timeline[impl playground.query-controls]
             with_scene_app_state(|state| {
                 if let Some(playground) = state.timeline_playground.as_mut() {
                     playground.regenerate()?;
+                }
+                Ok(())
+            })?;
+            Ok(SceneActionDisposition::KeepOpen)
+        }
+        SceneAction::ToggleTimelinePlaygroundLiveEvents => {
+            // timeline[impl playground.live-tracing-events]
+            with_scene_app_state(|state| {
+                if let Some(playground) = state.timeline_playground.as_mut() {
+                    playground.toggle_live_tracing_events();
                 }
                 Ok(())
             })?;
@@ -11787,6 +12211,17 @@ fn scene_pretty_text_target(
         });
     }
 
+    if state.scene_kind == SceneWindowKind::TimelinePlaygroundDetail {
+        let detail_state = timeline_playground_detail_window_state(state);
+        let pretty_text = timeline_playground_detail_pretty_text(&detail_state);
+        return Some(SceneSelectableTextTarget {
+            rect: windows_scene::timeline_playground_detail_selectable_text_rect(layout),
+            text: windows_scene::timeline_playground_detail_selectable_text(&pretty_text),
+            cell_width: 8,
+            cell_height: 15,
+        });
+    }
+
     if state.scene_kind != SceneWindowKind::AudioInputDeviceDetails {
         return None;
     }
@@ -11810,6 +12245,35 @@ fn scene_pretty_text_target(
         cell_width: windows_scene::AUDIO_INPUT_DEVICE_DETAIL_TEXT_CELL_WIDTH,
         cell_height: windows_scene::AUDIO_INPUT_DEVICE_DETAIL_TEXT_CELL_HEIGHT,
     })
+}
+
+fn timeline_playground_detail_pretty_text(
+    detail_state: &TimelinePlaygroundDetailWindowState,
+) -> String {
+    detail_state.detail.as_ref().map_or_else(
+        || "No timeline item selected".to_owned(),
+        |detail| format!("{}", detail.pretty()),
+    )
+}
+
+fn scene_window_caption(state: &SceneAppState) -> String {
+    if state.scene_kind == SceneWindowKind::TimelinePlaygroundDetail {
+        let detail_state = timeline_playground_detail_window_state(state);
+        if let Some(detail) = detail_state.detail.as_ref() {
+            return format!("{} - {}", detail.title(), state.scene_kind.title());
+        }
+    }
+    state.scene_kind.title().to_owned()
+}
+
+// timeline[impl playground.detail-title-prefix]
+fn sync_scene_window_title(state: &mut SceneAppState, hwnd: WindowHandle) -> eyre::Result<()> {
+    let caption = scene_window_caption(state);
+    if state.last_applied_scene_window_title != caption {
+        hwnd.set_title(&caption)?;
+        state.last_applied_scene_window_title = caption;
+    }
+    Ok(())
 }
 
 fn scene_pretty_text_cell_from_client_point(
@@ -12249,6 +12713,14 @@ fn update_scene_chrome_tooltip(
     }
 
     if let Some((tooltip_text, anchor_rect)) =
+        timeline_playground_item_tooltip(state, layout, point)?
+    {
+        // timeline[impl playground.hover-title-tooltip]
+        show_scene_tooltip(state, hwnd, point, &tooltip_text, anchor_rect)?;
+        return Ok(());
+    }
+
+    if let Some((tooltip_text, anchor_rect)) =
         timeline_viewport_control_tooltip(state, layout, point)
     {
         show_scene_tooltip(state, hwnd, point, tooltip_text, anchor_rect)?;
@@ -12386,6 +12858,121 @@ fn logs_control_tooltip(
     ))
 }
 
+fn timeline_playground_item_tooltip(
+    state: &SceneAppState,
+    layout: TerminalLayout,
+    point: ClientPoint,
+) -> eyre::Result<Option<(String, ClientRect)>> {
+    if state.scene_kind != SceneWindowKind::TimelinePlayground || state.diagnostics_visible {
+        return Ok(None);
+    }
+    let Some(playground) = state.timeline_playground.as_ref() else {
+        return Ok(None);
+    };
+    let playground_layout = windows_scene::timeline_playground_layout(
+        layout.terminal_panel_rect().inset(24),
+        playground.vertical_scroll_offset,
+    );
+    let query = playground
+        .query(u32::try_from(playground_layout.content_rect.width().max(1)).unwrap_or(1))?;
+    let render_plan = playground.dataset.render_plan(&query);
+    let Some((_rect, target)) = windows_scene::timeline_playground_item_hit_rects(
+        playground_layout,
+        &render_plan,
+        playground.view_state(None),
+        &[],
+    )
+    .into_iter()
+    .find(|(rect, _)| rect.contains(point)) else {
+        return Ok(None);
+    };
+    let Some(detail) =
+        timeline_playground_detail_for_render_item(&playground.dataset, target.render_item)
+    else {
+        return Ok(None);
+    };
+    Ok(Some((
+        detail.title().to_owned(),
+        timeline_playground_cursor_tooltip_anchor(point)?,
+    )))
+}
+
+// timeline[impl playground.hover-title-tooltip-cursor]
+fn timeline_playground_cursor_tooltip_anchor(point: ClientPoint) -> eyre::Result<ClientRect> {
+    let point = point.to_win32_point()?;
+    Ok(ClientRect::new(point.x, point.y, point.x + 1, point.y + 1))
+}
+
+fn timeline_playground_dataset_time_bounds(dataset: &TimelineDataset) -> Option<(i64, i64)> {
+    let mut bounds: Option<(i64, i64)> = None;
+    for item in dataset.items() {
+        let (start, end) = timeline_playground_item_time_range(item.kind());
+        bounds = Some(match bounds {
+            Some((current_start, current_end)) => (current_start.min(start), current_end.max(end)),
+            None => (start, end),
+        });
+    }
+    bounds
+}
+
+fn timeline_playground_dataset_intersects_range(
+    dataset: &TimelineDataset,
+    visible_start_ns: i64,
+    visible_end_ns: i64,
+) -> bool {
+    dataset.items().iter().any(|item| {
+        let (start, end) = timeline_playground_item_time_range(item.kind());
+        start <= visible_end_ns && end >= visible_start_ns
+    })
+}
+
+fn timeline_playground_nearest_item_at_or_before(
+    dataset: &TimelineDataset,
+    visible_start_ns: i64,
+) -> Option<i64> {
+    dataset
+        .items()
+        .iter()
+        .filter_map(|item| {
+            let (start, end) = timeline_playground_item_time_range(item.kind());
+            (end < visible_start_ns).then_some((visible_start_ns - end, i64::midpoint(start, end)))
+        })
+        .min_by_key(|(distance, _)| *distance)
+        .map(|(_, center)| center)
+}
+
+fn timeline_playground_nearest_item_at_or_after(
+    dataset: &TimelineDataset,
+    visible_end_ns: i64,
+) -> Option<i64> {
+    dataset
+        .items()
+        .iter()
+        .filter_map(|item| {
+            let (start, end) = timeline_playground_item_time_range(item.kind());
+            (start > visible_end_ns).then_some((start - visible_end_ns, i64::midpoint(start, end)))
+        })
+        .min_by_key(|(distance, _)| *distance)
+        .map(|(_, center)| center)
+}
+
+fn timeline_playground_item_time_range(kind: &TimelineItemKind) -> (i64, i64) {
+    match kind {
+        TimelineItemKind::Span(span) => {
+            let start = span.start().as_i64();
+            let end = span
+                .end()
+                .map_or(start, TimelineInstantNs::as_i64)
+                .max(start);
+            (start, end)
+        }
+        TimelineItemKind::Event(event) => {
+            let at = event.at().as_i64();
+            (at, at)
+        }
+    }
+}
+
 fn show_scene_tooltip(
     state: &mut SceneAppState,
     hwnd: WindowHandle,
@@ -12455,7 +13042,7 @@ fn scene_action_tooltip(
     let (button_rect, max_button_size) = if state.scene_kind == SceneWindowKind::TimelinePlayground
     {
         (
-            windows_scene::timeline_playground_layout(layout.terminal_panel_rect().inset(24))
+            windows_scene::timeline_playground_layout(layout.terminal_panel_rect().inset(24), 0)
                 .controls_rect,
             76,
         )
@@ -13082,6 +13669,8 @@ fn rects_intersect(a: ScreenRect, b: ScreenRect) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use crate::timeline::TimelineItemInput;
+
     use super::*;
 
     fn timeline_test_state(document: TimelineDocument) -> SceneAppState {
@@ -13137,6 +13726,7 @@ mod tests {
             diagnostic_cell_height: 16,
             logs_scroll_offset: 0,
             logs_follow_tail: true,
+            last_applied_scene_window_title: SceneWindowKind::Timeline.title().to_owned(),
             chrome_tooltip: ChromeTooltipController::default(),
             renderer: None,
         }
@@ -13241,7 +13831,7 @@ mod tests {
         state.timeline_playground = Some(TimelinePlaygroundState::new().expect("playground"));
         let layout = test_scene_layout();
         let playground_layout =
-            windows_scene::timeline_playground_layout(layout.terminal_panel_rect().inset(24));
+            windows_scene::timeline_playground_layout(layout.terminal_panel_rect().inset(24), 0);
 
         assert!(timeline_playground_pan_interaction_at_point(
             &state,
@@ -13270,13 +13860,219 @@ mod tests {
             origin: ClientPoint::new(100, 20),
             origin_visible_start_ns: playground.visible_start_ns,
             origin_visible_end_ns: playground.visible_end_ns,
+            origin_vertical_scroll_offset: playground.vertical_scroll_offset,
         };
+        let layout = windows_scene::timeline_playground_layout(
+            test_scene_layout().terminal_panel_rect().inset(24),
+            0,
+        );
 
-        apply_timeline_playground_pan_drag(&mut playground, pan_drag, 25, 100);
+        apply_timeline_playground_pan_drag(&mut playground, pan_drag, 25, 0, 100, layout, 18);
 
         assert_eq!(playground.visible_start_ns, 750);
         assert_eq!(playground.visible_end_ns, 1_750);
         assert_eq!(playground.zoom_animation, None);
+    }
+
+    #[test]
+    // timeline[verify playground.pan-negative-time]
+    fn timeline_playground_pan_can_move_before_zero() {
+        let mut playground = TimelinePlaygroundState::new().expect("playground");
+        playground.visible_start_ns = 0;
+        playground.visible_end_ns = 1_000;
+
+        playground.pan(-1);
+
+        assert_eq!(playground.visible_start_ns, -250);
+        assert_eq!(playground.visible_end_ns, 750);
+    }
+
+    #[test]
+    // timeline[verify playground.pan-negative-time]
+    fn timeline_playground_right_drag_can_move_zero_to_center() {
+        let mut playground = TimelinePlaygroundState::new().expect("playground");
+        playground.visible_start_ns = 0;
+        playground.visible_end_ns = 1_000;
+        let pan_drag = TimelinePlaygroundPanDrag {
+            origin: ClientPoint::new(100, 20),
+            origin_visible_start_ns: playground.visible_start_ns,
+            origin_visible_end_ns: playground.visible_end_ns,
+            origin_vertical_scroll_offset: playground.vertical_scroll_offset,
+        };
+        let layout = windows_scene::timeline_playground_layout(
+            test_scene_layout().terminal_panel_rect().inset(24),
+            0,
+        );
+
+        apply_timeline_playground_pan_drag(&mut playground, pan_drag, 50, 0, 100, layout, 18);
+
+        assert_eq!(playground.visible_start_ns, -500);
+        assert_eq!(playground.visible_end_ns, 500);
+    }
+
+    #[test]
+    // timeline[verify playground.vertical-pan]
+    fn timeline_playground_right_drag_pan_moves_vertical_offset() {
+        let mut playground = TimelinePlaygroundState::new().expect("playground");
+        let layout = windows_scene::timeline_playground_layout(
+            test_scene_layout().terminal_panel_rect().inset(24),
+            0,
+        );
+        let pan_drag = TimelinePlaygroundPanDrag {
+            origin: ClientPoint::new(100, 100),
+            origin_visible_start_ns: playground.visible_start_ns,
+            origin_visible_end_ns: playground.visible_end_ns,
+            origin_vertical_scroll_offset: 40,
+        };
+
+        apply_timeline_playground_pan_drag(&mut playground, pan_drag, 0, -20, 100, layout, 18);
+
+        assert_eq!(playground.vertical_scroll_offset, 60);
+    }
+
+    #[test]
+    // timeline[verify playground.live-tracing-pan]
+    fn timeline_playground_right_drag_pan_stops_live_tail_reset() {
+        let mut playground = TimelinePlaygroundState::new().expect("playground");
+        playground.source_mode = TimelinePlaygroundSourceMode::LiveTracingEvents;
+        playground.live_tracing_follow_tail = true;
+        let layout = windows_scene::timeline_playground_layout(
+            test_scene_layout().terminal_panel_rect().inset(24),
+            0,
+        );
+        let pan_drag = TimelinePlaygroundPanDrag {
+            origin: ClientPoint::new(100, 100),
+            origin_visible_start_ns: playground.visible_start_ns,
+            origin_visible_end_ns: playground.visible_end_ns,
+            origin_vertical_scroll_offset: 0,
+        };
+
+        apply_timeline_playground_pan_drag(&mut playground, pan_drag, 10, 0, 100, layout, 18);
+
+        assert!(!playground.live_tracing_follow_tail);
+    }
+
+    #[test]
+    // timeline[verify playground.vertical-pan-clamp]
+    fn timeline_playground_vertical_offset_reclamps_when_row_count_shrinks() {
+        let mut playground = TimelinePlaygroundState::new().expect("playground");
+        playground.vertical_scroll_offset = 10_000;
+        let layout = windows_scene::timeline_playground_layout(
+            test_scene_layout().terminal_panel_rect().inset(24),
+            playground.vertical_scroll_offset,
+        );
+
+        playground.clamp_vertical_scroll_offset(layout, 1);
+
+        assert_eq!(playground.vertical_scroll_offset, 0);
+    }
+
+    #[test]
+    // timeline[verify playground.row-transition-animation]
+    fn timeline_playground_row_positions_animate_when_prior_rows_disappear() {
+        let mut dataset = TimelineDataset::new();
+        dataset.push_event(
+            TimelineItemInput::new("first").with_group_key("row-a"),
+            TimelineInstantNs::new(0),
+        );
+        dataset.push_event(
+            TimelineItemInput::new("second").with_group_key("row-b"),
+            TimelineInstantNs::new(1_000),
+        );
+        dataset.compact();
+        let mut playground = TimelinePlaygroundState::new().expect("playground");
+        playground.dataset = dataset;
+
+        playground.visible_start_ns = 900;
+        playground.visible_end_ns = 1_100;
+        let filtered_plan = playground
+            .dataset
+            .render_plan(&playground.query(1_000).expect("query"));
+        let row_b_key = filtered_plan.rows()[0].key();
+        playground.last_row_positions = vec![(
+            row_b_key,
+            windows_scene::timeline_playground_row_world_top(1),
+        )];
+        playground.update_row_position_animation(&filtered_plan);
+
+        let visual_positions = playground.row_visual_positions(&filtered_plan);
+        let row_b_visual_top = visual_positions
+            .iter()
+            .find_map(|(key, top)| (*key == row_b_key).then_some(*top))
+            .expect("row-b visual position");
+        assert!(row_b_visual_top > 0);
+        assert_eq!(timeline_playground_row_positions(&filtered_plan)[0].1, 0);
+    }
+
+    #[test]
+    // timeline[verify playground.hover-title-tooltip-stable]
+    fn tooltip_controller_recognizes_unchanged_visible_request() {
+        let controller = ChromeTooltipController {
+            hwnd: None,
+            text: PWSTRBuffer::default(),
+            active_text: "Import capture".to_owned(),
+            active_position: Some(ScreenPoint::new(40, 80)),
+            visible: true,
+        };
+
+        assert!(controller.is_show_request_current("Import capture", ScreenPoint::new(40, 80)));
+        assert!(!controller.is_show_request_current("Other", ScreenPoint::new(40, 80)));
+        assert!(!controller.is_show_request_current("Import capture", ScreenPoint::new(41, 80)));
+    }
+
+    #[test]
+    // timeline[verify playground.hover-title-tooltip-cursor]
+    fn timeline_playground_tooltip_anchor_uses_cursor_point() {
+        let anchor = timeline_playground_cursor_tooltip_anchor(ClientPoint::new(120, 240))
+            .expect("cursor anchor");
+
+        assert_eq!(anchor, ClientRect::new(120, 240, 121, 241));
+    }
+
+    #[test]
+    // timeline[verify playground.detail-window-clamped]
+    fn timeline_playground_detail_window_position_is_clamped_to_virtual_bounds() {
+        let owner = ScreenRect::new(1800, 0, 1920, 900);
+        let bounds = ScreenRect::new(0, 0, 1920, 1080);
+
+        let rect = timeline_playground_detail_window_position_in_bounds(owner, bounds, 460, 760);
+
+        assert!(rect.left() >= bounds.left());
+        assert!(rect.right() <= bounds.right());
+        assert!(rect.top() >= bounds.top());
+        assert!(rect.bottom() <= bounds.bottom());
+    }
+
+    #[test]
+    // timeline[verify playground.fit-content]
+    fn timeline_playground_fit_content_allows_zero_centering() {
+        let mut dataset = TimelineDataset::new();
+        dataset.push_event(TimelineItemInput::new("origin"), TimelineInstantNs::new(0));
+        let mut playground = TimelinePlaygroundState::new().expect("playground");
+        playground.dataset = dataset;
+        playground.visible_start_ns = 500;
+        playground.visible_end_ns = 1_500;
+
+        playground.fit_to_content();
+
+        assert!(playground.visible_start_ns < 0);
+        assert!(playground.visible_end_ns > 0);
+    }
+
+    #[test]
+    // timeline[verify playground.pan-button-snap-item]
+    fn timeline_playground_pan_left_snaps_nearest_content_into_view() {
+        let mut dataset = TimelineDataset::new();
+        dataset.push_event(TimelineItemInput::new("earlier"), TimelineInstantNs::new(0));
+        let mut playground = TimelinePlaygroundState::new().expect("playground");
+        playground.dataset = dataset;
+        playground.visible_start_ns = 10_000;
+        playground.visible_end_ns = 11_000;
+
+        playground.pan(-1);
+
+        assert!(playground.visible_start_ns < 0);
+        assert!(playground.visible_end_ns > 0);
     }
 
     #[test]
@@ -13354,6 +14150,33 @@ mod tests {
 
         assert_eq!(animation.target_visible_start_ns, 375);
         assert_eq!(animation.target_visible_end_ns, 875);
+    }
+
+    #[test]
+    // timeline[verify playground.zoom-compounds]
+    fn timeline_playground_fast_zoom_compounds_against_pending_target() {
+        let mut playground = TimelinePlaygroundState::new().expect("playground");
+        playground.visible_start_ns = 0;
+        playground.visible_end_ns = 1_000;
+
+        playground.zoom_about_pixels(50, 100, 1, 2);
+        playground.zoom_about_pixels(50, 100, 1, 2);
+
+        let animation = playground.zoom_animation.expect("animation");
+        assert_eq!(animation.target_visible_start_ns, 375);
+        assert_eq!(animation.target_visible_end_ns, 625);
+    }
+
+    #[test]
+    // timeline[verify playground.live-tracing-events]
+    fn timeline_playground_user_navigation_stops_live_tail_reset() {
+        let mut playground = TimelinePlaygroundState::new().expect("playground");
+        playground.source_mode = TimelinePlaygroundSourceMode::LiveTracingEvents;
+        playground.live_tracing_follow_tail = true;
+
+        playground.pan(1);
+
+        assert!(!playground.live_tracing_follow_tail);
     }
 
     #[test]
@@ -13535,6 +14358,7 @@ mod tests {
             diagnostic_cell_height: 16,
             logs_scroll_offset: 0,
             logs_follow_tail: true,
+            last_applied_scene_window_title: SceneWindowKind::Launcher.title().to_owned(),
             chrome_tooltip: ChromeTooltipController::default(),
             renderer: None,
         };
@@ -13619,6 +14443,7 @@ mod tests {
             diagnostic_cell_height: 16,
             logs_scroll_offset: 0,
             logs_follow_tail: true,
+            last_applied_scene_window_title: SceneWindowKind::DemoMode.title().to_owned(),
             chrome_tooltip: ChromeTooltipController::default(),
             renderer: None,
         };
@@ -13694,6 +14519,7 @@ mod tests {
             diagnostic_cell_height: 16,
             logs_scroll_offset: 0,
             logs_follow_tail: true,
+            last_applied_scene_window_title: SceneWindowKind::Timeline.title().to_owned(),
             chrome_tooltip: ChromeTooltipController::default(),
             renderer: None,
         };

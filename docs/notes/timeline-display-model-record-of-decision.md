@@ -42,6 +42,93 @@ This note preserves the conversational decision trail that led to the timeline d
 
 ## Decision Trail
 
+### Playground Detail And Live Event Polish
+
+Question: After the first visible playground was usable, what should happen to the awkward detail and event presentation discovered during manual play?
+
+Response: Keep the native chrome as the place for window identity, make reflected text behave like other terminal-grid text, and use event-specific markers instead of span-like rectangles.
+
+Clarification:
+
+- The playground window already has a chrome title, so an additional in-body `Timeline Playground` title wastes space and can collide with controls.
+- Detail windows should be named by the selected item in native chrome, for example `Import Capture - Timeline Detail`, instead of repeating that title inside the body.
+- Detail text should preserve explicit line breaks, parse VT styling, and participate in the existing terminal-cell selection/copy path.
+- Diagnostics should look and behave like the existing Ratatui diagnostics views rather than falling back to an unstructured text dump.
+- Instant events are not durations. They should render as small downward markers at their timestamp, with hover/pin details still using the same hit-testing path.
+
+Decision:
+
+- Remove the duplicate in-body playground title and stack the playground summary fields vertically.
+- Render playground ruler subticks between labeled major ticks.
+- Render instant events as compact downward markers.
+- Update detail window titles dynamically to `<detail title> - Timeline Detail` and leave the body focused on state plus detail text.
+- Reuse the scene terminal selection machinery for timeline detail text and diagnostics.
+- Add a live tracing-event mode by projecting events captured by `LogCollectorLayer` into the reusable timeline dataset as instant events. This is an event-only first slice; span lifecycle capture remains future work.
+
+### Playground Navigation And Event Burst Behavior
+
+Question: Why did fast wheel input feel weak, live events become hard to navigate, and synthetic event bursts disappear rather than decompose while zooming in?
+
+Response: The viewport should treat user navigation as an accumulated target, live mode should stop tail-following once the user navigates, and event folding should be driven by projected event spacing instead of a single all-events cluster per visible row.
+
+Decision:
+
+- Repeated playground wheel zoom events compound against the pending target range while the visible range animates from the current interpolated range.
+- Live tracing-event mode follows the tail only on entry and while untouched. Panning or zooming disables tail follow so the chosen view remains navigable.
+- Event folding flushes clusters when adjacent visible events are separated by at least the minimum visible pixel threshold, so zooming in decomposes dense bursts into individual markers.
+- A light vertical cursor guide is rendered over the playground ruler/content surface to make the inspected timestamp easier to read.
+
+### Playground Overscan, Recovery, And Tooltip Titles
+
+Question: What should happen when the user wants the origin centered, pans far away from content, or wants quick identity without shifting attention to the detail sidecar?
+
+Response: Treat the playground viewport as an inspectable camera over time, not a scroll range clamped to zero. Recovery controls should be forgiving, and item identity should be available both in the sidecar detail and in the native tooltip channel.
+
+Decision:
+
+- Playground pan and zoom ranges may move before zero, allowing zero to sit in the center or right side of the viewport.
+- A Fit control sets the visible range to dataset content bounds with padding, including negative padding around near-zero content.
+- Pan buttons keep their normal quarter-viewport movement when content is visible, but when the viewport is empty they snap the nearest content in the requested direction into view.
+- The live tracing-event collector receives trace-level events before console/file output filters are applied, so the timeline can inspect low-level events even when normal logs stay quieter.
+- Hovering a rendered playground span, event, or folded cluster shows a native tooltip containing the same resolved title used by the sidecar detail window.
+
+### Closed Data Bounds And Thread Span Lanes
+
+Question: How should the playground distinguish real captured time from overscan, and how should it move toward Tracy-style thread rows?
+
+Response: Bounds should come only from data that has a complete timestamp range. Closed spans and instant events count. Open spans do not count until they close, because their start alone does not prove the visible future contains data. Thread rows should allow nested span lanes rather than forcing overlapping duration clips into the same vertical slot.
+
+Decision:
+
+- Dim the playground ruler/content before the first closed data point and after the last closed data point.
+- Ignore open spans when computing those dimming bounds, while still rendering them as open spans in the query when they are visible.
+- Capture tracing span lifecycles in the live adapter by recording span creation and close times, then projecting closed spans into the reusable timeline dataset.
+- Group live tracing spans by thread name, matching the live tracing event grouping.
+- Assign overlapping spans to nested per-row lanes in the render plan so the scene can draw multiple span lines inside a thread row.
+
+### Playground Manual Interaction Fixes
+
+Question: What should happen when manual play exposes native tooltip flicker, missing vertical panning, offscreen sidecars, or tiny spans disappearing while zoomed out?
+
+Response: Treat the playground as a native inspection surface. The cursor should drive hover tooltip placement, right-drag should move the camera in both axes, and small visible spans should retain a row-local marker even when folded. Sidecar placement should stay inside the virtual desktop so monitor layout cannot hide the detail window.
+
+Decision:
+
+- Anchor playground item title tooltips to a one-pixel cursor rect instead of the hovered item's centroid.
+- Cache the active native tooltip text and position so unchanged tooltip updates do not resend `TTM_UPDATETIPTEXTW`, `TTM_TRACKPOSITION`, and `TTM_TRACKACTIVATE` every frame.
+- Add playground vertical scroll state and apply right-drag y deltas through the same pan interaction as horizontal time panning.
+- Reclamp playground vertical scroll after render-plan row changes so zooming or grouping cannot leave the remaining rows offscreen.
+- Clip playground rows/items to the content surface and skip fully offscreen rows/items so vertical panning cannot draw timeline content over the ruler or controls.
+- Use the raw scrolled row geometry for span lane placement and clip only the final render/hit rects, preventing lanes from sticking to the content edge while their row scrolls away.
+- Keep row colors tied to row keys and retain row-key world positions across query changes so visible rows can animate into compacted positions without changing color.
+- Treat right-drag panning in live tracing mode as user navigation, stopping live-tail resets just like wheel zoom and pan buttons.
+- Split folded tiny span clusters by projected separation so zooming reveals separated spans instead of only shrinking the aggregate count.
+- Anchor span labels to the full projected span center and clamp the text box into the visible span slice, then add highlight/shadow bevel edges to keep adjacent spans visually separated.
+- Start closed-data bright bounds at time zero when all closed data starts after zero, while still ignoring open spans for right-side bounds.
+- Flush folded tiny-span clusters when their row changes, preserving at least one minimum-width marker per visible row.
+- Preserve projected duration width whenever a span is wider than the minimum marker, and draw the span title inside the clip only if it fits.
+- Clamp timeline detail sidecar windows to the virtual desktop bounds before opening them.
+
 ### Initial Direction: Progress Hub Versus Playground
 
 Question: Should the next implementation target a Progress Hub that replaces Jobs first?

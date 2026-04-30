@@ -96,8 +96,7 @@ pub fn init_logging(global_args: &GlobalArgs) -> eyre::Result<()> {
     } else {
         None
     };
-    let env_filter_layer = build_env_filter(global_args, rust_log.as_deref())?;
-    let subscriber = subscriber.with(env_filter_layer);
+    let stderr_env_filter_layer = build_env_filter(global_args, rust_log.as_deref())?;
 
     let stderr_layer = if global_args.debug {
         tracing_subscriber::fmt::layer()
@@ -118,6 +117,7 @@ pub fn init_logging(global_args: &GlobalArgs) -> eyre::Result<()> {
             .without_time()
             .boxed()
     };
+    let stderr_layer = stderr_layer.with_filter(stderr_env_filter_layer);
     #[cfg(feature = "tracy")]
     let stderr_layer = stderr_layer.with_filter(FilterFn::new(exclude_tracy_frame_mark));
     let subscriber = subscriber.with(stderr_layer);
@@ -142,6 +142,8 @@ pub fn init_logging(global_args: &GlobalArgs) -> eyre::Result<()> {
             .with_target(false)
             .with_line_number(true)
             .with_writer(json_writer);
+        let json_layer =
+            json_layer.with_filter(build_env_filter(global_args, rust_log.as_deref())?);
         #[cfg(feature = "tracy")]
         let json_layer = json_layer.with_filter(FilterFn::new(exclude_tracy_frame_mark));
         Some(json_layer)
@@ -150,6 +152,7 @@ pub fn init_logging(global_args: &GlobalArgs) -> eyre::Result<()> {
     };
     let subscriber = subscriber.with(json_layer);
 
+    // timeline[impl playground.live-tracing-unfiltered]
     let subscriber = subscriber.with(crate::logs::LogCollectorLayer);
 
     #[cfg(all(feature = "tracy", not(test)))]

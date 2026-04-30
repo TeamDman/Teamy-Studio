@@ -37,15 +37,27 @@ The first implementation slice is model-first and tests-first. It should create 
   - Fixed live playground regressions found during manual play: hover detail windows are now created as non-activating tool windows so first hover does not steal focus from the playground, and right-drag panning now has a playground-specific drag path over the ruler/content surface instead of reusing the main timeline document pan gate.
   - Added `timeline[playground.hover-detail-no-activate]` plus focused tests for non-activating detail-window styles and playground right-drag pan hit testing/range movement.
   - Validated the regression fixes with `cargo test timeline_playground`, `tracey query validate --deny warnings`, and `./check-all.ps1`. Tracey status reports `teamy-studio-timeline/rust` at 62 of 62 requirements covered, with 53 verification references.
+  - Polished the live playground UI after manual feedback: removed the duplicate in-body playground title, split the playground summary into stacked labels, added ruler subticks, rendered instant events as downward markers, moved detail item titles into the native detail-window title, made detail text selectable, and added a Ratatui-style diagnostics view for timeline detail windows.
+  - Added a live tracing-event mode to the Timeline Playground by reusing Teamy's existing tracing `LogCollectorLayer`, projecting captured tracing/log events into timeline instant-event items grouped by level/source/label.
+  - Fixed the next playground interaction pass: rapid wheel zoom now compounds against the pending target range, live tracing mode no longer re-snaps the viewport after user pan/zoom, event clusters decompose based on projected spacing while zooming in, and the playground renders a light cursor-position guide line.
+  - Validated the live-event and detail polish pass with `./check-all.ps1`; the first attempt reached passing clippy/build/tests but hit the known cold Tracey daemon startup timeout, and the immediate rerun passed.
+  - Implemented the next navigation and inspection pass: playground pan/zoom can move before zero, a Fit button sets the viewport to padded content bounds, pan buttons snap the nearest offscreen content into view when the current range is empty, item hover now shows a native title tooltip, and the live tracing collector is no longer filtered by console/file log levels.
+  - Implemented closed-data bounds dimming and the first live tracing span lifecycle adapter: closed spans become duration clips grouped by thread, overlapping spans receive nested lane indices inside each row, and open spans do not expand the dimming bounds until they close.
+  - Fixed the next manual-play pass: item title tooltips now anchor above the cursor and avoid redundant native refreshes, right-drag panning moves vertically as well as horizontally, dimming starts at time zero for positive synthetic data even when the first job is open, tiny zoomed-out spans keep per-row minimum markers, and detail sidecar windows clamp to the virtual desktop.
+  - Corrected the span rectangle projection after manual play showed wide spans rendered as thin markers: span clips now keep their projected duration width when wider than the minimum marker, vertical scroll reclamps when zoom/grouping changes reduce the row set, and fitting span titles render inside clips.
+  - Tightened vertical row panning so fully offscreen playground rows/items are skipped and partially visible rows/items are clipped to the timeline content surface instead of rendering over the ruler.
+  - Fixed the live tracing playground pan/zoom follow-up: right-drag panning now stops live-tail resets immediately, tiny span clusters decompose by projected separation as the user zooms, and span lanes are taller so fitted labels are readable.
+  - Refined span readability: labels now anchor to the full projected span center and clamp to the visible edge when that center is offscreen, while span clips get a subtle beveled edge so adjacent clips stay distinguishable.
+  - Added row-key transition behavior for zoom/filter changes: remaining rows animate from their previous row-key position to the compacted target position, and row/span colors now derive from stable row identity instead of visible row index.
 - Current focus:
-  - Decide the next slice after playing with the synthetic Timeline Playground, likely either UX polish for the playground or the first live log/job adapter into the reusable display model.
+  - Validate the live span-lifecycle and data-bounds slice, then manually compare the playground's thread rows and nested span lanes against Tracy Profiler's row model.
 - Remaining work:
-  - Try the Timeline Playground manually and tune first-slice usability issues that are easier to judge in the live UI than in tests.
   - Decide whether the sidecar detail-window pool needs stronger lifetime/ownership handling before broader use, because the first slice intentionally uses a simple shared handle.
   - Consider adding richer synthetic controls later, such as item count, burst density, open-span ratio, and time range presets.
+  - Decide whether live tracing should later preserve parent/child span relationships explicitly, beyond the current overlap-derived per-thread lane layout.
   - Migrate the existing timeline editor model to the new strict types in phases, then delete old normalizing range semantics.
 - Next step:
-  - Open the Timeline Playground from the launcher and play with grouping, folding, pan/zoom, hover details, and pinned details to choose the next implementation slice.
+  - Open the Timeline Playground from the launcher, toggle Live Events, and compare synthetic versus live captured event behavior under grouping, folding, pan/zoom, hover details, pinned details, selection, and diagnostics.
 
 ## Constraints And Assumptions
 
@@ -68,14 +80,35 @@ The first implementation slice is model-first and tests-first. It should create 
 - The first visible playground slice should expose seed regeneration, grouping mode, and folding threshold controls so users can directly exercise row derivation and dense-item clustering.
 - The first visible playground slice should support pan and zoom over synthetic timeline data, then recompute the render plan from the updated viewport.
 - Right-drag panning in the playground should work over the ruler/content surface even though the playground does not own a `TimelineDocument`.
+- The playground viewport should allow negative-time overscan so zero can sit away from the left edge, including fit-to-content views around near-zero data.
+- The playground should provide a fit-to-content button and pan buttons that can recover the nearest content when the current viewport is empty.
+- The playground should visually dim time outside the closed-data bounds, and open spans should not extend those bounds until they close.
+- The playground should support right-drag vertical row panning in addition to horizontal time panning.
+- Vertical row panning should reclamp whenever the rendered row set shrinks after zooming or grouping changes.
+- Vertical row panning should virtualize fully offscreen playground rows/items and clip partially visible geometry to the content surface.
+- Zoom/filter row-set changes should animate remaining rows into their new positions, and row/span colors should not change just because visible row indices compact.
 - Hovering a rendered span, event, folded span cluster, or folded event cluster should open or update a pooled sidecar detail window.
+- Hovered playground items should also expose their resolved title through the native tooltip system.
+- Hovered playground item title tooltips should be positioned from the cursor point and should not be redundantly reactivated while the text and position are unchanged.
 - Hover detail windows should not activate or steal focus from the playground, because focus changes alter the render cadence of the primary window.
 - Left-clicking a rendered span, event, folded span cluster, or folded event cluster should promote the current hover detail into a pinned detail window.
 - Hover and pinned detail windows should display a resolved Facet-derived detail view model with `facet-pretty`, not raw interned IDs alone.
 - The Progress Hub should eventually reuse the display model instead of reviving the hard-coded Jobs window model.
 - A job/progress timeline should display spans as duration clips that grow while open, cap when ended, and support hover details and later pinned detail windows.
 - Instant events should render as markers/carets and fold into clusters when too dense.
+- Live tracing/log events should be viewable in the playground as instant-event timeline data from the app's own subscriber.
+- Live tracing spans should be viewable as closed duration clips grouped by thread, with overlapping spans assigned to nested lanes inside the thread row.
+- Rapid wheel zoom should travel the full compounded distance instead of feeling damped by animation restarts.
+- Event bursts should decompose into individual markers as their projected spacing grows during zoom-in, independent of whether the cluster's left edge is near the viewport edge.
+- Live tracing/log mode should follow the tail on entry, then preserve user-controlled pan/zoom once the user navigates.
+- Right-drag panning in live tracing mode should count as user navigation immediately, not only after wheel zoom.
+- A light vertical guide should track the cursor position over the playground timeline surface.
+- Detail text should be selectable/copyable, and detail diagnostics should use the same Ratatui-style terminal UI language as other diagnostics windows.
 - Duration spans should render as clips and fold into clusters when their projected width is below the current minimum visible pixel threshold.
+- Zoomed-out visible spans should retain per-row minimum-width markers so tiny spans do not visually disappear.
+- Duration spans should preserve their projected width when wider than the minimum marker and should render their title inside the clip only when the text fits.
+- Folded tiny span clusters should split when adjacent spans become visually separable during zoom, and span clips should be tall enough for readable fitted labels.
+- Span labels should be centered within the full projected span rather than the currently visible slice, clamping to the visible edge when needed, and adjacent span clips should have a visual edge treatment.
 - Rows are derived from grouping/filter projection, not raw IDs. Sparse source IDs such as `job 1` and `job 207` must not create hundreds of empty visible rows.
 - Aggregated render items must remain interactive. Hover can summarize; click/middle-click later can inspect or zoom into the represented range.
 - The model must be able to represent timeline data from live tracing, Tracy capture files, synthetic samples, job/progress observations, object-backed audio events, and calendar-like sources.

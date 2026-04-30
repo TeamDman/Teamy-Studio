@@ -926,12 +926,17 @@ impl TimelineViewport {
         let visible_end = self.x_to_time(TimelineViewportPoint::new_pixels(f64::from(
             viewport_width_pixels,
         )));
-        let target_spacing = (visible_end.as_i64() - self.origin.as_i64())
+        let visible_delta = (i128::from(visible_end.as_i64()) - i128::from(self.origin.as_i64()))
             .abs()
+            .min(i128::from(i64::MAX));
+        let target_spacing = i64::try_from(visible_delta)
+            .unwrap_or(i64::MAX)
             .saturating_div(i64::try_from(target_tick_count).unwrap_or(1).max(1))
             .max(1);
         let step_ns = nice_time_step_ns(target_spacing);
-        let first_tick_ns = self.origin.as_i64().div_euclid(step_ns) * step_ns;
+        let first_tick_ns = saturating_i128_to_i64(
+            i128::from(self.origin.as_i64()).div_euclid(i128::from(step_ns)) * i128::from(step_ns),
+        );
         let mut current_tick_ns = first_tick_ns;
         let mut ticks = Vec::new();
 
@@ -956,6 +961,10 @@ impl TimelineViewport {
     }
 }
 
+fn saturating_i128_to_i64(value: i128) -> i64 {
+    i64::try_from(value).unwrap_or(if value < 0 { i64::MIN } else { i64::MAX })
+}
+
 #[expect(
     clippy::cast_possible_truncation,
     clippy::cast_precision_loss,
@@ -975,7 +984,7 @@ fn f64_to_i64_saturating(value: f64) -> i64 {
 
 fn nice_time_step_ns(target_spacing_ns: i64) -> i64 {
     let mut magnitude = 1_i64;
-    let target_spacing_ns = target_spacing_ns.abs().max(1);
+    let target_spacing_ns = target_spacing_ns.saturating_abs().max(1);
     while magnitude <= target_spacing_ns.saturating_div(10) {
         magnitude = magnitude.saturating_mul(10);
     }
@@ -992,7 +1001,7 @@ fn nice_time_step_ns(target_spacing_ns: i64) -> i64 {
 
 fn format_timeline_time_label(time: TimelineTimeNs) -> String {
     let nanoseconds = time.as_i64();
-    let absolute_nanoseconds = nanoseconds.abs();
+    let absolute_nanoseconds = nanoseconds.unsigned_abs();
     if absolute_nanoseconds >= 1_000_000_000 {
         format!("{:.3} s", time.duration().get::<second>())
     } else if absolute_nanoseconds >= 1_000_000 {
