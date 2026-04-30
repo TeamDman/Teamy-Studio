@@ -145,7 +145,7 @@ Invoke-Step -Label "clippy lint check" -Action {
 	Invoke-CargoWithOptionalVerbosity -Arguments @("clippy", "--all-features", "--", "-D", "warnings")
 }
 
-Invoke-Step -Label "build" -Action {
+Invoke-Step -Label "build (all features)" -Action {
 	Stop-TeamyStudioProcessIfRunning
 	if ($VerboseBuild) {
 		Write-BuildNetworkDiagnostics
@@ -169,4 +169,15 @@ Invoke-Step -Label "tests" -Action {
 
 Invoke-Step -Label "tracey status" -Action {
 	tracey query status
+}
+
+Invoke-Step -Label "build (default features)" -Action {
+	Stop-TeamyStudioProcessIfRunning
+	if ($VerboseBuild) {
+		Write-BuildNetworkDiagnostics
+		Write-CargoSourceDiagnostics
+		Invoke-CargoWithOptionalVerbosity -Arguments @("build", "--locked")
+	} else {
+		cargo build --quiet
+	}
 }
