@@ -331,6 +331,7 @@ struct TimelinePlaygroundState {
     vertical_scroll_offset: i32,
     source_mode: TimelinePlaygroundSourceMode,
     live_tracing_follow_tail: bool,
+    live_tracing_snapshot_revision: Option<logs::LiveTracingSnapshotRevision>,
     zoom_animation: Option<TimelinePlaygroundZoomAnimation>,
     row_position_animation: Option<TimelinePlaygroundRowPositionAnimation>,
     last_row_positions: Vec<(TimelineRenderRowKey, i32)>,
@@ -361,6 +362,7 @@ impl TimelinePlaygroundState {
             vertical_scroll_offset: 0,
             source_mode: TimelinePlaygroundSourceMode::Synthetic,
             live_tracing_follow_tail: false,
+            live_tracing_snapshot_revision: None,
             zoom_animation: None,
             row_position_animation: None,
             last_row_positions: Vec::new(),
@@ -372,6 +374,7 @@ impl TimelinePlaygroundState {
     fn regenerate(&mut self) -> eyre::Result<()> {
         self.source_mode = TimelinePlaygroundSourceMode::Synthetic;
         self.live_tracing_follow_tail = false;
+        self.live_tracing_snapshot_revision = None;
         self.seed = self.seed.wrapping_add(0x9e37_79b9_7f4a_7c15);
         self.dataset = generate_synthetic_timeline_dataset(
             &TimelineSyntheticConfig::default().with_seed(self.seed),
@@ -409,6 +412,7 @@ impl TimelinePlaygroundState {
             TimelinePlaygroundSourceMode::Synthetic => {
                 self.source_mode = TimelinePlaygroundSourceMode::LiveTracingEvents;
                 self.live_tracing_follow_tail = true;
+                self.live_tracing_snapshot_revision = None;
                 self.visible_start_ns = 0;
                 self.visible_end_ns = TIMELINE_PLAYGROUND_LIVE_INITIAL_DURATION_NS;
                 self.sync_live_tracing_events();
@@ -416,6 +420,7 @@ impl TimelinePlaygroundState {
             TimelinePlaygroundSourceMode::LiveTracingEvents => {
                 self.source_mode = TimelinePlaygroundSourceMode::Synthetic;
                 self.live_tracing_follow_tail = false;
+                self.live_tracing_snapshot_revision = None;
             }
         }
         self.hovered_item = None;
@@ -430,6 +435,7 @@ impl TimelinePlaygroundState {
             return;
         }
         let (dataset, latest_at_ns) = logs::tracing_event_timeline_dataset();
+        self.live_tracing_snapshot_revision = Some(logs::live_tracing_snapshot_revision());
         self.dataset = dataset;
         if self.live_tracing_follow_tail {
             let duration = (self.visible_end_ns - self.visible_start_ns).max(1);
@@ -3550,12 +3556,36 @@ fn handle_scene_focused_render_timer(hwnd: WindowHandle) -> LRESULT {
 
         maybe_complete_model_warning_prepare(state);
 
+        if !scene_needs_focused_timer_render(state) {
+            return Ok(());
+        }
+
         render_scene_window_frame(state, hwnd, None, true)?;
         Ok(())
     }) {
         Ok(()) => LRESULT(0),
         Err(error) => fail_and_close(hwnd, &error),
     }
+}
+
+fn scene_needs_focused_timer_render(state: &SceneAppState) -> bool {
+    if state.timeline_zoom_animation.is_some() {
+        return true;
+    }
+
+    if state.scene_kind == SceneWindowKind::TimelinePlayground
+        && let Some(playground) = state.timeline_playground.as_ref()
+    {
+        return playground.zoom_animation.is_some()
+            || playground.row_position_animation.is_some()
+            || (playground.live_tracing_follow_tail
+                && playground.live_tracing_snapshot_revision
+                    != Some(logs::live_tracing_snapshot_revision()));
+    }
+
+    state.scene_kind == SceneWindowKind::ModelWarning
+        && (state.model_warning_prepare_started_at.is_some()
+            || state.scene_opened_at.elapsed() < Duration::from_millis(300))
 }
 
 fn maybe_complete_model_warning_prepare(state: &mut SceneAppState) {
@@ -13675,6 +13705,7 @@ fn rects_intersect(a: ScreenRect, b: ScreenRect) -> bool {
 #[cfg(test)]
 mod tests {
     use crate::timeline::TimelineItemInput;
+    use tracing_subscriber::prelude::*;
 
     use super::*;
 
@@ -13745,6 +13776,66 @@ mod tests {
             cell_height: 16,
             diagnostic_panel_visible: false,
         }
+    }
+
+    #[test]
+    fn focused_timer_skips_static_timeline_detail_windows() {
+        let mut state = timeline_test_state(TimelineDocument::blank());
+        state.scene_kind = SceneWindowKind::TimelinePlaygroundDetail;
+        state.window_focused = true;
+
+        assert!(!scene_needs_focused_timer_render(&state));
+    }
+
+    #[test]
+    fn focused_timer_keeps_active_playground_animations_moving() {
+        let mut state = timeline_test_state(TimelineDocument::blank());
+        state.scene_kind = SceneWindowKind::TimelinePlayground;
+        state.window_focused = true;
+        let mut playground = TimelinePlaygroundState::new().expect("playground");
+        playground.zoom_animation = Some(TimelinePlaygroundZoomAnimation {
+            start_visible_start_ns: 0,
+            start_visible_end_ns: 1_000,
+            target_visible_start_ns: 250,
+            target_visible_end_ns: 750,
+            started_at: Instant::now(),
+        });
+        state.timeline_playground = Some(playground);
+
+        assert!(scene_needs_focused_timer_render(&state));
+    }
+
+    #[test]
+    fn focused_timer_skips_live_playground_when_no_new_records_arrived() {
+        logs::clear_logs();
+        let mut state = timeline_test_state(TimelineDocument::blank());
+        state.scene_kind = SceneWindowKind::TimelinePlayground;
+        state.window_focused = true;
+        let mut playground = TimelinePlaygroundState::new().expect("playground");
+        playground.source_mode = TimelinePlaygroundSourceMode::LiveTracingEvents;
+        playground.live_tracing_follow_tail = true;
+        playground.live_tracing_snapshot_revision = Some(logs::live_tracing_snapshot_revision());
+        state.timeline_playground = Some(playground);
+
+        assert!(!scene_needs_focused_timer_render(&state));
+    }
+
+    #[test]
+    fn focused_timer_renders_live_playground_after_new_records_arrive() {
+        logs::clear_logs();
+        let mut state = timeline_test_state(TimelineDocument::blank());
+        state.scene_kind = SceneWindowKind::TimelinePlayground;
+        state.window_focused = true;
+        let mut playground = TimelinePlaygroundState::new().expect("playground");
+        playground.source_mode = TimelinePlaygroundSourceMode::LiveTracingEvents;
+        playground.live_tracing_follow_tail = true;
+        playground.live_tracing_snapshot_revision = Some(logs::live_tracing_snapshot_revision());
+        state.timeline_playground = Some(playground);
+
+        let subscriber = tracing_subscriber::Registry::default().with(logs::LogCollectorLayer);
+        tracing::subscriber::with_default(subscriber, || tracing::info!("new live record"));
+
+        assert!(scene_needs_focused_timer_render(&state));
     }
 
     #[test]

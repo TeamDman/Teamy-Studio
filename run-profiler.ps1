@@ -201,7 +201,7 @@ if (Get-Command tracy-profiler.exe -ErrorAction SilentlyContinue) {
 
 $overallStopwatch.Stop()
 
-Write-Host "CSV:"
+Write-Host "CSV from tracy-csvexport.exe $capturePath"
 tracy-csvexport.exe $capturePath
 
 Write-Host "Timing summary:"
