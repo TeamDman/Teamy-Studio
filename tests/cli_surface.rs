@@ -77,6 +77,7 @@ fn test_version_includes_semver_and_git_revision() {
 // tool[verify cli.surface.terminal]
 // tool[verify cli.surface.self-test]
 // audio[verify cli.audio-command]
+// image[verify cli.image-command]
 #[test]
 fn test_root_help_describes_commands_args_and_environment() {
     let output = run_teamy_studio(&["--help"], &[]);
@@ -98,6 +99,10 @@ fn test_root_help_describes_commands_args_and_environment() {
     assert!(
         text.contains("audio"),
         "missing audio command in help:\n{text}"
+    );
+    assert!(
+        text.contains("image"),
+        "missing image command in help:\n{text}"
     );
     assert!(
         !text.contains("\n    workspace\n"),
@@ -131,6 +136,196 @@ fn test_root_help_describes_commands_args_and_environment() {
     assert!(
         text.contains("RUST_LOG"),
         "missing RUST_LOG in help:\n{text}"
+    );
+}
+
+// image[verify cli.image-command]
+// image[verify cli.upscale-command]
+// image[verify cli.model-command]
+// image[verify cli.model-list]
+// image[verify cli.model-prepare]
+// image[verify cli.model-show]
+// image[verify cli.upscale-defaults]
+#[test]
+fn test_image_help_is_available() {
+    let output = run_teamy_studio(&["image", "--help"], &[]);
+    let text = output_text(&output);
+
+    assert!(output.status.success(), "image help failed:\n{text}");
+    assert!(
+        text.contains("upscale"),
+        "missing upscale subcommand in help:\n{text}"
+    );
+    assert!(
+        text.contains("model"),
+        "missing model subcommand in help:\n{text}"
+    );
+
+    let output = run_teamy_studio(&["image", "upscale", "--help"], &[]);
+    let text = output_text(&output);
+
+    assert!(
+        output.status.success(),
+        "image upscale help failed:\n{text}"
+    );
+    assert!(text.contains("--style"), "missing --style:\n{text}");
+    assert!(text.contains("--scale"), "missing --scale:\n{text}");
+    assert!(text.contains("--tile-size"), "missing --tile-size:\n{text}");
+    assert!(
+        text.contains("--batch-size"),
+        "missing --batch-size:\n{text}"
+    );
+    assert!(text.contains("--device"), "missing --device:\n{text}");
+    assert!(
+        text.contains("--output-format"),
+        "missing --output-format:\n{text}"
+    );
+
+    let output = run_teamy_studio(&["image", "model", "--help"], &[]);
+    let text = output_text(&output);
+
+    assert!(output.status.success(), "image model help failed:\n{text}");
+    assert!(text.contains("list"), "missing list subcommand:\n{text}");
+    assert!(
+        text.contains("prepare"),
+        "missing prepare subcommand:\n{text}"
+    );
+    assert!(text.contains("show"), "missing show subcommand:\n{text}");
+}
+
+// image[verify cli.output-format-conflict]
+#[test]
+fn test_image_upscale_bails_when_explicit_output_format_conflicts_with_output_path() {
+    let output = run_teamy_studio(
+        &[
+            "image",
+            "upscale",
+            "input.png",
+            "output.jpg",
+            "--output-format",
+            "png",
+        ],
+        &[],
+    );
+    let text = output_text(&output);
+
+    assert!(
+        !output.status.success(),
+        "conflicting output format unexpectedly succeeded:\n{text}"
+    );
+    assert!(
+        text.contains("conflicts with output path extension"),
+        "missing conflict explanation:\n{text}"
+    );
+    assert!(
+        !text.contains("not implemented yet"),
+        "conflict should be reported before inference/model scaffolding:\n{text}"
+    );
+}
+
+// image[verify cli.model-list]
+// image[verify cli.model-show]
+// image[verify cli.model-prepare]
+// image[verify model.cache-layout]
+#[test]
+fn test_image_model_commands_report_and_prepare_managed_metadata() {
+    let cache_dir = TempDirGuard::new("teamy-image-model-cache");
+    let cache_dir_text = cache_dir.path().to_string_lossy().into_owned();
+
+    let output = run_teamy_studio(
+        &["--output-format", "json", "image", "model", "list"],
+        &[("TEAMY_STUDIO_CACHE_DIR", &cache_dir_text)],
+    );
+    let text = output_text(&output);
+
+    assert!(output.status.success(), "image model list failed:\n{text}");
+    assert!(
+        text.contains("waifu2x-art-2x"),
+        "missing default model:\n{text}"
+    );
+    assert!(
+        text.contains("models\\\\image") || text.contains("models/image"),
+        "missing managed image model root:\n{text}"
+    );
+    assert!(
+        text.contains("Missing"),
+        "model should start missing:\n{text}"
+    );
+
+    let output = run_teamy_studio(
+        &["--output-format", "json", "image", "model", "prepare"],
+        &[("TEAMY_STUDIO_CACHE_DIR", &cache_dir_text)],
+    );
+    let text = output_text(&output);
+
+    assert!(
+        output.status.success(),
+        "image model prepare failed:\n{text}"
+    );
+    assert!(
+        text.contains("waifu2x.swin_unet_2x"),
+        "missing architecture metadata:\n{text}"
+    );
+    assert!(
+        cache_dir
+            .path()
+            .join("models")
+            .join("image")
+            .join("waifu2x-art-2x")
+            .join("model-metadata.json")
+            .is_file(),
+        "prepare should write managed image model metadata"
+    );
+
+    let output = run_teamy_studio(
+        &["--output-format", "json", "image", "model", "show"],
+        &[("TEAMY_STUDIO_CACHE_DIR", &cache_dir_text)],
+    );
+    let text = output_text(&output);
+
+    assert!(output.status.success(), "image model show failed:\n{text}");
+    assert!(
+        text.contains("\"state\": \"Prepared\""),
+        "show should report the prepared managed Burnpack state:\n{text}"
+    );
+    assert!(
+        text.contains("20250502"),
+        "show should include source archive version:\n{text}"
+    );
+}
+
+// image[verify cli.auto-prepare-default-model]
+// image[verify model.cache-layout]
+#[test]
+fn test_image_upscale_auto_prepares_default_model_metadata_before_inference() {
+    let cache_dir = TempDirGuard::new("teamy-image-upscale-cache");
+    let cache_dir_text = cache_dir.path().to_string_lossy().into_owned();
+    let missing_input_path = cache_dir.path().join("input.png");
+    let missing_input_path_text = missing_input_path.to_string_lossy().into_owned();
+
+    let output = run_teamy_studio(
+        &["image", "upscale", &missing_input_path_text],
+        &[("TEAMY_STUDIO_CACHE_DIR", &cache_dir_text)],
+    );
+    let text = output_text(&output);
+
+    assert!(
+        !output.status.success(),
+        "upscale should fail because the test input path does not exist:\n{text}"
+    );
+    assert!(
+        text.contains("failed to open input image"),
+        "upscale should auto-prepare the model before failing on the missing input path:\n{text}"
+    );
+    assert!(
+        cache_dir
+            .path()
+            .join("models")
+            .join("image")
+            .join("waifu2x-art-2x")
+            .join("model-metadata.json")
+            .is_file(),
+        "upscale should auto-prepare default image model metadata before inference"
     );
 }
 
@@ -337,6 +532,7 @@ fn test_shell_surface_is_removed() {
 // cli[verify command.surface.self-test-terminal-throughput]
 // cli[verify command.surface.self-test-terminal-replay]
 // cli[verify command.surface.self-test-render-offscreen]
+// image[verify self-test.reference-command]
 #[test]
 fn test_self_test_help_is_available() {
     let output = run_teamy_studio(&["self-test", "--help"], &[]);
@@ -358,5 +554,9 @@ fn test_self_test_help_is_available() {
     assert!(
         text.contains("render-offscreen"),
         "missing render-offscreen subcommand in help:\n{text}"
+    );
+    assert!(
+        text.contains("image-upscale-reference"),
+        "missing image-upscale-reference subcommand in help:\n{text}"
     );
 }

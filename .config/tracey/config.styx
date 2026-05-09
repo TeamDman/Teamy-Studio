@@ -106,6 +106,18 @@ specs (
         )
     }
     {
+        name teamy-studio-image-upscale
+        source_url https://github.com/TeamDman/Teamy-Studio
+        include (docs/spec/product/image-upscale.md)
+        impls (
+            {
+                name rust
+                include (src/**/*.rs)
+                test_include (tests/**/*.rs)
+            }
+        )
+    }
+    {
         name teamy-studio-timeline
         source_url https://github.com/TeamDman/Teamy-Studio
         include (docs/spec/product/timeline.md)

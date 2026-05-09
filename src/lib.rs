@@ -5,6 +5,7 @@ pub mod app;
 pub mod audio;
 pub mod cli;
 pub mod frontend;
+pub mod image_model;
 pub mod logging_init;
 pub mod logs;
 pub mod model;
@@ -12,9 +13,9 @@ pub mod paths;
 pub mod shell_default;
 pub mod timeline;
 pub mod transcription;
+pub mod waifu2x_reference;
 pub mod whisper;
 pub mod win32_support;
-
 use crate::cli::Cli;
 use crate::cli::output::CliOutput;
 

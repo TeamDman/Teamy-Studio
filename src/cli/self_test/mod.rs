@@ -1,3 +1,4 @@
+pub mod image_upscale_reference;
 pub mod keyboard_input;
 pub mod render_offscreen;
 mod self_test_cli;
