@@ -14,17 +14,19 @@ sample image
 NUNIF_HOME
 G:\Programming\Caches\NUNIF_HOME
 
-# Waifu2x Burn Image Upscale Plan
+# Waifu2x Burn Image Pipeline Plan
 
 ## Goal
 
-Convert the nunif waifu2x image upscaling path to a Rust/Burn implementation in Teamy Studio and prove it through a CLI command:
+Convert the upstream nunif waifu2x image pipeline for still images into a Rust/Burn implementation in Teamy Studio and prove it through a CLI command:
 
 ```powershell
 teamy-studio image upscale <image-path> [output-path]
 ```
 
-The MVP is single-image upscaling for low-resolution scrapbooking assets: stickers, paper graphics, decorative illustration assets, and other art-like images where clean edges and transparent alpha preservation matter.
+The current vertical slice is single-image upscaling for low-resolution scrapbooking assets: stickers, paper graphics, decorative illustration assets, and other art-like images where clean edges and transparent alpha preservation matter.
+
+The broader follow-up goal is to capture the rest of the upstream still-image waifu2x pipeline as faithfully as practical in Rust: denoise-only, denoise-plus-upscale model selection, more upstream model families and domains, native checkpoint-driven scale variants, and the remaining image-only quality/runtime knobs that matter for still assets. Video is explicitly out of scope for this plan.
 
 The final runtime and model preparation behavior must be entirely Rust-based. Python is allowed only as a temporary development/reference harness for comparing layer logic while porting the model.
 
@@ -90,19 +92,29 @@ Done so far:
 - Verified that real tiled CLI path end-to-end with `cargo run -- image upscale target/test-artifacts/image-upscale/tiny-tiled-100.png --device cpu`, producing `tiny-tiled-100.upscaled-2x.png` with reported and observed output size `200x200`.
 - Reintroduced nunif-style alpha handling on top of the tiled runtime: preserve input alpha presence through preprocessing, apply alpha-border RGB padding for non-blank alpha, upscale alpha through the same scale model by expanding to RGB and averaging back to one channel, and write RGBA PNG output when alpha is present.
 - Verified the alpha path with `cargo test waifu2x_alpha_border_padding_fills_transparent_neighbors_from_opaque_pixels --lib` and `cargo run -- image upscale target/test-artifacts/image-upscale/tiny-alpha-64.png --device cpu`, producing `tiny-alpha-64.upscaled-2x.png` with reported `runtime_mode = "tiled-rgba"`, output size `128x128`, and observed on-disk alpha range `7..255`.
+- Added real CUDA-backed image upscale execution instead of the earlier CPU-only advisory path, reusing Burn CUDA device selection and generic model loading patterns already proven in Whisper.
+- Verified the CUDA path with `cargo run -- image upscale target/test-artifacts/image-upscale/tiny-alpha-64.png --device cuda --log-filter trace`, confirming `cubecl_cuda` activity and successful tiled RGBA output.
+- Added format-aware still-image writing for PNG, JPEG, and WebP, preserving alpha for PNG/WebP and flattening over white for JPEG.
+- Added focused self-test and CLI-surface coverage updates so managed model preparation, output format behavior, and image CLI paths match the now-real runtime behavior.
+- Added scale-4 support first, then generalized scale handling to powers of two by treating the current managed 2x model as a repeated-pass primitive: 2x = one pass, 4x = two passes, 8x = three passes.
+- Verified the generalized power-of-two path with `cargo test image_upscale_ --lib`, `cargo run -- image upscale target/test-artifacts/image-upscale/tiny-alpha-64.png --device cuda --log-filter trace --scale 8`, and a real local `--scale 4` CUDA run on `i adore you.png`.
 
 Current focus:
 
-- Keep the now-validated tiled RGBA path stable while broadening output handling beyond the current PNG-only restriction and tightening parity checks against the Python/nunif reference path.
+- Update this plan so it reflects the real current runtime and explicitly captures the remaining upstream nunif still-image pipeline work beyond the current art upscale path: denoise variants, denoise+scale model routing, more domains/families, native checkpoint scale variants, and image-only quality/runtime options.
 
 Remaining work:
 
-- Implement model artifact discovery, conversion, cache layout internals, Rust inference, self-test reference harness, and validation.
-- Build the GUI layer after the CLI proves the end-to-end path.
+- Capture the upstream still-image model inventory in Teamy metadata and CLI surfaces instead of hard-coding only `waifu2x-art-2x`.
+- Add denoise-only and denoise+scale model preparation/runtime support, including upstream-compatible noise level selection where the model family actually supports it.
+- Decide how to expose still-image quality/runtime knobs from upstream such as TTA and native checkpoint scale variants without pulling in the video-only surface.
+- Tighten Python-reference parity coverage so new model families and denoise paths do not drift from upstream semantics.
+- Re-run `.\check-all.ps1` after the latest scale generalization and after each major pipeline expansion.
+- Build the GUI layer only after the CLI proves the remaining image pipeline slices.
 
 Immediate next step:
 
-- Add focused parity checks against the Python/nunif reference harness for both transparent and opaque inputs, then decide how to extend the current PNG-only output writer to the other advertised formats without regressing alpha semantics.
+- Audit the upstream nunif still-image pipeline into concrete Teamy phases: model family/domain inventory, denoise/noise-level surfaces, native scale checkpoints, and still-image-only quality/runtime options such as TTA, then land the first narrow slice for denoise-aware model inventory and spec updates.
 
 ## Settled Decisions
 
@@ -111,6 +123,7 @@ Immediate next step:
 - Main target assets are stickers, paper graphics, and scrapbook-style art assets.
 - Default style is `art`.
 - Default scale is `2`.
+- Additional powers-of-two upscale factors are allowed today by repeated application of the 2x model. This is a pragmatic runtime capability, not yet a promise that Teamy supports upstream-native scale checkpoints for every family/domain.
 - All CLI parameters except the input image path are optional and have defaults.
 - Output format is automatic by default.
 - If an output path is supplied and `--output-format auto`, infer the output format from that output path extension.
@@ -119,6 +132,8 @@ Immediate next step:
 - Preserve alpha as MVP behavior, following nunif as closely as possible.
 - Tiling is part of the MVP.
 - Tiling defaults should inherit from nunif. For current nunif waifu2x, default tile size is `256` and default batch size is `4`.
+- Still-image denoise support is in scope for the next expansion of this plan.
+- Video filters and video-only options remain out of scope.
 - CUDA is the expected runtime path.
 - If `--device cpu` is not specified and CUDA is unavailable, bail with a warning/error that explains the `--device cpu` fallback flag.
 - CPU support should exist for tiny tests and explicit fallback, but it does not need to be pleasant for large real assets.
@@ -151,7 +166,7 @@ Optional arguments and defaults:
 
 - `[output-path]`: generated from the input path when omitted.
 - `--style art`: MVP default; future values may include `photo`, `scan`, or `art-scan` once supported.
-- `--scale 2`: MVP default; future `4` support should come later.
+- `--scale 2`: default. Additional powers-of-two scales currently reuse the same 2x model in repeated passes.
 - `--tile-size 256`: inherited from nunif default model behavior.
 - `--batch-size 4`: inherited from nunif default model behavior.
 - `--device cuda`: expected fast path. `--device cpu` is explicit fallback.
@@ -174,7 +189,7 @@ MVP exclusions:
 - No recursion.
 - No TTA.
 - No GUI.
-- No JPEG/WebP unless Teamy intentionally adds format support and alpha semantics for them. Current Teamy `image` dependency only enables PNG.
+- No video processing.
 
 ## Architecture Direction
 
@@ -231,17 +246,36 @@ The exact metadata shape should encode:
 
 ### Model Family Strategy
 
-The desired product target is high-quality art upscaling for sticker and paper graphics. The implementation should be staged:
+The desired product target is the upstream nunif still-image pipeline, staged so Teamy does not over-promise support before the Rust/Burn port is real.
 
-1. Use the simplest viable waifu2x architecture to prove Burn model loading, tensor layout, image IO, tiling, and alpha preservation.
-2. Move toward the current nunif default `swin_unet/art` quality target once the pipeline is proven.
+Short-term implementation strata:
+
+1. Keep the current `swin_unet/art/scale2x` path healthy as the reference-quality baseline.
+2. Add denoise-only and denoise+scale model inventory and selection for the same family/domain before broadening to more families.
+3. Add more upstream domains and native checkpoint scales once the selection/model-cache surface is stable.
+
+Relevant upstream still-image surfaces to capture over time:
+
+- `swin_unet/art` with `noise{0,1,2,3}`, `noise{0,1,2,3}_scale2x`, and `noise{0,1,2,3}_scale4x`
+- `swin_unet/photo` with the same denoise/scale variants
+- `swin_unet/art_scan` with the same denoise/scale variants
+- lower-quality but faster families such as `upconv_7/art`, `upconv_7/photo`, and `cunet/art` only after the higher-priority `swin_unet` still-image surface is mapped
+
+The implementation should be staged:
+
+1. Keep the current `swin_unet/art` 2x path as the first proven Burn runtime slice.
+2. Expand within `swin_unet` first so denoise/noise-level routing and native scale checkpoint support land on the product-target family before lower-priority families are added.
+3. Only then decide whether Teamy should also expose faster/lower-quality families such as `upconv_7` or `cunet`.
 
 Important context from nunif:
 
 - `upconv_7/art` and `upconv_7/photo` are fastest but lowest quality.
 - `swin_unet/art` is the current default art model family.
+- Upstream still-image denoise surfaces are expressed as checkpoint names such as `noise0.pth`, `noise1_scale2x.pth`, and `noise3_scale4x.pth` rather than as a single model with a scalar noise parameter.
 - `swin_unet` has stricter tile-size requirements and more complex layers.
 - `I2IBaseModel` defines defaults and tiling metadata: scale, offset, optional blend size, default tile size `256`, and default batch size `4`.
+
+Teamy should model the upstream image pipeline in terms of real managed model artifacts and explicit runtime routing, not pretend one checkpoint can natively cover arbitrary denoise/scale combinations that upstream actually represents as separate weights.
 
 Use the Python verifier to avoid guessing at layer semantics while porting.
 
@@ -515,27 +549,63 @@ Definition of done:
 - Transparent sticker-like fixture has no obvious edge matte/fringe regression.
 - Alpha behavior is covered by self-test and/or Rust tests.
 
-### Phase 8: End-To-End `image upscale`
+### Phase 8: Upstream Still-Image Model Inventory And Selection
+
+Objective: Move beyond the single hard-coded art 2x model and represent the upstream still-image pipeline explicitly.
+
+Tasks:
+
+- Extend the managed image model inventory to include upstream still-image families, domains, denoise levels, and native scale checkpoints that Teamy intends to support.
+- Decide the Teamy CLI surface for model selection: explicit model ids, higher-level `--style`/`--noise-level` routing, or a staged hybrid.
+- Update managed metadata so each prepared artifact records family/domain/denoise-level/native-scale information.
+- Make `image model list` and `image model show` useful for multiple prepared still-image models, not just the current default.
+- Update the Python reference harness so it can report against non-default models and denoise variants.
+
+Definition of done:
+
+- Teamy can describe and prepare more than one upstream still-image model variant.
+- The selection/routing surface is explicit enough that future denoise support does not require another metadata redesign.
+
+### Phase 9: Denoise And Denoise+Scale Runtime
+
+Objective: Capture the denoise part of the upstream still-image pipeline in Rust/Burn.
+
+Tasks:
+
+- Port the first denoise-only model path for the chosen high-priority family/domain.
+- Port the first native denoise+scale checkpoint path instead of relying only on repeated 2x passes.
+- Add a Teamy CLI surface for denoise selection that maps cleanly onto upstream checkpoint reality.
+- Extend parity/self-test coverage for denoise-only and denoise+scale transparent/opaque fixtures.
+- Verify alpha behavior stays correct on denoise paths as well as upscale paths.
+
+Definition of done:
+
+- Teamy can run at least one denoise-only and one denoise+scale still-image path in Rust/Burn.
+- The denoise surface is covered by focused reference comparisons and CLI tests.
+
+### Phase 10: End-To-End `image upscale`
 
 Objective: Make the proof command usable on real single-image scrapbook assets.
 
 Tasks:
 
-- Wire model resolution, auto-prepare, image decode, tiling, Burn inference, alpha handling, and PNG output together.
+- Wire model resolution, auto-prepare, image decode, tiling, Burn inference, alpha handling, and still-image output together.
 - Implement CUDA availability check and default bail behavior.
 - Implement explicit `--device cpu` fallback.
+- Decide which upstream still-image knobs should be surfaced now: for example TTA as an explicit opt-in, while leaving video-only options out.
 - Ensure progress and diagnostics go through tracing/stderr, not mixed into generated image output.
 - Run against at least one local real asset and inspect output manually.
 
 Definition of done:
 
-- `teamy-studio image upscale input.png` writes a valid generated PNG path.
+- `teamy-studio image upscale input.png` writes a valid generated output path for the chosen format and scale.
 - `teamy-studio image upscale input.png output.png` writes the requested path.
 - Missing prepared model warns, prepares, then continues.
 - CUDA missing without `--device cpu` bails with a helpful message.
 - Explicit `--device cpu` works on a small input.
+- The exposed still-image options map to real upstream-capable model paths rather than placeholders.
 
-### Phase 9: Tests, Tracey Coverage, And Hardening
+### Phase 11: Tests, Tracey Coverage, And Hardening
 
 Objective: Make the feature safe to keep evolving.
 
@@ -555,7 +625,7 @@ Definition of done:
 - New CLI and path semantics have tests.
 - `.\check-all.ps1` passes or unrelated pre-existing failures are documented.
 
-### Phase 10: GUI Layer
+### Phase 12: GUI Layer
 
 Objective: Add GUI only after the CLI proves real functionality.
 
@@ -584,13 +654,15 @@ Definition of done:
 7. Port the first model architecture to Burn and compare layers.
 8. Implement Rust model artifact preparation.
 9. Port nunif-compatible tiling and alpha behavior.
-10. Wire end-to-end `image upscale`.
-11. Harden tests, Tracey coverage, and `.\check-all.ps1`.
-12. Build GUI on top of the proven service path.
+10. Expand the managed model inventory to cover the upstream still-image variants Teamy actually wants to support.
+11. Add denoise and denoise+scale runtime paths.
+12. Wire the broader still-image `image upscale` surface end to end.
+13. Harden tests, Tracey coverage, and `.\check-all.ps1`.
+14. Build GUI on top of the proven service path.
 
 ## Acceptance Criteria For MVP
 
-- A single command can upscale one PNG-like image asset: `teamy-studio image upscale <image-path> [output-path]`.
+- A single command can process one still image asset through the supported upstream-derived image pipeline: `teamy-studio image upscale <image-path> [output-path]`.
 - Style defaults to `art` and scale defaults to `2`.
 - Output path and output format follow the settled automatic rules.
 - Explicit output format conflict with a user-supplied output extension fails.
@@ -602,13 +674,16 @@ Definition of done:
 - Normal runtime and prepare behavior do not use Python.
 - Python reference comparison is available only through a separate self-test command.
 - Tracey requirements are present and mapped for the new behavior.
+- The plan explicitly separates still-image pipeline work from out-of-scope video work.
 
 ## Open Decisions
 
 - Which concrete model architecture/checkpoint should be the first Burn port: a simpler `upconv_7/art` proof or the product-target `swin_unet/art` path first?
 - What exact Rust-only checkpoint conversion route is best for nunif `.pth` files?
 - What tolerance thresholds should be used for layer-level reference comparisons?
-- Should future output formats include WebP/JPEG, and if so, what explicit alpha flattening/background options should exist?
+- Which Teamy CLI surface is best for the broader still-image pipeline: explicit model ids, `--style` plus `--noise-level`, or a layered hybrid?
+- When Teamy exposes denoise levels, should it mirror upstream `-1/0/1/2/3` semantics directly or rename the no-denoise case for CLI clarity?
+- Which upstream still-image quality knobs should land after denoise support: TTA first, or native scale4x checkpoints first?
 - Should future batch support use shell glob expansion, explicit Teamy globbing, directory traversal, manifest files, or all of these?
 
 ## Out Of MVP
@@ -617,7 +692,7 @@ Definition of done:
 - Recursive directories.
 - Globbing and batch manifests.
 - TTA.
-- 4x upscale.
+- Video-only filters and video noise/grain surfaces.
 - Photo/scan/art-scan styles unless needed to unblock model conversion.
 - WebP/JPEG output.
 - Alpha flattening/background controls.

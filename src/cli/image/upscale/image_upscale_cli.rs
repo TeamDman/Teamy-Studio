@@ -20,6 +20,20 @@ pub const DEFAULT_IMAGE_UPSCALE_OUTPUT_FORMAT: ImageOutputFormat = ImageOutputFo
 pub enum ImageUpscaleStyle {
     #[default]
     Art,
+    Photo,
+    Scan,
+    ArtScan,
+}
+
+impl ImageUpscaleStyle {
+    #[must_use]
+    const fn as_model_style(self) -> &'static str {
+        match self {
+            Self::Art => "art",
+            Self::Photo => "photo",
+            Self::Scan | Self::ArtScan => "art_scan",
+        }
+    }
 }
 
 /// Image upscale execution device.
@@ -83,6 +97,7 @@ pub struct ResolvedImageOutput {
 
 #[derive(Clone, Debug, Facet, PartialEq)]
 pub struct ImageUpscaleReport {
+    pub model_name: String,
     pub input_path: String,
     pub output_path: String,
     pub output_format: String,
@@ -146,6 +161,14 @@ pub struct ImageUpscaleArgs {
     #[facet(args::named, default = DEFAULT_IMAGE_UPSCALE_SCALE)]
     pub scale: u8,
 
+    /// Optional upstream-compatible noise level for denoise-aware model selection.
+    #[facet(args::named)]
+    pub noise_level: Option<u8>,
+
+    /// Disable the default low-denoise art preset and use the scale-only art model instead.
+    #[facet(args::named, default)]
+    pub disable_denoise: bool,
+
     /// Nunif-compatible tile size.
     // image[impl cli.upscale-defaults]
     #[facet(args::named, default = DEFAULT_IMAGE_UPSCALE_TILE_SIZE)]
@@ -181,28 +204,23 @@ impl ImageUpscaleArgs {
         cache_home: &crate::paths::CacheHome,
     ) -> eyre::Result<CliOutput> {
         let output = self.resolve_output()?;
-        self.validate_supported_mvp_arguments()?;
+        let resolved_model = self.resolve_model()?;
+        self.validate_supported_mvp_arguments(resolved_model)?;
         // image[impl cli.auto-prepare-default-model]
-        let model_status = crate::image_model::inspect_image_model(
-            cache_home,
-            crate::image_model::DEFAULT_IMAGE_MODEL_NAME,
-        );
+        let model_status = crate::image_model::inspect_image_model(cache_home, resolved_model.name);
         if !matches!(
             model_status.state,
             crate::image_model::ImageModelPreparationState::Prepared
         ) {
             tracing::warn!(
-                model = crate::image_model::DEFAULT_IMAGE_MODEL_NAME,
+                model = resolved_model.name,
                 state = ?model_status.state,
-                "default image model is not prepared; preparing managed image model Burnpack"
+                "resolved image model is not prepared; preparing managed image model Burnpack"
             );
-            let _prepared = crate::image_model::prepare_image_model(
-                cache_home,
-                crate::image_model::DEFAULT_IMAGE_MODEL_NAME,
-                false,
-            )?;
+            let _prepared =
+                crate::image_model::prepare_image_model(cache_home, resolved_model.name, false)?;
         }
-        let upscale_passes = self.upscale_pass_count()?;
+        let upscale_passes = self.upscale_pass_count_for_model(resolved_model.scale)?;
         let prepared_input = load_image_upscale_input(Path::new(&self.image_path))?;
         let ran_alpha_runtime = prepared_input.alpha_hw.is_some();
         let mut rgb_chw = prepared_input.rgb_chw;
@@ -215,7 +233,7 @@ impl ImageUpscaleArgs {
             ImageUpscaleDevice::Cpu => {
                 crate::image_model::validate_managed_image_model_burnpack_load(
                     cache_home,
-                    crate::image_model::DEFAULT_IMAGE_MODEL_NAME,
+                    resolved_model.name,
                 )?;
                 for pass_index in 0..upscale_passes {
                     tracing::info!(
@@ -230,7 +248,7 @@ impl ImageUpscaleArgs {
                         .is_none_or(|values| values.iter().all(|value| *value >= 1.0));
                     let result = crate::image_model::upscale_managed_image_model_tiled_rgba(
                         cache_home,
-                        crate::image_model::DEFAULT_IMAGE_MODEL_NAME,
+                        resolved_model.name,
                         &rgb_chw,
                         alpha_hw.as_deref(),
                         blank_alpha,
@@ -239,14 +257,20 @@ impl ImageUpscaleArgs {
                         self.tile_size,
                         self.batch_size,
                     )?;
-                    (rgb_chw, alpha_hw, output_width, output_height, actual_tile_size) = result;
+                    (
+                        rgb_chw,
+                        alpha_hw,
+                        output_width,
+                        output_height,
+                        actual_tile_size,
+                    ) = result;
                 }
             }
             ImageUpscaleDevice::Cuda => {
                 let device = crate::image_model::waifu2x_inference_device();
                 crate::image_model::validate_managed_image_model_burnpack_load_cuda(
                     cache_home,
-                    crate::image_model::DEFAULT_IMAGE_MODEL_NAME,
+                    resolved_model.name,
                     &device,
                 )?;
                 for pass_index in 0..upscale_passes {
@@ -262,7 +286,7 @@ impl ImageUpscaleArgs {
                         .is_none_or(|values| values.iter().all(|value| *value >= 1.0));
                     let result = crate::image_model::upscale_managed_image_model_tiled_rgba_cuda(
                         cache_home,
-                        crate::image_model::DEFAULT_IMAGE_MODEL_NAME,
+                        resolved_model.name,
                         &rgb_chw,
                         alpha_hw.as_deref(),
                         blank_alpha,
@@ -272,7 +296,13 @@ impl ImageUpscaleArgs {
                         self.batch_size,
                         &device,
                     )?;
-                    (rgb_chw, alpha_hw, output_width, output_height, actual_tile_size) = result;
+                    (
+                        rgb_chw,
+                        alpha_hw,
+                        output_width,
+                        output_height,
+                        actual_tile_size,
+                    ) = result;
                 }
             }
         }
@@ -293,7 +323,7 @@ impl ImageUpscaleArgs {
             input = %self.image_path,
             output = %output.path.display(),
             format = ?output.format,
-            model = crate::image_model::DEFAULT_IMAGE_MODEL_NAME,
+            model = resolved_model.name,
             scale = self.scale,
             width = prepared_input.width,
             height = prepared_input.height,
@@ -306,6 +336,7 @@ impl ImageUpscaleArgs {
             "image upscale tiled Burn inference succeeded"
         );
         Ok(CliOutput::facet(ImageUpscaleReport {
+            model_name: resolved_model.name.to_owned(),
             input_path: self.image_path,
             output_path: output.path.display().to_string(),
             output_format: format!("{:?}", output.format),
@@ -362,8 +393,56 @@ impl ImageUpscaleArgs {
         }
     }
 
-    fn validate_supported_mvp_arguments(&self) -> eyre::Result<()> {
-        let _ = self.upscale_pass_count()?;
+    // image[impl cli.model-selection]
+    // image[impl cli.art-default-low-denoise]
+    // image[impl cli.art-disable-denoise]
+    // image[impl cli.unsupported-model-selection]
+    fn resolve_model(&self) -> eyre::Result<&'static crate::image_model::KnownImageModel> {
+        ensure!(
+            self.noise_level.is_none_or(|value| value <= 3),
+            "--noise-level must be between 0 and 3"
+        );
+        ensure!(
+            !(self.disable_denoise && self.noise_level.is_some()),
+            "--disable-denoise cannot be combined with --noise-level"
+        );
+        let effective_noise_level = self.effective_noise_level();
+        let prefer_native_4x = self.prefers_native_4x_art_model();
+        let method = if effective_noise_level.is_some() {
+            if prefer_native_4x {
+                "noise_scale4x"
+            } else {
+                "noise_scale2x"
+            }
+        } else if prefer_native_4x {
+            "scale4x"
+        } else {
+            crate::image_model::default_upscale_method()
+        };
+        crate::image_model::resolve_image_model_for_request(
+            crate::image_model::ImageModelSelectionRequest {
+                style: self.style.as_model_style(),
+                method,
+                noise_level: effective_noise_level,
+            },
+        )
+    }
+
+    #[must_use]
+    fn effective_noise_level(&self) -> Option<u8> {
+        if self.disable_denoise {
+            None
+        } else {
+            self.noise_level
+                .or_else(|| (self.style == ImageUpscaleStyle::Art).then_some(0))
+        }
+    }
+
+    fn validate_supported_mvp_arguments(
+        &self,
+        resolved_model: &crate::image_model::KnownImageModel,
+    ) -> eyre::Result<()> {
+        let _ = self.upscale_pass_count_for_model(resolved_model.scale)?;
         ensure!(self.tile_size > 0, "--tile-size must be greater than zero");
         ensure!(
             self.batch_size > 0,
@@ -372,14 +451,38 @@ impl ImageUpscaleArgs {
         Ok(())
     }
 
-    fn upscale_pass_count(&self) -> eyre::Result<u8> {
+    fn upscale_pass_count_for_model(&self, model_scale: u8) -> eyre::Result<u8> {
         ensure!(
             self.scale >= 2 && self.scale.is_power_of_two(),
             "image upscale currently supports powers-of-two scales starting at 2"
         );
-        u8::try_from(self.scale.ilog2())
-            .map_err(eyre::Report::from)
-            .wrap_err("image upscale pass count did not fit in u8")
+        ensure!(
+            model_scale >= 2 && model_scale.is_power_of_two(),
+            "resolved image model scale must be a power of two starting at 2"
+        );
+        let mut remaining_scale = self.scale;
+        let mut passes = 0_u8;
+        while remaining_scale > 1 {
+            ensure!(
+                remaining_scale.is_multiple_of(model_scale),
+                "image upscale scale {} cannot be composed from repeated {}x passes of model `{}`",
+                self.scale,
+                model_scale,
+                model_scale
+            );
+            remaining_scale /= model_scale;
+            passes = passes
+                .checked_add(1)
+                .ok_or_else(|| eyre::eyre!("image upscale pass count overflowed u8"))?;
+        }
+        Ok(passes)
+    }
+
+    fn prefers_native_4x_art_model(&self) -> bool {
+        self.style == ImageUpscaleStyle::Art
+            && self.scale >= 4
+            && self.scale.is_power_of_two()
+            && self.scale.ilog2().is_multiple_of(2)
     }
 }
 
@@ -719,6 +822,8 @@ mod tests {
             output_path: None,
             style: DEFAULT_IMAGE_UPSCALE_STYLE,
             scale,
+            noise_level: None,
+            disable_denoise: false,
             tile_size: DEFAULT_IMAGE_UPSCALE_TILE_SIZE,
             batch_size: DEFAULT_IMAGE_UPSCALE_BATCH_SIZE,
             device: ImageUpscaleDevice::Cuda,
@@ -728,22 +833,23 @@ mod tests {
 
     #[test]
     fn image_upscale_accepts_scale_4() {
-        sample_args(4)
-            .validate_supported_mvp_arguments()
+        let args = sample_args(4);
+        args.validate_supported_mvp_arguments(args.resolve_model().expect("model"))
             .expect("scale 4 should be accepted");
     }
 
     #[test]
     fn image_upscale_accepts_scale_8() {
-        sample_args(8)
-            .validate_supported_mvp_arguments()
+        let args = sample_args(8);
+        args.validate_supported_mvp_arguments(args.resolve_model().expect("model"))
             .expect("scale 8 should be accepted");
     }
 
     #[test]
     fn image_upscale_rejects_non_power_of_two_scale() {
-        let error = sample_args(6)
-            .validate_supported_mvp_arguments()
+        let args = sample_args(6);
+        let error = args
+            .validate_supported_mvp_arguments(args.resolve_model().expect("model"))
             .expect_err("scale 6 should be rejected");
 
         assert!(
@@ -757,7 +863,149 @@ mod tests {
     fn image_upscale_generates_4x_output_path() {
         let output = sample_args(4).resolve_output().expect("resolved output");
 
-        assert_eq!(output.path, PathBuf::from(r"C:\images\input.upscaled-4x.png"));
+        assert_eq!(
+            output.path,
+            PathBuf::from(r"C:\images\input.upscaled-4x.png")
+        );
         assert_eq!(output.format, ImageOutputFormat::Png);
+    }
+
+    #[test]
+    fn image_upscale_resolves_default_art_model() {
+        let model = sample_args(2).resolve_model().expect("model");
+
+        assert_eq!(model.name, "waifu2x-art-denoise-0-2x");
+    }
+
+    #[test]
+    fn image_upscale_resolves_native_art_4x_model_for_scale_4() {
+        let model = sample_args(4).resolve_model().expect("model");
+
+        assert_eq!(model.name, "waifu2x-art-denoise-0-4x");
+    }
+
+    #[test]
+    fn image_upscale_disable_denoise_restores_scale_only_art_model() {
+        let mut args = sample_args(2);
+        args.disable_denoise = true;
+
+        let model = args.resolve_model().expect("model");
+
+        assert_eq!(model.name, crate::image_model::DEFAULT_IMAGE_MODEL_NAME);
+    }
+
+    #[test]
+    fn image_upscale_disable_denoise_restores_native_scale_only_art_4x_model() {
+        let mut args = sample_args(4);
+        args.disable_denoise = true;
+
+        let model = args.resolve_model().expect("model");
+
+        assert_eq!(model.name, "waifu2x-art-4x");
+    }
+
+    #[test]
+    fn image_upscale_resolves_native_art_denoise_4x_model_for_scale_4() {
+        let mut args = sample_args(4);
+        args.noise_level = Some(3);
+
+        let model = args.resolve_model().expect("model");
+
+        assert_eq!(model.name, "waifu2x-art-denoise-3-4x");
+    }
+
+    #[test]
+    fn image_upscale_resolves_art_scale_8_to_repeatable_2x_model() {
+        let model = sample_args(8).resolve_model().expect("model");
+
+        assert_eq!(model.name, "waifu2x-art-denoise-0-2x");
+    }
+
+    #[test]
+    fn image_upscale_resolves_photo_model() {
+        let mut args = sample_args(2);
+        args.style = ImageUpscaleStyle::Photo;
+
+        let model = args.resolve_model().expect("model");
+
+        assert_eq!(model.name, "waifu2x-photo-2x");
+    }
+
+    #[test]
+    fn image_upscale_resolves_scan_alias_to_art_scan_model() {
+        let mut args = sample_args(2);
+        args.style = ImageUpscaleStyle::Scan;
+
+        let model = args.resolve_model().expect("model");
+
+        assert_eq!(model.name, "waifu2x-art-scan-2x");
+    }
+
+    #[test]
+    fn image_upscale_resolves_art_noise_model_request() {
+        let mut args = sample_args(2);
+        args.noise_level = Some(3);
+
+        let model = args.resolve_model().expect("model");
+
+        assert_eq!(model.name, "waifu2x-art-denoise-3-2x");
+    }
+
+    #[test]
+    fn image_upscale_uses_one_pass_for_native_4x_model() {
+        let args = sample_args(4);
+        let model = args.resolve_model().expect("model");
+
+        assert_eq!(
+            args.upscale_pass_count_for_model(model.scale)
+                .expect("passes"),
+            1
+        );
+    }
+
+    #[test]
+    fn image_upscale_uses_two_passes_for_native_4x_scale_16() {
+        let args = sample_args(16);
+        let model = args.resolve_model().expect("model");
+
+        assert_eq!(model.name, "waifu2x-art-denoise-0-4x");
+        assert_eq!(
+            args.upscale_pass_count_for_model(model.scale)
+                .expect("passes"),
+            2
+        );
+    }
+
+    #[test]
+    fn image_upscale_rejects_out_of_range_noise_level() {
+        let mut args = sample_args(2);
+        args.noise_level = Some(4);
+
+        let error = args
+            .resolve_model()
+            .expect_err("noise level 4 should be rejected");
+
+        assert!(
+            error
+                .to_string()
+                .contains("--noise-level must be between 0 and 3")
+        );
+    }
+
+    #[test]
+    fn image_upscale_rejects_disable_denoise_with_explicit_noise_level() {
+        let mut args = sample_args(2);
+        args.noise_level = Some(0);
+        args.disable_denoise = true;
+
+        let error = args
+            .resolve_model()
+            .expect_err("disable-denoise should reject explicit noise level");
+
+        assert!(
+            error
+                .to_string()
+                .contains("--disable-denoise cannot be combined with --noise-level")
+        );
     }
 }

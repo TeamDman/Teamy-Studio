@@ -244,6 +244,14 @@ fn test_image_model_commands_report_and_prepare_managed_metadata() {
         "missing default model:\n{text}"
     );
     assert!(
+        text.contains("waifu2x-art-denoise-3-4x"),
+        "list should include denoise-aware inventory variants:\n{text}"
+    );
+    assert!(
+        text.contains("inventory-only"),
+        "list should surface inventory-only runtime status for unsupported variants:\n{text}"
+    );
+    assert!(
         text.contains("models\\\\image") || text.contains("models/image"),
         "missing managed image model root:\n{text}"
     );
@@ -294,6 +302,32 @@ fn test_image_model_commands_report_and_prepare_managed_metadata() {
     );
 }
 
+// image[verify cli.model-prepare]
+#[test]
+fn test_image_model_prepare_rejects_inventory_only_variants() {
+    let cache_dir = TempDirGuard::new("teamy-image-model-inventory-cache");
+    let cache_dir_text = cache_dir.path().to_string_lossy().into_owned();
+
+    let output = run_teamy_studio(
+        &["image", "model", "prepare", "waifu2x-art-denoise-0"],
+        &[("TEAMY_STUDIO_CACHE_DIR", &cache_dir_text)],
+    );
+    let text = output_text(&output);
+
+    assert!(
+        !output.status.success(),
+        "inventory-only prepare should fail clearly:\n{text}"
+    );
+    assert!(
+        text.contains("inventory-only"),
+        "prepare failure should explain that the variant is inventory-only:\n{text}"
+    );
+    assert!(
+        text.contains("denoise-only Burn prep/runtime"),
+        "prepare failure should explain why the variant is not runnable yet:\n{text}"
+    );
+}
+
 // image[verify cli.auto-prepare-default-model]
 // image[verify model.cache-layout]
 #[test]
@@ -322,10 +356,183 @@ fn test_image_upscale_auto_prepares_default_model_metadata_before_inference() {
             .path()
             .join("models")
             .join("image")
-            .join("waifu2x-art-2x")
+            .join("waifu2x-art-denoise-0-2x")
             .join("model-metadata.json")
             .is_file(),
         "upscale should auto-prepare default image model metadata before inference"
+    );
+}
+
+// image[verify cli.upscale-command]
+#[test]
+fn test_image_upscale_noise_level_routes_to_supported_denoise_model() {
+    let cache_dir = TempDirGuard::new("teamy-image-upscale-noise-cache");
+    let cache_dir_text = cache_dir.path().to_string_lossy().into_owned();
+    let missing_input_path = cache_dir.path().join("input.png");
+    let missing_input_path_text = missing_input_path.to_string_lossy().into_owned();
+
+    let output = run_teamy_studio(
+        &[
+            "image",
+            "upscale",
+            &missing_input_path_text,
+            "--noise-level",
+            "3",
+        ],
+        &[("TEAMY_STUDIO_CACHE_DIR", &cache_dir_text)],
+    );
+    let text = output_text(&output);
+
+    assert!(
+        !output.status.success(),
+        "denoise-aware upscale should still fail on the missing test input path:\n{text}"
+    );
+    assert!(
+        text.contains("waifu2x-art-denoise-3-2x"),
+        "upscale should resolve the denoise-aware managed model name during prepare/logging:\n{text}"
+    );
+    assert!(
+        text.contains("failed to open input image"),
+        "upscale should get past model preparation and fail on the missing input path:\n{text}"
+    );
+    assert!(
+        cache_dir
+            .path()
+            .join("models")
+            .join("image")
+            .join("waifu2x-art-denoise-3-2x")
+            .join("model-metadata.json")
+            .is_file(),
+        "upscale should auto-prepare the denoise-aware 2x image model before inference"
+    );
+}
+
+// image[verify cli.model-selection]
+// image[verify cli.photo-derived-2x]
+#[test]
+fn test_image_upscale_photo_style_routes_to_supported_derived_2x_model() {
+    let cache_dir = TempDirGuard::new("teamy-image-upscale-photo-cache");
+    let cache_dir_text = cache_dir.path().to_string_lossy().into_owned();
+    let missing_input_path = cache_dir.path().join("input.png");
+    let missing_input_path_text = missing_input_path.to_string_lossy().into_owned();
+
+    let output = run_teamy_studio(
+        &[
+            "image",
+            "upscale",
+            &missing_input_path_text,
+            "--style",
+            "photo",
+        ],
+        &[("TEAMY_STUDIO_CACHE_DIR", &cache_dir_text)],
+    );
+    let text = output_text(&output);
+
+    assert!(
+        !output.status.success(),
+        "photo-style upscale should still fail on the missing test input path:\n{text}"
+    );
+    assert!(
+        text.contains("waifu2x-photo-2x"),
+        "upscale should resolve the photo managed model name during prepare/logging:\n{text}"
+    );
+    assert!(
+        text.contains("failed to open input image"),
+        "photo-style upscale should get past model preparation and fail on the missing input path:\n{text}"
+    );
+    assert!(
+        cache_dir
+            .path()
+            .join("models")
+            .join("image")
+            .join("waifu2x-photo-2x")
+            .join("model-metadata.json")
+            .is_file(),
+        "photo-style upscale should auto-prepare the derived 2x image model before inference"
+    );
+}
+
+// image[verify cli.model-selection]
+// image[verify cli.art-native-4x]
+#[test]
+fn test_image_upscale_scale_4_routes_to_native_art_4x_model() {
+    let cache_dir = TempDirGuard::new("teamy-image-upscale-art-4x-cache");
+    let cache_dir_text = cache_dir.path().to_string_lossy().into_owned();
+    let missing_input_path = cache_dir.path().join("input.png");
+    let missing_input_path_text = missing_input_path.to_string_lossy().into_owned();
+
+    let output = run_teamy_studio(
+        &["image", "upscale", &missing_input_path_text, "--scale", "4"],
+        &[("TEAMY_STUDIO_CACHE_DIR", &cache_dir_text)],
+    );
+    let text = output_text(&output);
+
+    assert!(
+        !output.status.success(),
+        "scale-4 art upscale should still fail on the missing test input path:\n{text}"
+    );
+    assert!(
+        text.contains("waifu2x-art-denoise-0-4x"),
+        "upscale should resolve the native art 4x managed model name during prepare/logging:\n{text}"
+    );
+    assert!(
+        text.contains("failed to open input image"),
+        "scale-4 art upscale should get past model preparation and fail on the missing input path:\n{text}"
+    );
+    assert!(
+        cache_dir
+            .path()
+            .join("models")
+            .join("image")
+            .join("waifu2x-art-denoise-0-4x")
+            .join("model-metadata.json")
+            .is_file(),
+        "scale-4 art upscale should auto-prepare the native 4x image model before inference"
+    );
+}
+
+// image[verify cli.model-selection]
+// image[verify cli.photo-derived-2x]
+#[test]
+fn test_image_upscale_scan_style_routes_to_supported_derived_2x_model() {
+    let cache_dir = TempDirGuard::new("teamy-image-upscale-scan-cache");
+    let cache_dir_text = cache_dir.path().to_string_lossy().into_owned();
+    let missing_input_path = cache_dir.path().join("input.png");
+    let missing_input_path_text = missing_input_path.to_string_lossy().into_owned();
+
+    let output = run_teamy_studio(
+        &[
+            "image",
+            "upscale",
+            &missing_input_path_text,
+            "--style",
+            "scan",
+        ],
+        &[("TEAMY_STUDIO_CACHE_DIR", &cache_dir_text)],
+    );
+    let text = output_text(&output);
+
+    assert!(
+        !output.status.success(),
+        "scan-style upscale should still fail on the missing test input path:\n{text}"
+    );
+    assert!(
+        text.contains("waifu2x-art-scan-2x"),
+        "upscale should resolve the art_scan managed model name during prepare/logging:\n{text}"
+    );
+    assert!(
+        text.contains("failed to open input image"),
+        "scan-style upscale should get past model preparation and fail on the missing input path:\n{text}"
+    );
+    assert!(
+        cache_dir
+            .path()
+            .join("models")
+            .join("image")
+            .join("waifu2x-art-scan-2x")
+            .join("model-metadata.json")
+            .is_file(),
+        "scan-style upscale should auto-prepare the derived art_scan 2x image model before inference"
     );
 }
 

@@ -32,13 +32,18 @@ pub const IMAGE_MODEL_BURNPACK_FILE_NAME: &str = "model.bpk";
 pub const IMAGE_MODEL_SOURCE_DIR_NAME: &str = "source";
 pub const NUNIF_WAIFU2X_MODEL_ARCHIVE_VERSION: &str = "20250502";
 pub const NUNIF_WAIFU2X_MODEL_ARCHIVE_URL: &str = "https://github.com/nagadomi/nunif/releases/download/0.0.0/waifu2x_pretrained_models_20250502.zip";
+pub const IMAGE_MODEL_RUNTIME_STATUS_IMPLEMENTED: &str = "implemented";
+pub const IMAGE_MODEL_RUNTIME_STATUS_INVENTORY_ONLY: &str = "inventory-only";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct KnownImageModel {
     pub name: &'static str,
     pub family: &'static str,
     pub style: &'static str,
+    pub method: &'static str,
+    pub noise_level: Option<u8>,
     pub scale: u8,
+    pub native_scale: u8,
     pub architecture: &'static str,
     pub source_archive_url: &'static str,
     pub source_archive_version: &'static str,
@@ -49,28 +54,328 @@ pub struct KnownImageModel {
     pub default_batch_size: u32,
     pub input_channels: u32,
     pub output_channels: u32,
-    pub parameter_count: u64,
+    pub parameter_count: Option<u64>,
     pub alpha_behavior: &'static str,
+    pub teamy_runtime_status: &'static str,
+    pub teamy_runtime_notes: &'static str,
 }
 
-pub const KNOWN_IMAGE_MODELS: [KnownImageModel; 1] = [KnownImageModel {
-    name: DEFAULT_IMAGE_MODEL_NAME,
-    family: "waifu2x",
-    style: "art",
-    scale: 2,
-    architecture: "waifu2x.swin_unet_2x",
-    source_archive_url: NUNIF_WAIFU2X_MODEL_ARCHIVE_URL,
-    source_archive_version: NUNIF_WAIFU2X_MODEL_ARCHIVE_VERSION,
-    source_checkpoint_path: "pretrained_models/swin_unet/art/scale2x.pth",
-    model_offset: 16,
-    blend_size: 8,
-    default_tile_size: 256,
-    default_batch_size: 4,
-    input_channels: 3,
-    output_channels: 3,
-    parameter_count: 3_758_304,
-    alpha_behavior: "nunif-compatible-alpha-border-padding-and-alpha-upscale",
-}];
+#[expect(
+    clippy::too_many_arguments,
+    reason = "image model inventory rows are declared inline as explicit constants for readability"
+)]
+const fn known_swin_unet_model(
+    style: &'static str,
+    name: &'static str,
+    method: &'static str,
+    noise_level: Option<u8>,
+    scale: u8,
+    native_scale: u8,
+    architecture: &'static str,
+    source_checkpoint_path: &'static str,
+    parameter_count: Option<u64>,
+    teamy_runtime_status: &'static str,
+    teamy_runtime_notes: &'static str,
+) -> KnownImageModel {
+    known_swin_unet_model_with_tiling(
+        style,
+        name,
+        method,
+        noise_level,
+        scale,
+        native_scale,
+        architecture,
+        source_checkpoint_path,
+        16,
+        8,
+        parameter_count,
+        teamy_runtime_status,
+        teamy_runtime_notes,
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "image model inventory rows are declared inline as explicit constants for readability"
+)]
+const fn known_swin_unet_model_with_tiling(
+    style: &'static str,
+    name: &'static str,
+    method: &'static str,
+    noise_level: Option<u8>,
+    scale: u8,
+    native_scale: u8,
+    architecture: &'static str,
+    source_checkpoint_path: &'static str,
+    model_offset: u32,
+    blend_size: u32,
+    parameter_count: Option<u64>,
+    teamy_runtime_status: &'static str,
+    teamy_runtime_notes: &'static str,
+) -> KnownImageModel {
+    KnownImageModel {
+        name,
+        family: "waifu2x",
+        style,
+        method,
+        noise_level,
+        scale,
+        native_scale,
+        architecture,
+        source_archive_url: NUNIF_WAIFU2X_MODEL_ARCHIVE_URL,
+        source_archive_version: NUNIF_WAIFU2X_MODEL_ARCHIVE_VERSION,
+        source_checkpoint_path,
+        model_offset,
+        blend_size,
+        default_tile_size: 256,
+        default_batch_size: 4,
+        input_channels: 3,
+        output_channels: 3,
+        parameter_count,
+        alpha_behavior: "nunif-compatible-alpha-border-padding-and-alpha-upscale",
+        teamy_runtime_status,
+        teamy_runtime_notes,
+    }
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the art inventory helper forwards explicit checkpoint metadata into the shared constructor"
+)]
+const fn known_swin_unet_art_model(
+    name: &'static str,
+    method: &'static str,
+    noise_level: Option<u8>,
+    scale: u8,
+    native_scale: u8,
+    architecture: &'static str,
+    source_checkpoint_path: &'static str,
+    parameter_count: Option<u64>,
+    teamy_runtime_status: &'static str,
+    teamy_runtime_notes: &'static str,
+) -> KnownImageModel {
+    known_swin_unet_model(
+        "art",
+        name,
+        method,
+        noise_level,
+        scale,
+        native_scale,
+        architecture,
+        source_checkpoint_path,
+        parameter_count,
+        teamy_runtime_status,
+        teamy_runtime_notes,
+    )
+}
+
+const fn known_swin_unet_art_native_4x_model(
+    name: &'static str,
+    method: &'static str,
+    noise_level: Option<u8>,
+    source_checkpoint_path: &'static str,
+    parameter_count: Option<u64>,
+    teamy_runtime_status: &'static str,
+    teamy_runtime_notes: &'static str,
+) -> KnownImageModel {
+    known_swin_unet_model_with_tiling(
+        "art",
+        name,
+        method,
+        noise_level,
+        4,
+        4,
+        "waifu2x.swin_unet_4x",
+        source_checkpoint_path,
+        32,
+        16,
+        parameter_count,
+        teamy_runtime_status,
+        teamy_runtime_notes,
+    )
+}
+
+pub const KNOWN_IMAGE_MODELS: [KnownImageModel; 16] = [
+    known_swin_unet_art_model(
+        DEFAULT_IMAGE_MODEL_NAME,
+        "scale2x",
+        None,
+        2,
+        2,
+        "waifu2x.swin_unet_2x",
+        "pretrained_models/swin_unet/art/scale2x.pth",
+        Some(3_758_304),
+        IMAGE_MODEL_RUNTIME_STATUS_IMPLEMENTED,
+        "Current Teamy Burn prep and runtime support this art 2x checkpoint end to end.",
+    ),
+    known_swin_unet_model(
+        "photo",
+        "waifu2x-photo-2x",
+        "scale2x",
+        None,
+        2,
+        2,
+        "waifu2x.swin_unet_4x",
+        "pretrained_models/swin_unet/photo/scale4x.pth",
+        None,
+        IMAGE_MODEL_RUNTIME_STATUS_IMPLEMENTED,
+        "Teamy prepares the upstream photo 4x checkpoint and downscales each 4x tile back to the logical 2x output, matching nunif's derived 2x wrapper.",
+    ),
+    known_swin_unet_model(
+        "art_scan",
+        "waifu2x-art-scan-2x",
+        "scale2x",
+        None,
+        2,
+        2,
+        "waifu2x.swin_unet_4x",
+        "pretrained_models/swin_unet/art_scan/scale4x.pth",
+        None,
+        IMAGE_MODEL_RUNTIME_STATUS_IMPLEMENTED,
+        "Teamy prepares the upstream art_scan 4x checkpoint and downscales each 4x tile back to the logical 2x output, matching nunif's derived 2x wrapper.",
+    ),
+    known_swin_unet_art_native_4x_model(
+        "waifu2x-art-4x",
+        "scale4x",
+        None,
+        "pretrained_models/swin_unet/art/scale4x.pth",
+        None,
+        IMAGE_MODEL_RUNTIME_STATUS_IMPLEMENTED,
+        "Current Teamy Burn prep and runtime support this native art 4x checkpoint end to end.",
+    ),
+    known_swin_unet_art_model(
+        "waifu2x-art-denoise-0",
+        "noise",
+        Some(0),
+        1,
+        1,
+        "waifu2x.swin_unet_1x",
+        "pretrained_models/swin_unet/art/noise0.pth",
+        None,
+        IMAGE_MODEL_RUNTIME_STATUS_INVENTORY_ONLY,
+        "Inventory only for now; Teamy has not implemented denoise-only Burn prep/runtime yet.",
+    ),
+    known_swin_unet_art_model(
+        "waifu2x-art-denoise-1",
+        "noise",
+        Some(1),
+        1,
+        1,
+        "waifu2x.swin_unet_1x",
+        "pretrained_models/swin_unet/art/noise1.pth",
+        None,
+        IMAGE_MODEL_RUNTIME_STATUS_INVENTORY_ONLY,
+        "Inventory only for now; Teamy has not implemented denoise-only Burn prep/runtime yet.",
+    ),
+    known_swin_unet_art_model(
+        "waifu2x-art-denoise-2",
+        "noise",
+        Some(2),
+        1,
+        1,
+        "waifu2x.swin_unet_1x",
+        "pretrained_models/swin_unet/art/noise2.pth",
+        None,
+        IMAGE_MODEL_RUNTIME_STATUS_INVENTORY_ONLY,
+        "Inventory only for now; Teamy has not implemented denoise-only Burn prep/runtime yet.",
+    ),
+    known_swin_unet_art_model(
+        "waifu2x-art-denoise-3",
+        "noise",
+        Some(3),
+        1,
+        1,
+        "waifu2x.swin_unet_1x",
+        "pretrained_models/swin_unet/art/noise3.pth",
+        None,
+        IMAGE_MODEL_RUNTIME_STATUS_INVENTORY_ONLY,
+        "Inventory only for now; Teamy has not implemented denoise-only Burn prep/runtime yet.",
+    ),
+    known_swin_unet_art_model(
+        "waifu2x-art-denoise-0-2x",
+        "noise_scale2x",
+        Some(0),
+        2,
+        2,
+        "waifu2x.swin_unet_2x",
+        "pretrained_models/swin_unet/art/noise0_scale2x.pth",
+        Some(3_758_304),
+        IMAGE_MODEL_RUNTIME_STATUS_IMPLEMENTED,
+        "Current Teamy Burn prep and runtime support this art denoise+2x checkpoint end to end.",
+    ),
+    known_swin_unet_art_model(
+        "waifu2x-art-denoise-1-2x",
+        "noise_scale2x",
+        Some(1),
+        2,
+        2,
+        "waifu2x.swin_unet_2x",
+        "pretrained_models/swin_unet/art/noise1_scale2x.pth",
+        Some(3_758_304),
+        IMAGE_MODEL_RUNTIME_STATUS_IMPLEMENTED,
+        "Current Teamy Burn prep and runtime support this art denoise+2x checkpoint end to end.",
+    ),
+    known_swin_unet_art_model(
+        "waifu2x-art-denoise-2-2x",
+        "noise_scale2x",
+        Some(2),
+        2,
+        2,
+        "waifu2x.swin_unet_2x",
+        "pretrained_models/swin_unet/art/noise2_scale2x.pth",
+        Some(3_758_304),
+        IMAGE_MODEL_RUNTIME_STATUS_IMPLEMENTED,
+        "Current Teamy Burn prep and runtime support this art denoise+2x checkpoint end to end.",
+    ),
+    known_swin_unet_art_model(
+        "waifu2x-art-denoise-3-2x",
+        "noise_scale2x",
+        Some(3),
+        2,
+        2,
+        "waifu2x.swin_unet_2x",
+        "pretrained_models/swin_unet/art/noise3_scale2x.pth",
+        Some(3_758_304),
+        IMAGE_MODEL_RUNTIME_STATUS_IMPLEMENTED,
+        "Current Teamy Burn prep and runtime support this art denoise+2x checkpoint end to end.",
+    ),
+    known_swin_unet_art_native_4x_model(
+        "waifu2x-art-denoise-0-4x",
+        "noise_scale4x",
+        Some(0),
+        "pretrained_models/swin_unet/art/noise0_scale4x.pth",
+        None,
+        IMAGE_MODEL_RUNTIME_STATUS_IMPLEMENTED,
+        "Current Teamy Burn prep and runtime support this native art denoise+4x checkpoint end to end.",
+    ),
+    known_swin_unet_art_native_4x_model(
+        "waifu2x-art-denoise-1-4x",
+        "noise_scale4x",
+        Some(1),
+        "pretrained_models/swin_unet/art/noise1_scale4x.pth",
+        None,
+        IMAGE_MODEL_RUNTIME_STATUS_IMPLEMENTED,
+        "Current Teamy Burn prep and runtime support this native art denoise+4x checkpoint end to end.",
+    ),
+    known_swin_unet_art_native_4x_model(
+        "waifu2x-art-denoise-2-4x",
+        "noise_scale4x",
+        Some(2),
+        "pretrained_models/swin_unet/art/noise2_scale4x.pth",
+        None,
+        IMAGE_MODEL_RUNTIME_STATUS_IMPLEMENTED,
+        "Current Teamy Burn prep and runtime support this native art denoise+4x checkpoint end to end.",
+    ),
+    known_swin_unet_art_native_4x_model(
+        "waifu2x-art-denoise-3-4x",
+        "noise_scale4x",
+        Some(3),
+        "pretrained_models/swin_unet/art/noise3_scale4x.pth",
+        None,
+        IMAGE_MODEL_RUNTIME_STATUS_IMPLEMENTED,
+        "Current Teamy Burn prep and runtime support this native art denoise+4x checkpoint end to end.",
+    ),
+];
 
 #[derive(Clone, Debug, Facet, PartialEq, Serialize)]
 #[facet(rename_all = "snake_case")]
@@ -78,7 +383,10 @@ pub struct ImageModelMetadata {
     pub model_name: String,
     pub family: String,
     pub style: String,
+    pub method: String,
+    pub noise_level: Option<u8>,
     pub scale: u8,
+    pub native_scale: u8,
     pub architecture: String,
     pub source_archive_url: String,
     pub source_archive_version: String,
@@ -89,8 +397,10 @@ pub struct ImageModelMetadata {
     pub default_batch_size: u32,
     pub input_channels: u32,
     pub output_channels: u32,
-    pub parameter_count: u64,
+    pub parameter_count: Option<u64>,
     pub alpha_behavior: String,
+    pub teamy_runtime_status: String,
+    pub teamy_runtime_notes: String,
 }
 
 impl From<&KnownImageModel> for ImageModelMetadata {
@@ -99,7 +409,10 @@ impl From<&KnownImageModel> for ImageModelMetadata {
             model_name: model.name.to_owned(),
             family: model.family.to_owned(),
             style: model.style.to_owned(),
+            method: model.method.to_owned(),
+            noise_level: model.noise_level,
             scale: model.scale,
+            native_scale: model.native_scale,
             architecture: model.architecture.to_owned(),
             source_archive_url: model.source_archive_url.to_owned(),
             source_archive_version: model.source_archive_version.to_owned(),
@@ -112,6 +425,8 @@ impl From<&KnownImageModel> for ImageModelMetadata {
             output_channels: model.output_channels,
             parameter_count: model.parameter_count,
             alpha_behavior: model.alpha_behavior.to_owned(),
+            teamy_runtime_status: model.teamy_runtime_status.to_owned(),
+            teamy_runtime_notes: model.teamy_runtime_notes.to_owned(),
         }
     }
 }
@@ -173,6 +488,7 @@ pub struct ImageModelCheckpointReport {
 #[derive(Clone, Debug, Facet, PartialEq, Eq)]
 pub struct ImageModelCheckpointBurnLoadProbeReport {
     pub module_name: String,
+    pub output_scale: u64,
     pub checkpoint_filter_regex: String,
     pub matched_checkpoint_keys: Vec<String>,
     pub patch0_weight_shape: Vec<u64>,
@@ -221,6 +537,7 @@ pub struct ImageModelCheckpointBurnLoadProbeReport {
     pub swin5_block1_qkv_weight_shape: Vec<u64>,
     pub swin5_block1_relative_position_bias_table_shape: Vec<u64>,
     pub swin5_block1_relative_position_index_shape: Vec<u64>,
+    pub proj2_weight_shape: Option<Vec<u64>>,
     pub up1_proj_weight_shape: Vec<u64>,
     pub up2_proj_weight_shape: Vec<u64>,
     pub to_image_proj_weight_shape: Vec<u64>,
@@ -240,9 +557,22 @@ pub struct ImageModelDetailsReport {
 }
 
 #[derive(Clone, Debug, Facet, PartialEq, Eq)]
+pub struct ImageModelInventoryEntry {
+    pub status: ImageModelStatusReport,
+    pub family: String,
+    pub style: String,
+    pub method: String,
+    pub noise_level: Option<u8>,
+    pub native_scale: u8,
+    pub architecture: String,
+    pub source_checkpoint_path: String,
+    pub teamy_runtime_status: String,
+}
+
+#[derive(Clone, Debug, Facet, PartialEq, Eq)]
 pub struct ImageModelListReport {
     pub managed_root: String,
-    pub models: Vec<ImageModelStatusReport>,
+    pub models: Vec<ImageModelInventoryEntry>,
 }
 
 #[derive(Clone, Debug, Facet, PartialEq)]
@@ -252,6 +582,13 @@ pub struct PreparedImageModelReport {
     pub source_artifacts: ImageModelSourceArtifactsReport,
     pub checkpoint: Option<ImageModelCheckpointReport>,
     pub burn_load_probe: Option<ImageModelCheckpointBurnLoadProbeReport>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ImageModelSelectionRequest<'a> {
+    pub style: &'a str,
+    pub method: &'a str,
+    pub noise_level: Option<u8>,
 }
 
 pub(crate) type Waifu2xCpuBackend = NdArray<f32>;
@@ -289,9 +626,11 @@ pub(crate) struct Waifu2xPatchStem<B: Backend> {
     stage4_block1: Waifu2xSwinBlockProbe<B>,
     stage5_block0: Waifu2xSwinBlockProbe<B>,
     stage5_block1: Waifu2xSwinBlockProbe<B>,
+    proj2: Option<Linear<B>>,
     up1_proj: Linear<B>,
     up2_proj: Linear<B>,
     to_image_proj: Linear<B>,
+    output_scale: usize,
 }
 
 #[derive(Module, Debug)]
@@ -336,7 +675,7 @@ impl<B: Backend> Waifu2xPatchStem<B> {
         let x = x5 + x4;
         let x = self.forward_swin_stage(x, [&self.stage4_block0, &self.stage4_block1]);
         let x = self.forward_patch_up(x, &self.up1_proj);
-        let x = x + x3;
+        let x = x + self.forward_proj2(x3);
         let x = self.forward_swin_stage(x, [&self.stage5_block0, &self.stage5_block1]);
         self.forward_to_image(x)
     }
@@ -371,9 +710,17 @@ impl<B: Backend> Waifu2xPatchStem<B> {
         pixel_shuffle_2x(x).permute([0, 2, 3, 1])
     }
 
+    fn forward_proj2(&self, input: Tensor<B, 4>) -> Tensor<B, 4> {
+        if let Some(proj2) = &self.proj2 {
+            proj2.forward(input)
+        } else {
+            input
+        }
+    }
+
     fn forward_to_image(&self, input: Tensor<B, 4>) -> Tensor<B, 4> {
         let x = self.to_image_proj.forward(input).permute([0, 3, 1, 2]);
-        pixel_shuffle_2x(x)
+        pixel_shuffle(x, self.output_scale)
     }
 
     #[expect(
@@ -558,17 +905,34 @@ impl<B: Backend> Waifu2xSwinMlpProbe<B> {
 }
 
 fn pixel_shuffle_2x<B: Backend>(input: Tensor<B, 4>) -> Tensor<B, 4> {
+    pixel_shuffle(input, 2)
+}
+
+fn pixel_shuffle<B: Backend>(input: Tensor<B, 4>, upscale_factor: usize) -> Tensor<B, 4> {
     let [batch, channels, height, width] = input.dims();
+    let upscale_area = upscale_factor * upscale_factor;
     assert_eq!(
-        channels % 4,
+        channels % upscale_area,
         0,
-        "pixel shuffle expects the channel dimension to be divisible by 4"
+        "pixel shuffle expects the channel dimension to be divisible by the upscale area"
     );
-    let out_channels = channels / 4;
+    let out_channels = channels / upscale_area;
     input
-        .reshape([batch, out_channels, 2, 2, height, width])
+        .reshape([
+            batch,
+            out_channels,
+            upscale_factor,
+            upscale_factor,
+            height,
+            width,
+        ])
         .permute([0, 1, 4, 2, 5, 3])
-        .reshape([batch, out_channels, height * 2, width * 2])
+        .reshape([
+            batch,
+            out_channels,
+            height * upscale_factor,
+            width * upscale_factor,
+        ])
 }
 
 fn shifted_window_attention_mask<B: Backend>(
@@ -740,8 +1104,65 @@ pub fn list_image_models(cache_home: &CacheHome) -> ImageModelListReport {
         managed_root: image_models_root(cache_home).display().to_string(),
         models: KNOWN_IMAGE_MODELS
             .iter()
-            .map(|model| inspect_image_model(cache_home, model.name))
+            .map(|model| ImageModelInventoryEntry {
+                status: inspect_image_model(cache_home, model.name),
+                family: model.family.to_owned(),
+                style: model.style.to_owned(),
+                method: model.method.to_owned(),
+                noise_level: model.noise_level,
+                native_scale: model.native_scale,
+                architecture: model.architecture.to_owned(),
+                source_checkpoint_path: model.source_checkpoint_path.to_owned(),
+                teamy_runtime_status: model.teamy_runtime_status.to_owned(),
+            })
             .collect(),
+    }
+}
+
+#[must_use]
+pub fn default_upscale_model_name() -> &'static str {
+    DEFAULT_IMAGE_MODEL_NAME
+}
+
+#[must_use]
+pub fn default_upscale_method() -> &'static str {
+    "scale2x"
+}
+
+/// # Errors
+///
+/// This function returns an error if no known managed image model matches the requested
+/// style, method, and optional noise-level combination.
+pub fn resolve_image_model_for_request(
+    request: ImageModelSelectionRequest<'_>,
+) -> eyre::Result<&'static KnownImageModel> {
+    let style = normalize_image_model_style(request.style);
+    KNOWN_IMAGE_MODELS
+        .iter()
+        .find(|model| {
+            model.style.eq_ignore_ascii_case(style)
+                && model.method.eq_ignore_ascii_case(request.method)
+                && model.noise_level == request.noise_level
+        })
+        .ok_or_else(|| {
+            let noise_suffix = request
+                .noise_level
+                .map(|value| format!(", noise-level {value}"))
+                .unwrap_or_default();
+            eyre::eyre!(
+                "no known image model matches style `{}` with method `{}`{}",
+                request.style,
+                request.method,
+                noise_suffix
+            )
+        })
+}
+
+fn normalize_image_model_style(style: &str) -> &str {
+    if style.eq_ignore_ascii_case("scan") {
+        "art_scan"
+    } else {
+        style
     }
 }
 
@@ -757,6 +1178,7 @@ pub fn prepare_image_model(
     overwrite: bool,
 ) -> eyre::Result<PreparedImageModelReport> {
     let known = known_image_model(model_name).ok_or_else(|| unknown_model_error(model_name))?;
+    ensure_image_model_runtime_is_implemented(known, "prepare")?;
     let managed_dir = managed_image_model_dir(cache_home, known.name);
     let metadata_path = image_model_metadata_path(&managed_dir);
     std::fs::create_dir_all(&managed_dir)
@@ -887,11 +1309,10 @@ fn ensure_image_model_burnpack(
         .metadata(
             "image.output_channels",
             metadata.output_channels.to_string(),
-        )
-        .metadata(
-            "image.parameter_count",
-            metadata.parameter_count.to_string(),
         );
+    if let Some(parameter_count) = metadata.parameter_count {
+        store = store.metadata("image.parameter_count", parameter_count.to_string());
+    }
     println!(
         "Saving image model Burnpack weights: {}",
         burnpack_path.display()
@@ -1110,6 +1531,15 @@ fn load_waifu2x_probe_model_from_checkpoint(
     )?;
     let stage5_block1_index =
         required_checkpoint_snapshot(&reader, "unet.swin5.block.1.attn.relative_position_index")?;
+    let output_scale = waifu2x_output_scale_from_checkpoint_reader(&reader);
+    let proj2 = if output_scale == 4 {
+        Some(required_checkpoint_snapshot(
+            &reader,
+            WAIFU2X_PROJ2_WEIGHT_KEY,
+        )?)
+    } else {
+        None
+    };
     let up1_proj = required_checkpoint_snapshot(&reader, "unet.up1.proj.weight")?;
     let up2_proj = required_checkpoint_snapshot(&reader, "unet.up2.proj.weight")?;
     let to_image_proj = required_checkpoint_snapshot(&reader, "unet.to_image.proj.weight")?;
@@ -1246,9 +1676,13 @@ fn load_waifu2x_probe_model_from_checkpoint(
             stage5_block1_mlp0,
             stage5_block1_mlp3,
         )?,
+        proj2: proj2
+            .map(|weight| linear_from_weight_snapshot(weight, &device))
+            .transpose()?,
         up1_proj: linear_from_weight_snapshot(up1_proj, &device)?,
         up2_proj: linear_from_weight_snapshot(up2_proj, &device)?,
         to_image_proj: linear_from_weight_snapshot(to_image_proj, &device)?,
+        output_scale,
     };
 
     let mut store = build_waifu2x_checkpoint_store(checkpoint_path);
@@ -1324,7 +1758,184 @@ fn init_swin_block_from_dims<B: Backend>(
     }
 }
 
-fn init_waifu2x_art_2x_probe_model<B: Backend>(device: &B::Device) -> Waifu2xPatchStem<B> {
+const WAIFU2X_PROJ2_WEIGHT_KEY: &str = "unet.proj2.weight";
+const WAIFU2X_CHECKPOINT_FILTER_REGEX: &str = r"^(unet\.patch\.(0|2)|unet\.down(1|2)\.conv)\.(weight|bias)$|^unet\.swin(1|2)\.block\.(0|1)\.(attn\.(qkv|proj)|mlp\.(0|3))\.(weight|bias)$|^unet\.swin(1|2)\.block\.(0|1)\.attn\.relative_position_(bias_table|index)$|^unet\.swin3\.block\.[0-5]\.(attn\.(qkv|proj)|mlp\.(0|3))\.(weight|bias)$|^unet\.swin3\.block\.[0-5]\.attn\.relative_position_(bias_table|index)$|^unet\.swin4\.block\.(0|1)\.(attn\.(qkv|proj)|mlp\.(0|3))\.(weight|bias)$|^unet\.swin4\.block\.(0|1)\.attn\.relative_position_(bias_table|index)$|^unet\.swin5\.block\.(0|1)\.(attn\.(qkv|proj)|mlp\.(0|3))\.(weight|bias)$|^unet\.swin5\.block\.(0|1)\.attn\.relative_position_(bias_table|index)$|^unet\.proj2\.(weight|bias)$|^(unet\.(up1|up2|to_image)\.proj)\.(weight|bias)$";
+
+fn waifu2x_output_scale_for_architecture(architecture: &str) -> eyre::Result<usize> {
+    match architecture.trim() {
+        "waifu2x.swin_unet_2x" => Ok(2),
+        "waifu2x.swin_unet_4x" => Ok(4),
+        other => bail!("unsupported waifu2x architecture `{other}` for Burn runtime"),
+    }
+}
+
+fn waifu2x_output_scale_from_checkpoint_keys<'a>(keys: impl IntoIterator<Item = &'a str>) -> usize {
+    if keys.into_iter().any(|key| key == WAIFU2X_PROJ2_WEIGHT_KEY) {
+        4
+    } else {
+        2
+    }
+}
+
+fn waifu2x_output_scale_from_checkpoint_reader(reader: &PytorchReader) -> usize {
+    waifu2x_output_scale_from_checkpoint_keys(reader.keys().iter().map(String::as_str))
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "the waifu2x checkpoint store remapping stays explicit so checkpoint tensor routing remains local"
+)]
+fn configure_waifu2x_checkpoint_store(store: PytorchStore) -> PytorchStore {
+    store
+        .with_top_level_key("state_dict")
+        .with_regex(WAIFU2X_CHECKPOINT_FILTER_REGEX)
+        .with_key_remapping(r"^unet\.patch\.0\.", "patch0.")
+        .with_key_remapping(r"^unet\.patch\.2\.", "patch2.")
+        .with_key_remapping(r"^unet\.down1\.conv\.", "down1_conv.")
+        .with_key_remapping(r"^unet\.down2\.conv\.", "down2_conv.")
+        .with_key_remapping(r"^unet\.swin1\.block\.0\.attn\.", "block0.attn.")
+        .with_key_remapping(r"^unet\.swin1\.block\.0\.mlp\.0\.", "block0.mlp.lin0.")
+        .with_key_remapping(r"^unet\.swin1\.block\.0\.mlp\.3\.", "block0.mlp.lin3.")
+        .with_key_remapping(r"^unet\.swin1\.block\.1\.attn\.", "block1.attn.")
+        .with_key_remapping(r"^unet\.swin1\.block\.1\.mlp\.0\.", "block1.mlp.lin0.")
+        .with_key_remapping(r"^unet\.swin1\.block\.1\.mlp\.3\.", "block1.mlp.lin3.")
+        .with_key_remapping(r"^unet\.swin2\.block\.0\.attn\.", "stage2_block0.attn.")
+        .with_key_remapping(
+            r"^unet\.swin2\.block\.0\.mlp\.0\.",
+            "stage2_block0.mlp.lin0.",
+        )
+        .with_key_remapping(
+            r"^unet\.swin2\.block\.0\.mlp\.3\.",
+            "stage2_block0.mlp.lin3.",
+        )
+        .with_key_remapping(r"^unet\.swin2\.block\.1\.attn\.", "stage2_block1.attn.")
+        .with_key_remapping(
+            r"^unet\.swin2\.block\.1\.mlp\.0\.",
+            "stage2_block1.mlp.lin0.",
+        )
+        .with_key_remapping(
+            r"^unet\.swin2\.block\.1\.mlp\.3\.",
+            "stage2_block1.mlp.lin3.",
+        )
+        .with_key_remapping(r"^unet\.swin3\.block\.0\.attn\.", "stage3_block0.attn.")
+        .with_key_remapping(
+            r"^unet\.swin3\.block\.0\.mlp\.0\.",
+            "stage3_block0.mlp.lin0.",
+        )
+        .with_key_remapping(
+            r"^unet\.swin3\.block\.0\.mlp\.3\.",
+            "stage3_block0.mlp.lin3.",
+        )
+        .with_key_remapping(r"^unet\.swin3\.block\.1\.attn\.", "stage3_block1.attn.")
+        .with_key_remapping(
+            r"^unet\.swin3\.block\.1\.mlp\.0\.",
+            "stage3_block1.mlp.lin0.",
+        )
+        .with_key_remapping(
+            r"^unet\.swin3\.block\.1\.mlp\.3\.",
+            "stage3_block1.mlp.lin3.",
+        )
+        .with_key_remapping(r"^unet\.swin3\.block\.2\.attn\.", "stage3_block2.attn.")
+        .with_key_remapping(
+            r"^unet\.swin3\.block\.2\.mlp\.0\.",
+            "stage3_block2.mlp.lin0.",
+        )
+        .with_key_remapping(
+            r"^unet\.swin3\.block\.2\.mlp\.3\.",
+            "stage3_block2.mlp.lin3.",
+        )
+        .with_key_remapping(r"^unet\.swin3\.block\.3\.attn\.", "stage3_block3.attn.")
+        .with_key_remapping(
+            r"^unet\.swin3\.block\.3\.mlp\.0\.",
+            "stage3_block3.mlp.lin0.",
+        )
+        .with_key_remapping(
+            r"^unet\.swin3\.block\.3\.mlp\.3\.",
+            "stage3_block3.mlp.lin3.",
+        )
+        .with_key_remapping(r"^unet\.swin3\.block\.4\.attn\.", "stage3_block4.attn.")
+        .with_key_remapping(
+            r"^unet\.swin3\.block\.4\.mlp\.0\.",
+            "stage3_block4.mlp.lin0.",
+        )
+        .with_key_remapping(
+            r"^unet\.swin3\.block\.4\.mlp\.3\.",
+            "stage3_block4.mlp.lin3.",
+        )
+        .with_key_remapping(r"^unet\.swin3\.block\.5\.attn\.", "stage3_block5.attn.")
+        .with_key_remapping(
+            r"^unet\.swin3\.block\.5\.mlp\.0\.",
+            "stage3_block5.mlp.lin0.",
+        )
+        .with_key_remapping(
+            r"^unet\.swin3\.block\.5\.mlp\.3\.",
+            "stage3_block5.mlp.lin3.",
+        )
+        .with_key_remapping(r"^unet\.swin4\.block\.0\.attn\.", "stage4_block0.attn.")
+        .with_key_remapping(
+            r"^unet\.swin4\.block\.0\.mlp\.0\.",
+            "stage4_block0.mlp.lin0.",
+        )
+        .with_key_remapping(
+            r"^unet\.swin4\.block\.0\.mlp\.3\.",
+            "stage4_block0.mlp.lin3.",
+        )
+        .with_key_remapping(r"^unet\.swin4\.block\.1\.attn\.", "stage4_block1.attn.")
+        .with_key_remapping(
+            r"^unet\.swin4\.block\.1\.mlp\.0\.",
+            "stage4_block1.mlp.lin0.",
+        )
+        .with_key_remapping(
+            r"^unet\.swin4\.block\.1\.mlp\.3\.",
+            "stage4_block1.mlp.lin3.",
+        )
+        .with_key_remapping(r"^unet\.swin5\.block\.0\.attn\.", "stage5_block0.attn.")
+        .with_key_remapping(
+            r"^unet\.swin5\.block\.0\.mlp\.0\.",
+            "stage5_block0.mlp.lin0.",
+        )
+        .with_key_remapping(
+            r"^unet\.swin5\.block\.0\.mlp\.3\.",
+            "stage5_block0.mlp.lin3.",
+        )
+        .with_key_remapping(r"^unet\.swin5\.block\.1\.attn\.", "stage5_block1.attn.")
+        .with_key_remapping(
+            r"^unet\.swin5\.block\.1\.mlp\.0\.",
+            "stage5_block1.mlp.lin0.",
+        )
+        .with_key_remapping(
+            r"^unet\.swin5\.block\.1\.mlp\.3\.",
+            "stage5_block1.mlp.lin3.",
+        )
+        .with_key_remapping(r"^unet\.proj2\.", "proj2.")
+        .with_key_remapping(r"^unet\.up1\.proj\.", "up1_proj.")
+        .with_key_remapping(r"^unet\.up2\.proj\.", "up2_proj.")
+        .with_key_remapping(r"^unet\.to_image\.proj\.", "to_image_proj.")
+        .allow_partial(true)
+}
+
+fn init_waifu2x_probe_model<B: Backend>(
+    device: &B::Device,
+    output_scale: usize,
+) -> Waifu2xPatchStem<B> {
+    let (proj2, up1_proj, stage5_block0, stage5_block1, to_image_proj) = match output_scale {
+        2 => (
+            None,
+            LinearConfig::new(192, 384).init(device),
+            init_swin_block_from_dims(device, 96, 192),
+            init_swin_block_from_dims(device, 96, 192),
+            LinearConfig::new(96, 12).init(device),
+        ),
+        4 => (
+            Some(LinearConfig::new(96, 192).init(device)),
+            LinearConfig::new(192, 768).init(device),
+            init_swin_block_from_dims(device, 192, 384),
+            init_swin_block_from_dims(device, 192, 384),
+            LinearConfig::new(192, 48).init(device),
+        ),
+        _ => panic!("unsupported waifu2x output scale {output_scale}"),
+    };
+
     Waifu2xPatchStem {
         patch0: Conv2dConfig::new([3, 48], [3, 3]).init(device),
         patch2: Conv2dConfig::new([48, 96], [3, 3]).init(device),
@@ -1346,11 +1957,13 @@ fn init_waifu2x_art_2x_probe_model<B: Backend>(device: &B::Device) -> Waifu2xPat
         stage3_block5: init_swin_block_from_dims(device, 192, 384),
         stage4_block0: init_swin_block_from_dims(device, 192, 384),
         stage4_block1: init_swin_block_from_dims(device, 192, 384),
-        stage5_block0: init_swin_block_from_dims(device, 96, 192),
-        stage5_block1: init_swin_block_from_dims(device, 96, 192),
-        up1_proj: LinearConfig::new(192, 384).init(device),
+        stage5_block0,
+        stage5_block1,
+        proj2,
+        up1_proj,
         up2_proj: LinearConfig::new(192, 768).init(device),
-        to_image_proj: LinearConfig::new(96, 12).init(device),
+        to_image_proj,
+        output_scale,
     }
 }
 
@@ -1360,6 +1973,7 @@ fn load_managed_image_model_burnpack_with_device<B: Backend>(
     device: &B::Device,
 ) -> eyre::Result<Waifu2xPatchStem<B>> {
     let known = known_image_model(model_name).ok_or_else(|| unknown_model_error(model_name))?;
+    ensure_image_model_runtime_is_implemented(known, "load")?;
     let model_dir = managed_image_model_dir(cache_home, known.name);
     let status = inspect_image_model_dir(known.name, &model_dir);
     if !matches!(status.state, ImageModelPreparationState::Prepared) {
@@ -1370,7 +1984,8 @@ fn load_managed_image_model_burnpack_with_device<B: Backend>(
         );
     }
     let burnpack_path = image_model_burnpack_path(&model_dir);
-    let mut model = init_waifu2x_art_2x_probe_model::<B>(device);
+    let output_scale = waifu2x_output_scale_for_architecture(known.architecture)?;
+    let mut model = init_waifu2x_probe_model::<B>(device, output_scale);
     let mut store = BurnpackStore::from_file(&burnpack_path).allow_partial(true);
     let result = model.load_from(&mut store).wrap_err_with(|| {
         format!(
@@ -1897,21 +2512,50 @@ fn flush_waifu2x_tile_batch<B: Backend>(
             [actual_batch, channels, output_height, output_width]
         );
     }
-    if output_height != config.model_output_size || output_width != config.model_output_size {
+    eyre::ensure!(
+        config
+            .output_tile_step
+            .is_multiple_of(config.input_tile_step),
+        "waifu2x tiled inference expected output tile step {} to be a multiple of input tile step {}",
+        config.output_tile_step,
+        config.input_tile_step
+    );
+    let logical_scale = config.output_tile_step / config.input_tile_step;
+    eyre::ensure!(
+        model.output_scale >= logical_scale && model.output_scale.is_multiple_of(logical_scale),
+        "waifu2x tiled inference expected model output scale {} to be a multiple of logical scale {}",
+        model.output_scale,
+        logical_scale
+    );
+    let downscale_factor = model.output_scale / logical_scale;
+    let runtime_output_size = config
+        .model_output_size
+        .checked_mul(downscale_factor)
+        .ok_or_else(|| eyre::eyre!("waifu2x tiled runtime output size overflowed usize"))?;
+    if output_height != runtime_output_size || output_width != runtime_output_size {
         bail!(
             "waifu2x tiled inference expected per-tile output {}x{}, got {}x{}",
-            config.model_output_size,
-            config.model_output_size,
+            runtime_output_size,
+            runtime_output_size,
             output_width,
             output_height
         );
     }
 
-    let output_values = output
+    let mut output_values = output
         .to_data()
         .to_vec::<f32>()
         .map_err(|error| eyre::eyre!("{error:?}"))
         .wrap_err("waifu2x tiled output tensor was not f32")?;
+    if downscale_factor > 1 {
+        output_values = downscale_rgb_chw_tile_batch(
+            &output_values,
+            batch_len,
+            runtime_output_size,
+            runtime_output_size,
+            downscale_factor,
+        )?;
+    }
     let tile_output_len = 3_usize
         .checked_mul(config.model_output_size)
         .and_then(|value| value.checked_mul(config.model_output_size))
@@ -2346,6 +2990,117 @@ fn collapse_rgb_chw_to_alpha_hw_mean(
     Ok(alpha)
 }
 
+fn downscale_rgb_chw_tile(
+    rgb_chw: &[f32],
+    width: usize,
+    height: usize,
+    downscale_factor: usize,
+) -> eyre::Result<Vec<f32>> {
+    eyre::ensure!(
+        downscale_factor > 0,
+        "waifu2x tile downscale factor must be greater than zero"
+    );
+    eyre::ensure!(
+        width.is_multiple_of(downscale_factor) && height.is_multiple_of(downscale_factor),
+        "waifu2x tile downscale expected {width}x{height} to be divisible by {downscale_factor}"
+    );
+    let pixel_count = width
+        .checked_mul(height)
+        .ok_or_else(|| eyre::eyre!("waifu2x tile downscale pixel count overflowed usize"))?;
+    if rgb_chw.len() != pixel_count * 3 {
+        bail!(
+            "waifu2x tile downscale expected {} RGB values for {}x{}, got {}",
+            pixel_count * 3,
+            width,
+            height,
+            rgb_chw.len()
+        );
+    }
+    let mut interleaved = vec![0.0_f32; rgb_chw.len()];
+    for row in 0..height {
+        for column in 0..width {
+            let pixel_index = row * width + column;
+            let interleaved_base = pixel_index * 3;
+            interleaved[interleaved_base] = rgb_chw[pixel_index];
+            interleaved[interleaved_base + 1] = rgb_chw[pixel_count + pixel_index];
+            interleaved[interleaved_base + 2] = rgb_chw[pixel_count * 2 + pixel_index];
+        }
+    }
+
+    let width_u32 = u32::try_from(width).wrap_err("waifu2x tile width does not fit in u32")?;
+    let height_u32 = u32::try_from(height).wrap_err("waifu2x tile height does not fit in u32")?;
+    let image = image::ImageBuffer::<image::Rgb<f32>, Vec<f32>>::from_raw(
+        width_u32,
+        height_u32,
+        interleaved,
+    )
+    .ok_or_else(|| eyre::eyre!("failed to assemble waifu2x RGB tile for downscale"))?;
+
+    let target_width = width / downscale_factor;
+    let target_height = height / downscale_factor;
+    let resized = image::imageops::resize(
+        &image,
+        u32::try_from(target_width).wrap_err("waifu2x target tile width does not fit in u32")?,
+        u32::try_from(target_height).wrap_err("waifu2x target tile height does not fit in u32")?,
+        image::imageops::FilterType::CatmullRom,
+    );
+    let resized_raw = resized.into_raw();
+    let target_pixel_count = target_width
+        .checked_mul(target_height)
+        .ok_or_else(|| eyre::eyre!("waifu2x target tile pixel count overflowed usize"))?;
+    let mut output = vec![0.0_f32; target_pixel_count * 3];
+    for row in 0..target_height {
+        for column in 0..target_width {
+            let pixel_index = row * target_width + column;
+            let interleaved_base = pixel_index * 3;
+            output[pixel_index] = resized_raw[interleaved_base];
+            output[target_pixel_count + pixel_index] = resized_raw[interleaved_base + 1];
+            output[target_pixel_count * 2 + pixel_index] = resized_raw[interleaved_base + 2];
+        }
+    }
+    Ok(output)
+}
+
+fn downscale_rgb_chw_tile_batch(
+    batch_rgb_chw: &[f32],
+    batch_len: usize,
+    width: usize,
+    height: usize,
+    downscale_factor: usize,
+) -> eyre::Result<Vec<f32>> {
+    let tile_len = width
+        .checked_mul(height)
+        .and_then(|value| value.checked_mul(3))
+        .ok_or_else(|| eyre::eyre!("waifu2x tile batch length overflowed usize"))?;
+    if batch_rgb_chw.len() != tile_len * batch_len {
+        bail!(
+            "waifu2x tile batch downscale expected {} values for {} tiles of size {}x{}, got {}",
+            tile_len * batch_len,
+            batch_len,
+            width,
+            height,
+            batch_rgb_chw.len()
+        );
+    }
+
+    let target_tile_len = (width / downscale_factor)
+        .checked_mul(height / downscale_factor)
+        .and_then(|value| value.checked_mul(3))
+        .ok_or_else(|| eyre::eyre!("waifu2x target tile batch length overflowed usize"))?;
+    let mut output = Vec::with_capacity(target_tile_len * batch_len);
+    for batch_index in 0..batch_len {
+        let start = batch_index * tile_len;
+        let end = start + tile_len;
+        output.extend(downscale_rgb_chw_tile(
+            &batch_rgb_chw[start..end],
+            width,
+            height,
+            downscale_factor,
+        )?);
+    }
+    Ok(output)
+}
+
 fn find_valid_waifu2x_tile_size(base_tile_size: u32) -> eyre::Result<u32> {
     let mut tile_size = base_tile_size;
     while tile_size > 0 {
@@ -2388,59 +3143,7 @@ fn choose_waifu2x_tile_size(
 }
 
 fn build_waifu2x_checkpoint_store(checkpoint_path: &Path) -> PytorchStore {
-    PytorchStore::from_file(checkpoint_path)
-        .with_top_level_key("state_dict")
-        .with_regex(r"^(unet\.patch\.(0|2)|unet\.down(1|2)\.conv)\.(weight|bias)$|^unet\.swin(1|2)\.block\.(0|1)\.(attn\.(qkv|proj)|mlp\.(0|3))\.(weight|bias)$|^unet\.swin(1|2)\.block\.(0|1)\.attn\.relative_position_(bias_table|index)$|^unet\.swin3\.block\.[0-5]\.(attn\.(qkv|proj)|mlp\.(0|3))\.(weight|bias)$|^unet\.swin3\.block\.[0-5]\.attn\.relative_position_(bias_table|index)$|^unet\.swin4\.block\.(0|1)\.(attn\.(qkv|proj)|mlp\.(0|3))\.(weight|bias)$|^unet\.swin4\.block\.(0|1)\.attn\.relative_position_(bias_table|index)$|^unet\.swin5\.block\.(0|1)\.(attn\.(qkv|proj)|mlp\.(0|3))\.(weight|bias)$|^unet\.swin5\.block\.(0|1)\.attn\.relative_position_(bias_table|index)$|^(unet\.(up1|up2|to_image)\.proj)\.(weight|bias)$")
-        .with_key_remapping(r"^unet\.patch\.0\.", "patch0.")
-        .with_key_remapping(r"^unet\.patch\.2\.", "patch2.")
-        .with_key_remapping(r"^unet\.down1\.conv\.", "down1_conv.")
-        .with_key_remapping(r"^unet\.down2\.conv\.", "down2_conv.")
-        .with_key_remapping(r"^unet\.swin1\.block\.0\.attn\.", "block0.attn.")
-        .with_key_remapping(r"^unet\.swin1\.block\.0\.mlp\.0\.", "block0.mlp.lin0.")
-        .with_key_remapping(r"^unet\.swin1\.block\.0\.mlp\.3\.", "block0.mlp.lin3.")
-        .with_key_remapping(r"^unet\.swin1\.block\.1\.attn\.", "block1.attn.")
-        .with_key_remapping(r"^unet\.swin1\.block\.1\.mlp\.0\.", "block1.mlp.lin0.")
-        .with_key_remapping(r"^unet\.swin1\.block\.1\.mlp\.3\.", "block1.mlp.lin3.")
-        .with_key_remapping(r"^unet\.swin2\.block\.0\.attn\.", "stage2_block0.attn.")
-        .with_key_remapping(r"^unet\.swin2\.block\.0\.mlp\.0\.", "stage2_block0.mlp.lin0.")
-        .with_key_remapping(r"^unet\.swin2\.block\.0\.mlp\.3\.", "stage2_block0.mlp.lin3.")
-        .with_key_remapping(r"^unet\.swin2\.block\.1\.attn\.", "stage2_block1.attn.")
-        .with_key_remapping(r"^unet\.swin2\.block\.1\.mlp\.0\.", "stage2_block1.mlp.lin0.")
-        .with_key_remapping(r"^unet\.swin2\.block\.1\.mlp\.3\.", "stage2_block1.mlp.lin3.")
-        .with_key_remapping(r"^unet\.swin3\.block\.0\.attn\.", "stage3_block0.attn.")
-        .with_key_remapping(r"^unet\.swin3\.block\.0\.mlp\.0\.", "stage3_block0.mlp.lin0.")
-        .with_key_remapping(r"^unet\.swin3\.block\.0\.mlp\.3\.", "stage3_block0.mlp.lin3.")
-        .with_key_remapping(r"^unet\.swin3\.block\.1\.attn\.", "stage3_block1.attn.")
-        .with_key_remapping(r"^unet\.swin3\.block\.1\.mlp\.0\.", "stage3_block1.mlp.lin0.")
-        .with_key_remapping(r"^unet\.swin3\.block\.1\.mlp\.3\.", "stage3_block1.mlp.lin3.")
-        .with_key_remapping(r"^unet\.swin3\.block\.2\.attn\.", "stage3_block2.attn.")
-        .with_key_remapping(r"^unet\.swin3\.block\.2\.mlp\.0\.", "stage3_block2.mlp.lin0.")
-        .with_key_remapping(r"^unet\.swin3\.block\.2\.mlp\.3\.", "stage3_block2.mlp.lin3.")
-        .with_key_remapping(r"^unet\.swin3\.block\.3\.attn\.", "stage3_block3.attn.")
-        .with_key_remapping(r"^unet\.swin3\.block\.3\.mlp\.0\.", "stage3_block3.mlp.lin0.")
-        .with_key_remapping(r"^unet\.swin3\.block\.3\.mlp\.3\.", "stage3_block3.mlp.lin3.")
-        .with_key_remapping(r"^unet\.swin3\.block\.4\.attn\.", "stage3_block4.attn.")
-        .with_key_remapping(r"^unet\.swin3\.block\.4\.mlp\.0\.", "stage3_block4.mlp.lin0.")
-        .with_key_remapping(r"^unet\.swin3\.block\.4\.mlp\.3\.", "stage3_block4.mlp.lin3.")
-        .with_key_remapping(r"^unet\.swin3\.block\.5\.attn\.", "stage3_block5.attn.")
-        .with_key_remapping(r"^unet\.swin3\.block\.5\.mlp\.0\.", "stage3_block5.mlp.lin0.")
-        .with_key_remapping(r"^unet\.swin3\.block\.5\.mlp\.3\.", "stage3_block5.mlp.lin3.")
-        .with_key_remapping(r"^unet\.swin4\.block\.0\.attn\.", "stage4_block0.attn.")
-        .with_key_remapping(r"^unet\.swin4\.block\.0\.mlp\.0\.", "stage4_block0.mlp.lin0.")
-        .with_key_remapping(r"^unet\.swin4\.block\.0\.mlp\.3\.", "stage4_block0.mlp.lin3.")
-        .with_key_remapping(r"^unet\.swin4\.block\.1\.attn\.", "stage4_block1.attn.")
-        .with_key_remapping(r"^unet\.swin4\.block\.1\.mlp\.0\.", "stage4_block1.mlp.lin0.")
-        .with_key_remapping(r"^unet\.swin4\.block\.1\.mlp\.3\.", "stage4_block1.mlp.lin3.")
-        .with_key_remapping(r"^unet\.swin5\.block\.0\.attn\.", "stage5_block0.attn.")
-        .with_key_remapping(r"^unet\.swin5\.block\.0\.mlp\.0\.", "stage5_block0.mlp.lin0.")
-        .with_key_remapping(r"^unet\.swin5\.block\.0\.mlp\.3\.", "stage5_block0.mlp.lin3.")
-        .with_key_remapping(r"^unet\.swin5\.block\.1\.attn\.", "stage5_block1.attn.")
-        .with_key_remapping(r"^unet\.swin5\.block\.1\.mlp\.0\.", "stage5_block1.mlp.lin0.")
-        .with_key_remapping(r"^unet\.swin5\.block\.1\.mlp\.3\.", "stage5_block1.mlp.lin3.")
-        .with_key_remapping(r"^unet\.up1\.proj\.", "up1_proj.")
-        .with_key_remapping(r"^unet\.up2\.proj\.", "up2_proj.")
-        .with_key_remapping(r"^unet\.to_image\.proj\.", "to_image_proj.")
-        .allow_partial(true)
+    configure_waifu2x_checkpoint_store(PytorchStore::from_file(checkpoint_path))
 }
 
 fn checkpoint_tensor_preview(
@@ -2826,6 +3529,18 @@ fn inspect_image_model_burn_load_probe(
         stage5_block1_index,
         "unet.swin5.block.1.attn.relative_position_index",
     )?;
+    let output_scale = waifu2x_output_scale_from_checkpoint_reader(&reader);
+    let proj2 = if output_scale == 4 {
+        Some(required_checkpoint_snapshot(
+            &reader,
+            WAIFU2X_PROJ2_WEIGHT_KEY,
+        )?)
+    } else {
+        None
+    };
+    let proj2_weight_shape = proj2
+        .map(|snapshot| tensor_shape_u64(snapshot, WAIFU2X_PROJ2_WEIGHT_KEY))
+        .transpose()?;
     let up1_proj_weight_shape = tensor_shape_u64(up1_proj, "unet.up1.proj.weight")?;
     let up2_proj_weight_shape = tensor_shape_u64(up2_proj, "unet.up2.proj.weight")?;
     let to_image_proj_weight_shape = tensor_shape_u64(to_image_proj, "unet.to_image.proj.weight")?;
@@ -3081,137 +3796,17 @@ fn inspect_image_model_burn_load_probe(
                 lin3: linear_from_weight_snapshot(stage5_block1_mlp3, &device)?,
             },
         },
+        proj2: proj2
+            .map(|weight| linear_from_weight_snapshot(weight, &device))
+            .transpose()?,
         up1_proj: linear_from_weight_snapshot(up1_proj, &device)?,
         up2_proj: linear_from_weight_snapshot(up2_proj, &device)?,
         to_image_proj: linear_from_weight_snapshot(to_image_proj, &device)?,
+        output_scale,
     };
 
-    let checkpoint_filter_regex = r"^(unet\.patch\.(0|2)|unet\.down(1|2)\.conv)\.(weight|bias)$|^unet\.swin(1|2)\.block\.(0|1)\.(attn\.(qkv|proj)|mlp\.(0|3))\.(weight|bias)$|^unet\.swin(1|2)\.block\.(0|1)\.attn\.relative_position_(bias_table|index)$|^unet\.swin3\.block\.[0-5]\.(attn\.(qkv|proj)|mlp\.(0|3))\.(weight|bias)$|^unet\.swin3\.block\.[0-5]\.attn\.relative_position_(bias_table|index)$|^unet\.swin4\.block\.(0|1)\.(attn\.(qkv|proj)|mlp\.(0|3))\.(weight|bias)$|^unet\.swin4\.block\.(0|1)\.attn\.relative_position_(bias_table|index)$|^unet\.swin5\.block\.(0|1)\.(attn\.(qkv|proj)|mlp\.(0|3))\.(weight|bias)$|^unet\.swin5\.block\.(0|1)\.attn\.relative_position_(bias_table|index)$|^(unet\.(up1|up2|to_image)\.proj)\.(weight|bias)$".to_owned();
-    let mut store = PytorchStore::from_file(checkpoint_path)
-        .with_top_level_key("state_dict")
-        .with_regex(&checkpoint_filter_regex)
-        .with_key_remapping(r"^unet\.patch\.0\.", "patch0.")
-        .with_key_remapping(r"^unet\.patch\.2\.", "patch2.")
-        .with_key_remapping(r"^unet\.down1\.conv\.", "down1_conv.")
-        .with_key_remapping(r"^unet\.down2\.conv\.", "down2_conv.")
-        .with_key_remapping(r"^unet\.swin1\.block\.0\.attn\.", "block0.attn.")
-        .with_key_remapping(r"^unet\.swin1\.block\.0\.mlp\.0\.", "block0.mlp.lin0.")
-        .with_key_remapping(r"^unet\.swin1\.block\.0\.mlp\.3\.", "block0.mlp.lin3.")
-        .with_key_remapping(r"^unet\.swin1\.block\.1\.attn\.", "block1.attn.")
-        .with_key_remapping(r"^unet\.swin1\.block\.1\.mlp\.0\.", "block1.mlp.lin0.")
-        .with_key_remapping(r"^unet\.swin1\.block\.1\.mlp\.3\.", "block1.mlp.lin3.")
-        .with_key_remapping(r"^unet\.swin2\.block\.0\.attn\.", "stage2_block0.attn.")
-        .with_key_remapping(
-            r"^unet\.swin2\.block\.0\.mlp\.0\.",
-            "stage2_block0.mlp.lin0.",
-        )
-        .with_key_remapping(
-            r"^unet\.swin2\.block\.0\.mlp\.3\.",
-            "stage2_block0.mlp.lin3.",
-        )
-        .with_key_remapping(r"^unet\.swin2\.block\.1\.attn\.", "stage2_block1.attn.")
-        .with_key_remapping(
-            r"^unet\.swin2\.block\.1\.mlp\.0\.",
-            "stage2_block1.mlp.lin0.",
-        )
-        .with_key_remapping(
-            r"^unet\.swin2\.block\.1\.mlp\.3\.",
-            "stage2_block1.mlp.lin3.",
-        )
-        .with_key_remapping(r"^unet\.swin3\.block\.0\.attn\.", "stage3_block0.attn.")
-        .with_key_remapping(
-            r"^unet\.swin3\.block\.0\.mlp\.0\.",
-            "stage3_block0.mlp.lin0.",
-        )
-        .with_key_remapping(
-            r"^unet\.swin3\.block\.0\.mlp\.3\.",
-            "stage3_block0.mlp.lin3.",
-        )
-        .with_key_remapping(r"^unet\.swin3\.block\.1\.attn\.", "stage3_block1.attn.")
-        .with_key_remapping(
-            r"^unet\.swin3\.block\.1\.mlp\.0\.",
-            "stage3_block1.mlp.lin0.",
-        )
-        .with_key_remapping(
-            r"^unet\.swin3\.block\.1\.mlp\.3\.",
-            "stage3_block1.mlp.lin3.",
-        )
-        .with_key_remapping(r"^unet\.swin3\.block\.2\.attn\.", "stage3_block2.attn.")
-        .with_key_remapping(
-            r"^unet\.swin3\.block\.2\.mlp\.0\.",
-            "stage3_block2.mlp.lin0.",
-        )
-        .with_key_remapping(
-            r"^unet\.swin3\.block\.2\.mlp\.3\.",
-            "stage3_block2.mlp.lin3.",
-        )
-        .with_key_remapping(r"^unet\.swin3\.block\.3\.attn\.", "stage3_block3.attn.")
-        .with_key_remapping(
-            r"^unet\.swin3\.block\.3\.mlp\.0\.",
-            "stage3_block3.mlp.lin0.",
-        )
-        .with_key_remapping(
-            r"^unet\.swin3\.block\.3\.mlp\.3\.",
-            "stage3_block3.mlp.lin3.",
-        )
-        .with_key_remapping(r"^unet\.swin3\.block\.4\.attn\.", "stage3_block4.attn.")
-        .with_key_remapping(
-            r"^unet\.swin3\.block\.4\.mlp\.0\.",
-            "stage3_block4.mlp.lin0.",
-        )
-        .with_key_remapping(
-            r"^unet\.swin3\.block\.4\.mlp\.3\.",
-            "stage3_block4.mlp.lin3.",
-        )
-        .with_key_remapping(r"^unet\.swin3\.block\.5\.attn\.", "stage3_block5.attn.")
-        .with_key_remapping(
-            r"^unet\.swin3\.block\.5\.mlp\.0\.",
-            "stage3_block5.mlp.lin0.",
-        )
-        .with_key_remapping(
-            r"^unet\.swin3\.block\.5\.mlp\.3\.",
-            "stage3_block5.mlp.lin3.",
-        )
-        .with_key_remapping(r"^unet\.swin4\.block\.0\.attn\.", "stage4_block0.attn.")
-        .with_key_remapping(
-            r"^unet\.swin4\.block\.0\.mlp\.0\.",
-            "stage4_block0.mlp.lin0.",
-        )
-        .with_key_remapping(
-            r"^unet\.swin4\.block\.0\.mlp\.3\.",
-            "stage4_block0.mlp.lin3.",
-        )
-        .with_key_remapping(r"^unet\.swin4\.block\.1\.attn\.", "stage4_block1.attn.")
-        .with_key_remapping(
-            r"^unet\.swin4\.block\.1\.mlp\.0\.",
-            "stage4_block1.mlp.lin0.",
-        )
-        .with_key_remapping(
-            r"^unet\.swin4\.block\.1\.mlp\.3\.",
-            "stage4_block1.mlp.lin3.",
-        )
-        .with_key_remapping(r"^unet\.swin5\.block\.0\.attn\.", "stage5_block0.attn.")
-        .with_key_remapping(
-            r"^unet\.swin5\.block\.0\.mlp\.0\.",
-            "stage5_block0.mlp.lin0.",
-        )
-        .with_key_remapping(
-            r"^unet\.swin5\.block\.0\.mlp\.3\.",
-            "stage5_block0.mlp.lin3.",
-        )
-        .with_key_remapping(r"^unet\.swin5\.block\.1\.attn\.", "stage5_block1.attn.")
-        .with_key_remapping(
-            r"^unet\.swin5\.block\.1\.mlp\.0\.",
-            "stage5_block1.mlp.lin0.",
-        )
-        .with_key_remapping(
-            r"^unet\.swin5\.block\.1\.mlp\.3\.",
-            "stage5_block1.mlp.lin3.",
-        )
-        .with_key_remapping(r"^unet\.up1\.proj\.", "up1_proj.")
-        .with_key_remapping(r"^unet\.up2\.proj\.", "up2_proj.")
-        .with_key_remapping(r"^unet\.to_image\.proj\.", "to_image_proj.")
-        .allow_partial(true);
+    let checkpoint_filter_regex = WAIFU2X_CHECKPOINT_FILTER_REGEX.to_owned();
+    let mut store = configure_waifu2x_checkpoint_store(PytorchStore::from_file(checkpoint_path));
     let result = probe.load_from(&mut store).wrap_err_with(|| {
         format!(
             "failed to run waifu2x Burn patch/down1/swin-block load probe from {}",
@@ -3373,6 +3968,8 @@ fn inspect_image_model_burn_load_probe(
                     | "unet.swin5.block.1.mlp.0.bias"
                     | "unet.swin5.block.1.mlp.3.weight"
                     | "unet.swin5.block.1.mlp.3.bias"
+                    | "unet.proj2.weight"
+                    | "unet.proj2.bias"
                     | "unet.up1.proj.weight"
                     | "unet.up1.proj.bias"
                     | "unet.up2.proj.weight"
@@ -3386,6 +3983,7 @@ fn inspect_image_model_burn_load_probe(
 
     Ok(Some(ImageModelCheckpointBurnLoadProbeReport {
         module_name: "waifu2x.full-checkpoint-probe".to_owned(),
+        output_scale: output_scale as u64,
         checkpoint_filter_regex,
         matched_checkpoint_keys,
         patch0_weight_shape,
@@ -3434,6 +4032,7 @@ fn inspect_image_model_burn_load_probe(
         swin5_block1_qkv_weight_shape,
         swin5_block1_relative_position_bias_table_shape,
         swin5_block1_relative_position_index_shape,
+        proj2_weight_shape,
         up1_proj_weight_shape,
         up2_proj_weight_shape,
         to_image_proj_weight_shape,
@@ -3579,6 +4178,23 @@ fn write_image_model_metadata(path: &Path, metadata: &ImageModelMetadata) -> eyr
     std::fs::write(path, format!("{json}\n"))
         .wrap_err_with(|| format!("failed to write image model metadata {}", path.display()))?;
     Ok(())
+}
+
+fn ensure_image_model_runtime_is_implemented(
+    known: &KnownImageModel,
+    action: &str,
+) -> eyre::Result<()> {
+    if known.teamy_runtime_status == IMAGE_MODEL_RUNTIME_STATUS_IMPLEMENTED {
+        return Ok(());
+    }
+
+    bail!(
+        "image model `{}` is {} and cannot be {} yet: {}",
+        known.name,
+        known.teamy_runtime_status,
+        action,
+        known.teamy_runtime_notes
+    )
 }
 
 fn ensure_image_model_source_artifacts(
@@ -3781,7 +4397,10 @@ fn read_image_model_metadata(path: &Path) -> eyre::Result<ImageModelMetadata> {
         model_name: read_string_field(&value, "model_name")?,
         family: read_string_field(&value, "family")?,
         style: read_string_field(&value, "style")?,
+        method: read_string_field(&value, "method")?,
+        noise_level: read_optional_u8_field(&value, "noise_level")?,
         scale: read_u8_field(&value, "scale")?,
+        native_scale: read_u8_field(&value, "native_scale")?,
         architecture: read_string_field(&value, "architecture")?,
         source_archive_url: read_string_field(&value, "source_archive_url")?,
         source_archive_version: read_string_field(&value, "source_archive_version")?,
@@ -3792,8 +4411,10 @@ fn read_image_model_metadata(path: &Path) -> eyre::Result<ImageModelMetadata> {
         default_batch_size: read_u32_field(&value, "default_batch_size")?,
         input_channels: read_u32_field(&value, "input_channels")?,
         output_channels: read_u32_field(&value, "output_channels")?,
-        parameter_count: read_u64_field(&value, "parameter_count")?,
+        parameter_count: read_optional_u64_field(&value, "parameter_count")?,
         alpha_behavior: read_string_field(&value, "alpha_behavior")?,
+        teamy_runtime_status: read_string_field(&value, "teamy_runtime_status")?,
+        teamy_runtime_notes: read_string_field(&value, "teamy_runtime_notes")?,
     })
 }
 
@@ -3817,6 +4438,15 @@ fn read_u8_field(value: &serde_json::Value, field: &str) -> eyre::Result<u8> {
         .wrap_err_with(|| format!("image model metadata field `{field}` must fit in u8"))
 }
 
+fn read_optional_u8_field(value: &serde_json::Value, field: &str) -> eyre::Result<Option<u8>> {
+    read_optional_u64_field(value, field)?
+        .map(|number| {
+            u8::try_from(number)
+                .wrap_err_with(|| format!("image model metadata field `{field}` must fit in u8"))
+        })
+        .transpose()
+}
+
 fn read_u32_field(value: &serde_json::Value, field: &str) -> eyre::Result<u32> {
     let number = read_u64_field(value, field)?;
     u32::try_from(number)
@@ -3828,6 +4458,15 @@ fn read_u64_field(value: &serde_json::Value, field: &str) -> eyre::Result<u64> {
         .get(field)
         .and_then(serde_json::Value::as_u64)
         .ok_or_else(|| eyre::eyre!("image model metadata field `{field}` must be an integer"))
+}
+
+fn read_optional_u64_field(value: &serde_json::Value, field: &str) -> eyre::Result<Option<u64>> {
+    match value.get(field) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(number) => number.as_u64().map(Some).ok_or_else(|| {
+            eyre::eyre!("image model metadata field `{field}` must be an integer or null")
+        }),
+    }
 }
 
 fn unknown_model_error(model_name: &str) -> eyre::Report {
@@ -3844,6 +4483,43 @@ fn unknown_model_error(model_name: &str) -> eyre::Report {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn known_image_models_include_art_denoise_inventory() {
+        let model = known_image_model("waifu2x-art-denoise-3-4x").expect("known model");
+
+        assert_eq!(model.family, "waifu2x");
+        assert_eq!(model.style, "art");
+        assert_eq!(model.method, "noise_scale4x");
+        assert_eq!(model.noise_level, Some(3));
+        assert_eq!(model.scale, 4);
+        assert_eq!(model.native_scale, 4);
+        assert_eq!(model.architecture, "waifu2x.swin_unet_4x");
+        assert_eq!(
+            model.source_checkpoint_path,
+            "pretrained_models/swin_unet/art/noise3_scale4x.pth"
+        );
+        assert_eq!(
+            model.teamy_runtime_status,
+            IMAGE_MODEL_RUNTIME_STATUS_IMPLEMENTED
+        );
+        assert_eq!(model.model_offset, 32);
+        assert_eq!(model.blend_size, 16);
+    }
+
+    #[test]
+    fn prepare_rejects_inventory_only_models_before_touching_cache() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let cache_home = CacheHome(temp.path().to_path_buf());
+
+        let error = prepare_image_model(&cache_home, "waifu2x-art-denoise-0", false)
+            .expect_err("inventory-only model should not prepare yet");
+        let error_text = format!("{error:#}");
+
+        assert!(error_text.contains("inventory-only"));
+        assert!(error_text.contains("cannot be prepare yet"));
+        assert!(!managed_image_model_dir(&cache_home, "waifu2x-art-denoise-0").exists());
+    }
 
     #[test]
     fn validated_relative_path_rejects_escape_components() {
@@ -3880,9 +4556,28 @@ mod tests {
     }
 
     #[test]
+    fn waifu2x_checkpoint_scale_detection_distinguishes_2x_and_4x() {
+        assert_eq!(
+            waifu2x_output_scale_from_checkpoint_keys([
+                "unet.patch.0.weight",
+                "unet.to_image.proj.weight",
+            ]),
+            2
+        );
+        assert_eq!(
+            waifu2x_output_scale_from_checkpoint_keys([
+                "unet.patch.0.weight",
+                WAIFU2X_PROJ2_WEIGHT_KEY,
+                "unet.to_image.proj.weight",
+            ]),
+            4
+        );
+    }
+
+    #[test]
     fn waifu2x_forward_preserves_the_known_2x_shape_contract() {
         let device = Default::default();
-        let model = init_waifu2x_art_2x_probe_model::<Waifu2xProbeBackend>(&device);
+        let model = init_waifu2x_probe_model::<Waifu2xProbeBackend>(&device, 2);
         let values = (0..(64 * 64 * 3))
             .map(|value| (value % 257) as f32 / 256.0)
             .collect::<Vec<_>>();
@@ -3897,9 +4592,26 @@ mod tests {
     }
 
     #[test]
+    fn waifu2x_forward_preserves_the_known_4x_shape_contract() {
+        let device = Default::default();
+        let model = init_waifu2x_probe_model::<Waifu2xProbeBackend>(&device, 4);
+        let values = (0..(64 * 64 * 3))
+            .map(|value| (value % 257) as f32 / 256.0)
+            .collect::<Vec<_>>();
+        let input = Tensor::<Waifu2xProbeBackend, 4>::from_data(
+            TensorData::new(values, [1, 3, 64, 64]),
+            &device,
+        );
+
+        let output = model.forward(input);
+
+        assert_eq!(output.dims(), [1, 3, 192, 192]);
+    }
+
+    #[test]
     fn waifu2x_tiled_inference_handles_sizes_the_untiled_path_rejected() {
         let device = Default::default();
-        let model = init_waifu2x_art_2x_probe_model::<Waifu2xProbeBackend>(&device);
+        let model = init_waifu2x_probe_model::<Waifu2xProbeBackend>(&device, 2);
         let values = (0..(100 * 100 * 3))
             .map(|value| (value % 257) as f32 / 256.0)
             .collect::<Vec<_>>();
