@@ -11,7 +11,10 @@ image[cli.upscale-command]
 The `image` command group must expose an `upscale` subcommand that accepts one input image path and an optional output path.
 
 image[cli.upscale-defaults]
-The `image upscale` command must default to style `art`, scale `2`, tile size `256`, batch size `4`, device `cuda`, and output format `auto`.
+The `image upscale` command must default to preset `quality`, style `art`, scale `2`, tile size `256`, batch size `4`, device `cuda`, and output format `auto`.
+
+image[cli.quality-preset-default]
+The `image upscale` command must default to preset `quality` so quality-oriented optional settings stay enabled unless the user explicitly asks for a different preset.
 
 image[cli.model-selection]
 The `image upscale` command must resolve its managed image model from the CLI request shape, including style and optional denoise noise level, instead of hard-coding one checkpoint for every request.
@@ -24,6 +27,21 @@ For `style = art`, when `--noise-level` is omitted, `image upscale` must default
 
 image[cli.art-disable-denoise]
 For `style = art`, `image upscale --disable-denoise` must opt out of the default low-denoise preset and resolve the scale-only managed art model instead.
+
+image[cli.fast-preset]
+For `style = art`, `image upscale --preset fast` must change the preset-derived default from low-denoise art to the scale-only managed art model when no explicit denoise override is supplied.
+
+image[cli.preset-seeds-optional-defaults]
+The image-upscale preset must seed the defaults for optional image-quality/runtime flags, but explicit flags such as `--noise-level`, `--disable-denoise`, `--tta`, or `--disable-tta` must still override preset-derived defaults.
+
+image[cli.tta]
+The `image upscale` command must expose `--tta` so users can force test-time augmentation on for a single still-image invocation.
+
+image[cli.disable-tta]
+The `image upscale` command must expose `--disable-tta` so users can force test-time augmentation off even when the active preset would normally enable it.
+
+image[cli.quality-preset-tta]
+When `image upscale` runs with preset `quality` and no explicit TTA override, TTA must be enabled by default so the default image path favors maximum still-image quality.
 
 image[cli.art-native-4x]
 For `style = art`, when the requested upscale factor is a power of 4, `image upscale` must prefer the native managed `scale4x` or `noise_scale4x` model instead of always repeating 2x passes.
@@ -72,6 +90,9 @@ Normal image upscale runtime and model preparation must use Rust and Burn rather
 
 image[runtime.tiled-inference]
 Image upscaling must use tiled inference with nunif-compatible model offset and blend semantics.
+
+image[runtime.tta]
+When TTA is enabled, image upscaling must run the supported geometric self-ensemble variants for each tile, restore them to the original orientation, and average them before normal tile writeback.
 
 image[runtime.nunif-alpha-behavior]
 Image upscaling must preserve nunif-compatible alpha behavior for non-opaque and opaque alpha channels.

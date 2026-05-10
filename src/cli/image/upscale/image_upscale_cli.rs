@@ -12,6 +12,7 @@ pub const DEFAULT_IMAGE_UPSCALE_TILE_SIZE: u32 = 256;
 pub const DEFAULT_IMAGE_UPSCALE_BATCH_SIZE: u32 = 4;
 pub const DEFAULT_IMAGE_UPSCALE_DEVICE: ImageUpscaleDevice = ImageUpscaleDevice::Cuda;
 pub const DEFAULT_IMAGE_UPSCALE_OUTPUT_FORMAT: ImageOutputFormat = ImageOutputFormat::Auto;
+pub const DEFAULT_IMAGE_UPSCALE_PRESET: ImageUpscalePreset = ImageUpscalePreset::Quality;
 
 /// Image upscale style.
 #[derive(Facet, Arbitrary, Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -32,6 +33,34 @@ impl ImageUpscaleStyle {
             Self::Art => "art",
             Self::Photo => "photo",
             Self::Scan | Self::ArtScan => "art_scan",
+        }
+    }
+}
+
+/// Image upscale quality/runtime preset.
+#[derive(Facet, Arbitrary, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[facet(rename_all = "kebab-case")]
+#[repr(u8)]
+pub enum ImageUpscalePreset {
+    #[default]
+    Quality,
+    Fast,
+}
+
+impl ImageUpscalePreset {
+    #[must_use]
+    const fn default_art_noise_level(self) -> Option<u8> {
+        match self {
+            Self::Quality => Some(0),
+            Self::Fast => None,
+        }
+    }
+
+    #[must_use]
+    const fn default_tta_enabled(self) -> bool {
+        match self {
+            Self::Quality => true,
+            Self::Fast => false,
         }
     }
 }
@@ -151,6 +180,12 @@ pub struct ImageUpscaleArgs {
     #[facet(args::positional)]
     pub output_path: Option<String>,
 
+    /// Quality/runtime preset that seeds optional image-upscale defaults.
+    // image[impl cli.upscale-defaults]
+    // image[impl cli.quality-preset-default]
+    #[facet(args::named, default = DEFAULT_IMAGE_UPSCALE_PRESET)]
+    pub preset: ImageUpscalePreset,
+
     /// Upscale style to use.
     // image[impl cli.upscale-defaults]
     #[facet(args::named, default = DEFAULT_IMAGE_UPSCALE_STYLE)]
@@ -168,6 +203,16 @@ pub struct ImageUpscaleArgs {
     /// Disable the default low-denoise art preset and use the scale-only art model instead.
     #[facet(args::named, default)]
     pub disable_denoise: bool,
+
+    /// Force test-time augmentation on for image-quality self-ensemble inference.
+    // image[impl cli.tta]
+    #[facet(args::named, default)]
+    pub tta: bool,
+
+    /// Force test-time augmentation off even when the preset would enable it.
+    // image[impl cli.disable-tta]
+    #[facet(args::named, default)]
+    pub disable_tta: bool,
 
     /// Nunif-compatible tile size.
     // image[impl cli.upscale-defaults]
@@ -203,6 +248,7 @@ impl ImageUpscaleArgs {
         _app_home: &crate::paths::AppHome,
         cache_home: &crate::paths::CacheHome,
     ) -> eyre::Result<CliOutput> {
+        let tta_enabled = self.effective_tta_enabled()?;
         let output = self.resolve_output()?;
         let resolved_model = self.resolve_model()?;
         self.validate_supported_mvp_arguments(resolved_model)?;
@@ -256,6 +302,7 @@ impl ImageUpscaleArgs {
                         output_height,
                         self.tile_size,
                         self.batch_size,
+                        tta_enabled,
                     )?;
                     (
                         rgb_chw,
@@ -294,6 +341,7 @@ impl ImageUpscaleArgs {
                         output_height,
                         self.tile_size,
                         self.batch_size,
+                        tta_enabled,
                         &device,
                     )?;
                     (
@@ -349,9 +397,17 @@ impl ImageUpscaleArgs {
             blank_alpha: prepared_input.blank_alpha,
             alpha_preserved,
             runtime_mode: if ran_alpha_runtime {
-                "tiled-rgba".to_owned()
+                if tta_enabled {
+                    "tiled-rgba-tta".to_owned()
+                } else {
+                    "tiled-rgba".to_owned()
+                }
             } else {
-                "tiled-rgb-only".to_owned()
+                if tta_enabled {
+                    "tiled-rgb-only-tta".to_owned()
+                } else {
+                    "tiled-rgb-only".to_owned()
+                }
             },
         }))
     }
@@ -396,6 +452,9 @@ impl ImageUpscaleArgs {
     // image[impl cli.model-selection]
     // image[impl cli.art-default-low-denoise]
     // image[impl cli.art-disable-denoise]
+    // image[impl cli.fast-preset]
+    // image[impl cli.preset-seeds-optional-defaults]
+    // image[impl cli.quality-preset-tta]
     // image[impl cli.unsupported-model-selection]
     fn resolve_model(&self) -> eyre::Result<&'static crate::image_model::KnownImageModel> {
         ensure!(
@@ -405,6 +464,10 @@ impl ImageUpscaleArgs {
         ensure!(
             !(self.disable_denoise && self.noise_level.is_some()),
             "--disable-denoise cannot be combined with --noise-level"
+        );
+        ensure!(
+            !(self.tta && self.disable_tta),
+            "--tta cannot be combined with --disable-tta"
         );
         let effective_noise_level = self.effective_noise_level();
         let prefer_native_4x = self.prefers_native_4x_art_model();
@@ -433,9 +496,26 @@ impl ImageUpscaleArgs {
         if self.disable_denoise {
             None
         } else {
-            self.noise_level
-                .or_else(|| (self.style == ImageUpscaleStyle::Art).then_some(0))
+            self.noise_level.or_else(|| {
+                (self.style == ImageUpscaleStyle::Art)
+                    .then(|| self.preset.default_art_noise_level())
+                    .flatten()
+            })
         }
+    }
+
+    fn effective_tta_enabled(&self) -> eyre::Result<bool> {
+        ensure!(
+            !(self.tta && self.disable_tta),
+            "--tta cannot be combined with --disable-tta"
+        );
+        Ok(if self.tta {
+            true
+        } else if self.disable_tta {
+            false
+        } else {
+            self.preset.default_tta_enabled()
+        })
     }
 
     fn validate_supported_mvp_arguments(
@@ -820,10 +900,13 @@ mod tests {
         ImageUpscaleArgs {
             image_path: String::from(r"C:\images\input.png"),
             output_path: None,
+            preset: DEFAULT_IMAGE_UPSCALE_PRESET,
             style: DEFAULT_IMAGE_UPSCALE_STYLE,
             scale,
             noise_level: None,
             disable_denoise: false,
+            tta: false,
+            disable_tta: false,
             tile_size: DEFAULT_IMAGE_UPSCALE_TILE_SIZE,
             batch_size: DEFAULT_IMAGE_UPSCALE_BATCH_SIZE,
             device: ImageUpscaleDevice::Cuda,
@@ -892,6 +975,69 @@ mod tests {
         let model = args.resolve_model().expect("model");
 
         assert_eq!(model.name, crate::image_model::DEFAULT_IMAGE_MODEL_NAME);
+    }
+
+    #[test]
+    fn image_upscale_fast_preset_uses_scale_only_art_model_by_default() {
+        let mut args = sample_args(2);
+        args.preset = ImageUpscalePreset::Fast;
+
+        let model = args.resolve_model().expect("model");
+
+        assert_eq!(model.name, crate::image_model::DEFAULT_IMAGE_MODEL_NAME);
+    }
+
+    #[test]
+    fn image_upscale_quality_preset_enables_tta_by_default() {
+        let args = sample_args(2);
+
+        assert!(args.effective_tta_enabled().expect("tta default"));
+    }
+
+    #[test]
+    fn image_upscale_fast_preset_disables_tta_by_default() {
+        let mut args = sample_args(2);
+        args.preset = ImageUpscalePreset::Fast;
+
+        assert!(!args.effective_tta_enabled().expect("tta default"));
+    }
+
+    #[test]
+    fn image_upscale_explicit_tta_overrides_fast_preset() {
+        let mut args = sample_args(2);
+        args.preset = ImageUpscalePreset::Fast;
+        args.tta = true;
+
+        assert!(args.effective_tta_enabled().expect("tta override"));
+    }
+
+    #[test]
+    fn image_upscale_disable_tta_overrides_quality_preset() {
+        let mut args = sample_args(2);
+        args.disable_tta = true;
+
+        assert!(!args.effective_tta_enabled().expect("tta override"));
+    }
+
+    #[test]
+    fn image_upscale_fast_preset_uses_native_scale_only_art_4x_model_by_default() {
+        let mut args = sample_args(4);
+        args.preset = ImageUpscalePreset::Fast;
+
+        let model = args.resolve_model().expect("model");
+
+        assert_eq!(model.name, "waifu2x-art-4x");
+    }
+
+    #[test]
+    fn image_upscale_explicit_noise_level_overrides_fast_preset() {
+        let mut args = sample_args(2);
+        args.preset = ImageUpscalePreset::Fast;
+        args.noise_level = Some(3);
+
+        let model = args.resolve_model().expect("model");
+
+        assert_eq!(model.name, "waifu2x-art-denoise-3-2x");
     }
 
     #[test]
@@ -1006,6 +1152,23 @@ mod tests {
             error
                 .to_string()
                 .contains("--disable-denoise cannot be combined with --noise-level")
+        );
+    }
+
+    #[test]
+    fn image_upscale_rejects_tta_with_disable_tta() {
+        let mut args = sample_args(2);
+        args.tta = true;
+        args.disable_tta = true;
+
+        let error = args
+            .effective_tta_enabled()
+            .expect_err("tta and disable-tta should conflict");
+
+        assert!(
+            error
+                .to_string()
+                .contains("--tta cannot be combined with --disable-tta")
         );
     }
 }

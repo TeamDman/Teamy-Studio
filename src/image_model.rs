@@ -596,6 +596,50 @@ pub(crate) type Waifu2xInferenceBackend = Cuda<f32, i32>;
 type Waifu2xProbeBackend = Waifu2xCpuBackend;
 type Waifu2xUpscaledImage = (Vec<f32>, Option<Vec<f32>>, u32, u32, u32);
 
+const WAIFU2X_TTA_TRANSFORM_COUNT: usize = 8;
+const WAIFU2X_TTA_TRANSFORM_COUNT_F32: f32 = 8.0;
+#[cfg(test)]
+const TEAMY_STUDIO_FULL_CHECK_ENV_VAR: &str = "TEAMY_STUDIO_FULL_CHECK";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Waifu2xTtaTransform {
+    Identity,
+    Rotate90,
+    Rotate180,
+    Rotate270,
+    FlipHorizontal,
+    FlipVertical,
+    Transpose,
+    Transverse,
+}
+
+const WAIFU2X_TTA_TRANSFORMS: [Waifu2xTtaTransform; WAIFU2X_TTA_TRANSFORM_COUNT] = [
+    Waifu2xTtaTransform::Identity,
+    Waifu2xTtaTransform::Rotate90,
+    Waifu2xTtaTransform::Rotate180,
+    Waifu2xTtaTransform::Rotate270,
+    Waifu2xTtaTransform::FlipHorizontal,
+    Waifu2xTtaTransform::FlipVertical,
+    Waifu2xTtaTransform::Transpose,
+    Waifu2xTtaTransform::Transverse,
+];
+
+impl Waifu2xTtaTransform {
+    #[must_use]
+    const fn inverse(self) -> Self {
+        match self {
+            Self::Identity => Self::Identity,
+            Self::Rotate90 => Self::Rotate270,
+            Self::Rotate180 => Self::Rotate180,
+            Self::Rotate270 => Self::Rotate90,
+            Self::FlipHorizontal => Self::FlipHorizontal,
+            Self::FlipVertical => Self::FlipVertical,
+            Self::Transpose => Self::Transpose,
+            Self::Transverse => Self::Transverse,
+        }
+    }
+}
+
 #[must_use]
 pub(crate) fn waifu2x_inference_device() -> CudaDevice {
     CudaDevice::default()
@@ -2075,6 +2119,7 @@ fn upscale_managed_image_model_tiled_rgba_with_device<B: Backend>(
     height: u32,
     requested_tile_size: u32,
     batch_size: u32,
+    tta_enabled: bool,
     device: &B::Device,
 ) -> eyre::Result<Waifu2xUpscaledImage> {
     let known = known_image_model(model_name).ok_or_else(|| unknown_model_error(model_name))?;
@@ -2108,6 +2153,7 @@ fn upscale_managed_image_model_tiled_rgba_with_device<B: Backend>(
         u32::from(known.scale),
         known.model_offset,
         known.blend_size,
+        tta_enabled,
         "rgb",
     )?;
     let alpha = match alpha_hw {
@@ -2120,6 +2166,7 @@ fn upscale_managed_image_model_tiled_rgba_with_device<B: Backend>(
             height,
             actual_tile_size,
             batch_size,
+            tta_enabled,
             u32::from(known.scale),
             known.model_offset,
             known.blend_size,
@@ -2143,6 +2190,7 @@ pub(crate) fn upscale_managed_image_model_tiled_rgba(
     height: u32,
     requested_tile_size: u32,
     batch_size: u32,
+    tta_enabled: bool,
 ) -> eyre::Result<Waifu2xUpscaledImage> {
     let device = burn::backend::ndarray::NdArrayDevice::default();
     upscale_managed_image_model_tiled_rgba_with_device::<Waifu2xCpuBackend>(
@@ -2155,6 +2203,7 @@ pub(crate) fn upscale_managed_image_model_tiled_rgba(
         height,
         requested_tile_size,
         batch_size,
+        tta_enabled,
         &device,
     )
 }
@@ -2173,6 +2222,7 @@ pub(crate) fn upscale_managed_image_model_tiled_rgba_cuda(
     height: u32,
     requested_tile_size: u32,
     batch_size: u32,
+    tta_enabled: bool,
     device: &CudaDevice,
 ) -> eyre::Result<Waifu2xUpscaledImage> {
     upscale_managed_image_model_tiled_rgba_with_device::<Waifu2xInferenceBackend>(
@@ -2185,6 +2235,7 @@ pub(crate) fn upscale_managed_image_model_tiled_rgba_cuda(
         height,
         requested_tile_size,
         batch_size,
+        tta_enabled,
         device,
     )
 }
@@ -2202,6 +2253,7 @@ fn upscale_waifu2x_tiled_alpha_with_model<B: Backend>(
     height: u32,
     tile_size: u32,
     batch_size: u32,
+    tta_enabled: bool,
     scale: u32,
     offset: u32,
     blend_size: u32,
@@ -2240,8 +2292,18 @@ fn upscale_waifu2x_tiled_alpha_with_model<B: Backend>(
     let alpha_rgb = expand_alpha_hw_to_rgb_chw(alpha_hw);
     let (alpha_rgb, actual_output_width, actual_output_height) =
         upscale_waifu2x_tiled_rgb_with_model(
-            model, device, &alpha_rgb, width, height, tile_size, batch_size, scale, offset,
-            blend_size, "alpha",
+            model,
+            device,
+            &alpha_rgb,
+            width,
+            height,
+            tile_size,
+            batch_size,
+            scale,
+            offset,
+            blend_size,
+            tta_enabled,
+            "alpha",
         )?;
     let actual_output_width = usize::try_from(actual_output_width)
         .wrap_err("waifu2x tiled alpha output width does not fit in usize")?;
@@ -2269,6 +2331,7 @@ fn upscale_waifu2x_tiled_rgb_with_model<B: Backend>(
     scale: u32,
     offset: u32,
     blend_size: u32,
+    tta_enabled: bool,
     phase_label: &str,
 ) -> eyre::Result<(Vec<f32>, u32, u32)> {
     let width_usize =
@@ -2368,6 +2431,7 @@ fn upscale_waifu2x_tiled_rgb_with_model<B: Backend>(
                     &mut minibatch_tiles,
                     &mut minibatch_indexes,
                     &config,
+                    tta_enabled,
                     &mut pixels,
                     weights.as_mut(),
                     blend_filter.as_deref(),
@@ -2393,6 +2457,7 @@ fn upscale_waifu2x_tiled_rgb_with_model<B: Backend>(
             &mut minibatch_tiles,
             &mut minibatch_indexes,
             &config,
+            tta_enabled,
             &mut pixels,
             weights.as_mut(),
             blend_filter.as_deref(),
@@ -2460,22 +2525,39 @@ fn flush_waifu2x_tile_batch<B: Backend>(
     minibatch_tiles: &mut Vec<f32>,
     minibatch_indexes: &mut Vec<(usize, usize)>,
     config: &Waifu2xTiledRenderConfig,
+    tta_enabled: bool,
     pixels: &mut [f32],
     weights: Option<&mut Vec<f32>>,
     blend_filter: Option<&[f32]>,
 ) -> eyre::Result<()> {
     let batch_len = minibatch_indexes.len();
+    let model_batch_len = if tta_enabled {
+        batch_len
+            .checked_mul(WAIFU2X_TTA_TRANSFORM_COUNT)
+            .ok_or_else(|| eyre::eyre!("waifu2x TTA batch size overflowed usize"))?
+    } else {
+        batch_len
+    };
+    let input_values = if tta_enabled {
+        let expanded = expand_waifu2x_tta_batch(minibatch_tiles, batch_len, config.tile_size)?;
+        minibatch_tiles.clear();
+        expanded
+    } else {
+        std::mem::take(minibatch_tiles)
+    };
     let input = Tensor::<B, 4>::from_data(
         TensorData::new(
-            std::mem::take(minibatch_tiles),
-            [batch_len, 3, config.tile_size, config.tile_size],
+            input_values,
+            [model_batch_len, 3, config.tile_size, config.tile_size],
         ),
         device,
     );
     tracing::info!(
         phase = phase_label,
         batch_tiles = batch_len,
+        model_batch_tiles = model_batch_len,
         tile_size = config.tile_size,
+        tta_enabled,
         "waifu2x tile batch started"
     );
     let started = Instant::now();
@@ -2491,6 +2573,7 @@ fn flush_waifu2x_tile_batch<B: Backend>(
             tracing::info!(
                 phase = heartbeat_phase.as_str(),
                 batch_tiles = batch_len,
+                model_batch_tiles = model_batch_len,
                 elapsed_seconds = started.elapsed().as_secs_f32(),
                 "waifu2x tile batch still running"
             );
@@ -2502,11 +2585,12 @@ fn flush_waifu2x_tile_batch<B: Backend>(
     tracing::info!(
         phase = phase_label,
         batch_tiles = batch_len,
+        model_batch_tiles = model_batch_len,
         elapsed_seconds = started.elapsed().as_secs_f32(),
         "waifu2x tile batch completed"
     );
     let [actual_batch, channels, output_height, output_width] = output.dims();
-    if actual_batch != batch_len || channels != 3 {
+    if actual_batch != model_batch_len || channels != 3 {
         bail!(
             "waifu2x tiled inference expected output dims [batch, 3, H, W], got {:?}",
             [actual_batch, channels, output_height, output_width]
@@ -2547,6 +2631,10 @@ fn flush_waifu2x_tile_batch<B: Backend>(
         .to_vec::<f32>()
         .map_err(|error| eyre::eyre!("{error:?}"))
         .wrap_err("waifu2x tiled output tensor was not f32")?;
+    if tta_enabled {
+        output_values =
+            merge_waifu2x_tta_output_tiles(&output_values, batch_len, runtime_output_size)?;
+    }
     if downscale_factor > 1 {
         output_values = downscale_rgb_chw_tile_batch(
             &output_values,
@@ -2597,6 +2685,148 @@ fn flush_waifu2x_tile_batch<B: Backend>(
 
     minibatch_indexes.clear();
     Ok(())
+}
+
+fn expand_waifu2x_tta_batch(
+    minibatch_tiles: &[f32],
+    batch_len: usize,
+    tile_size: usize,
+) -> eyre::Result<Vec<f32>> {
+    let tile_len = 3_usize
+        .checked_mul(tile_size)
+        .and_then(|value| value.checked_mul(tile_size))
+        .ok_or_else(|| eyre::eyre!("waifu2x TTA tile size overflowed usize"))?;
+    let expected_len = batch_len
+        .checked_mul(tile_len)
+        .ok_or_else(|| eyre::eyre!("waifu2x TTA minibatch size overflowed usize"))?;
+    if minibatch_tiles.len() != expected_len {
+        bail!(
+            "waifu2x TTA expected {} input tile values, got {}",
+            expected_len,
+            minibatch_tiles.len()
+        );
+    }
+    let expanded_len = expected_len
+        .checked_mul(WAIFU2X_TTA_TRANSFORM_COUNT)
+        .ok_or_else(|| eyre::eyre!("waifu2x TTA expanded batch size overflowed usize"))?;
+    let mut expanded = Vec::with_capacity(expanded_len);
+    for batch_index in 0..batch_len {
+        let tile_start = batch_index * tile_len;
+        let tile_end = tile_start + tile_len;
+        let tile = &minibatch_tiles[tile_start..tile_end];
+        for transform in WAIFU2X_TTA_TRANSFORMS {
+            expanded.extend(transform_rgb_chw_square_tile(tile, tile_size, transform)?);
+        }
+    }
+    Ok(expanded)
+}
+
+fn merge_waifu2x_tta_output_tiles(
+    output_values: &[f32],
+    batch_len: usize,
+    tile_size: usize,
+) -> eyre::Result<Vec<f32>> {
+    let tile_len = 3_usize
+        .checked_mul(tile_size)
+        .and_then(|value| value.checked_mul(tile_size))
+        .ok_or_else(|| eyre::eyre!("waifu2x TTA output tile size overflowed usize"))?;
+    let expected_len = batch_len
+        .checked_mul(WAIFU2X_TTA_TRANSFORM_COUNT)
+        .and_then(|value| value.checked_mul(tile_len))
+        .ok_or_else(|| eyre::eyre!("waifu2x TTA output batch size overflowed usize"))?;
+    if output_values.len() != expected_len {
+        bail!(
+            "waifu2x TTA expected {} output tile values, got {}",
+            expected_len,
+            output_values.len()
+        );
+    }
+    let merged_len = batch_len
+        .checked_mul(tile_len)
+        .ok_or_else(|| eyre::eyre!("waifu2x TTA merged output size overflowed usize"))?;
+    let mut merged = vec![0.0_f32; merged_len];
+    for batch_index in 0..batch_len {
+        let merged_start = batch_index * tile_len;
+        let merged_end = merged_start + tile_len;
+        let merged_tile = &mut merged[merged_start..merged_end];
+        let tta_start = batch_index * WAIFU2X_TTA_TRANSFORM_COUNT * tile_len;
+        for (transform_index, transform) in WAIFU2X_TTA_TRANSFORMS.into_iter().enumerate() {
+            let tile_start = tta_start + transform_index * tile_len;
+            let tile_end = tile_start + tile_len;
+            let restored = transform_rgb_chw_square_tile(
+                &output_values[tile_start..tile_end],
+                tile_size,
+                transform.inverse(),
+            )?;
+            for (merged_value, restored_value) in merged_tile.iter_mut().zip(restored) {
+                *merged_value += restored_value;
+            }
+        }
+        for value in merged_tile {
+            *value /= WAIFU2X_TTA_TRANSFORM_COUNT_F32;
+        }
+    }
+    Ok(merged)
+}
+
+fn transform_rgb_chw_square_tile(
+    tile_rgb: &[f32],
+    tile_size: usize,
+    transform: Waifu2xTtaTransform,
+) -> eyre::Result<Vec<f32>> {
+    let plane_len = tile_size
+        .checked_mul(tile_size)
+        .ok_or_else(|| eyre::eyre!("waifu2x TTA plane size overflowed usize"))?;
+    let expected_len = plane_len
+        .checked_mul(3)
+        .ok_or_else(|| eyre::eyre!("waifu2x TTA tile length overflowed usize"))?;
+    if tile_rgb.len() != expected_len {
+        bail!(
+            "waifu2x TTA expected square RGB tile length {}, got {}",
+            expected_len,
+            tile_rgb.len()
+        );
+    }
+    let mut transformed = vec![0.0_f32; expected_len];
+    for channel in 0..3 {
+        let channel_base = channel * plane_len;
+        for row in 0..tile_size {
+            for column in 0..tile_size {
+                let (source_row, source_column) =
+                    map_waifu2x_tta_coords(transform, tile_size, row, column);
+                let dest_index = channel_base + row * tile_size + column;
+                let source_index = channel_base + source_row * tile_size + source_column;
+                transformed[dest_index] = tile_rgb[source_index];
+            }
+        }
+    }
+    Ok(transformed)
+}
+
+fn map_waifu2x_tta_coords(
+    transform: Waifu2xTtaTransform,
+    tile_size: usize,
+    row: usize,
+    column: usize,
+) -> (usize, usize) {
+    let last = tile_size - 1;
+    match transform {
+        Waifu2xTtaTransform::Identity => (row, column),
+        Waifu2xTtaTransform::Rotate90 => (last - column, row),
+        Waifu2xTtaTransform::Rotate180 => (last - row, last - column),
+        Waifu2xTtaTransform::Rotate270 => (column, last - row),
+        Waifu2xTtaTransform::FlipHorizontal => (row, last - column),
+        Waifu2xTtaTransform::FlipVertical => (last - row, column),
+        Waifu2xTtaTransform::Transpose => (column, row),
+        Waifu2xTtaTransform::Transverse => (last - column, last - row),
+    }
+}
+
+#[cfg(test)]
+fn is_full_check_enabled() -> bool {
+    std::env::var(TEAMY_STUDIO_FULL_CHECK_ENV_VAR)
+        .ok()
+        .is_some_and(|value| value == "1")
 }
 
 fn accumulate_waifu2x_tile(
@@ -4617,13 +4847,68 @@ mod tests {
             .collect::<Vec<_>>();
 
         let (rgb, output_width, output_height) = upscale_waifu2x_tiled_rgb_with_model(
-            &model, &device, &values, 100, 100, 64, 2, 2, 16, 8, "test-rgb",
+            &model, &device, &values, 100, 100, 64, 2, 2, 16, 8, false, "test-rgb",
         )
         .expect("tiled inference");
 
         assert_eq!(output_width, 200);
         assert_eq!(output_height, 200);
         assert_eq!(rgb.len(), 3 * 200 * 200);
+    }
+
+    #[test]
+    fn waifu2x_tta_transform_inverse_roundtrip_restores_tile() {
+        let tile_size = 4;
+        let tile = (0..(3 * tile_size * tile_size))
+            .map(|value| value as f32 / 10.0)
+            .collect::<Vec<_>>();
+
+        for transform in WAIFU2X_TTA_TRANSFORMS {
+            let transformed =
+                transform_rgb_chw_square_tile(&tile, tile_size, transform).expect("transform");
+            let restored =
+                transform_rgb_chw_square_tile(&transformed, tile_size, transform.inverse())
+                    .expect("inverse transform");
+
+            assert_eq!(restored, tile);
+        }
+    }
+
+    #[test]
+    fn waifu2x_tiled_inference_supports_tta() {
+        if !is_full_check_enabled() {
+            eprintln!(
+                "skipping waifu2x_tiled_inference_supports_tta unless {}=1",
+                TEAMY_STUDIO_FULL_CHECK_ENV_VAR
+            );
+            return;
+        }
+        let device = Default::default();
+        let model = init_waifu2x_probe_model::<Waifu2xProbeBackend>(&device, 2);
+        let values = (0..(64 * 64 * 3))
+            .map(|value| (value % 257) as f32 / 256.0)
+            .collect::<Vec<_>>();
+        let tile_size = choose_waifu2x_tile_size(256, 64, 64, 2, 16, 8).expect("tile size");
+
+        let (rgb, output_width, output_height) = upscale_waifu2x_tiled_rgb_with_model(
+            &model,
+            &device,
+            &values,
+            64,
+            64,
+            tile_size,
+            1,
+            2,
+            16,
+            8,
+            true,
+            "test-rgb-tta",
+        )
+        .expect("tiled inference with tta");
+
+        assert_eq!(output_width, 128);
+        assert_eq!(output_height, 128);
+        assert_eq!(rgb.len(), 3 * 128 * 128);
     }
 
     #[test]

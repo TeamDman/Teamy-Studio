@@ -98,23 +98,29 @@ Done so far:
 - Added focused self-test and CLI-surface coverage updates so managed model preparation, output format behavior, and image CLI paths match the now-real runtime behavior.
 - Added scale-4 support first, then generalized scale handling to powers of two by treating the current managed 2x model as a repeated-pass primitive: 2x = one pass, 4x = two passes, 8x = three passes.
 - Verified the generalized power-of-two path with `cargo test image_upscale_ --lib`, `cargo run -- image upscale target/test-artifacts/image-upscale/tiny-alpha-64.png --device cuda --log-filter trace --scale 8`, and a real local `--scale 4` CUDA run on `i adore you.png`.
+- Expanded the managed image model inventory beyond the original single art 2x checkpoint so Teamy can describe and prepare upstream `swin_unet` art, photo, and art_scan variants with explicit style, method, native scale, and runtime status metadata.
+- Added runnable art denoise+2x support and routed CLI `--style` plus `--noise-level` selection through the shared model inventory instead of hard-coding one checkpoint for every request.
+- Generalized the Burn waifu2x runtime to handle both 2x and 4x checkpoint layouts, including native art 4x and native art denoise+4x checkpoints, and added the derived-2x-from-4x runtime path for photo and art_scan.
+- Fixed the native 4x tiled-runtime metadata mismatch by giving 4x models the upstream `offset = 32` and `blend_size = 16`, which removed the real `--scale 4` CUDA failure and improved seam behavior.
+- Changed the default art CLI route to a denoise-aware low-noise preset (`noise_level = 0`) and added an explicit `--disable-denoise` escape hatch so the scale-only art models remain reachable.
+- Updated CLI surface coverage and feature-sensitive terminal replay coverage so `cargo test --test cli_surface`, `cargo test --test terminal_replay_cli`, and `./check-all.ps1` pass after the denoise/default-quality changes.
 
 Current focus:
 
-- Update this plan so it reflects the real current runtime and explicitly captures the remaining upstream nunif still-image pipeline work beyond the current art upscale path: denoise variants, denoise+scale model routing, more domains/families, native checkpoint scale variants, and image-only quality/runtime options.
+- Update this plan so it reflects the real current runtime and captures the next quality-oriented slice: explicit quality/runtime knobs, especially TTA and preset-driven defaults, without regressing the now-correct baseline image pipeline.
 
 Remaining work:
 
-- Capture the upstream still-image model inventory in Teamy metadata and CLI surfaces instead of hard-coding only `waifu2x-art-2x`.
-- Add denoise-only and denoise+scale model preparation/runtime support, including upstream-compatible noise level selection where the model family actually supports it.
-- Decide how to expose still-image quality/runtime knobs from upstream such as TTA and native checkpoint scale variants without pulling in the video-only surface.
+- Add denoise-only runtime support for the inventory-only `noise{0,1,2,3}` checkpoints when that path is worth exposing to users.
+- Add preset-driven quality/runtime controls so default behavior stays maximum quality while fast-path users can opt into cheaper settings explicitly.
+- Add TTA as an optional still-image quality knob, ideally through preset-aware defaults plus an explicit override flag.
 - Tighten Python-reference parity coverage so new model families and denoise paths do not drift from upstream semantics.
 - Re-run `.\check-all.ps1` after the latest scale generalization and after each major pipeline expansion.
 - Build the GUI layer only after the CLI proves the remaining image pipeline slices.
 
 Immediate next step:
 
-- Audit the upstream nunif still-image pipeline into concrete Teamy phases: model family/domain inventory, denoise/noise-level surfaces, native scale checkpoints, and still-image-only quality/runtime options such as TTA, then land the first narrow slice for denoise-aware model inventory and spec updates.
+- Define the preset and TTA product surface in spec terms first: default `quality` preset, explicit `fast` preset, preset-seeded defaults for optional knobs, and an explicit `--tta` override that can still force the high-quality path when users need it.
 
 ## Settled Decisions
 
@@ -133,6 +139,11 @@ Immediate next step:
 - Tiling is part of the MVP.
 - Tiling defaults should inherit from nunif. For current nunif waifu2x, default tile size is `256` and default batch size is `4`.
 - Still-image denoise support is in scope for the next expansion of this plan.
+- Default user-facing behavior should prioritize maximum quality rather than minimum latency.
+- Presets should seed the defaults for optional image-quality/runtime flags instead of replacing the explicit flags.
+- The default preset should be `quality`.
+- A `fast` preset should exist for users who want lower latency and are willing to trade away quality-oriented options.
+- TTA should be implemented as an image-only quality knob that presets can enable or disable by default, while still remaining explicitly overridable from the CLI.
 - Video filters and video-only options remain out of scope.
 - CUDA is the expected runtime path.
 - If `--device cpu` is not specified and CUDA is unavailable, bail with a warning/error that explains the `--device cpu` fallback flag.
@@ -150,6 +161,7 @@ Intended command shape:
 
 ```powershell
 teamy-studio image upscale <image-path> [output-path] `
+  --preset quality `
   --style art `
   --scale 2 `
   --tile-size 256 `
@@ -165,12 +177,18 @@ Required argument:
 Optional arguments and defaults:
 
 - `[output-path]`: generated from the input path when omitted.
+- `--preset quality`: default preset. Presets set the starting values for optional quality/runtime knobs.
 - `--style art`: MVP default; future values may include `photo`, `scan`, or `art-scan` once supported.
 - `--scale 2`: default. Additional powers-of-two scales currently reuse the same 2x model in repeated passes.
 - `--tile-size 256`: inherited from nunif default model behavior.
 - `--batch-size 4`: inherited from nunif default model behavior.
 - `--device cuda`: expected fast path. `--device cpu` is explicit fallback.
 - `--output-format auto`: infer from output path when present, otherwise default generated output should be PNG.
+
+Future quality/runtime knobs to surface through the same command:
+
+- `--tta`: explicit override for test-time augmentation. The default value should come from the active preset.
+- other quality/runtime flags should follow the same rule: the preset chooses the default, and the explicit flag wins when supplied.
 
 Output path behavior:
 
@@ -187,7 +205,6 @@ MVP exclusions:
 - No directories.
 - No globbing.
 - No recursion.
-- No TTA.
 - No GUI.
 - No video processing.
 
@@ -290,8 +307,29 @@ The runtime path should:
 - normalize RGB into the expected tensor layout
 - preserve and process alpha using nunif-equivalent behavior
 - run tiled Burn inference
+- optionally run TTA transforms as a batched inference expansion when the resolved quality settings request it
 - stitch tiles using the model offset and blend behavior
 - encode the output image in Rust
+
+### Quality Preset Strategy
+
+Still-image quality/runtime options should be modeled in two layers:
+
+1. A high-level preset such as `quality` or `fast` chooses the default values for optional knobs.
+2. Explicit flags such as `--tta` override the preset-derived defaults for a specific invocation.
+
+Current product direction:
+
+- `quality` should be the default preset.
+- `quality` should aim for the highest practical still-image quality Teamy can provide, even if it is slower.
+- `fast` should be opt-in and should disable or relax expensive quality-oriented knobs where that makes sense.
+- Presets should not hide capability. Users should always be able to override an individual knob explicitly.
+
+For TTA specifically:
+
+- treat TTA as an image-only quality knob, not a video feature
+- implement it so geometric transforms can be expanded into one inference batch per tile when memory allows
+- keep the explicit CLI override separate from the preset name so future knobs can follow the same pattern
 
 ### Python Verification Boundary
 
@@ -592,7 +630,9 @@ Tasks:
 - Wire model resolution, auto-prepare, image decode, tiling, Burn inference, alpha handling, and still-image output together.
 - Implement CUDA availability check and default bail behavior.
 - Implement explicit `--device cpu` fallback.
-- Decide which upstream still-image knobs should be surfaced now: for example TTA as an explicit opt-in, while leaving video-only options out.
+- Add preset resolution for still-image runtime defaults, with `quality` as the default preset and `fast` as an explicit opt-in.
+- Add explicit CLI overrides for quality/runtime knobs such as TTA so presets seed defaults rather than hiding functionality.
+- Implement TTA as an optional image-only quality pass, with batching across transformed variants when memory allows.
 - Ensure progress and diagnostics go through tracing/stderr, not mixed into generated image output.
 - Run against at least one local real asset and inspect output manually.
 
@@ -603,6 +643,8 @@ Definition of done:
 - Missing prepared model warns, prepares, then continues.
 - CUDA missing without `--device cpu` bails with a helpful message.
 - Explicit `--device cpu` works on a small input.
+- Preset-derived defaults and explicit per-flag overrides resolve predictably.
+- TTA can be enabled intentionally and improves quality on representative still-image fixtures without breaking alpha or tiling semantics.
 - The exposed still-image options map to real upstream-capable model paths rather than placeholders.
 
 ### Phase 11: Tests, Tracey Coverage, And Hardening
@@ -657,8 +699,9 @@ Definition of done:
 10. Expand the managed model inventory to cover the upstream still-image variants Teamy actually wants to support.
 11. Add denoise and denoise+scale runtime paths.
 12. Wire the broader still-image `image upscale` surface end to end.
-13. Harden tests, Tracey coverage, and `.\check-all.ps1`.
-14. Build GUI on top of the proven service path.
+13. Add preset-driven quality/runtime controls, including TTA.
+14. Harden tests, Tracey coverage, and `./check-all.ps1`.
+15. Build GUI on top of the proven service path.
 
 ## Acceptance Criteria For MVP
 
@@ -671,6 +714,8 @@ Definition of done:
 - CUDA is the default path; missing CUDA without `--device cpu` produces a clear bail message.
 - Missing default image model is prepared automatically with a warning before upscaling.
 - Explicit image model prepare/list/show commands exist.
+- Default behavior favors maximum practical still-image quality rather than minimum latency.
+- Presets set defaults for optional quality/runtime knobs, and explicit flags can override those defaults.
 - Normal runtime and prepare behavior do not use Python.
 - Python reference comparison is available only through a separate self-test command.
 - Tracey requirements are present and mapped for the new behavior.
@@ -683,7 +728,8 @@ Definition of done:
 - What tolerance thresholds should be used for layer-level reference comparisons?
 - Which Teamy CLI surface is best for the broader still-image pipeline: explicit model ids, `--style` plus `--noise-level`, or a layered hybrid?
 - When Teamy exposes denoise levels, should it mirror upstream `-1/0/1/2/3` semantics directly or rename the no-denoise case for CLI clarity?
-- Which upstream still-image quality knobs should land after denoise support: TTA first, or native scale4x checkpoints first?
+- Which exact preset-controlled knobs should ship in the first `fast`/`quality` slice besides TTA?
+- Should `quality` enable TTA immediately by default once it exists, or should the first rollout keep `quality` as the semantic default while leaving `--tta` opt-in until more fixture comparisons are gathered?
 - Should future batch support use shell glob expansion, explicit Teamy globbing, directory traversal, manifest files, or all of these?
 
 ## Out Of MVP
@@ -691,7 +737,6 @@ Definition of done:
 - Video processing.
 - Recursive directories.
 - Globbing and batch manifests.
-- TTA.
 - Video-only filters and video noise/grain surfaces.
 - Photo/scan/art-scan styles unless needed to unblock model conversion.
 - WebP/JPEG output.

@@ -159,11 +159,21 @@ Invoke-Step -Label "build (all features)" -Action {
 Invoke-Step -Label "tests" -Action {
 	Stop-TeamyStudioProcessIfRunning
 	$featuresArg = Get-NonTracyTestFeatureArgs -Full:$Full
+	$previousFullCheck = $env:TEAMY_STUDIO_FULL_CHECK
+	$env:TEAMY_STUDIO_FULL_CHECK = if ($Full) { '1' } else { '0' }
+	try {
 	if ($VerboseBuild) {
 		$testArguments = @("test") + $featuresArg + @("--locked")
 		Invoke-CargoWithOptionalVerbosity -Arguments $testArguments
 	} else {
 		cargo test @featuresArg --quiet
+	}
+	} finally {
+		if ($null -eq $previousFullCheck) {
+			Remove-Item Env:TEAMY_STUDIO_FULL_CHECK -ErrorAction SilentlyContinue
+		} else {
+			$env:TEAMY_STUDIO_FULL_CHECK = $previousFullCheck
+		}
 	}
 }
 

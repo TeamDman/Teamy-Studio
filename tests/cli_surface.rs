@@ -146,6 +146,8 @@ fn test_root_help_describes_commands_args_and_environment() {
 // image[verify cli.model-prepare]
 // image[verify cli.model-show]
 // image[verify cli.upscale-defaults]
+// image[verify cli.tta]
+// image[verify cli.disable-tta]
 #[test]
 fn test_image_help_is_available() {
     let output = run_teamy_studio(&["image", "--help"], &[]);
@@ -179,6 +181,11 @@ fn test_image_help_is_available() {
     assert!(
         text.contains("--output-format"),
         "missing --output-format:\n{text}"
+    );
+    assert!(text.contains("--tta"), "missing --tta:\n{text}");
+    assert!(
+        text.contains("--disable-tta"),
+        "missing --disable-tta:\n{text}"
     );
 
     let output = run_teamy_studio(&["image", "model", "--help"], &[]);
@@ -404,6 +411,51 @@ fn test_image_upscale_noise_level_routes_to_supported_denoise_model() {
             .join("model-metadata.json")
             .is_file(),
         "upscale should auto-prepare the denoise-aware 2x image model before inference"
+    );
+}
+
+// image[verify cli.fast-preset]
+// image[verify cli.preset-seeds-optional-defaults]
+#[test]
+fn test_image_upscale_fast_preset_routes_to_scale_only_art_model() {
+    let cache_dir = TempDirGuard::new("teamy-image-upscale-fast-cache");
+    let cache_dir_text = cache_dir.path().to_string_lossy().into_owned();
+    let missing_input_path = cache_dir.path().join("input.png");
+    let missing_input_path_text = missing_input_path.to_string_lossy().into_owned();
+
+    let output = run_teamy_studio(
+        &[
+            "image",
+            "upscale",
+            &missing_input_path_text,
+            "--preset",
+            "fast",
+        ],
+        &[("TEAMY_STUDIO_CACHE_DIR", &cache_dir_text)],
+    );
+    let text = output_text(&output);
+
+    assert!(
+        !output.status.success(),
+        "fast-preset upscale should still fail on the missing test input path:\n{text}"
+    );
+    assert!(
+        text.contains("waifu2x-art-2x"),
+        "fast preset should resolve the scale-only managed art model during prepare/logging:\n{text}"
+    );
+    assert!(
+        text.contains("failed to open input image"),
+        "fast-preset upscale should get past model preparation and fail on the missing input path:\n{text}"
+    );
+    assert!(
+        cache_dir
+            .path()
+            .join("models")
+            .join("image")
+            .join("waifu2x-art-2x")
+            .join("model-metadata.json")
+            .is_file(),
+        "fast preset should auto-prepare the scale-only image model before inference"
     );
 }
 
