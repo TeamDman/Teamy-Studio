@@ -457,6 +457,33 @@ float4 apply_timeline_add_text_track_button(float2 uv, float4 color, float4 stat
     return float4(rgb * glow, color.a);
 }
 
+float sd_equilateral_triangle_px(float2 pointPx, float radiusPx) {
+    float k = sqrt(3.0);
+    float2 p = pointPx;
+    p.x = abs(p.x) - radiusPx;
+    p.y = p.y + (radiusPx / k);
+    if (p.x + (k * p.y) > 0.0) {
+        p = float2(p.x - (k * p.y), (-k * p.x) - p.y) * 0.5;
+    }
+    p.x -= clamp(p.x, -2.0 * radiusPx, 0.0);
+    float distancePx = length(p);
+    return (p.y < 0.0) ? -distancePx : distancePx;
+}
+
+float4 apply_cursor_latency_ripple(float2 uv, float4 color, float4 state) {
+    float2 originUv = state.xy;
+    float2 panelPx = max(state.zw, float2(1.0, 1.0));
+    float2 pointPx = (uv - originUv) * panelPx;
+    float triangleRadiusPx = max(18.0, min(panelPx.x, panelPx.y) * 0.055);
+    float sdf = sd_equilateral_triangle_px(pointPx, triangleRadiusPx);
+    float ripple = 0.5 + (0.5 * cos(abs(sdf) * 0.165));
+    float edge = 1.0 - smoothstep(0.0, triangleRadiusPx * 0.9, abs(sdf));
+    float glow = 0.88 + (0.24 * ripple) + (0.16 * edge);
+    float stripe = 0.94 + (0.06 * sin((uv.y * panelPx.y * 0.035) - (PanelTime() * 1.2)));
+    float3 rgb = color.rgb * glow * stripe;
+    return float4(rgb, color.a);
+}
+
 float4 PSMain(PsInput input) : SV_TARGET {
     if (input.effect > 11.5 && input.effect < 12.5) {
         float coverage = slug_coverage(input.uv, input.glyph, input.glyphData, input.banding);
@@ -473,7 +500,9 @@ float4 PSMain(PsInput input) : SV_TARGET {
     }
 
     float4 shaded = input.color;
-    if (input.effect > 29.5) {
+    if (input.effect > 30.5) {
+        shaded = apply_cursor_latency_ripple(input.uv, input.color, input.glyphData);
+    } else if (input.effect > 29.5) {
         shaded = apply_timeline_add_text_track_button(input.uv, input.color, input.glyphData);
     } else if (input.effect > 28.5) {
         shaded = apply_target_marker(input.uv, input.color, input.glyphData);

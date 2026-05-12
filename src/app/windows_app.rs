@@ -1,5 +1,6 @@
 use std::cell::RefCell;
 use std::cmp::Ordering;
+use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::marker::PhantomData;
 use std::path::Path;
@@ -34,7 +35,7 @@ use windows::Win32::UI::Controls::{
 };
 use windows::Win32::UI::HiDpi::{GetDpiForSystem, GetDpiForWindow};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, VK_ADD, VK_CONTROL, VK_DOWN, VK_ESCAPE, VK_LBUTTON, VK_LEFT, VK_MENU,
+    GetKeyState, VK_ADD, VK_CONTROL, VK_DOWN, VK_ESCAPE, VK_F3, VK_LBUTTON, VK_LEFT, VK_MENU,
     VK_OEM_MINUS, VK_OEM_PLUS, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_SPACE, VK_SUBTRACT, VK_TAB, VK_UP,
 };
 use windows::Win32::UI::Shell::{
@@ -337,6 +338,249 @@ struct TimelinePlaygroundState {
     last_row_positions: Vec<(TimelineRenderRowKey, i32)>,
     hovered_item: Option<windows_scene::TimelinePlaygroundHitTarget>,
     hover_detail_window: Option<TimelinePlaygroundDetailWindowHandle>,
+}
+
+const CURSOR_LATENCY_MAX_HISTORY: usize = 12;
+const CURSOR_LATENCY_MAX_SAMPLE_AGE: Duration = Duration::from_millis(180);
+const CURSOR_LATENCY_MAX_LEAD_PIXELS: f32 = 96.0;
+const LATENCY_OVERLAY_MAX_HISTORY: usize = 120;
+const LATENCY_OVERLAY_ROTATION_PAUSE: Duration = Duration::from_millis(500);
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct CursorLatencySample {
+    point: ClientPoint,
+    captured_at: Instant,
+}
+
+#[derive(Debug)]
+struct CursorLatencyPlaygroundState {
+    behavior: windows_scene::CursorLatencyBehavior,
+    last_os_cursor_position: Option<ClientPoint>,
+    rendered_cursor_position: Option<ClientPoint>,
+    samples: VecDeque<CursorLatencySample>,
+}
+
+#[derive(Debug)]
+struct LatencyOverlayState {
+    visible: bool,
+    anchor: windows_scene::LatencyOverlayAnchor,
+    last_f3_pressed_at: Option<Instant>,
+    last_render_started_at: Option<Instant>,
+    frame_intervals: VecDeque<Duration>,
+}
+
+impl LatencyOverlayState {
+    fn new() -> Self {
+        Self {
+            visible: false,
+            anchor: windows_scene::LatencyOverlayAnchor::TopRight,
+            last_f3_pressed_at: None,
+            last_render_started_at: None,
+            frame_intervals: VecDeque::with_capacity(LATENCY_OVERLAY_MAX_HISTORY),
+        }
+    }
+
+    fn record_render_start(&mut self, now: Instant) {
+        if let Some(previous) = self.last_render_started_at {
+            self.frame_intervals.push_back(now.duration_since(previous));
+        }
+        while self.frame_intervals.len() > LATENCY_OVERLAY_MAX_HISTORY {
+            self.frame_intervals.pop_front();
+        }
+        self.last_render_started_at = Some(now);
+    }
+
+    fn handle_f3(&mut self, now: Instant) {
+        // cursor-latency[impl overlay.f3-toggle]
+        // cursor-latency[impl overlay.position-cycle]
+        // cursor-latency[impl overlay.hide-after-pause]
+        if self.visible {
+            if self
+                .last_f3_pressed_at
+                .is_some_and(|last| now.duration_since(last) <= LATENCY_OVERLAY_ROTATION_PAUSE)
+            {
+                self.anchor = self.anchor.next();
+            } else {
+                self.visible = false;
+            }
+        } else {
+            self.visible = true;
+        }
+        self.last_f3_pressed_at = Some(now);
+    }
+
+    fn is_visible(&self) -> bool {
+        self.visible
+    }
+
+    fn view_state(&self) -> Option<windows_scene::LatencyOverlayViewState> {
+        if !self.visible {
+            return None;
+        }
+
+        let recent = self
+            .frame_intervals
+            .iter()
+            .rev()
+            .take(72)
+            .copied()
+            .collect::<Vec<_>>();
+        let latest_frame_ms = recent.first().map(|duration| duration.as_secs_f32() * 1000.0);
+        let average_fps = if recent.is_empty() {
+            None
+        } else {
+            let sample_count = recent.len().min(30);
+            let average_secs = recent
+                .iter()
+                .take(sample_count)
+                .map(Duration::as_secs_f32)
+                .sum::<f32>()
+                / sample_count as f32;
+            (average_secs > 0.0).then_some(1.0 / average_secs)
+        };
+
+        Some(windows_scene::LatencyOverlayViewState {
+            anchor: self.anchor,
+            average_fps,
+            latest_frame_ms,
+            frame_times_ms: recent
+                .into_iter()
+                .rev()
+                .map(|duration| duration.as_secs_f32() * 1000.0)
+                .collect(),
+        })
+    }
+}
+
+impl CursorLatencyPlaygroundState {
+    fn new() -> Self {
+        Self {
+            behavior: windows_scene::CursorLatencyBehavior::Fastest,
+            last_os_cursor_position: None,
+            rendered_cursor_position: None,
+            samples: VecDeque::with_capacity(CURSOR_LATENCY_MAX_HISTORY),
+        }
+    }
+
+    fn sync(
+        &mut self,
+        cursor_position: Option<ClientPoint>,
+        now: Instant,
+        focused_render_interval_ms: u32,
+    ) {
+        self.last_os_cursor_position = cursor_position;
+        if let Some(point) = cursor_position {
+            self.samples.push_back(CursorLatencySample {
+                point,
+                captured_at: now,
+            });
+        }
+        while self.samples.len() > CURSOR_LATENCY_MAX_HISTORY {
+            self.samples.pop_front();
+        }
+        while self
+            .samples
+            .front()
+            .is_some_and(|sample| now.duration_since(sample.captured_at) > CURSOR_LATENCY_MAX_SAMPLE_AGE)
+        {
+            self.samples.pop_front();
+        }
+        self.rendered_cursor_position = cursor_latency_projected_position(
+            self.behavior,
+            &self.samples,
+            Duration::from_millis(u64::from(focused_render_interval_ms.max(1))),
+        );
+    }
+
+    fn trail_points(&self) -> Vec<ClientPoint> {
+        self.samples.iter().map(|sample| sample.point).collect()
+    }
+
+    fn view_state(&self) -> windows_scene::CursorLatencyPlaygroundViewState {
+        let fastest_cursor_position = cursor_latency_projected_position(
+            windows_scene::CursorLatencyBehavior::Fastest,
+            &self.samples,
+            Duration::from_millis(16),
+        );
+        let match_os_cursor_position = cursor_latency_projected_position(
+            windows_scene::CursorLatencyBehavior::MatchOs,
+            &self.samples,
+            Duration::from_millis(16),
+        );
+        let lead_pixels = self
+            .last_os_cursor_position
+            .zip(fastest_cursor_position)
+            .map_or(0, |(os, rendered)| cursor_latency_distance_pixels(os, rendered));
+        windows_scene::CursorLatencyPlaygroundViewState {
+            behavior: self.behavior,
+            os_cursor_position: self.last_os_cursor_position,
+            rendered_cursor_position: self.rendered_cursor_position,
+            fastest_cursor_position,
+            match_os_cursor_position,
+            trail_points: self.trail_points(),
+            lead_pixels,
+            sample_count: self.samples.len(),
+        }
+    }
+}
+
+fn cursor_latency_projected_position(
+    behavior: windows_scene::CursorLatencyBehavior,
+    samples: &VecDeque<CursorLatencySample>,
+    lead_interval: Duration,
+) -> Option<ClientPoint> {
+    let latest = samples.back().copied()?;
+    if behavior == windows_scene::CursorLatencyBehavior::MatchOs {
+        // cursor-latency[impl playground.match-os]
+        return Some(latest.point);
+    }
+
+    // cursor-latency[impl playground.fastest]
+    let previous = samples
+        .iter()
+        .rev()
+        .skip(1)
+        .find(|sample| sample.point != latest.point)
+        .copied();
+    let Some(previous) = previous else {
+        return Some(latest.point);
+    };
+
+    let sample_dt = latest.captured_at.saturating_duration_since(previous.captured_at);
+    if sample_dt.is_zero() {
+        return Some(latest.point);
+    }
+
+    let (latest_x, latest_y) = client_point_pixels(latest.point);
+    let (previous_x, previous_y) = client_point_pixels(previous.point);
+    let delta_x = (latest_x - previous_x) as f32;
+    let delta_y = (latest_y - previous_y) as f32;
+    let lead_scale =
+        (lead_interval.as_secs_f32() / sample_dt.as_secs_f32()).clamp(0.0, 1.35);
+    let projected_x = latest_x as f32 + delta_x * lead_scale;
+    let projected_y = latest_y as f32 + delta_y * lead_scale;
+    let lead_x = (projected_x - latest_x as f32).clamp(-CURSOR_LATENCY_MAX_LEAD_PIXELS, CURSOR_LATENCY_MAX_LEAD_PIXELS);
+    let lead_y = (projected_y - latest_y as f32).clamp(-CURSOR_LATENCY_MAX_LEAD_PIXELS, CURSOR_LATENCY_MAX_LEAD_PIXELS);
+
+    Some(ClientPoint::new(
+        latest_x.saturating_add(lead_x.round() as i32),
+        latest_y.saturating_add(lead_y.round() as i32),
+    ))
+}
+
+fn client_point_pixels(point: ClientPoint) -> (i32, i32) {
+    let point = point
+        .to_win32_point()
+        .expect("client points built from pixel coordinates must convert back to pixels");
+    (point.x, point.y)
+}
+
+fn cursor_latency_distance_pixels(left: ClientPoint, right: ClientPoint) -> i32 {
+    let (left_x, left_y) = client_point_pixels(left);
+    let (right_x, right_y) = client_point_pixels(right);
+    let delta_x = right_x - left_x;
+    let delta_y = right_y - left_y;
+    ((delta_x * delta_x + delta_y * delta_y) as f64).sqrt().round() as i32
 }
 
 #[derive(Clone, Debug)]
@@ -1002,6 +1246,8 @@ struct SceneAppState {
     model_warning: Option<windows_scene::ModelWarningViewState>,
     model_warning_prepare_started_at: Option<Instant>,
     timeline_playground: Option<TimelinePlaygroundState>,
+    cursor_latency_playground: Option<CursorLatencyPlaygroundState>,
+    latency_overlay: LatencyOverlayState,
     timeline_playground_detail: Option<TimelinePlaygroundDetailWindowHandle>,
     timeline_tool: TimelineInteractionTool,
     timeline_selection: Option<windows_scene::TimelineRectSelection>,
@@ -1694,6 +1940,7 @@ enum ScenePointerAction {
 enum SceneKeyAction {
     NotHandled,
     Handled,
+    ToggleLatencyOverlay,
     CloseWindow,
     CommitAudioInputPickerSelection(Option<AudioInputDeviceSummary>),
     InvokeSceneAction(SceneAction),
@@ -2063,6 +2310,11 @@ fn run_scene_window(
     } else {
         None
     };
+    let cursor_latency_playground = if scene_kind == SceneWindowKind::CursorLatencyPlayground {
+        Some(CursorLatencyPlaygroundState::new())
+    } else {
+        None
+    };
 
     SCENE_APP_STATE.with(|state| {
         *state.borrow_mut() = Some(SceneAppState {
@@ -2083,6 +2335,8 @@ fn run_scene_window(
             model_warning: initialization.model_warning,
             model_warning_prepare_started_at: None,
             timeline_playground,
+            cursor_latency_playground,
+            latency_overlay: LatencyOverlayState::new(),
             timeline_playground_detail: initialization.timeline_playground_detail,
             timeline_tool: TimelineInteractionTool::default(),
             timeline_selection: None,
@@ -3569,7 +3823,15 @@ fn handle_scene_focused_render_timer(hwnd: WindowHandle) -> LRESULT {
 }
 
 fn scene_needs_focused_timer_render(state: &SceneAppState) -> bool {
+    if state.latency_overlay.is_visible() {
+        return true;
+    }
+
     if state.timeline_zoom_animation.is_some() {
+        return true;
+    }
+
+    if state.scene_kind == SceneWindowKind::CursorLatencyPlayground {
         return true;
     }
 
@@ -3659,6 +3921,10 @@ fn handle_scene_key_down_message(
         Err(error) => return fail_and_close(hwnd, &error),
     };
     let action = with_scene_app_state(|state| {
+        if virtual_key == u32::from(VK_F3.0) {
+            return Ok(SceneKeyAction::ToggleLatencyOverlay);
+        }
+
         if alt_key_is_down() && virtual_key == u32::from(b'X') {
             // audio[impl gui.diagnostics-toggle]
             scene_toggle_diagnostics_panel(state);
@@ -4014,6 +4280,16 @@ fn handle_scene_key_down_message(
             def_window_proc(hwnd, message, wparam, lparam)
         }
         Ok(SceneKeyAction::Handled) => LRESULT(0),
+        Ok(SceneKeyAction::ToggleLatencyOverlay) => {
+            let result = with_scene_app_state(|state| {
+                state.latency_overlay.handle_f3(Instant::now());
+                render_scene_window_frame(state, hwnd, None, false)
+            });
+            match result {
+                Ok(()) => LRESULT(0),
+                Err(error) => fail_and_close(hwnd, &error),
+            }
+        }
         Ok(SceneKeyAction::CloseWindow) => {
             hwnd.post_close();
             LRESULT(0)
@@ -6439,6 +6715,8 @@ fn render_scene_window_frame(
     resize: Option<(u32, u32)>,
     force_redraw: bool,
 ) -> eyre::Result<()> {
+    let render_started_at = Instant::now();
+    state.latency_overlay.record_render_start(render_started_at);
     sync_demo_mode_state(state);
     apply_timeline_zoom_animation(state);
     apply_timeline_playground_zoom_animation(state);
@@ -6472,12 +6750,22 @@ fn render_scene_window_frame(
     if state.scene_kind == SceneWindowKind::Logs && !state.diagnostics_visible {
         sync_logs_scroll_offset(state, layout);
     }
+    if state.scene_kind == SceneWindowKind::CursorLatencyPlayground && !state.diagnostics_visible {
+        let sampled_cursor = cursor_client_point(hwnd).ok();
+        if let Some(playground) = state.cursor_latency_playground.as_mut() {
+            playground.sync(
+                sampled_cursor,
+                render_started_at,
+                state.focused_render_interval_ms,
+            );
+        }
+    }
     let window_chrome_buttons_state = scene_window_chrome_buttons_state(state, hwnd, layout);
     let scramble_input_device_identifiers = state
         .demo_mode_scramble_input_device_identifiers
         .is_enabled();
     let timeline_document = timeline_document_snapshot(state);
-    let scene = if state.diagnostics_visible && state.scene_kind == SceneWindowKind::Launcher {
+    let mut scene = if state.diagnostics_visible && state.scene_kind == SceneWindowKind::Launcher {
         windows_scene::build_launcher_diagnostic_render_scene(
             layout,
             window_chrome_buttons_state,
@@ -6627,6 +6915,19 @@ fn render_scene_window_frame(
             scramble_input_device_identifiers,
             demo_mode_visual_state(state, layout),
         )
+    } else if state.scene_kind == SceneWindowKind::CursorLatencyPlayground {
+        let button_visual_states = scene_button_visual_states(state, layout);
+        let view_state = state
+            .cursor_latency_playground
+            .as_ref()
+            .expect("cursor latency playground scene has playground state")
+            .view_state();
+        windows_scene::build_cursor_latency_playground_render_scene(
+            layout,
+            window_chrome_buttons_state,
+            view_state,
+            &button_visual_states,
+        )
     } else if state.scene_kind == SceneWindowKind::TimelinePlayground {
         let pointer_position = state.pointer_position;
         let button_visual_states = scene_button_visual_states(state, layout);
@@ -6691,6 +6992,10 @@ fn render_scene_window_frame(
             state.scene_virtual_cursor,
         )
     };
+
+    if let Some(overlay_view) = state.latency_overlay.view_state() {
+        windows_scene::push_latency_overlay(&mut scene, layout, &overlay_view);
+    }
 
     let Some(renderer) = state.renderer.as_mut() else {
         return Ok(());
@@ -6884,7 +7189,8 @@ fn scene_button_visual_states(
                 .map(|click| click.clicked_at);
             let active = scene_action_active(spec.action)
                 || selected
-                || timeline_playground_action_active(state, spec.action);
+                || timeline_playground_action_active(state, spec.action)
+                || cursor_latency_playground_action_active(state, spec.action);
             (
                 spec.action,
                 windows_scene::compute_button_visual_state(
@@ -6921,6 +7227,22 @@ fn timeline_playground_action_active(state: &SceneAppState, action: SceneAction)
         ) | (
             SceneAction::TimelinePlaygroundGroupingAll,
             TimelineGroupingMode::All
+        )
+    )
+}
+
+fn cursor_latency_playground_action_active(state: &SceneAppState, action: SceneAction) -> bool {
+    let Some(playground) = state.cursor_latency_playground.as_ref() else {
+        return false;
+    };
+    matches!(
+        (action, playground.behavior),
+        (
+            SceneAction::SetCursorLatencyBehaviorFastest,
+            windows_scene::CursorLatencyBehavior::Fastest,
+        ) | (
+            SceneAction::SetCursorLatencyBehaviorMatchOs,
+            windows_scene::CursorLatencyBehavior::MatchOs,
         )
     )
 }
@@ -7512,18 +7834,8 @@ fn scene_action_at_point(
     point: ClientPoint,
 ) -> Option<SceneAction> {
     let specs = windows_scene::scene_button_specs(scene_kind);
-    let (button_rect, max_button_size) = if scene_kind == SceneWindowKind::TimelinePlayground {
-        (
-            windows_scene::timeline_playground_layout(layout.terminal_panel_rect().inset(24), 0)
-                .controls_rect,
-            76,
-        )
-    } else {
-        (
-            layout.terminal_panel_rect(),
-            scaled_scene_button_size(system_dpi()),
-        )
-    };
+    let (button_rect, max_button_size) =
+        scene_action_button_layout(scene_kind, layout, scaled_scene_button_size(system_dpi()));
     let button_layouts =
         windows_scene::layout_scene_buttons(button_rect, specs.len(), max_button_size);
     specs
@@ -9061,6 +9373,8 @@ fn scene_interactive_region_contains(
     point.is_some_and(|point| {
         scene_drag_handle_contains(layout, point)
             || window_chrome_button_at_point(layout, point).is_some()
+            || (!state.diagnostics_visible
+                && timeline_playground_pan_interaction_at_point(state, layout, point))
             || (state.diagnostics_visible && scene_diagnostic_text_rect(layout).contains(point))
             || (!state.diagnostics_visible
                 && timeline_add_track_button_at_point(state, layout, point))
@@ -9644,10 +9958,31 @@ fn scene_action_hit_rects(
     max_button_size: i32,
 ) -> Vec<ClientRect> {
     let specs = windows_scene::scene_button_specs(scene_kind);
-    windows_scene::layout_scene_buttons(layout.terminal_panel_rect(), specs.len(), max_button_size)
+    let (button_rect, max_button_size) =
+        scene_action_button_layout(scene_kind, layout, max_button_size);
+    windows_scene::layout_scene_buttons(button_rect, specs.len(), max_button_size)
         .into_iter()
         .map(windows_scene::SceneButtonLayout::hit_rect)
         .collect()
+}
+
+fn scene_action_button_layout(
+    scene_kind: SceneWindowKind,
+    layout: TerminalLayout,
+    default_max_button_size: i32,
+) -> (ClientRect, i32) {
+    match scene_kind {
+        SceneWindowKind::TimelinePlayground => (
+            windows_scene::timeline_playground_layout(layout.terminal_panel_rect().inset(24), 0)
+                .controls_rect,
+            76,
+        ),
+        SceneWindowKind::CursorLatencyPlayground => (
+            windows_scene::cursor_latency_playground_controls_rect(layout.terminal_panel_rect()),
+            windows_scene::DEFAULT_MAX_BUTTON_SIZE,
+        ),
+        _ => (layout.terminal_panel_rect(), default_max_button_size),
+    }
 }
 
 fn next_sequential_index(action_count: usize, current_index: usize, direction: i32) -> usize {
@@ -9850,6 +10185,23 @@ fn perform_scene_action(
                     }
                 })
                 .wrap_err("failed to spawn Teamy Studio cursor gallery thread")?;
+            Ok(SceneActionDisposition::KeepOpen)
+        }
+        SceneAction::OpenCursorLatencyPlayground => {
+            let app_home = app_home.clone();
+            thread::Builder::new()
+                .name("teamy-studio-cursor-latency-playground".to_owned())
+                .spawn_with_current_span(move || {
+                    if let Err(error) = run_scene_window(
+                        &app_home,
+                        SceneWindowKind::CursorLatencyPlayground,
+                        vt_engine,
+                        SceneWindowInitialization::default(),
+                    ) {
+                        error!(?error, "failed to open cursor latency playground window");
+                    }
+                })
+                .wrap_err("failed to spawn Teamy Studio cursor latency playground thread")?;
             Ok(SceneActionDisposition::KeepOpen)
         }
         SceneAction::OpenDemoMode => {
@@ -10149,6 +10501,24 @@ fn perform_scene_action(
                 if let Some(playground) = state.timeline_playground.as_mut() {
                     playground.minimum_visible_pixels =
                         playground.minimum_visible_pixels.saturating_sub(1).max(1);
+                }
+                Ok(())
+            })?;
+            Ok(SceneActionDisposition::KeepOpen)
+        }
+        SceneAction::SetCursorLatencyBehaviorFastest => {
+            with_scene_app_state(|state| {
+                if let Some(playground) = state.cursor_latency_playground.as_mut() {
+                    playground.behavior = windows_scene::CursorLatencyBehavior::Fastest;
+                }
+                Ok(())
+            })?;
+            Ok(SceneActionDisposition::KeepOpen)
+        }
+        SceneAction::SetCursorLatencyBehaviorMatchOs => {
+            with_scene_app_state(|state| {
+                if let Some(playground) = state.cursor_latency_playground.as_mut() {
+                    playground.behavior = windows_scene::CursorLatencyBehavior::MatchOs;
                 }
                 Ok(())
             })?;
@@ -12693,6 +13063,11 @@ fn update_terminal_chrome_tooltip(
     hwnd: WindowHandle,
     point: ClientPoint,
 ) -> eyre::Result<()> {
+    if !state.window_focused {
+        state.chrome_tooltip.hide(hwnd);
+        return Ok(());
+    }
+
     let layout = terminal_client_layout(hwnd, state)?;
     if update_window_chrome_tooltip(
         &mut state.chrome_tooltip,
@@ -12719,6 +13094,11 @@ fn update_scene_chrome_tooltip(
     hwnd: WindowHandle,
     point: ClientPoint,
 ) -> eyre::Result<()> {
+    if !state.window_focused {
+        state.chrome_tooltip.hide(hwnd);
+        return Ok(());
+    }
+
     let layout = scene_client_layout(hwnd, state)?;
     if update_window_chrome_tooltip(
         &mut state.chrome_tooltip,
@@ -13074,19 +13454,8 @@ fn scene_action_tooltip(
     }
 
     let specs = windows_scene::scene_button_specs(state.scene_kind);
-    let (button_rect, max_button_size) = if state.scene_kind == SceneWindowKind::TimelinePlayground
-    {
-        (
-            windows_scene::timeline_playground_layout(layout.terminal_panel_rect().inset(24), 0)
-                .controls_rect,
-            76,
-        )
-    } else {
-        (
-            layout.terminal_panel_rect(),
-            scaled_scene_button_size(state.dpi),
-        )
-    };
+    let (button_rect, max_button_size) =
+        scene_action_button_layout(state.scene_kind, layout, scaled_scene_button_size(state.dpi));
     let button_layouts =
         windows_scene::layout_scene_buttons(button_rect, specs.len(), max_button_size);
 
@@ -13728,6 +14097,8 @@ mod tests {
             model_warning: None,
             model_warning_prepare_started_at: None,
             timeline_playground: None,
+            cursor_latency_playground: None,
+            latency_overlay: LatencyOverlayState::new(),
             timeline_playground_detail: None,
             timeline_tool: TimelineInteractionTool::default(),
             timeline_selection: None,
@@ -13801,6 +14172,26 @@ mod tests {
             started_at: Instant::now(),
         });
         state.timeline_playground = Some(playground);
+
+        assert!(scene_needs_focused_timer_render(&state));
+    }
+
+    #[test]
+    fn focused_timer_keeps_cursor_latency_playground_live() {
+        let mut state = timeline_test_state(TimelineDocument::blank());
+        state.scene_kind = SceneWindowKind::CursorLatencyPlayground;
+        state.window_focused = true;
+        state.cursor_latency_playground = Some(CursorLatencyPlaygroundState::new());
+
+        assert!(scene_needs_focused_timer_render(&state));
+    }
+
+    #[test]
+    fn focused_timer_keeps_latency_overlay_live_on_any_scene() {
+        let mut state = timeline_test_state(TimelineDocument::blank());
+        state.scene_kind = SceneWindowKind::Launcher;
+        state.window_focused = true;
+        state.latency_overlay.visible = true;
 
         assert!(scene_needs_focused_timer_render(&state));
     }
@@ -13943,6 +14334,29 @@ mod tests {
             &state,
             layout,
             rect_center(playground_layout.controls_rect)
+        ));
+    }
+
+    #[test]
+    // timeline[verify playground.cursor-guide]
+    fn timeline_playground_scene_interactive_region_includes_cursor_guide_surface() {
+        let mut state = timeline_test_state(TimelineDocument::blank());
+        state.scene_kind = SceneWindowKind::TimelinePlayground;
+        state.timeline_document = None;
+        state.timeline_playground = Some(TimelinePlaygroundState::new().expect("playground"));
+        let layout = test_scene_layout();
+        let playground_layout =
+            windows_scene::timeline_playground_layout(layout.terminal_panel_rect().inset(24), 0);
+
+        assert!(scene_interactive_region_contains(
+            &state,
+            layout,
+            Some(rect_center(playground_layout.ruler_rect))
+        ));
+        assert!(scene_interactive_region_contains(
+            &state,
+            layout,
+            Some(rect_center(playground_layout.content_rect))
         ));
     }
 
@@ -14306,6 +14720,77 @@ mod tests {
     }
 
     #[test]
+    fn cursor_latency_fastest_behavior_projects_ahead_of_recent_motion() {
+        let now = Instant::now();
+        let samples = VecDeque::from([
+            CursorLatencySample {
+                point: ClientPoint::new(100, 200),
+                captured_at: now - Duration::from_millis(16),
+            },
+            CursorLatencySample {
+                point: ClientPoint::new(120, 200),
+                captured_at: now,
+            },
+        ]);
+
+        let projected = cursor_latency_projected_position(
+            windows_scene::CursorLatencyBehavior::Fastest,
+            &samples,
+            Duration::from_millis(16),
+        )
+        .expect("projection");
+
+        assert!(client_point_pixels(projected).0 > 120);
+        assert_eq!(client_point_pixels(projected).1, 200);
+    }
+
+    #[test]
+    fn cursor_latency_match_os_behavior_stays_on_latest_sample() {
+        let now = Instant::now();
+        let samples = VecDeque::from([
+            CursorLatencySample {
+                point: ClientPoint::new(100, 200),
+                captured_at: now - Duration::from_millis(16),
+            },
+            CursorLatencySample {
+                point: ClientPoint::new(120, 212),
+                captured_at: now,
+            },
+        ]);
+
+        let projected = cursor_latency_projected_position(
+            windows_scene::CursorLatencyBehavior::MatchOs,
+            &samples,
+            Duration::from_millis(16),
+        )
+        .expect("projection");
+
+        assert_eq!(projected, ClientPoint::new(120, 212));
+    }
+
+    #[test]
+    fn latency_overlay_f3_cycles_then_hides_after_pause() {
+        let now = Instant::now();
+        let mut overlay = LatencyOverlayState::new();
+
+        overlay.handle_f3(now);
+        assert!(overlay.visible);
+        assert_eq!(overlay.anchor, windows_scene::LatencyOverlayAnchor::TopRight);
+
+        overlay.handle_f3(now + Duration::from_millis(100));
+        assert!(overlay.visible);
+        assert_eq!(overlay.anchor, windows_scene::LatencyOverlayAnchor::Right);
+
+        overlay.handle_f3(now + Duration::from_millis(800));
+        assert!(!overlay.visible);
+        assert_eq!(overlay.anchor, windows_scene::LatencyOverlayAnchor::Right);
+
+        overlay.handle_f3(now + Duration::from_millis(900));
+        assert!(overlay.visible);
+        assert_eq!(overlay.anchor, windows_scene::LatencyOverlayAnchor::Right);
+    }
+
+    #[test]
     // windowing[verify scene.text.keyboard-copy]
     fn ctrl_c_maps_to_scene_copy_selection() {
         assert_eq!(
@@ -14424,6 +14909,8 @@ mod tests {
             model_warning: None,
             model_warning_prepare_started_at: None,
             timeline_playground: None,
+            cursor_latency_playground: None,
+            latency_overlay: LatencyOverlayState::new(),
             timeline_playground_detail: None,
             timeline_tool: TimelineInteractionTool::default(),
             timeline_selection: None,
@@ -14487,6 +14974,90 @@ mod tests {
         assert_eq!(tooltip.1, button_layouts[0].hit_rect());
     }
 
+    #[test]
+    fn cursor_latency_play_area_does_not_trigger_scene_button_tooltips() {
+        let state = SceneAppState {
+            app_home: AppHome(std::path::PathBuf::from(".")),
+            hwnd: None,
+            dpi: USER_DEFAULT_SCREEN_DPI,
+            scene_kind: SceneWindowKind::CursorLatencyPlayground,
+            scene_opened_at: Instant::now(),
+            vt_engine: VtEngineChoice::default(),
+            audio_input_picker: AudioInputPickerState::default(),
+            audio_input_picker_completion: AudioInputPickerCompletion::default(),
+            audio_input_device_window: None,
+            timeline_document: None,
+            timeline_transcription_settings: None,
+            timeline_document_command_sender: None,
+            timeline_document_command_receiver: None,
+            timeline_document_command_target: None,
+            model_warning: None,
+            model_warning_prepare_started_at: None,
+            timeline_playground: None,
+            cursor_latency_playground: Some(CursorLatencyPlaygroundState::new()),
+            latency_overlay: LatencyOverlayState::new(),
+            timeline_playground_detail: None,
+            timeline_tool: TimelineInteractionTool::default(),
+            timeline_selection: None,
+            pending_timeline_selection: None,
+            pending_timeline_text_block: None,
+            pending_timeline_track_reorder: None,
+            timeline_pan_drag: None,
+            timeline_playground_pan_drag: None,
+            timeline_zoom_animation: None,
+            timeline_vertical_scroll_offset: 0,
+            demo_mode_scramble_input_device_identifiers:
+                DemoModeInputDeviceIdentifierScramble::default(),
+            demo_mode_scramble_toggle_last_changed_at: None,
+            scene_action_selected_index: 0,
+            scene_virtual_cursor: None,
+            pointer_position: None,
+            pressed_target: None,
+            pin_button_last_clicked_at: None,
+            pinned_topmost: false,
+            last_clicked_action: None,
+            diagnostics_button_last_clicked_at: None,
+            diagnostics_visible: false,
+            diagnostic_selection: None,
+            pending_diagnostic_selection: None,
+            diagnostic_selection_drag_point: None,
+            in_move_size_loop: false,
+            window_focused: false,
+            focused_render_interval_ms: 16,
+            terminal_cell_width: 8,
+            terminal_cell_height: 16,
+            diagnostic_cell_width: 8,
+            diagnostic_cell_height: 16,
+            logs_scroll_offset: 0,
+            logs_follow_tail: true,
+            last_applied_scene_window_title: SceneWindowKind::CursorLatencyPlayground
+                .title()
+                .to_owned(),
+            chrome_tooltip: ChromeTooltipController::default(),
+            renderer: None,
+        };
+        let layout = TerminalLayout {
+            client_width: 1280,
+            client_height: 760,
+            cell_width: 8,
+            cell_height: 16,
+            diagnostic_panel_visible: false,
+        };
+        let controls_rect = windows_scene::cursor_latency_playground_controls_rect(
+            layout.terminal_panel_rect(),
+        );
+        let play_area_point = ClientPoint::new(
+            controls_rect.left() + 80,
+            controls_rect.bottom() + 160,
+        );
+
+        assert!(scene_action_tooltip(&state, layout, play_area_point).is_none());
+        assert!(
+            scene_action_at_point(SceneWindowKind::CursorLatencyPlayground, layout, play_area_point)
+                .is_none()
+        );
+    }
+
     // windowing[verify virtual-cursor.tooltips]
     // windowing[verify demo-mode.input-device-identifier-scramble]
     #[test]
@@ -14509,6 +15080,8 @@ mod tests {
             model_warning: None,
             model_warning_prepare_started_at: None,
             timeline_playground: None,
+            cursor_latency_playground: None,
+            latency_overlay: LatencyOverlayState::new(),
             timeline_playground_detail: None,
             timeline_tool: TimelineInteractionTool::default(),
             timeline_selection: None,
@@ -14585,6 +15158,8 @@ mod tests {
             model_warning: None,
             model_warning_prepare_started_at: None,
             timeline_playground: None,
+            cursor_latency_playground: None,
+            latency_overlay: LatencyOverlayState::new(),
             timeline_playground_detail: None,
             timeline_tool: TimelineInteractionTool::default(),
             timeline_selection: None,

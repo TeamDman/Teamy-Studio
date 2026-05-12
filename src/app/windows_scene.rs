@@ -85,6 +85,7 @@ pub enum SceneWindowKind {
     AudioInputDevicePicker,
     AudioInputDeviceDetails,
     CursorGallery,
+    CursorLatencyPlayground,
     DemoMode,
     TimelinePlayground,
     TimelinePlaygroundDetail,
@@ -107,6 +108,7 @@ impl SceneWindowKind {
             Self::AudioInputDevicePicker => "Audio Devices",
             Self::AudioInputDeviceDetails => "Microphone",
             Self::CursorGallery => "Cursor Gallery",
+            Self::CursorLatencyPlayground => "Cursor Latency Playground",
             Self::DemoMode => "Demo Mode",
             Self::TimelinePlayground => "Timeline Playground",
             Self::TimelinePlaygroundDetail => "Timeline Detail",
@@ -175,6 +177,7 @@ pub enum SceneAction {
     OpenTerminal,
     OpenCursorInfo,
     OpenCursorGallery,
+    OpenCursorLatencyPlayground,
     OpenDemoMode,
     OpenTimelinePlayground,
     OpenStorage,
@@ -210,6 +213,63 @@ pub enum SceneAction {
     TimelinePlaygroundGroupingAll,
     IncreaseTimelinePlaygroundFolding,
     DecreaseTimelinePlaygroundFolding,
+    SetCursorLatencyBehaviorFastest,
+    SetCursorLatencyBehaviorMatchOs,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CursorLatencyBehavior {
+    Fastest,
+    MatchOs,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct CursorLatencyPlaygroundViewState {
+    pub behavior: CursorLatencyBehavior,
+    pub os_cursor_position: Option<ClientPoint>,
+    pub rendered_cursor_position: Option<ClientPoint>,
+    pub fastest_cursor_position: Option<ClientPoint>,
+    pub match_os_cursor_position: Option<ClientPoint>,
+    pub trail_points: Vec<ClientPoint>,
+    pub lead_pixels: i32,
+    pub sample_count: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LatencyOverlayAnchor {
+    TopLeft,
+    Top,
+    TopRight,
+    Right,
+    BottomRight,
+    Bottom,
+    BottomLeft,
+    Left,
+    Center,
+}
+
+impl LatencyOverlayAnchor {
+    pub const fn next(self) -> Self {
+        match self {
+            Self::TopLeft => Self::Top,
+            Self::Top => Self::TopRight,
+            Self::TopRight => Self::Right,
+            Self::Right => Self::BottomRight,
+            Self::BottomRight => Self::Bottom,
+            Self::Bottom => Self::BottomLeft,
+            Self::BottomLeft => Self::Left,
+            Self::Left => Self::Center,
+            Self::Center => Self::TopLeft,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct LatencyOverlayViewState {
+    pub anchor: LatencyOverlayAnchor,
+    pub average_fps: Option<f32>,
+    pub latest_frame_ms: Option<f32>,
+    pub frame_times_ms: Vec<f32>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -2317,6 +2377,14 @@ pub fn scene_button_specs(scene_kind: SceneWindowKind) -> &'static [SceneButtonS
                 color: [0.20, 0.18, 0.32, 1.0],
             },
             SceneButtonSpec {
+                // cursor-latency[impl launcher-button]
+                action: SceneAction::OpenCursorLatencyPlayground,
+                label: "Cursor Latency Playground",
+                tooltip: "Compare app-drawn cursor behavior against the OS cursor",
+                sprite: SpriteId::CursorArrow,
+                color: [0.28, 0.17, 0.18, 1.0],
+            },
+            SceneButtonSpec {
                 // windowing[impl launcher.buttons.demo-mode]
                 action: SceneAction::OpenDemoMode,
                 label: "Demo Mode",
@@ -2500,9 +2568,27 @@ pub fn scene_button_specs(scene_kind: SceneWindowKind) -> &'static [SceneButtonS
                 // timeline[impl playground.viewport-controls]
                 action: SceneAction::ZoomTimelineOut,
                 label: "Zoom Out",
-                tooltip: "Zoom out of the playground viewport",
+                tooltip: "Zoom the playground viewport out",
                 sprite: SpriteId::Terminal,
-                color: [0.16, 0.24, 0.30, 1.0],
+                color: [0.17, 0.20, 0.29, 1.0],
+            },
+        ],
+        SceneWindowKind::CursorLatencyPlayground => &[
+            SceneButtonSpec {
+                // cursor-latency[impl playground.behavior-controls]
+                action: SceneAction::SetCursorLatencyBehaviorFastest,
+                label: "Fastest",
+                tooltip: "Lead the cursor polygon to mimic app-first presentation",
+                sprite: SpriteId::CursorArrow,
+                color: [0.30, 0.18, 0.16, 1.0],
+            },
+            SceneButtonSpec {
+                // cursor-latency[impl playground.behavior-controls]
+                action: SceneAction::SetCursorLatencyBehaviorMatchOs,
+                label: "Match OS",
+                tooltip: "Keep the cursor polygon welded to the sampled OS cursor",
+                sprite: SpriteId::CursorArrow,
+                color: [0.16, 0.25, 0.29, 1.0],
             },
         ],
         SceneWindowKind::TimelineStart => &[
@@ -6530,6 +6616,183 @@ pub fn build_cursor_gallery_render_scene(
     scene
 }
 
+#[must_use]
+// cursor-latency[impl playground.window]
+pub fn build_cursor_latency_playground_render_scene(
+    layout: TerminalLayout,
+    window_chrome_buttons_state: WindowChromeButtonsState,
+    view_state: CursorLatencyPlaygroundViewState,
+    button_states: &[(SceneAction, ButtonVisualState)],
+) -> RenderScene {
+    let mut scene = build_scene_shell(
+        layout,
+        SceneWindowKind::CursorLatencyPlayground,
+        window_chrome_buttons_state,
+    );
+    let specs = scene_button_specs(SceneWindowKind::CursorLatencyPlayground);
+    let controls_rect = cursor_latency_playground_controls_rect(layout.terminal_panel_rect());
+    let button_layouts = layout_scene_buttons(controls_rect, specs.len(), DEFAULT_MAX_BUTTON_SIZE);
+    for (index, spec) in specs.iter().enumerate() {
+        let button_layout = button_layouts[index];
+        let visual_state = button_states
+            .iter()
+            .find_map(|(action, state)| (*action == spec.action).then_some(*state))
+            .unwrap_or_default();
+        let card_color = if visual_state.active {
+            [
+                spec.color[0] + 0.08,
+                spec.color[1] + 0.08,
+                spec.color[2] + 0.08,
+                1.0,
+            ]
+        } else {
+            spec.color
+        };
+        push_panel_with_data(
+            &mut scene,
+            button_layout.card_rect.to_win32_rect(),
+            card_color,
+            PanelEffect::SceneButtonCard,
+            visual_state.shader_data(),
+        );
+        push_sprite(
+            &mut scene,
+            button_layout.sprite_rect.to_win32_rect(),
+            [1.0, 1.0, 1.0, 1.0],
+            spec.sprite,
+        );
+        push_centered_text(
+            &mut scene,
+            button_layout.label_rect.to_win32_rect(),
+            spec.label,
+            [0.97, 0.97, 0.99, 1.0],
+        );
+    }
+
+    let controls_bottom = button_layouts
+        .iter()
+        .map(|layout| layout.hit_rect().bottom())
+        .max()
+        .unwrap_or(controls_rect.bottom());
+    let body_rect = ClientRect::new(
+        layout.terminal_panel_rect().left() + 28,
+        controls_bottom + 10,
+        layout.terminal_panel_rect().right() - 28,
+        layout.terminal_panel_rect().bottom() - 22,
+    );
+    let title_rect = ClientRect::new(
+        body_rect.left(),
+        body_rect.top(),
+        body_rect.left() + 420,
+        body_rect.top() + 42,
+    );
+    let summary_rect = ClientRect::new(
+        body_rect.right() - 260,
+        body_rect.top() + 2,
+        body_rect.right(),
+        body_rect.top() + 56,
+    );
+    let canvas_rect = ClientRect::new(
+        body_rect.left(),
+        title_rect.bottom() + 44,
+        body_rect.right(),
+        body_rect.bottom(),
+    );
+
+    push_panel(
+        &mut scene,
+        body_rect.to_win32_rect(),
+        [0.07, 0.08, 0.10, 1.0],
+        PanelEffect::SceneBody,
+    );
+    push_title_text(
+        &mut scene,
+        title_rect.to_win32_rect(),
+        "Cursor Latency Playground",
+        [0.96, 0.98, 1.0, 1.0],
+    );
+    push_text_block(
+        &mut scene,
+        ClientRect::new(
+            body_rect.left(),
+            title_rect.bottom() - 2,
+            body_rect.left() + 640,
+            title_rect.bottom() + 38,
+        )
+        .to_win32_rect(),
+        "Fastest projects the cursor polygon ahead from recent motion to mimic the app-first presentation you observed in the DirectX experiment. Match OS pins that same polygon to the sampled OS cursor so the comparison is obvious.",
+        8,
+        14,
+        [0.74, 0.79, 0.85, 1.0],
+    );
+    let summary = format!(
+        "focus: {}\nfastest lead: {} px\nsamples: {}",
+        match view_state.behavior {
+            CursorLatencyBehavior::Fastest => "fastest",
+            CursorLatencyBehavior::MatchOs => "match os",
+        },
+        view_state.lead_pixels,
+        view_state.sample_count,
+    );
+    push_text_block(
+        &mut scene,
+        summary_rect.to_win32_rect(),
+        &summary,
+        8,
+        18,
+        [0.90, 0.93, 0.98, 1.0],
+    );
+
+    let gutter = 12;
+    let half_width = (canvas_rect.width() - gutter).max(0) / 2;
+    let fastest_rect = ClientRect::new(
+        canvas_rect.left(),
+        canvas_rect.top(),
+        canvas_rect.left() + half_width,
+        canvas_rect.bottom(),
+    );
+    let match_os_rect = ClientRect::new(
+        fastest_rect.right() + gutter,
+        canvas_rect.top(),
+        canvas_rect.right(),
+        canvas_rect.bottom(),
+    );
+    let match_color = preferred_title_bar_color(window_chrome_buttons_state.focused);
+    let fastest_color = hue_rotate_180(match_color);
+    push_cursor_latency_half(
+        &mut scene,
+        cursor_latency_half_content_rect(fastest_rect),
+        cursor_latency_half_content_rect(match_os_rect),
+        fastest_rect,
+        "Fastest",
+        fastest_color,
+        view_state.fastest_cursor_position,
+        view_state.lead_pixels,
+    );
+    push_cursor_latency_half(
+        &mut scene,
+        cursor_latency_half_content_rect(fastest_rect),
+        cursor_latency_half_content_rect(match_os_rect),
+        match_os_rect,
+        "Match OS",
+        match_color,
+        view_state.match_os_cursor_position,
+        0,
+    );
+
+    scene
+}
+
+#[must_use]
+pub fn cursor_latency_playground_controls_rect(panel_rect: ClientRect) -> ClientRect {
+    ClientRect::new(
+        panel_rect.left() + 20,
+        panel_rect.top() + 10,
+        panel_rect.right() - 20,
+        panel_rect.top() + 98,
+    )
+}
+
 fn client_rect_center(rect: ClientRect) -> ClientPoint {
     ClientPoint::new(
         rect.left() + (rect.width() / 2),
@@ -6579,6 +6842,312 @@ fn push_cursor_gallery_glow(
             }
             .shader_data(),
         );
+    }
+}
+
+fn push_cursor_latency_half(
+    scene: &mut RenderScene,
+    source_fastest_rect: ClientRect,
+    source_match_os_rect: ClientRect,
+    half_rect: ClientRect,
+    label: &str,
+    accent: [f32; 4],
+    source_point: Option<ClientPoint>,
+    lead_pixels: i32,
+) {
+    // cursor-latency[impl playground.split-halves]
+    // cursor-latency[impl playground.ripple-sdf]
+    let background = mix_rgba([0.05, 0.06, 0.08, 1.0], accent, 0.22);
+    push_panel(
+        scene,
+        half_rect.to_win32_rect(),
+        background,
+        PanelEffect::TerminalFill,
+    );
+    push_panel(
+        scene,
+        ClientRect::new(half_rect.left(), half_rect.top(), half_rect.right(), half_rect.top() + 40)
+            .to_win32_rect(),
+        mix_rgba(background, accent, 0.45),
+        PanelEffect::SceneBody,
+    );
+    push_centered_text(
+        scene,
+        ClientRect::new(half_rect.left() + 14, half_rect.top() + 6, half_rect.right() - 14, half_rect.top() + 34)
+            .to_win32_rect(),
+        &if lead_pixels > 0 {
+            format!("{label}  latest  +{lead_pixels}px")
+        } else {
+            format!("{label}  latest")
+        },
+        [0.97, 0.98, 1.0, 1.0],
+    );
+
+    if let Some(point) = source_point {
+        push_cursor_latency_ripple_panel(
+            scene,
+            source_fastest_rect,
+            source_match_os_rect,
+            cursor_latency_half_content_rect(half_rect),
+            point,
+            accent,
+        );
+    }
+}
+
+fn push_cursor_latency_ripple_panel(
+    scene: &mut RenderScene,
+    source_fastest_rect: ClientRect,
+    source_match_os_rect: ClientRect,
+    half_content_rect: ClientRect,
+    source_point: ClientPoint,
+    accent: [f32; 4],
+) {
+    let origin_uv = map_cursor_latency_point(
+        source_fastest_rect,
+        source_match_os_rect,
+        source_point,
+    );
+    let base = mix_rgba([0.05, 0.06, 0.08, 1.0], accent, 0.16);
+    push_panel_with_data(
+        scene,
+        half_content_rect.to_win32_rect(),
+        base,
+        PanelEffect::CursorLatencyRipple,
+        [
+            origin_uv.0,
+            origin_uv.1,
+            half_content_rect.width().max(1) as f32,
+            half_content_rect.height().max(1) as f32,
+        ],
+    );
+}
+
+fn cursor_latency_half_content_rect(half_rect: ClientRect) -> ClientRect {
+    ClientRect::new(
+        half_rect.left(),
+        half_rect.top() + 40,
+        half_rect.right(),
+        half_rect.bottom(),
+    )
+}
+
+fn map_cursor_latency_point(
+    fastest_rect: ClientRect,
+    match_os_rect: ClientRect,
+    point: ClientPoint,
+) -> (f32, f32) {
+    let source_rect = point
+        .to_win32_point()
+        .map_or(fastest_rect, |pixel| {
+            if pixel.x >= match_os_rect.left() {
+                match_os_rect
+            } else {
+                fastest_rect
+            }
+        });
+    let (point_x, point_y) = clamp_client_point_pixels(point, source_rect);
+    let width = source_rect.width().max(1) as f32;
+    let height = source_rect.height().max(1) as f32;
+    (
+        ((point_x - source_rect.left()) as f32 / width).clamp(0.0, 1.0),
+        ((point_y - source_rect.top()) as f32 / height).clamp(0.0, 1.0),
+    )
+}
+
+fn mix_rgba(a: [f32; 4], b: [f32; 4], amount: f32) -> [f32; 4] {
+    let amount = amount.clamp(0.0, 1.0);
+    [
+        a[0] + (b[0] - a[0]) * amount,
+        a[1] + (b[1] - a[1]) * amount,
+        a[2] + (b[2] - a[2]) * amount,
+        a[3] + (b[3] - a[3]) * amount,
+    ]
+}
+
+fn hue_rotate_180(color: [f32; 4]) -> [f32; 4] {
+    let (hue, saturation, value) = rgb_to_hsv(color[0], color[1], color[2]);
+    let (red, green, blue) = hsv_to_rgb((hue + 0.5).fract(), saturation, value);
+    [red, green, blue, color[3]]
+}
+
+fn rgb_to_hsv(red: f32, green: f32, blue: f32) -> (f32, f32, f32) {
+    let max = red.max(green).max(blue);
+    let min = red.min(green).min(blue);
+    let delta = max - min;
+    let hue = if delta <= f32::EPSILON {
+        0.0
+    } else if (max - red).abs() <= f32::EPSILON {
+        ((green - blue) / delta).rem_euclid(6.0) / 6.0
+    } else if (max - green).abs() <= f32::EPSILON {
+        (((blue - red) / delta) + 2.0) / 6.0
+    } else {
+        (((red - green) / delta) + 4.0) / 6.0
+    };
+    let saturation = if max <= f32::EPSILON { 0.0 } else { delta / max };
+    (hue, saturation, max)
+}
+
+fn hsv_to_rgb(hue: f32, saturation: f32, value: f32) -> (f32, f32, f32) {
+    if saturation <= f32::EPSILON {
+        return (value, value, value);
+    }
+    let scaled = (hue.rem_euclid(1.0) * 6.0).clamp(0.0, 6.0);
+    let sector = scaled.floor();
+    let fraction = scaled - sector;
+    let p = value * (1.0 - saturation);
+    let q = value * (1.0 - saturation * fraction);
+    let t = value * (1.0 - saturation * (1.0 - fraction));
+    match sector as i32 {
+        0 => (value, t, p),
+        1 => (q, value, p),
+        2 => (p, value, t),
+        3 => (p, q, value),
+        4 => (t, p, value),
+        _ => (value, p, q),
+    }
+}
+
+fn clamp_client_point_pixels(point: ClientPoint, rect: ClientRect) -> (i32, i32) {
+    let point = point
+        .to_win32_point()
+        .expect("client-space points must convert back to pixels");
+    (
+        point.x.clamp(rect.left(), rect.right()),
+        point.y.clamp(rect.top(), rect.bottom()),
+    )
+}
+
+pub fn push_latency_overlay(
+    scene: &mut RenderScene,
+    layout: TerminalLayout,
+    view_state: &LatencyOverlayViewState,
+) {
+    // cursor-latency[impl overlay.frame-graph]
+    let overlay_rect = latency_overlay_rect(layout.terminal_panel_rect(), view_state.anchor);
+    let header_rect = ClientRect::new(
+        overlay_rect.left() + 14,
+        overlay_rect.top() + 10,
+        overlay_rect.right() - 14,
+        overlay_rect.top() + 38,
+    );
+    let graph_rect = ClientRect::new(
+        overlay_rect.left() + 10,
+        overlay_rect.top() + 42,
+        overlay_rect.right() - 10,
+        overlay_rect.bottom() - 10,
+    );
+    push_panel(
+        scene,
+        overlay_rect.to_win32_rect(),
+        [0.05, 0.07, 0.10, 0.92],
+        PanelEffect::SceneButtonCard,
+    );
+    push_panel(
+        scene,
+        overlay_rect.inset(1).to_win32_rect(),
+        [0.10, 0.12, 0.16, 0.94],
+        PanelEffect::SceneBody,
+    );
+    let fps_text = view_state
+        .average_fps
+        .map(|fps| format!("{:>3.0} fps", fps))
+        .unwrap_or_else(|| "--- fps".to_owned());
+    let latest_text = view_state
+        .latest_frame_ms
+        .map(|ms| format!("{ms:>4.1} ms"))
+        .unwrap_or_else(|| "--.- ms".to_owned());
+    push_text_block(
+        scene,
+        header_rect.to_win32_rect(),
+        &format!("Latency  {fps_text}  {latest_text}"),
+        4,
+        18,
+        [0.95, 0.97, 1.0, 1.0],
+    );
+    push_latency_overlay_reference_lines(scene, graph_rect);
+    push_latency_overlay_bars(scene, graph_rect, &view_state.frame_times_ms);
+}
+
+fn latency_overlay_rect(panel_rect: ClientRect, anchor: LatencyOverlayAnchor) -> ClientRect {
+    let width = 238;
+    let height = 128;
+    let margin = 18;
+    let left = match anchor {
+        LatencyOverlayAnchor::TopLeft
+        | LatencyOverlayAnchor::Left
+        | LatencyOverlayAnchor::BottomLeft => panel_rect.left() + margin,
+        LatencyOverlayAnchor::Top | LatencyOverlayAnchor::Center | LatencyOverlayAnchor::Bottom => {
+            panel_rect.left() + (panel_rect.width() - width) / 2
+        }
+        LatencyOverlayAnchor::TopRight
+        | LatencyOverlayAnchor::Right
+        | LatencyOverlayAnchor::BottomRight => panel_rect.right() - width - margin,
+    };
+    let top = match anchor {
+        LatencyOverlayAnchor::TopLeft
+        | LatencyOverlayAnchor::Top
+        | LatencyOverlayAnchor::TopRight => panel_rect.top() + margin,
+        LatencyOverlayAnchor::Left
+        | LatencyOverlayAnchor::Center
+        | LatencyOverlayAnchor::Right => panel_rect.top() + (panel_rect.height() - height) / 2,
+        LatencyOverlayAnchor::BottomLeft
+        | LatencyOverlayAnchor::Bottom
+        | LatencyOverlayAnchor::BottomRight => panel_rect.bottom() - height - margin,
+    };
+
+    ClientRect::new(left, top, left + width, top + height)
+}
+
+fn push_latency_overlay_reference_lines(scene: &mut RenderScene, graph_rect: ClientRect) {
+    for target_ms in [16.67_f32, 33.33_f32] {
+        let ratio = (target_ms / 50.0).clamp(0.0, 1.0);
+        let y = graph_rect.bottom() - ((graph_rect.height() as f32 - 8.0) * ratio) as i32 - 4;
+        push_panel(
+            scene,
+            ClientRect::new(
+                graph_rect.left(),
+                y,
+                graph_rect.right(),
+                (y + 1).min(graph_rect.bottom()),
+            )
+            .to_win32_rect(),
+            [0.28, 0.33, 0.41, 0.55],
+            PanelEffect::TerminalFill,
+        );
+    }
+}
+
+fn push_latency_overlay_bars(
+    scene: &mut RenderScene,
+    graph_rect: ClientRect,
+    frame_times_ms: &[f32],
+) {
+    let mut x = graph_rect.right() - 6;
+    for frame_ms in frame_times_ms.iter().rev() {
+        let severity = (*frame_ms / 33.33).clamp(0.0, 1.8);
+        let width = (2.0 + severity * 7.0).round() as i32;
+        let height_ratio = (*frame_ms / 50.0).clamp(0.10, 1.0);
+        let height = ((graph_rect.height() - 8) as f32 * height_ratio).round() as i32;
+        let left = x - width;
+        if left <= graph_rect.left() + 4 {
+            break;
+        }
+        let color = if *frame_ms <= 16.67 {
+            [0.42, 0.94, 0.70, 0.96]
+        } else if *frame_ms <= 33.33 {
+            [0.98, 0.79, 0.30, 0.96]
+        } else {
+            [1.0, 0.43, 0.32, 0.96]
+        };
+        push_panel(
+            scene,
+            ClientRect::new(left, graph_rect.bottom() - height - 2, x, graph_rect.bottom() - 2)
+                .to_win32_rect(),
+            color,
+            PanelEffect::TerminalFill,
+        );
+        x = left - 2;
     }
 }
 
@@ -9452,6 +10021,11 @@ mod tests {
         assert!(
             specs
                 .iter()
+                .any(|spec| spec.action == SceneAction::OpenCursorLatencyPlayground)
+        );
+        assert!(
+            specs
+                .iter()
                 .any(|spec| spec.action == SceneAction::OpenDemoMode)
         );
         assert!(
@@ -9511,6 +10085,28 @@ mod tests {
         assert!(actions.contains(&SceneAction::PanTimelineRight));
         assert!(actions.contains(&SceneAction::ZoomTimelineIn));
         assert!(actions.contains(&SceneAction::ZoomTimelineOut));
+    }
+
+    #[test]
+    fn cursor_latency_playground_scene_specs_expose_behavior_controls() {
+        let specs = scene_button_specs(SceneWindowKind::CursorLatencyPlayground);
+        let actions = specs.iter().map(|spec| spec.action).collect::<Vec<_>>();
+
+        assert_eq!(actions.len(), 2);
+        assert!(actions.contains(&SceneAction::SetCursorLatencyBehaviorFastest));
+        assert!(actions.contains(&SceneAction::SetCursorLatencyBehaviorMatchOs));
+    }
+
+    #[test]
+    fn cursor_latency_point_maps_from_source_half_local_space() {
+        let fastest_rect = ClientRect::new(0, 40, 200, 240);
+        let match_os_rect = ClientRect::new(212, 40, 412, 240);
+        let source_point = ClientPoint::new(100, 140);
+
+        let mapped = map_cursor_latency_point(fastest_rect, match_os_rect, source_point);
+
+        assert!((mapped.0 - 0.5).abs() < f32::EPSILON);
+        assert!((mapped.1 - 0.5).abs() < f32::EPSILON);
     }
 
     // timeline[verify playground.synthetic-render-plan]

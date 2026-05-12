@@ -130,6 +130,18 @@ specs (
         )
     }
     {
+        name teamy-studio-cursor-latency
+        source_url https://github.com/TeamDman/Teamy-Studio
+        include (docs/spec/product/cursor-latency.md)
+        impls (
+            {
+                name rust
+                include (src/**/*.rs)
+                test_include (tests/**/*.rs)
+            }
+        )
+    }
+    {
         name teamy-studio-observability
         source_url https://github.com/TeamDman/Teamy-Studio
         include (docs/spec/product/observability.md)
