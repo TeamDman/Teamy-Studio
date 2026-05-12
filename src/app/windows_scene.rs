@@ -7061,7 +7061,7 @@ pub fn push_latency_overlay(
         scene,
         header_rect.to_win32_rect(),
         &format!("Latency  {fps_text}  {latest_text}"),
-        4,
+        8,
         18,
         [0.95, 0.97, 1.0, 1.0],
     );
@@ -10107,6 +10107,33 @@ mod tests {
 
         assert!((mapped.0 - 0.5).abs() < f32::EPSILON);
         assert!((mapped.1 - 0.5).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn latency_overlay_header_uses_readable_glyph_width() {
+        let layout = sample_layout();
+        let mut scene = RenderScene {
+            panels: Vec::new(),
+            glyphs: Vec::new(),
+            sprites: Vec::new(),
+            overlay_panels: Vec::new(),
+        };
+        let view_state = LatencyOverlayViewState {
+            anchor: LatencyOverlayAnchor::TopRight,
+            average_fps: Some(144.0),
+            latest_frame_ms: Some(6.9),
+            frame_times_ms: vec![6.9, 7.1, 6.8],
+        };
+
+        push_latency_overlay(&mut scene, layout, &view_state);
+
+        let min_glyph_width = scene
+            .glyphs
+            .iter()
+            .map(|glyph| glyph.rect.right - glyph.rect.left)
+            .min()
+            .expect("overlay should render glyphs");
+        assert!(min_glyph_width >= 8);
     }
 
     // timeline[verify playground.synthetic-render-plan]

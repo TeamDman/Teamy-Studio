@@ -1,10 +1,11 @@
 use std::cell::RefCell;
 use std::cmp::Ordering;
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::c_void;
 use std::marker::PhantomData;
 use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock, mpsc};
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::thread;
 use std::time::{Duration, Instant};
 #[cfg(feature = "tracy")]
@@ -23,8 +24,9 @@ use widestring::U16CString;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, CLEARTYPE_QUALITY, CreateFontIndirectW, DeleteObject, EndPaint, GetDC,
-    GetDeviceCaps, GetMonitorInfoW, GetTextExtentPoint32W, HFONT, LOGFONTW, MONITOR_FROM_FLAGS,
-    MONITORINFO, MonitorFromWindow, PAINTSTRUCT, ReleaseDC, SelectObject, VREFRESH,
+    DEVMODEW, ENUM_CURRENT_SETTINGS, EnumDisplaySettingsW, GetDeviceCaps, GetMonitorInfoW,
+    GetTextExtentPoint32W, HFONT, LOGFONTW, MONITOR_FROM_FLAGS, MONITORINFO, MONITORINFOEXW,
+    MonitorFromWindow, PAINTSTRUCT, ReleaseDC, SelectObject, VREFRESH,
 };
 use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
@@ -47,7 +49,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetClientRect, GetCursorPos, GetMessageW, GetSystemMetrics, GetWindowRect,
     GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, HTCAPTION, HTCLIENT,
     HTTRANSPARENT, HWND_NOTOPMOST, HWND_TOPMOST, IDC_ARROW, IDC_CROSS, IDC_HAND, IDC_HELP,
-    IDC_IBEAM, IDC_SIZEALL, IDC_SIZEWE, IDC_WAIT, IsWindowVisible, IsZoomed, KillTimer,
+    IDC_IBEAM, IDC_SIZEALL, IDC_SIZEWE, IDC_WAIT, IsWindowVisible, IsZoomed,
     LoadCursorW, MSG, MoveWindow, PostMessageW, PostQuitMessage, RegisterClassExW,
     SM_CXPADDEDBORDER, SM_CXSCREEN, SM_CXSIZEFRAME, SM_CXVIRTUALSCREEN, SM_CYSCREEN,
     SM_CYSIZEFRAME, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SW_HIDE, SW_MAXIMIZE,
@@ -56,7 +58,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SetWindowTextW, ShowWindow, TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CHAR,
     WM_CLOSE, WM_DESTROY, WM_DPICHANGED, WM_ENTERSIZEMOVE, WM_ERASEBKGND, WM_EXITSIZEMOVE,
     WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
-    WM_NCCALCSIZE, WM_NCHITTEST, WM_NCLBUTTONDOWN, WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP,
+    WM_MOVE, WM_NCCALCSIZE, WM_NCHITTEST, WM_NCLBUTTONDOWN, WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP,
     WM_SETCURSOR, WM_SETFOCUS, WM_SIZE, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WNDCLASSEXW,
     WS_EX_APPWINDOW, WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
     WS_EX_TRANSPARENT, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP, WS_THICKFRAME, WS_VISIBLE,
@@ -139,7 +141,7 @@ const MIN_RESIZE_BORDER_THICKNESS: i32 = 1;
 const MOUSE_WHEEL_DELTA: i16 = 120;
 const TERMINAL_WHEEL_SCROLL_LINES: isize = 3;
 const SELECTION_AUTO_SCROLL_MAX_LINES: isize = 12;
-const FOCUSED_RENDER_TIMER_ID: usize = 2;
+const HIGH_RESOLUTION_TIMER_PERIOD_MS: u32 = 1;
 const TOAST_RENDER_TIMER_ID: usize = 3;
 const TOAST_RENDER_INTERVAL_MS: u32 = 16;
 const USER_DEFAULT_SCREEN_DPI: u32 = 96;
@@ -165,6 +167,7 @@ const TIMELINE_DOCUMENT_CHANGED_MESSAGE: u32 = WM_APP + 0x403;
 const TIMELINE_DOCUMENT_COMMAND_MESSAGE: u32 = WM_APP + 0x404;
 const TIMELINE_TRANSCRIPTION_WORKER_COMPLETED_MESSAGE: u32 = WM_APP + 0x405;
 const TIMELINE_PLAYGROUND_DETAIL_CHANGED_MESSAGE: u32 = WM_APP + 0x406;
+const FOCUSED_RENDER_TICK_MESSAGE: u32 = WM_APP + 0x407;
 
 #[derive(Clone, Debug)]
 enum TimelineDocumentCommand {
@@ -1517,6 +1520,23 @@ struct WindowHandle {
     window_thread: WindowThread,
 }
 
+static ACTIVE_HIGH_RESOLUTION_TIMER_WINDOWS: OnceLock<Mutex<HashSet<isize>>> = OnceLock::new();
+static ACTIVE_FOCUSED_RENDER_TICKERS: OnceLock<Mutex<HashMap<isize, FocusedRenderTicker>>> =
+    OnceLock::new();
+
+const TIMERR_NOERROR: u32 = 0;
+
+#[link(name = "winmm")]
+unsafe extern "system" {
+    fn timeBeginPeriod(uperiod: u32) -> u32;
+    fn timeEndPeriod(uperiod: u32) -> u32;
+}
+
+struct FocusedRenderTicker {
+    stop: Arc<AtomicBool>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
 impl WindowHandle {
     fn new(window_thread: WindowThread, hwnd: HWND) -> Self {
         Self {
@@ -1663,13 +1683,12 @@ impl WindowHandle {
     }
 
     fn set_focused_render_timer(self, interval_ms: u32) -> eyre::Result<()> {
-        self.set_timer(FOCUSED_RENDER_TIMER_ID, interval_ms)
+        restart_focused_render_ticker(self.hwnd, interval_ms)
     }
 
     fn clear_focused_render_timer(self) {
         self.window_thread.assert_window_thread();
-        // Safety: removing a thread-owned timer from this live HWND is valid.
-        let _ = unsafe { KillTimer(Some(self.hwnd), FOCUSED_RENDER_TIMER_ID) };
+        stop_focused_render_ticker(self.hwnd);
     }
 
     fn set_timer(self, timer_id: usize, interval_ms: u32) -> eyre::Result<()> {
@@ -1691,7 +1710,103 @@ impl WindowHandle {
     fn post_quit_message(self) {
         self.window_thread.post_quit_message();
     }
+}
 
+fn high_resolution_timer_windows() -> &'static Mutex<HashSet<isize>> {
+    ACTIVE_HIGH_RESOLUTION_TIMER_WINDOWS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn focused_render_tickers() -> &'static Mutex<HashMap<isize, FocusedRenderTicker>> {
+    ACTIVE_FOCUSED_RENDER_TICKERS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn restart_focused_render_ticker(hwnd: HWND, interval_ms: u32) -> eyre::Result<()> {
+    stop_focused_render_ticker(hwnd);
+    enable_high_resolution_timer_period_for_hwnd(hwnd)?;
+    let stop = Arc::new(AtomicBool::new(false));
+    let thread_stop = Arc::clone(&stop);
+    let interval = Duration::from_millis(u64::from(interval_ms.max(1)));
+    let hwnd_key = hwnd.0 as isize;
+    let handle = thread::Builder::new()
+        .name(format!("teamy-focused-render-ticker-{hwnd_key}"))
+        .spawn(move || run_focused_render_ticker(hwnd_key, interval, thread_stop))
+        .map_err(|error| eyre::eyre!("failed to spawn focused render ticker: {error}"))?;
+    focused_render_tickers()
+        .lock()
+        .expect("focused render ticker tracking should not be poisoned")
+        .insert(
+            hwnd_key,
+            FocusedRenderTicker {
+                stop,
+                handle: Some(handle),
+            },
+        );
+    Ok(())
+}
+
+fn stop_focused_render_ticker(hwnd: HWND) {
+    let ticker = focused_render_tickers()
+        .lock()
+        .expect("focused render ticker tracking should not be poisoned")
+        .remove(&(hwnd.0 as isize));
+    if let Some(mut ticker) = ticker {
+        ticker.stop.store(true, AtomicOrdering::Release);
+        if let Some(handle) = ticker.handle.take() {
+            let _ = handle.join();
+        }
+        disable_high_resolution_timer_period_for_hwnd(hwnd);
+    }
+}
+
+fn run_focused_render_ticker(hwnd_raw: isize, interval: Duration, stop: Arc<AtomicBool>) {
+    let hwnd = HWND(hwnd_raw as *mut c_void);
+    let mut next_tick = Instant::now() + interval;
+    while !stop.load(AtomicOrdering::Acquire) {
+        let now = Instant::now();
+        if now < next_tick {
+            thread::sleep(next_tick - now);
+        }
+        if stop.load(AtomicOrdering::Acquire) {
+            break;
+        }
+        let _ = unsafe { PostMessageW(Some(hwnd), FOCUSED_RENDER_TICK_MESSAGE, WPARAM(0), LPARAM(0)) };
+        next_tick += interval;
+        let now = Instant::now();
+        if next_tick < now {
+            next_tick = now + interval;
+        }
+    }
+}
+
+fn enable_high_resolution_timer_period_for_hwnd(hwnd: HWND) -> eyre::Result<()> {
+    let mut active_windows = high_resolution_timer_windows()
+        .lock()
+        .expect("high-resolution timer tracking should not be poisoned");
+    if active_windows.insert(hwnd.0 as isize) {
+        // Safety: requesting a process-wide 1 ms multimedia timer period is valid.
+        let result = unsafe { timeBeginPeriod(HIGH_RESOLUTION_TIMER_PERIOD_MS) };
+        if result != TIMERR_NOERROR {
+            active_windows.remove(&(hwnd.0 as isize));
+            eyre::bail!(
+                "failed to enable {HIGH_RESOLUTION_TIMER_PERIOD_MS} ms timer period: MMRESULT={}",
+                result
+            );
+        }
+    }
+    Ok(())
+}
+
+fn disable_high_resolution_timer_period_for_hwnd(hwnd: HWND) {
+    let mut active_windows = high_resolution_timer_windows()
+        .lock()
+        .expect("high-resolution timer tracking should not be poisoned");
+    if active_windows.remove(&(hwnd.0 as isize)) {
+        // Safety: ending a previously requested process-wide timer period is valid.
+        let _ = unsafe { timeEndPeriod(HIGH_RESOLUTION_TIMER_PERIOD_MS) };
+    }
+}
+
+impl WindowHandle {
     fn capture_mouse(self) {
         self.window_thread.assert_window_thread();
         // Safety: capturing mouse input for this live window during a pointer drag is valid.
@@ -2193,7 +2308,7 @@ fn run_with_terminal_session(
         font_height = diagnostic_font_height,
     )
     .in_scope(|| measure_terminal_cell_size(diagnostic_font_height))?;
-    let focused_render_interval_ms = measure_focused_render_interval_ms();
+    let focused_render_interval_ms = measure_focused_render_interval_ms(None);
 
     APP_STATE.with(|state| {
         *state.borrow_mut() = Some(AppState {
@@ -2243,6 +2358,7 @@ fn run_with_terminal_session(
     let chrome_tooltip = ChromeTooltipController::create(hwnd)?;
     with_app_state(|state| {
         state.hwnd = Some(hwnd);
+        state.focused_render_interval_ms = measure_focused_render_interval_ms(Some(hwnd.raw()));
         state.terminal.set_wake_window(hwnd.raw());
         state.chrome_tooltip = chrome_tooltip;
         state.renderer = Some(renderer);
@@ -2284,7 +2400,7 @@ fn run_scene_window(
     initialize_demo_mode_state(app_home)?;
     let window_thread = WindowThread::current();
     let dpi = system_dpi();
-    let focused_render_interval_ms = measure_focused_render_interval_ms();
+    let focused_render_interval_ms = measure_focused_render_interval_ms(None);
     let (terminal_cell_width, terminal_cell_height) =
         measure_terminal_cell_size(scaled_font_height(TERMINAL_FONT_HEIGHT, dpi))?;
     let (diagnostic_cell_width, diagnostic_cell_height) =
@@ -2385,6 +2501,7 @@ fn run_scene_window(
     let chrome_tooltip = ChromeTooltipController::create(hwnd)?;
     with_scene_app_state(|state| {
         state.hwnd = Some(hwnd);
+        state.focused_render_interval_ms = measure_focused_render_interval_ms(Some(hwnd.raw()));
         if state.timeline_document_command_target.is_none()
             && scene_kind_owns_timeline_document_commands(state.scene_kind)
         {
@@ -3633,10 +3750,11 @@ extern "system" fn window_proc(
         WM_ENTERSIZEMOVE => handle_enter_size_move(hwnd),
         WM_EXITSIZEMOVE => handle_exit_size_move(hwnd),
         WM_DPICHANGED => handle_dpi_changed(hwnd, lparam),
+        WM_MOVE => handle_move(hwnd),
         WM_SIZE => handle_size(hwnd),
         TERMINAL_WORKER_WAKE_MESSAGE => handle_terminal_worker_wake(hwnd),
         WM_TIMER if wparam.0 == POLL_TIMER_ID => handle_timer(hwnd),
-        WM_TIMER if wparam.0 == FOCUSED_RENDER_TIMER_ID => handle_focused_render_timer(hwnd),
+        FOCUSED_RENDER_TICK_MESSAGE => handle_focused_render_timer(hwnd),
         WM_CHAR => handle_char_message(hwnd, message, wparam, lparam),
         WM_KEYDOWN | WM_SYSKEYDOWN => handle_key_down_message(hwnd, message, wparam, lparam),
         WM_KEYUP | WM_SYSKEYUP => handle_key_up_message(hwnd, message, wparam, lparam),
@@ -3685,8 +3803,9 @@ extern "system" fn scene_window_proc(
         WM_ENTERSIZEMOVE => handle_scene_enter_size_move(hwnd),
         WM_EXITSIZEMOVE => handle_scene_exit_size_move(hwnd),
         WM_DPICHANGED => handle_scene_dpi_changed(hwnd, lparam),
+        WM_MOVE => handle_scene_move(hwnd),
         WM_SIZE => handle_scene_size(hwnd),
-        WM_TIMER if wparam.0 == FOCUSED_RENDER_TIMER_ID => handle_scene_focused_render_timer(hwnd),
+        FOCUSED_RENDER_TICK_MESSAGE => handle_scene_focused_render_timer(hwnd),
         DEMO_MODE_STATE_CHANGED_MESSAGE => handle_scene_demo_mode_state_changed(hwnd),
         TIMELINE_DOCUMENT_CHANGED_MESSAGE => handle_scene_timeline_document_changed(hwnd),
         TIMELINE_DOCUMENT_COMMAND_MESSAGE => handle_scene_timeline_document_command(hwnd),
@@ -3775,6 +3894,7 @@ fn handle_scene_exit_size_move(hwnd: WindowHandle) -> LRESULT {
 
 fn handle_scene_size(hwnd: WindowHandle) -> LRESULT {
     match with_scene_app_state(|state| {
+        refresh_scene_focused_render_interval(state, hwnd)?;
         let layout = scene_client_layout(hwnd, state)?;
         render_scene_window_frame(
             state,
@@ -3793,10 +3913,20 @@ fn handle_scene_size(hwnd: WindowHandle) -> LRESULT {
 }
 
 fn handle_scene_dpi_changed(hwnd: WindowHandle, lparam: LPARAM) -> LRESULT {
-    let result = with_scene_app_state(|state| apply_scene_dpi(state, window_dpi(hwnd)))
+    let result = with_scene_app_state(|state| {
+        apply_scene_dpi(state, window_dpi(hwnd))?;
+        refresh_scene_focused_render_interval(state, hwnd)
+    })
         .and_then(|()| apply_suggested_dpi_rect(hwnd, lparam));
 
     match result {
+        Ok(()) => LRESULT(0),
+        Err(error) => fail_and_close(hwnd, &error),
+    }
+}
+
+fn handle_scene_move(hwnd: WindowHandle) -> LRESULT {
+    match with_scene_app_state(|state| refresh_scene_focused_render_interval(state, hwnd)) {
         Ok(()) => LRESULT(0),
         Err(error) => fail_and_close(hwnd, &error),
     }
@@ -3892,6 +4022,7 @@ fn handle_scene_focus_changed(hwnd: WindowHandle, focused: bool) -> LRESULT {
     match with_scene_app_state(|state| {
         state.window_focused = focused;
         if focused {
+            refresh_scene_focused_render_interval(state, hwnd)?;
             hwnd.set_focused_render_timer(state.focused_render_interval_ms)?;
             render_scene_window_frame(state, hwnd, None, true)?;
         } else {
@@ -4411,6 +4542,7 @@ fn handle_scene_key_down_message(
 }
 
 fn handle_scene_destroy_message(hwnd: WindowHandle) -> LRESULT {
+    hwnd.clear_focused_render_timer();
     unregister_scene_window(hwnd);
     SCENE_APP_STATE.with(|state| {
         if let Some(state) = state.borrow_mut().as_mut() {
@@ -6165,6 +6297,7 @@ fn handle_exit_size_move(hwnd: WindowHandle) -> LRESULT {
 
 fn handle_size(hwnd: WindowHandle) -> LRESULT {
     match with_app_state(|state| {
+        refresh_app_focused_render_interval(state, hwnd)?;
         let layout = terminal_client_layout(hwnd, state)?;
         if state.in_move_size_loop
             && should_defer_terminal_resize_during_move_size(state.terminal_layout, layout)
@@ -6190,10 +6323,20 @@ fn handle_size(hwnd: WindowHandle) -> LRESULT {
 }
 
 fn handle_dpi_changed(hwnd: WindowHandle, lparam: LPARAM) -> LRESULT {
-    let result = with_app_state(|state| apply_app_dpi(state, window_dpi(hwnd)))
+    let result = with_app_state(|state| {
+        apply_app_dpi(state, window_dpi(hwnd))?;
+        refresh_app_focused_render_interval(state, hwnd)
+    })
         .and_then(|()| apply_suggested_dpi_rect(hwnd, lparam));
 
     match result {
+        Ok(()) => LRESULT(0),
+        Err(error) => fail_and_close(hwnd, &error),
+    }
+}
+
+fn handle_move(hwnd: WindowHandle) -> LRESULT {
+    match with_app_state(|state| refresh_app_focused_render_interval(state, hwnd)) {
         Ok(()) => LRESULT(0),
         Err(error) => fail_and_close(hwnd, &error),
     }
@@ -6233,6 +6376,7 @@ fn handle_focus_changed(hwnd: WindowHandle, focused: bool) -> LRESULT {
     match with_app_state(|state| {
         state.window_focused = focused;
         if focused {
+            refresh_app_focused_render_interval(state, hwnd)?;
             hwnd.set_focused_render_timer(state.focused_render_interval_ms)?;
             render_current_frame_with_options(state, hwnd, None, true)?;
         } else {
@@ -6438,6 +6582,7 @@ fn handle_non_client_hit_test(hwnd: WindowHandle, lparam: LPARAM) -> LRESULT {
 }
 
 fn handle_destroy_message(hwnd: WindowHandle) -> LRESULT {
+    hwnd.clear_focused_render_timer();
     APP_STATE.with(|state| {
         let mut state = state.borrow_mut();
         if let Some(app_state) = state.as_mut()
@@ -10671,7 +10816,38 @@ fn perform_scene_action(
     }
 }
 
-fn measure_focused_render_interval_ms() -> u32 {
+fn refresh_app_focused_render_interval(state: &mut AppState, hwnd: WindowHandle) -> eyre::Result<()> {
+    state.focused_render_interval_ms = measure_focused_render_interval_ms(Some(hwnd.raw()));
+    if state.window_focused {
+        hwnd.set_focused_render_timer(state.focused_render_interval_ms)?;
+    }
+    Ok(())
+}
+
+fn refresh_scene_focused_render_interval(
+    state: &mut SceneAppState,
+    hwnd: WindowHandle,
+) -> eyre::Result<()> {
+    state.focused_render_interval_ms = measure_focused_render_interval_ms(Some(hwnd.raw()));
+    if state.window_focused {
+        hwnd.set_focused_render_timer(state.focused_render_interval_ms)?;
+    }
+    Ok(())
+}
+
+fn focused_render_interval_ms_for_refresh_hz(refresh_hz: u32) -> u32 {
+    if refresh_hz <= 1 {
+        16
+    } else {
+        (1_000 / refresh_hz).max(1)
+    }
+}
+
+fn measure_focused_render_interval_ms(hwnd: Option<HWND>) -> u32 {
+    if let Some(refresh_hz) = hwnd.and_then(monitor_refresh_hz_for_window) {
+        return focused_render_interval_ms_for_refresh_hz(refresh_hz);
+    }
+
     // Safety: querying the screen DC with a null HWND is valid.
     let hdc = unsafe { GetDC(None) };
     if hdc.0.is_null() {
@@ -10683,12 +10859,46 @@ fn measure_focused_render_interval_ms() -> u32 {
     // Safety: releasing the screen DC after GetDC(None) is required.
     unsafe { ReleaseDC(None, hdc) };
 
-    let refresh_hz = u32::try_from(refresh_hz).unwrap_or(60);
-    if refresh_hz <= 1 {
-        return 16;
+    focused_render_interval_ms_for_refresh_hz(u32::try_from(refresh_hz).unwrap_or(60))
+}
+
+fn monitor_refresh_hz_for_window(hwnd: HWND) -> Option<u32> {
+    // Safety: resolving the nearest monitor for a live top-level HWND is a read-only OS query.
+    let monitor = unsafe { MonitorFromWindow(hwnd, MONITOR_FROM_FLAGS(2)) };
+    if monitor.0.is_null() {
+        return None;
     }
 
-    (1_000 / refresh_hz).max(1)
+    let mut info = MONITORINFOEXW {
+        monitorInfo: MONITORINFO {
+            cbSize: u32::try_from(std::mem::size_of::<MONITORINFOEXW>()).ok()?,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    // Safety: `info` is writable storage for the monitor returned above.
+    if !unsafe { GetMonitorInfoW(monitor, (&raw mut info.monitorInfo).cast()) }.as_bool() {
+        return None;
+    }
+
+    let mut device_mode = DEVMODEW {
+        dmSize: u16::try_from(std::mem::size_of::<DEVMODEW>()).ok()?,
+        ..Default::default()
+    };
+    // Safety: the monitor device name comes from GetMonitorInfoW and is null-terminated.
+    if !unsafe {
+        EnumDisplaySettingsW(
+            PCWSTR(info.szDevice.as_ptr()),
+            ENUM_CURRENT_SETTINGS,
+            &raw mut device_mode,
+        )
+    }
+    .as_bool()
+    {
+        return None;
+    }
+
+    Some(device_mode.dmDisplayFrequency)
 }
 
 fn terminal_scrollbar_visual_state(state: &AppState) -> TerminalScrollbarVisualState {
@@ -14788,6 +14998,20 @@ mod tests {
         overlay.handle_f3(now + Duration::from_millis(900));
         assert!(overlay.visible);
         assert_eq!(overlay.anchor, windows_scene::LatencyOverlayAnchor::Right);
+    }
+
+    #[test]
+    fn focused_render_interval_tracks_refresh_rate() {
+        assert_eq!(focused_render_interval_ms_for_refresh_hz(144), 6);
+        assert_eq!(focused_render_interval_ms_for_refresh_hz(60), 16);
+        assert_eq!(focused_render_interval_ms_for_refresh_hz(1), 16);
+        assert_eq!(focused_render_interval_ms_for_refresh_hz(0), 16);
+    }
+
+    #[test]
+    fn focused_render_interval_prefers_short_period_for_high_refresh_displays() {
+        assert!(focused_render_interval_ms_for_refresh_hz(144) < focused_render_interval_ms_for_refresh_hz(60));
+        assert!(focused_render_interval_ms_for_refresh_hz(240) <= 4);
     }
 
     #[test]
