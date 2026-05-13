@@ -60,6 +60,7 @@ pub fn build_text_grid_scene_with_palette(
         transformed_glyphs: Vec::new(),
         sprites: Vec::new(),
         overlay_panels: Vec::new(),
+        overlay_glyphs: Vec::new(),
     };
 
     if rows.cols == 0 {

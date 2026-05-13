@@ -37,7 +37,8 @@ use super::windows_audio_input::{
 use super::windows_d3d12_renderer::{
     ButtonVisualState, PanelEffect, RenderScene, SpriteId, WindowChromeButtonsState,
     preferred_background_color, preferred_title_bar_color, push_centered_text, push_glyph,
-    push_panel, push_panel_with_data, push_sprite, push_text_block, push_title_text,
+    push_overlay_panel, push_overlay_text_block, push_panel, push_panel_with_data, push_sprite,
+    push_text_block, push_title_text,
     push_transformed_glyph,
     push_window_chrome_buttons, push_window_garden_frame,
 };
@@ -1218,7 +1219,7 @@ pub fn build_text_rendering_plane_render_scene(
     push_text_block(
         &mut scene,
         workspace.footer_rect.to_win32_rect(),
-        "Left drag rotates. Middle drag pans the camera. Right drag translates the text plane. Mouse wheel zooms around the plane center.",
+        "Left drag rotates. Middle drag pans the camera. Right drag translates the text plane. Mouse wheel zooms around the cursor.",
         9,
         16,
         [0.76, 0.80, 0.88, 1.0],
@@ -7438,13 +7439,13 @@ pub fn push_latency_overlay(
         overlay_rect.right() - 10,
         overlay_rect.bottom() - 10,
     );
-    push_panel(
+    push_overlay_panel(
         scene,
         overlay_rect.to_win32_rect(),
         [0.05, 0.07, 0.10, 0.92],
         PanelEffect::SceneButtonCard,
     );
-    push_panel(
+    push_overlay_panel(
         scene,
         overlay_rect.inset(1).to_win32_rect(),
         [0.10, 0.12, 0.16, 0.94],
@@ -7458,7 +7459,7 @@ pub fn push_latency_overlay(
         .latest_frame_ms
         .map(|ms| format!("{ms:>4.1} ms"))
         .unwrap_or_else(|| "--.- ms".to_owned());
-    push_text_block(
+    push_overlay_text_block(
         scene,
         header_rect.to_win32_rect(),
         &format!("Latency  {fps_text}  {latest_text}"),
@@ -7504,7 +7505,7 @@ fn push_latency_overlay_reference_lines(scene: &mut RenderScene, graph_rect: Cli
     for target_ms in [16.67_f32, 33.33_f32] {
         let ratio = (target_ms / 50.0).clamp(0.0, 1.0);
         let y = graph_rect.bottom() - ((graph_rect.height() as f32 - 8.0) * ratio) as i32 - 4;
-        push_panel(
+        push_overlay_panel(
             scene,
             ClientRect::new(
                 graph_rect.left(),
@@ -7541,7 +7542,7 @@ fn push_latency_overlay_bars(
         } else {
             [1.0, 0.43, 0.32, 0.96]
         };
-        push_panel(
+        push_overlay_panel(
             scene,
             ClientRect::new(left, graph_rect.bottom() - height - 2, x, graph_rect.bottom() - 2)
                 .to_win32_rect(),
@@ -9991,6 +9992,7 @@ fn empty_render_scene() -> RenderScene {
         transformed_glyphs: Vec::new(),
         sprites: Vec::new(),
         overlay_panels: Vec::new(),
+        overlay_glyphs: Vec::new(),
     }
 }
 
@@ -10169,6 +10171,7 @@ fn build_scene_shell(
         transformed_glyphs: Vec::new(),
         sprites: Vec::new(),
         overlay_panels: Vec::new(),
+        overlay_glyphs: Vec::new(),
     };
 
     push_panel(
@@ -10538,6 +10541,7 @@ mod tests {
             transformed_glyphs: Vec::new(),
             sprites: Vec::new(),
             overlay_panels: Vec::new(),
+            overlay_glyphs: Vec::new(),
         };
         let view_state = LatencyOverlayViewState {
             anchor: LatencyOverlayAnchor::TopRight,

@@ -89,6 +89,15 @@ float icon_pin(float2 uv) {
     return saturate(max(max(head, neck), max(tip, shine)));
 }
 
+float icon_hourglass(float2 uv) {
+    float top = triangle_mask(uv, float2(0.28, 0.24), float2(0.72, 0.24), float2(0.50, 0.48), 0.014);
+    float bottom = triangle_mask(uv, float2(0.28, 0.76), float2(0.72, 0.76), float2(0.50, 0.52), 0.014);
+    float cap_top = line_segment_mask(uv, float2(0.26, 0.20), float2(0.74, 0.20), 0.032);
+    float cap_bottom = line_segment_mask(uv, float2(0.26, 0.80), float2(0.74, 0.80), 0.032);
+    float neck = line_segment_mask(uv, float2(0.50, 0.46), float2(0.50, 0.54), 0.028);
+    return saturate(max(max(top, bottom), max(max(cap_top, cap_bottom), neck)));
+}
+
 float icon_minimize(float2 uv) {
     return box_fill_mask(uv, float2(0.5, 0.64), float2(0.22, 0.04));
 }
@@ -136,22 +145,26 @@ float chrome_icon_mask(float2 uv, float effect) {
     }
 
     if (effect < 17.5) {
-        return icon_diagnostics(uv);
+        return icon_hourglass(uv);
     }
 
     if (effect < 18.5) {
-        return icon_minimize(uv);
+        return icon_diagnostics(uv);
     }
 
     if (effect < 19.5) {
-        return icon_maximize(uv);
+        return icon_minimize(uv);
     }
 
     if (effect < 20.5) {
+        return icon_maximize(uv);
+    }
+
+    if (effect < 21.5) {
         return icon_restore(uv);
     }
 
-    if (effect > 21.5) {
+    if (effect > 22.5) {
         return icon_gear(uv);
     }
 

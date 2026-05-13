@@ -176,6 +176,7 @@ const TEXT_RENDERING_DOUBLE_RIGHT_CLICK_WINDOW: Duration = Duration::from_millis
 const TEXT_RENDERING_DOUBLE_RIGHT_CLICK_MAX_MOVEMENT_PX: u32 = 1;
 const TEXT_RENDERING_PITCH_LIMIT_RADIANS: f32 = 1.45;
 const TEXT_RENDERING_CAMERA_DISTANCE: f32 = 1400.0;
+const TEXT_RENDERING_VIRTUALIZATION_PADDING_PX: f32 = 48.0;
 
 #[derive(Clone, Debug)]
 enum TimelineDocumentCommand {
@@ -421,9 +422,17 @@ struct TextRenderingPlaygroundSharedState {
     sprite_sheet_characters: Vec<char>,
     plane_viewport: TextRenderingViewportState,
     sprite_sheet_viewport: TextRenderingViewportState,
+    render_revision: u64,
     last_interaction_at: Option<Instant>,
     open_windows: Vec<isize>,
     closing_all: bool,
+}
+
+#[derive(Clone, Debug)]
+struct TextRenderingGlyphInstanceCache {
+    rect: ClientRect,
+    render_revision: u64,
+    glyphs: Vec<windows_scene::TextRenderingGlyphInstance>,
 }
 
 #[derive(Clone, Debug)]
@@ -447,6 +456,7 @@ impl TextRenderingPlaygroundHandle {
                 sprite_sheet_characters,
                 plane_viewport: TextRenderingViewportState::default(),
                 sprite_sheet_viewport: TextRenderingViewportState::default(),
+                render_revision: 0,
                 last_interaction_at: None,
                 open_windows: Vec::new(),
                 closing_all: false,
@@ -1333,6 +1343,7 @@ impl HostedTerminalSession {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum WindowChromeButton {
     Pin,
+    Latency,
     Diagnostics,
     Minimize,
     MaximizeRestore,
@@ -1413,6 +1424,7 @@ struct SceneAppState {
     text_rendering_editor_focused: bool,
     text_rendering_last_right_button_down_at: Option<Instant>,
     text_rendering_last_right_button_down_point: Option<ClientPoint>,
+    text_rendering_glyph_cache: Option<TextRenderingGlyphInstanceCache>,
     latency_overlay: LatencyOverlayState,
     timeline_playground_detail: Option<TimelinePlaygroundDetailWindowHandle>,
     timeline_tool: TimelineInteractionTool,
@@ -1547,7 +1559,7 @@ fn update_text_rendering_preset(
     };
     shared.active_preset = preset;
     shared.text = text_rendering_preset_text(preset, &shared.sprite_sheet_sample);
-    shared.last_interaction_at = Some(Instant::now());
+    mark_text_rendering_playground_changed(&mut shared, Instant::now());
     drop(shared);
     playground.broadcast_changed();
     Ok(())
@@ -1564,6 +1576,39 @@ fn text_rendering_viewport_mut(
         }
         _ => None,
     }
+}
+
+fn mark_text_rendering_playground_changed(
+    shared: &mut TextRenderingPlaygroundSharedState,
+    when: Instant,
+) {
+    shared.render_revision = shared.render_revision.wrapping_add(1);
+    shared.last_interaction_at = Some(when);
+}
+
+fn cached_text_rendering_glyph_instances<'a>(
+    state: &'a mut SceneAppState,
+    rect: ClientRect,
+    render_revision: u64,
+    text: &str,
+    viewport: TextRenderingViewportState,
+    color: [f32; 4],
+) -> &'a [windows_scene::TextRenderingGlyphInstance] {
+    let cache_hit = state
+        .text_rendering_glyph_cache
+        .as_ref()
+        .is_some_and(|cache| cache.rect == rect && cache.render_revision == render_revision);
+    if !cache_hit {
+        state.text_rendering_glyph_cache = Some(TextRenderingGlyphInstanceCache {
+            rect,
+            render_revision,
+            glyphs: build_text_rendering_glyph_instances(rect, text, viewport, color),
+        });
+    }
+    state
+        .text_rendering_glyph_cache
+        .as_ref()
+        .map_or(&[], |cache| cache.glyphs.as_slice())
 }
 
 fn open_text_rendering_playground_windows(
@@ -2788,6 +2833,7 @@ fn run_scene_window(
             text_rendering_editor_focused: false,
             text_rendering_last_right_button_down_at: None,
             text_rendering_last_right_button_down_point: None,
+            text_rendering_glyph_cache: None,
             latency_overlay: LatencyOverlayState::new(),
             timeline_playground_detail: initialization.timeline_playground_detail,
             timeline_tool: TimelineInteractionTool::default(),
@@ -3838,6 +3884,7 @@ fn render_toast_host(state: &mut ToastHostState) -> eyre::Result<()> {
         transformed_glyphs: Vec::new(),
         sprites: Vec::new(),
         overlay_panels: Vec::new(),
+        overlay_glyphs: Vec::new(),
     };
     windows_scene::push_info_toasts(&mut scene, layout, &toast_view_states(state, now));
     let frame = RenderFrameModel {
@@ -5098,6 +5145,10 @@ fn handle_scene_left_button_down(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Re
                 scene_toggle_pin(state, hwnd)?;
                 return Ok(ScenePointerAction::RenderOnly);
             }
+            if button == WindowChromeButton::Latency {
+                state.latency_overlay.handle_f3(Instant::now());
+                return Ok(ScenePointerAction::RenderOnly);
+            }
             return Ok(ScenePointerAction::WindowChrome(button));
         }
 
@@ -6136,7 +6187,7 @@ fn handle_scene_mouse_move(
                 ];
             }
         }
-        shared.last_interaction_at = Some(Instant::now());
+        mark_text_rendering_playground_changed(&mut shared, Instant::now());
         drop(shared);
         playground.broadcast_changed();
         Ok(true)
@@ -6649,7 +6700,7 @@ fn handle_scene_right_button_down(hwnd: WindowHandle, lparam: LPARAM) -> eyre::R
                 && let Ok(mut shared) = playground.shared.lock()
             {
                 shared.text.clear();
-                shared.last_interaction_at = Some(Instant::now());
+                mark_text_rendering_playground_changed(&mut shared, Instant::now());
                 drop(shared);
                 playground.broadcast_changed();
             }
@@ -6690,7 +6741,7 @@ fn handle_scene_right_button_down(hwnd: WindowHandle, lparam: LPARAM) -> eyre::R
                             text_rendering_viewport_mut(&mut shared, state.scene_kind)
                         {
                             *viewport = TextRenderingViewportState::default();
-                            shared.last_interaction_at = Some(now);
+                            mark_text_rendering_playground_changed(&mut shared, now);
                         }
                     }
                     playground.broadcast_changed();
@@ -6813,13 +6864,24 @@ fn handle_scene_mouse_wheel(
             if wheel_delta == 0 {
                 return Ok(true);
             }
+            let point_pixels = point.to_win32_point()?;
             if let Some(playground) = state.text_rendering_playground.as_ref().cloned() {
                 if let Ok(mut shared) = playground.shared.lock()
                     && let Some(viewport) = text_rendering_viewport_mut(&mut shared, state.scene_kind)
                 {
                     let factor = if wheel_delta > 0 { 1.12 } else { 1.0 / 1.12 };
+                    let center = [
+                        (interaction_rect.left() + interaction_rect.width() / 2) as f32
+                            + viewport.camera_offset[0]
+                            + viewport.plane_offset[0],
+                        (interaction_rect.top() + interaction_rect.height() / 2) as f32
+                            + viewport.camera_offset[1]
+                            + viewport.plane_offset[1],
+                    ];
                     viewport.zoom = (viewport.zoom * factor).max(0.05);
-                    shared.last_interaction_at = Some(Instant::now());
+                    viewport.plane_offset[0] += (point_pixels.x as f32 - center[0]) * (1.0 - factor);
+                    viewport.plane_offset[1] += (point_pixels.y as f32 - center[1]) * (1.0 - factor);
+                    mark_text_rendering_playground_changed(&mut shared, Instant::now());
                 }
                 playground.broadcast_changed();
             }
@@ -6956,6 +7018,7 @@ fn window_chrome_mouse_down_action(
 ) -> WindowChromePointerAction {
     match button_at_point {
         Some(WindowChromeButton::Pin) => WindowChromePointerAction::RenderOnly,
+        Some(WindowChromeButton::Latency) => WindowChromePointerAction::RenderOnly,
         Some(WindowChromeButton::Diagnostics) => WindowChromePointerAction::RenderOnly,
         Some(button) => WindowChromePointerAction::Execute(button),
         None => WindowChromePointerAction::NotHandled,
@@ -7199,7 +7262,7 @@ fn handle_scene_char_message(
                 }
                 _ => return Ok(false),
             }
-            shared.last_interaction_at = Some(Instant::now());
+            mark_text_rendering_playground_changed(&mut shared, Instant::now());
         }
         if let Some(playground) = playground {
             playground.broadcast_changed();
@@ -7504,6 +7567,14 @@ fn terminal_window_chrome_buttons_state(
             state.pin_button_last_clicked_at,
             state.pinned_topmost,
         ),
+        latency_enabled: false,
+        latency: window_chrome_button_visual_state(
+            layout.latency_button_rect(),
+            state.pointer_position,
+            state.pressed_chrome_button == Some(WindowChromeButton::Latency),
+            None,
+            false,
+        ),
         diagnostics: window_chrome_button_visual_state(
             layout.diagnostics_button_rect(),
             state.pointer_position,
@@ -7533,6 +7604,7 @@ fn terminal_window_chrome_buttons_state(
             false,
         ),
         pinned: state.pinned_topmost,
+        latency_visible: false,
         maximized: hwnd.is_zoomed(),
         focused: state.window_focused,
     }
@@ -7550,6 +7622,15 @@ fn scene_window_chrome_buttons_state(
             state.pressed_target == Some(ScenePressedTarget::ChromeButton(WindowChromeButton::Pin)),
             state.pin_button_last_clicked_at,
             state.pinned_topmost,
+        ),
+        latency_enabled: true,
+        latency: window_chrome_button_visual_state(
+            layout.latency_button_rect(),
+            state.pointer_position,
+            state.pressed_target
+                == Some(ScenePressedTarget::ChromeButton(WindowChromeButton::Latency)),
+            state.latency_overlay.last_f3_pressed_at,
+            state.latency_overlay.is_visible(),
         ),
         diagnostics: window_chrome_button_visual_state(
             layout.diagnostics_button_rect(),
@@ -7590,6 +7671,7 @@ fn scene_window_chrome_buttons_state(
             false,
         ),
         pinned: state.pinned_topmost,
+        latency_visible: state.latency_overlay.is_visible(),
         maximized: hwnd.is_zoomed(),
         focused: state.window_focused,
     }
@@ -7841,14 +7923,22 @@ fn render_scene_window_frame(
             .as_ref()
             .and_then(|playground| playground.shared.lock().ok())
             .expect("text rendering plane scene has shared playground state");
+        let interaction_rect = windows_scene::text_rendering_plane_interaction_rect(layout);
+        let render_revision = shared.render_revision;
+        let viewport = shared.plane_viewport;
+        let text = shared.text.clone();
+        let view_state = text_rendering_plane_view_state(&shared);
+        drop(shared);
         windows_scene::build_text_rendering_plane_render_scene(
             layout,
             window_chrome_buttons_state,
-            text_rendering_plane_view_state(&shared),
-            &build_text_rendering_glyph_instances(
-                windows_scene::text_rendering_plane_interaction_rect(layout),
-                &shared.text,
-                shared.plane_viewport,
+            view_state,
+            cached_text_rendering_glyph_instances(
+                state,
+                interaction_rect,
+                render_revision,
+                &text,
+                viewport,
                 [0.88, 0.94, 1.0, 1.0],
             ),
         )
@@ -7870,14 +7960,22 @@ fn render_scene_window_frame(
             .as_ref()
             .and_then(|playground| playground.shared.lock().ok())
             .expect("text rendering sprite sheet scene has shared playground state");
+        let interaction_rect = windows_scene::text_rendering_plane_interaction_rect(layout);
+        let render_revision = shared.render_revision;
+        let viewport = shared.sprite_sheet_viewport;
+        let sprite_sheet_sample = shared.sprite_sheet_sample.clone();
+        let view_state = text_rendering_sprite_sheet_view_state(&shared);
+        drop(shared);
         windows_scene::build_text_rendering_sprite_sheet_render_scene(
             layout,
             window_chrome_buttons_state,
-            text_rendering_sprite_sheet_view_state(&shared),
-            &build_text_rendering_glyph_instances(
-                windows_scene::text_rendering_plane_interaction_rect(layout),
-                &shared.sprite_sheet_sample,
-                shared.sprite_sheet_viewport,
+            view_state,
+            cached_text_rendering_glyph_instances(
+                state,
+                interaction_rect,
+                render_revision,
+                &sprite_sheet_sample,
+                viewport,
                 [0.84, 0.98, 0.90, 1.0],
             ),
         )
@@ -8793,6 +8891,10 @@ fn build_text_rendering_glyph_instances(
         plane_origin[0] + ((max_line_advance * scale) / 2.0),
         plane_origin[1] + ((line_count * line_height) / 2.0),
     ];
+    let cull_left = rect.left() as f32 - TEXT_RENDERING_VIRTUALIZATION_PADDING_PX;
+    let cull_right = rect.right() as f32 + TEXT_RENDERING_VIRTUALIZATION_PADDING_PX;
+    let cull_top = rect.top() as f32 - TEXT_RENDERING_VIRTUALIZATION_PADDING_PX;
+    let cull_bottom = rect.bottom() as f32 + TEXT_RENDERING_VIRTUALIZATION_PADDING_PX;
 
     let mut glyphs = Vec::new();
     for (row_index, line) in lines.iter().enumerate() {
@@ -8840,16 +8942,16 @@ fn build_text_rendering_glyph_instances(
             let max_x = corners.iter().map(|corner| corner[0]).fold(f32::NEG_INFINITY, f32::max);
             let min_y = corners.iter().map(|corner| corner[1]).fold(f32::INFINITY, f32::min);
             let max_y = corners.iter().map(|corner| corner[1]).fold(f32::NEG_INFINITY, f32::max);
-            if max_x >= rect.left() as f32
-                && min_x <= rect.right() as f32
-                && max_y >= rect.top() as f32
-                && min_y <= rect.bottom() as f32
+            if max_x >= cull_left
+                && min_x <= cull_right
+                && max_y >= cull_top
+                && min_y <= cull_bottom
             {
-            glyphs.push(windows_scene::TextRenderingGlyphInstance {
-                character,
-                color,
-                corners,
-            });
+                glyphs.push(windows_scene::TextRenderingGlyphInstance {
+                    character,
+                    color,
+                    corners,
+                });
             }
             pen_x_units += advance;
         }
@@ -10426,6 +10528,7 @@ fn f64_to_i32_saturating(value: f64) -> i32 {
 fn window_chrome_button_rect(layout: TerminalLayout, button: WindowChromeButton) -> ClientRect {
     match button {
         WindowChromeButton::Pin => layout.pin_button_rect(),
+        WindowChromeButton::Latency => layout.latency_button_rect(),
         WindowChromeButton::Diagnostics => layout.diagnostics_button_rect(),
         WindowChromeButton::Minimize => layout.minimize_button_rect(),
         WindowChromeButton::MaximizeRestore => layout.maximize_restore_button_rect(),
@@ -10439,6 +10542,7 @@ fn window_chrome_button_at_point(
 ) -> Option<WindowChromeButton> {
     [
         WindowChromeButton::Pin,
+        WindowChromeButton::Latency,
         WindowChromeButton::Diagnostics,
         WindowChromeButton::Minimize,
         WindowChromeButton::MaximizeRestore,
@@ -10492,7 +10596,7 @@ fn scene_toggle_pin(state: &mut SceneAppState, hwnd: WindowHandle) -> eyre::Resu
 
 fn execute_window_chrome_button(hwnd: WindowHandle, button: WindowChromeButton) {
     match button {
-        WindowChromeButton::Pin | WindowChromeButton::Diagnostics => {}
+        WindowChromeButton::Pin | WindowChromeButton::Latency | WindowChromeButton::Diagnostics => {}
         WindowChromeButton::Minimize => hwnd.minimize(),
         WindowChromeButton::MaximizeRestore => hwnd.toggle_maximize_restore(),
         WindowChromeButton::Close => hwnd.post_close(),
@@ -14351,6 +14455,7 @@ fn update_terminal_chrome_tooltip(
         layout,
         point,
         state.diagnostic_panel_visible,
+        false,
         hwnd.is_zoomed(),
         state.pinned_topmost,
     )? {
@@ -14382,6 +14487,7 @@ fn update_scene_chrome_tooltip(
         layout,
         point,
         state.diagnostics_visible,
+        state.latency_overlay.is_visible(),
         hwnd.is_zoomed(),
         state.pinned_topmost,
     )? {
@@ -14755,6 +14861,7 @@ fn update_window_chrome_tooltip(
     layout: TerminalLayout,
     point: ClientPoint,
     diagnostics_active: bool,
+    latency_active: bool,
     maximized: bool,
     pinned: bool,
 ) -> eyre::Result<bool> {
@@ -14763,7 +14870,7 @@ fn update_window_chrome_tooltip(
     };
 
     let tooltip_text =
-        window_chrome_button_tooltip_text(button, diagnostics_active, maximized, pinned);
+        window_chrome_button_tooltip_text(button, diagnostics_active, latency_active, maximized, pinned);
     let anchor_rect = client_rect_to_screen_rect(hwnd, window_chrome_button_rect(layout, button))?;
     let cursor_rect = pointer_cursor_screen_rect(hwnd, point)?;
     let monitor_bounds = monitor_work_rect(hwnd)?;
@@ -15199,6 +15306,7 @@ fn audio_input_timeline_head_tooltip(
 fn window_chrome_button_tooltip_text(
     button: WindowChromeButton,
     diagnostics_active: bool,
+    latency_active: bool,
     maximized: bool,
     pinned: bool,
 ) -> &'static str {
@@ -15208,6 +15316,13 @@ fn window_chrome_button_tooltip_text(
                 "Unpin window from top"
             } else {
                 "Keep window on top"
+            }
+        }
+        WindowChromeButton::Latency => {
+            if latency_active {
+                "Hide latency overlay"
+            } else {
+                "Show latency overlay"
             }
         }
         WindowChromeButton::Diagnostics => {
@@ -15432,6 +15547,7 @@ mod tests {
             text_rendering_editor_focused: false,
             text_rendering_last_right_button_down_at: None,
             text_rendering_last_right_button_down_point: None,
+            text_rendering_glyph_cache: None,
             latency_overlay: LatencyOverlayState::new(),
             timeline_playground_detail: None,
             timeline_tool: TimelineInteractionTool::default(),
@@ -16283,6 +16399,7 @@ mod tests {
             text_rendering_editor_focused: false,
             text_rendering_last_right_button_down_at: None,
             text_rendering_last_right_button_down_point: None,
+            text_rendering_glyph_cache: None,
             latency_overlay: LatencyOverlayState::new(),
             timeline_playground_detail: None,
             timeline_tool: TimelineInteractionTool::default(),
@@ -16373,6 +16490,7 @@ mod tests {
             text_rendering_editor_focused: false,
             text_rendering_last_right_button_down_at: None,
             text_rendering_last_right_button_down_point: None,
+            text_rendering_glyph_cache: None,
             latency_overlay: LatencyOverlayState::new(),
             timeline_playground_detail: None,
             timeline_tool: TimelineInteractionTool::default(),
@@ -16464,6 +16582,7 @@ mod tests {
             text_rendering_editor_focused: false,
             text_rendering_last_right_button_down_at: None,
             text_rendering_last_right_button_down_point: None,
+            text_rendering_glyph_cache: None,
             latency_overlay: LatencyOverlayState::new(),
             timeline_playground_detail: None,
             timeline_tool: TimelineInteractionTool::default(),
@@ -16547,6 +16666,7 @@ mod tests {
             text_rendering_editor_focused: false,
             text_rendering_last_right_button_down_at: None,
             text_rendering_last_right_button_down_point: None,
+            text_rendering_glyph_cache: None,
             latency_overlay: LatencyOverlayState::new(),
             timeline_playground_detail: None,
             timeline_tool: TimelineInteractionTool::default(),
@@ -17130,6 +17250,14 @@ mod tests {
         assert_eq!(
             scene_mouse_down_action(None),
             ScenePointerAction::NotHandled
+        );
+    }
+
+    #[test]
+    fn window_chrome_mouse_down_action_handles_latency_on_press() {
+        assert_eq!(
+            window_chrome_mouse_down_action(Some(WindowChromeButton::Latency),),
+            WindowChromePointerAction::RenderOnly
         );
     }
 

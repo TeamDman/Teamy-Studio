@@ -500,23 +500,23 @@ float4 PSMain(PsInput input) : SV_TARGET {
     }
 
     float4 shaded = input.color;
-    if (input.effect > 30.5) {
+    if (input.effect > 31.5) {
         shaded = apply_cursor_latency_ripple(input.uv, input.color, input.glyphData);
-    } else if (input.effect > 29.5) {
+    } else if (input.effect > 30.5) {
         shaded = apply_timeline_add_text_track_button(input.uv, input.color, input.glyphData);
-    } else if (input.effect > 28.5) {
+    } else if (input.effect > 29.5) {
         shaded = apply_target_marker(input.uv, input.color, input.glyphData);
-    } else if (input.effect > 27.5) {
+    } else if (input.effect > 28.5) {
         shaded = apply_transcription_toggle(input.uv, input.color, input.glyphData);
-    } else if (input.effect > 26.5) {
+    } else if (input.effect > 27.5) {
         shaded = apply_playback_button(input.uv, input.color, input.glyphData);
-    } else if (input.effect > 25.5) {
+    } else if (input.effect > 26.5) {
         shaded = apply_demo_toggle(input.uv, input.color, input.glyphData);
-    } else if (input.effect > 24.5) {
+    } else if (input.effect > 25.5) {
         shaded = apply_timeline_head_grabber(input.uv, input.color, input.glyphData);
-    } else if (input.effect > 23.5) {
+    } else if (input.effect > 24.5) {
         shaded = apply_loopback_button(input.uv, input.color, input.glyphData);
-    } else if (input.effect > 22.5) {
+    } else if (input.effect > 23.5) {
         shaded = apply_record_arm_button(input.uv, input.color, input.glyphData);
     } else if (input.effect > 15.5) {
         shaded = apply_window_chrome_button(input.uv, input.color, input.glyphData, input.effect);

@@ -772,9 +772,9 @@ impl TerminalLayout {
     pub fn title_text_rect(self) -> ClientRect {
         let title_bar = self.title_bar_rect();
         let plus = self.diagnostics_button_rect();
-        let pin = self.pin_button_rect();
+        let latency = self.latency_button_rect();
         ClientRect::new(
-            pin.right() + 12,
+            latency.right() + 12,
             title_bar.top(),
             (plus.left() - 12).max(title_bar.left() + 1),
             title_bar.bottom(),
@@ -851,6 +851,18 @@ impl TerminalLayout {
             top,
             title_bar.left() + 10 + button_size,
             top + button_size,
+        )
+    }
+
+    #[must_use]
+    pub fn latency_button_rect(self) -> ClientRect {
+        let pin = self.pin_button_rect();
+        let button_size = pin.width();
+        ClientRect::new(
+            pin.right() + 8,
+            pin.top(),
+            pin.right() + 8 + button_size,
+            pin.bottom(),
         )
     }
 
@@ -4285,6 +4297,7 @@ mod tests {
         let content = layout.content_frame_rect();
         let title = layout.title_bar_rect();
         let pin = layout.pin_button_rect();
+        let latency = layout.latency_button_rect();
         let title_text = layout.title_text_rect();
         let terminal_panel = layout.terminal_panel_rect();
         let diagnostic = layout.diagnostic_panel_rect();
@@ -4302,7 +4315,8 @@ mod tests {
         assert!(title.bottom() <= terminal_panel.top());
         assert!(terminal_panel.bottom() <= diagnostic.top());
         assert!(pin.left() >= title.left());
-        assert!(pin.right() <= title_text.left());
+        assert!(pin.right() <= latency.left());
+        assert!(latency.right() <= title_text.left());
         assert!(details.left() < minimize.left());
         assert!(minimize.left() < maximize.left());
         assert!(maximize.left() < close.left());
@@ -4313,7 +4327,7 @@ mod tests {
             assert!(rect.right() <= content.right());
             assert!(rect.bottom() <= content.bottom());
         }
-        for button in [pin, details, minimize, maximize, close] {
+        for button in [pin, latency, details, minimize, maximize, close] {
             assert!(button.top() >= title.top());
             assert!(button.bottom() <= title.bottom());
         }
@@ -4339,6 +4353,7 @@ mod tests {
 
         let terminal_panel = layout.terminal_panel_rect();
         let diagnostic = layout.diagnostic_panel_rect();
+        let latency = layout.latency_button_rect();
         let details = layout.diagnostics_button_rect();
         let minimize = layout.minimize_button_rect();
         let maximize = layout.maximize_restore_button_rect();
@@ -4348,6 +4363,7 @@ mod tests {
 
         assert!(terminal_panel.height() >= 0);
         assert!(diagnostic.height() >= 0);
+        assert!(latency.height() >= 0);
         assert!(details.height() >= 0);
         assert!(minimize.height() >= 0);
         assert!(maximize.height() >= 0);
@@ -4355,6 +4371,7 @@ mod tests {
         assert!(terminal.height() >= 0);
         assert!(scrollbar.height() >= 0);
         assert!(diagnostic.top() <= diagnostic.bottom());
+        assert!(latency.top() <= latency.bottom());
         assert!(details.top() <= details.bottom());
         assert!(minimize.top() <= minimize.bottom());
         assert!(maximize.top() <= maximize.bottom());

@@ -270,21 +270,22 @@ pub enum PanelEffect {
     SceneButtonCard = 14,
     SceneBody = 15,
     WindowChromePin = 16,
-    WindowChromeDiagnostics = 17,
-    WindowChromeMinimize = 18,
-    WindowChromeMaximize = 19,
-    WindowChromeRestore = 20,
-    WindowChromeClose = 21,
-    GearButton = 22,
-    RecordArmButton = 23,
-    LoopbackButton = 24,
-    TimelineHeadGrabber = 25,
-    DemoToggle = 26,
-    PlaybackButton = 27,
-    TranscriptionToggle = 28,
-    TargetMarker = 29,
-    TimelineAddTextTrackButton = 30,
-    CursorLatencyRipple = 31,
+    WindowChromeLatency = 17,
+    WindowChromeDiagnostics = 18,
+    WindowChromeMinimize = 19,
+    WindowChromeMaximize = 20,
+    WindowChromeRestore = 21,
+    WindowChromeClose = 22,
+    GearButton = 23,
+    RecordArmButton = 24,
+    LoopbackButton = 25,
+    TimelineHeadGrabber = 26,
+    DemoToggle = 27,
+    PlaybackButton = 28,
+    TranscriptionToggle = 29,
+    TargetMarker = 30,
+    TimelineAddTextTrackButton = 31,
+    CursorLatencyRipple = 32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -362,6 +363,7 @@ pub struct RenderScene {
     pub transformed_glyphs: Vec<TransformedGlyphQuad>,
     pub sprites: Vec<SpriteQuad>,
     pub overlay_panels: Vec<PanelRect>,
+    pub overlay_glyphs: Vec<GlyphQuad>,
 }
 
 #[derive(Debug)]
@@ -437,11 +439,14 @@ pub struct RendererTerminalVisualState {
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct WindowChromeButtonsState {
     pub pin: ButtonVisualState,
+    pub latency_enabled: bool,
+    pub latency: ButtonVisualState,
     pub diagnostics: ButtonVisualState,
     pub minimize: ButtonVisualState,
     pub maximize_restore: ButtonVisualState,
     pub close: ButtonVisualState,
     pub pinned: bool,
+    pub latency_visible: bool,
     pub maximized: bool,
     pub focused: bool,
 }
@@ -1531,7 +1536,8 @@ fn build_scene_vertices_with_assets(
             + scene.sprites.len()
             + scene.glyphs.len()
             + scene.transformed_glyphs.len()
-            + scene.overlay_panels.len())
+            + scene.overlay_panels.len()
+            + scene.overlay_glyphs.len())
             * 6,
     );
     for panel in &scene.panels {
@@ -1582,6 +1588,14 @@ fn build_scene_vertices_with_assets(
             [0.0, 0.0, 1.0, 1.0],
             panel.data,
         );
+    }
+    for glyph in &scene.overlay_glyphs {
+        let slug_glyph = glyph_cache
+            .get(&glyph.character)
+            .or_else(|| glyph_cache.get(&FALLBACK_GLYPH))
+            .copied()
+            .unwrap_or_else(|| SlugGlyph::empty(font));
+        append_text_rect(&mut vertices, glyph.rect, glyph.color, slug_glyph, font);
     }
     vertices
 }
@@ -1838,6 +1852,7 @@ fn build_terminal_row_scene(
         transformed_glyphs: Vec::new(),
         sprites: Vec::new(),
         overlay_panels: Vec::new(),
+        overlay_glyphs: Vec::new(),
     };
 
     for background in &row.backgrounds {
@@ -1874,6 +1889,7 @@ fn build_terminal_cursor_scene(
         transformed_glyphs: Vec::new(),
         sprites: Vec::new(),
         overlay_panels: Vec::with_capacity(4),
+        overlay_glyphs: Vec::new(),
     };
     let cell_rect = terminal_cell_rect(terminal_rect, cursor.cell, cell_width, cell_height);
     for rect in terminal_cursor_overlay_rects(cell_rect, cursor.style) {
@@ -1899,6 +1915,7 @@ fn build_terminal_scrollbar_scene(
         transformed_glyphs: Vec::new(),
         sprites: Vec::new(),
         overlay_panels: Vec::new(),
+        overlay_glyphs: Vec::new(),
     };
     if scrollbar_rect.width() <= 0 || scrollbar_rect.height() <= 0 {
         return scene;
@@ -2075,6 +2092,7 @@ pub fn build_panel_scene(
         transformed_glyphs: Vec::new(),
         sprites: Vec::new(),
         overlay_panels: Vec::with_capacity(16),
+        overlay_glyphs: Vec::new(),
     };
     push_panel(
         &mut scene,
@@ -2187,7 +2205,7 @@ pub fn push_window_chrome_buttons(
     layout: TerminalLayout,
     window_chrome_buttons_state: WindowChromeButtonsState,
 ) {
-    let buttons = [
+    let mut buttons = vec![
         (
             layout.pin_button_rect().to_win32_rect(),
             window_chrome_button_color(
@@ -2235,6 +2253,22 @@ pub fn push_window_chrome_buttons(
             PanelEffect::WindowChromeClose,
         ),
     ];
+
+    if window_chrome_buttons_state.latency_enabled {
+        buttons.insert(
+            1,
+            (
+                layout.latency_button_rect().to_win32_rect(),
+                window_chrome_button_color(
+                    window_chrome_buttons_state.latency,
+                    window_chrome_buttons_state.latency_visible,
+                    false,
+                ),
+                window_chrome_buttons_state.latency,
+                PanelEffect::WindowChromeLatency,
+            ),
+        );
+    }
 
     for (rect, color, state, effect) in buttons {
         push_panel_with_data(scene, rect, color, effect, state.shader_data());
@@ -2294,6 +2328,53 @@ pub fn push_overlay_panel(
         effect,
         data: [0.0; 4],
     });
+}
+
+pub fn push_overlay_text_block(
+    scene: &mut RenderScene,
+    rect: RECT,
+    text: &str,
+    glyph_width: i32,
+    glyph_height: i32,
+    color: [f32; 4],
+) {
+    let mut cursor_x = rect.left;
+    let mut cursor_y = rect.top;
+
+    for character in text.chars() {
+        if character == '\n' {
+            cursor_x = rect.left;
+            cursor_y += glyph_height;
+            if cursor_y + glyph_height > rect.bottom {
+                break;
+            }
+            continue;
+        }
+
+        if cursor_x + glyph_width > rect.right {
+            cursor_x = rect.left;
+            cursor_y += glyph_height;
+        }
+        if cursor_y + glyph_height > rect.bottom {
+            break;
+        }
+
+        if character != ' ' && scene.overlay_glyphs.len() < MAX_GLYPH_COUNT {
+            push_overlay_glyph(
+                scene,
+                RECT {
+                    left: cursor_x,
+                    top: cursor_y,
+                    right: cursor_x + glyph_width,
+                    bottom: cursor_y + glyph_height,
+                },
+                character,
+                color,
+            );
+        }
+
+        cursor_x += glyph_width;
+    }
 }
 
 pub fn push_sprite(scene: &mut RenderScene, rect: RECT, color: [f32; 4], sprite: SpriteId) {
@@ -2398,6 +2479,17 @@ pub fn push_glyph(scene: &mut RenderScene, rect: RECT, character: char, color: [
     });
 }
 
+pub fn push_overlay_glyph(scene: &mut RenderScene, rect: RECT, character: char, color: [f32; 4]) {
+    if scene.overlay_glyphs.len() >= MAX_GLYPH_COUNT || character == ' ' {
+        return;
+    }
+    scene.overlay_glyphs.push(GlyphQuad {
+        rect,
+        color,
+        character,
+    });
+}
+
 pub fn push_transformed_glyph(
     scene: &mut RenderScene,
     corners: [[f32; 2]; 4],
@@ -2428,7 +2520,7 @@ fn collect_scene_chars(scene: &RenderScene) -> Vec<char> {
 fn collect_scene_chars_from_fragments(scenes: &[&RenderScene]) -> Vec<char> {
     let glyph_capacity = scenes
         .iter()
-        .map(|scene| scene.glyphs.len() + scene.transformed_glyphs.len())
+        .map(|scene| scene.glyphs.len() + scene.transformed_glyphs.len() + scene.overlay_glyphs.len())
         .sum::<usize>()
         + 1;
     let mut chars = Vec::with_capacity(glyph_capacity);
@@ -2440,6 +2532,11 @@ fn collect_scene_chars_from_fragments(scenes: &[&RenderScene]) -> Vec<char> {
             }
         }
         for glyph in &scene.transformed_glyphs {
+            if !chars.contains(&glyph.character) {
+                chars.push(glyph.character);
+            }
+        }
+        for glyph in &scene.overlay_glyphs {
             if !chars.contains(&glyph.character) {
                 chars.push(glyph.character);
             }
@@ -2870,12 +2967,13 @@ pub(crate) fn render_frame_model_scene_snapshot(frame: &RenderFrameModel) -> Str
     for (fragment_index, scene) in scenes.iter().enumerate() {
         let _ = writeln!(
             snapshot,
-            "[fragment {fragment_index}] panels={} glyphs={} transformed_glyphs={} sprites={} overlay_panels={}",
+            "[fragment {fragment_index}] panels={} glyphs={} transformed_glyphs={} sprites={} overlay_panels={} overlay_glyphs={}",
             scene.panels.len(),
             scene.glyphs.len(),
             scene.transformed_glyphs.len(),
             scene.sprites.len(),
             scene.overlay_panels.len(),
+            scene.overlay_glyphs.len(),
         );
 
         for (panel_index, panel) in scene.panels.iter().enumerate() {
@@ -2971,6 +3069,23 @@ pub(crate) fn render_frame_model_scene_snapshot(frame: &RenderFrameModel) -> Str
                 panel.data[1],
                 panel.data[2],
                 panel.data[3],
+            );
+        }
+        for (glyph_index, glyph) in scene.overlay_glyphs.iter().enumerate() {
+            let escaped = glyph.character.escape_default().to_string();
+            let _ = writeln!(
+                snapshot,
+                "overlay_glyph {glyph_index} char=U+{:04X} literal='{}' rect={},{},{},{} color={:.3},{:.3},{:.3},{:.3}",
+                u32::from(glyph.character),
+                escaped,
+                glyph.rect.left,
+                glyph.rect.top,
+                glyph.rect.right,
+                glyph.rect.bottom,
+                glyph.color[0],
+                glyph.color[1],
+                glyph.color[2],
+                glyph.color[3],
             );
         }
     }
@@ -5884,6 +5999,7 @@ mod tests {
             transformed_glyphs: Vec::new(),
             sprites: Vec::new(),
             overlay_panels: Vec::new(),
+            overlay_glyphs: Vec::new(),
         };
         push_text_block(
             &mut scene,
@@ -5932,6 +6048,7 @@ mod tests {
             transformed_glyphs: Vec::new(),
             sprites: Vec::new(),
             overlay_panels: Vec::new(),
+            overlay_glyphs: Vec::new(),
         };
         push_centered_text(
             &mut scene,
@@ -5956,6 +6073,7 @@ mod tests {
             transformed_glyphs: Vec::new(),
             sprites: Vec::new(),
             overlay_panels: Vec::new(),
+            overlay_glyphs: Vec::new(),
         };
         push_title_text(
             &mut scene,
@@ -6306,6 +6424,11 @@ mod tests {
             .iter()
             .filter(|panel| matches!(panel.effect, PanelEffect::WindowChromePin))
             .count();
+        let latency_button_count = scene
+            .panels
+            .iter()
+            .filter(|panel| matches!(panel.effect, PanelEffect::WindowChromeLatency))
+            .count();
         let diagnostics_button_count = scene
             .panels
             .iter()
@@ -6333,6 +6456,7 @@ mod tests {
             .count();
 
         assert_eq!(pin_button_count, 1);
+    assert_eq!(latency_button_count, 0);
         assert_eq!(diagnostics_button_count, 1);
         assert_eq!(minimize_button_count, 1);
         assert_eq!(maximize_button_count, 1);
@@ -6389,6 +6513,7 @@ mod tests {
             transformed_glyphs: Vec::new(),
             sprites: Vec::new(),
             overlay_panels: Vec::new(),
+            overlay_glyphs: Vec::new(),
         };
         push_glyph(
             &mut scene,
@@ -6428,6 +6553,7 @@ mod tests {
             transformed_glyphs: Vec::new(),
             sprites: Vec::new(),
             overlay_panels: Vec::new(),
+            overlay_glyphs: Vec::new(),
         };
 
         push_panel(
