@@ -76,8 +76,8 @@ const MAX_GLYPH_COUNT: usize = 8_192;
 const MAX_SPRITE_COUNT: usize = 256;
 const MAX_VERTEX_COUNT: usize = (MAX_PANEL_COUNT + MAX_GLYPH_COUNT + MAX_SPRITE_COUNT) * 6;
 const FALLBACK_GLYPH: char = '?';
-const MAX_CURVE_FLOAT4_COUNT: usize = 65_536;
-const MAX_BAND_UINT_COUNT: usize = 262_144;
+const MAX_CURVE_FLOAT4_COUNT: usize = 262_144;
+const MAX_BAND_UINT_COUNT: usize = 1_048_576;
 const TERMINAL_FONT_FAMILY: &str = "CaskaydiaCove Nerd Font Mono";
 const SLUG_GLYPH_DILATION_PX: f32 = 0.5;
 const SLUG_BAND_SIZE_FONT_UNITS: f32 = 64.0;
@@ -94,6 +94,8 @@ const SPRITE_ATLAS_COLUMNS: u32 = 4;
 const SPRITE_ATLAS_ROWS: u32 = 4;
 
 static TERMINAL_FONT_CACHE: OnceLock<Result<Arc<LoadedTerminalFont>, String>> = OnceLock::new();
+static TERMINAL_FONT_LAYOUT_CACHE: OnceLock<Result<Arc<TerminalFontLayoutSnapshot>, String>> =
+    OnceLock::new();
 static SPRITE_ATLAS_CACHE: OnceLock<Result<Arc<SpriteAtlas>, String>> = OnceLock::new();
 static COMPILED_SHADER_CACHE: OnceLock<Result<CompiledShaders, String>> = OnceLock::new();
 
@@ -201,6 +203,24 @@ struct LoadedTerminalFont {
     cell_advance: f32,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct TerminalFontGlyphMetrics {
+    pub x_min: f32,
+    pub y_min: f32,
+    pub x_max: f32,
+    pub y_max: f32,
+    pub advance: f32,
+}
+
+#[derive(Clone, Debug)]
+pub struct TerminalFontLayoutSnapshot {
+    pub units_per_em: f32,
+    pub ascender: f32,
+    pub descender: f32,
+    pub cell_advance: f32,
+    pub glyphs: HashMap<char, TerminalFontGlyphMetrics>,
+}
+
 impl SlugGlyph {
     fn empty(font: &LoadedTerminalFont) -> Self {
         Self {
@@ -282,6 +302,13 @@ pub struct GlyphQuad {
     pub character: char,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TransformedGlyphQuad {
+    pub corners: [[f32; 2]; 4],
+    pub color: [f32; 4],
+    pub character: char,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SpriteId {
     Terminal,
@@ -332,6 +359,7 @@ impl ButtonVisualState {
 pub struct RenderScene {
     pub panels: Vec<PanelRect>,
     pub glyphs: Vec<GlyphQuad>,
+    pub transformed_glyphs: Vec<TransformedGlyphQuad>,
     pub sprites: Vec<SpriteQuad>,
     pub overlay_panels: Vec<PanelRect>,
 }
@@ -1502,6 +1530,7 @@ fn build_scene_vertices_with_assets(
         (scene.panels.len()
             + scene.sprites.len()
             + scene.glyphs.len()
+            + scene.transformed_glyphs.len()
             + scene.overlay_panels.len())
             * 6,
     );
@@ -1534,6 +1563,14 @@ fn build_scene_vertices_with_assets(
             .copied()
             .unwrap_or_else(|| SlugGlyph::empty(font));
         append_text_rect(&mut vertices, glyph.rect, glyph.color, slug_glyph, font);
+    }
+    for glyph in &scene.transformed_glyphs {
+        let slug_glyph = glyph_cache
+            .get(&glyph.character)
+            .or_else(|| glyph_cache.get(&FALLBACK_GLYPH))
+            .copied()
+            .unwrap_or_else(|| SlugGlyph::empty(font));
+        append_transformed_text_quad(&mut vertices, glyph.corners, glyph.color, slug_glyph);
     }
     for panel in &scene.overlay_panels {
         append_rect_with_data(
@@ -1798,6 +1835,7 @@ fn build_terminal_row_scene(
     let mut scene = RenderScene {
         panels: Vec::with_capacity(row.backgrounds.len()),
         glyphs: Vec::with_capacity(row.glyphs.len()),
+        transformed_glyphs: Vec::new(),
         sprites: Vec::new(),
         overlay_panels: Vec::new(),
     };
@@ -1833,6 +1871,7 @@ fn build_terminal_cursor_scene(
     let mut scene = RenderScene {
         panels: Vec::new(),
         glyphs: Vec::new(),
+        transformed_glyphs: Vec::new(),
         sprites: Vec::new(),
         overlay_panels: Vec::with_capacity(4),
     };
@@ -1857,6 +1896,7 @@ fn build_terminal_scrollbar_scene(
     let mut scene = RenderScene {
         panels: Vec::with_capacity(2),
         glyphs: Vec::new(),
+        transformed_glyphs: Vec::new(),
         sprites: Vec::new(),
         overlay_panels: Vec::new(),
     };
@@ -2032,6 +2072,7 @@ pub fn build_panel_scene(
     let mut scene = RenderScene {
         panels: Vec::with_capacity(10),
         glyphs: Vec::with_capacity(2_048),
+        transformed_glyphs: Vec::new(),
         sprites: Vec::new(),
         overlay_panels: Vec::with_capacity(16),
     };
@@ -2357,6 +2398,22 @@ pub fn push_glyph(scene: &mut RenderScene, rect: RECT, character: char, color: [
     });
 }
 
+pub fn push_transformed_glyph(
+    scene: &mut RenderScene,
+    corners: [[f32; 2]; 4],
+    character: char,
+    color: [f32; 4],
+) {
+    if scene.transformed_glyphs.len() >= MAX_GLYPH_COUNT || character == ' ' {
+        return;
+    }
+    scene.transformed_glyphs.push(TransformedGlyphQuad {
+        corners,
+        color,
+        character,
+    });
+}
+
 #[cfg_attr(
     not(test),
     expect(
@@ -2369,11 +2426,20 @@ fn collect_scene_chars(scene: &RenderScene) -> Vec<char> {
 }
 
 fn collect_scene_chars_from_fragments(scenes: &[&RenderScene]) -> Vec<char> {
-    let glyph_capacity = scenes.iter().map(|scene| scene.glyphs.len()).sum::<usize>() + 1;
+    let glyph_capacity = scenes
+        .iter()
+        .map(|scene| scene.glyphs.len() + scene.transformed_glyphs.len())
+        .sum::<usize>()
+        + 1;
     let mut chars = Vec::with_capacity(glyph_capacity);
     chars.push(FALLBACK_GLYPH);
     for scene in scenes {
         for glyph in &scene.glyphs {
+            if !chars.contains(&glyph.character) {
+                chars.push(glyph.character);
+            }
+        }
+        for glyph in &scene.transformed_glyphs {
             if !chars.contains(&glyph.character) {
                 chars.push(glyph.character);
             }
@@ -2431,6 +2497,48 @@ fn cached_terminal_font() -> eyre::Result<Arc<LoadedTerminalFont>> {
     TERMINAL_FONT_CACHE
         .get_or_init(|| {
             load_terminal_font()
+                .map(Arc::new)
+                .map_err(|error| error.to_string())
+        })
+        .as_ref()
+        .map(Arc::clone)
+        .map_err(|error| eyre::eyre!(error.clone()))
+}
+
+fn build_terminal_font_layout_snapshot() -> eyre::Result<TerminalFontLayoutSnapshot> {
+    let font = load_terminal_font()?;
+    let face = Face::parse(&font.font_bytes, font.face_index)
+        .wrap_err("failed to parse terminal font for layout snapshot")?;
+    let glyphs = collect_font_unicode_chars(&face)
+        .into_iter()
+        .filter_map(|character| {
+            let glyph_id = face.glyph_index(character)?;
+            let glyph = build_slug_glyph_from_face(&font, &face, glyph_id, 0, 0);
+            Some((
+                character,
+                TerminalFontGlyphMetrics {
+                    x_min: glyph.x_min,
+                    y_min: glyph.y_min,
+                    x_max: glyph.x_max,
+                    y_max: glyph.y_max,
+                    advance: glyph.advance,
+                },
+            ))
+        })
+        .collect();
+    Ok(TerminalFontLayoutSnapshot {
+        units_per_em: font.units_per_em,
+        ascender: font.ascender,
+        descender: font.descender,
+        cell_advance: font.cell_advance,
+        glyphs,
+    })
+}
+
+pub fn terminal_font_layout_snapshot() -> eyre::Result<Arc<TerminalFontLayoutSnapshot>> {
+    TERMINAL_FONT_LAYOUT_CACHE
+        .get_or_init(|| {
+            build_terminal_font_layout_snapshot()
                 .map(Arc::new)
                 .map_err(|error| error.to_string())
         })
@@ -2762,9 +2870,10 @@ pub(crate) fn render_frame_model_scene_snapshot(frame: &RenderFrameModel) -> Str
     for (fragment_index, scene) in scenes.iter().enumerate() {
         let _ = writeln!(
             snapshot,
-            "[fragment {fragment_index}] panels={} glyphs={} sprites={} overlay_panels={}",
+            "[fragment {fragment_index}] panels={} glyphs={} transformed_glyphs={} sprites={} overlay_panels={}",
             scene.panels.len(),
             scene.glyphs.len(),
+            scene.transformed_glyphs.len(),
             scene.sprites.len(),
             scene.overlay_panels.len(),
         );
@@ -2800,6 +2909,28 @@ pub(crate) fn render_frame_model_scene_snapshot(frame: &RenderFrameModel) -> Str
                 glyph.rect.top,
                 glyph.rect.right,
                 glyph.rect.bottom,
+                glyph.color[0],
+                glyph.color[1],
+                glyph.color[2],
+                glyph.color[3],
+            );
+        }
+
+        for (glyph_index, glyph) in scene.transformed_glyphs.iter().enumerate() {
+            let escaped = glyph.character.escape_default().to_string();
+            let _ = writeln!(
+                snapshot,
+                "transformed_glyph {glyph_index} char=U+{:04X} literal='{}' tl={:.3},{:.3} tr={:.3},{:.3} br={:.3},{:.3} bl={:.3},{:.3} color={:.3},{:.3},{:.3},{:.3}",
+                u32::from(glyph.character),
+                escaped,
+                glyph.corners[0][0],
+                glyph.corners[0][1],
+                glyph.corners[1][0],
+                glyph.corners[1][1],
+                glyph.corners[2][0],
+                glyph.corners[2][1],
+                glyph.corners[3][0],
+                glyph.corners[3][1],
                 glyph.color[0],
                 glyph.color[1],
                 glyph.color[2],
@@ -3299,6 +3430,13 @@ fn band_index(value: f32, scale: f32, offset: f32, band_count: u32) -> u32 {
     ((value * scale) + offset)
         .trunc()
         .clamp(0.0, band_count.saturating_sub(1) as f32) as u32
+}
+
+pub fn terminal_font_unicode_chars() -> eyre::Result<Vec<char>> {
+    let font = load_terminal_font()?;
+    let face = Face::parse(&font.font_bytes, font.face_index)
+        .wrap_err("failed to parse terminal font face for glyph enumeration")?;
+    Ok(collect_font_unicode_chars(&face))
 }
 
 fn collect_font_unicode_chars(face: &Face<'_>) -> Vec<char> {
@@ -5476,6 +5614,108 @@ fn append_text_rect(
     ]);
 }
 
+fn append_transformed_text_quad(
+    vertices: &mut Vec<Vertex>,
+    corners: [[f32; 2]; 4],
+    color: [f32; 4],
+    glyph: SlugGlyph,
+) {
+    if vertices.len() + 6 > MAX_VERTEX_COUNT {
+        return;
+    }
+
+    let [top_left_corner, top_right_corner, bottom_right_corner, bottom_left_corner] = corners;
+    let glyph_data = [
+        glyph.curve_start as f32,
+        glyph.curve_count as f32,
+        glyph.band_count_x.saturating_sub(1) as f32,
+        glyph.band_count_y.saturating_sub(1) as f32,
+    ];
+    let banding = glyph.band_transform;
+    let object_dx = (glyph.x_max - glyph.x_min).abs().max(1.0);
+    let object_dy = (glyph.y_min - glyph.y_max).abs().max(1.0);
+    let axis_x = [
+        (top_right_corner[0] - top_left_corner[0]) / object_dx,
+        (top_right_corner[1] - top_left_corner[1]) / object_dx,
+    ];
+    let axis_y = [
+        (bottom_left_corner[0] - top_left_corner[0]) / object_dy,
+        (bottom_left_corner[1] - top_left_corner[1]) / object_dy,
+    ];
+    let determinant = axis_x[0] * axis_y[1] - axis_x[1] * axis_y[0];
+    if determinant.abs() <= f32::EPSILON {
+        return;
+    }
+
+    let inverse_determinant = 1.0 / determinant;
+    let jacobian = [
+        axis_y[1] * inverse_determinant,
+        -axis_y[0] * inverse_determinant,
+        -axis_x[1] * inverse_determinant,
+        axis_x[0] * inverse_determinant,
+    ];
+    let effect = PanelEffect::Text as u32 as f32;
+    let glyph_index = glyph.band_start as f32;
+
+    let top_left = Vertex {
+        position: [top_left_corner[0], top_left_corner[1], 0.0],
+        color,
+        uv: [glyph.x_min, glyph.y_max],
+        effect,
+        glyph: glyph_index,
+        glyph_data,
+        banding,
+        normal: [-1.0, 1.0],
+        jacobian,
+        _padding: [0.0; 2],
+    };
+    let top_right = Vertex {
+        position: [top_right_corner[0], top_right_corner[1], 0.0],
+        color,
+        uv: [glyph.x_max, glyph.y_max],
+        effect,
+        glyph: glyph_index,
+        glyph_data,
+        banding,
+        normal: [1.0, 1.0],
+        jacobian,
+        _padding: [0.0; 2],
+    };
+    let bottom_right = Vertex {
+        position: [bottom_right_corner[0], bottom_right_corner[1], 0.0],
+        color,
+        uv: [glyph.x_max, glyph.y_min],
+        effect,
+        glyph: glyph_index,
+        glyph_data,
+        banding,
+        normal: [1.0, -1.0],
+        jacobian,
+        _padding: [0.0; 2],
+    };
+    let bottom_left = Vertex {
+        position: [bottom_left_corner[0], bottom_left_corner[1], 0.0],
+        color,
+        uv: [glyph.x_min, glyph.y_min],
+        effect,
+        glyph: glyph_index,
+        glyph_data,
+        banding,
+        normal: [-1.0, -1.0],
+        jacobian,
+        _padding: [0.0; 2],
+    };
+
+    vertices.extend_from_slice(&[
+        top_left,
+        top_right,
+        bottom_right,
+        top_left,
+        bottom_right,
+        bottom_left,
+    ]);
+}
+
 #[cfg(test)]
 fn append_rect(
     vertices: &mut Vec<Vertex>,
@@ -5641,6 +5881,7 @@ mod tests {
         let mut scene = RenderScene {
             panels: Vec::new(),
             glyphs: Vec::new(),
+            transformed_glyphs: Vec::new(),
             sprites: Vec::new(),
             overlay_panels: Vec::new(),
         };
@@ -5688,6 +5929,7 @@ mod tests {
         let mut scene = RenderScene {
             panels: Vec::new(),
             glyphs: Vec::new(),
+            transformed_glyphs: Vec::new(),
             sprites: Vec::new(),
             overlay_panels: Vec::new(),
         };
@@ -5711,6 +5953,7 @@ mod tests {
         let mut scene = RenderScene {
             panels: Vec::new(),
             glyphs: Vec::new(),
+            transformed_glyphs: Vec::new(),
             sprites: Vec::new(),
             overlay_panels: Vec::new(),
         };
@@ -6143,6 +6386,7 @@ mod tests {
         let mut scene = RenderScene {
             panels: Vec::new(),
             glyphs: Vec::new(),
+            transformed_glyphs: Vec::new(),
             sprites: Vec::new(),
             overlay_panels: Vec::new(),
         };
@@ -6181,6 +6425,7 @@ mod tests {
         let mut scene = RenderScene {
             panels: Vec::new(),
             glyphs: Vec::new(),
+            transformed_glyphs: Vec::new(),
             sprites: Vec::new(),
             overlay_panels: Vec::new(),
         };

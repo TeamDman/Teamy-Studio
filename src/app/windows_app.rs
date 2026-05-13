@@ -5,7 +5,7 @@ use std::ffi::c_void;
 use std::marker::PhantomData;
 use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock, mpsc};
-use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use std::thread;
 use std::time::{Duration, Instant};
 #[cfg(feature = "tracy")]
@@ -57,10 +57,11 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SYSTEM_METRICS_INDEX, SendMessageW, SetCursor, SetCursorPos, SetTimer, SetWindowPos,
     SetWindowTextW, ShowWindow, TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CHAR,
     WM_CLOSE, WM_DESTROY, WM_DPICHANGED, WM_ENTERSIZEMOVE, WM_ERASEBKGND, WM_EXITSIZEMOVE,
-    WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
-    WM_MOVE, WM_NCCALCSIZE, WM_NCHITTEST, WM_NCLBUTTONDOWN, WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP,
-    WM_SETCURSOR, WM_SETFOCUS, WM_SIZE, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WNDCLASSEXW,
-    WS_EX_APPWINDOW, WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+    WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN,
+    WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_MOVE, WM_NCCALCSIZE, WM_NCHITTEST,
+    WM_NCLBUTTONDOWN, WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SETFOCUS,
+    WM_SIZE, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WNDCLASSEXW, WS_EX_APPWINDOW,
+    WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
     WS_EX_TRANSPARENT, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP, WS_THICKFRAME, WS_VISIBLE,
 };
 use windows::core::{BOOL, PCWSTR, w};
@@ -96,7 +97,8 @@ use super::windows_audio_input::{
 use super::windows_cursor_info::{CursorInfoConfig, CursorInfoVirtualSession};
 use super::windows_d3d12_renderer::{
     ButtonVisualState, RenderFrameModel, RenderScene, RenderThreadProxy,
-    RendererTerminalVisualState, WindowChromeButtonsState,
+    RendererTerminalVisualState, WindowChromeButtonsState, terminal_font_layout_snapshot,
+    terminal_font_unicode_chars,
 };
 use super::windows_demo_mode::{
     current_demo_mode_state, initialize_demo_mode_state, set_scramble_input_device_identifiers,
@@ -168,6 +170,12 @@ const TIMELINE_DOCUMENT_COMMAND_MESSAGE: u32 = WM_APP + 0x404;
 const TIMELINE_TRANSCRIPTION_WORKER_COMPLETED_MESSAGE: u32 = WM_APP + 0x405;
 const TIMELINE_PLAYGROUND_DETAIL_CHANGED_MESSAGE: u32 = WM_APP + 0x406;
 const FOCUSED_RENDER_TICK_MESSAGE: u32 = WM_APP + 0x407;
+const TEXT_RENDERING_PLAYGROUND_CHANGED_MESSAGE: u32 = WM_APP + 0x408;
+const TEXT_RENDERING_TOOLTIP_COOLDOWN: Duration = Duration::from_millis(850);
+const TEXT_RENDERING_DOUBLE_RIGHT_CLICK_WINDOW: Duration = Duration::from_millis(350);
+const TEXT_RENDERING_DOUBLE_RIGHT_CLICK_MAX_MOVEMENT_PX: u32 = 1;
+const TEXT_RENDERING_PITCH_LIMIT_RADIANS: f32 = 1.45;
+const TEXT_RENDERING_CAMERA_DISTANCE: f32 = 1400.0;
 
 #[derive(Clone, Debug)]
 enum TimelineDocumentCommand {
@@ -260,6 +268,7 @@ struct SceneWindowInitialization {
     timeline_transcription_settings: Option<windows_scene::TimelineTranscriptionSettingsViewState>,
     model_warning: Option<windows_scene::ModelWarningViewState>,
     timeline_playground_detail: Option<TimelinePlaygroundDetailWindowHandle>,
+    text_rendering_playground: Option<TextRenderingPlaygroundHandle>,
     initial_position: Option<ScreenRect>,
     timeline_document_command_sender: Option<mpsc::Sender<TimelineDocumentCommand>>,
     timeline_document_command_target: Option<isize>,
@@ -361,6 +370,154 @@ struct CursorLatencyPlaygroundState {
     last_os_cursor_position: Option<ClientPoint>,
     rendered_cursor_position: Option<ClientPoint>,
     samples: VecDeque<CursorLatencySample>,
+}
+
+static NEXT_TEXT_RENDERING_SESSION_ID: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct TextRenderingViewportState {
+    zoom: f32,
+    yaw_radians: f32,
+    pitch_radians: f32,
+    camera_offset: [f32; 2],
+    plane_offset: [f32; 2],
+}
+
+impl Default for TextRenderingViewportState {
+    fn default() -> Self {
+        Self {
+            zoom: 1.0,
+            yaw_radians: 0.0,
+            pitch_radians: 0.0,
+            camera_offset: [0.0, 0.0],
+            plane_offset: [0.0, 0.0],
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TextRenderingDragKind {
+    Rotate,
+    Translate,
+    Pan,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct TextRenderingDragState {
+    kind: TextRenderingDragKind,
+    origin: ClientPoint,
+    origin_yaw_radians: f32,
+    origin_pitch_radians: f32,
+    origin_plane_offset: [f32; 2],
+    origin_camera_offset: [f32; 2],
+}
+
+#[derive(Debug)]
+struct TextRenderingPlaygroundSharedState {
+    session_id: u64,
+    active_preset: windows_scene::TextRenderingPreset,
+    text: String,
+    sprite_sheet_sample: String,
+    sprite_sheet_characters: Vec<char>,
+    plane_viewport: TextRenderingViewportState,
+    sprite_sheet_viewport: TextRenderingViewportState,
+    last_interaction_at: Option<Instant>,
+    open_windows: Vec<isize>,
+    closing_all: bool,
+}
+
+#[derive(Clone, Debug)]
+struct TextRenderingPlaygroundHandle {
+    shared: Arc<Mutex<TextRenderingPlaygroundSharedState>>,
+}
+
+impl TextRenderingPlaygroundHandle {
+    fn new() -> eyre::Result<Self> {
+        let sprite_sheet_characters = terminal_font_unicode_chars()?;
+        let sprite_sheet_sample = build_text_rendering_sprite_sheet_sample(&sprite_sheet_characters);
+        Ok(Self {
+            shared: Arc::new(Mutex::new(TextRenderingPlaygroundSharedState {
+                session_id: NEXT_TEXT_RENDERING_SESSION_ID.fetch_add(1, AtomicOrdering::Relaxed),
+                active_preset: windows_scene::TextRenderingPreset::LoremIpsum,
+                text: text_rendering_preset_text(
+                    windows_scene::TextRenderingPreset::LoremIpsum,
+                    &sprite_sheet_sample,
+                ),
+                sprite_sheet_sample,
+                sprite_sheet_characters,
+                plane_viewport: TextRenderingViewportState::default(),
+                sprite_sheet_viewport: TextRenderingViewportState::default(),
+                last_interaction_at: None,
+                open_windows: Vec::new(),
+                closing_all: false,
+            })),
+        })
+    }
+
+    fn register_window(&self, hwnd: WindowHandle) {
+        if let Ok(mut shared) = self.shared.lock() {
+            let raw = hwnd.raw().0 as isize;
+            if !shared.open_windows.contains(&raw) {
+                shared.open_windows.push(raw);
+            }
+            shared.closing_all = false;
+        }
+    }
+
+    fn unregister_window(&self, hwnd: WindowHandle) {
+        if let Ok(mut shared) = self.shared.lock() {
+            let raw = hwnd.raw().0 as isize;
+            shared.open_windows.retain(|candidate| *candidate != raw);
+            if shared.open_windows.is_empty() {
+                shared.closing_all = false;
+            }
+        }
+    }
+
+    fn request_group_close(&self, hwnd: WindowHandle) {
+        let hwnd_raw = hwnd.raw().0 as isize;
+        let windows = if let Ok(mut shared) = self.shared.lock() {
+            if shared.closing_all {
+                Vec::new()
+            } else {
+                shared.closing_all = true;
+                shared
+                    .open_windows
+                    .iter()
+                    .copied()
+                    .filter(|candidate| *candidate != hwnd_raw)
+                    .collect::<Vec<_>>()
+            }
+        } else {
+            Vec::new()
+        };
+
+        for raw in windows {
+            let target = HWND(raw as *mut c_void);
+            let _ = unsafe { PostMessageW(Some(target), WM_CLOSE, WPARAM(0), LPARAM(0)) };
+        }
+    }
+
+    fn broadcast_changed(&self) {
+        let windows = self
+            .shared
+            .lock()
+            .ok()
+            .map(|shared| shared.open_windows.clone())
+            .unwrap_or_default();
+
+        for raw in windows {
+            let target = HWND(raw as *mut c_void);
+            let _ = unsafe {
+                PostMessageW(
+                    Some(target),
+                    TEXT_RENDERING_PLAYGROUND_CHANGED_MESSAGE,
+                    WPARAM(0),
+                    LPARAM(0),
+                )
+            };
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -1186,6 +1343,7 @@ enum WindowChromeButton {
 enum ScenePressedTarget {
     ChromeButton(WindowChromeButton),
     Action(SceneAction),
+    TextRenderingPlane(TextRenderingDragKind),
     TimelineTransportPlayPause,
     TimelineTranscriptionSettingsTarget(windows_scene::TimelineTranscriptionSettingsTarget),
     ModelWarningPrepare,
@@ -1250,6 +1408,11 @@ struct SceneAppState {
     model_warning_prepare_started_at: Option<Instant>,
     timeline_playground: Option<TimelinePlaygroundState>,
     cursor_latency_playground: Option<CursorLatencyPlaygroundState>,
+    text_rendering_playground: Option<TextRenderingPlaygroundHandle>,
+    text_rendering_drag: Option<TextRenderingDragState>,
+    text_rendering_editor_focused: bool,
+    text_rendering_last_right_button_down_at: Option<Instant>,
+    text_rendering_last_right_button_down_point: Option<ClientPoint>,
     latency_overlay: LatencyOverlayState,
     timeline_playground_detail: Option<TimelinePlaygroundDetailWindowHandle>,
     timeline_tool: TimelineInteractionTool,
@@ -1326,6 +1489,146 @@ fn toggle_demo_mode_scramble_input_device_identifiers(
         DemoModeInputDeviceIdentifierScramble::from_enabled(enabled);
     state.demo_mode_scramble_toggle_last_changed_at = Some(Instant::now());
     broadcast_demo_mode_state_changed();
+    Ok(())
+}
+
+fn text_rendering_preset_text(
+    preset: windows_scene::TextRenderingPreset,
+    sprite_sheet_sample: &str,
+) -> String {
+    match preset {
+        windows_scene::TextRenderingPreset::LoremIpsum => [
+            "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Quis ipsum suspendisse ultrices gravida dictum fusce ut placerat orci nulla pellentesque dignissim enim sit amet venenatis urna cursus eget nunc scelerisque viverra mauris in aliquam sem fringilla ut morbi tincidunt augue interdum velit.",
+            "Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Nunc pulvinar sapien et ligula ullamcorper malesuada proin libero nunc consequat interdum varius sit amet mattis vulputate enim nulla aliquet porttitor lacus luctus accumsan tortor posuere ac ut consequat semper viverra nam libero justo laoreet sit amet.",
+            "Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Integer feugiat scelerisque varius morbi enim nunc faucibus a pellentesque sit amet porttitor eget dolor morbi non arcu risus quis varius quam quisque id diam vel quam elementum pulvinar etiam non quam lacus suspendisse faucibus interdum posuere lorem.",
+            "Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum. Mauris ultrices eros in cursus turpis massa tincidunt dui ut ornare lectus sit amet est placerat in egestas erat imperdiet sed euismod nisi porta lorem mollis aliquam ut porttitor leo a diam sollicitudin tempor id eu nisl nunc mi ipsum faucibus vitae aliquet nec ullamcorper.",
+            "Habitant morbi tristique senectus et netus et malesuada fames ac turpis egestas sed tempus urna et pharetra pharetra massa massa ultricies mi quis hendrerit dolor magna eget est lorem ipsum dolor sit amet consectetur adipiscing elit duis tristique sollicitudin nibh sit amet commodo nulla facilisi nullam vehicula ipsum a arcu cursus vitae congue mauris.",
+            "Amet justo donec enim diam vulputate ut pharetra sit amet aliquam id diam maecenas ultricies mi eget mauris pharetra et ultrices neque ornare aenean euismod elementum nisi quis eleifend quam adipiscing vitae proin sagittis nisl rhoncus mattis rhoncus urna neque viverra justo nec ultrices dui sapien eget mi proin sed libero enim sed faucibus turpis in eu mi bibendum neque.",
+        ]
+        .join("\n\n"),
+        windows_scene::TextRenderingPreset::SpriteSheet => sprite_sheet_sample.to_owned(),
+        windows_scene::TextRenderingPreset::Alphabet => [
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZ",
+            "abcdefghijklmnopqrstuvwxyz",
+            "0123456789 !?.,:;+-=*/\\()[]{}<>@#$%^&_'\"",
+        ]
+        .join("\n"),
+        windows_scene::TextRenderingPreset::QuickBrownFox => {
+            "The quick brown fox jumps over the lazy dog.\nPack my box with five dozen liquor jugs.".to_owned()
+        }
+        windows_scene::TextRenderingPreset::SphinxBlackQuartz => {
+            "Sphinx of black quartz, judge my vow.\nHow vexingly quick daft zebras jump!".to_owned()
+        }
+    }
+}
+
+fn build_text_rendering_sprite_sheet_sample(characters: &[char]) -> String {
+    let filtered = characters
+        .iter()
+        .copied()
+        .filter(|character| !character.is_control() && !character.is_whitespace())
+        .collect::<Vec<_>>();
+    filtered
+        .chunks(48)
+        .map(|chunk| chunk.iter().collect::<String>())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn update_text_rendering_preset(
+    state: &mut SceneAppState,
+    preset: windows_scene::TextRenderingPreset,
+) -> eyre::Result<()> {
+    let Some(playground) = state.text_rendering_playground.as_ref().cloned() else {
+        return Ok(());
+    };
+    let Ok(mut shared) = playground.shared.lock() else {
+        eyre::bail!("failed to lock text rendering playground state")
+    };
+    shared.active_preset = preset;
+    shared.text = text_rendering_preset_text(preset, &shared.sprite_sheet_sample);
+    shared.last_interaction_at = Some(Instant::now());
+    drop(shared);
+    playground.broadcast_changed();
+    Ok(())
+}
+
+fn text_rendering_viewport_mut(
+    shared: &mut TextRenderingPlaygroundSharedState,
+    scene_kind: SceneWindowKind,
+) -> Option<&mut TextRenderingViewportState> {
+    match scene_kind {
+        SceneWindowKind::TextRenderingPlaygroundPlane => Some(&mut shared.plane_viewport),
+        SceneWindowKind::TextRenderingPlaygroundSpriteSheet => {
+            Some(&mut shared.sprite_sheet_viewport)
+        }
+        _ => None,
+    }
+}
+
+fn open_text_rendering_playground_windows(
+    app_home: &AppHome,
+    vt_engine: VtEngineChoice,
+) -> eyre::Result<()> {
+    let playground = TextRenderingPlaygroundHandle::new()?;
+    let screen_width = system_metric(SM_CXSCREEN).max(1280);
+    let screen_height = system_metric(SM_CYSCREEN).max(900);
+    let width = (screen_width / 2).clamp(560, 1080);
+    let height = (screen_height / 2).clamp(420, 880);
+    let left = ((screen_width - (width * 2)) / 3).max(20);
+    let top = ((screen_height - (height * 2)) / 3).max(20);
+    let gap_x = left;
+    let gap_y = top;
+    let windows = [
+        (
+            "teamy-studio-text-plane",
+            SceneWindowKind::TextRenderingPlaygroundPlane,
+            ScreenRect::new(left, top, left + width, top + height),
+        ),
+        (
+            "teamy-studio-text-editor",
+            SceneWindowKind::TextRenderingPlaygroundEditor,
+            ScreenRect::new(left + width + gap_x, top, left + (width * 2) + gap_x, top + height),
+        ),
+        (
+            "teamy-studio-text-presets",
+            SceneWindowKind::TextRenderingPlaygroundPresets,
+            ScreenRect::new(left, top + height + gap_y, left + width, top + (height * 2) + gap_y),
+        ),
+        (
+            "teamy-studio-text-sprites",
+            SceneWindowKind::TextRenderingPlaygroundSpriteSheet,
+            ScreenRect::new(
+                left + width + gap_x,
+                top + height + gap_y,
+                left + (width * 2) + gap_x,
+                top + (height * 2) + gap_y,
+            ),
+        ),
+    ];
+
+    for (thread_name, scene_kind, initial_position) in windows {
+        let app_home = app_home.clone();
+        let playground = playground.clone();
+        thread::Builder::new()
+            .name(thread_name.to_owned())
+            .spawn_with_current_span(move || {
+                if let Err(error) = run_scene_window(
+                    &app_home,
+                    scene_kind,
+                    vt_engine,
+                    SceneWindowInitialization {
+                        text_rendering_playground: Some(playground),
+                        initial_position: Some(initial_position),
+                        ..SceneWindowInitialization::default()
+                    },
+                ) {
+                    error!(?error, ?scene_kind, "failed to open text rendering playground window");
+                }
+            })
+            .wrap_err("failed to spawn text rendering playground window thread")?;
+    }
+
     Ok(())
 }
 
@@ -1534,6 +1837,7 @@ unsafe extern "system" {
 
 struct FocusedRenderTicker {
     stop: Arc<AtomicBool>,
+    pending_tick: Arc<AtomicBool>,
     handle: Option<thread::JoinHandle<()>>,
 }
 
@@ -1724,12 +2028,16 @@ fn restart_focused_render_ticker(hwnd: HWND, interval_ms: u32) -> eyre::Result<(
     stop_focused_render_ticker(hwnd);
     enable_high_resolution_timer_period_for_hwnd(hwnd)?;
     let stop = Arc::new(AtomicBool::new(false));
+    let pending_tick = Arc::new(AtomicBool::new(false));
     let thread_stop = Arc::clone(&stop);
+    let thread_pending_tick = Arc::clone(&pending_tick);
     let interval = Duration::from_millis(u64::from(interval_ms.max(1)));
     let hwnd_key = hwnd.0 as isize;
     let handle = thread::Builder::new()
         .name(format!("teamy-focused-render-ticker-{hwnd_key}"))
-        .spawn(move || run_focused_render_ticker(hwnd_key, interval, thread_stop))
+        .spawn(move || {
+            run_focused_render_ticker(hwnd_key, interval, thread_stop, thread_pending_tick)
+        })
         .map_err(|error| eyre::eyre!("failed to spawn focused render ticker: {error}"))?;
     focused_render_tickers()
         .lock()
@@ -1738,6 +2046,7 @@ fn restart_focused_render_ticker(hwnd: HWND, interval_ms: u32) -> eyre::Result<(
             hwnd_key,
             FocusedRenderTicker {
                 stop,
+                pending_tick,
                 handle: Some(handle),
             },
         );
@@ -1758,7 +2067,12 @@ fn stop_focused_render_ticker(hwnd: HWND) {
     }
 }
 
-fn run_focused_render_ticker(hwnd_raw: isize, interval: Duration, stop: Arc<AtomicBool>) {
+fn run_focused_render_ticker(
+    hwnd_raw: isize,
+    interval: Duration,
+    stop: Arc<AtomicBool>,
+    pending_tick: Arc<AtomicBool>,
+) {
     let hwnd = HWND(hwnd_raw as *mut c_void);
     let mut next_tick = Instant::now() + interval;
     while !stop.load(AtomicOrdering::Acquire) {
@@ -1769,12 +2083,28 @@ fn run_focused_render_ticker(hwnd_raw: isize, interval: Duration, stop: Arc<Atom
         if stop.load(AtomicOrdering::Acquire) {
             break;
         }
-        let _ = unsafe { PostMessageW(Some(hwnd), FOCUSED_RENDER_TICK_MESSAGE, WPARAM(0), LPARAM(0)) };
+        if !pending_tick.swap(true, AtomicOrdering::AcqRel) {
+            let posted = unsafe {
+                PostMessageW(Some(hwnd), FOCUSED_RENDER_TICK_MESSAGE, WPARAM(0), LPARAM(0))
+            }
+            .is_ok();
+            if !posted {
+                pending_tick.store(false, AtomicOrdering::Release);
+            }
+        }
         next_tick += interval;
         let now = Instant::now();
         if next_tick < now {
             next_tick = now + interval;
         }
+    }
+}
+
+fn clear_focused_render_tick_pending(hwnd: HWND) {
+    if let Ok(tickers) = focused_render_tickers().lock()
+        && let Some(ticker) = tickers.get(&(hwnd.0 as isize))
+    {
+        ticker.pending_tick.store(false, AtomicOrdering::Release);
     }
 }
 
@@ -2431,6 +2761,7 @@ fn run_scene_window(
     } else {
         None
     };
+    let text_rendering_playground = initialization.text_rendering_playground.take();
 
     SCENE_APP_STATE.with(|state| {
         *state.borrow_mut() = Some(SceneAppState {
@@ -2452,6 +2783,11 @@ fn run_scene_window(
             model_warning_prepare_started_at: None,
             timeline_playground,
             cursor_latency_playground,
+            text_rendering_playground,
+            text_rendering_drag: None,
+            text_rendering_editor_focused: false,
+            text_rendering_last_right_button_down_at: None,
+            text_rendering_last_right_button_down_point: None,
             latency_overlay: LatencyOverlayState::new(),
             timeline_playground_detail: initialization.timeline_playground_detail,
             timeline_tool: TimelineInteractionTool::default(),
@@ -2511,6 +2847,9 @@ fn run_scene_window(
             && let Ok(mut detail_hwnd) = detail.hwnd.lock()
         {
             *detail_hwnd = Some(hwnd.raw().0 as isize);
+        }
+        if let Some(playground) = &state.text_rendering_playground {
+            playground.register_window(hwnd);
         }
         state.chrome_tooltip = chrome_tooltip;
         state.renderer = Some(renderer);
@@ -3496,6 +3835,7 @@ fn render_toast_host(state: &mut ToastHostState) -> eyre::Result<()> {
     let mut scene = RenderScene {
         panels: Vec::new(),
         glyphs: Vec::new(),
+        transformed_glyphs: Vec::new(),
         sprites: Vec::new(),
         overlay_panels: Vec::new(),
     };
@@ -3815,9 +4155,16 @@ extern "system" fn scene_window_proc(
         TIMELINE_PLAYGROUND_DETAIL_CHANGED_MESSAGE => {
             handle_scene_timeline_playground_detail_changed(hwnd)
         }
+        TEXT_RENDERING_PLAYGROUND_CHANGED_MESSAGE => {
+            handle_scene_text_rendering_playground_changed(hwnd)
+        }
+        WM_CHAR => handle_scene_char_message(hwnd, message, wparam, lparam),
         WM_KEYDOWN | WM_SYSKEYDOWN => handle_scene_key_down_message(hwnd, message, wparam, lparam),
         WM_LBUTTONDOWN => handle_bool_message(hwnd, message, wparam, lparam, |hwnd| {
             handle_scene_left_button_down(hwnd, lparam)
+        }),
+        WM_MBUTTONDOWN => handle_bool_message(hwnd, message, wparam, lparam, |hwnd| {
+            handle_scene_middle_button_down(hwnd, lparam)
         }),
         WM_MOUSEMOVE => handle_bool_message(hwnd, message, wparam, lparam, |hwnd| {
             handle_scene_mouse_move(hwnd, wparam, lparam)
@@ -3834,6 +4181,9 @@ extern "system" fn scene_window_proc(
         }),
         WM_RBUTTONUP => handle_bool_message(hwnd, message, wparam, lparam, |hwnd| {
             handle_scene_right_button_up(hwnd, lparam)
+        }),
+        WM_MBUTTONUP => handle_bool_message(hwnd, message, wparam, lparam, |hwnd| {
+            handle_scene_middle_button_up(hwnd, lparam)
         }),
         WM_MOUSEWHEEL => handle_bool_message(hwnd, message, wparam, lparam, |hwnd| {
             handle_scene_mouse_wheel(hwnd, wparam, lparam)
@@ -3856,12 +4206,20 @@ fn handle_scene_close_message(hwnd: WindowHandle) -> LRESULT {
         let warning = (state.scene_kind == SceneWindowKind::TimelineTranscriptionSettings)
             .then(|| transcription_model_warning_for_selected_settings(state))
             .flatten();
-        Ok((state.app_home.clone(), state.vt_engine, warning))
+        Ok((
+            state.app_home.clone(),
+            state.vt_engine,
+            warning,
+            state.text_rendering_playground.clone(),
+        ))
     });
     match close_action {
-        Ok((app_home, vt_engine, warning)) => {
+        Ok((app_home, vt_engine, warning, text_rendering_playground)) => {
             if let Some(warning) = warning {
                 open_model_warning_window(&app_home, vt_engine, warning);
+            }
+            if let Some(playground) = text_rendering_playground {
+                playground.request_group_close(hwnd);
             }
             hwnd.destroy();
             LRESULT(0)
@@ -3933,6 +4291,7 @@ fn handle_scene_move(hwnd: WindowHandle) -> LRESULT {
 }
 
 fn handle_scene_focused_render_timer(hwnd: WindowHandle) -> LRESULT {
+    clear_focused_render_tick_pending(hwnd.raw());
     match with_scene_app_state(|state| {
         if !state.window_focused {
             return Ok(());
@@ -3945,6 +4304,18 @@ fn handle_scene_focused_render_timer(hwnd: WindowHandle) -> LRESULT {
         }
 
         render_scene_window_frame(state, hwnd, None, true)?;
+        Ok(())
+    }) {
+        Ok(()) => LRESULT(0),
+        Err(error) => fail_and_close(hwnd, &error),
+    }
+}
+
+fn handle_scene_text_rendering_playground_changed(hwnd: WindowHandle) -> LRESULT {
+    match with_scene_app_state(|state| {
+        if state.text_rendering_playground.is_some() {
+            render_scene_window_frame(state, hwnd, None, true)?;
+        }
         Ok(())
     }) {
         Ok(()) => LRESULT(0),
@@ -4087,6 +4458,14 @@ fn handle_scene_key_down_message(
                     return Ok(SceneKeyAction::CloseWindow);
                 }
             }
+        }
+
+        if state.scene_kind == SceneWindowKind::TextRenderingPlaygroundEditor
+            && virtual_key == u32::from(VK_ESCAPE.0)
+        {
+            state.text_rendering_editor_focused = false;
+            render_scene_window_frame(state, hwnd, None, false)?;
+            return Ok(SceneKeyAction::Handled);
         }
 
         if state.scene_kind == SceneWindowKind::AudioInputDeviceDetails {
@@ -4546,6 +4925,9 @@ fn handle_scene_destroy_message(hwnd: WindowHandle) -> LRESULT {
     unregister_scene_window(hwnd);
     SCENE_APP_STATE.with(|state| {
         if let Some(state) = state.borrow_mut().as_mut() {
+            if let Some(playground) = &state.text_rendering_playground {
+                playground.unregister_window(hwnd);
+            }
             state.chrome_tooltip.destroy();
         }
         let _ = state.borrow_mut().take();
@@ -4735,6 +5117,39 @@ fn handle_scene_left_button_down(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Re
                 mode: selection_mode,
             });
             state.diagnostic_selection_drag_point = Some(point);
+            hwnd.capture_mouse();
+            return Ok(ScenePointerAction::RenderOnly);
+        }
+
+        if !state.diagnostics_visible
+            && state.scene_kind == SceneWindowKind::TextRenderingPlaygroundEditor
+        {
+            state.text_rendering_editor_focused =
+                windows_scene::text_rendering_editor_text_rect(layout).contains(point);
+            return Ok(ScenePointerAction::RenderOnly);
+        }
+
+        if !state.diagnostics_visible
+            && state.scene_kind == SceneWindowKind::TextRenderingPlaygroundPlane
+            && windows_scene::text_rendering_plane_interaction_rect(layout).contains(point)
+        {
+            let viewport = state
+                .text_rendering_playground
+                .as_ref()
+                .and_then(|playground| playground.shared.lock().ok())
+                .map(|shared| shared.plane_viewport)
+                .unwrap_or_default();
+            state.text_rendering_drag = Some(TextRenderingDragState {
+                kind: TextRenderingDragKind::Rotate,
+                origin: point,
+                origin_yaw_radians: viewport.yaw_radians,
+                origin_pitch_radians: viewport.pitch_radians,
+                origin_plane_offset: viewport.plane_offset,
+                origin_camera_offset: viewport.camera_offset,
+            });
+            state.pressed_target = Some(ScenePressedTarget::TextRenderingPlane(
+                TextRenderingDragKind::Rotate,
+            ));
             hwnd.capture_mouse();
             return Ok(ScenePointerAction::RenderOnly);
         }
@@ -5330,6 +5745,7 @@ fn handle_scene_left_button_up(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Resu
     let point = ClientPoint::from_lparam(lparam);
     let should_release_capture = with_scene_app_state(|state| {
         Ok(state.pressed_target.is_some()
+            || state.text_rendering_drag.is_some()
             || state.pending_diagnostic_selection.is_some()
             || state.pending_timeline_selection.is_some())
     })?;
@@ -5340,6 +5756,10 @@ fn handle_scene_left_button_up(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Resu
     let action = with_scene_app_state(|state| {
         state.pointer_position = Some(point);
         let pressed_target = state.pressed_target.take();
+        if matches!(pressed_target, Some(ScenePressedTarget::TextRenderingPlane(_))) {
+            state.text_rendering_drag = None;
+            return Ok(ScenePointerAction::RenderOnly);
+        }
 
         if matches!(
             pressed_target,
@@ -5674,6 +6094,58 @@ fn handle_scene_mouse_move(
         return Ok(true);
     }
 
+    let text_rendering_dragging = with_scene_app_state(|state| {
+        let Some(drag) = state.text_rendering_drag else {
+            return Ok(false);
+        };
+        let Some(playground) = state.text_rendering_playground.as_ref().cloned() else {
+            state.text_rendering_drag = None;
+            state.pressed_target = None;
+            return Ok(false);
+        };
+        let Ok(mut shared) = playground.shared.lock() else {
+            return Ok(false);
+        };
+        let Some(viewport) = text_rendering_viewport_mut(&mut shared, state.scene_kind) else {
+            state.text_rendering_drag = None;
+            state.pressed_target = None;
+            return Ok(false);
+        };
+        let origin = drag.origin.to_win32_point()?;
+        let current = point.to_win32_point()?;
+        let delta_x = (current.x - origin.x) as f32;
+        let delta_y = (current.y - origin.y) as f32;
+        match drag.kind {
+            TextRenderingDragKind::Rotate => {
+                viewport.yaw_radians = drag.origin_yaw_radians + (delta_x * 0.01);
+                viewport.pitch_radians = (drag.origin_pitch_radians - (delta_y * 0.01)).clamp(
+                    -TEXT_RENDERING_PITCH_LIMIT_RADIANS,
+                    TEXT_RENDERING_PITCH_LIMIT_RADIANS,
+                );
+            }
+            TextRenderingDragKind::Translate => {
+                viewport.plane_offset = [
+                    drag.origin_plane_offset[0] + delta_x,
+                    drag.origin_plane_offset[1] + delta_y,
+                ];
+            }
+            TextRenderingDragKind::Pan => {
+                viewport.camera_offset = [
+                    drag.origin_camera_offset[0] + delta_x,
+                    drag.origin_camera_offset[1] + delta_y,
+                ];
+            }
+        }
+        shared.last_interaction_at = Some(Instant::now());
+        drop(shared);
+        playground.broadcast_changed();
+        Ok(true)
+    })?;
+    if text_rendering_dragging {
+        with_scene_app_state(|state| render_scene_window_frame(state, hwnd, None, false))?;
+        return Ok(true);
+    }
+
     let timeline_playground_hover_changed = with_scene_app_state(|state| {
         if state.scene_kind != SceneWindowKind::TimelinePlayground || state.diagnostics_visible {
             return Ok(false);
@@ -5964,6 +6436,55 @@ fn handle_scene_mouse_move(
 fn handle_scene_right_button_up(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Result<bool> {
     let point = ClientPoint::from_lparam(lparam);
 
+    let released_text_drag = with_scene_app_state(|state| {
+        state.pointer_position = Some(point);
+        let released = matches!(
+            state.pressed_target,
+            Some(ScenePressedTarget::TextRenderingPlane(TextRenderingDragKind::Translate))
+        );
+        if released {
+            let current = point.to_win32_point()?;
+            let stationary_click = state
+                .text_rendering_drag
+                .is_some_and(|drag| {
+                    drag.origin.to_win32_point().ok().is_some_and(|origin| {
+                        (origin.x - current.x).abs()
+                            <= TEXT_RENDERING_DOUBLE_RIGHT_CLICK_MAX_MOVEMENT_PX as i32
+                            && (origin.y - current.y).abs()
+                                <= TEXT_RENDERING_DOUBLE_RIGHT_CLICK_MAX_MOVEMENT_PX as i32
+                    })
+                });
+            if stationary_click {
+                state.text_rendering_last_right_button_down_at = Some(Instant::now());
+                state.text_rendering_last_right_button_down_point = Some(point);
+            } else {
+                state.text_rendering_last_right_button_down_at = None;
+                state.text_rendering_last_right_button_down_point = None;
+            }
+            state.pressed_target = None;
+            state.text_rendering_drag = None;
+        }
+        Ok(released)
+    })?;
+    if released_text_drag {
+        hwnd.release_mouse_capture();
+        with_scene_app_state(|state| render_scene_window_frame(state, hwnd, None, false))?;
+        return Ok(true);
+    }
+
+    let consumed_editor_clear = with_scene_app_state(|state| {
+        if state.scene_kind != SceneWindowKind::TextRenderingPlaygroundEditor {
+            return Ok(false);
+        }
+        let layout = scene_client_layout(hwnd, state)?;
+        Ok(windows_scene::text_rendering_editor_text_rect(layout).contains(point))
+    })?;
+    if consumed_editor_clear {
+        hwnd.release_mouse_capture();
+        with_scene_app_state(|state| render_scene_window_frame(state, hwnd, None, false))?;
+        return Ok(true);
+    }
+
     let released_timeline_pan = with_scene_app_state(|state| {
         state.pointer_position = Some(point);
         let released = state.timeline_pan_drag.take().is_some()
@@ -6039,6 +6560,79 @@ fn handle_scene_right_button_up(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Res
     Ok(true)
 }
 
+fn handle_scene_middle_button_down(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Result<bool> {
+    let point = ClientPoint::from_lparam(lparam);
+    let started = with_scene_app_state(|state| {
+        state.pointer_position = Some(point);
+        state.chrome_tooltip.hide(hwnd);
+        let layout = scene_client_layout(hwnd, state)?;
+        if state.diagnostics_visible
+            || !matches!(
+                state.scene_kind,
+                SceneWindowKind::TextRenderingPlaygroundPlane
+                    | SceneWindowKind::TextRenderingPlaygroundSpriteSheet
+            )
+            || !windows_scene::text_rendering_plane_interaction_rect(layout).contains(point)
+        {
+            return Ok(false);
+        }
+        let viewport = state
+            .text_rendering_playground
+            .as_ref()
+            .and_then(|playground| playground.shared.lock().ok())
+            .and_then(|shared| {
+                Some(match state.scene_kind {
+                    SceneWindowKind::TextRenderingPlaygroundPlane => shared.plane_viewport,
+                    SceneWindowKind::TextRenderingPlaygroundSpriteSheet => {
+                        shared.sprite_sheet_viewport
+                    }
+                    _ => return None,
+                })
+            })
+            .unwrap_or_default();
+        state.text_rendering_drag = Some(TextRenderingDragState {
+            kind: TextRenderingDragKind::Pan,
+            origin: point,
+            origin_yaw_radians: viewport.yaw_radians,
+            origin_pitch_radians: viewport.pitch_radians,
+            origin_plane_offset: viewport.plane_offset,
+            origin_camera_offset: viewport.camera_offset,
+        });
+        state.pressed_target = Some(ScenePressedTarget::TextRenderingPlane(
+            TextRenderingDragKind::Pan,
+        ));
+        Ok(true)
+    })?;
+    if !started {
+        return Ok(false);
+    }
+    hwnd.capture_mouse();
+    with_scene_app_state(|state| render_scene_window_frame(state, hwnd, None, false))?;
+    Ok(true)
+}
+
+fn handle_scene_middle_button_up(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Result<bool> {
+    let point = ClientPoint::from_lparam(lparam);
+    let released = with_scene_app_state(|state| {
+        state.pointer_position = Some(point);
+        let released = matches!(
+            state.pressed_target,
+            Some(ScenePressedTarget::TextRenderingPlane(TextRenderingDragKind::Pan))
+        );
+        if released {
+            state.pressed_target = None;
+            state.text_rendering_drag = None;
+        }
+        Ok(released)
+    })?;
+    if !released {
+        return Ok(false);
+    }
+    hwnd.release_mouse_capture();
+    with_scene_app_state(|state| render_scene_window_frame(state, hwnd, None, false))?;
+    Ok(true)
+}
+
 // timeline[impl viewport.mouse-pan]
 fn handle_scene_right_button_down(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Result<bool> {
     let point = ClientPoint::from_lparam(lparam);
@@ -6047,6 +6641,94 @@ fn handle_scene_right_button_down(hwnd: WindowHandle, lparam: LPARAM) -> eyre::R
         state.pointer_position = Some(point);
         state.chrome_tooltip.hide(hwnd);
         let layout = scene_client_layout(hwnd, state)?;
+        if !state.diagnostics_visible
+            && state.scene_kind == SceneWindowKind::TextRenderingPlaygroundEditor
+            && windows_scene::text_rendering_editor_text_rect(layout).contains(point)
+        {
+            if let Some(playground) = state.text_rendering_playground.as_ref().cloned()
+                && let Ok(mut shared) = playground.shared.lock()
+            {
+                shared.text.clear();
+                shared.last_interaction_at = Some(Instant::now());
+                drop(shared);
+                playground.broadcast_changed();
+            }
+            state.text_rendering_editor_focused = false;
+            return Ok(true);
+        }
+
+        if !state.diagnostics_visible
+            && matches!(
+                state.scene_kind,
+                SceneWindowKind::TextRenderingPlaygroundPlane
+                    | SceneWindowKind::TextRenderingPlaygroundSpriteSheet
+            )
+            && windows_scene::text_rendering_plane_interaction_rect(layout).contains(point)
+        {
+            let now = Instant::now();
+            let current = point.to_win32_point()?;
+            let double_right_click = state
+                .text_rendering_last_right_button_down_at
+                .is_some_and(|clicked_at| {
+                    now.saturating_duration_since(clicked_at)
+                        <= TEXT_RENDERING_DOUBLE_RIGHT_CLICK_WINDOW
+                })
+                && state
+                    .text_rendering_last_right_button_down_point
+                    .is_some_and(|clicked_point| {
+                        clicked_point.to_win32_point().ok().is_some_and(|clicked_point| {
+                            (clicked_point.x - current.x).abs()
+                                <= TEXT_RENDERING_DOUBLE_RIGHT_CLICK_MAX_MOVEMENT_PX as i32
+                                && (clicked_point.y - current.y).abs()
+                                    <= TEXT_RENDERING_DOUBLE_RIGHT_CLICK_MAX_MOVEMENT_PX as i32
+                        })
+                    });
+            if double_right_click {
+                if let Some(playground) = state.text_rendering_playground.as_ref().cloned() {
+                    if let Ok(mut shared) = playground.shared.lock() {
+                        if let Some(viewport) =
+                            text_rendering_viewport_mut(&mut shared, state.scene_kind)
+                        {
+                            *viewport = TextRenderingViewportState::default();
+                            shared.last_interaction_at = Some(now);
+                        }
+                    }
+                    playground.broadcast_changed();
+                }
+                state.text_rendering_last_right_button_down_at = None;
+                state.text_rendering_last_right_button_down_point = None;
+                state.text_rendering_drag = None;
+                state.pressed_target = None;
+                return Ok(true);
+            }
+            let viewport = state
+                .text_rendering_playground
+                .as_ref()
+                .and_then(|playground| playground.shared.lock().ok())
+                .and_then(|shared| {
+                    Some(match state.scene_kind {
+                        SceneWindowKind::TextRenderingPlaygroundPlane => shared.plane_viewport,
+                        SceneWindowKind::TextRenderingPlaygroundSpriteSheet => {
+                            shared.sprite_sheet_viewport
+                        }
+                        _ => return None,
+                    })
+                })
+                .unwrap_or_default();
+            state.text_rendering_drag = Some(TextRenderingDragState {
+                kind: TextRenderingDragKind::Translate,
+                origin: point,
+                origin_yaw_radians: viewport.yaw_radians,
+                origin_pitch_radians: viewport.pitch_radians,
+                origin_plane_offset: viewport.plane_offset,
+                origin_camera_offset: viewport.camera_offset,
+            });
+            state.pressed_target = Some(ScenePressedTarget::TextRenderingPlane(
+                TextRenderingDragKind::Translate,
+            ));
+            return Ok(true);
+        }
+
         if state.scene_kind == SceneWindowKind::TimelinePlayground {
             if !timeline_playground_pan_interaction_at_point(state, layout, point) {
                 trace!(
@@ -6117,6 +6799,34 @@ fn handle_scene_mouse_wheel(
 
     with_scene_app_state(|state| {
         let layout = scene_client_layout(hwnd, state)?;
+        if matches!(
+            state.scene_kind,
+            SceneWindowKind::TextRenderingPlaygroundPlane
+                | SceneWindowKind::TextRenderingPlaygroundSpriteSheet
+        ) && !state.diagnostics_visible
+        {
+            let interaction_rect = windows_scene::text_rendering_plane_interaction_rect(layout);
+            if !interaction_rect.contains(point) {
+                return Ok(false);
+            }
+            let wheel_delta = high_word_i16(wparam.0);
+            if wheel_delta == 0 {
+                return Ok(true);
+            }
+            if let Some(playground) = state.text_rendering_playground.as_ref().cloned() {
+                if let Ok(mut shared) = playground.shared.lock()
+                    && let Some(viewport) = text_rendering_viewport_mut(&mut shared, state.scene_kind)
+                {
+                    let factor = if wheel_delta > 0 { 1.12 } else { 1.0 / 1.12 };
+                    viewport.zoom = (viewport.zoom * factor).max(0.05);
+                    shared.last_interaction_at = Some(Instant::now());
+                }
+                playground.broadcast_changed();
+            }
+            render_scene_window_frame(state, hwnd, None, false)?;
+            return Ok(true);
+        }
+
         if state.scene_kind == SceneWindowKind::Logs && !state.diagnostics_visible {
             let wheel_delta = high_word_i16(wparam.0);
             scroll_logs_by_wheel(state, layout, wheel_delta);
@@ -6355,6 +7065,7 @@ fn handle_timer(hwnd: WindowHandle) -> LRESULT {
 }
 
 fn handle_focused_render_timer(hwnd: WindowHandle) -> LRESULT {
+    clear_focused_render_tick_pending(hwnd.raw());
     match with_app_state(|state| {
         if !state.window_focused {
             return Ok(());
@@ -6447,6 +7158,57 @@ fn handle_char_message(
                 def_window_proc(hwnd, message, wparam, lparam)
             }
         }
+        Err(error) => fail_and_close(hwnd, &error),
+    }
+}
+
+fn handle_scene_char_message(
+    hwnd: WindowHandle,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    let code_unit = match wparam_to_u32(wparam) {
+        Ok(code_unit) => code_unit,
+        Err(error) => return fail_and_close(hwnd, &error),
+    };
+
+    match with_scene_app_state(|state| {
+        if state.scene_kind != SceneWindowKind::TextRenderingPlaygroundEditor
+            || !state.text_rendering_editor_focused
+        {
+            return Ok(false);
+        }
+        let playground = state.text_rendering_playground.as_ref().cloned();
+        {
+            let Some(playground) = playground.as_ref() else {
+                return Ok(false);
+            };
+            let Ok(mut shared) = playground.shared.lock() else {
+                eyre::bail!("failed to lock text rendering playground state")
+            };
+            match char::from_u32(code_unit) {
+                Some('\u{8}') => {
+                    shared.text.pop();
+                }
+                Some('\r') => shared.text.push('\n'),
+                Some(character)
+                    if !character.is_control() || character == '\n' || character == '\t' =>
+                {
+                    shared.text.push(character);
+                }
+                _ => return Ok(false),
+            }
+            shared.last_interaction_at = Some(Instant::now());
+        }
+        if let Some(playground) = playground {
+            playground.broadcast_changed();
+        }
+        render_scene_window_frame(state, hwnd, None, false)?;
+        Ok(true)
+    }) {
+        Ok(true) => LRESULT(0),
+        Ok(false) => def_window_proc(hwnd, message, wparam, lparam),
         Err(error) => fail_and_close(hwnd, &error),
     }
 }
@@ -7073,6 +7835,52 @@ fn render_scene_window_frame(
             view_state,
             &button_visual_states,
         )
+    } else if state.scene_kind == SceneWindowKind::TextRenderingPlaygroundPlane {
+        let shared = state
+            .text_rendering_playground
+            .as_ref()
+            .and_then(|playground| playground.shared.lock().ok())
+            .expect("text rendering plane scene has shared playground state");
+        windows_scene::build_text_rendering_plane_render_scene(
+            layout,
+            window_chrome_buttons_state,
+            text_rendering_plane_view_state(&shared),
+            &build_text_rendering_glyph_instances(
+                windows_scene::text_rendering_plane_interaction_rect(layout),
+                &shared.text,
+                shared.plane_viewport,
+                [0.88, 0.94, 1.0, 1.0],
+            ),
+        )
+    } else if state.scene_kind == SceneWindowKind::TextRenderingPlaygroundEditor {
+        let shared = state
+            .text_rendering_playground
+            .as_ref()
+            .and_then(|playground| playground.shared.lock().ok())
+            .expect("text rendering editor scene has shared playground state");
+        windows_scene::build_text_rendering_editor_render_scene(
+            layout,
+            window_chrome_buttons_state,
+            &text_rendering_editor_view_state(state, &shared),
+            state.diagnostic_selection,
+        )
+    } else if state.scene_kind == SceneWindowKind::TextRenderingPlaygroundSpriteSheet {
+        let shared = state
+            .text_rendering_playground
+            .as_ref()
+            .and_then(|playground| playground.shared.lock().ok())
+            .expect("text rendering sprite sheet scene has shared playground state");
+        windows_scene::build_text_rendering_sprite_sheet_render_scene(
+            layout,
+            window_chrome_buttons_state,
+            text_rendering_sprite_sheet_view_state(&shared),
+            &build_text_rendering_glyph_instances(
+                windows_scene::text_rendering_plane_interaction_rect(layout),
+                &shared.sprite_sheet_sample,
+                shared.sprite_sheet_viewport,
+                [0.84, 0.98, 0.90, 1.0],
+            ),
+        )
     } else if state.scene_kind == SceneWindowKind::TimelinePlayground {
         let pointer_position = state.pointer_position;
         let button_visual_states = scene_button_visual_states(state, layout);
@@ -7335,7 +8143,8 @@ fn scene_button_visual_states(
             let active = scene_action_active(spec.action)
                 || selected
                 || timeline_playground_action_active(state, spec.action)
-                || cursor_latency_playground_action_active(state, spec.action);
+                || cursor_latency_playground_action_active(state, spec.action)
+                || text_rendering_preset_action_active(state, spec.action);
             (
                 spec.action,
                 windows_scene::compute_button_visual_state(
@@ -7390,6 +8199,20 @@ fn cursor_latency_playground_action_active(state: &SceneAppState, action: SceneA
             windows_scene::CursorLatencyBehavior::MatchOs,
         )
     )
+}
+
+fn text_rendering_preset_action_active(state: &SceneAppState, action: SceneAction) -> bool {
+    let Some(preset) = windows_scene::text_rendering_preset_for_action(action) else {
+        return false;
+    };
+    let Some(playground) = state.text_rendering_playground.as_ref() else {
+        return false;
+    };
+    playground
+        .shared
+        .lock()
+        .ok()
+        .is_some_and(|shared| shared.active_preset == preset)
 }
 
 #[expect(
@@ -7856,6 +8679,182 @@ fn build_scene_diagnostic_text(state: &SceneAppState) -> String {
     }
 
     lines.join("\n")
+}
+
+fn text_rendering_plane_view_state(
+    shared: &TextRenderingPlaygroundSharedState,
+) -> windows_scene::TextRenderingPlaneViewState {
+    windows_scene::TextRenderingPlaneViewState {
+        glyph_count: shared.text.chars().filter(|character| *character != '\n').count(),
+        line_count: shared.text.lines().count().max(1),
+        zoom: shared.plane_viewport.zoom,
+        yaw_degrees: shared.plane_viewport.yaw_radians.to_degrees(),
+        pitch_degrees: shared.plane_viewport.pitch_radians.to_degrees(),
+        camera_offset: shared.plane_viewport.camera_offset,
+        plane_offset: shared.plane_viewport.plane_offset,
+    }
+}
+
+fn text_rendering_editor_view_state(
+    state: &SceneAppState,
+    shared: &TextRenderingPlaygroundSharedState,
+) -> windows_scene::TextRenderingEditorViewState {
+    windows_scene::TextRenderingEditorViewState {
+        active_preset: shared.active_preset,
+        focused: state.text_rendering_editor_focused,
+        text: shared.text.clone(),
+    }
+}
+
+fn text_rendering_sprite_sheet_view_state(
+    shared: &TextRenderingPlaygroundSharedState,
+) -> windows_scene::TextRenderingSpriteSheetViewState {
+    windows_scene::TextRenderingSpriteSheetViewState {
+        glyph_count: shared.sprite_sheet_characters.len(),
+        zoom: shared.sprite_sheet_viewport.zoom,
+        yaw_degrees: shared.sprite_sheet_viewport.yaw_radians.to_degrees(),
+        pitch_degrees: shared.sprite_sheet_viewport.pitch_radians.to_degrees(),
+        camera_offset: shared.sprite_sheet_viewport.camera_offset,
+        plane_offset: shared.sprite_sheet_viewport.plane_offset,
+    }
+}
+
+fn rotate_text_rendering_vector_3d(
+    vector: [f32; 3],
+    yaw_radians: f32,
+    pitch_radians: f32,
+) -> [f32; 3] {
+    let (yaw_sin, yaw_cos) = yaw_radians.sin_cos();
+    let yaw_rotated = [
+        (vector[0] * yaw_cos) + (vector[2] * yaw_sin),
+        vector[1],
+        (-vector[0] * yaw_sin) + (vector[2] * yaw_cos),
+    ];
+    let (pitch_sin, pitch_cos) = pitch_radians.sin_cos();
+    [
+        yaw_rotated[0],
+        (yaw_rotated[1] * pitch_cos) - (yaw_rotated[2] * pitch_sin),
+        (yaw_rotated[1] * pitch_sin) + (yaw_rotated[2] * pitch_cos),
+    ]
+}
+
+fn project_text_rendering_point(point: [f32; 3], center: [f32; 2]) -> [f32; 2] {
+    let perspective = TEXT_RENDERING_CAMERA_DISTANCE
+        / (TEXT_RENDERING_CAMERA_DISTANCE - point[2]).max(80.0);
+    [
+        center[0] + (point[0] * perspective),
+        center[1] + (point[1] * perspective),
+    ]
+}
+
+fn build_text_rendering_glyph_instances(
+    rect: ClientRect,
+    text: &str,
+    viewport: TextRenderingViewportState,
+    color: [f32; 4],
+) -> Vec<windows_scene::TextRenderingGlyphInstance> {
+    let Ok(font) = terminal_font_layout_snapshot() else {
+        return Vec::new();
+    };
+    let font_size = 28.0 * viewport.zoom.max(0.1);
+    let units_per_em = font.units_per_em.max(1.0);
+    let scale = font_size / units_per_em;
+    let line_height_units = (font.ascender - font.descender).max(1.0);
+    let line_height = line_height_units * scale;
+    let lines = text.lines().collect::<Vec<_>>();
+    let line_count = lines.len().max(1) as f32;
+    let line_advances = lines
+        .iter()
+        .map(|line| {
+            let mut advance = 0.0;
+            for character in line.chars() {
+                let glyph = font.glyphs.get(&character).copied();
+                advance += glyph.map_or(font.cell_advance, |glyph| glyph.advance.max(0.0));
+            }
+            advance.max(0.0)
+        })
+        .collect::<Vec<_>>();
+    let max_line_advance = line_advances
+        .iter()
+        .copied()
+        .fold(0.0_f32, f32::max)
+        .max(font.cell_advance);
+    let plane_origin = [
+        (rect.left() + rect.width() / 2) as f32
+            + viewport.camera_offset[0]
+            + viewport.plane_offset[0]
+            - ((max_line_advance * scale) / 2.0),
+        (rect.top() + rect.height() / 2) as f32
+            + viewport.camera_offset[1]
+            + viewport.plane_offset[1]
+            - ((line_count * line_height) / 2.0),
+    ];
+    let center = [
+        plane_origin[0] + ((max_line_advance * scale) / 2.0),
+        plane_origin[1] + ((line_count * line_height) / 2.0),
+    ];
+
+    let mut glyphs = Vec::new();
+    for (row_index, line) in lines.iter().enumerate() {
+        let line_left = plane_origin[0] + ((max_line_advance - line_advances[row_index]) * scale * 0.5);
+        let line_top = plane_origin[1] + (row_index as f32 * line_height);
+        let mut pen_x_units = 0.0;
+        for character in line.chars() {
+            let advance = font
+                .glyphs
+                .get(&character)
+                .map_or(font.cell_advance, |glyph| glyph.advance.max(0.0));
+            if character.is_control() || character == ' ' {
+                pen_x_units += advance;
+                continue;
+            }
+            let glyph = font.glyphs.get(&character).copied().unwrap_or_else(|| {
+                super::windows_d3d12_renderer::TerminalFontGlyphMetrics {
+                    x_min: 0.0,
+                    y_min: font.descender,
+                    x_max: advance,
+                    y_max: font.ascender,
+                    advance,
+                }
+            });
+            let left = line_left + (pen_x_units + glyph.x_min) * scale;
+            let right = line_left + (pen_x_units + glyph.x_max) * scale;
+            let top = line_top + (font.ascender - glyph.y_max) * scale;
+            let bottom = line_top + (font.ascender - glyph.y_min) * scale;
+            let corners = [
+                [left, top],
+                [right, top],
+                [right, bottom],
+                [left, bottom],
+            ]
+            .map(|corner| {
+                let translated = [corner[0] - center[0], corner[1] - center[1], 0.0];
+                let rotated = rotate_text_rendering_vector_3d(
+                    translated,
+                    viewport.yaw_radians,
+                    viewport.pitch_radians,
+                );
+                project_text_rendering_point(rotated, center)
+            });
+            let min_x = corners.iter().map(|corner| corner[0]).fold(f32::INFINITY, f32::min);
+            let max_x = corners.iter().map(|corner| corner[0]).fold(f32::NEG_INFINITY, f32::max);
+            let min_y = corners.iter().map(|corner| corner[1]).fold(f32::INFINITY, f32::min);
+            let max_y = corners.iter().map(|corner| corner[1]).fold(f32::NEG_INFINITY, f32::max);
+            if max_x >= rect.left() as f32
+                && min_x <= rect.right() as f32
+                && max_y >= rect.top() as f32
+                && min_y <= rect.bottom() as f32
+            {
+            glyphs.push(windows_scene::TextRenderingGlyphInstance {
+                character,
+                color,
+                corners,
+            });
+            }
+            pen_x_units += advance;
+        }
+    }
+    glyphs
 }
 
 fn push_audio_input_device_window_diagnostic_text(
@@ -10349,6 +11348,19 @@ fn perform_scene_action(
                 .wrap_err("failed to spawn Teamy Studio cursor latency playground thread")?;
             Ok(SceneActionDisposition::KeepOpen)
         }
+        SceneAction::OpenTextRenderingPlayground => {
+            let app_home = app_home.clone();
+            thread::Builder::new()
+                .name("teamy-studio-text-rendering-playground".to_owned())
+                .spawn_with_current_span(move || {
+                    if let Err(error) = open_text_rendering_playground_windows(&app_home, vt_engine)
+                    {
+                        error!(?error, "failed to open text rendering playground windows");
+                    }
+                })
+                .wrap_err("failed to spawn Teamy Studio text rendering playground thread")?;
+            Ok(SceneActionDisposition::KeepOpen)
+        }
         SceneAction::OpenDemoMode => {
             let app_home = app_home.clone();
             thread::Builder::new()
@@ -10666,6 +11678,18 @@ fn perform_scene_action(
                     playground.behavior = windows_scene::CursorLatencyBehavior::MatchOs;
                 }
                 Ok(())
+            })?;
+            Ok(SceneActionDisposition::KeepOpen)
+        }
+        SceneAction::SelectTextRenderingPresetLoremIpsum
+        | SceneAction::SelectTextRenderingPresetSpriteSheet
+        | SceneAction::SelectTextRenderingPresetAlphabet
+        | SceneAction::SelectTextRenderingPresetQuickBrownFox
+        | SceneAction::SelectTextRenderingPresetSphinxBlackQuartz => {
+            with_scene_app_state(|state| {
+                let preset = windows_scene::text_rendering_preset_for_action(action)
+                    .expect("preset action must map to a text rendering preset");
+                update_text_rendering_preset(state, preset)
             })?;
             Ok(SceneActionDisposition::KeepOpen)
         }
@@ -12837,6 +13861,19 @@ fn scene_pretty_text_target(
         });
     }
 
+    if state.scene_kind == SceneWindowKind::TextRenderingPlaygroundEditor {
+        let shared = state
+            .text_rendering_playground
+            .as_ref()
+            .and_then(|playground| playground.shared.lock().ok())?;
+        return Some(SceneSelectableTextTarget {
+            rect: windows_scene::text_rendering_editor_text_rect(layout),
+            text: shared.text.clone(),
+            cell_width: 9,
+            cell_height: 16,
+        });
+    }
+
     if state.scene_kind != SceneWindowKind::AudioInputDeviceDetails {
         return None;
     }
@@ -12877,6 +13914,17 @@ fn scene_window_caption(state: &SceneAppState) -> String {
         if let Some(detail) = detail_state.detail.as_ref() {
             return format!("{} - {}", detail.title(), state.scene_kind.title());
         }
+    }
+    if matches!(
+        state.scene_kind,
+        SceneWindowKind::TextRenderingPlaygroundPlane
+            | SceneWindowKind::TextRenderingPlaygroundEditor
+            | SceneWindowKind::TextRenderingPlaygroundPresets
+            | SceneWindowKind::TextRenderingPlaygroundSpriteSheet
+    ) && let Some(playground) = state.text_rendering_playground.as_ref()
+        && let Ok(shared) = playground.shared.lock()
+    {
+        return format!("{} [{}]", state.scene_kind.title(), shared.session_id);
     }
     state.scene_kind.title().to_owned()
 }
@@ -13057,6 +14105,24 @@ fn scene_cursor_for_point(
         if windows_scene::logs_selectable_text_rect(layout).contains(point) {
             return Some(IDC_IBEAM);
         }
+    }
+
+    if !state.diagnostics_visible
+        && state.scene_kind == SceneWindowKind::TextRenderingPlaygroundEditor
+        && windows_scene::text_rendering_editor_text_rect(layout).contains(point)
+    {
+        return Some(IDC_IBEAM);
+    }
+
+    if !state.diagnostics_visible
+        && matches!(
+            state.scene_kind,
+            SceneWindowKind::TextRenderingPlaygroundPlane
+                | SceneWindowKind::TextRenderingPlaygroundSpriteSheet
+        )
+        && windows_scene::text_rendering_plane_interaction_rect(layout).contains(point)
+    {
+        return Some(IDC_SIZEALL);
     }
 
     if state.scene_kind == SceneWindowKind::TimelineTranscriptionSettings
@@ -13413,6 +14479,11 @@ fn update_scene_chrome_tooltip(
         return Ok(());
     }
 
+    if let Some((tooltip_text, anchor_rect)) = text_rendering_scene_tooltip(state, layout, point) {
+        show_scene_tooltip(state, hwnd, point, tooltip_text, anchor_rect)?;
+        return Ok(());
+    }
+
     if let Some((tooltip_text, anchor_rect)) = scene_action_tooltip(state, layout, point) {
         show_scene_tooltip(state, hwnd, point, tooltip_text, anchor_rect)?;
         return Ok(());
@@ -13481,6 +14552,54 @@ fn logs_control_tooltip(
         windows_scene::logs_control_tooltip(control),
         windows_scene::logs_control_rect(layout, control),
     ))
+}
+
+fn text_rendering_scene_tooltip(
+    state: &SceneAppState,
+    layout: TerminalLayout,
+    point: ClientPoint,
+) -> Option<(&'static str, ClientRect)> {
+    if state.diagnostics_visible {
+        return None;
+    }
+
+    match state.scene_kind {
+        SceneWindowKind::TextRenderingPlaygroundEditor => {
+            if state.text_rendering_editor_focused {
+                return None;
+            }
+            windows_scene::text_rendering_editor_text_rect(layout)
+                .contains(point)
+                .then_some((
+                    "Left click focuses the editor.\nType to update the shared text plane.\nRight click clears the buffer.\nEsc defocuses the editor.",
+                    windows_scene::text_rendering_editor_text_rect(layout),
+                ))
+        }
+        SceneWindowKind::TextRenderingPlaygroundPlane
+        | SceneWindowKind::TextRenderingPlaygroundSpriteSheet => {
+            if state.text_rendering_drag.is_some() {
+                return None;
+            }
+            let cooldown_active = state
+                .text_rendering_playground
+                .as_ref()
+                .and_then(|playground| playground.shared.lock().ok())
+                .and_then(|shared| shared.last_interaction_at)
+                .is_some_and(|last_interaction_at| {
+                    last_interaction_at.elapsed() < TEXT_RENDERING_TOOLTIP_COOLDOWN
+                });
+            if cooldown_active {
+                return None;
+            }
+            windows_scene::text_rendering_plane_interaction_rect(layout)
+                .contains(point)
+                .then_some((
+                    "Left drag rotates in 3D. Middle drag pans the camera. Right drag translates the plane. Double right click resets translation, rotation, and zoom. Mouse wheel zooms.",
+                    windows_scene::text_rendering_plane_interaction_rect(layout),
+                ))
+        }
+        _ => None,
+    }
 }
 
 fn timeline_playground_item_tooltip(
@@ -14308,6 +15427,11 @@ mod tests {
             model_warning_prepare_started_at: None,
             timeline_playground: None,
             cursor_latency_playground: None,
+            text_rendering_playground: None,
+            text_rendering_drag: None,
+            text_rendering_editor_focused: false,
+            text_rendering_last_right_button_down_at: None,
+            text_rendering_last_right_button_down_point: None,
             latency_overlay: LatencyOverlayState::new(),
             timeline_playground_detail: None,
             timeline_tool: TimelineInteractionTool::default(),
@@ -14404,6 +15528,26 @@ mod tests {
         state.latency_overlay.visible = true;
 
         assert!(scene_needs_focused_timer_render(&state));
+    }
+
+    #[test]
+    fn sprite_sheet_sample_keeps_all_supported_glyphs() {
+        let characters = (0x21..0x221)
+            .filter_map(char::from_u32)
+            .collect::<Vec<_>>();
+        let expected = characters
+            .iter()
+            .copied()
+            .filter(|character| !character.is_control() && !character.is_whitespace())
+            .collect::<Vec<_>>();
+
+        let sample = build_text_rendering_sprite_sheet_sample(&characters);
+        let rendered = sample
+            .chars()
+            .filter(|character| *character != '\n')
+            .collect::<Vec<_>>();
+
+        assert_eq!(rendered, expected);
     }
 
     #[test]
@@ -15134,6 +16278,11 @@ mod tests {
             model_warning_prepare_started_at: None,
             timeline_playground: None,
             cursor_latency_playground: None,
+            text_rendering_playground: None,
+            text_rendering_drag: None,
+            text_rendering_editor_focused: false,
+            text_rendering_last_right_button_down_at: None,
+            text_rendering_last_right_button_down_point: None,
             latency_overlay: LatencyOverlayState::new(),
             timeline_playground_detail: None,
             timeline_tool: TimelineInteractionTool::default(),
@@ -15219,6 +16368,11 @@ mod tests {
             model_warning_prepare_started_at: None,
             timeline_playground: None,
             cursor_latency_playground: Some(CursorLatencyPlaygroundState::new()),
+            text_rendering_playground: None,
+            text_rendering_drag: None,
+            text_rendering_editor_focused: false,
+            text_rendering_last_right_button_down_at: None,
+            text_rendering_last_right_button_down_point: None,
             latency_overlay: LatencyOverlayState::new(),
             timeline_playground_detail: None,
             timeline_tool: TimelineInteractionTool::default(),
@@ -15305,6 +16459,11 @@ mod tests {
             model_warning_prepare_started_at: None,
             timeline_playground: None,
             cursor_latency_playground: None,
+            text_rendering_playground: None,
+            text_rendering_drag: None,
+            text_rendering_editor_focused: false,
+            text_rendering_last_right_button_down_at: None,
+            text_rendering_last_right_button_down_point: None,
             latency_overlay: LatencyOverlayState::new(),
             timeline_playground_detail: None,
             timeline_tool: TimelineInteractionTool::default(),
@@ -15383,6 +16542,11 @@ mod tests {
             model_warning_prepare_started_at: None,
             timeline_playground: None,
             cursor_latency_playground: None,
+            text_rendering_playground: None,
+            text_rendering_drag: None,
+            text_rendering_editor_focused: false,
+            text_rendering_last_right_button_down_at: None,
+            text_rendering_last_right_button_down_point: None,
             latency_overlay: LatencyOverlayState::new(),
             timeline_playground_detail: None,
             timeline_tool: TimelineInteractionTool::default(),

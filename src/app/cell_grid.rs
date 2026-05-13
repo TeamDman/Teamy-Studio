@@ -57,6 +57,7 @@ pub fn build_text_grid_scene_with_palette(
     let mut scene = RenderScene {
         panels: Vec::new(),
         glyphs: Vec::new(),
+        transformed_glyphs: Vec::new(),
         sprites: Vec::new(),
         overlay_panels: Vec::new(),
     };

@@ -38,6 +38,7 @@ use super::windows_d3d12_renderer::{
     ButtonVisualState, PanelEffect, RenderScene, SpriteId, WindowChromeButtonsState,
     preferred_background_color, preferred_title_bar_color, push_centered_text, push_glyph,
     push_panel, push_panel_with_data, push_sprite, push_text_block, push_title_text,
+    push_transformed_glyph,
     push_window_chrome_buttons, push_window_garden_frame,
 };
 use super::windows_terminal::{TerminalLayout, TerminalSelection};
@@ -86,6 +87,10 @@ pub enum SceneWindowKind {
     AudioInputDeviceDetails,
     CursorGallery,
     CursorLatencyPlayground,
+    TextRenderingPlaygroundPlane,
+    TextRenderingPlaygroundEditor,
+    TextRenderingPlaygroundPresets,
+    TextRenderingPlaygroundSpriteSheet,
     DemoMode,
     TimelinePlayground,
     TimelinePlaygroundDetail,
@@ -109,6 +114,10 @@ impl SceneWindowKind {
             Self::AudioInputDeviceDetails => "Microphone",
             Self::CursorGallery => "Cursor Gallery",
             Self::CursorLatencyPlayground => "Cursor Latency Playground",
+            Self::TextRenderingPlaygroundPlane => "Text Plane",
+            Self::TextRenderingPlaygroundEditor => "Text Input",
+            Self::TextRenderingPlaygroundPresets => "Text Presets",
+            Self::TextRenderingPlaygroundSpriteSheet => "Sprite Sheet Explorer",
             Self::DemoMode => "Demo Mode",
             Self::TimelinePlayground => "Timeline Playground",
             Self::TimelinePlaygroundDetail => "Timeline Detail",
@@ -178,6 +187,7 @@ pub enum SceneAction {
     OpenCursorInfo,
     OpenCursorGallery,
     OpenCursorLatencyPlayground,
+    OpenTextRenderingPlayground,
     OpenDemoMode,
     OpenTimelinePlayground,
     OpenStorage,
@@ -215,6 +225,51 @@ pub enum SceneAction {
     DecreaseTimelinePlaygroundFolding,
     SetCursorLatencyBehaviorFastest,
     SetCursorLatencyBehaviorMatchOs,
+    SelectTextRenderingPresetLoremIpsum,
+    SelectTextRenderingPresetSpriteSheet,
+    SelectTextRenderingPresetAlphabet,
+    SelectTextRenderingPresetQuickBrownFox,
+    SelectTextRenderingPresetSphinxBlackQuartz,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TextRenderingPreset {
+    LoremIpsum,
+    SpriteSheet,
+    Alphabet,
+    QuickBrownFox,
+    SphinxBlackQuartz,
+}
+
+impl TextRenderingPreset {
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::LoremIpsum => "Lorem Ipsum",
+            Self::SpriteSheet => "Spritesheet",
+            Self::Alphabet => "Alphabet",
+            Self::QuickBrownFox => "Quick Brown Fox",
+            Self::SphinxBlackQuartz => "Sphinx Black Quartz",
+        }
+    }
+}
+
+#[must_use]
+pub const fn text_rendering_preset_for_action(action: SceneAction) -> Option<TextRenderingPreset> {
+    match action {
+        SceneAction::SelectTextRenderingPresetLoremIpsum => Some(TextRenderingPreset::LoremIpsum),
+        SceneAction::SelectTextRenderingPresetSpriteSheet => {
+            Some(TextRenderingPreset::SpriteSheet)
+        }
+        SceneAction::SelectTextRenderingPresetAlphabet => Some(TextRenderingPreset::Alphabet),
+        SceneAction::SelectTextRenderingPresetQuickBrownFox => {
+            Some(TextRenderingPreset::QuickBrownFox)
+        }
+        SceneAction::SelectTextRenderingPresetSphinxBlackQuartz => {
+            Some(TextRenderingPreset::SphinxBlackQuartz)
+        }
+        _ => None,
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -298,6 +353,41 @@ pub struct TimelinePlaygroundLayout {
     pub row_header_rect: ClientRect,
     pub content_rect: ClientRect,
     pub vertical_scroll_offset: i32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TextRenderingPlaneViewState {
+    pub glyph_count: usize,
+    pub line_count: usize,
+    pub zoom: f32,
+    pub yaw_degrees: f32,
+    pub pitch_degrees: f32,
+    pub camera_offset: [f32; 2],
+    pub plane_offset: [f32; 2],
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct TextRenderingEditorViewState {
+    pub active_preset: TextRenderingPreset,
+    pub focused: bool,
+    pub text: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TextRenderingSpriteSheetViewState {
+    pub glyph_count: usize,
+    pub zoom: f32,
+    pub yaw_degrees: f32,
+    pub pitch_degrees: f32,
+    pub camera_offset: [f32; 2],
+    pub plane_offset: [f32; 2],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TextRenderingGlyphInstance {
+    pub character: char,
+    pub color: [f32; 4],
+    pub corners: [[f32; 2]; 4],
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -835,6 +925,44 @@ pub struct SceneButtonSpec {
     pub color: [f32; 4],
 }
 
+const TEXT_RENDERING_PRESET_BUTTON_SPECS: [SceneButtonSpec; 5] = [
+    SceneButtonSpec {
+        action: SceneAction::SelectTextRenderingPresetLoremIpsum,
+        label: "Lorem Ipsum",
+        tooltip: "Replace the editor text with two default lorem ipsum paragraphs",
+        sprite: SpriteId::Terminal,
+        color: [0.20, 0.27, 0.24, 1.0],
+    },
+    SceneButtonSpec {
+        action: SceneAction::SelectTextRenderingPresetSpriteSheet,
+        label: "Spritesheet",
+        tooltip: "Replace the editor text with a font glyph sheet sample",
+        sprite: SpriteId::Storage,
+        color: [0.20, 0.23, 0.34, 1.0],
+    },
+    SceneButtonSpec {
+        action: SceneAction::SelectTextRenderingPresetAlphabet,
+        label: "Alphabet",
+        tooltip: "Replace the editor text with repeated alphabet lines",
+        sprite: SpriteId::Terminal,
+        color: [0.24, 0.21, 0.30, 1.0],
+    },
+    SceneButtonSpec {
+        action: SceneAction::SelectTextRenderingPresetQuickBrownFox,
+        label: "Quick Brown Fox",
+        tooltip: "Replace the editor text with the quick-brown-fox pangram sample",
+        sprite: SpriteId::Terminal,
+        color: [0.27, 0.22, 0.20, 1.0],
+    },
+    SceneButtonSpec {
+        action: SceneAction::SelectTextRenderingPresetSphinxBlackQuartz,
+        label: "Sphinx Black Quartz",
+        tooltip: "Replace the editor text with the sphinx-black-quartz pangram sample",
+        sprite: SpriteId::Terminal,
+        color: [0.18, 0.26, 0.32, 1.0],
+    },
+];
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct CursorGallerySpriteSpec {
     pub cursor: CursorGalleryCursorKind,
@@ -979,6 +1107,268 @@ pub fn build_scene_render_scene(
         );
     }
 
+    scene
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TextRenderingWorkspaceLayout {
+    body_rect: ClientRect,
+    title_rect: ClientRect,
+    summary_rect: ClientRect,
+    content_rect: ClientRect,
+    footer_rect: ClientRect,
+}
+
+fn text_rendering_workspace_layout(layout: TerminalLayout) -> TextRenderingWorkspaceLayout {
+    let body_rect = layout.terminal_panel_rect().inset(24);
+    let title_rect = ClientRect::new(
+        body_rect.left() + 22,
+        body_rect.top() + 18,
+        body_rect.right() - 22,
+        body_rect.top() + 52,
+    );
+    let summary_rect = ClientRect::new(
+        body_rect.left() + 22,
+        body_rect.top() + 58,
+        body_rect.right() - 22,
+        body_rect.top() + 96,
+    );
+    let footer_rect = ClientRect::new(
+        body_rect.left() + 22,
+        body_rect.bottom() - 56,
+        body_rect.right() - 22,
+        body_rect.bottom() - 18,
+    );
+    let content_rect = ClientRect::new(
+        body_rect.left() + 18,
+        summary_rect.bottom() + 12,
+        body_rect.right() - 18,
+        footer_rect.top() - 12,
+    );
+    TextRenderingWorkspaceLayout {
+        body_rect,
+        title_rect,
+        summary_rect,
+        content_rect,
+        footer_rect,
+    }
+}
+
+#[must_use]
+pub fn text_rendering_plane_interaction_rect(layout: TerminalLayout) -> ClientRect {
+    text_rendering_workspace_layout(layout).content_rect
+}
+
+#[must_use]
+pub fn text_rendering_editor_text_rect(layout: TerminalLayout) -> ClientRect {
+    text_rendering_workspace_layout(layout).content_rect.inset(18)
+}
+
+#[must_use]
+pub fn build_text_rendering_plane_render_scene(
+    layout: TerminalLayout,
+    window_chrome_buttons_state: WindowChromeButtonsState,
+    view_state: TextRenderingPlaneViewState,
+    glyphs: &[TextRenderingGlyphInstance],
+) -> RenderScene {
+    let workspace = text_rendering_workspace_layout(layout);
+    let mut scene = build_scene_shell(
+        layout,
+        SceneWindowKind::TextRenderingPlaygroundPlane,
+        window_chrome_buttons_state,
+    );
+    push_panel(
+        &mut scene,
+        workspace.body_rect.to_win32_rect(),
+        [0.03, 0.04, 0.06, 1.0],
+        PanelEffect::SceneBody,
+    );
+    push_panel(
+        &mut scene,
+        workspace.content_rect.to_win32_rect(),
+        [0.02, 0.03, 0.05, 1.0],
+        PanelEffect::TerminalFill,
+    );
+    push_title_text(
+        &mut scene,
+        workspace.title_rect.to_win32_rect(),
+        "Interactive text plane",
+        [0.92, 0.95, 1.0, 1.0],
+    );
+    let summary = format!(
+        "Glyphs: {}   Lines: {}   Zoom: {:.2}x   Yaw: {:.1} deg   Pitch: {:.1} deg\nCamera: ({:.0}, {:.0})   Plane: ({:.0}, {:.0})",
+        view_state.glyph_count,
+        view_state.line_count,
+        view_state.zoom,
+        view_state.yaw_degrees,
+        view_state.pitch_degrees,
+        view_state.camera_offset[0],
+        view_state.camera_offset[1],
+        view_state.plane_offset[0],
+        view_state.plane_offset[1],
+    );
+    push_text_block(
+        &mut scene,
+        workspace.summary_rect.to_win32_rect(),
+        &summary,
+        9,
+        16,
+        [0.70, 0.82, 1.0, 1.0],
+    );
+    push_text_block(
+        &mut scene,
+        workspace.footer_rect.to_win32_rect(),
+        "Left drag rotates. Middle drag pans the camera. Right drag translates the text plane. Mouse wheel zooms around the plane center.",
+        9,
+        16,
+        [0.76, 0.80, 0.88, 1.0],
+    );
+    for glyph in glyphs {
+        push_transformed_glyph(&mut scene, glyph.corners, glyph.character, glyph.color);
+    }
+    scene
+}
+
+#[must_use]
+pub fn build_text_rendering_editor_render_scene(
+    layout: TerminalLayout,
+    window_chrome_buttons_state: WindowChromeButtonsState,
+    view_state: &TextRenderingEditorViewState,
+    _selection: Option<TerminalSelection>,
+) -> RenderScene {
+    let workspace = text_rendering_workspace_layout(layout);
+    let editor_rect = text_rendering_editor_text_rect(layout);
+    let mut scene = build_scene_shell(
+        layout,
+        SceneWindowKind::TextRenderingPlaygroundEditor,
+        window_chrome_buttons_state,
+    );
+    push_panel(
+        &mut scene,
+        workspace.body_rect.to_win32_rect(),
+        [0.06, 0.04, 0.03, 1.0],
+        PanelEffect::SceneBody,
+    );
+    push_title_text(
+        &mut scene,
+        workspace.title_rect.to_win32_rect(),
+        "Text input",
+        [1.0, 0.95, 0.90, 1.0],
+    );
+    let summary = format!(
+        "Preset: {}   Focus: {}   Characters: {}",
+        view_state.active_preset.label(),
+        if view_state.focused { "focused" } else { "idle" },
+        view_state.text.chars().count(),
+    );
+    push_text_block(
+        &mut scene,
+        workspace.summary_rect.to_win32_rect(),
+        &summary,
+        9,
+        16,
+        [1.0, 0.80, 0.68, 1.0],
+    );
+    push_panel(
+        &mut scene,
+        workspace.content_rect.to_win32_rect(),
+        [0.12, 0.08, 0.05, 1.0],
+        PanelEffect::TerminalFill,
+    );
+    if view_state.focused {
+        push_panel(
+            &mut scene,
+            ClientRect::new(
+                workspace.content_rect.left() + 4,
+                workspace.content_rect.top() + 4,
+                workspace.content_rect.left() + 10,
+                workspace.content_rect.bottom() - 4,
+            )
+            .to_win32_rect(),
+            [1.0, 0.72, 0.38, 0.85],
+            PanelEffect::SceneButtonCard,
+        );
+    }
+    push_text_block(
+        &mut scene,
+        editor_rect.to_win32_rect(),
+        &view_state.text,
+        9,
+        16,
+        [0.98, 0.96, 0.92, 1.0],
+    );
+    push_text_block(
+        &mut scene,
+        workspace.footer_rect.to_win32_rect(),
+        "Left click focuses the editor. Type to update the plane. Right click clears the text. Press Esc to defocus. Presets replace the whole buffer.",
+        9,
+        16,
+        [0.94, 0.83, 0.70, 1.0],
+    );
+    scene
+}
+
+#[must_use]
+pub fn build_text_rendering_sprite_sheet_render_scene(
+    layout: TerminalLayout,
+    window_chrome_buttons_state: WindowChromeButtonsState,
+    view_state: TextRenderingSpriteSheetViewState,
+    glyphs: &[TextRenderingGlyphInstance],
+) -> RenderScene {
+    let workspace = text_rendering_workspace_layout(layout);
+    let mut scene = build_scene_shell(
+        layout,
+        SceneWindowKind::TextRenderingPlaygroundSpriteSheet,
+        window_chrome_buttons_state,
+    );
+    push_panel(
+        &mut scene,
+        workspace.body_rect.to_win32_rect(),
+        [0.03, 0.05, 0.04, 1.0],
+        PanelEffect::SceneBody,
+    );
+    push_panel(
+        &mut scene,
+        workspace.content_rect.to_win32_rect(),
+        [0.02, 0.05, 0.04, 1.0],
+        PanelEffect::TerminalFill,
+    );
+    push_title_text(
+        &mut scene,
+        workspace.title_rect.to_win32_rect(),
+        "Sprite sheet explorer",
+        [0.90, 1.0, 0.94, 1.0],
+    );
+    let summary = format!(
+        "Glyphs: {}   Zoom: {:.2}x   Yaw: {:.1} deg   Pitch: {:.1} deg\nCamera: ({:.0}, {:.0})   Plane: ({:.0}, {:.0})",
+        view_state.glyph_count,
+        view_state.zoom,
+        view_state.yaw_degrees,
+        view_state.pitch_degrees,
+        view_state.camera_offset[0],
+        view_state.camera_offset[1],
+        view_state.plane_offset[0],
+        view_state.plane_offset[1],
+    );
+    push_text_block(
+        &mut scene,
+        workspace.summary_rect.to_win32_rect(),
+        &summary,
+        9,
+        16,
+        [0.74, 0.96, 0.84, 1.0],
+    );
+    push_text_block(
+        &mut scene,
+        workspace.footer_rect.to_win32_rect(),
+        "The sprite-sheet plane uses the same controls as the text plane so you can compare arbitrary text against the font's broader glyph coverage.",
+        9,
+        16,
+        [0.74, 0.90, 0.80, 1.0],
+    );
+    for glyph in glyphs {
+        push_transformed_glyph(&mut scene, glyph.corners, glyph.character, glyph.color);
+    }
     scene
 }
 
@@ -2385,6 +2775,13 @@ pub fn scene_button_specs(scene_kind: SceneWindowKind) -> &'static [SceneButtonS
                 color: [0.28, 0.17, 0.18, 1.0],
             },
             SceneButtonSpec {
+                action: SceneAction::OpenTextRenderingPlayground,
+                label: "Text Rendering Playground",
+                tooltip: "Open the multi-window text rendering playground",
+                sprite: SpriteId::Terminal,
+                color: [0.17, 0.21, 0.34, 1.0],
+            },
+            SceneButtonSpec {
                 // windowing[impl launcher.buttons.demo-mode]
                 action: SceneAction::OpenDemoMode,
                 label: "Demo Mode",
@@ -2591,6 +2988,7 @@ pub fn scene_button_specs(scene_kind: SceneWindowKind) -> &'static [SceneButtonS
                 color: [0.16, 0.25, 0.29, 1.0],
             },
         ],
+        SceneWindowKind::TextRenderingPlaygroundPresets => &TEXT_RENDERING_PRESET_BUTTON_SPECS,
         SceneWindowKind::TimelineStart => &[
             SceneButtonSpec {
                 // timeline[impl start-window.create-or-import]
@@ -2679,6 +3077,9 @@ pub fn scene_button_specs(scene_kind: SceneWindowKind) -> &'static [SceneButtonS
         | SceneWindowKind::AudioDaemon
         | SceneWindowKind::AudioInputDevicePicker
         | SceneWindowKind::AudioInputDeviceDetails
+        | SceneWindowKind::TextRenderingPlaygroundPlane
+        | SceneWindowKind::TextRenderingPlaygroundEditor
+        | SceneWindowKind::TextRenderingPlaygroundSpriteSheet
         | SceneWindowKind::TimelinePlaygroundDetail
         | SceneWindowKind::TimelineTranscriptionSettings
         | SceneWindowKind::ModelWarning => &[],
@@ -9587,6 +9988,7 @@ fn empty_render_scene() -> RenderScene {
     RenderScene {
         panels: Vec::new(),
         glyphs: Vec::new(),
+        transformed_glyphs: Vec::new(),
         sprites: Vec::new(),
         overlay_panels: Vec::new(),
     }
@@ -9764,6 +10166,7 @@ fn build_scene_shell(
     let mut scene = RenderScene {
         panels: Vec::new(),
         glyphs: Vec::new(),
+        transformed_glyphs: Vec::new(),
         sprites: Vec::new(),
         overlay_panels: Vec::new(),
     };
@@ -10026,6 +10429,11 @@ mod tests {
         assert!(
             specs
                 .iter()
+                .any(|spec| spec.action == SceneAction::OpenTextRenderingPlayground)
+        );
+        assert!(
+            specs
+                .iter()
                 .any(|spec| spec.action == SceneAction::OpenDemoMode)
         );
         assert!(
@@ -10063,6 +10471,18 @@ mod tests {
                 .iter()
                 .any(|spec| spec.action == SceneAction::OpenTimelinePlayground)
         );
+    }
+
+    #[test]
+    fn text_rendering_presets_expose_all_requested_presets() {
+        let specs = scene_button_specs(SceneWindowKind::TextRenderingPlaygroundPresets);
+        let actions = specs.iter().map(|spec| spec.action).collect::<Vec<_>>();
+
+        assert!(actions.contains(&SceneAction::SelectTextRenderingPresetLoremIpsum));
+        assert!(actions.contains(&SceneAction::SelectTextRenderingPresetSpriteSheet));
+        assert!(actions.contains(&SceneAction::SelectTextRenderingPresetAlphabet));
+        assert!(actions.contains(&SceneAction::SelectTextRenderingPresetQuickBrownFox));
+        assert!(actions.contains(&SceneAction::SelectTextRenderingPresetSphinxBlackQuartz));
     }
 
     // timeline[verify playground.query-controls]
@@ -10115,6 +10535,7 @@ mod tests {
         let mut scene = RenderScene {
             panels: Vec::new(),
             glyphs: Vec::new(),
+            transformed_glyphs: Vec::new(),
             sprites: Vec::new(),
             overlay_panels: Vec::new(),
         };
