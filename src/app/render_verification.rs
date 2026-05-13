@@ -4,16 +4,33 @@ use std::sync::Arc;
 use eyre::Context;
 use facet::Facet;
 use image::{Rgba, RgbaImage};
+use windows::Win32::Foundation::RECT;
 
 use super::spatial::TerminalCellPoint;
 use super::windows_d3d12_renderer::{
-    self, RenderFrameModel, RendererTerminalVisualState, WindowChromeButtonsState,
+    self, PanelEffect, RenderFrameModel, RenderScene, RendererTerminalVisualState,
+    TransformedGlyphQuad, TransformedTextPlaneBasis, WindowChromeButtonsState,
 };
 use super::windows_terminal::{
     self, TerminalDisplayCursor, TerminalDisplayCursorStyle, TerminalDisplayRow,
 };
 
 const DEFAULT_RENDER_FIXTURE_ID: &str = "basic-terminal-frame";
+const TRANSFORMED_TEXT_RENDER_FIXTURE_ID: &str = "transformed-text-plane";
+const REFERENCE_TEXT_RENDER_TEXT: &str = "test";
+const REFERENCE_TEXT_FONT_SIZE_PX: f32 = 168.0;
+const REFERENCE_TEXT_CAMERA_DISTANCE: f32 = 1400.0;
+const REFERENCE_TEXT_NEAR_PLANE_DISTANCE: f32 = 80.0;
+const REFERENCE_TEXT_COLOR: [f32; 4] = [1.0, 1.0, 1.0, 1.0];
+const REFERENCE_TEXT_BACKGROUND: [f32; 4] = [0.0, 0.0, 0.0, 1.0];
+const REFERENCE_TEXT_YAW_RADIANS: f32 = -0.52;
+const REFERENCE_TEXT_PITCH_RADIANS: f32 = 0.31;
+
+#[derive(Clone, Debug)]
+pub(crate) struct ReferenceTextLayout {
+    pub layout: windows_terminal::TerminalLayout,
+    pub transformed_scene: RenderScene,
+}
 
 struct BuiltInRenderFixture {
     id: &'static str,
@@ -21,11 +38,18 @@ struct BuiltInRenderFixture {
     build_frame: fn() -> RenderFrameModel,
 }
 
-const BUILT_IN_RENDER_FIXTURES: &[BuiltInRenderFixture] = &[BuiltInRenderFixture {
-    id: DEFAULT_RENDER_FIXTURE_ID,
-    description: "Smoke terminal frame with diagnostic chrome, two rows of slug text, a cursor, and a scrollbar.",
-    build_frame: build_basic_terminal_frame_fixture,
-}];
+const BUILT_IN_RENDER_FIXTURES: &[BuiltInRenderFixture] = &[
+    BuiltInRenderFixture {
+        id: DEFAULT_RENDER_FIXTURE_ID,
+        description: "Smoke terminal frame with diagnostic chrome, two rows of slug text, a cursor, and a scrollbar.",
+        build_frame: build_basic_terminal_frame_fixture,
+    },
+    BuiltInRenderFixture {
+        id: TRANSFORMED_TEXT_RENDER_FIXTURE_ID,
+        description: "Reference transformed text plane for offscreen verification artifacts and regression debugging.",
+        build_frame: build_reference_transformed_text_frame,
+    },
+];
 
 #[derive(Debug, Facet)]
 pub struct RenderOffscreenFixtureSummary {
@@ -657,6 +681,166 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
         hash = hash.wrapping_mul(0x0100_0000_01b3);
     }
     hash
+}
+
+#[cfg(test)]
+pub(crate) fn build_reference_zero_angle_transformed_text_frame() -> RenderFrameModel {
+    build_reference_zero_angle_transformed_text_layout().frame()
+}
+
+pub(crate) fn build_reference_transformed_text_frame() -> RenderFrameModel {
+    build_reference_text_layout(REFERENCE_TEXT_YAW_RADIANS, REFERENCE_TEXT_PITCH_RADIANS).frame()
+}
+
+#[cfg(test)]
+pub(crate) fn build_reference_zero_angle_transformed_text_layout() -> ReferenceTextLayout {
+    build_reference_text_layout(0.0, 0.0)
+}
+
+fn build_reference_text_frame(
+    yaw_radians: f32,
+    pitch_radians: f32,
+    transformed: bool,
+) -> RenderFrameModel {
+    let layout = build_reference_text_layout(yaw_radians, pitch_radians);
+    if transformed {
+        layout.frame()
+    } else {
+        panic!("flat reference text frames are no longer supported; use CPU-composited glyph references in tests")
+    }
+}
+
+fn build_reference_text_layout(yaw_radians: f32, pitch_radians: f32) -> ReferenceTextLayout {
+    let layout = windows_terminal::TerminalLayout {
+        client_width: 1040,
+        client_height: 680,
+        cell_width: 8,
+        cell_height: 16,
+        diagnostic_panel_visible: false,
+    };
+    let (_, plane_basis, glyphs) = super::windows_app::build_text_rendering_plane_verification_geometry(
+        layout,
+        REFERENCE_TEXT_RENDER_TEXT,
+        REFERENCE_TEXT_FONT_SIZE_PX / 28.0,
+        yaw_radians,
+        pitch_radians,
+        [0.0, 0.0],
+        [0.0, 0.0],
+        REFERENCE_TEXT_COLOR,
+    );
+    let transformed_scene = build_reference_text_scene(layout, plane_basis, &glyphs);
+    ReferenceTextLayout {
+        layout,
+        transformed_scene,
+    }
+}
+
+fn build_reference_text_scene(
+    layout: windows_terminal::TerminalLayout,
+    plane_basis: Option<TransformedTextPlaneBasis>,
+    glyphs: &[super::windows_scene::TextRenderingGlyphInstance],
+) -> RenderScene {
+    let mut scene = RenderScene {
+        panels: vec![windows_d3d12_renderer::PanelRect {
+            rect: RECT {
+                left: 0,
+                top: 0,
+                right: layout.client_width,
+                bottom: layout.client_height,
+            },
+            color: REFERENCE_TEXT_BACKGROUND,
+            effect: PanelEffect::TerminalFill,
+            data: [0.0; 4],
+        }],
+        glyphs: Vec::new(),
+        transformed_glyphs: Vec::new(),
+        transformed_glyph_clip_rect: Some(RECT {
+            left: 0,
+            top: 0,
+            right: layout.client_width,
+            bottom: layout.client_height,
+        }),
+        transformed_text_plane_basis: plane_basis,
+        sprites: Vec::new(),
+        overlay_panels: Vec::new(),
+        overlay_transformed_panels: Vec::new(),
+        overlay_glyphs: Vec::new(),
+    };
+    for glyph in glyphs {
+        scene.transformed_glyphs.push(TransformedGlyphQuad {
+            corners: glyph.corners,
+            corner_w: glyph.corner_w,
+            local_bounds: glyph.local_bounds,
+            color: glyph.color,
+            character: glyph.character,
+            debug_id: glyph.debug_id,
+        });
+    }
+
+    scene
+}
+
+impl ReferenceTextLayout {
+    pub(crate) fn frame(&self) -> RenderFrameModel {
+        windows_d3d12_renderer::RenderFrameModel {
+            layout: self.layout,
+            title: Some("transformed-text-plane".to_owned()),
+            diagnostic_text: String::new(),
+            diagnostic_selection: None,
+            window_chrome_buttons_state: WindowChromeButtonsState::default(),
+            diagnostic_cell_width: 8,
+            diagnostic_cell_height: 16,
+            scene: Some(self.transformed_scene.clone()),
+            terminal_cell_width: 8,
+            terminal_cell_height: 16,
+            terminal_display: Arc::new(windows_terminal::TerminalDisplayState {
+                rows: Vec::new(),
+                dirty_rows: Vec::new(),
+                cursor: None,
+                scrollbar: None,
+            }),
+            terminal_visual_state: RendererTerminalVisualState::default(),
+        }
+    }
+}
+
+fn project_reference_quad(
+    local_corners: [[f32; 2]; 4],
+    center: [f32; 2],
+    yaw_radians: f32,
+    pitch_radians: f32,
+) -> ([[f32; 2]; 4], [f32; 4]) {
+    let mut corners = [[0.0; 2]; 4];
+    let mut corner_w = [0.0; 4];
+    for (index, local_corner) in local_corners.into_iter().enumerate() {
+        let (screen, clip_w) = project_reference_point(local_corner, center, yaw_radians, pitch_radians);
+        corners[index] = screen;
+        corner_w[index] = clip_w;
+    }
+    (corners, corner_w)
+}
+
+fn project_reference_point(
+    local_point: [f32; 2],
+    center: [f32; 2],
+    yaw_radians: f32,
+    pitch_radians: f32,
+) -> ([f32; 2], f32) {
+    let (yaw_sin, yaw_cos) = yaw_radians.sin_cos();
+    let (pitch_sin, pitch_cos) = pitch_radians.sin_cos();
+    let yaw_x = (local_point[0] * yaw_cos) + 0.0 * yaw_sin;
+    let yaw_z = -(local_point[0] * yaw_sin) + 0.0 * yaw_cos;
+    let rotated_y = (local_point[1] * pitch_cos) - (yaw_z * pitch_sin);
+    let rotated_z = (local_point[1] * pitch_sin) + (yaw_z * pitch_cos);
+    let perspective = (1.0 - (rotated_z / REFERENCE_TEXT_CAMERA_DISTANCE))
+        .max(REFERENCE_TEXT_NEAR_PLANE_DISTANCE / REFERENCE_TEXT_CAMERA_DISTANCE);
+    (
+        [
+            center[0] + (yaw_x / perspective),
+            center[1] + (rotated_y / perspective),
+        ],
+        perspective,
+    )
 }
 
 fn build_basic_terminal_frame_fixture() -> RenderFrameModel {

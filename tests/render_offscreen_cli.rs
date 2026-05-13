@@ -98,3 +98,15 @@ fn render_offscreen_command_runs_headlessly_and_writes_png_artifact() {
         "scene snapshot should include fragment metadata"
     );
 }
+
+#[test]
+fn render_offscreen_command_lists_transformed_text_fixture() {
+    let output = run_teamy_studio(&["self-test", "render-offscreen", "--list-fixtures"]);
+    let text = output_text(&output);
+
+    assert!(output.status.success(), "render-offscreen --list-fixtures failed:\n{text}");
+    assert!(
+        text.contains("transformed-text-plane"),
+        "transformed text render fixture was not exposed through the self-test CLI:\n{text}"
+    );
+}

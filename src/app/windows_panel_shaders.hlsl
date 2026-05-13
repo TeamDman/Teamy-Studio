@@ -20,6 +20,7 @@ struct PsInput {
     float glyph : GLYPH;
     float4 glyphData : GLYPHDATA;
     float4 banding : BANDING;
+    float4 uvBounds : JACOBIAN;
     float4 localBounds : LOCALBOUNDS;
     float debugId : VIEWPORT;
     float transformedFlag : VIEWPORT1;
@@ -36,7 +37,8 @@ cbuffer ParamStruct : register(b0)
     float4 scene_time;
     float4 transformed_text_clip_rect;
     float4 transformed_text_debug_hover;
-    float4 transformed_text_inverse_homography[3];
+    float4 transformed_text_projection[2];
+    float4 transformed_text_inverse_homography[2];
     float4 sprite_atlas;
 };
 
@@ -48,6 +50,59 @@ float PanelTime() {
 
 float4 premultiply_alpha(float4 color) {
     return float4(color.rgb * color.a, color.a);
+}
+
+float3 rotate_transformed_text_point(float2 localPoint) {
+    float4 rotation = transformed_text_projection[1];
+    float yawSin = rotation.x;
+    float yawCos = rotation.y;
+    float pitchSin = rotation.z;
+    float pitchCos = rotation.w;
+
+    float3 yawRotated = float3(localPoint.x * yawCos, localPoint.y, -localPoint.x * yawSin);
+    return float3(
+        yawRotated.x,
+        (yawRotated.y * pitchCos) - (yawRotated.z * pitchSin),
+        (yawRotated.y * pitchSin) + (yawRotated.z * pitchCos)
+    );
+}
+
+float4 project_transformed_text_point(float2 localPoint) {
+    float4 projection = transformed_text_projection[0];
+    float2 center = projection.xy;
+    float cameraDistance = projection.z;
+    float3 rotated = rotate_transformed_text_point(localPoint);
+    float clipW = 1.0 - (rotated.z / cameraDistance);
+    float2 centerClip = float2(
+        dot(slug_matrix[0].xy, center) + slug_matrix[0].w,
+        dot(slug_matrix[1].xy, center) + slug_matrix[1].w
+    );
+    float2 projectedOffset = float2(
+        dot(slug_matrix[0].xy, rotated.xy),
+        dot(slug_matrix[1].xy, rotated.xy)
+    );
+    return float4(
+        (centerClip.x * clipW) + projectedOffset.x,
+        (centerClip.y * clipW) + projectedOffset.y,
+        clipW * 0.5,
+        clipW
+    );
+}
+
+float2 reconstruct_transformed_local_point(float2 screenPoint) {
+    float4 row0 = transformed_text_inverse_homography[0];
+    float4 row1 = transformed_text_inverse_homography[1];
+    float denominator = (row0.w * screenPoint.x) + (row1.w * screenPoint.y) + 1.0;
+    return float2(
+        ((row0.x * screenPoint.x) + (row0.y * screenPoint.y) + row0.z) / denominator,
+        ((row1.x * screenPoint.x) + (row1.y * screenPoint.y) + row1.z) / denominator
+    );
+}
+
+float remap_range(float value, float sourceMin, float sourceMax, float targetMin, float targetMax) {
+    float sourceSpan = max(sourceMax - sourceMin, 1.0 / 65536.0);
+    float t = (value - sourceMin) / sourceSpan;
+    return targetMin + ((targetMax - targetMin) * t);
 }
 
 float2 SlugDilate(float2 position, float2 texcoord, float2 normal, float4 jacobian, out float2 sampleCoord) {
@@ -74,58 +129,30 @@ PsInput VSMain(VsInput input) {
     float2 uv = input.uv;
 
     if (input.effect > 9.5 && any(input.normal != 0.0.xx)) {
-        position = SlugDilate(position, uv, input.normal, input.jacobian, uv);
+        if (input.debugData.y <= 0.5) {
+            position = SlugDilate(position, uv, input.normal, input.jacobian, uv);
+        }
     }
 
-    output.position.x = position.x * slug_matrix[0].x + position.y * slug_matrix[0].y + slug_matrix[0].w;
-    output.position.y = position.x * slug_matrix[1].x + position.y * slug_matrix[1].y + slug_matrix[1].w;
-    output.position.z = position.x * slug_matrix[2].x + position.y * slug_matrix[2].y + slug_matrix[2].w;
-    output.position.w = position.x * slug_matrix[3].x + position.y * slug_matrix[3].y + slug_matrix[3].w;
+    if (input.debugData.y > 0.5) {
+        output.position = project_transformed_text_point(position);
+    } else {
+        output.position.x = position.x * slug_matrix[0].x + position.y * slug_matrix[0].y + slug_matrix[0].w;
+        output.position.y = position.x * slug_matrix[1].x + position.y * slug_matrix[1].y + slug_matrix[1].w;
+        output.position.z = position.x * slug_matrix[2].x + position.y * slug_matrix[2].y + slug_matrix[2].w;
+        output.position.w = position.x * slug_matrix[3].x + position.y * slug_matrix[3].y + slug_matrix[3].w;
+    }
     output.color = input.color;
     output.uv = uv;
     output.effect = input.effect;
     output.glyph = input.glyph;
     output.glyphData = input.glyphData;
     output.banding = input.banding;
+    output.uvBounds = input.jacobian;
     output.localBounds = input.localBounds;
     output.debugId = input.debugData.x;
     output.transformedFlag = input.debugData.y;
     return output;
-}
-
-float2 apply_inverse_homography(float2 screenPoint) {
-    if (abs(transformed_text_inverse_homography[2].z) <= (1.0 / 65536.0)) {
-        return screenPoint;
-    }
-
-    float3 samplePoint3 = float3(screenPoint, 1.0);
-    float x = dot(transformed_text_inverse_homography[0].xyz, samplePoint3);
-    float y = dot(transformed_text_inverse_homography[1].xyz, samplePoint3);
-    float w = dot(transformed_text_inverse_homography[2].xyz, samplePoint3);
-    if (abs(w) <= (1.0 / 65536.0)) {
-        return screenPoint;
-    }
-    return float2(x, y) / w;
-}
-
-float2 transformed_text_render_coord(float2 screenPoint, float4 localBounds, float4 glyphData, float4 banding) {
-    float2 localPoint = apply_inverse_homography(screenPoint);
-    float width = max(localBounds.y - localBounds.x, 1.0 / 65536.0);
-    float height = max(localBounds.w - localBounds.z, 1.0 / 65536.0);
-    float normalizedX = saturate((localPoint.x - localBounds.x) / width);
-    float normalizedY = saturate((localPoint.y - localBounds.z) / height);
-
-    float xScale = max(banding.x, 1.0 / 65536.0);
-    float yScale = max(banding.y, 1.0 / 65536.0);
-    float uvMinX = -banding.z / xScale;
-    float uvMinY = -banding.w / yScale;
-    float uvMaxX = uvMinX + ((glyphData.z + 1.0) / xScale);
-    float uvMaxY = uvMinY + ((glyphData.w + 1.0) / yScale);
-
-    return float2(
-        lerp(uvMinX, uvMaxX, normalizedX),
-        lerp(uvMaxY, uvMinY, normalizedY)
-    );
 }
 
 float4 unpack_rgba8(uint packed) {
@@ -243,7 +270,7 @@ uint2 LoadBandEntry(uint bandStart, uint bandIndex) {
     return uint2(BandData[entry], BandData[entry + 1U]);
 }
 
-float slug_coverage(float2 renderCoord, float bandStartFloat, float4 glyphData, float4 banding) {
+float slug_coverage_single_sample(float2 renderCoord, float bandStartFloat, float4 glyphData, float4 banding) {
     int curveStart = (int)glyphData.x;
     int curveCount = (int)glyphData.y;
     if (curveCount <= 0) {
@@ -330,6 +357,17 @@ float slug_coverage(float2 renderCoord, float bandStartFloat, float4 glyphData, 
     }
 
     return CalcCoverage(xcov, ycov, xwgt, ywgt);
+}
+
+float slug_coverage(float2 renderCoord, float bandStartFloat, float4 glyphData, float4 banding) {
+    float2 emsPerPixel = max(fwidth(renderCoord), float2(1.0 / 65536.0, 1.0 / 65536.0));
+    float2 sampleStep = emsPerPixel * 0.25;
+    float coverage = 0.0;
+    coverage += slug_coverage_single_sample(renderCoord + float2(-sampleStep.x, -sampleStep.y), bandStartFloat, glyphData, banding);
+    coverage += slug_coverage_single_sample(renderCoord + float2(sampleStep.x, -sampleStep.y), bandStartFloat, glyphData, banding);
+    coverage += slug_coverage_single_sample(renderCoord + float2(-sampleStep.x, sampleStep.y), bandStartFloat, glyphData, banding);
+    coverage += slug_coverage_single_sample(renderCoord + float2(sampleStep.x, sampleStep.y), bandStartFloat, glyphData, banding);
+    return coverage * 0.25;
 }
 
 float2 evaluate_quadratic(float2 p0, float2 p1, float2 p2, float t) {
@@ -686,9 +724,19 @@ float4 PSMain(PsInput input) : SV_TARGET {
                 || input.position.y >= transformed_text_clip_rect.w)) {
             discard;
         }
-        float2 renderCoord = input.transformedFlag > 0.5
-            ? transformed_text_render_coord(input.position.xy, input.localBounds, input.glyphData, input.banding)
-            : input.uv;
+        float2 renderCoord = input.uv;
+        if (input.transformedFlag > 0.5) {
+            float2 localPoint = reconstruct_transformed_local_point(input.position.xy);
+            localPoint = clamp(
+                localPoint,
+                float2(input.localBounds.x, input.localBounds.z),
+                float2(input.localBounds.y, input.localBounds.w)
+            );
+            renderCoord = float2(
+                remap_range(localPoint.x, input.localBounds.x, input.localBounds.y, input.uvBounds.x, input.uvBounds.y),
+                remap_range(localPoint.y, input.localBounds.z, input.localBounds.w, input.uvBounds.z, input.uvBounds.w)
+            );
+        }
         float coverage = slug_coverage(renderCoord, input.glyph, input.glyphData, input.banding);
         float4 shaded = float4(input.color.rgb, input.color.a * coverage);
         if (scene_time.y > 0.5) {

@@ -35,7 +35,8 @@ use super::windows_audio_input::{
     AudioInputDeviceSummary, AudioInputDeviceWindowState, AudioInputTimelineHeadKind,
 };
 use super::windows_d3d12_renderer::{
-    ButtonVisualState, PanelEffect, RenderScene, SpriteId, WindowChromeButtonsState,
+    ButtonVisualState, PanelEffect, RenderScene, SpriteId, TransformedTextPlaneBasis,
+    WindowChromeButtonsState,
     preferred_background_color, preferred_title_bar_color, push_centered_text, push_glyph,
     push_overlay_panel, push_overlay_text_block, push_overlay_transformed_panel, push_panel,
     push_panel_with_data, push_sprite, push_text_block, push_title_text,
@@ -1181,6 +1182,7 @@ pub fn build_text_rendering_plane_render_scene(
     layout: TerminalLayout,
     window_chrome_buttons_state: WindowChromeButtonsState,
     view_state: TextRenderingPlaneViewState,
+    plane_basis: Option<TransformedTextPlaneBasis>,
     glyphs: &[TextRenderingGlyphInstance],
     debug_overlay: Option<&TextRenderingDebugOverlayViewState>,
 ) -> RenderScene {
@@ -1191,6 +1193,7 @@ pub fn build_text_rendering_plane_render_scene(
         window_chrome_buttons_state,
     );
     scene.transformed_glyph_clip_rect = Some(workspace.content_rect.to_win32_rect());
+    scene.transformed_text_plane_basis = plane_basis;
     push_panel(
         &mut scene,
         workspace.body_rect.to_win32_rect(),
@@ -1338,6 +1341,7 @@ pub fn build_text_rendering_sprite_sheet_render_scene(
     layout: TerminalLayout,
     window_chrome_buttons_state: WindowChromeButtonsState,
     view_state: TextRenderingSpriteSheetViewState,
+    plane_basis: Option<TransformedTextPlaneBasis>,
     glyphs: &[TextRenderingGlyphInstance],
     debug_overlay: Option<&TextRenderingDebugOverlayViewState>,
 ) -> RenderScene {
@@ -1347,6 +1351,7 @@ pub fn build_text_rendering_sprite_sheet_render_scene(
         SceneWindowKind::TextRenderingPlaygroundSpriteSheet,
         window_chrome_buttons_state,
     );
+    scene.transformed_text_plane_basis = plane_basis;
     push_panel(
         &mut scene,
         workspace.body_rect.to_win32_rect(),
@@ -10090,6 +10095,7 @@ fn empty_render_scene() -> RenderScene {
         glyphs: Vec::new(),
         transformed_glyphs: Vec::new(),
         transformed_glyph_clip_rect: None,
+        transformed_text_plane_basis: None,
         sprites: Vec::new(),
         overlay_panels: Vec::new(),
         overlay_transformed_panels: Vec::new(),
@@ -10271,6 +10277,7 @@ fn build_scene_shell(
         glyphs: Vec::new(),
         transformed_glyphs: Vec::new(),
         transformed_glyph_clip_rect: None,
+        transformed_text_plane_basis: None,
         sprites: Vec::new(),
         overlay_panels: Vec::new(),
         overlay_transformed_panels: Vec::new(),
@@ -10643,6 +10650,7 @@ mod tests {
             glyphs: Vec::new(),
             transformed_glyphs: Vec::new(),
             transformed_glyph_clip_rect: None,
+            transformed_text_plane_basis: None,
             sprites: Vec::new(),
             overlay_panels: Vec::new(),
             overlay_transformed_panels: Vec::new(),

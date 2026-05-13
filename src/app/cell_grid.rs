@@ -59,6 +59,7 @@ pub fn build_text_grid_scene_with_palette(
         glyphs: Vec::new(),
         transformed_glyphs: Vec::new(),
         transformed_glyph_clip_rect: None,
+        transformed_text_plane_basis: None,
         sprites: Vec::new(),
         overlay_panels: Vec::new(),
         overlay_transformed_panels: Vec::new(),

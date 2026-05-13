@@ -123,7 +123,8 @@ struct ShaderParams {
     scene_time: [f32; 4],
     transformed_text_clip_rect: [f32; 4],
     transformed_text_debug_hover: [f32; 4],
-    transformed_text_inverse_homography: [[f32; 4]; 3],
+    transformed_text_projection: [[f32; 4]; 2],
+    transformed_text_inverse_homography: [[f32; 4]; 2],
     sprite_atlas: [f32; 4],
 }
 
@@ -325,6 +326,17 @@ pub struct TransformedPanelQuad {
     pub data: [f32; 4],
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TransformedTextPlaneBasis {
+    pub screen_corners: [[f32; 2]; 4],
+    pub local_corners: [[f32; 2]; 4],
+    pub screen_center: [f32; 2],
+    pub yaw_radians: f32,
+    pub pitch_radians: f32,
+    pub camera_distance: f32,
+    pub near_plane_distance: f32,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SpriteId {
     Terminal,
@@ -377,6 +389,7 @@ pub struct RenderScene {
     pub glyphs: Vec<GlyphQuad>,
     pub transformed_glyphs: Vec<TransformedGlyphQuad>,
     pub transformed_glyph_clip_rect: Option<RECT>,
+    pub transformed_text_plane_basis: Option<TransformedTextPlaneBasis>,
     pub sprites: Vec<SpriteQuad>,
     pub overlay_panels: Vec<PanelRect>,
     pub overlay_transformed_panels: Vec<TransformedPanelQuad>,
@@ -420,7 +433,8 @@ pub struct D3d12PanelRenderer {
     transformed_glyph_clip_rect: Option<RECT>,
     transformed_glyph_debug_enabled: bool,
     transformed_glyph_debug_hover: [f32; 4],
-    transformed_text_inverse_homography: [[f32; 4]; 3],
+    transformed_text_projection: [[f32; 4]; 2],
+    transformed_text_inverse_homography: [[f32; 4]; 2],
     viewport: D3D12_VIEWPORT,
     scissor_rect: RECT,
     width: u32,
@@ -893,7 +907,8 @@ impl D3d12PanelRenderer {
             transformed_glyph_clip_rect: None,
             transformed_glyph_debug_enabled: false,
             transformed_glyph_debug_hover: [0.0; 4],
-            transformed_text_inverse_homography: [[0.0; 4]; 3],
+            transformed_text_projection: [[0.0; 4]; 2],
+            transformed_text_inverse_homography: [[0.0; 4]; 2],
             viewport,
             scissor_rect,
             width,
@@ -1066,10 +1081,14 @@ impl D3d12PanelRenderer {
             .filter(|scene| scene.transformed_glyph_clip_rect.is_some())
             .find_map(|scene| scene.overlay_transformed_panels.first().map(|panel| panel.data))
             .unwrap_or([0.0; 4]);
+        self.transformed_text_projection = scenes
+            .iter()
+            .find_map(|scene| transformed_text_projection_for_scene(scene))
+            .unwrap_or([[0.0; 4]; 2]);
         self.transformed_text_inverse_homography = scenes
             .iter()
             .find_map(|scene| transformed_text_inverse_homography_for_scene(scene))
-            .unwrap_or([[0.0; 4]; 3]);
+            .unwrap_or([[0.0; 4]; 2]);
         {
             #[cfg(feature = "tracy")]
             let _span = debug_span!("update_slug_curves").entered();
@@ -1102,8 +1121,10 @@ impl D3d12PanelRenderer {
                 .overlay_transformed_panels
                 .first()
                 .map_or([0.0; 4], |panel| panel.data);
+            self.transformed_text_projection =
+                transformed_text_projection_for_scene(scene).unwrap_or([[0.0; 4]; 2]);
             self.transformed_text_inverse_homography =
-                transformed_text_inverse_homography_for_scene(scene).unwrap_or([[0.0; 4]; 3]);
+                transformed_text_inverse_homography_for_scene(scene).unwrap_or([[0.0; 4]; 2]);
             let _glyph_cache_changed = {
                 #[cfg(feature = "tracy")]
                 let _span = debug_span!("update_slug_curves").entered();
@@ -1128,7 +1149,8 @@ impl D3d12PanelRenderer {
         self.transformed_glyph_clip_rect = None;
         self.transformed_glyph_debug_enabled = false;
         self.transformed_glyph_debug_hover = [0.0; 4];
-        self.transformed_text_inverse_homography = [[0.0; 4]; 3];
+        self.transformed_text_projection = [[0.0; 4]; 2];
+        self.transformed_text_inverse_homography = [[0.0; 4]; 2];
         let (terminal_scenes, terminal_reused) = terminal_scene_fragments(
             &mut scene_cache.terminal,
             frame.layout,
@@ -1512,6 +1534,7 @@ impl D3d12PanelRenderer {
             ],
         );
         params.transformed_text_debug_hover = self.transformed_glyph_debug_hover;
+        params.transformed_text_projection = self.transformed_text_projection;
         params.transformed_text_inverse_homography = self.transformed_text_inverse_homography;
         params.scene_time[1] = if self.transformed_glyph_debug_enabled {
             1.0
@@ -1938,6 +1961,7 @@ fn build_terminal_row_scene(
         glyphs: Vec::with_capacity(row.glyphs.len()),
         transformed_glyphs: Vec::new(),
         transformed_glyph_clip_rect: None,
+        transformed_text_plane_basis: None,
         sprites: Vec::new(),
         overlay_panels: Vec::new(),
         overlay_transformed_panels: Vec::new(),
@@ -1977,6 +2001,7 @@ fn build_terminal_cursor_scene(
         glyphs: Vec::new(),
         transformed_glyphs: Vec::new(),
         transformed_glyph_clip_rect: None,
+        transformed_text_plane_basis: None,
         sprites: Vec::new(),
         overlay_panels: Vec::with_capacity(4),
         overlay_transformed_panels: Vec::new(),
@@ -2005,6 +2030,7 @@ fn build_terminal_scrollbar_scene(
         glyphs: Vec::new(),
         transformed_glyphs: Vec::new(),
         transformed_glyph_clip_rect: None,
+        transformed_text_plane_basis: None,
         sprites: Vec::new(),
         overlay_panels: Vec::new(),
         overlay_transformed_panels: Vec::new(),
@@ -2184,6 +2210,7 @@ pub fn build_panel_scene(
         glyphs: Vec::with_capacity(2_048),
         transformed_glyphs: Vec::new(),
         transformed_glyph_clip_rect: None,
+        transformed_text_plane_basis: None,
         sprites: Vec::new(),
         overlay_panels: Vec::with_capacity(16),
         overlay_transformed_panels: Vec::new(),
@@ -3009,7 +3036,7 @@ pub fn render_frame_model_offscreen_image(
     let vertex_count = upload_fragment_vertices(&vertex_buffer, &vertex_slices)?;
     upload_curve_data(&curve_buffer, &curve_data)?;
     upload_band_data(&band_buffer, &band_data)?;
-    upload_offscreen_shader_params(&shader_param_buffer, width, height, &sprite_atlas)?;
+    upload_offscreen_shader_params(&shader_param_buffer, width, height, &sprite_atlas, &scene_refs)?;
 
     let viewport = D3D12_VIEWPORT {
         TopLeftX: 0.0,
@@ -3306,8 +3333,28 @@ fn upload_offscreen_shader_params(
     width: u32,
     height: u32,
     sprite_atlas: &SpriteAtlas,
+    scenes: &[&RenderScene],
 ) -> eyre::Result<()> {
     let mut params = build_shader_params(width as f32, height as f32, 0.0);
+    params.transformed_text_clip_rect = scenes
+        .iter()
+        .find_map(|scene| scene.transformed_glyph_clip_rect)
+        .map_or([-1.0, -1.0, -1.0, -1.0], |rect| {
+            [
+                rect.left as f32,
+                rect.top as f32,
+                rect.right as f32,
+                rect.bottom as f32,
+            ]
+        });
+    params.transformed_text_projection = scenes
+        .iter()
+        .find_map(|scene| transformed_text_projection_for_scene(scene))
+        .unwrap_or([[0.0; 4]; 2]);
+    params.transformed_text_inverse_homography = scenes
+        .iter()
+        .find_map(|scene| transformed_text_inverse_homography_for_scene(scene))
+        .unwrap_or([[0.0; 4]; 2]);
     params.sprite_atlas = [
         sprite_atlas.width as f32,
         sprite_atlas.height as f32,
@@ -3767,7 +3814,7 @@ fn render_snapshot_glyph_into_image(
     }
 }
 
-fn cpu_slug_coverage(
+fn cpu_slug_coverage_single_sample(
     render_coord: [f32; 2],
     pixels_per_em: f32,
     curves: &[QuadraticCurve],
@@ -3850,8 +3897,35 @@ fn cpu_slug_coverage(
     calc_coverage(xcov, ycov, xwgt, ywgt)
 }
 
+fn cpu_slug_coverage(
+    render_coord: [f32; 2],
+    pixels_per_em: f32,
+    curves: &[QuadraticCurve],
+    band_data: &[u32],
+    glyph: SlugGlyph,
+) -> f32 {
+    let sample_step = 0.25 / pixels_per_em.max(1.0 / 65536.0);
+    let sample_offsets = [
+        [-sample_step, -sample_step],
+        [sample_step, -sample_step],
+        [-sample_step, sample_step],
+        [sample_step, sample_step],
+    ];
+    let mut coverage = 0.0;
+    for offset in sample_offsets {
+        coverage += cpu_slug_coverage_single_sample(
+            [render_coord[0] + offset[0], render_coord[1] + offset[1]],
+            pixels_per_em,
+            curves,
+            band_data,
+            glyph,
+        );
+    }
+    coverage * 0.25
+}
+
 #[cfg(test)]
-fn cpu_slug_coverage_all_curves(
+fn cpu_slug_coverage_all_curves_single_sample(
     render_coord: [f32; 2],
     pixels_per_em: f32,
     curves: &[QuadraticCurve],
@@ -3886,6 +3960,32 @@ fn cpu_slug_coverage_all_curves(
     }
 
     calc_coverage(xcov, ycov, xwgt, ywgt)
+}
+
+#[cfg(test)]
+fn cpu_slug_coverage_all_curves(
+    render_coord: [f32; 2],
+    pixels_per_em: f32,
+    curves: &[QuadraticCurve],
+    glyph: SlugGlyph,
+) -> f32 {
+    let sample_step = 0.25 / pixels_per_em.max(1.0 / 65536.0);
+    let sample_offsets = [
+        [-sample_step, -sample_step],
+        [sample_step, -sample_step],
+        [-sample_step, sample_step],
+        [sample_step, sample_step],
+    ];
+    let mut coverage = 0.0;
+    for offset in sample_offsets {
+        coverage += cpu_slug_coverage_all_curves_single_sample(
+            [render_coord[0] + offset[0], render_coord[1] + offset[1]],
+            pixels_per_em,
+            curves,
+            glyph,
+        );
+    }
+    coverage * 0.25
 }
 
 fn is_degenerate_quadratic(curve: &QuadraticCurve) -> bool {
@@ -4981,28 +5081,27 @@ fn build_shader_params(width: f32, height: f32, elapsed_seconds: f32) -> ShaderP
         scene_time: [elapsed_seconds, 0.0, 0.0, 0.0],
         transformed_text_clip_rect: [-1.0, -1.0, -1.0, -1.0],
         transformed_text_debug_hover: [0.0; 4],
-        transformed_text_inverse_homography: [[0.0; 4]; 3],
+        transformed_text_projection: [[0.0; 4]; 2],
+        transformed_text_inverse_homography: [[0.0; 4]; 2],
         sprite_atlas: [1.0, 1.0, 0.0, 0.0],
     }
 }
 
-fn transformed_text_inverse_homography_for_scene(
+fn transformed_text_projection_for_scene(
     scene: &RenderScene,
-) -> Option<[[f32; 4]; 3]> {
-    let glyph = scene.transformed_glyphs.first()?;
-    let local = [
-        [glyph.local_bounds[0], glyph.local_bounds[2]],
-        [glyph.local_bounds[1], glyph.local_bounds[2]],
-        [glyph.local_bounds[1], glyph.local_bounds[3]],
-        [glyph.local_bounds[0], glyph.local_bounds[3]],
-    ];
-    solve_inverse_homography(glyph.corners, local).map(|coefficients| {
+) -> Option<[[f32; 4]; 2]> {
+    let basis = scene.transformed_text_plane_basis?;
+    let (yaw_sin, yaw_cos) = basis.yaw_radians.sin_cos();
+    let (pitch_sin, pitch_cos) = basis.pitch_radians.sin_cos();
+    Some([
         [
-            [coefficients[0], coefficients[1], coefficients[2], 0.0],
-            [coefficients[3], coefficients[4], coefficients[5], 0.0],
-            [coefficients[6], coefficients[7], 1.0, 0.0],
-        ]
-    })
+            basis.screen_center[0],
+            basis.screen_center[1],
+            basis.camera_distance,
+            basis.near_plane_distance,
+        ],
+        [yaw_sin, yaw_cos, pitch_sin, pitch_cos],
+    ])
 }
 
 fn solve_inverse_homography(
@@ -5059,6 +5158,16 @@ fn solve_inverse_homography(
     Some(std::array::from_fn(|index| augmented[index][8]))
 }
 
+fn transformed_text_inverse_homography_for_scene(
+    scene: &RenderScene,
+) -> Option<[[f32; 4]; 2]> {
+    let basis = scene.transformed_text_plane_basis?;
+    let inverse = solve_inverse_homography(basis.screen_corners, basis.local_corners)?;
+    Some([
+        [inverse[0], inverse[1], inverse[2], inverse[6]],
+        [inverse[3], inverse[4], inverse[5], inverse[7]],
+    ])
+}
 fn create_vertex_buffer(
     device: &ID3D12Device,
 ) -> eyre::Result<(ID3D12Resource, D3D12_VERTEX_BUFFER_VIEW)> {
@@ -5936,7 +6045,7 @@ fn append_text_rect(
 
 fn append_transformed_text_quad(
     vertices: &mut Vec<Vertex>,
-    corners: [[f32; 2]; 4],
+    _corners: [[f32; 2]; 4],
     _corner_w: [f32; 4],
     local_bounds: [f32; 4],
     color: [f32; 4],
@@ -5947,7 +6056,6 @@ fn append_transformed_text_quad(
         return;
     }
 
-    let [top_left_corner, top_right_corner, bottom_right_corner, bottom_left_corner] = corners;
     let glyph_data = [
         glyph.curve_start as f32,
         glyph.curve_count as f32,
@@ -5955,33 +6063,12 @@ fn append_transformed_text_quad(
         glyph.band_count_y.saturating_sub(1) as f32,
     ];
     let banding = glyph.band_transform;
-    let object_dx = (glyph.x_max - glyph.x_min).abs().max(1.0);
-    let object_dy = (glyph.y_min - glyph.y_max).abs().max(1.0);
-    let axis_x = [
-        (top_right_corner[0] - top_left_corner[0]) / object_dx,
-        (top_right_corner[1] - top_left_corner[1]) / object_dx,
-    ];
-    let axis_y = [
-        (bottom_left_corner[0] - top_left_corner[0]) / object_dy,
-        (bottom_left_corner[1] - top_left_corner[1]) / object_dy,
-    ];
-    let determinant = axis_x[0] * axis_y[1] - axis_x[1] * axis_y[0];
-    if determinant.abs() <= f32::EPSILON {
-        return;
-    }
-
-    let inverse_determinant = 1.0 / determinant;
-    let jacobian = [
-        axis_y[1] * inverse_determinant,
-        -axis_y[0] * inverse_determinant,
-        -axis_x[1] * inverse_determinant,
-        axis_x[0] * inverse_determinant,
-    ];
+    let uv_bounds = [glyph.x_min, glyph.x_max, glyph.y_max, glyph.y_min];
     let effect = PanelEffect::Text as u32 as f32;
     let glyph_index = glyph.band_start as f32;
 
     let top_left = Vertex {
-        position: [top_left_corner[0], top_left_corner[1], 0.0],
+        position: [local_bounds[0], local_bounds[2], 0.0],
         color,
         uv: [glyph.x_min, glyph.y_max],
         effect,
@@ -5989,12 +6076,12 @@ fn append_transformed_text_quad(
         glyph_data,
         banding,
         normal: [-1.0, 1.0],
-        jacobian,
+        jacobian: uv_bounds,
         local_bounds,
         _padding: [debug_id, 1.0],
     };
     let top_right = Vertex {
-        position: [top_right_corner[0], top_right_corner[1], 0.0],
+        position: [local_bounds[1], local_bounds[2], 0.0],
         color,
         uv: [glyph.x_max, glyph.y_max],
         effect,
@@ -6002,12 +6089,12 @@ fn append_transformed_text_quad(
         glyph_data,
         banding,
         normal: [1.0, 1.0],
-        jacobian,
+        jacobian: uv_bounds,
         local_bounds,
         _padding: [debug_id, 1.0],
     };
     let bottom_right = Vertex {
-        position: [bottom_right_corner[0], bottom_right_corner[1], 0.0],
+        position: [local_bounds[1], local_bounds[3], 0.0],
         color,
         uv: [glyph.x_max, glyph.y_min],
         effect,
@@ -6015,12 +6102,12 @@ fn append_transformed_text_quad(
         glyph_data,
         banding,
         normal: [1.0, -1.0],
-        jacobian,
+        jacobian: uv_bounds,
         local_bounds,
         _padding: [debug_id, 1.0],
     };
     let bottom_left = Vertex {
-        position: [bottom_left_corner[0], bottom_left_corner[1], 0.0],
+        position: [local_bounds[0], local_bounds[3], 0.0],
         color,
         uv: [glyph.x_min, glyph.y_min],
         effect,
@@ -6028,7 +6115,7 @@ fn append_transformed_text_quad(
         glyph_data,
         banding,
         normal: [-1.0, -1.0],
-        jacobian,
+        jacobian: uv_bounds,
         local_bounds,
         _padding: [debug_id, 1.0],
     };
@@ -6268,8 +6355,13 @@ mod tests {
         dirty_fragment_ranges, extract_glyph_curves, fragment_ranges_match, fragment_vertex_ranges,
         load_terminal_font, preferred_title_bar_color, push_centered_text, push_glyph,
         push_overlay_panel, push_panel, push_text_block, push_title_text,
-        render_snapshot_glyph_into_image, shader_compile_flags, solve_inverse_homography,
-        terminal_scrollbar_geometry, window_garden_shader_data,
+        load_snapshot_glyph, render_frame_model_offscreen_image, render_snapshot_glyph_into_image,
+        shader_compile_flags, solve_inverse_homography, terminal_scrollbar_geometry,
+        window_garden_shader_data,
+    };
+    use crate::app::render_verification::{
+        build_reference_zero_angle_transformed_text_frame,
+        build_reference_zero_angle_transformed_text_layout,
     };
     use crate::app::spatial::ClientRect;
     use crate::app::windows_terminal::TerminalDisplayScrollbar;
@@ -6290,6 +6382,7 @@ mod tests {
             glyphs: Vec::new(),
             transformed_glyphs: Vec::new(),
             transformed_glyph_clip_rect: None,
+            transformed_text_plane_basis: None,
             sprites: Vec::new(),
             overlay_panels: Vec::new(),
             overlay_transformed_panels: Vec::new(),
@@ -6360,12 +6453,326 @@ mod tests {
     }
 
     #[test]
+    fn zero_angle_transformed_text_matches_cpu_glyph_reference() -> eyre::Result<()> {
+        let reference_layout = build_reference_zero_angle_transformed_text_layout();
+        let reference = render_reference_text_layout_cpu(&reference_layout)?;
+        let transformed = render_frame_model_offscreen_image(
+            &build_reference_zero_angle_transformed_text_frame(),
+        )?;
+
+        assert_eq!(reference.dimensions(), transformed.dimensions());
+
+        let mut mismatch_count = 0_usize;
+        let mut first_mismatch = None;
+        for y in 0..reference.height() {
+            for x in 0..reference.width() {
+                let left = reference.get_pixel(x, y);
+                let right = transformed.get_pixel(x, y);
+                if left.0 == right.0 {
+                    continue;
+                }
+                mismatch_count += 1;
+                first_mismatch.get_or_insert((x, y, *left, *right));
+            }
+        }
+
+        let mismatch_summary = first_mismatch.map_or_else(
+            || "no mismatches".to_owned(),
+            |(x, y, left, right)| {
+                format!(
+                    "first mismatch at ({x}, {y}): plain={:?} transformed={:?}",
+                    left.0, right.0
+                )
+            },
+        );
+
+        assert_eq!(
+            mismatch_count,
+            0,
+            "zero-angle transformed text should exactly match the CPU glyph reference; mismatched pixels={mismatch_count}; {mismatch_summary}"
+        );
+
+        Ok(())
+    }
+
+    fn render_reference_text_layout_cpu(
+        reference_layout: &crate::app::render_verification::ReferenceTextLayout,
+    ) -> eyre::Result<RgbaImage> {
+        let mut image = RgbaImage::new(
+            reference_layout.layout.client_width as u32,
+            reference_layout.layout.client_height as u32,
+        );
+        for pixel in image.pixels_mut() {
+            *pixel = image::Rgba([0, 0, 0, 255]);
+        }
+
+        let font = load_terminal_font()?;
+        let face = Face::parse(&font.font_bytes, font.face_index)?;
+        for glyph_quad in &reference_layout.transformed_scene.transformed_glyphs {
+            let (curves, band_data, glyph) = load_snapshot_glyph(&font, &face, glyph_quad.character)?;
+            let local_points = [
+                [glyph_quad.local_bounds[0], glyph_quad.local_bounds[2]],
+                [glyph_quad.local_bounds[1], glyph_quad.local_bounds[2]],
+                [glyph_quad.local_bounds[1], glyph_quad.local_bounds[3]],
+                [glyph_quad.local_bounds[0], glyph_quad.local_bounds[3]],
+            ];
+            let inverse = solve_inverse_homography(glyph_quad.corners, local_points)
+                .expect("reference transformed glyph should produce an inverse homography");
+            let min_x = glyph_quad
+                .corners
+                .iter()
+                .map(|corner| corner[0])
+                .fold(f32::INFINITY, f32::min)
+                .floor()
+                .max(0.0) as u32;
+            let max_x = glyph_quad
+                .corners
+                .iter()
+                .map(|corner| corner[0])
+                .fold(f32::NEG_INFINITY, f32::max)
+                .ceil()
+                .min(image.width() as f32) as u32;
+            let min_y = glyph_quad
+                .corners
+                .iter()
+                .map(|corner| corner[1])
+                .fold(f32::INFINITY, f32::min)
+                .floor()
+                .max(0.0) as u32;
+            let max_y = glyph_quad
+                .corners
+                .iter()
+                .map(|corner| corner[1])
+                .fold(f32::NEG_INFINITY, f32::max)
+                .ceil()
+                .min(image.height() as f32) as u32;
+
+            for y in min_y..max_y {
+                for x in min_x..max_x {
+                    let sample = [x as f32 + 0.5, y as f32 + 0.5];
+                    let local = apply_inverse_homography_point(inverse, sample);
+                    if local[0] < glyph_quad.local_bounds[0]
+                        || local[0] > glyph_quad.local_bounds[1]
+                        || local[1] < glyph_quad.local_bounds[2]
+                        || local[1] > glyph_quad.local_bounds[3]
+                    {
+                        continue;
+                    }
+
+                    let render_coord = [
+                        remap_range(
+                            local[0],
+                            glyph_quad.local_bounds[0],
+                            glyph_quad.local_bounds[1],
+                            glyph.x_min,
+                            glyph.x_max,
+                        ),
+                        remap_range(
+                            local[1],
+                            glyph_quad.local_bounds[2],
+                            glyph_quad.local_bounds[3],
+                            glyph.y_max,
+                            glyph.y_min,
+                        ),
+                    ];
+                    let sample_x1 = apply_inverse_homography_point(inverse, [sample[0] + 1.0, sample[1]]);
+                    let sample_y1 = apply_inverse_homography_point(inverse, [sample[0], sample[1] + 1.0]);
+                    let render_coord_x1 = [
+                        remap_range(
+                            sample_x1[0],
+                            glyph_quad.local_bounds[0],
+                            glyph_quad.local_bounds[1],
+                            glyph.x_min,
+                            glyph.x_max,
+                        ),
+                        remap_range(
+                            sample_x1[1],
+                            glyph_quad.local_bounds[2],
+                            glyph_quad.local_bounds[3],
+                            glyph.y_max,
+                            glyph.y_min,
+                        ),
+                    ];
+                    let render_coord_y1 = [
+                        remap_range(
+                            sample_y1[0],
+                            glyph_quad.local_bounds[0],
+                            glyph_quad.local_bounds[1],
+                            glyph.x_min,
+                            glyph.x_max,
+                        ),
+                        remap_range(
+                            sample_y1[1],
+                            glyph_quad.local_bounds[2],
+                            glyph_quad.local_bounds[3],
+                            glyph.y_max,
+                            glyph.y_min,
+                        ),
+                    ];
+                    let fwidth = [
+                        (render_coord_x1[0] - render_coord[0]).abs()
+                            + (render_coord_y1[0] - render_coord[0]).abs(),
+                        (render_coord_x1[1] - render_coord[1]).abs()
+                            + (render_coord_y1[1] - render_coord[1]).abs(),
+                    ];
+                    let pixels_per_em = [
+                        1.0 / fwidth[0].max(1.0 / 65536.0),
+                        1.0 / fwidth[1].max(1.0 / 65536.0),
+                    ];
+                    let coverage = cpu_slug_coverage_anisotropic(
+                        render_coord,
+                        pixels_per_em,
+                        &curves,
+                        &band_data,
+                        glyph,
+                    );
+                    if coverage <= 0.0 {
+                        continue;
+                    }
+                    let value = (coverage * 255.0).round().clamp(0.0, 255.0) as u8;
+                    image.put_pixel(x, y, image::Rgba([value, value, value, 255]));
+                }
+            }
+        }
+
+        Ok(image)
+    }
+
+    fn apply_inverse_homography_point(transform: [f32; 8], screen: [f32; 2]) -> [f32; 2] {
+        let denominator = (transform[6] * screen[0]) + (transform[7] * screen[1]) + 1.0;
+        [
+            ((transform[0] * screen[0]) + (transform[1] * screen[1]) + transform[2]) / denominator,
+            ((transform[3] * screen[0]) + (transform[4] * screen[1]) + transform[5]) / denominator,
+        ]
+    }
+
+    fn remap_range(value: f32, source_min: f32, source_max: f32, target_min: f32, target_max: f32) -> f32 {
+        let source_span = (source_max - source_min).max(1.0 / 65536.0);
+        let t = (value - source_min) / source_span;
+        target_min + ((target_max - target_min) * t)
+    }
+
+    fn cpu_slug_coverage_anisotropic_single_sample(
+        render_coord: [f32; 2],
+        pixels_per_em: [f32; 2],
+        curves: &[super::QuadraticCurve],
+        band_data: &[u32],
+        glyph: super::SlugGlyph,
+    ) -> f32 {
+        if glyph.curve_count == 0 {
+            return 0.0;
+        }
+
+        let mut xcov: f32 = 0.0;
+        let mut ycov: f32 = 0.0;
+        let mut xwgt: f32 = 0.0;
+        let mut ywgt: f32 = 0.0;
+        let horizontal_band = super::band_index(
+            render_coord[1],
+            glyph.band_transform[1],
+            glyph.band_transform[3],
+            glyph.band_count_y,
+        ) as usize;
+        let horizontal_entry = glyph.band_start as usize + (horizontal_band * 2);
+        let horizontal_count = band_data.get(horizontal_entry).copied().unwrap_or_default() as usize;
+        let horizontal_start = band_data
+            .get(horizontal_entry + 1)
+            .copied()
+            .unwrap_or_default() as usize;
+        for offset in 0..horizontal_count {
+            let curve_index = band_data
+                .get(horizontal_start + offset)
+                .copied()
+                .unwrap_or_default() as usize;
+            let Some(curve) = curves.get(curve_index) else {
+                continue;
+            };
+            if (super::curve_extents(*curve).max_x - render_coord[0]) * pixels_per_em[0] < -0.5 {
+                break;
+            }
+            super::accumulate_horizontal_curve_coverage(
+                curve,
+                render_coord,
+                pixels_per_em[0],
+                &mut xcov,
+                &mut xwgt,
+            );
+        }
+
+        let vertical_band = super::band_index(
+            render_coord[0],
+            glyph.band_transform[0],
+            glyph.band_transform[2],
+            glyph.band_count_x,
+        ) as usize;
+        let vertical_entry =
+            glyph.band_start as usize + (glyph.band_count_y as usize * 2) + (vertical_band * 2);
+        let vertical_count = band_data.get(vertical_entry).copied().unwrap_or_default() as usize;
+        let vertical_start = band_data
+            .get(vertical_entry + 1)
+            .copied()
+            .unwrap_or_default() as usize;
+        for offset in 0..vertical_count {
+            let curve_index = band_data
+                .get(vertical_start + offset)
+                .copied()
+                .unwrap_or_default() as usize;
+            let Some(curve) = curves.get(curve_index) else {
+                continue;
+            };
+            if (super::curve_extents(*curve).min_y - render_coord[1]) * pixels_per_em[1] > 0.5 {
+                break;
+            }
+            super::accumulate_vertical_curve_coverage(
+                curve,
+                render_coord,
+                pixels_per_em[1],
+                &mut ycov,
+                &mut ywgt,
+            );
+        }
+
+        super::calc_coverage(xcov, ycov, xwgt, ywgt)
+    }
+
+    fn cpu_slug_coverage_anisotropic(
+        render_coord: [f32; 2],
+        pixels_per_em: [f32; 2],
+        curves: &[super::QuadraticCurve],
+        band_data: &[u32],
+        glyph: super::SlugGlyph,
+    ) -> f32 {
+        let sample_step = [
+            0.25 / pixels_per_em[0].max(1.0 / 65536.0),
+            0.25 / pixels_per_em[1].max(1.0 / 65536.0),
+        ];
+        let sample_offsets = [
+            [-sample_step[0], -sample_step[1]],
+            [sample_step[0], -sample_step[1]],
+            [-sample_step[0], sample_step[1]],
+            [sample_step[0], sample_step[1]],
+        ];
+        let mut coverage = 0.0;
+        for offset in sample_offsets {
+            coverage += cpu_slug_coverage_anisotropic_single_sample(
+                [render_coord[0] + offset[0], render_coord[1] + offset[1]],
+                pixels_per_em,
+                curves,
+                band_data,
+                glyph,
+            );
+        }
+        coverage * 0.25
+    }
+
+    #[test]
     fn push_centered_text_places_a_glyph() {
         let mut scene = RenderScene {
             panels: Vec::new(),
             glyphs: Vec::new(),
             transformed_glyphs: Vec::new(),
             transformed_glyph_clip_rect: None,
+            transformed_text_plane_basis: None,
             sprites: Vec::new(),
             overlay_panels: Vec::new(),
             overlay_transformed_panels: Vec::new(),
@@ -6393,6 +6800,7 @@ mod tests {
             glyphs: Vec::new(),
             transformed_glyphs: Vec::new(),
             transformed_glyph_clip_rect: None,
+            transformed_text_plane_basis: None,
             sprites: Vec::new(),
             overlay_panels: Vec::new(),
             overlay_transformed_panels: Vec::new(),
@@ -6837,6 +7245,7 @@ mod tests {
             glyphs: Vec::new(),
             transformed_glyphs: Vec::new(),
             transformed_glyph_clip_rect: None,
+            transformed_text_plane_basis: None,
             sprites: Vec::new(),
             overlay_panels: Vec::new(),
             overlay_transformed_panels: Vec::new(),
@@ -6879,6 +7288,7 @@ mod tests {
             glyphs: Vec::new(),
             transformed_glyphs: Vec::new(),
             transformed_glyph_clip_rect: None,
+            transformed_text_plane_basis: None,
             sprites: Vec::new(),
             overlay_panels: Vec::new(),
             overlay_transformed_panels: Vec::new(),
@@ -7111,10 +7521,12 @@ mod tests {
         )?;
         write_fontdue_reference_png('b', 256, 512, 512, &output_dir.join("b-fontdue-256.png"))?;
         write_fontdue_reference_png('r', 256, 512, 512, &output_dir.join("r-fontdue-256.png"))?;
+        write_fontdue_reference_png('g', 256, 512, 512, &output_dir.join("g-fontdue-256.png"))?;
 
         assert!(output_dir.join("slash-fontdue-256.png").exists());
         assert!(output_dir.join("b-fontdue-256.png").exists());
         assert!(output_dir.join("r-fontdue-256.png").exists());
+        assert!(output_dir.join("g-fontdue-256.png").exists());
         Ok(())
     }
 
@@ -7132,7 +7544,7 @@ mod tests {
         let font = load_terminal_font()?;
         let face = Face::parse(&font.font_bytes, font.face_index)?;
 
-        for character in ['/', 'b', 'r'] {
+        for character in ['/', 'b', 'r', 'g'] {
             let glyph_id = face
                 .glyph_index(character)
                 .expect("comparison glyph should exist in terminal font");
@@ -7166,6 +7578,7 @@ mod tests {
         assert!(output_dir.join("slash-slug-fontdue-diff.png").exists());
         assert!(output_dir.join("b-slug-fontdue-diff.png").exists());
         assert!(output_dir.join("r-slug-fontdue-diff.png").exists());
+        assert!(output_dir.join("g-slug-fontdue-diff.png").exists());
         Ok(())
     }
 
@@ -7199,7 +7612,7 @@ mod tests {
         let font = load_terminal_font()?;
         let face = Face::parse(&font.font_bytes, font.face_index)?;
 
-        for character in ['b', 'r'] {
+        for character in ['b', 'r', 'g', '6'] {
             let glyph_id = face
                 .glyph_index(character)
                 .expect("comparison glyph should exist in terminal font");

@@ -178,6 +178,7 @@ const TEXT_RENDERING_DOUBLE_RIGHT_CLICK_WINDOW: Duration = Duration::from_millis
 const TEXT_RENDERING_DOUBLE_RIGHT_CLICK_MAX_MOVEMENT_PX: u32 = 1;
 const TEXT_RENDERING_PITCH_LIMIT_RADIANS: f32 = 1.45;
 const TEXT_RENDERING_CAMERA_DISTANCE: f32 = 1400.0;
+const TEXT_RENDERING_NEAR_PLANE_DISTANCE: f32 = 80.0;
 const TEXT_RENDERING_VIRTUALIZATION_PADDING_PX: f32 = 48.0;
 
 #[derive(Clone, Debug)]
@@ -1649,6 +1650,78 @@ fn cached_text_rendering_glyph_instances<'a>(
         .text_rendering_glyph_cache
         .as_ref()
         .map_or(&[], |cache| cache.glyphs.as_slice())
+}
+
+fn text_rendering_projection_basis(
+    rect: ClientRect,
+    text: &str,
+    viewport: TextRenderingViewportState,
+) -> Option<super::windows_d3d12_renderer::TransformedTextPlaneBasis> {
+    let Ok(font) = terminal_font_layout_snapshot() else {
+        return None;
+    };
+    let font_size = 28.0 * viewport.zoom.max(0.1);
+    let units_per_em = font.units_per_em.max(1.0);
+    let scale = font_size / units_per_em;
+    let line_height_units = (font.ascender - font.descender).max(1.0);
+    let line_height = line_height_units * scale;
+    let lines = text.lines().collect::<Vec<_>>();
+    let line_count = lines.len().max(1) as f32;
+    let line_advances = lines
+        .iter()
+        .map(|line| {
+            let mut advance = 0.0;
+            for character in line.chars() {
+                let glyph = font.glyphs.get(&character).copied();
+                advance += glyph.map_or(font.cell_advance, |glyph| glyph.advance.max(0.0));
+            }
+            advance.max(0.0)
+        })
+        .collect::<Vec<_>>();
+    let plane_width = line_advances
+        .iter()
+        .copied()
+        .fold(0.0_f32, f32::max)
+        .max(font.cell_advance)
+        * scale;
+    let plane_height = (line_count * line_height).max(line_height);
+    let plane_origin = [
+        (rect.left() + rect.width() / 2) as f32
+            + viewport.camera_offset[0]
+            + viewport.plane_offset[0]
+            - (plane_width / 2.0),
+        (rect.top() + rect.height() / 2) as f32
+            + viewport.camera_offset[1]
+            + viewport.plane_offset[1]
+            - (plane_height / 2.0),
+    ];
+    let center = [
+        plane_origin[0] + (plane_width / 2.0),
+        plane_origin[1] + (plane_height / 2.0),
+    ];
+    let local_corners = [
+        [-plane_width / 2.0, -plane_height / 2.0],
+        [plane_width / 2.0, -plane_height / 2.0],
+        [plane_width / 2.0, plane_height / 2.0],
+        [-plane_width / 2.0, plane_height / 2.0],
+    ];
+    let screen_corners = local_corners.map(|local_corner| {
+        let rotated = rotate_text_rendering_vector_3d(
+            [local_corner[0], local_corner[1], 0.0],
+            viewport.yaw_radians,
+            viewport.pitch_radians,
+        );
+        project_text_rendering_point(rotated, center)
+    });
+    Some(super::windows_d3d12_renderer::TransformedTextPlaneBasis {
+        screen_corners,
+        local_corners,
+        screen_center: center,
+        yaw_radians: viewport.yaw_radians,
+        pitch_radians: viewport.pitch_radians,
+        camera_distance: TEXT_RENDERING_CAMERA_DISTANCE,
+        near_plane_distance: TEXT_RENDERING_NEAR_PLANE_DISTANCE,
+    })
 }
 
 fn text_rendering_debug_overlay_view_state(
@@ -3976,6 +4049,7 @@ fn render_toast_host(state: &mut ToastHostState) -> eyre::Result<()> {
         glyphs: Vec::new(),
         transformed_glyphs: Vec::new(),
         transformed_glyph_clip_rect: None,
+        transformed_text_plane_basis: None,
         sprites: Vec::new(),
         overlay_panels: Vec::new(),
         overlay_transformed_panels: Vec::new(),
@@ -8054,6 +8128,7 @@ fn render_scene_window_frame(
         drop(shared);
         let diagnostics_visible = state.diagnostics_visible;
         let pointer_position = state.pointer_position;
+        let plane_basis = text_rendering_projection_basis(interaction_rect, &text, viewport);
         let glyphs = cached_text_rendering_glyph_instances(
             state,
             interaction_rect,
@@ -8074,6 +8149,7 @@ fn render_scene_window_frame(
             layout,
             window_chrome_buttons_state,
             view_state,
+            plane_basis,
             glyphs,
             debug_overlay.as_ref(),
         )
@@ -8103,6 +8179,8 @@ fn render_scene_window_frame(
         drop(shared);
         let diagnostics_visible = state.diagnostics_visible;
         let pointer_position = state.pointer_position;
+        let plane_basis =
+            text_rendering_projection_basis(interaction_rect, &sprite_sheet_sample, viewport);
         let glyphs = cached_text_rendering_glyph_instances(
             state,
             interaction_rect,
@@ -8123,6 +8201,7 @@ fn render_scene_window_frame(
             layout,
             window_chrome_buttons_state,
             view_state,
+            plane_basis,
             glyphs,
             debug_overlay.as_ref(),
         )
@@ -8938,6 +9017,42 @@ fn text_rendering_plane_view_state(
         camera_offset: shared.plane_viewport.camera_offset,
         plane_offset: shared.plane_viewport.plane_offset,
     }
+}
+
+pub(crate) fn build_text_rendering_plane_verification_geometry(
+    layout: super::windows_terminal::TerminalLayout,
+    text: &str,
+    zoom: f32,
+    yaw_radians: f32,
+    pitch_radians: f32,
+    camera_offset: [f32; 2],
+    plane_offset: [f32; 2],
+    color: [f32; 4],
+) -> (
+    windows_scene::TextRenderingPlaneViewState,
+    Option<super::windows_d3d12_renderer::TransformedTextPlaneBasis>,
+    Vec<windows_scene::TextRenderingGlyphInstance>,
+) {
+    let viewport = TextRenderingViewportState {
+        zoom,
+        yaw_radians,
+        pitch_radians,
+        camera_offset,
+        plane_offset,
+    };
+    let interaction_rect = windows_scene::text_rendering_plane_interaction_rect(layout);
+    let plane_basis = text_rendering_projection_basis(interaction_rect, text, viewport);
+    let glyphs = build_text_rendering_glyph_instances(interaction_rect, text, viewport, color);
+    let view_state = windows_scene::TextRenderingPlaneViewState {
+        glyph_count: text.chars().filter(|character| *character != '\n').count(),
+        line_count: text.lines().count().max(1),
+        zoom,
+        yaw_degrees: yaw_radians.to_degrees(),
+        pitch_degrees: pitch_radians.to_degrees(),
+        camera_offset,
+        plane_offset,
+    };
+    (view_state, plane_basis, glyphs)
 }
 
 fn text_rendering_editor_view_state(
