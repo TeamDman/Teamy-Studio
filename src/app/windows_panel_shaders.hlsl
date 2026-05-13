@@ -8,7 +8,8 @@ struct VsInput {
     float4 banding : BANDING;
     float2 normal : NORMAL;
     float4 jacobian : JACOBIAN;
-    float2 padding : VIEWPORT;
+    float4 localBounds : LOCALBOUNDS;
+    float2 debugData : VIEWPORT;
 };
 
 struct PsInput {
@@ -19,6 +20,9 @@ struct PsInput {
     float glyph : GLYPH;
     float4 glyphData : GLYPHDATA;
     float4 banding : BANDING;
+    float4 localBounds : LOCALBOUNDS;
+    float debugId : VIEWPORT;
+    float transformedFlag : VIEWPORT1;
 };
 
 Buffer<float4> CurveData : register(t0);
@@ -31,6 +35,8 @@ cbuffer ParamStruct : register(b0)
     float4 slug_viewport;
     float4 scene_time;
     float4 transformed_text_clip_rect;
+    float4 transformed_text_debug_hover;
+    float4 transformed_text_inverse_homography[3];
     float4 sprite_atlas;
 };
 
@@ -81,7 +87,45 @@ PsInput VSMain(VsInput input) {
     output.glyph = input.glyph;
     output.glyphData = input.glyphData;
     output.banding = input.banding;
+    output.localBounds = input.localBounds;
+    output.debugId = input.debugData.x;
+    output.transformedFlag = input.debugData.y;
     return output;
+}
+
+float2 apply_inverse_homography(float2 screenPoint) {
+    if (abs(transformed_text_inverse_homography[2].z) <= (1.0 / 65536.0)) {
+        return screenPoint;
+    }
+
+    float3 samplePoint3 = float3(screenPoint, 1.0);
+    float x = dot(transformed_text_inverse_homography[0].xyz, samplePoint3);
+    float y = dot(transformed_text_inverse_homography[1].xyz, samplePoint3);
+    float w = dot(transformed_text_inverse_homography[2].xyz, samplePoint3);
+    if (abs(w) <= (1.0 / 65536.0)) {
+        return screenPoint;
+    }
+    return float2(x, y) / w;
+}
+
+float2 transformed_text_render_coord(float2 screenPoint, float4 localBounds, float4 glyphData, float4 banding) {
+    float2 localPoint = apply_inverse_homography(screenPoint);
+    float width = max(localBounds.y - localBounds.x, 1.0 / 65536.0);
+    float height = max(localBounds.w - localBounds.z, 1.0 / 65536.0);
+    float normalizedX = saturate((localPoint.x - localBounds.x) / width);
+    float normalizedY = saturate((localPoint.y - localBounds.z) / height);
+
+    float xScale = max(banding.x, 1.0 / 65536.0);
+    float yScale = max(banding.y, 1.0 / 65536.0);
+    float uvMinX = -banding.z / xScale;
+    float uvMinY = -banding.w / yScale;
+    float uvMaxX = uvMinX + ((glyphData.z + 1.0) / xScale);
+    float uvMaxY = uvMinY + ((glyphData.w + 1.0) / yScale);
+
+    return float2(
+        lerp(uvMinX, uvMaxX, normalizedX),
+        lerp(uvMaxY, uvMinY, normalizedY)
+    );
 }
 
 float4 unpack_rgba8(uint packed) {
@@ -256,8 +300,8 @@ float slug_coverage(float2 renderCoord, float bandStartFloat, float4 glyphData, 
     uint2 verticalEntry = LoadBandEntry(verticalBandStart, verticalBand);
 
     [loop]
-    for (uint offset = 0U; offset < verticalEntry.x; offset++) {
-        int curveIndex = (int)BandData[verticalEntry.y + offset];
+    for (uint verticalOffset = 0U; verticalOffset < verticalEntry.x; verticalOffset++) {
+        int curveIndex = (int)BandData[verticalEntry.y + verticalOffset];
         int baseIndex = curveStart + (curveIndex * 2);
         float4 p12 = CurveData[baseIndex] - float4(renderCoord, renderCoord);
         float2 p3 = CurveData[baseIndex + 1].xy - renderCoord;
@@ -286,6 +330,154 @@ float slug_coverage(float2 renderCoord, float bandStartFloat, float4 glyphData, 
     }
 
     return CalcCoverage(xcov, ycov, xwgt, ywgt);
+}
+
+float2 evaluate_quadratic(float2 p0, float2 p1, float2 p2, float t) {
+    float omt = 1.0 - t;
+    return (omt * omt * p0) + (2.0 * omt * t * p1) + (t * t * p2);
+}
+
+float distance_to_segment(float2 samplePoint, float2 segmentStart, float2 segmentEnd) {
+    float2 delta = segmentEnd - segmentStart;
+    float length_squared = dot(delta, delta);
+    if (length_squared <= (1.0 / 65536.0)) {
+        return length(samplePoint - segmentStart);
+    }
+    float t = saturate(dot(samplePoint - segmentStart, delta) / length_squared);
+    float2 projection = segmentStart + (delta * t);
+    return length(samplePoint - projection);
+}
+
+float3 debug_curve_color(float curveIndex) {
+    float tint = 0.92 + (0.08 * frac(curveIndex * 0.37));
+    return float3(0.18, 0.96, 0.42) * tint;
+}
+
+float curve_distance(float2 samplePoint, int curveStart, int curveIndex) {
+    int baseIndex = curveStart + (curveIndex * 2);
+    float4 p12 = CurveData[baseIndex];
+    float2 p0 = p12.xy;
+    float2 p1 = p12.zw;
+    float2 p2 = CurveData[baseIndex + 1].xy;
+
+    float bestCurveDistance = 1e9;
+    float2 previous = p0;
+    [unroll]
+    for (int segmentIndex = 1; segmentIndex <= 12; segmentIndex++) {
+        float t = segmentIndex / 12.0;
+        float2 current = evaluate_quadratic(p0, p1, p2, t);
+        bestCurveDistance = min(bestCurveDistance, distance_to_segment(samplePoint, previous, current));
+        previous = current;
+    }
+
+    return bestCurveDistance;
+}
+
+float rect_outline_alpha(float2 samplePoint, float2 minPoint, float2 maxPoint, float pixelsPerEm) {
+    float withinX = step(minPoint.x, samplePoint.x) * step(samplePoint.x, maxPoint.x);
+    float withinY = step(minPoint.y, samplePoint.y) * step(samplePoint.y, maxPoint.y);
+    float edgeDistance = min(
+        min(abs(samplePoint.x - minPoint.x), abs(samplePoint.x - maxPoint.x)),
+        min(abs(samplePoint.y - minPoint.y), abs(samplePoint.y - maxPoint.y))
+    ) * pixelsPerEm;
+    return (withinX * withinY) * (1.0 - smoothstep(0.9, 2.8, edgeDistance));
+}
+
+float point_marker_alpha(float2 samplePoint, float2 markerPoint, float pixelsPerEm, float radiusPx) {
+    float distancePx = length(samplePoint - markerPoint) * pixelsPerEm;
+    return 1.0 - smoothstep(radiusPx, radiusPx + 1.2, distancePx);
+}
+
+float4 slug_geometry_debug(float2 renderCoord, float4 glyphData, float debugId) {
+    int curveStart = (int)glyphData.x;
+    int curveCount = (int)glyphData.y;
+    if (curveCount <= 0) {
+        return float4(0.0, 0.0, 0.0, 0.0);
+    }
+
+    float2 renderCoordWidth = max(fwidth(renderCoord), float2(1.0 / 4096.0, 1.0 / 4096.0));
+    float pixelsPerEm = 1.0 / min(renderCoordWidth.x, renderCoordWidth.y);
+    float bestCurveDistancePx = 1e9;
+    float bestHandleDistancePx = 1e9;
+    float bestPointDistancePx = 1e9;
+    float bestCurveIndex = 0.0;
+    float pointAlpha = 0.0;
+
+    [loop]
+    for (int curveIndex = 0; curveIndex < curveCount; curveIndex++) {
+        int baseIndex = curveStart + (curveIndex * 2);
+        float4 p12 = CurveData[baseIndex];
+        float2 p0 = p12.xy;
+        float2 p1 = p12.zw;
+        float2 p2 = CurveData[baseIndex + 1].xy;
+
+        float bestCurveDistance = curve_distance(renderCoord, curveStart, curveIndex);
+        float curvePointAlpha = max(
+            point_marker_alpha(renderCoord, p0, pixelsPerEm, 1.9),
+            max(
+                point_marker_alpha(renderCoord, p1, pixelsPerEm, 2.2),
+                point_marker_alpha(renderCoord, p2, pixelsPerEm, 1.9)
+            )
+        );
+
+        float handleDistance = min(
+            distance_to_segment(renderCoord, p0, p1),
+            distance_to_segment(renderCoord, p1, p2)
+        );
+
+        float curveDistancePx = bestCurveDistance * pixelsPerEm;
+        if (curveDistancePx < bestCurveDistancePx) {
+            bestCurveDistancePx = curveDistancePx;
+            bestCurveIndex = curveIndex;
+        }
+        bestHandleDistancePx = min(bestHandleDistancePx, handleDistance * pixelsPerEm);
+        bestPointDistancePx = min(
+            bestPointDistancePx,
+            min(length(renderCoord - p0), min(length(renderCoord - p1), length(renderCoord - p2))) * pixelsPerEm
+        );
+        pointAlpha = max(pointAlpha, curvePointAlpha);
+    }
+
+    float curveAlpha = 1.0 - smoothstep(1.10, 3.10, bestCurveDistancePx);
+    float handleAlpha = 1.0 - smoothstep(0.90, 2.20, bestHandleDistancePx);
+    pointAlpha = max(pointAlpha, 1.0 - smoothstep(1.2, 3.0, bestPointDistancePx));
+    float3 curveColor = debug_curve_color(bestCurveIndex);
+    float3 handleColor = float3(0.58, 1.0, 0.72);
+    float3 debugColor = lerp(handleColor, curveColor, saturate(curveAlpha));
+    debugColor = lerp(debugColor, float3(1.0, 0.90, 0.42), pointAlpha * 0.92);
+    float alpha = max(max(curveAlpha * 0.98, handleAlpha * 0.62), pointAlpha * 0.78);
+
+    if (transformed_text_debug_hover.w > 0.5 && abs(debugId - transformed_text_debug_hover.x) < 0.25) {
+        float2 hoverPoint = transformed_text_debug_hover.yz;
+        float bestHoverCurveDistance = 1e9;
+        int hoveredCurveIndex = 0;
+        float2 hoveredMinPoint = float2(0.0, 0.0);
+        float2 hoveredMaxPoint = float2(0.0, 0.0);
+        [loop]
+        for (int curveIndex = 0; curveIndex < curveCount; curveIndex++) {
+            int baseIndex = curveStart + (curveIndex * 2);
+            float4 p12 = CurveData[baseIndex];
+            float2 p0 = p12.xy;
+            float2 p1 = p12.zw;
+            float2 p2 = CurveData[baseIndex + 1].xy;
+            float hoverCurveDistance = curve_distance(hoverPoint, curveStart, curveIndex);
+            if (hoverCurveDistance < bestHoverCurveDistance) {
+                bestHoverCurveDistance = hoverCurveDistance;
+                hoveredCurveIndex = curveIndex;
+                hoveredMinPoint = min(min(p0, p1), p2);
+                hoveredMaxPoint = max(max(p0, p1), p2);
+            }
+        }
+
+        float hoveredCurveDistancePx = curve_distance(renderCoord, curveStart, hoveredCurveIndex) * pixelsPerEm;
+        float hoveredCurveAlpha = 1.0 - smoothstep(1.2, 4.2, hoveredCurveDistancePx);
+        float hoveredBoundsAlpha = rect_outline_alpha(renderCoord, hoveredMinPoint, hoveredMaxPoint, pixelsPerEm);
+        float hoveredAlpha = max(hoveredCurveAlpha, hoveredBoundsAlpha * 0.9);
+        debugColor = lerp(debugColor, float3(1.0, 0.34, 0.82), hoveredAlpha);
+        alpha = max(alpha, hoveredAlpha * 0.96);
+    }
+
+    return float4(debugColor, saturate(alpha));
 }
 
 float4 apply_blue_background(float2 uv, float4 color) {
@@ -494,8 +686,17 @@ float4 PSMain(PsInput input) : SV_TARGET {
                 || input.position.y >= transformed_text_clip_rect.w)) {
             discard;
         }
-        float coverage = slug_coverage(input.uv, input.glyph, input.glyphData, input.banding);
-        return premultiply_alpha(float4(input.color.rgb, input.color.a * coverage));
+        float2 renderCoord = input.transformedFlag > 0.5
+            ? transformed_text_render_coord(input.position.xy, input.localBounds, input.glyphData, input.banding)
+            : input.uv;
+        float coverage = slug_coverage(renderCoord, input.glyph, input.glyphData, input.banding);
+        float4 shaded = float4(input.color.rgb, input.color.a * coverage);
+        if (scene_time.y > 0.5) {
+            float4 geometry = slug_geometry_debug(renderCoord, input.glyphData, input.debugId);
+            shaded.rgb = lerp(shaded.rgb, geometry.rgb, geometry.a * 0.88);
+            shaded.a = max(shaded.a, geometry.a * 0.82);
+        }
+        return premultiply_alpha(shaded);
     }
 
     if (input.effect > 12.5 && input.effect < 13.5) {

@@ -389,12 +389,17 @@ pub struct TextRenderingGlyphInstance {
     pub character: char,
     pub color: [f32; 4],
     pub corners: [[f32; 2]; 4],
+    pub corner_w: [f32; 4],
+    pub local_bounds: [f32; 4],
+    pub glyph_uv_bounds: [f32; 4],
+    pub debug_id: f32,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct TextRenderingDebugOverlayViewState {
     pub clip_rect: ClientRect,
     pub glyph_bounds: Vec<[[f32; 2]; 4]>,
+    pub hovered_glyph_debug_data: Option<[f32; 4]>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1233,7 +1238,15 @@ pub fn build_text_rendering_plane_render_scene(
         [0.76, 0.80, 0.88, 1.0],
     );
     for glyph in glyphs {
-        push_transformed_glyph(&mut scene, glyph.corners, glyph.character, glyph.color);
+        push_transformed_glyph(
+            &mut scene,
+            glyph.corners,
+            glyph.corner_w,
+            glyph.local_bounds,
+            glyph.character,
+            glyph.color,
+            glyph.debug_id,
+        );
     }
     if let Some(debug_overlay) = debug_overlay {
         push_text_rendering_debug_overlay(&mut scene, debug_overlay);
@@ -1380,7 +1393,15 @@ pub fn build_text_rendering_sprite_sheet_render_scene(
         [0.74, 0.90, 0.80, 1.0],
     );
     for glyph in glyphs {
-        push_transformed_glyph(&mut scene, glyph.corners, glyph.character, glyph.color);
+        push_transformed_glyph(
+            &mut scene,
+            glyph.corners,
+            glyph.corner_w,
+            glyph.local_bounds,
+            glyph.character,
+            glyph.color,
+            glyph.debug_id,
+        );
     }
     if let Some(debug_overlay) = debug_overlay {
         push_text_rendering_debug_overlay(&mut scene, debug_overlay);
@@ -1420,9 +1441,9 @@ fn push_text_rendering_debug_overlay(
         push_overlay_transformed_panel(
             scene,
             *glyph_bounds,
-            [1.0, 0.36, 0.64, 0.18],
+            [1.0, 0.78, 0.12, 0.24],
             PanelEffect::TerminalFill,
-            [0.0; 4],
+            debug_overlay.hovered_glyph_debug_data.unwrap_or([0.0; 4]),
         );
     }
 }

@@ -46,6 +46,7 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, EnumWindows, GetClassNameW,
+    CS_DBLCLKS,
     GetClientRect, GetCursorPos, GetMessageW, GetSystemMetrics, GetWindowRect,
     GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, HTCAPTION, HTCLIENT,
     HTTRANSPARENT, HWND_NOTOPMOST, HWND_TOPMOST, IDC_ARROW, IDC_CROSS, IDC_HAND, IDC_HELP,
@@ -58,7 +59,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SYSTEM_METRICS_INDEX, SendMessageW, SetCursor, SetCursorPos, SetTimer, SetWindowPos,
     SetWindowTextW, ShowWindow, TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CHAR,
     WM_CLOSE, WM_DESTROY, WM_DPICHANGED, WM_ENTERSIZEMOVE, WM_ERASEBKGND, WM_EXITSIZEMOVE,
-    WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN,
+    WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN,
     WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_MOVE, WM_NCCALCSIZE, WM_NCHITTEST,
     WM_NCLBUTTONDOWN, WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SETFOCUS,
     WM_SIZE, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WNDCLASSEXW, WS_EX_APPWINDOW,
@@ -1652,12 +1653,63 @@ fn cached_text_rendering_glyph_instances<'a>(
 
 fn text_rendering_debug_overlay_view_state(
     clip_rect: ClientRect,
+    viewport: TextRenderingViewportState,
+    pointer_position: Option<ClientPoint>,
     glyphs: &[windows_scene::TextRenderingGlyphInstance],
 ) -> windows_scene::TextRenderingDebugOverlayViewState {
     windows_scene::TextRenderingDebugOverlayViewState {
         clip_rect,
         glyph_bounds: glyphs.iter().map(|glyph| glyph.corners).collect(),
+        hovered_glyph_debug_data: text_rendering_hovered_glyph_debug_data(
+            clip_rect,
+            viewport,
+            pointer_position,
+            glyphs,
+        ),
     }
+}
+
+fn text_rendering_hovered_glyph_debug_data(
+    clip_rect: ClientRect,
+    viewport: TextRenderingViewportState,
+    pointer_position: Option<ClientPoint>,
+    glyphs: &[windows_scene::TextRenderingGlyphInstance],
+) -> Option<[f32; 4]> {
+    let point = pointer_position?;
+    if !clip_rect.contains(point) {
+        return None;
+    }
+
+    let center = text_rendering_plane_center(clip_rect, viewport);
+    let (point_x, point_y) = client_point_pixels(point);
+    let local_point = unproject_text_rendering_screen_point_to_plane(
+        viewport,
+        center,
+        [point_x as f32, point_y as f32],
+    )?;
+
+    glyphs.iter().find_map(|glyph| {
+        let [left, right, top, bottom] = glyph.local_bounds;
+        if local_point[0] < left
+            || local_point[0] > right
+            || local_point[1] < top
+            || local_point[1] > bottom
+        {
+            return None;
+        }
+
+        let width = (right - left).max(f32::EPSILON);
+        let height = (bottom - top).max(f32::EPSILON);
+        let normalized_x = ((local_point[0] - left) / width).clamp(0.0, 1.0);
+        let normalized_y = ((local_point[1] - top) / height).clamp(0.0, 1.0);
+        let [uv_left, uv_right, uv_top, uv_bottom] = glyph.glyph_uv_bounds;
+        Some([
+            glyph.debug_id,
+            uv_left + ((uv_right - uv_left) * normalized_x),
+            uv_top + ((uv_bottom - uv_top) * normalized_y),
+            1.0,
+        ])
+    })
 }
 
 fn open_text_rendering_playground_windows(
@@ -3615,6 +3667,7 @@ fn create_window(window_thread: WindowThread, window_title: &str) -> eyre::Resul
     let class = WNDCLASSEXW {
         cbSize: u32::try_from(std::mem::size_of::<WNDCLASSEXW>())
             .expect("WNDCLASSEXW size must fit in u32"),
+        style: CS_DBLCLKS,
         hInstance: instance.into(),
         lpszClassName: WINDOW_CLASS_NAME,
         lpfnWndProc: Some(window_proc),
@@ -3682,6 +3735,7 @@ fn create_scene_window(
     let class = WNDCLASSEXW {
         cbSize: u32::try_from(std::mem::size_of::<WNDCLASSEXW>())
             .expect("WNDCLASSEXW size must fit in u32"),
+        style: CS_DBLCLKS,
         hInstance: instance.into(),
         lpszClassName: SCENE_WINDOW_CLASS_NAME,
         lpfnWndProc: Some(scene_window_proc),
@@ -4189,6 +4243,9 @@ extern "system" fn window_proc(
         WM_LBUTTONDOWN => handle_bool_message(hwnd, message, wparam, lparam, |hwnd| {
             handle_left_button_down(hwnd, lparam)
         }),
+        WM_LBUTTONDBLCLK => handle_bool_message(hwnd, message, wparam, lparam, |hwnd| {
+            handle_left_button_double_click(hwnd, lparam)
+        }),
         WM_MOUSEMOVE => handle_bool_message(hwnd, message, wparam, lparam, |hwnd| {
             handle_mouse_move(hwnd, wparam, lparam)
         }),
@@ -4250,6 +4307,9 @@ extern "system" fn scene_window_proc(
         WM_KEYDOWN | WM_SYSKEYDOWN => handle_scene_key_down_message(hwnd, message, wparam, lparam),
         WM_LBUTTONDOWN => handle_bool_message(hwnd, message, wparam, lparam, |hwnd| {
             handle_scene_left_button_down(hwnd, lparam)
+        }),
+        WM_LBUTTONDBLCLK => handle_bool_message(hwnd, message, wparam, lparam, |hwnd| {
+            handle_scene_left_button_double_click(hwnd, lparam)
         }),
         WM_MBUTTONDOWN => handle_bool_message(hwnd, message, wparam, lparam, |hwnd| {
             handle_scene_middle_button_down(hwnd, lparam)
@@ -5840,6 +5900,19 @@ fn handle_scene_left_button_down(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Re
             Ok(true)
         }
     }
+}
+
+fn handle_scene_left_button_double_click(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Result<bool> {
+    let point = ClientPoint::from_lparam(lparam);
+    let toggled = with_scene_app_state(|state| {
+        let layout = scene_client_layout(hwnd, state)?;
+        Ok(scene_drag_handle_contains(layout, point))
+    })?;
+    if !toggled {
+        return Ok(false);
+    }
+    hwnd.toggle_maximize_restore();
+    Ok(true)
 }
 
 #[expect(
@@ -7980,6 +8053,7 @@ fn render_scene_window_frame(
         let view_state = text_rendering_plane_view_state(&shared);
         drop(shared);
         let diagnostics_visible = state.diagnostics_visible;
+        let pointer_position = state.pointer_position;
         let glyphs = cached_text_rendering_glyph_instances(
             state,
             interaction_rect,
@@ -7988,8 +8062,14 @@ fn render_scene_window_frame(
             viewport,
             [0.88, 0.94, 1.0, 1.0],
         );
-        let debug_overlay = diagnostics_visible
-            .then(|| text_rendering_debug_overlay_view_state(interaction_rect, glyphs));
+        let debug_overlay = diagnostics_visible.then(|| {
+            text_rendering_debug_overlay_view_state(
+                interaction_rect,
+                viewport,
+                pointer_position,
+                glyphs,
+            )
+        });
         windows_scene::build_text_rendering_plane_render_scene(
             layout,
             window_chrome_buttons_state,
@@ -8022,6 +8102,7 @@ fn render_scene_window_frame(
         let view_state = text_rendering_sprite_sheet_view_state(&shared);
         drop(shared);
         let diagnostics_visible = state.diagnostics_visible;
+        let pointer_position = state.pointer_position;
         let glyphs = cached_text_rendering_glyph_instances(
             state,
             interaction_rect,
@@ -8030,8 +8111,14 @@ fn render_scene_window_frame(
             viewport,
             [0.84, 0.98, 0.90, 1.0],
         );
-        let debug_overlay = diagnostics_visible
-            .then(|| text_rendering_debug_overlay_view_state(interaction_rect, glyphs));
+        let debug_overlay = diagnostics_visible.then(|| {
+            text_rendering_debug_overlay_view_state(
+                interaction_rect,
+                viewport,
+                pointer_position,
+                glyphs,
+            )
+        });
         windows_scene::build_text_rendering_sprite_sheet_render_scene(
             layout,
             window_chrome_buttons_state,
@@ -8994,12 +9081,19 @@ fn zoom_text_rendering_viewport_about_cursor(
 }
 
 fn project_text_rendering_point(point: [f32; 3], center: [f32; 2]) -> [f32; 2] {
+    project_text_rendering_point_with_weight(point, center).0
+}
+
+fn project_text_rendering_point_with_weight(point: [f32; 3], center: [f32; 2]) -> ([f32; 2], f32) {
     let perspective = TEXT_RENDERING_CAMERA_DISTANCE
         / (TEXT_RENDERING_CAMERA_DISTANCE - point[2]).max(80.0);
-    [
-        center[0] + (point[0] * perspective),
-        center[1] + (point[1] * perspective),
-    ]
+    (
+        [
+            center[0] + (point[0] * perspective),
+            center[1] + (point[1] * perspective),
+        ],
+        1.0 / perspective.max(0.0001),
+    )
 }
 
 fn build_text_rendering_glyph_instances(
@@ -9080,7 +9174,7 @@ fn build_text_rendering_glyph_instances(
             let right = line_left + (pen_x_units + glyph.x_max) * scale;
             let top = line_top + (font.ascender - glyph.y_max) * scale;
             let bottom = line_top + (font.ascender - glyph.y_min) * scale;
-            let corners = [
+            let transformed_corners = [
                 [left, top],
                 [right, top],
                 [right, bottom],
@@ -9093,8 +9187,10 @@ fn build_text_rendering_glyph_instances(
                     viewport.yaw_radians,
                     viewport.pitch_radians,
                 );
-                project_text_rendering_point(rotated, center)
+                project_text_rendering_point_with_weight(rotated, center)
             });
+            let corners = transformed_corners.map(|(corner, _)| corner);
+            let corner_w = transformed_corners.map(|(_, clip_w)| clip_w);
             let min_x = corners.iter().map(|corner| corner[0]).fold(f32::INFINITY, f32::min);
             let max_x = corners.iter().map(|corner| corner[0]).fold(f32::NEG_INFINITY, f32::max);
             let min_y = corners.iter().map(|corner| corner[1]).fold(f32::INFINITY, f32::min);
@@ -9108,6 +9204,15 @@ fn build_text_rendering_glyph_instances(
                     character,
                     color,
                     corners,
+                    corner_w,
+                    local_bounds: [
+                        left - center[0],
+                        right - center[0],
+                        top - center[1],
+                        bottom - center[1],
+                    ],
+                    glyph_uv_bounds: [glyph.x_min, glyph.x_max, glyph.y_max, glyph.y_min],
+                    debug_id: glyphs.len() as f32 + 1.0,
                 });
             }
             pen_x_units += advance;
@@ -13660,6 +13765,15 @@ fn handle_left_button_down(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Result<b
             Ok(true)
         }
     }
+}
+
+fn handle_left_button_double_click(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Result<bool> {
+    let point = ClientPoint::from_lparam(lparam);
+    if !hit_test_drag_handle_point(hwnd, point)? {
+        return Ok(false);
+    }
+    hwnd.toggle_maximize_restore();
+    Ok(true)
 }
 
 #[expect(

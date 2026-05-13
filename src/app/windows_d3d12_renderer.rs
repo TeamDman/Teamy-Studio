@@ -111,6 +111,7 @@ struct Vertex {
     banding: [f32; 4],
     normal: [f32; 2],
     jacobian: [f32; 4],
+    local_bounds: [f32; 4],
     _padding: [f32; 2],
 }
 
@@ -121,6 +122,8 @@ struct ShaderParams {
     slug_viewport: [f32; 4],
     scene_time: [f32; 4],
     transformed_text_clip_rect: [f32; 4],
+    transformed_text_debug_hover: [f32; 4],
+    transformed_text_inverse_homography: [[f32; 4]; 3],
     sprite_atlas: [f32; 4],
 }
 
@@ -307,8 +310,11 @@ pub struct GlyphQuad {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TransformedGlyphQuad {
     pub corners: [[f32; 2]; 4],
+    pub corner_w: [f32; 4],
+    pub local_bounds: [f32; 4],
     pub color: [f32; 4],
     pub character: char,
+    pub debug_id: f32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -412,6 +418,9 @@ pub struct D3d12PanelRenderer {
     cached_chars: Vec<char>,
     glyph_cache_generation: u64,
     transformed_glyph_clip_rect: Option<RECT>,
+    transformed_glyph_debug_enabled: bool,
+    transformed_glyph_debug_hover: [f32; 4],
+    transformed_text_inverse_homography: [[f32; 4]; 3],
     viewport: D3D12_VIEWPORT,
     scissor_rect: RECT,
     width: u32,
@@ -882,6 +891,9 @@ impl D3d12PanelRenderer {
             cached_chars: Vec::new(),
             glyph_cache_generation: 0,
             transformed_glyph_clip_rect: None,
+            transformed_glyph_debug_enabled: false,
+            transformed_glyph_debug_hover: [0.0; 4],
+            transformed_text_inverse_homography: [[0.0; 4]; 3],
             viewport,
             scissor_rect,
             width,
@@ -1046,6 +1058,18 @@ impl D3d12PanelRenderer {
         self.transformed_glyph_clip_rect = scenes
             .iter()
             .find_map(|scene| scene.transformed_glyph_clip_rect);
+        self.transformed_glyph_debug_enabled = scenes.iter().any(|scene| {
+            scene.transformed_glyph_clip_rect.is_some() && !scene.overlay_transformed_panels.is_empty()
+        });
+        self.transformed_glyph_debug_hover = scenes
+            .iter()
+            .filter(|scene| scene.transformed_glyph_clip_rect.is_some())
+            .find_map(|scene| scene.overlay_transformed_panels.first().map(|panel| panel.data))
+            .unwrap_or([0.0; 4]);
+        self.transformed_text_inverse_homography = scenes
+            .iter()
+            .find_map(|scene| transformed_text_inverse_homography_for_scene(scene))
+            .unwrap_or([[0.0; 4]; 3]);
         {
             #[cfg(feature = "tracy")]
             let _span = debug_span!("update_slug_curves").entered();
@@ -1072,6 +1096,14 @@ impl D3d12PanelRenderer {
 
         if let Some(scene) = frame.scene.as_ref() {
             self.transformed_glyph_clip_rect = scene.transformed_glyph_clip_rect;
+            self.transformed_glyph_debug_enabled =
+                scene.transformed_glyph_clip_rect.is_some() && !scene.overlay_transformed_panels.is_empty();
+            self.transformed_glyph_debug_hover = scene
+                .overlay_transformed_panels
+                .first()
+                .map_or([0.0; 4], |panel| panel.data);
+            self.transformed_text_inverse_homography =
+                transformed_text_inverse_homography_for_scene(scene).unwrap_or([[0.0; 4]; 3]);
             let _glyph_cache_changed = {
                 #[cfg(feature = "tracy")]
                 let _span = debug_span!("update_slug_curves").entered();
@@ -1094,6 +1126,9 @@ impl D3d12PanelRenderer {
             frame.window_chrome_buttons_state,
         );
         self.transformed_glyph_clip_rect = None;
+        self.transformed_glyph_debug_enabled = false;
+        self.transformed_glyph_debug_hover = [0.0; 4];
+        self.transformed_text_inverse_homography = [[0.0; 4]; 3];
         let (terminal_scenes, terminal_reused) = terminal_scene_fragments(
             &mut scene_cache.terminal,
             frame.layout,
@@ -1476,6 +1511,13 @@ impl D3d12PanelRenderer {
                 rect.bottom as f32,
             ],
         );
+        params.transformed_text_debug_hover = self.transformed_glyph_debug_hover;
+        params.transformed_text_inverse_homography = self.transformed_text_inverse_homography;
+        params.scene_time[1] = if self.transformed_glyph_debug_enabled {
+            1.0
+        } else {
+            0.0
+        };
         params.sprite_atlas = [
             self.sprite_atlas.width as f32,
             self.sprite_atlas.height as f32,
@@ -1598,13 +1640,30 @@ fn build_scene_vertices_with_assets(
             .unwrap_or_else(|| SlugGlyph::empty(font));
         append_text_rect(&mut vertices, glyph.rect, glyph.color, slug_glyph, font);
     }
+    for panel in &scene.overlay_transformed_panels {
+        append_transformed_panel_quad(
+            &mut vertices,
+            panel.corners,
+            panel.color,
+            panel.effect,
+            panel.data,
+        );
+    }
     for glyph in &scene.transformed_glyphs {
         let slug_glyph = glyph_cache
             .get(&glyph.character)
             .or_else(|| glyph_cache.get(&FALLBACK_GLYPH))
             .copied()
             .unwrap_or_else(|| SlugGlyph::empty(font));
-        append_transformed_text_quad(&mut vertices, glyph.corners, glyph.color, slug_glyph);
+            append_transformed_text_quad(
+                &mut vertices,
+                glyph.corners,
+                glyph.corner_w,
+                glyph.local_bounds,
+                glyph.color,
+                slug_glyph,
+                glyph.debug_id,
+            );
     }
     for panel in &scene.overlay_panels {
         append_rect_with_data(
@@ -1614,15 +1673,6 @@ fn build_scene_vertices_with_assets(
             panel.effect as u32,
             0,
             [0.0, 0.0, 1.0, 1.0],
-            panel.data,
-        );
-    }
-    for panel in &scene.overlay_transformed_panels {
-        append_transformed_panel_quad(
-            &mut vertices,
-            panel.corners,
-            panel.color,
-            panel.effect,
             panel.data,
         );
     }
@@ -2556,16 +2606,22 @@ pub fn push_overlay_glyph(scene: &mut RenderScene, rect: RECT, character: char, 
 pub fn push_transformed_glyph(
     scene: &mut RenderScene,
     corners: [[f32; 2]; 4],
+    corner_w: [f32; 4],
+    local_bounds: [f32; 4],
     character: char,
     color: [f32; 4],
+    debug_id: f32,
 ) {
     if scene.transformed_glyphs.len() >= MAX_GLYPH_COUNT || character == ' ' {
         return;
     }
     scene.transformed_glyphs.push(TransformedGlyphQuad {
         corners,
+        corner_w,
+        local_bounds,
         color,
         character,
+        debug_id,
     });
 }
 
@@ -4580,9 +4636,15 @@ fn create_pipeline_state(
             ..Default::default()
         },
         D3D12_INPUT_ELEMENT_DESC {
+            SemanticName: s!("LOCALBOUNDS"),
+            Format: DXGI_FORMAT_R32G32B32A32_FLOAT,
+            AlignedByteOffset: 100,
+            ..Default::default()
+        },
+        D3D12_INPUT_ELEMENT_DESC {
             SemanticName: s!("VIEWPORT"),
             Format: DXGI_FORMAT_R32G32_FLOAT,
-            AlignedByteOffset: 100,
+            AlignedByteOffset: 116,
             ..Default::default()
         },
     ];
@@ -4918,8 +4980,83 @@ fn build_shader_params(width: f32, height: f32, elapsed_seconds: f32) -> ShaderP
         slug_viewport: [safe_width, safe_height, 0.0, 0.0],
         scene_time: [elapsed_seconds, 0.0, 0.0, 0.0],
         transformed_text_clip_rect: [-1.0, -1.0, -1.0, -1.0],
+        transformed_text_debug_hover: [0.0; 4],
+        transformed_text_inverse_homography: [[0.0; 4]; 3],
         sprite_atlas: [1.0, 1.0, 0.0, 0.0],
     }
+}
+
+fn transformed_text_inverse_homography_for_scene(
+    scene: &RenderScene,
+) -> Option<[[f32; 4]; 3]> {
+    let glyph = scene.transformed_glyphs.first()?;
+    let local = [
+        [glyph.local_bounds[0], glyph.local_bounds[2]],
+        [glyph.local_bounds[1], glyph.local_bounds[2]],
+        [glyph.local_bounds[1], glyph.local_bounds[3]],
+        [glyph.local_bounds[0], glyph.local_bounds[3]],
+    ];
+    solve_inverse_homography(glyph.corners, local).map(|coefficients| {
+        [
+            [coefficients[0], coefficients[1], coefficients[2], 0.0],
+            [coefficients[3], coefficients[4], coefficients[5], 0.0],
+            [coefficients[6], coefficients[7], 1.0, 0.0],
+        ]
+    })
+}
+
+fn solve_inverse_homography(
+    screen_points: [[f32; 2]; 4],
+    local_points: [[f32; 2]; 4],
+) -> Option<[f32; 8]> {
+    let mut augmented = [[0.0f32; 9]; 8];
+    for (point_index, (screen_point, local_point)) in
+        screen_points.into_iter().zip(local_points).enumerate()
+    {
+        let row = point_index * 2;
+        let x = screen_point[0];
+        let y = screen_point[1];
+        let u = local_point[0];
+        let v = local_point[1];
+        augmented[row] = [x, y, 1.0, 0.0, 0.0, 0.0, -u * x, -u * y, u];
+        augmented[row + 1] = [0.0, 0.0, 0.0, x, y, 1.0, -v * x, -v * y, v];
+    }
+
+    for pivot_index in 0..8 {
+        let (best_row, best_value) = (pivot_index..8)
+            .map(|row| (row, augmented[row][pivot_index].abs()))
+            .max_by(|left, right| {
+                left.1
+                    .partial_cmp(&right.1)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })?;
+        if best_value <= 1.0 / 65536.0 {
+            return None;
+        }
+        if best_row != pivot_index {
+            augmented.swap(best_row, pivot_index);
+        }
+
+        let pivot = augmented[pivot_index][pivot_index];
+        for column in pivot_index..9 {
+            augmented[pivot_index][column] /= pivot;
+        }
+
+        for row in 0..8 {
+            if row == pivot_index {
+                continue;
+            }
+            let factor = augmented[row][pivot_index];
+            if factor.abs() <= f32::EPSILON {
+                continue;
+            }
+            for column in pivot_index..9 {
+                augmented[row][column] -= factor * augmented[pivot_index][column];
+            }
+        }
+    }
+
+    Some(std::array::from_fn(|index| augmented[index][8]))
 }
 
 fn create_vertex_buffer(
@@ -5744,6 +5881,7 @@ fn append_text_rect(
         banding,
         normal: [-1.0, 1.0],
         jacobian,
+        local_bounds: [0.0; 4],
         _padding: [0.0; 2],
     };
     let top_right = Vertex {
@@ -5756,6 +5894,7 @@ fn append_text_rect(
         banding,
         normal: [1.0, 1.0],
         jacobian,
+        local_bounds: [0.0; 4],
         _padding: [0.0; 2],
     };
     let bottom_right = Vertex {
@@ -5768,6 +5907,7 @@ fn append_text_rect(
         banding,
         normal: [1.0, -1.0],
         jacobian,
+        local_bounds: [0.0; 4],
         _padding: [0.0; 2],
     };
     let bottom_left = Vertex {
@@ -5780,6 +5920,7 @@ fn append_text_rect(
         banding,
         normal: [-1.0, -1.0],
         jacobian,
+        local_bounds: [0.0; 4],
         _padding: [0.0; 2],
     };
 
@@ -5796,8 +5937,11 @@ fn append_text_rect(
 fn append_transformed_text_quad(
     vertices: &mut Vec<Vertex>,
     corners: [[f32; 2]; 4],
+    _corner_w: [f32; 4],
+    local_bounds: [f32; 4],
     color: [f32; 4],
     glyph: SlugGlyph,
+    debug_id: f32,
 ) {
     if vertices.len() + 6 > MAX_VERTEX_COUNT {
         return;
@@ -5846,7 +5990,8 @@ fn append_transformed_text_quad(
         banding,
         normal: [-1.0, 1.0],
         jacobian,
-        _padding: [0.0; 2],
+        local_bounds,
+        _padding: [debug_id, 1.0],
     };
     let top_right = Vertex {
         position: [top_right_corner[0], top_right_corner[1], 0.0],
@@ -5858,7 +6003,8 @@ fn append_transformed_text_quad(
         banding,
         normal: [1.0, 1.0],
         jacobian,
-        _padding: [0.0; 2],
+        local_bounds,
+        _padding: [debug_id, 1.0],
     };
     let bottom_right = Vertex {
         position: [bottom_right_corner[0], bottom_right_corner[1], 0.0],
@@ -5870,7 +6016,8 @@ fn append_transformed_text_quad(
         banding,
         normal: [1.0, -1.0],
         jacobian,
-        _padding: [0.0; 2],
+        local_bounds,
+        _padding: [debug_id, 1.0],
     };
     let bottom_left = Vertex {
         position: [bottom_left_corner[0], bottom_left_corner[1], 0.0],
@@ -5882,7 +6029,8 @@ fn append_transformed_text_quad(
         banding,
         normal: [-1.0, -1.0],
         jacobian,
-        _padding: [0.0; 2],
+        local_bounds,
+        _padding: [debug_id, 1.0],
     };
 
     vertices.extend_from_slice(&[
@@ -5918,6 +6066,7 @@ fn append_transformed_panel_quad(
         banding: [0.0; 4],
         normal: [0.0; 2],
         jacobian: [0.0; 4],
+        local_bounds: [0.0; 4],
         _padding: [0.0; 2],
     };
     let top_right = Vertex {
@@ -5930,6 +6079,7 @@ fn append_transformed_panel_quad(
         banding: [0.0; 4],
         normal: [0.0; 2],
         jacobian: [0.0; 4],
+        local_bounds: [0.0; 4],
         _padding: [0.0; 2],
     };
     let bottom_right = Vertex {
@@ -5942,6 +6092,7 @@ fn append_transformed_panel_quad(
         banding: [0.0; 4],
         normal: [0.0; 2],
         jacobian: [0.0; 4],
+        local_bounds: [0.0; 4],
         _padding: [0.0; 2],
     };
     let bottom_left = Vertex {
@@ -5954,6 +6105,7 @@ fn append_transformed_panel_quad(
         banding: [0.0; 4],
         normal: [0.0; 2],
         jacobian: [0.0; 4],
+        local_bounds: [0.0; 4],
         _padding: [0.0; 2],
     };
 
@@ -6017,6 +6169,7 @@ fn append_rect_with_data(
         banding: [0.0; 4],
         normal: [0.0; 2],
         jacobian: [0.0; 4],
+        local_bounds: [0.0; 4],
         _padding: [0.0; 2],
     };
     let top_right = Vertex {
@@ -6029,6 +6182,7 @@ fn append_rect_with_data(
         banding: [0.0; 4],
         normal: [0.0; 2],
         jacobian: [0.0; 4],
+        local_bounds: [0.0; 4],
         _padding: [0.0; 2],
     };
     let bottom_right = Vertex {
@@ -6041,6 +6195,7 @@ fn append_rect_with_data(
         banding: [0.0; 4],
         normal: [0.0; 2],
         jacobian: [0.0; 4],
+        local_bounds: [0.0; 4],
         _padding: [0.0; 2],
     };
     let bottom_left = Vertex {
@@ -6053,6 +6208,7 @@ fn append_rect_with_data(
         banding: [0.0; 4],
         normal: [0.0; 2],
         jacobian: [0.0; 4],
+        local_bounds: [0.0; 4],
         _padding: [0.0; 2],
     };
 
@@ -6112,8 +6268,8 @@ mod tests {
         dirty_fragment_ranges, extract_glyph_curves, fragment_ranges_match, fragment_vertex_ranges,
         load_terminal_font, preferred_title_bar_color, push_centered_text, push_glyph,
         push_overlay_panel, push_panel, push_text_block, push_title_text,
-        render_snapshot_glyph_into_image, shader_compile_flags, terminal_scrollbar_geometry,
-        window_garden_shader_data,
+        render_snapshot_glyph_into_image, shader_compile_flags, solve_inverse_homography,
+        terminal_scrollbar_geometry, window_garden_shader_data,
     };
     use crate::app::spatial::ClientRect;
     use crate::app::windows_terminal::TerminalDisplayScrollbar;
@@ -6176,6 +6332,31 @@ mod tests {
         assert!(!shaders.pixel.is_empty(), "pixel shader bytecode should not be empty");
 
         Ok(())
+    }
+
+    #[test]
+    fn inverse_homography_maps_projected_quad_back_to_local_space() {
+        let projected = [[144.0, 92.0], [222.0, 108.0], [210.0, 178.0], [128.0, 166.0]];
+        let local = [[-40.0, -16.0], [24.0, -16.0], [24.0, 40.0], [-40.0, 40.0]];
+
+        let coefficients = solve_inverse_homography(projected, local).expect("homography should solve");
+
+        for (screen_point, local_point) in projected.into_iter().zip(local) {
+            let denominator = (coefficients[6] * screen_point[0])
+                + (coefficients[7] * screen_point[1])
+                + 1.0;
+            let mapped_x = ((coefficients[0] * screen_point[0])
+                + (coefficients[1] * screen_point[1])
+                + coefficients[2])
+                / denominator;
+            let mapped_y = ((coefficients[3] * screen_point[0])
+                + (coefficients[4] * screen_point[1])
+                + coefficients[5])
+                / denominator;
+
+            assert!((mapped_x - local_point[0]).abs() < 0.01);
+            assert!((mapped_y - local_point[1]).abs() < 0.01);
+        }
     }
 
     #[test]
@@ -6302,6 +6483,7 @@ mod tests {
             banding: [0.0; 4],
             normal: [0.0; 2],
             jacobian: [0.0; 4],
+            local_bounds: [0.0; 4],
             _padding: [0.0; 2],
         };
         let fragment_a = vec![vertex];
@@ -6331,6 +6513,7 @@ mod tests {
             banding: [0.0; 4],
             normal: [0.0; 2],
             jacobian: [0.0; 4],
+            local_bounds: [0.0; 4],
             _padding: [0.0; 2],
         };
         let fragment_a = vec![Vertex {
