@@ -120,6 +120,7 @@ struct ShaderParams {
     slug_matrix: [[f32; 4]; 4],
     slug_viewport: [f32; 4],
     scene_time: [f32; 4],
+    transformed_text_clip_rect: [f32; 4],
     sprite_atlas: [f32; 4],
 }
 
@@ -310,6 +311,14 @@ pub struct TransformedGlyphQuad {
     pub character: char,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TransformedPanelQuad {
+    pub corners: [[f32; 2]; 4],
+    pub color: [f32; 4],
+    pub effect: PanelEffect,
+    pub data: [f32; 4],
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SpriteId {
     Terminal,
@@ -361,8 +370,10 @@ pub struct RenderScene {
     pub panels: Vec<PanelRect>,
     pub glyphs: Vec<GlyphQuad>,
     pub transformed_glyphs: Vec<TransformedGlyphQuad>,
+    pub transformed_glyph_clip_rect: Option<RECT>,
     pub sprites: Vec<SpriteQuad>,
     pub overlay_panels: Vec<PanelRect>,
+    pub overlay_transformed_panels: Vec<TransformedPanelQuad>,
     pub overlay_glyphs: Vec<GlyphQuad>,
 }
 
@@ -400,6 +411,7 @@ pub struct D3d12PanelRenderer {
     glyph_cache: HashMap<char, SlugGlyph>,
     cached_chars: Vec<char>,
     glyph_cache_generation: u64,
+    transformed_glyph_clip_rect: Option<RECT>,
     viewport: D3D12_VIEWPORT,
     scissor_rect: RECT,
     width: u32,
@@ -869,6 +881,7 @@ impl D3d12PanelRenderer {
             glyph_cache: HashMap::new(),
             cached_chars: Vec::new(),
             glyph_cache_generation: 0,
+            transformed_glyph_clip_rect: None,
             viewport,
             scissor_rect,
             width,
@@ -1030,6 +1043,9 @@ impl D3d12PanelRenderer {
 
     #[cfg_attr(feature = "tracy", instrument(level = "debug", skip_all))]
     pub fn render_fragments(&mut self, scenes: &[&RenderScene]) -> eyre::Result<()> {
+        self.transformed_glyph_clip_rect = scenes
+            .iter()
+            .find_map(|scene| scene.transformed_glyph_clip_rect);
         {
             #[cfg(feature = "tracy")]
             let _span = debug_span!("update_slug_curves").entered();
@@ -1055,6 +1071,7 @@ impl D3d12PanelRenderer {
         }
 
         if let Some(scene) = frame.scene.as_ref() {
+            self.transformed_glyph_clip_rect = scene.transformed_glyph_clip_rect;
             let _glyph_cache_changed = {
                 #[cfg(feature = "tracy")]
                 let _span = debug_span!("update_slug_curves").entered();
@@ -1076,6 +1093,7 @@ impl D3d12PanelRenderer {
             frame.title.as_deref(),
             frame.window_chrome_buttons_state,
         );
+        self.transformed_glyph_clip_rect = None;
         let (terminal_scenes, terminal_reused) = terminal_scene_fragments(
             &mut scene_cache.terminal,
             frame.layout,
@@ -1449,6 +1467,15 @@ impl D3d12PanelRenderer {
         let elapsed_seconds = self.animation_start.elapsed().as_secs_f32();
         let mut params =
             build_shader_params(self.width as f32, self.height as f32, elapsed_seconds);
+        params.transformed_text_clip_rect = self.transformed_glyph_clip_rect.map_or(
+            [-1.0, -1.0, -1.0, -1.0],
+            |rect| [
+                rect.left as f32,
+                rect.top as f32,
+                rect.right as f32,
+                rect.bottom as f32,
+            ],
+        );
         params.sprite_atlas = [
             self.sprite_atlas.width as f32,
             self.sprite_atlas.height as f32,
@@ -1537,6 +1564,7 @@ fn build_scene_vertices_with_assets(
             + scene.glyphs.len()
             + scene.transformed_glyphs.len()
             + scene.overlay_panels.len()
+            + scene.overlay_transformed_panels.len()
             + scene.overlay_glyphs.len())
             * 6,
     );
@@ -1586,6 +1614,15 @@ fn build_scene_vertices_with_assets(
             panel.effect as u32,
             0,
             [0.0, 0.0, 1.0, 1.0],
+            panel.data,
+        );
+    }
+    for panel in &scene.overlay_transformed_panels {
+        append_transformed_panel_quad(
+            &mut vertices,
+            panel.corners,
+            panel.color,
+            panel.effect,
             panel.data,
         );
     }
@@ -1850,8 +1887,10 @@ fn build_terminal_row_scene(
         panels: Vec::with_capacity(row.backgrounds.len()),
         glyphs: Vec::with_capacity(row.glyphs.len()),
         transformed_glyphs: Vec::new(),
+        transformed_glyph_clip_rect: None,
         sprites: Vec::new(),
         overlay_panels: Vec::new(),
+        overlay_transformed_panels: Vec::new(),
         overlay_glyphs: Vec::new(),
     };
 
@@ -1887,8 +1926,10 @@ fn build_terminal_cursor_scene(
         panels: Vec::new(),
         glyphs: Vec::new(),
         transformed_glyphs: Vec::new(),
+        transformed_glyph_clip_rect: None,
         sprites: Vec::new(),
         overlay_panels: Vec::with_capacity(4),
+        overlay_transformed_panels: Vec::new(),
         overlay_glyphs: Vec::new(),
     };
     let cell_rect = terminal_cell_rect(terminal_rect, cursor.cell, cell_width, cell_height);
@@ -1913,8 +1954,10 @@ fn build_terminal_scrollbar_scene(
         panels: Vec::with_capacity(2),
         glyphs: Vec::new(),
         transformed_glyphs: Vec::new(),
+        transformed_glyph_clip_rect: None,
         sprites: Vec::new(),
         overlay_panels: Vec::new(),
+        overlay_transformed_panels: Vec::new(),
         overlay_glyphs: Vec::new(),
     };
     if scrollbar_rect.width() <= 0 || scrollbar_rect.height() <= 0 {
@@ -2090,8 +2133,10 @@ pub fn build_panel_scene(
         panels: Vec::with_capacity(10),
         glyphs: Vec::with_capacity(2_048),
         transformed_glyphs: Vec::new(),
+        transformed_glyph_clip_rect: None,
         sprites: Vec::new(),
         overlay_panels: Vec::with_capacity(16),
+        overlay_transformed_panels: Vec::new(),
         overlay_glyphs: Vec::new(),
     };
     push_panel(
@@ -2375,6 +2420,24 @@ pub fn push_overlay_text_block(
 
         cursor_x += glyph_width;
     }
+}
+
+pub fn push_overlay_transformed_panel(
+    scene: &mut RenderScene,
+    corners: [[f32; 2]; 4],
+    color: [f32; 4],
+    effect: PanelEffect,
+    data: [f32; 4],
+) {
+    if scene.overlay_transformed_panels.len() >= MAX_PANEL_COUNT {
+        return;
+    }
+    scene.overlay_transformed_panels.push(TransformedPanelQuad {
+        corners,
+        color,
+        effect,
+        data,
+    });
 }
 
 pub fn push_sprite(scene: &mut RenderScene, rect: RECT, color: [f32; 4], sprite: SpriteId) {
@@ -4854,6 +4917,7 @@ fn build_shader_params(width: f32, height: f32, elapsed_seconds: f32) -> ShaderP
         ],
         slug_viewport: [safe_width, safe_height, 0.0, 0.0],
         scene_time: [elapsed_seconds, 0.0, 0.0, 0.0],
+        transformed_text_clip_rect: [-1.0, -1.0, -1.0, -1.0],
         sprite_atlas: [1.0, 1.0, 0.0, 0.0],
     }
 }
@@ -5831,6 +5895,78 @@ fn append_transformed_text_quad(
     ]);
 }
 
+fn append_transformed_panel_quad(
+    vertices: &mut Vec<Vertex>,
+    corners: [[f32; 2]; 4],
+    color: [f32; 4],
+    effect: PanelEffect,
+    data: [f32; 4],
+) {
+    if vertices.len() + 6 > MAX_VERTEX_COUNT {
+        return;
+    }
+
+    let [top_left_corner, top_right_corner, bottom_right_corner, bottom_left_corner] = corners;
+    let effect = effect as u32 as f32;
+    let top_left = Vertex {
+        position: [top_left_corner[0], top_left_corner[1], 0.0],
+        color,
+        uv: [0.0, 0.0],
+        effect,
+        glyph: 0.0,
+        glyph_data: data,
+        banding: [0.0; 4],
+        normal: [0.0; 2],
+        jacobian: [0.0; 4],
+        _padding: [0.0; 2],
+    };
+    let top_right = Vertex {
+        position: [top_right_corner[0], top_right_corner[1], 0.0],
+        color,
+        uv: [1.0, 0.0],
+        effect,
+        glyph: 0.0,
+        glyph_data: data,
+        banding: [0.0; 4],
+        normal: [0.0; 2],
+        jacobian: [0.0; 4],
+        _padding: [0.0; 2],
+    };
+    let bottom_right = Vertex {
+        position: [bottom_right_corner[0], bottom_right_corner[1], 0.0],
+        color,
+        uv: [1.0, 1.0],
+        effect,
+        glyph: 0.0,
+        glyph_data: data,
+        banding: [0.0; 4],
+        normal: [0.0; 2],
+        jacobian: [0.0; 4],
+        _padding: [0.0; 2],
+    };
+    let bottom_left = Vertex {
+        position: [bottom_left_corner[0], bottom_left_corner[1], 0.0],
+        color,
+        uv: [0.0, 1.0],
+        effect,
+        glyph: 0.0,
+        glyph_data: data,
+        banding: [0.0; 4],
+        normal: [0.0; 2],
+        jacobian: [0.0; 4],
+        _padding: [0.0; 2],
+    };
+
+    vertices.extend_from_slice(&[
+        top_left,
+        top_right,
+        bottom_right,
+        top_left,
+        bottom_right,
+        bottom_left,
+    ]);
+}
+
 #[cfg(test)]
 fn append_rect(
     vertices: &mut Vec<Vertex>,
@@ -5997,8 +6133,10 @@ mod tests {
             panels: Vec::new(),
             glyphs: Vec::new(),
             transformed_glyphs: Vec::new(),
+            transformed_glyph_clip_rect: None,
             sprites: Vec::new(),
             overlay_panels: Vec::new(),
+            overlay_transformed_panels: Vec::new(),
             overlay_glyphs: Vec::new(),
         };
         push_text_block(
@@ -6046,8 +6184,10 @@ mod tests {
             panels: Vec::new(),
             glyphs: Vec::new(),
             transformed_glyphs: Vec::new(),
+            transformed_glyph_clip_rect: None,
             sprites: Vec::new(),
             overlay_panels: Vec::new(),
+            overlay_transformed_panels: Vec::new(),
             overlay_glyphs: Vec::new(),
         };
         push_centered_text(
@@ -6071,8 +6211,10 @@ mod tests {
             panels: Vec::new(),
             glyphs: Vec::new(),
             transformed_glyphs: Vec::new(),
+            transformed_glyph_clip_rect: None,
             sprites: Vec::new(),
             overlay_panels: Vec::new(),
+            overlay_transformed_panels: Vec::new(),
             overlay_glyphs: Vec::new(),
         };
         push_title_text(
@@ -6511,8 +6653,10 @@ mod tests {
             panels: Vec::new(),
             glyphs: Vec::new(),
             transformed_glyphs: Vec::new(),
+            transformed_glyph_clip_rect: None,
             sprites: Vec::new(),
             overlay_panels: Vec::new(),
+            overlay_transformed_panels: Vec::new(),
             overlay_glyphs: Vec::new(),
         };
         push_glyph(
@@ -6551,8 +6695,10 @@ mod tests {
             panels: Vec::new(),
             glyphs: Vec::new(),
             transformed_glyphs: Vec::new(),
+            transformed_glyph_clip_rect: None,
             sprites: Vec::new(),
             overlay_panels: Vec::new(),
+            overlay_transformed_panels: Vec::new(),
             overlay_glyphs: Vec::new(),
         };
 

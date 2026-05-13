@@ -51,6 +51,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     HTTRANSPARENT, HWND_NOTOPMOST, HWND_TOPMOST, IDC_ARROW, IDC_CROSS, IDC_HAND, IDC_HELP,
     IDC_IBEAM, IDC_SIZEALL, IDC_SIZEWE, IDC_WAIT, IsWindowVisible, IsZoomed,
     LoadCursorW, MSG, MoveWindow, PostMessageW, PostQuitMessage, RegisterClassExW,
+    SetForegroundWindow,
     SM_CXPADDEDBORDER, SM_CXSCREEN, SM_CXSIZEFRAME, SM_CXVIRTUALSCREEN, SM_CYSCREEN,
     SM_CYSIZEFRAME, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SW_HIDE, SW_MAXIMIZE,
     SW_MINIMIZE, SW_RESTORE, SW_SHOW, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
@@ -201,17 +202,23 @@ thread_local! {
     static SCENE_APP_STATE: RefCell<Option<SceneAppState>> = const { RefCell::new(None) };
 }
 
-fn scene_window_registry() -> &'static Mutex<Vec<isize>> {
-    static SCENE_WINDOW_REGISTRY: OnceLock<Mutex<Vec<isize>>> = OnceLock::new();
+fn scene_window_registry() -> &'static Mutex<Vec<RegisteredSceneWindow>> {
+    static SCENE_WINDOW_REGISTRY: OnceLock<Mutex<Vec<RegisteredSceneWindow>>> = OnceLock::new();
 
     SCENE_WINDOW_REGISTRY.get_or_init(|| Mutex::new(Vec::new()))
 }
 
-fn register_scene_window(hwnd: WindowHandle) {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RegisteredSceneWindow {
+    raw: isize,
+    kind: SceneWindowKind,
+}
+
+fn register_scene_window(hwnd: WindowHandle, kind: SceneWindowKind) {
     if let Ok(mut windows) = scene_window_registry().lock() {
         let raw = hwnd.raw().0 as isize;
-        if !windows.contains(&raw) {
-            windows.push(raw);
+        if !windows.iter().any(|window| window.raw == raw) {
+            windows.push(RegisteredSceneWindow { raw, kind });
         }
     }
 }
@@ -219,7 +226,26 @@ fn register_scene_window(hwnd: WindowHandle) {
 fn unregister_scene_window(hwnd: WindowHandle) {
     if let Ok(mut windows) = scene_window_registry().lock() {
         let raw = hwnd.raw().0 as isize;
-        windows.retain(|window| *window != raw);
+        windows.retain(|window| window.raw != raw);
+    }
+}
+
+fn focus_launcher_scene_window(excluding: WindowHandle) {
+    let Ok(windows) = scene_window_registry().lock() else {
+        return;
+    };
+    let Some(launcher) = windows.iter().rev().find(|window| {
+        window.kind == SceneWindowKind::Launcher && window.raw != excluding.raw().0 as isize
+    }) else {
+        return;
+    };
+    let hwnd = HWND(launcher.raw as *mut c_void);
+    if !unsafe { IsWindowVisible(hwnd) }.as_bool() {
+        return;
+    }
+    unsafe {
+        let _ = ShowWindow(hwnd, SW_RESTORE);
+        let _ = SetForegroundWindow(hwnd);
     }
 }
 
@@ -229,8 +255,8 @@ fn broadcast_demo_mode_state_changed() {
         return;
     };
 
-    for raw in windows.iter().copied() {
-        let hwnd = HWND(raw as *mut c_void);
+    for window in windows.iter().copied() {
+        let hwnd = HWND(window.raw as *mut c_void);
         // Safety: the registry stores HWND values for live scene windows and stale entries are tolerated by PostMessageW.
         let _ = unsafe {
             PostMessageW(
@@ -248,8 +274,8 @@ fn broadcast_timeline_document_changed() {
         return;
     };
 
-    for raw in windows.iter().copied() {
-        let hwnd = HWND(raw as *mut c_void);
+    for window in windows.iter().copied() {
+        let hwnd = HWND(window.raw as *mut c_void);
         // Safety: the registry stores HWND values for live scene windows and stale entries are tolerated by PostMessageW.
         let _ = unsafe {
             PostMessageW(
@@ -432,6 +458,7 @@ struct TextRenderingPlaygroundSharedState {
 struct TextRenderingGlyphInstanceCache {
     rect: ClientRect,
     render_revision: u64,
+    viewport: TextRenderingViewportState,
     glyphs: Vec<windows_scene::TextRenderingGlyphInstance>,
 }
 
@@ -1559,7 +1586,7 @@ fn update_text_rendering_preset(
     };
     shared.active_preset = preset;
     shared.text = text_rendering_preset_text(preset, &shared.sprite_sheet_sample);
-    mark_text_rendering_playground_changed(&mut shared, Instant::now());
+    mark_text_rendering_playground_content_changed(&mut shared, Instant::now());
     drop(shared);
     playground.broadcast_changed();
     Ok(())
@@ -1578,12 +1605,19 @@ fn text_rendering_viewport_mut(
     }
 }
 
-fn mark_text_rendering_playground_changed(
+fn note_text_rendering_playground_interaction(
     shared: &mut TextRenderingPlaygroundSharedState,
     when: Instant,
 ) {
-    shared.render_revision = shared.render_revision.wrapping_add(1);
     shared.last_interaction_at = Some(when);
+}
+
+fn mark_text_rendering_playground_content_changed(
+    shared: &mut TextRenderingPlaygroundSharedState,
+    when: Instant,
+) {
+    note_text_rendering_playground_interaction(shared, when);
+    shared.render_revision = shared.render_revision.wrapping_add(1);
 }
 
 fn cached_text_rendering_glyph_instances<'a>(
@@ -1597,11 +1631,16 @@ fn cached_text_rendering_glyph_instances<'a>(
     let cache_hit = state
         .text_rendering_glyph_cache
         .as_ref()
-        .is_some_and(|cache| cache.rect == rect && cache.render_revision == render_revision);
+        .is_some_and(|cache| {
+            cache.rect == rect
+                && cache.render_revision == render_revision
+                && cache.viewport == viewport
+        });
     if !cache_hit {
         state.text_rendering_glyph_cache = Some(TextRenderingGlyphInstanceCache {
             rect,
             render_revision,
+            viewport,
             glyphs: build_text_rendering_glyph_instances(rect, text, viewport, color),
         });
     }
@@ -1609,6 +1648,16 @@ fn cached_text_rendering_glyph_instances<'a>(
         .text_rendering_glyph_cache
         .as_ref()
         .map_or(&[], |cache| cache.glyphs.as_slice())
+}
+
+fn text_rendering_debug_overlay_view_state(
+    clip_rect: ClientRect,
+    glyphs: &[windows_scene::TextRenderingGlyphInstance],
+) -> windows_scene::TextRenderingDebugOverlayViewState {
+    windows_scene::TextRenderingDebugOverlayViewState {
+        clip_rect,
+        glyph_bounds: glyphs.iter().map(|glyph| glyph.corners).collect(),
+    }
 }
 
 fn open_text_rendering_playground_windows(
@@ -1639,16 +1688,6 @@ fn open_text_rendering_playground_windows(
             "teamy-studio-text-presets",
             SceneWindowKind::TextRenderingPlaygroundPresets,
             ScreenRect::new(left, top + height + gap_y, left + width, top + (height * 2) + gap_y),
-        ),
-        (
-            "teamy-studio-text-sprites",
-            SceneWindowKind::TextRenderingPlaygroundSpriteSheet,
-            ScreenRect::new(
-                left + width + gap_x,
-                top + height + gap_y,
-                left + (width * 2) + gap_x,
-                top + (height * 2) + gap_y,
-            ),
         ),
     ];
 
@@ -2878,7 +2917,7 @@ fn run_scene_window(
     });
 
     let hwnd = create_scene_window(window_thread, scene_kind)?;
-    register_scene_window(hwnd);
+    register_scene_window(hwnd, scene_kind);
     let renderer = RenderThreadProxy::new(hwnd.raw())?;
     let chrome_tooltip = ChromeTooltipController::create(hwnd)?;
     with_scene_app_state(|state| {
@@ -3882,8 +3921,10 @@ fn render_toast_host(state: &mut ToastHostState) -> eyre::Result<()> {
         panels: Vec::new(),
         glyphs: Vec::new(),
         transformed_glyphs: Vec::new(),
+        transformed_glyph_clip_rect: None,
         sprites: Vec::new(),
         overlay_panels: Vec::new(),
+        overlay_transformed_panels: Vec::new(),
         overlay_glyphs: Vec::new(),
     };
     windows_scene::push_info_toasts(&mut scene, layout, &toast_view_states(state, now));
@@ -4969,6 +5010,16 @@ fn handle_scene_key_down_message(
 
 fn handle_scene_destroy_message(hwnd: WindowHandle) -> LRESULT {
     hwnd.clear_focused_render_timer();
+    let should_focus_launcher = SCENE_APP_STATE.with(|state| {
+        state.borrow().as_ref().is_some_and(|state| {
+            matches!(
+                state.scene_kind,
+                SceneWindowKind::TextRenderingPlaygroundPlane
+                    | SceneWindowKind::TextRenderingPlaygroundEditor
+                    | SceneWindowKind::TextRenderingPlaygroundPresets
+            )
+        })
+    });
     unregister_scene_window(hwnd);
     SCENE_APP_STATE.with(|state| {
         if let Some(state) = state.borrow_mut().as_mut() {
@@ -4979,6 +5030,9 @@ fn handle_scene_destroy_message(hwnd: WindowHandle) -> LRESULT {
         }
         let _ = state.borrow_mut().take();
     });
+    if should_focus_launcher {
+        focus_launcher_scene_window(hwnd);
+    }
     hwnd.post_quit_message();
     LRESULT(0)
 }
@@ -5153,6 +5207,7 @@ fn handle_scene_left_button_down(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Re
         }
 
         if state.diagnostics_visible
+            && !matches!(state.scene_kind, SceneWindowKind::TextRenderingPlaygroundPlane)
             && let Some(cell) = scene_diagnostic_cell_from_client_point(
                 layout,
                 point,
@@ -5180,8 +5235,7 @@ fn handle_scene_left_button_down(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Re
             return Ok(ScenePointerAction::RenderOnly);
         }
 
-        if !state.diagnostics_visible
-            && state.scene_kind == SceneWindowKind::TextRenderingPlaygroundPlane
+        if state.scene_kind == SceneWindowKind::TextRenderingPlaygroundPlane
             && windows_scene::text_rendering_plane_interaction_rect(layout).contains(point)
         {
             let viewport = state
@@ -6187,9 +6241,8 @@ fn handle_scene_mouse_move(
                 ];
             }
         }
-        mark_text_rendering_playground_changed(&mut shared, Instant::now());
+        note_text_rendering_playground_interaction(&mut shared, Instant::now());
         drop(shared);
-        playground.broadcast_changed();
         Ok(true)
     })?;
     if text_rendering_dragging {
@@ -6617,8 +6670,7 @@ fn handle_scene_middle_button_down(hwnd: WindowHandle, lparam: LPARAM) -> eyre::
         state.pointer_position = Some(point);
         state.chrome_tooltip.hide(hwnd);
         let layout = scene_client_layout(hwnd, state)?;
-        if state.diagnostics_visible
-            || !matches!(
+        if !matches!(
                 state.scene_kind,
                 SceneWindowKind::TextRenderingPlaygroundPlane
                     | SceneWindowKind::TextRenderingPlaygroundSpriteSheet
@@ -6700,7 +6752,7 @@ fn handle_scene_right_button_down(hwnd: WindowHandle, lparam: LPARAM) -> eyre::R
                 && let Ok(mut shared) = playground.shared.lock()
             {
                 shared.text.clear();
-                mark_text_rendering_playground_changed(&mut shared, Instant::now());
+                mark_text_rendering_playground_content_changed(&mut shared, Instant::now());
                 drop(shared);
                 playground.broadcast_changed();
             }
@@ -6708,8 +6760,7 @@ fn handle_scene_right_button_down(hwnd: WindowHandle, lparam: LPARAM) -> eyre::R
             return Ok(true);
         }
 
-        if !state.diagnostics_visible
-            && matches!(
+        if matches!(
                 state.scene_kind,
                 SceneWindowKind::TextRenderingPlaygroundPlane
                     | SceneWindowKind::TextRenderingPlaygroundSpriteSheet
@@ -6741,10 +6792,9 @@ fn handle_scene_right_button_down(hwnd: WindowHandle, lparam: LPARAM) -> eyre::R
                             text_rendering_viewport_mut(&mut shared, state.scene_kind)
                         {
                             *viewport = TextRenderingViewportState::default();
-                            mark_text_rendering_playground_changed(&mut shared, now);
+                            note_text_rendering_playground_interaction(&mut shared, now);
                         }
                     }
-                    playground.broadcast_changed();
                 }
                 state.text_rendering_last_right_button_down_at = None;
                 state.text_rendering_last_right_button_down_point = None;
@@ -6854,7 +6904,7 @@ fn handle_scene_mouse_wheel(
             state.scene_kind,
             SceneWindowKind::TextRenderingPlaygroundPlane
                 | SceneWindowKind::TextRenderingPlaygroundSpriteSheet
-        ) && !state.diagnostics_visible
+        )
         {
             let interaction_rect = windows_scene::text_rendering_plane_interaction_rect(layout);
             if !interaction_rect.contains(point) {
@@ -6870,20 +6920,14 @@ fn handle_scene_mouse_wheel(
                     && let Some(viewport) = text_rendering_viewport_mut(&mut shared, state.scene_kind)
                 {
                     let factor = if wheel_delta > 0 { 1.12 } else { 1.0 / 1.12 };
-                    let center = [
-                        (interaction_rect.left() + interaction_rect.width() / 2) as f32
-                            + viewport.camera_offset[0]
-                            + viewport.plane_offset[0],
-                        (interaction_rect.top() + interaction_rect.height() / 2) as f32
-                            + viewport.camera_offset[1]
-                            + viewport.plane_offset[1],
-                    ];
-                    viewport.zoom = (viewport.zoom * factor).max(0.05);
-                    viewport.plane_offset[0] += (point_pixels.x as f32 - center[0]) * (1.0 - factor);
-                    viewport.plane_offset[1] += (point_pixels.y as f32 - center[1]) * (1.0 - factor);
-                    mark_text_rendering_playground_changed(&mut shared, Instant::now());
+                    zoom_text_rendering_viewport_about_cursor(
+                        viewport,
+                        interaction_rect,
+                        [point_pixels.x as f32, point_pixels.y as f32],
+                        factor,
+                    );
+                    note_text_rendering_playground_interaction(&mut shared, Instant::now());
                 }
-                playground.broadcast_changed();
             }
             render_scene_window_frame(state, hwnd, None, false)?;
             return Ok(true);
@@ -7262,7 +7306,7 @@ fn handle_scene_char_message(
                 }
                 _ => return Ok(false),
             }
-            mark_text_rendering_playground_changed(&mut shared, Instant::now());
+            mark_text_rendering_playground_content_changed(&mut shared, Instant::now());
         }
         if let Some(playground) = playground {
             playground.broadcast_changed();
@@ -7824,7 +7868,13 @@ fn render_scene_window_frame(
             state.diagnostic_cell_width,
             state.diagnostic_cell_height,
         )
-    } else if state.diagnostics_visible {
+    } else if state.diagnostics_visible
+        && !matches!(
+            state.scene_kind,
+            SceneWindowKind::TextRenderingPlaygroundPlane
+                | SceneWindowKind::TextRenderingPlaygroundSpriteSheet
+        )
+    {
         windows_scene::build_scene_diagnostic_render_scene(
             layout,
             state.scene_kind,
@@ -7929,18 +7979,23 @@ fn render_scene_window_frame(
         let text = shared.text.clone();
         let view_state = text_rendering_plane_view_state(&shared);
         drop(shared);
+        let diagnostics_visible = state.diagnostics_visible;
+        let glyphs = cached_text_rendering_glyph_instances(
+            state,
+            interaction_rect,
+            render_revision,
+            &text,
+            viewport,
+            [0.88, 0.94, 1.0, 1.0],
+        );
+        let debug_overlay = diagnostics_visible
+            .then(|| text_rendering_debug_overlay_view_state(interaction_rect, glyphs));
         windows_scene::build_text_rendering_plane_render_scene(
             layout,
             window_chrome_buttons_state,
             view_state,
-            cached_text_rendering_glyph_instances(
-                state,
-                interaction_rect,
-                render_revision,
-                &text,
-                viewport,
-                [0.88, 0.94, 1.0, 1.0],
-            ),
+            glyphs,
+            debug_overlay.as_ref(),
         )
     } else if state.scene_kind == SceneWindowKind::TextRenderingPlaygroundEditor {
         let shared = state
@@ -7966,18 +8021,23 @@ fn render_scene_window_frame(
         let sprite_sheet_sample = shared.sprite_sheet_sample.clone();
         let view_state = text_rendering_sprite_sheet_view_state(&shared);
         drop(shared);
+        let diagnostics_visible = state.diagnostics_visible;
+        let glyphs = cached_text_rendering_glyph_instances(
+            state,
+            interaction_rect,
+            render_revision,
+            &sprite_sheet_sample,
+            viewport,
+            [0.84, 0.98, 0.90, 1.0],
+        );
+        let debug_overlay = diagnostics_visible
+            .then(|| text_rendering_debug_overlay_view_state(interaction_rect, glyphs));
         windows_scene::build_text_rendering_sprite_sheet_render_scene(
             layout,
             window_chrome_buttons_state,
             view_state,
-            cached_text_rendering_glyph_instances(
-                state,
-                interaction_rect,
-                render_revision,
-                &sprite_sheet_sample,
-                viewport,
-                [0.84, 0.98, 0.90, 1.0],
-            ),
+            glyphs,
+            debug_overlay.as_ref(),
         )
     } else if state.scene_kind == SceneWindowKind::TimelinePlayground {
         let pointer_position = state.pointer_position;
@@ -8834,6 +8894,103 @@ fn rotate_text_rendering_vector_3d(
         (yaw_rotated[1] * pitch_cos) - (yaw_rotated[2] * pitch_sin),
         (yaw_rotated[1] * pitch_sin) + (yaw_rotated[2] * pitch_cos),
     ]
+}
+
+fn inverse_rotate_text_rendering_vector_3d(
+    vector: [f32; 3],
+    yaw_radians: f32,
+    pitch_radians: f32,
+) -> [f32; 3] {
+    let (pitch_sin, pitch_cos) = pitch_radians.sin_cos();
+    let pitch_unrotated = [
+        vector[0],
+        (vector[1] * pitch_cos) + (vector[2] * pitch_sin),
+        (-vector[1] * pitch_sin) + (vector[2] * pitch_cos),
+    ];
+    let (yaw_sin, yaw_cos) = yaw_radians.sin_cos();
+    [
+        (pitch_unrotated[0] * yaw_cos) - (pitch_unrotated[2] * yaw_sin),
+        pitch_unrotated[1],
+        (pitch_unrotated[0] * yaw_sin) + (pitch_unrotated[2] * yaw_cos),
+    ]
+}
+
+fn text_rendering_plane_center(
+    rect: ClientRect,
+    viewport: TextRenderingViewportState,
+) -> [f32; 2] {
+    [
+        (rect.left() + rect.width() / 2) as f32 + viewport.camera_offset[0] + viewport.plane_offset[0],
+        (rect.top() + rect.height() / 2) as f32 + viewport.camera_offset[1] + viewport.plane_offset[1],
+    ]
+}
+
+fn unproject_text_rendering_screen_point_to_plane(
+    viewport: TextRenderingViewportState,
+    center: [f32; 2],
+    screen_point: [f32; 2],
+) -> Option<[f32; 2]> {
+    let plane_normal = rotate_text_rendering_vector_3d(
+        [0.0, 0.0, 1.0],
+        viewport.yaw_radians,
+        viewport.pitch_radians,
+    );
+    let camera = [0.0, 0.0, TEXT_RENDERING_CAMERA_DISTANCE];
+    let ray_direction = [
+        screen_point[0] - center[0],
+        screen_point[1] - center[1],
+        -TEXT_RENDERING_CAMERA_DISTANCE,
+    ];
+    let denominator = dot_text_rendering_vector_3d(plane_normal, ray_direction);
+    if denominator.abs() <= 0.0001 {
+        return None;
+    }
+    let t = -dot_text_rendering_vector_3d(plane_normal, camera) / denominator;
+    if !t.is_finite() || t <= 0.0 {
+        return None;
+    }
+    let plane_point = [
+        camera[0] + (ray_direction[0] * t),
+        camera[1] + (ray_direction[1] * t),
+        camera[2] + (ray_direction[2] * t),
+    ];
+    let local = inverse_rotate_text_rendering_vector_3d(
+        plane_point,
+        viewport.yaw_radians,
+        viewport.pitch_radians,
+    );
+    Some([local[0], local[1]])
+}
+
+fn dot_text_rendering_vector_3d(left: [f32; 3], right: [f32; 3]) -> f32 {
+    (left[0] * right[0]) + (left[1] * right[1]) + (left[2] * right[2])
+}
+
+fn zoom_text_rendering_viewport_about_cursor(
+    viewport: &mut TextRenderingViewportState,
+    rect: ClientRect,
+    cursor: [f32; 2],
+    factor: f32,
+) {
+    let center = text_rendering_plane_center(rect, *viewport);
+    let anchored_local = unproject_text_rendering_screen_point_to_plane(*viewport, center, cursor);
+    viewport.zoom = (viewport.zoom * factor).max(0.05);
+    let Some(anchored_local) = anchored_local else {
+        viewport.plane_offset[0] += (cursor[0] - center[0]) * (1.0 - factor);
+        viewport.plane_offset[1] += (cursor[1] - center[1]) * (1.0 - factor);
+        return;
+    };
+    let scaled_anchor = [anchored_local[0] * factor, anchored_local[1] * factor, 0.0];
+    let projected_anchor = project_text_rendering_point(
+        rotate_text_rendering_vector_3d(
+            scaled_anchor,
+            viewport.yaw_radians,
+            viewport.pitch_radians,
+        ),
+        center,
+    );
+    viewport.plane_offset[0] += cursor[0] - projected_anchor[0];
+    viewport.plane_offset[1] += cursor[1] - projected_anchor[1];
 }
 
 fn project_text_rendering_point(point: [f32; 3], center: [f32; 2]) -> [f32; 2] {
@@ -14218,8 +14375,7 @@ fn scene_cursor_for_point(
         return Some(IDC_IBEAM);
     }
 
-    if !state.diagnostics_visible
-        && matches!(
+    if matches!(
             state.scene_kind,
             SceneWindowKind::TextRenderingPlaygroundPlane
                 | SceneWindowKind::TextRenderingPlaygroundSpriteSheet
@@ -14665,10 +14821,6 @@ fn text_rendering_scene_tooltip(
     layout: TerminalLayout,
     point: ClientPoint,
 ) -> Option<(&'static str, ClientRect)> {
-    if state.diagnostics_visible {
-        return None;
-    }
-
     match state.scene_kind {
         SceneWindowKind::TextRenderingPlaygroundEditor => {
             if state.text_rendering_editor_focused {

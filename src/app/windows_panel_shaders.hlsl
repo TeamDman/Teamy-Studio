@@ -30,6 +30,7 @@ cbuffer ParamStruct : register(b0)
     float4 slug_matrix[4];
     float4 slug_viewport;
     float4 scene_time;
+    float4 transformed_text_clip_rect;
     float4 sprite_atlas;
 };
 
@@ -486,6 +487,13 @@ float4 apply_cursor_latency_ripple(float2 uv, float4 color, float4 state) {
 
 float4 PSMain(PsInput input) : SV_TARGET {
     if (input.effect > 11.5 && input.effect < 12.5) {
+        if (transformed_text_clip_rect.z >= 0.0
+            && (input.position.x < transformed_text_clip_rect.x
+                || input.position.y < transformed_text_clip_rect.y
+                || input.position.x >= transformed_text_clip_rect.z
+                || input.position.y >= transformed_text_clip_rect.w)) {
+            discard;
+        }
         float coverage = slug_coverage(input.uv, input.glyph, input.glyphData, input.banding);
         return premultiply_alpha(float4(input.color.rgb, input.color.a * coverage));
     }

@@ -37,8 +37,8 @@ use super::windows_audio_input::{
 use super::windows_d3d12_renderer::{
     ButtonVisualState, PanelEffect, RenderScene, SpriteId, WindowChromeButtonsState,
     preferred_background_color, preferred_title_bar_color, push_centered_text, push_glyph,
-    push_overlay_panel, push_overlay_text_block, push_panel, push_panel_with_data, push_sprite,
-    push_text_block, push_title_text,
+    push_overlay_panel, push_overlay_text_block, push_overlay_transformed_panel, push_panel,
+    push_panel_with_data, push_sprite, push_text_block, push_title_text,
     push_transformed_glyph,
     push_window_chrome_buttons, push_window_garden_frame,
 };
@@ -389,6 +389,12 @@ pub struct TextRenderingGlyphInstance {
     pub character: char,
     pub color: [f32; 4],
     pub corners: [[f32; 2]; 4],
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct TextRenderingDebugOverlayViewState {
+    pub clip_rect: ClientRect,
+    pub glyph_bounds: Vec<[[f32; 2]; 4]>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1171,6 +1177,7 @@ pub fn build_text_rendering_plane_render_scene(
     window_chrome_buttons_state: WindowChromeButtonsState,
     view_state: TextRenderingPlaneViewState,
     glyphs: &[TextRenderingGlyphInstance],
+    debug_overlay: Option<&TextRenderingDebugOverlayViewState>,
 ) -> RenderScene {
     let workspace = text_rendering_workspace_layout(layout);
     let mut scene = build_scene_shell(
@@ -1178,6 +1185,7 @@ pub fn build_text_rendering_plane_render_scene(
         SceneWindowKind::TextRenderingPlaygroundPlane,
         window_chrome_buttons_state,
     );
+    scene.transformed_glyph_clip_rect = Some(workspace.content_rect.to_win32_rect());
     push_panel(
         &mut scene,
         workspace.body_rect.to_win32_rect(),
@@ -1227,6 +1235,9 @@ pub fn build_text_rendering_plane_render_scene(
     for glyph in glyphs {
         push_transformed_glyph(&mut scene, glyph.corners, glyph.character, glyph.color);
     }
+    if let Some(debug_overlay) = debug_overlay {
+        push_text_rendering_debug_overlay(&mut scene, debug_overlay);
+    }
     scene
 }
 
@@ -1253,11 +1264,11 @@ pub fn build_text_rendering_editor_render_scene(
     push_title_text(
         &mut scene,
         workspace.title_rect.to_win32_rect(),
-        "Text input",
+        "Shared text input",
         [1.0, 0.95, 0.90, 1.0],
     );
     let summary = format!(
-        "Preset: {}   Focus: {}   Characters: {}",
+        "Preset: {}   Focus: {}   Characters: {}   Plane: live",
         view_state.active_preset.label(),
         if view_state.focused { "focused" } else { "idle" },
         view_state.text.chars().count(),
@@ -1301,7 +1312,7 @@ pub fn build_text_rendering_editor_render_scene(
     push_text_block(
         &mut scene,
         workspace.footer_rect.to_win32_rect(),
-        "Left click focuses the editor. Type to update the plane. Right click clears the text. Press Esc to defocus. Presets replace the whole buffer.",
+        "Left click focuses the editor. Type to update the same text the plane renders. Right click clears the text. Press Esc to defocus. Presets replace the whole buffer.",
         9,
         16,
         [0.94, 0.83, 0.70, 1.0],
@@ -1315,6 +1326,7 @@ pub fn build_text_rendering_sprite_sheet_render_scene(
     window_chrome_buttons_state: WindowChromeButtonsState,
     view_state: TextRenderingSpriteSheetViewState,
     glyphs: &[TextRenderingGlyphInstance],
+    debug_overlay: Option<&TextRenderingDebugOverlayViewState>,
 ) -> RenderScene {
     let workspace = text_rendering_workspace_layout(layout);
     let mut scene = build_scene_shell(
@@ -1370,7 +1382,49 @@ pub fn build_text_rendering_sprite_sheet_render_scene(
     for glyph in glyphs {
         push_transformed_glyph(&mut scene, glyph.corners, glyph.character, glyph.color);
     }
+    if let Some(debug_overlay) = debug_overlay {
+        push_text_rendering_debug_overlay(&mut scene, debug_overlay);
+    }
     scene
+}
+
+fn push_text_rendering_debug_overlay(
+    scene: &mut RenderScene,
+    debug_overlay: &TextRenderingDebugOverlayViewState,
+) {
+    let clip_rect = debug_overlay.clip_rect;
+    push_overlay_panel(
+        scene,
+        clip_rect.to_win32_rect(),
+        [0.16, 0.62, 1.0, 0.08],
+        PanelEffect::TerminalFill,
+    );
+
+    let border_thickness = 2;
+    let borders = [
+        ClientRect::new(clip_rect.left(), clip_rect.top(), clip_rect.right(), clip_rect.top() + border_thickness),
+        ClientRect::new(clip_rect.left(), clip_rect.bottom() - border_thickness, clip_rect.right(), clip_rect.bottom()),
+        ClientRect::new(clip_rect.left(), clip_rect.top(), clip_rect.left() + border_thickness, clip_rect.bottom()),
+        ClientRect::new(clip_rect.right() - border_thickness, clip_rect.top(), clip_rect.right(), clip_rect.bottom()),
+    ];
+    for border in borders {
+        push_overlay_panel(
+            scene,
+            border.to_win32_rect(),
+            [0.24, 0.86, 1.0, 0.92],
+            PanelEffect::TerminalFill,
+        );
+    }
+
+    for glyph_bounds in &debug_overlay.glyph_bounds {
+        push_overlay_transformed_panel(
+            scene,
+            *glyph_bounds,
+            [1.0, 0.36, 0.64, 0.18],
+            PanelEffect::TerminalFill,
+            [0.0; 4],
+        );
+    }
 }
 
 #[must_use]
@@ -1764,6 +1818,10 @@ pub fn build_timeline_playground_detail_diagnostic_render_scene(
     scene.glyphs.extend(diagnostic_scene.glyphs);
     scene.sprites.extend(diagnostic_scene.sprites);
     scene.overlay_panels.extend(diagnostic_scene.overlay_panels);
+    scene
+        .overlay_transformed_panels
+        .extend(diagnostic_scene.overlay_transformed_panels);
+    scene.overlay_glyphs.extend(diagnostic_scene.overlay_glyphs);
     scene
 }
 
@@ -8713,6 +8771,10 @@ fn push_selectable_text_block(
     scene.glyphs.extend(text_scene.glyphs);
     scene.sprites.extend(text_scene.sprites);
     scene.overlay_panels.extend(text_scene.overlay_panels);
+    scene
+        .overlay_transformed_panels
+        .extend(text_scene.overlay_transformed_panels);
+    scene.overlay_glyphs.extend(text_scene.overlay_glyphs);
 }
 
 // timeline[impl playground.detail-vt-text]
@@ -8994,6 +9056,10 @@ pub fn build_scene_diagnostic_render_scene(
     scene.sprites.extend(diagnostic_scene.sprites);
     scene.overlay_panels.extend(diagnostic_scene.overlay_panels);
     scene
+        .overlay_transformed_panels
+        .extend(diagnostic_scene.overlay_transformed_panels);
+    scene.overlay_glyphs.extend(diagnostic_scene.overlay_glyphs);
+    scene
 }
 
 #[must_use]
@@ -9025,6 +9091,10 @@ pub fn build_launcher_diagnostic_render_scene(
     scene.glyphs.extend(diagnostic_scene.glyphs);
     scene.sprites.extend(diagnostic_scene.sprites);
     scene.overlay_panels.extend(diagnostic_scene.overlay_panels);
+    scene
+        .overlay_transformed_panels
+        .extend(diagnostic_scene.overlay_transformed_panels);
+    scene.overlay_glyphs.extend(diagnostic_scene.overlay_glyphs);
     push_virtual_cursor_pointer(
         &mut scene,
         virtual_cursor,
@@ -9104,6 +9174,10 @@ pub fn build_audio_input_device_diagnostic_render_scene(
     scene.sprites.extend(diagnostic_scene.sprites);
     scene.overlay_panels.extend(diagnostic_scene.overlay_panels);
     scene
+        .overlay_transformed_panels
+        .extend(diagnostic_scene.overlay_transformed_panels);
+    scene.overlay_glyphs.extend(diagnostic_scene.overlay_glyphs);
+    scene
 }
 
 #[must_use]
@@ -9133,6 +9207,10 @@ pub fn build_audio_daemon_diagnostic_render_scene(
     scene.glyphs.extend(diagnostic_scene.glyphs);
     scene.sprites.extend(diagnostic_scene.sprites);
     scene.overlay_panels.extend(diagnostic_scene.overlay_panels);
+    scene
+        .overlay_transformed_panels
+        .extend(diagnostic_scene.overlay_transformed_panels);
+    scene.overlay_glyphs.extend(diagnostic_scene.overlay_glyphs);
     scene
 }
 
@@ -9990,8 +10068,10 @@ fn empty_render_scene() -> RenderScene {
         panels: Vec::new(),
         glyphs: Vec::new(),
         transformed_glyphs: Vec::new(),
+        transformed_glyph_clip_rect: None,
         sprites: Vec::new(),
         overlay_panels: Vec::new(),
+        overlay_transformed_panels: Vec::new(),
         overlay_glyphs: Vec::new(),
     }
 }
@@ -10169,8 +10249,10 @@ fn build_scene_shell(
         panels: Vec::new(),
         glyphs: Vec::new(),
         transformed_glyphs: Vec::new(),
+        transformed_glyph_clip_rect: None,
         sprites: Vec::new(),
         overlay_panels: Vec::new(),
+        overlay_transformed_panels: Vec::new(),
         overlay_glyphs: Vec::new(),
     };
 
@@ -10539,8 +10621,10 @@ mod tests {
             panels: Vec::new(),
             glyphs: Vec::new(),
             transformed_glyphs: Vec::new(),
+            transformed_glyph_clip_rect: None,
             sprites: Vec::new(),
             overlay_panels: Vec::new(),
+            overlay_transformed_panels: Vec::new(),
             overlay_glyphs: Vec::new(),
         };
         let view_state = LatencyOverlayViewState {
