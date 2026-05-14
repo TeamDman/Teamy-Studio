@@ -89,6 +89,14 @@ float4 project_transformed_text_point(float2 localPoint) {
     );
 }
 
+float4 transformed_clip_from_screen(float2 screenPoint, float clipW) {
+    float2 ndc = float2(
+        (screenPoint.x / max(slug_viewport.x, 1.0)) * 2.0 - 1.0,
+        1.0 - (screenPoint.y / max(slug_viewport.y, 1.0)) * 2.0
+    );
+    return float4(ndc * clipW, clipW * 0.5, clipW);
+}
+
 float2 reconstruct_transformed_local_point(float2 screenPoint) {
     float4 row0 = transformed_text_inverse_homography[0];
     float4 row1 = transformed_text_inverse_homography[1];
@@ -128,14 +136,12 @@ PsInput VSMain(VsInput input) {
     float2 position = input.position.xy;
     float2 uv = input.uv;
 
-    if (input.effect > 9.5 && any(input.normal != 0.0.xx)) {
-        if (input.debugData.y <= 0.5) {
-            position = SlugDilate(position, uv, input.normal, input.jacobian, uv);
-        }
+    if (input.effect > 9.5 && input.debugData.y <= 0.5 && any(input.normal != 0.0.xx)) {
+        position = SlugDilate(position, uv, input.normal, input.jacobian, uv);
     }
 
     if (input.debugData.y > 0.5) {
-        output.position = project_transformed_text_point(position);
+        output.position = transformed_clip_from_screen(position, max(input.position.z, 1.0 / 65536.0));
     } else {
         output.position.x = position.x * slug_matrix[0].x + position.y * slug_matrix[0].y + slug_matrix[0].w;
         output.position.y = position.x * slug_matrix[1].x + position.y * slug_matrix[1].y + slug_matrix[1].w;
@@ -229,6 +235,7 @@ void ApplyDegenerateHorizontalCoverage(
     float2 p0,
     float2 p1,
     float pixelsPerEm,
+    bool leftRay,
     inout float xcov,
     inout float xwgt
 ) {
@@ -238,7 +245,7 @@ void ApplyDegenerateHorizontalCoverage(
     if (CrossesZeroHalfOpen(p0.y, p1.y) && abs(dy) > (1.0 / 65536.0)) {
         float t = -p0.y / dy;
         float xr = (p0.x + (p1.x - p0.x) * t) * pixelsPerEm;
-        float sample = saturate(xr + 0.5);
+        float sample = leftRay ? saturate(0.5 - xr) : saturate(xr + 0.5);
         xcov += (p1.y > p0.y) ? sample : -sample;
         xwgt = max(xwgt, saturate(1.0 - abs(xr) * 2.0));
     }
@@ -248,6 +255,7 @@ void ApplyDegenerateVerticalCoverage(
     float2 p0,
     float2 p1,
     float pixelsPerEm,
+    bool leftRay,
     inout float ycov,
     inout float ywgt
 ) {
@@ -255,7 +263,7 @@ void ApplyDegenerateVerticalCoverage(
     if (CrossesZeroHalfOpen(p0.x, p1.x) && abs(dx) > (1.0 / 65536.0)) {
         float t = -p0.x / dx;
         float yr = (p0.y + (p1.y - p0.y) * t) * pixelsPerEm;
-        float sample = saturate(-yr + 0.5);
+        float sample = leftRay ? saturate(0.5 - yr) : saturate(yr + 0.5);
         ycov += (p1.x > p0.x) ? sample : -sample;
         ywgt = max(ywgt, saturate(1.0 - abs(yr) * 2.0));
     }
@@ -265,9 +273,9 @@ uint ClampBandIndex(float coord, float scale, float offset, uint bandMax) {
     return (uint)clamp((int)(coord * scale + offset), 0, (int)bandMax);
 }
 
-uint2 LoadBandEntry(uint bandStart, uint bandIndex) {
-    uint entry = bandStart + (bandIndex * 2U);
-    return uint2(BandData[entry], BandData[entry + 1U]);
+uint4 LoadBandEntry(uint bandStart, uint bandIndex) {
+    uint entry = bandStart + (bandIndex * 4U);
+    return uint4(BandData[entry], BandData[entry + 1U], BandData[entry + 2U], BandData[entry + 3U]);
 }
 
 float slug_coverage_single_sample(float2 renderCoord, float bandStartFloat, float4 glyphData, float4 banding) {
@@ -287,11 +295,13 @@ float slug_coverage_single_sample(float2 renderCoord, float bandStartFloat, floa
     float ywgt = 0.0;
 
     uint horizontalBand = ClampBandIndex(renderCoord.y, banding.y, banding.w, bandMaxY);
-    uint2 horizontalEntry = LoadBandEntry(bandStart, horizontalBand);
+    uint4 horizontalEntry = LoadBandEntry(bandStart, horizontalBand);
+    bool horizontalLeftRay = renderCoord.x < asfloat(horizontalEntry.w);
+    uint horizontalCurveStart = horizontalLeftRay ? horizontalEntry.z : horizontalEntry.y;
 
     [loop]
     for (uint offset = 0U; offset < horizontalEntry.x; offset++) {
-        int curveIndex = (int)BandData[horizontalEntry.y + offset];
+        int curveIndex = (int)BandData[horizontalCurveStart + offset];
         int baseIndex = curveStart + (curveIndex * 2);
         float4 p12 = CurveData[baseIndex] - float4(renderCoord, renderCoord);
         float2 p3 = CurveData[baseIndex + 1].xy - renderCoord;
@@ -299,58 +309,78 @@ float slug_coverage_single_sample(float2 renderCoord, float bandStartFloat, floa
         p12.w += SLUG_HORIZONTAL_COVERAGE_EPSILON;
         p3.y += SLUG_HORIZONTAL_COVERAGE_EPSILON;
 
-        if (max(max(p12.x, p12.z), p3.x) * pixelsPerEm.x < -0.5) {
-            break;
+        if (horizontalLeftRay) {
+            if (min(min(p12.x, p12.z), p3.x) * pixelsPerEm.x > 0.5) {
+                break;
+            }
+        } else {
+            if (max(max(p12.x, p12.z), p3.x) * pixelsPerEm.x < -0.5) {
+                break;
+            }
         }
 
         if (ShouldUseDegenerateLineFallback(p12, p3)) {
-            ApplyDegenerateHorizontalCoverage(p12.xy, p3, pixelsPerEm.x, xcov, xwgt);
+            ApplyDegenerateHorizontalCoverage(p12.xy, p3, pixelsPerEm.x, horizontalLeftRay, xcov, xwgt);
             continue;
         }
 
         uint hcode = CalcRootCode(p12.y, p12.w, p3.y);
         if (hcode != 0U) {
             float2 hr = SolveHorizPoly(p12, p3) * pixelsPerEm.x;
+            float2 hcov = horizontalLeftRay
+                ? clamp(0.5.xx - hr, 0.0.xx, 1.0.xx)
+                : clamp(hr + 0.5.xx, 0.0.xx, 1.0.xx);
             if ((hcode & 1U) != 0U) {
-                xcov += saturate(hr.x + 0.5);
+                xcov += hcov.x;
                 xwgt = max(xwgt, saturate(1.0 - abs(hr.x) * 2.0));
             }
             if (hcode > 1U) {
-                xcov -= saturate(hr.y + 0.5);
+                xcov -= hcov.y;
                 xwgt = max(xwgt, saturate(1.0 - abs(hr.y) * 2.0));
             }
         }
     }
 
-    uint verticalBandStart = bandStart + ((bandMaxY + 1U) * 2U);
+    uint verticalBandStart = bandStart + ((bandMaxY + 1U) * 4U);
     uint verticalBand = ClampBandIndex(renderCoord.x, banding.x, banding.z, bandMaxX);
-    uint2 verticalEntry = LoadBandEntry(verticalBandStart, verticalBand);
+    uint4 verticalEntry = LoadBandEntry(verticalBandStart, verticalBand);
+    bool verticalLeftRay = renderCoord.y < asfloat(verticalEntry.w);
+    uint verticalCurveStart = verticalLeftRay ? verticalEntry.z : verticalEntry.y;
 
     [loop]
     for (uint verticalOffset = 0U; verticalOffset < verticalEntry.x; verticalOffset++) {
-        int curveIndex = (int)BandData[verticalEntry.y + verticalOffset];
+        int curveIndex = (int)BandData[verticalCurveStart + verticalOffset];
         int baseIndex = curveStart + (curveIndex * 2);
         float4 p12 = CurveData[baseIndex] - float4(renderCoord, renderCoord);
         float2 p3 = CurveData[baseIndex + 1].xy - renderCoord;
 
-        if (min(min(p12.y, p12.w), p3.y) * pixelsPerEm.y > 0.5) {
-            break;
+        if (verticalLeftRay) {
+            if (min(min(p12.y, p12.w), p3.y) * pixelsPerEm.y > 0.5) {
+                break;
+            }
+        } else {
+            if (max(max(p12.y, p12.w), p3.y) * pixelsPerEm.y < -0.5) {
+                break;
+            }
         }
 
         if (ShouldUseDegenerateLineFallback(p12, p3)) {
-            ApplyDegenerateVerticalCoverage(p12.xy, p3, pixelsPerEm.y, ycov, ywgt);
+            ApplyDegenerateVerticalCoverage(p12.xy, p3, pixelsPerEm.y, verticalLeftRay, ycov, ywgt);
             continue;
         }
 
         uint vcode = CalcRootCode(p12.x, p12.z, p3.x);
         if (vcode != 0U) {
             float2 vr = SolveVertPoly(p12, p3) * pixelsPerEm.y;
+            float2 vcov = verticalLeftRay
+                ? clamp(0.5.xx - vr, 0.0.xx, 1.0.xx)
+                : clamp(vr + 0.5.xx, 0.0.xx, 1.0.xx);
             if ((vcode & 1U) != 0U) {
-                ycov -= saturate(-vr.x + 0.5);
+                ycov -= vcov.x;
                 ywgt = max(ywgt, saturate(1.0 - abs(vr.x) * 2.0));
             }
             if (vcode > 1U) {
-                ycov += saturate(-vr.y + 0.5);
+                ycov += vcov.y;
                 ywgt = max(ywgt, saturate(1.0 - abs(vr.y) * 2.0));
             }
         }
@@ -727,11 +757,12 @@ float4 PSMain(PsInput input) : SV_TARGET {
         float2 renderCoord = input.uv;
         if (input.transformedFlag > 0.5) {
             float2 localPoint = reconstruct_transformed_local_point(input.position.xy);
-            localPoint = clamp(
-                localPoint,
-                float2(input.localBounds.x, input.localBounds.z),
-                float2(input.localBounds.y, input.localBounds.w)
-            );
+            if (localPoint.x < input.localBounds.x
+                || localPoint.x > input.localBounds.y
+                || localPoint.y < input.localBounds.z
+                || localPoint.y > input.localBounds.w) {
+                discard;
+            }
             renderCoord = float2(
                 remap_range(localPoint.x, input.localBounds.x, input.localBounds.y, input.uvBounds.x, input.uvBounds.y),
                 remap_range(localPoint.y, input.localBounds.z, input.localBounds.w, input.uvBounds.z, input.uvBounds.w)

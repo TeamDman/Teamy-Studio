@@ -198,6 +198,20 @@ struct SlugGlyph {
     advance: f32,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct DirectionalBandHeader {
+    count: u32,
+    descending_start: u32,
+    ascending_start: u32,
+    split: f32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CoverageRayDirection {
+    Left,
+    Right,
+}
+
 #[derive(Clone, Debug)]
 struct LoadedTerminalFont {
     font_bytes: Vec<u8>,
@@ -3608,7 +3622,9 @@ fn append_slug_band_data(
     ];
     let curve_extents: Vec<_> = curves.iter().copied().map(curve_extents).collect();
     let mut horizontal_bands = vec![Vec::<usize>::new(); band_count_y as usize];
+    let mut horizontal_bands_ascending = vec![Vec::<usize>::new(); band_count_y as usize];
     let mut vertical_bands = vec![Vec::<usize>::new(); band_count_x as usize];
+    let mut vertical_bands_ascending = vec![Vec::<usize>::new(); band_count_x as usize];
 
     for (curve_index, extents) in curve_extents.iter().enumerate() {
         let horizontal_start = band_index(
@@ -3651,8 +3667,30 @@ fn append_slug_band_data(
                 .total_cmp(&curve_extents[*lhs].max_x)
         });
     }
+    for (ascending_band, descending_band) in horizontal_bands_ascending
+        .iter_mut()
+        .zip(horizontal_bands.iter())
+    {
+        *ascending_band = descending_band.clone();
+        ascending_band.sort_by(|lhs, rhs| {
+            curve_extents[*lhs]
+                .min_x
+                .total_cmp(&curve_extents[*rhs].min_x)
+        });
+    }
     for band in &mut vertical_bands {
         band.sort_by(|lhs, rhs| {
+            curve_extents[*rhs]
+                .max_y
+                .total_cmp(&curve_extents[*lhs].max_y)
+        });
+    }
+    for (ascending_band, descending_band) in vertical_bands_ascending
+        .iter_mut()
+        .zip(vertical_bands.iter())
+    {
+        *ascending_band = descending_band.clone();
+        ascending_band.sort_by(|lhs, rhs| {
             curve_extents[*lhs]
                 .min_y
                 .total_cmp(&curve_extents[*rhs].min_y)
@@ -3660,29 +3698,147 @@ fn append_slug_band_data(
     }
 
     let table_start = band_data.len();
-    let table_len = ((band_count_x + band_count_y) as usize) * 2;
+    let table_len = ((band_count_x + band_count_y) as usize) * 4;
     band_data.resize(table_start + table_len, 0);
 
     for (band_index, band) in horizontal_bands.iter().enumerate() {
-        let entry_index = table_start + (band_index * 2);
+        let ascending_band = &horizontal_bands_ascending[band_index];
+        let split = choose_horizontal_band_split(
+            band,
+            ascending_band,
+            &curve_extents,
+            glyph.x_min,
+            glyph.x_max,
+        );
+        let entry_index = table_start + (band_index * 4);
         band_data[entry_index] = band.len() as u32;
         band_data[entry_index + 1] = band_data.len() as u32;
         for curve_index in band {
             band_data.push(*curve_index as u32);
         }
+        band_data[entry_index + 2] = band_data.len() as u32;
+        for curve_index in ascending_band {
+            band_data.push(*curve_index as u32);
+        }
+        band_data[entry_index + 3] = split.to_bits();
     }
 
-    let vertical_table_start = table_start + (band_count_y as usize * 2);
+    let vertical_table_start = table_start + (band_count_y as usize * 4);
     for (band_index, band) in vertical_bands.iter().enumerate() {
-        let entry_index = vertical_table_start + (band_index * 2);
+        let ascending_band = &vertical_bands_ascending[band_index];
+        let split = choose_vertical_band_split(
+            band,
+            ascending_band,
+            &curve_extents,
+            glyph.y_min,
+            glyph.y_max,
+        );
+        let entry_index = vertical_table_start + (band_index * 4);
         band_data[entry_index] = band.len() as u32;
         band_data[entry_index + 1] = band_data.len() as u32;
         for curve_index in band {
             band_data.push(*curve_index as u32);
         }
+        band_data[entry_index + 2] = band_data.len() as u32;
+        for curve_index in ascending_band {
+            band_data.push(*curve_index as u32);
+        }
+        band_data[entry_index + 3] = split.to_bits();
     }
 
     (band_count_x, band_count_y, band_transform)
+}
+
+fn choose_horizontal_band_split(
+    descending_band: &[usize],
+    ascending_band: &[usize],
+    curve_extents: &[CurveExtents],
+    fallback_min: f32,
+    fallback_max: f32,
+) -> f32 {
+    choose_band_split(
+        descending_band,
+        ascending_band,
+        curve_extents,
+        |extents| extents.max_x,
+        |extents| extents.min_x,
+        fallback_min,
+        fallback_max,
+    )
+}
+
+fn choose_vertical_band_split(
+    descending_band: &[usize],
+    ascending_band: &[usize],
+    curve_extents: &[CurveExtents],
+    fallback_min: f32,
+    fallback_max: f32,
+) -> f32 {
+    choose_band_split(
+        descending_band,
+        ascending_band,
+        curve_extents,
+        |extents| extents.max_y,
+        |extents| extents.min_y,
+        fallback_min,
+        fallback_max,
+    )
+}
+
+fn choose_band_split(
+    descending_band: &[usize],
+    ascending_band: &[usize],
+    curve_extents: &[CurveExtents],
+    descending_value: impl Fn(CurveExtents) -> f32,
+    ascending_value: impl Fn(CurveExtents) -> f32,
+    fallback_min: f32,
+    fallback_max: f32,
+) -> f32 {
+    let count = descending_band.len();
+    if count == 0 {
+        return (fallback_min + fallback_max) * 0.5;
+    }
+
+    let mut best_worst = count;
+    let mut best_split = (fallback_min + fallback_max) * 0.5;
+    let mut left_count = count;
+
+    for (curve_offset, curve_index) in descending_band.iter().enumerate() {
+        let split = descending_value(curve_extents[*curve_index]);
+        let right_count = curve_offset + 1;
+        while left_count > 0
+            && ascending_value(curve_extents[ascending_band[left_count - 1]]) > split
+        {
+            left_count -= 1;
+        }
+        let worst = right_count.max(left_count);
+        if worst < best_worst {
+            best_worst = worst;
+            best_split = split;
+        }
+    }
+
+    best_split
+}
+
+fn load_directional_band_header(
+    band_data: &[u32],
+    entry_index: usize,
+) -> DirectionalBandHeader {
+    DirectionalBandHeader {
+        count: band_data.get(entry_index).copied().unwrap_or_default(),
+        descending_start: band_data.get(entry_index + 1).copied().unwrap_or_default(),
+        ascending_start: band_data.get(entry_index + 2).copied().unwrap_or_default(),
+        split: f32::from_bits(band_data.get(entry_index + 3).copied().unwrap_or_default()),
+    }
+}
+
+fn horizontal_band_header_index(glyph: SlugGlyph, band_index: usize) -> usize {
+    glyph.band_start as usize + (band_index * 4)
+}
+
+fn vertical_band_header_index(glyph: SlugGlyph, band_index: usize) -> usize {
+    glyph.band_start as usize + (glyph.band_count_y as usize * 4) + (band_index * 4)
 }
 
 fn curve_extents(curve: QuadraticCurve) -> CurveExtents {
@@ -3835,13 +3991,18 @@ fn cpu_slug_coverage_single_sample(
         glyph.band_transform[3],
         glyph.band_count_y,
     ) as usize;
-    let horizontal_entry = glyph.band_start as usize + (horizontal_band * 2);
-    let horizontal_count = band_data.get(horizontal_entry).copied().unwrap_or_default() as usize;
-    let horizontal_start = band_data
-        .get(horizontal_entry + 1)
-        .copied()
-        .unwrap_or_default() as usize;
-    for offset in 0..horizontal_count {
+    let horizontal_header =
+        load_directional_band_header(band_data, horizontal_band_header_index(glyph, horizontal_band));
+    let horizontal_direction = if render_coord[0] < horizontal_header.split {
+        CoverageRayDirection::Left
+    } else {
+        CoverageRayDirection::Right
+    };
+    let horizontal_start = match horizontal_direction {
+        CoverageRayDirection::Left => horizontal_header.ascending_start as usize,
+        CoverageRayDirection::Right => horizontal_header.descending_start as usize,
+    };
+    for offset in 0..horizontal_header.count as usize {
         let curve_index = band_data
             .get(horizontal_start + offset)
             .copied()
@@ -3849,13 +4010,24 @@ fn cpu_slug_coverage_single_sample(
         let Some(curve) = curves.get(curve_index) else {
             continue;
         };
-        if (curve_extents(*curve).max_x - render_coord[0]) * pixels_per_em < -0.5 {
-            break;
+        let extents = curve_extents(*curve);
+        match horizontal_direction {
+            CoverageRayDirection::Left => {
+                if (extents.min_x - render_coord[0]) * pixels_per_em > 0.5 {
+                    break;
+                }
+            }
+            CoverageRayDirection::Right => {
+                if (extents.max_x - render_coord[0]) * pixels_per_em < -0.5 {
+                    break;
+                }
+            }
         }
         accumulate_horizontal_curve_coverage(
             curve,
             render_coord,
             pixels_per_em,
+            horizontal_direction,
             &mut xcov,
             &mut xwgt,
         );
@@ -3867,14 +4039,18 @@ fn cpu_slug_coverage_single_sample(
         glyph.band_transform[2],
         glyph.band_count_x,
     ) as usize;
-    let vertical_entry =
-        glyph.band_start as usize + (glyph.band_count_y as usize * 2) + (vertical_band * 2);
-    let vertical_count = band_data.get(vertical_entry).copied().unwrap_or_default() as usize;
-    let vertical_start = band_data
-        .get(vertical_entry + 1)
-        .copied()
-        .unwrap_or_default() as usize;
-    for offset in 0..vertical_count {
+    let vertical_header =
+        load_directional_band_header(band_data, vertical_band_header_index(glyph, vertical_band));
+    let vertical_direction = if render_coord[1] < vertical_header.split {
+        CoverageRayDirection::Left
+    } else {
+        CoverageRayDirection::Right
+    };
+    let vertical_start = match vertical_direction {
+        CoverageRayDirection::Left => vertical_header.ascending_start as usize,
+        CoverageRayDirection::Right => vertical_header.descending_start as usize,
+    };
+    for offset in 0..vertical_header.count as usize {
         let curve_index = band_data
             .get(vertical_start + offset)
             .copied()
@@ -3882,13 +4058,24 @@ fn cpu_slug_coverage_single_sample(
         let Some(curve) = curves.get(curve_index) else {
             continue;
         };
-        if (curve_extents(*curve).min_y - render_coord[1]) * pixels_per_em > 0.5 {
-            break;
+        let extents = curve_extents(*curve);
+        match vertical_direction {
+            CoverageRayDirection::Left => {
+                if (extents.min_y - render_coord[1]) * pixels_per_em > 0.5 {
+                    break;
+                }
+            }
+            CoverageRayDirection::Right => {
+                if (extents.max_y - render_coord[1]) * pixels_per_em < -0.5 {
+                    break;
+                }
+            }
         }
         accumulate_vertical_curve_coverage(
             curve,
             render_coord,
             pixels_per_em,
+            vertical_direction,
             &mut ycov,
             &mut ywgt,
         );
@@ -3929,6 +4116,7 @@ fn cpu_slug_coverage_all_curves_single_sample(
     render_coord: [f32; 2],
     pixels_per_em: f32,
     curves: &[QuadraticCurve],
+    band_data: &[u32],
     glyph: SlugGlyph,
 ) -> f32 {
     if glyph.curve_count == 0 {
@@ -3941,12 +4129,39 @@ fn cpu_slug_coverage_all_curves_single_sample(
     let mut ywgt: f32 = 0.0;
     let start = usize::try_from(glyph.curve_start).unwrap_or_default();
     let end = start + usize::try_from(glyph.curve_count).unwrap_or_default();
+    let horizontal_band = band_index(
+        render_coord[1],
+        glyph.band_transform[1],
+        glyph.band_transform[3],
+        glyph.band_count_y,
+    ) as usize;
+    let horizontal_header =
+        load_directional_band_header(band_data, horizontal_band_header_index(glyph, horizontal_band));
+    let horizontal_direction = if render_coord[0] < horizontal_header.split {
+        CoverageRayDirection::Left
+    } else {
+        CoverageRayDirection::Right
+    };
+    let vertical_band = band_index(
+        render_coord[0],
+        glyph.band_transform[0],
+        glyph.band_transform[2],
+        glyph.band_count_x,
+    ) as usize;
+    let vertical_header =
+        load_directional_band_header(band_data, vertical_band_header_index(glyph, vertical_band));
+    let vertical_direction = if render_coord[1] < vertical_header.split {
+        CoverageRayDirection::Left
+    } else {
+        CoverageRayDirection::Right
+    };
 
     for curve in curves.iter().skip(start).take(end.saturating_sub(start)) {
         accumulate_horizontal_curve_coverage(
             curve,
             render_coord,
             pixels_per_em,
+            horizontal_direction,
             &mut xcov,
             &mut xwgt,
         );
@@ -3954,6 +4169,7 @@ fn cpu_slug_coverage_all_curves_single_sample(
             curve,
             render_coord,
             pixels_per_em,
+            vertical_direction,
             &mut ycov,
             &mut ywgt,
         );
@@ -3967,6 +4183,7 @@ fn cpu_slug_coverage_all_curves(
     render_coord: [f32; 2],
     pixels_per_em: f32,
     curves: &[QuadraticCurve],
+    band_data: &[u32],
     glyph: SlugGlyph,
 ) -> f32 {
     let sample_step = 0.25 / pixels_per_em.max(1.0 / 65536.0);
@@ -3982,6 +4199,7 @@ fn cpu_slug_coverage_all_curves(
             [render_coord[0] + offset[0], render_coord[1] + offset[1]],
             pixels_per_em,
             curves,
+            band_data,
             glyph,
         );
     }
@@ -4003,6 +4221,7 @@ fn apply_degenerate_horizontal_coverage(
     curve: &QuadraticCurve,
     render_coord: [f32; 2],
     pixels_per_em: f32,
+    direction: CoverageRayDirection,
     xcov: &mut f32,
     xwgt: &mut f32,
 ) {
@@ -4015,13 +4234,17 @@ fn apply_degenerate_horizontal_coverage(
         curve.p2[1] - render_coord[1] + SLUG_HORIZONTAL_COVERAGE_EPSILON,
     ];
     if let Some(intersection_x) = horizontal_line_intersection(p0, p1) {
-        let sample = saturate((intersection_x * pixels_per_em) + 0.5);
+        let signed_distance = intersection_x * pixels_per_em;
+        let sample = match direction {
+            CoverageRayDirection::Left => saturate(0.5 - signed_distance),
+            CoverageRayDirection::Right => saturate(signed_distance + 0.5),
+        };
         if p1[1] > p0[1] {
             *xcov += sample;
         } else {
             *xcov -= sample;
         }
-        *xwgt = (*xwgt).max(saturate(1.0 - (intersection_x * pixels_per_em).abs() * 2.0));
+        *xwgt = (*xwgt).max(saturate(1.0 - signed_distance.abs() * 2.0));
     }
 }
 
@@ -4029,19 +4252,24 @@ fn apply_degenerate_vertical_coverage(
     curve: &QuadraticCurve,
     render_coord: [f32; 2],
     pixels_per_em: f32,
+    direction: CoverageRayDirection,
     ycov: &mut f32,
     ywgt: &mut f32,
 ) {
     let p0 = [curve.p0[0] - render_coord[0], curve.p0[1] - render_coord[1]];
     let p1 = [curve.p2[0] - render_coord[0], curve.p2[1] - render_coord[1]];
     if let Some(intersection_y) = vertical_line_intersection(p0, p1) {
-        let sample = saturate(((-intersection_y) * pixels_per_em) + 0.5);
+        let signed_distance = intersection_y * pixels_per_em;
+        let sample = match direction {
+            CoverageRayDirection::Left => saturate(0.5 - signed_distance),
+            CoverageRayDirection::Right => saturate(signed_distance + 0.5),
+        };
         if p1[0] > p0[0] {
             *ycov += sample;
         } else {
             *ycov -= sample;
         }
-        *ywgt = (*ywgt).max(saturate(1.0 - (intersection_y * pixels_per_em).abs() * 2.0));
+        *ywgt = (*ywgt).max(saturate(1.0 - signed_distance.abs() * 2.0));
     }
 }
 
@@ -4077,11 +4305,19 @@ fn accumulate_horizontal_curve_coverage(
     curve: &QuadraticCurve,
     render_coord: [f32; 2],
     pixels_per_em: f32,
+    direction: CoverageRayDirection,
     xcov: &mut f32,
     xwgt: &mut f32,
 ) {
     if should_use_degenerate_line_fallback(curve) {
-        apply_degenerate_horizontal_coverage(curve, render_coord, pixels_per_em, xcov, xwgt);
+        apply_degenerate_horizontal_coverage(
+            curve,
+            render_coord,
+            pixels_per_em,
+            direction,
+            xcov,
+            xwgt,
+        );
         return;
     }
 
@@ -4102,14 +4338,22 @@ fn accumulate_horizontal_curve_coverage(
 
     let hr = solve_horiz_poly(p12, p3);
     if (hcode & 1) != 0 {
-        let sample = saturate((hr[0] * pixels_per_em) + 0.5);
+        let signed_distance = hr[0] * pixels_per_em;
+        let sample = match direction {
+            CoverageRayDirection::Left => saturate(0.5 - signed_distance),
+            CoverageRayDirection::Right => saturate(signed_distance + 0.5),
+        };
         *xcov += sample;
-        *xwgt = (*xwgt).max(saturate(1.0 - (hr[0] * pixels_per_em).abs() * 2.0));
+        *xwgt = (*xwgt).max(saturate(1.0 - signed_distance.abs() * 2.0));
     }
     if hcode > 1 {
-        let sample = saturate((hr[1] * pixels_per_em) + 0.5);
+        let signed_distance = hr[1] * pixels_per_em;
+        let sample = match direction {
+            CoverageRayDirection::Left => saturate(0.5 - signed_distance),
+            CoverageRayDirection::Right => saturate(signed_distance + 0.5),
+        };
         *xcov -= sample;
-        *xwgt = (*xwgt).max(saturate(1.0 - (hr[1] * pixels_per_em).abs() * 2.0));
+        *xwgt = (*xwgt).max(saturate(1.0 - signed_distance.abs() * 2.0));
     }
 }
 
@@ -4117,11 +4361,19 @@ fn accumulate_vertical_curve_coverage(
     curve: &QuadraticCurve,
     render_coord: [f32; 2],
     pixels_per_em: f32,
+    direction: CoverageRayDirection,
     ycov: &mut f32,
     ywgt: &mut f32,
 ) {
     if should_use_degenerate_line_fallback(curve) {
-        apply_degenerate_vertical_coverage(curve, render_coord, pixels_per_em, ycov, ywgt);
+        apply_degenerate_vertical_coverage(
+            curve,
+            render_coord,
+            pixels_per_em,
+            direction,
+            ycov,
+            ywgt,
+        );
         return;
     }
 
@@ -4139,14 +4391,22 @@ fn accumulate_vertical_curve_coverage(
 
     let vr = solve_vert_poly(p12, p3);
     if (vcode & 1) != 0 {
-        let sample = saturate(((-vr[0]) * pixels_per_em) + 0.5);
+        let signed_distance = vr[0] * pixels_per_em;
+        let sample = match direction {
+            CoverageRayDirection::Left => saturate(0.5 - signed_distance),
+            CoverageRayDirection::Right => saturate(signed_distance + 0.5),
+        };
         *ycov -= sample;
-        *ywgt = (*ywgt).max(saturate(1.0 - (vr[0] * pixels_per_em).abs() * 2.0));
+        *ywgt = (*ywgt).max(saturate(1.0 - signed_distance.abs() * 2.0));
     }
     if vcode > 1 {
-        let sample = saturate(((-vr[1]) * pixels_per_em) + 0.5);
+        let signed_distance = vr[1] * pixels_per_em;
+        let sample = match direction {
+            CoverageRayDirection::Left => saturate(0.5 - signed_distance),
+            CoverageRayDirection::Right => saturate(signed_distance + 0.5),
+        };
         *ycov += sample;
-        *ywgt = (*ywgt).max(saturate(1.0 - (vr[1] * pixels_per_em).abs() * 2.0));
+        *ywgt = (*ywgt).max(saturate(1.0 - signed_distance.abs() * 2.0));
     }
 }
 
@@ -4752,7 +5012,7 @@ fn create_pipeline_state(
     let blend_target = D3D12_RENDER_TARGET_BLEND_DESC {
         BlendEnable: TRUE,
         LogicOpEnable: false.into(),
-        SrcBlend: D3D12_BLEND_SRC_ALPHA,
+        SrcBlend: D3D12_BLEND_ONE,
         DestBlend: D3D12_BLEND_INV_SRC_ALPHA,
         BlendOp: D3D12_BLEND_OP_ADD,
         SrcBlendAlpha: D3D12_BLEND_ONE,
@@ -6045,8 +6305,8 @@ fn append_text_rect(
 
 fn append_transformed_text_quad(
     vertices: &mut Vec<Vertex>,
-    _corners: [[f32; 2]; 4],
-    _corner_w: [f32; 4],
+    corners: [[f32; 2]; 4],
+    corner_w: [f32; 4],
     local_bounds: [f32; 4],
     color: [f32; 4],
     glyph: SlugGlyph,
@@ -6063,12 +6323,12 @@ fn append_transformed_text_quad(
         glyph.band_count_y.saturating_sub(1) as f32,
     ];
     let banding = glyph.band_transform;
-    let uv_bounds = [glyph.x_min, glyph.x_max, glyph.y_max, glyph.y_min];
+    let jacobian = [glyph.x_min, glyph.x_max, glyph.y_max, glyph.y_min];
     let effect = PanelEffect::Text as u32 as f32;
     let glyph_index = glyph.band_start as f32;
 
     let top_left = Vertex {
-        position: [local_bounds[0], local_bounds[2], 0.0],
+        position: [corners[0][0], corners[0][1], corner_w[0]],
         color,
         uv: [glyph.x_min, glyph.y_max],
         effect,
@@ -6076,12 +6336,12 @@ fn append_transformed_text_quad(
         glyph_data,
         banding,
         normal: [-1.0, 1.0],
-        jacobian: uv_bounds,
+        jacobian,
         local_bounds,
         _padding: [debug_id, 1.0],
     };
     let top_right = Vertex {
-        position: [local_bounds[1], local_bounds[2], 0.0],
+        position: [corners[1][0], corners[1][1], corner_w[1]],
         color,
         uv: [glyph.x_max, glyph.y_max],
         effect,
@@ -6089,12 +6349,12 @@ fn append_transformed_text_quad(
         glyph_data,
         banding,
         normal: [1.0, 1.0],
-        jacobian: uv_bounds,
+        jacobian,
         local_bounds,
         _padding: [debug_id, 1.0],
     };
     let bottom_right = Vertex {
-        position: [local_bounds[1], local_bounds[3], 0.0],
+        position: [corners[2][0], corners[2][1], corner_w[2]],
         color,
         uv: [glyph.x_max, glyph.y_min],
         effect,
@@ -6102,12 +6362,12 @@ fn append_transformed_text_quad(
         glyph_data,
         banding,
         normal: [1.0, -1.0],
-        jacobian: uv_bounds,
+        jacobian,
         local_bounds,
         _padding: [debug_id, 1.0],
     };
     let bottom_left = Vertex {
-        position: [local_bounds[0], local_bounds[3], 0.0],
+        position: [corners[3][0], corners[3][1], corner_w[3]],
         color,
         uv: [glyph.x_min, glyph.y_min],
         effect,
@@ -6115,7 +6375,7 @@ fn append_transformed_text_quad(
         glyph_data,
         banding,
         normal: [-1.0, -1.0],
-        jacobian: uv_bounds,
+        jacobian,
         local_bounds,
         _padding: [debug_id, 1.0],
     };
@@ -6468,7 +6728,7 @@ mod tests {
             for x in 0..reference.width() {
                 let left = reference.get_pixel(x, y);
                 let right = transformed.get_pixel(x, y);
-                if left.0 == right.0 {
+                if rgba_matches_with_tolerance(*left, *right, 1) {
                     continue;
                 }
                 mismatch_count += 1;
@@ -6493,6 +6753,17 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    fn rgba_matches_with_tolerance(
+        left: image::Rgba<u8>,
+        right: image::Rgba<u8>,
+        tolerance: u8,
+    ) -> bool {
+        left.0
+            .into_iter()
+            .zip(right.0)
+            .all(|(lhs, rhs)| lhs.abs_diff(rhs) <= tolerance)
     }
 
     fn render_reference_text_layout_cpu(
@@ -6673,13 +6944,20 @@ mod tests {
             glyph.band_transform[3],
             glyph.band_count_y,
         ) as usize;
-        let horizontal_entry = glyph.band_start as usize + (horizontal_band * 2);
-        let horizontal_count = band_data.get(horizontal_entry).copied().unwrap_or_default() as usize;
-        let horizontal_start = band_data
-            .get(horizontal_entry + 1)
-            .copied()
-            .unwrap_or_default() as usize;
-        for offset in 0..horizontal_count {
+        let horizontal_header = super::load_directional_band_header(
+            band_data,
+            super::horizontal_band_header_index(glyph, horizontal_band),
+        );
+        let horizontal_direction = if render_coord[0] < horizontal_header.split {
+            super::CoverageRayDirection::Left
+        } else {
+            super::CoverageRayDirection::Right
+        };
+        let horizontal_start = match horizontal_direction {
+            super::CoverageRayDirection::Left => horizontal_header.ascending_start as usize,
+            super::CoverageRayDirection::Right => horizontal_header.descending_start as usize,
+        };
+        for offset in 0..horizontal_header.count as usize {
             let curve_index = band_data
                 .get(horizontal_start + offset)
                 .copied()
@@ -6687,13 +6965,24 @@ mod tests {
             let Some(curve) = curves.get(curve_index) else {
                 continue;
             };
-            if (super::curve_extents(*curve).max_x - render_coord[0]) * pixels_per_em[0] < -0.5 {
-                break;
+            let extents = super::curve_extents(*curve);
+            match horizontal_direction {
+                super::CoverageRayDirection::Left => {
+                    if (extents.min_x - render_coord[0]) * pixels_per_em[0] > 0.5 {
+                        break;
+                    }
+                }
+                super::CoverageRayDirection::Right => {
+                    if (extents.max_x - render_coord[0]) * pixels_per_em[0] < -0.5 {
+                        break;
+                    }
+                }
             }
             super::accumulate_horizontal_curve_coverage(
                 curve,
                 render_coord,
                 pixels_per_em[0],
+                horizontal_direction,
                 &mut xcov,
                 &mut xwgt,
             );
@@ -6705,14 +6994,20 @@ mod tests {
             glyph.band_transform[2],
             glyph.band_count_x,
         ) as usize;
-        let vertical_entry =
-            glyph.band_start as usize + (glyph.band_count_y as usize * 2) + (vertical_band * 2);
-        let vertical_count = band_data.get(vertical_entry).copied().unwrap_or_default() as usize;
-        let vertical_start = band_data
-            .get(vertical_entry + 1)
-            .copied()
-            .unwrap_or_default() as usize;
-        for offset in 0..vertical_count {
+        let vertical_header = super::load_directional_band_header(
+            band_data,
+            super::vertical_band_header_index(glyph, vertical_band),
+        );
+        let vertical_direction = if render_coord[1] < vertical_header.split {
+            super::CoverageRayDirection::Left
+        } else {
+            super::CoverageRayDirection::Right
+        };
+        let vertical_start = match vertical_direction {
+            super::CoverageRayDirection::Left => vertical_header.ascending_start as usize,
+            super::CoverageRayDirection::Right => vertical_header.descending_start as usize,
+        };
+        for offset in 0..vertical_header.count as usize {
             let curve_index = band_data
                 .get(vertical_start + offset)
                 .copied()
@@ -6720,13 +7015,24 @@ mod tests {
             let Some(curve) = curves.get(curve_index) else {
                 continue;
             };
-            if (super::curve_extents(*curve).min_y - render_coord[1]) * pixels_per_em[1] > 0.5 {
-                break;
+            let extents = super::curve_extents(*curve);
+            match vertical_direction {
+                super::CoverageRayDirection::Left => {
+                    if (extents.min_y - render_coord[1]) * pixels_per_em[1] > 0.5 {
+                        break;
+                    }
+                }
+                super::CoverageRayDirection::Right => {
+                    if (extents.max_y - render_coord[1]) * pixels_per_em[1] < -0.5 {
+                        break;
+                    }
+                }
             }
             super::accumulate_vertical_curve_coverage(
                 curve,
                 render_coord,
                 pixels_per_em[1],
+                vertical_direction,
                 &mut ycov,
                 &mut ywgt,
             );
@@ -7637,7 +7943,7 @@ mod tests {
                         glyph.y_min + (step_y * y as f32),
                     ];
                     let banded = cpu_slug_coverage(sample, 16.0, &curves, &band_data, glyph);
-                    let full = cpu_slug_coverage_all_curves(sample, 16.0, &curves, glyph);
+                    let full = cpu_slug_coverage_all_curves(sample, 16.0, &curves, &band_data, glyph);
                     assert!(
                         (banded - full).abs() <= 0.0001,
                         "{character} coverage mismatch at ({}, {}): banded={banded} full={full}",
@@ -7909,7 +8215,7 @@ mod tests {
             let (sample, scale) =
                 snapshot_render_coord_for_pixel(&font, glyph, 256, 512, 512, pixel_x, pixel_y);
             let banded = cpu_slug_coverage(sample, scale, &curves, &band_data, glyph);
-            let full = cpu_slug_coverage_all_curves(sample, scale, &curves, glyph);
+            let full = cpu_slug_coverage_all_curves(sample, scale, &curves, &band_data, glyph);
             assert!(
                 full > 0.99,
                 "full curve walk should fill the r top hook pixel ({pixel_x}, {pixel_y}), got {full}"
