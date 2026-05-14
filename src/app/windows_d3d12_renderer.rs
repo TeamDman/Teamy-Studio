@@ -76,6 +76,8 @@ const MAX_GLYPH_COUNT: usize = 8_192;
 const MAX_SPRITE_COUNT: usize = 256;
 const MAX_VERTEX_COUNT: usize = (MAX_PANEL_COUNT + MAX_GLYPH_COUNT + MAX_SPRITE_COUNT) * 6;
 const FALLBACK_GLYPH: char = '?';
+// These are initial upload capacities. Large glyph sets such as the sprite-sheet
+// explorer may require the renderer to grow the backing upload resources.
 const MAX_CURVE_FLOAT4_COUNT: usize = 262_144;
 const MAX_BAND_UINT_COUNT: usize = 1_048_576;
 const TERMINAL_FONT_FAMILY: &str = "CaskaydiaCove Nerd Font Mono";
@@ -84,6 +86,7 @@ const SLUG_BAND_SIZE_FONT_UNITS: f32 = 64.0;
 const SLUG_HORIZONTAL_COVERAGE_EPSILON: f32 = 1.0 / 65536.0;
 const TEAMY_D3D12_GPU_VALIDATION_ENV: &str = "TEAMY_D3D12_GPU_VALIDATION";
 const TEAMY_D3D12_OFFSCREEN_ADAPTER_ENV: &str = "TEAMY_D3D12_OFFSCREEN_ADAPTER";
+const OFFSCREEN_RENDER_FENCE_TIMEOUT_MS: u32 = 10_000;
 const WINDOWS_PANEL_SHADERS_PATH: &str = "src/app/windows_panel_shaders.hlsl";
 const WINDOWS_CHROME_SHADERS_PATH: &str = "src/app/windows_chrome_shaders.hlsl";
 const WINDOWS_PANEL_SHADERS_SOURCE: &str = include_str!("windows_panel_shaders.hlsl");
@@ -437,7 +440,9 @@ pub struct D3d12PanelRenderer {
     shader_param_buffer: ID3D12Resource,
     srv_heap: ID3D12DescriptorHeap,
     curve_buffer: ID3D12Resource,
+    curve_buffer_capacity: usize,
     band_buffer: ID3D12Resource,
+    band_buffer_capacity: usize,
     _sprite_buffer: ID3D12Resource,
     sprite_atlas: Arc<SpriteAtlas>,
     font: Arc<LoadedTerminalFont>,
@@ -911,7 +916,9 @@ impl D3d12PanelRenderer {
             shader_param_buffer,
             srv_heap,
             curve_buffer,
+            curve_buffer_capacity: MAX_CURVE_FLOAT4_COUNT,
             band_buffer,
+            band_buffer_capacity: MAX_BAND_UINT_COUNT,
             _sprite_buffer: sprite_buffer,
             sprite_atlas,
             font,
@@ -1498,13 +1505,14 @@ impl D3d12PanelRenderer {
 
         let (curve_data, band_data, glyph_cache) =
             build_slug_curve_buffer(&self.font, &scene_chars)?;
+        self.ensure_shader_resource_capacities(curve_data.len(), band_data.len())?;
         unsafe {
             let mut mapped = std::ptr::null_mut();
             self.curve_buffer.Map(0, None, Some(&mut mapped))?;
             std::ptr::write_bytes(
                 mapped,
                 0,
-                MAX_CURVE_FLOAT4_COUNT * std::mem::size_of::<[f32; 4]>(),
+                self.curve_buffer_capacity * std::mem::size_of::<[f32; 4]>(),
             );
             std::ptr::copy_nonoverlapping(
                 curve_data.as_ptr(),
@@ -1518,7 +1526,7 @@ impl D3d12PanelRenderer {
             std::ptr::write_bytes(
                 band_mapped,
                 0,
-                MAX_BAND_UINT_COUNT * std::mem::size_of::<u32>(),
+                self.band_buffer_capacity * std::mem::size_of::<u32>(),
             );
             std::ptr::copy_nonoverlapping(
                 band_data.as_ptr(),
@@ -1532,6 +1540,52 @@ impl D3d12PanelRenderer {
         self.cached_chars = scene_chars;
         self.glyph_cache_generation += 1;
         Ok(true)
+    }
+
+    fn ensure_shader_resource_capacities(
+        &mut self,
+        required_curve_capacity: usize,
+        required_band_capacity: usize,
+    ) -> eyre::Result<()> {
+        if required_curve_capacity <= self.curve_buffer_capacity
+            && required_band_capacity <= self.band_buffer_capacity
+        {
+            return Ok(());
+        }
+
+        // These upload buffers and the descriptor heap are bound directly as SRVs.
+        // Recreate them only after the GPU is idle so earlier frames cannot observe
+        // a partially swapped heap/resource set.
+        self.wait_for_gpu()?;
+
+        let next_curve_capacity = required_curve_capacity
+            .max(self.curve_buffer_capacity.saturating_mul(2))
+            .max(MAX_CURVE_FLOAT4_COUNT);
+        let next_band_capacity = required_band_capacity
+            .max(self.band_buffer_capacity.saturating_mul(2))
+            .max(MAX_BAND_UINT_COUNT);
+        let (srv_heap, curve_buffer, band_buffer, sprite_buffer, sprite_atlas) =
+            create_shader_resources_and_srv_with_capacities(
+                &self.device,
+                Arc::clone(&self.sprite_atlas),
+                next_curve_capacity,
+                next_band_capacity,
+            )
+            .wrap_err_with(|| {
+                format!(
+                    "failed to grow shader resources for curves={} bands={}",
+                    next_curve_capacity, next_band_capacity
+                )
+            })?;
+
+        self.srv_heap = srv_heap;
+        self.curve_buffer = curve_buffer;
+        self.curve_buffer_capacity = next_curve_capacity;
+        self.band_buffer = band_buffer;
+        self.band_buffer_capacity = next_band_capacity;
+        self._sprite_buffer = sprite_buffer;
+        self.sprite_atlas = sprite_atlas;
+        Ok(())
     }
 
     fn update_shader_params(&self) -> eyre::Result<()> {
@@ -2841,14 +2895,6 @@ fn build_slug_curve_buffer(
         );
     }
 
-    if curve_data.len() > MAX_CURVE_FLOAT4_COUNT {
-        eyre::bail!("slug curve buffer capacity exceeded")
-    }
-
-    if band_data.len() > MAX_BAND_UINT_COUNT {
-        eyre::bail!("slug band buffer capacity exceeded")
-    }
-
     Ok((curve_data, band_data, glyph_cache))
 }
 
@@ -2980,20 +3026,88 @@ pub fn offscreen_render_backend_name() -> &'static str {
     }
 }
 
+fn log_offscreen_dxgi_debug_messages(queue: &IDXGIInfoQueue, context: &str) {
+    let count = unsafe { queue.GetNumStoredMessages(DXGI_DEBUG_ALL) };
+    if count == 0 {
+        return;
+    }
+
+    warn!(context, count, "offscreen DXGI debug messages");
+    for index in 0..count {
+        let mut message_size = 0;
+        if unsafe { queue.GetMessage(DXGI_DEBUG_ALL, index, None, &mut message_size) }.is_err() {
+            warn!(context, index, "failed to query offscreen DXGI debug message size");
+            continue;
+        }
+
+        let mut message_buffer = vec![0_u8; message_size];
+        let message_ptr = message_buffer.as_mut_ptr() as *mut DXGI_INFO_QUEUE_MESSAGE;
+        if unsafe { queue.GetMessage(DXGI_DEBUG_ALL, index, Some(message_ptr), &mut message_size) }
+            .is_err()
+        {
+            warn!(context, index, "failed to read offscreen DXGI debug message");
+            continue;
+        }
+
+        let (severity, description) = unsafe {
+            let description_slice = std::slice::from_raw_parts(
+                (*message_ptr).pDescription as *const u8,
+                (*message_ptr).DescriptionByteLength,
+            );
+            let severity = match (*message_ptr).Severity {
+                DXGI_INFO_QUEUE_MESSAGE_SEVERITY_CORRUPTION => "CORRUPTION",
+                DXGI_INFO_QUEUE_MESSAGE_SEVERITY_ERROR => "ERROR",
+                DXGI_INFO_QUEUE_MESSAGE_SEVERITY_WARNING => "WARNING",
+                DXGI_INFO_QUEUE_MESSAGE_SEVERITY_INFO => "INFO",
+                DXGI_INFO_QUEUE_MESSAGE_SEVERITY_MESSAGE => "MESSAGE",
+                _ => "UNKNOWN",
+            };
+            let description = String::from_utf8_lossy(description_slice)
+                .trim_matches(char::from(0))
+                .trim()
+                .to_string();
+            (severity, description)
+        };
+
+        warn!(context, index, severity, %description, "offscreen DXGI debug message");
+    }
+
+    unsafe { queue.ClearStoredMessages(DXGI_DEBUG_ALL) };
+}
+
 /// os[impl os.windows.rendering.direct3d12.offscreen-terminal-verification]
 pub fn render_frame_model_offscreen_image(
     frame: &RenderFrameModel,
 ) -> eyre::Result<ImageBuffer<Rgba<u8>, Vec<u8>>> {
     let width = u32::try_from(frame.layout.client_width.max(1)).unwrap_or(1);
     let height = u32::try_from(frame.layout.client_height.max(1)).unwrap_or(1);
+    info!(width, height, "starting offscreen render");
     let use_warp_adapter = offscreen_uses_warp_adapter();
-    let (_dxgi_factory, device, _dxgi_info_queue) = create_device_with_adapter(use_warp_adapter)
+    let (_dxgi_factory, device, dxgi_info_queue) = create_device_with_adapter(use_warp_adapter)
         .wrap_err_with(|| {
             format!(
                 "failed to create {} D3D12 device for offscreen render",
                 offscreen_render_backend_name()
             )
         })?;
+    if let Some(queue) = &dxgi_info_queue {
+        unsafe {
+            let _ = queue.SetBreakOnSeverity(
+                DXGI_DEBUG_ALL,
+                DXGI_INFO_QUEUE_MESSAGE_SEVERITY_CORRUPTION,
+                false,
+            );
+            let _ = queue.SetBreakOnSeverity(
+                DXGI_DEBUG_ALL,
+                DXGI_INFO_QUEUE_MESSAGE_SEVERITY_ERROR,
+                false,
+            );
+            queue.ClearStoredMessages(DXGI_DEBUG_ALL);
+        }
+        info!(
+            "disabled DXGI break-on-error for offscreen render so self-tests can report diagnostics"
+        );
+    }
     let command_queue = create_command_queue(&device)
         .wrap_err("failed to create D3D12 command queue for offscreen render")?;
     let command_allocator: ID3D12CommandAllocator =
@@ -3019,9 +3133,6 @@ pub fn render_frame_model_offscreen_image(
     let shader_param_buffer = create_shader_param_buffer(&device)
         .wrap_err("failed to create offscreen shader parameter buffer")?;
     let sprite_atlas = cached_sprite_atlas()?;
-    let (srv_heap, curve_buffer, band_buffer, _sprite_buffer, sprite_atlas) =
-        create_shader_resources_and_srv(&device, sprite_atlas)
-            .wrap_err("failed to create offscreen shader resources")?;
     let (render_target, rtv_heap) = create_offscreen_render_target(&device, width, height)
         .wrap_err_with(|| {
             format!("failed to create offscreen render target for {width}x{height} image")
@@ -3032,13 +3143,30 @@ pub fn render_frame_model_offscreen_image(
         })?;
     let fence: ID3D12Fence = unsafe { device.CreateFence(0, D3D12_FENCE_FLAG_NONE) }
         .wrap_err("failed to create offscreen fence")?;
-    let fence_event = unsafe { Owned::new(CreateEventW(None, false, false, None)?) };
 
     let scenes = build_offscreen_frame_scenes(frame);
+    info!(fragment_count = scenes.len(), "built offscreen scenes");
     let scene_refs = scenes.iter().map(Arc::as_ref).collect::<Vec<_>>();
     let scene_chars = collect_scene_chars_from_fragments(&scene_refs);
     let (curve_data, band_data, glyph_cache) =
         build_slug_curve_buffer(&font, &scene_chars).wrap_err("failed to build slug curve data")?;
+    info!(
+        glyph_count = scene_chars.len(),
+        curve_count = curve_data.len(),
+        band_count = band_data.len(),
+        "built offscreen slug buffers"
+    );
+    let curve_capacity = curve_data.len().max(MAX_CURVE_FLOAT4_COUNT);
+    let band_capacity = band_data.len().max(MAX_BAND_UINT_COUNT);
+    let (srv_heap, curve_buffer, band_buffer, _sprite_buffer, sprite_atlas) =
+        create_shader_resources_and_srv_with_capacities(
+            &device,
+            sprite_atlas,
+            curve_capacity,
+            band_capacity,
+        )
+        .wrap_err("failed to create offscreen shader resources")?;
+    info!(curve_capacity, band_capacity, "allocated offscreen shader resources");
     let vertex_fragments = scene_refs
         .iter()
         .map(|scene| build_scene_vertices_with_assets(scene, &sprite_atlas, &glyph_cache, &font))
@@ -3048,9 +3176,11 @@ pub fn render_frame_model_offscreen_image(
         .map(Vec::as_slice)
         .collect::<Vec<_>>();
     let vertex_count = upload_fragment_vertices(&vertex_buffer, &vertex_slices)?;
-    upload_curve_data(&curve_buffer, &curve_data)?;
-    upload_band_data(&band_buffer, &band_data)?;
+    info!(vertex_count, "uploaded offscreen vertices");
+    upload_curve_data(&curve_buffer, curve_capacity, &curve_data)?;
+    upload_band_data(&band_buffer, band_capacity, &band_data)?;
     upload_offscreen_shader_params(&shader_param_buffer, width, height, &sprite_atlas, &scene_refs)?;
+    info!("uploaded offscreen shader data");
 
     let viewport = D3D12_VIEWPORT {
         TopLeftX: 0.0,
@@ -3105,12 +3235,44 @@ pub fn render_frame_model_offscreen_image(
     unsafe {
         command_queue.ExecuteCommandLists(&command_lists);
         command_queue.Signal(&fence, 1)?;
+        info!("submitted offscreen command list");
+        if let Some(queue) = &dxgi_info_queue {
+            log_offscreen_dxgi_debug_messages(queue, "offscreen render post-submit");
+        }
+        if let Err(error) = device.GetDeviceRemovedReason() {
+            eyre::bail!("offscreen device was removed after command submission: {error}");
+        }
         if fence.GetCompletedValue() < 1 {
-            fence.SetEventOnCompletion(1, *fence_event)?;
-            WaitForSingleObjectEx(*fence_event, INFINITE, false);
+            let wait_started = Instant::now();
+            // Offscreen verification submits a single command list, so bounded fence polling is
+            // simpler and more diagnosable here than routing through a Win32 event wait.
+            while fence.GetCompletedValue() < 1 {
+                if let Err(error) = device.GetDeviceRemovedReason() {
+                    if let Some(queue) = &dxgi_info_queue {
+                        log_offscreen_dxgi_debug_messages(queue, "offscreen render device removed");
+                    }
+                    eyre::bail!("offscreen device was removed while waiting for completion: {error}");
+                }
+                if wait_started.elapsed().as_millis()
+                    >= u128::from(OFFSCREEN_RENDER_FENCE_TIMEOUT_MS)
+                {
+                    if let Some(queue) = &dxgi_info_queue {
+                        log_offscreen_dxgi_debug_messages(queue, "offscreen render fence timeout");
+                    }
+                    eyre::bail!(
+                        "offscreen render fence timed out after {OFFSCREEN_RENDER_FENCE_TIMEOUT_MS}ms; \
+                         the fixture likely stalled the command queue before readback"
+                    );
+                }
+                thread::yield_now();
+            }
         }
     }
 
+    info!("reading back offscreen render target");
+    if let Some(queue) = &dxgi_info_queue {
+        log_offscreen_dxgi_debug_messages(queue, "offscreen render pre-readback");
+    }
     readback_texture_to_image(&readback_buffer, width, height, row_pitch)
 }
 
@@ -3312,14 +3474,18 @@ fn upload_fragment_vertices(
     Ok(vertex_count)
 }
 
-fn upload_curve_data(curve_buffer: &ID3D12Resource, curve_data: &[[f32; 4]]) -> eyre::Result<()> {
+fn upload_curve_data(
+    curve_buffer: &ID3D12Resource,
+    curve_capacity: usize,
+    curve_data: &[[f32; 4]],
+) -> eyre::Result<()> {
     unsafe {
         let mut mapped = std::ptr::null_mut();
         curve_buffer.Map(0, None, Some(&mut mapped))?;
         std::ptr::write_bytes(
             mapped,
             0,
-            MAX_CURVE_FLOAT4_COUNT * std::mem::size_of::<[f32; 4]>(),
+            curve_capacity * std::mem::size_of::<[f32; 4]>(),
         );
         std::ptr::copy_nonoverlapping(
             curve_data.as_ptr(),
@@ -3331,11 +3497,15 @@ fn upload_curve_data(curve_buffer: &ID3D12Resource, curve_data: &[[f32; 4]]) -> 
     Ok(())
 }
 
-fn upload_band_data(band_buffer: &ID3D12Resource, band_data: &[u32]) -> eyre::Result<()> {
+fn upload_band_data(
+    band_buffer: &ID3D12Resource,
+    band_capacity: usize,
+    band_data: &[u32],
+) -> eyre::Result<()> {
     unsafe {
         let mut mapped = std::ptr::null_mut();
         band_buffer.Map(0, None, Some(&mut mapped))?;
-        std::ptr::write_bytes(mapped, 0, MAX_BAND_UINT_COUNT * std::mem::size_of::<u32>());
+        std::ptr::write_bytes(mapped, 0, band_capacity * std::mem::size_of::<u32>());
         std::ptr::copy_nonoverlapping(band_data.as_ptr(), mapped as *mut u32, band_data.len());
         band_buffer.Unmap(0, None);
     }
@@ -6006,9 +6176,29 @@ fn create_shader_resources_and_srv(
     ID3D12Resource,
     Arc<SpriteAtlas>,
 )> {
-    let curve_data = vec![[0.0_f32; 4]; MAX_CURVE_FLOAT4_COUNT];
+    create_shader_resources_and_srv_with_capacities(
+        device,
+        sprite_atlas,
+        MAX_CURVE_FLOAT4_COUNT,
+        MAX_BAND_UINT_COUNT,
+    )
+}
+
+fn create_shader_resources_and_srv_with_capacities(
+    device: &ID3D12Device,
+    sprite_atlas: Arc<SpriteAtlas>,
+    curve_capacity: usize,
+    band_capacity: usize,
+) -> eyre::Result<(
+    ID3D12DescriptorHeap,
+    ID3D12Resource,
+    ID3D12Resource,
+    ID3D12Resource,
+    Arc<SpriteAtlas>,
+)> {
+    let curve_data = vec![[0.0_f32; 4]; curve_capacity];
     let byte_len = (curve_data.len() * std::mem::size_of::<[f32; 4]>()) as u64;
-    let band_data = vec![0_u32; MAX_BAND_UINT_COUNT];
+    let band_data = vec![0_u32; band_capacity];
     let band_byte_len = (band_data.len() * std::mem::size_of::<u32>()) as u64;
     let sprite_byte_len = (sprite_atlas.pixels.len() * std::mem::size_of::<u32>()) as u64;
 
@@ -8260,6 +8450,30 @@ mod tests {
                 "slug snapshot should keep the outer r base pixel on the cut row ({pixel_x}, {pixel_y})"
             );
         }
+
+        Ok(())
+    }
+
+    #[test]
+    fn full_terminal_unicode_set_builds_slug_buffers() -> eyre::Result<()> {
+        let chars = super::terminal_font_unicode_chars()?;
+        let font = load_terminal_font()?;
+        let (curve_data, band_data, glyph_cache) = super::build_slug_curve_buffer(&font, &chars)?;
+
+        assert!(!chars.is_empty(), "expected terminal font to expose unicode glyphs");
+        assert!(
+            !curve_data.is_empty(),
+            "expected curve data for the full terminal unicode glyph set"
+        );
+        assert!(
+            !band_data.is_empty(),
+            "expected band data for the full terminal unicode glyph set"
+        );
+        assert_eq!(
+            glyph_cache.len(),
+            chars.len(),
+            "expected a glyph cache entry for every enumerated terminal glyph"
+        );
 
         Ok(())
     }

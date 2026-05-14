@@ -149,9 +149,12 @@ pub fn run_render_offscreen_fixture(
     let scene_snapshot = windows_d3d12_renderer::render_frame_model_scene_snapshot(&frame);
     let (non_transparent_pixels, bright_pixels) = summarize_offscreen_image(&image);
     if non_transparent_pixels == 0 || bright_pixels == 0 {
+        let artifacts = write_failed_render_artifacts(fixture.id, artifact_output, &image, &scene_snapshot)?;
+        let actual_path_text = artifacts.png.as_deref().unwrap_or("<not written>");
+        let snapshot_path_text = artifacts.scene_snapshot.as_deref().unwrap_or("<not written>");
         eyre::bail!(
-            "render fixture `{}` produced an empty or fully dark image",
-            fixture.id
+            "render fixture `{}` produced an empty or fully dark image; actual=`{actual_path_text}` scene=`{snapshot_path_text}`",
+            fixture.id,
         )
     }
 
@@ -314,6 +317,30 @@ fn write_actual_outputs(
         png: artifact_path,
         diff: diff_path,
         scene_snapshot: scene_snapshot_artifact_path,
+    })
+}
+
+fn write_failed_render_artifacts(
+    fixture: &str,
+    artifact_output: Option<&Path>,
+    image: &RgbaImage,
+    scene_snapshot: &str,
+) -> eyre::Result<ArtifactWrites> {
+    let actual_artifact_path = artifact_output
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| default_actual_artifact_path(fixture));
+    let actual_scene_snapshot_path = artifact_output
+        .map(default_scene_snapshot_path_from_artifact)
+        .unwrap_or_else(|| default_actual_scene_snapshot_artifact_path(fixture));
+
+    let png = write_png_artifact(fixture, Some(&actual_artifact_path), image)?;
+    let scene_snapshot =
+        write_scene_snapshot_artifact(fixture, Some(&actual_scene_snapshot_path), scene_snapshot)?;
+
+    Ok(ArtifactWrites {
+        png,
+        diff: None,
+        scene_snapshot,
     })
 }
 
