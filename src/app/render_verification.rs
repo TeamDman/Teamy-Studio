@@ -19,9 +19,14 @@ const DEFAULT_RENDER_FIXTURE_ID: &str = "basic-terminal-frame";
 const TRANSFORMED_TEXT_RENDER_FIXTURE_ID: &str = "transformed-text-plane";
 const INDUCE_HAVOC_RENDER_FIXTURE_ID: &str = "induce-havoc";
 const TEAMY_INDUCE_HAVOC_ITERATIONS_ENV: &str = "TEAMY_INDUCE_HAVOC_ITERATIONS";
+const TEAMY_INDUCE_HAVOC_PROFILE_ENV: &str = "TEAMY_INDUCE_HAVOC_PROFILE";
 const DEFAULT_INDUCE_HAVOC_ITERATIONS: usize = 6;
+const INDUCE_HAVOC_PROFILE_EXTREME: &str = "extreme";
 const REFERENCE_TEXT_RENDER_TEXT: &str = "test";
+const DENSE_HAVOC_RENDER_TEXT: &str =
+    "transformed text driver repro transformed text driver repro transformed text driver repro";
 const REFERENCE_TEXT_FONT_SIZE_PX: f32 = 168.0;
+const DENSE_HAVOC_FONT_SIZE_PX: f32 = 208.0;
 const REFERENCE_TEXT_CAMERA_DISTANCE: f32 = 1400.0;
 const REFERENCE_TEXT_NEAR_PLANE_DISTANCE: f32 = 80.0;
 const REFERENCE_TEXT_COLOR: [f32; 4] = [1.0, 1.0, 1.0, 1.0];
@@ -33,6 +38,12 @@ const REFERENCE_TEXT_PITCH_RADIANS: f32 = 0.31;
 pub(crate) struct ReferenceTextLayout {
     pub layout: windows_terminal::TerminalLayout,
     pub transformed_scene: RenderScene,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InduceHavocProfile {
+    Standard,
+    Extreme,
 }
 
 struct BuiltInRenderFixture {
@@ -239,23 +250,49 @@ fn run_induce_havoc_render_fixture(
     artifact_output: Option<&Path>,
 ) -> eyre::Result<RenderOffscreenSelfTestReport> {
     let iterations = induce_havoc_iteration_count();
-    let phases = [
-        (DEFAULT_RENDER_FIXTURE_ID, build_basic_terminal_frame_fixture as fn() -> RenderFrameModel),
-        (
-            "zero-angle-transformed-text-plane",
-            build_reference_zero_angle_transformed_text_frame_runtime as fn() -> RenderFrameModel,
-        ),
-        (
-            TRANSFORMED_TEXT_RENDER_FIXTURE_ID,
-            build_reference_transformed_text_frame as fn() -> RenderFrameModel,
-        ),
-    ];
+    let profile = induce_havoc_profile();
+    let phases: Vec<(&str, fn() -> RenderFrameModel)> = match profile {
+        InduceHavocProfile::Standard => vec![
+            (
+                DEFAULT_RENDER_FIXTURE_ID,
+                build_basic_terminal_frame_fixture as fn() -> RenderFrameModel,
+            ),
+            (
+                "zero-angle-transformed-text-plane",
+                build_reference_zero_angle_transformed_text_frame_runtime
+                    as fn() -> RenderFrameModel,
+            ),
+            (
+                TRANSFORMED_TEXT_RENDER_FIXTURE_ID,
+                build_reference_transformed_text_frame as fn() -> RenderFrameModel,
+            ),
+        ],
+        InduceHavocProfile::Extreme => vec![
+            (
+                DEFAULT_RENDER_FIXTURE_ID,
+                build_basic_terminal_frame_fixture as fn() -> RenderFrameModel,
+            ),
+            (
+                "dense-transformed-text-plane-a",
+                build_dense_reference_transformed_text_frame as fn() -> RenderFrameModel,
+            ),
+            (
+                "dense-transformed-text-plane-b",
+                build_dense_reference_transformed_text_frame as fn() -> RenderFrameModel,
+            ),
+            (
+                TRANSFORMED_TEXT_RENDER_FIXTURE_ID,
+                build_reference_transformed_text_frame as fn() -> RenderFrameModel,
+            ),
+        ],
+    };
 
     let mut last_image = None;
     let mut last_scene_snapshot = None;
+    let phase_count = phases.len();
 
     for iteration in 0..iterations {
-        for (phase_name, build_frame) in phases {
+        for &(phase_name, build_frame) in &phases {
             let frame = build_frame();
             let scene_snapshot = windows_d3d12_renderer::render_frame_model_scene_snapshot(&frame);
             let image = windows_d3d12_renderer::render_frame_model_offscreen_image(&frame)
@@ -322,7 +359,7 @@ fn run_induce_havoc_render_fixture(
         fixture: INDUCE_HAVOC_RENDER_FIXTURE_ID.to_owned(),
         backend: windows_d3d12_renderer::offscreen_render_backend_name().to_owned(),
         checked_expected_outputs: false,
-        iterations: iterations * phases.len(),
+        iterations: iterations * phase_count,
         expected_image_path: String::new(),
         expected_scene_snapshot_path: String::new(),
         artifact_path: artifacts.png,
@@ -629,6 +666,15 @@ fn resolve_fixture(fixture: Option<&str>) -> eyre::Result<&'static BuiltInRender
         })
 }
 
+fn induce_havoc_profile() -> InduceHavocProfile {
+    match std::env::var(TEAMY_INDUCE_HAVOC_PROFILE_ENV) {
+        Ok(value) if value.eq_ignore_ascii_case(INDUCE_HAVOC_PROFILE_EXTREME) => {
+            InduceHavocProfile::Extreme
+        }
+        _ => InduceHavocProfile::Standard,
+    }
+}
+
 fn induce_havoc_iteration_count() -> usize {
     std::env::var(TEAMY_INDUCE_HAVOC_ITERATIONS_ENV)
         .ok()
@@ -878,17 +924,49 @@ fn build_reference_text_frame(
 }
 
 fn build_reference_text_layout(yaw_radians: f32, pitch_radians: f32) -> ReferenceTextLayout {
-    let layout = windows_terminal::TerminalLayout {
-        client_width: 1040,
-        client_height: 680,
-        cell_width: 8,
-        cell_height: 16,
-        diagnostic_panel_visible: false,
-    };
+    build_reference_text_layout_with_config(
+        windows_terminal::TerminalLayout {
+            client_width: 1040,
+            client_height: 680,
+            cell_width: 8,
+            cell_height: 16,
+            diagnostic_panel_visible: false,
+        },
+        REFERENCE_TEXT_RENDER_TEXT,
+        REFERENCE_TEXT_FONT_SIZE_PX,
+        yaw_radians,
+        pitch_radians,
+    )
+}
+
+fn build_dense_reference_transformed_text_frame() -> RenderFrameModel {
+    build_reference_text_layout_with_config(
+        windows_terminal::TerminalLayout {
+            client_width: 1920,
+            client_height: 1080,
+            cell_width: 8,
+            cell_height: 16,
+            diagnostic_panel_visible: false,
+        },
+        DENSE_HAVOC_RENDER_TEXT,
+        DENSE_HAVOC_FONT_SIZE_PX,
+        REFERENCE_TEXT_YAW_RADIANS,
+        REFERENCE_TEXT_PITCH_RADIANS,
+    )
+    .frame()
+}
+
+fn build_reference_text_layout_with_config(
+    layout: windows_terminal::TerminalLayout,
+    text: &str,
+    font_size_px: f32,
+    yaw_radians: f32,
+    pitch_radians: f32,
+) -> ReferenceTextLayout {
     let (_, plane_basis, glyphs) = super::windows_app::build_text_rendering_plane_verification_geometry(
         layout,
-        REFERENCE_TEXT_RENDER_TEXT,
-        REFERENCE_TEXT_FONT_SIZE_PX / 28.0,
+        text,
+        font_size_px / 28.0,
         yaw_radians,
         pitch_radians,
         [0.0, 0.0],
