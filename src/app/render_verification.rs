@@ -17,6 +17,9 @@ use super::windows_terminal::{
 
 const DEFAULT_RENDER_FIXTURE_ID: &str = "basic-terminal-frame";
 const TRANSFORMED_TEXT_RENDER_FIXTURE_ID: &str = "transformed-text-plane";
+const INDUCE_HAVOC_RENDER_FIXTURE_ID: &str = "induce-havoc";
+const TEAMY_INDUCE_HAVOC_ITERATIONS_ENV: &str = "TEAMY_INDUCE_HAVOC_ITERATIONS";
+const DEFAULT_INDUCE_HAVOC_ITERATIONS: usize = 6;
 const REFERENCE_TEXT_RENDER_TEXT: &str = "test";
 const REFERENCE_TEXT_FONT_SIZE_PX: f32 = 168.0;
 const REFERENCE_TEXT_CAMERA_DISTANCE: f32 = 1400.0;
@@ -49,6 +52,11 @@ const BUILT_IN_RENDER_FIXTURES: &[BuiltInRenderFixture] = &[
         description: "Reference transformed text plane for offscreen verification artifacts and regression debugging.",
         build_frame: build_reference_transformed_text_frame,
     },
+    BuiltInRenderFixture {
+        id: INDUCE_HAVOC_RENDER_FIXTURE_ID,
+        description: "Diagnostic-only offscreen stress loop that alternates nearby basic and transformed render paths to reproduce graphics-stack instability.",
+        build_frame: build_basic_terminal_frame_fixture,
+    },
 ];
 
 #[derive(Debug, Facet)]
@@ -71,6 +79,8 @@ pub struct RenderOffscreenFixtureListReport {
 pub struct RenderOffscreenSelfTestReport {
     fixture: String,
     backend: String,
+    checked_expected_outputs: bool,
+    iterations: usize,
     expected_image_path: String,
     expected_scene_snapshot_path: String,
     artifact_path: Option<String>,
@@ -144,6 +154,16 @@ pub fn run_render_offscreen_fixture(
     update_expected: bool,
 ) -> eyre::Result<RenderOffscreenSelfTestReport> {
     let fixture = resolve_fixture(fixture)?;
+    if fixture.id == INDUCE_HAVOC_RENDER_FIXTURE_ID {
+        if update_expected {
+            eyre::bail!(
+                "render fixture `{}` is diagnostic-only and does not support --update-expected",
+                fixture.id
+            );
+        }
+        return run_induce_havoc_render_fixture(artifact_output);
+    }
+
     let frame = (fixture.build_frame)();
     let image = windows_d3d12_renderer::render_frame_model_offscreen_image(&frame)?;
     let scene_snapshot = windows_d3d12_renderer::render_frame_model_scene_snapshot(&frame);
@@ -185,6 +205,8 @@ pub fn run_render_offscreen_fixture(
     let report = RenderOffscreenSelfTestReport {
         fixture: fixture.id.to_owned(),
         backend: windows_d3d12_renderer::offscreen_render_backend_name().to_owned(),
+        checked_expected_outputs: true,
+        iterations: 1,
         expected_image_path: paths.expected_image.display().to_string(),
         expected_scene_snapshot_path: paths.expected_scene_snapshot.display().to_string(),
         artifact_path: artifacts.png,
@@ -211,6 +233,112 @@ pub fn run_render_offscreen_fixture(
     }
 
     Ok(report)
+}
+
+fn run_induce_havoc_render_fixture(
+    artifact_output: Option<&Path>,
+) -> eyre::Result<RenderOffscreenSelfTestReport> {
+    let iterations = induce_havoc_iteration_count();
+    let phases = [
+        (DEFAULT_RENDER_FIXTURE_ID, build_basic_terminal_frame_fixture as fn() -> RenderFrameModel),
+        (
+            "zero-angle-transformed-text-plane",
+            build_reference_zero_angle_transformed_text_frame_runtime as fn() -> RenderFrameModel,
+        ),
+        (
+            TRANSFORMED_TEXT_RENDER_FIXTURE_ID,
+            build_reference_transformed_text_frame as fn() -> RenderFrameModel,
+        ),
+    ];
+
+    let mut last_image = None;
+    let mut last_scene_snapshot = None;
+
+    for iteration in 0..iterations {
+        for (phase_name, build_frame) in phases {
+            let frame = build_frame();
+            let scene_snapshot = windows_d3d12_renderer::render_frame_model_scene_snapshot(&frame);
+            let image = windows_d3d12_renderer::render_frame_model_offscreen_image(&frame)
+                .wrap_err_with(|| {
+                    let scene_artifact_path = artifact_output
+                        .map(default_scene_snapshot_path_from_artifact)
+                        .unwrap_or_else(|| {
+                            default_actual_scene_snapshot_artifact_path(
+                                INDUCE_HAVOC_RENDER_FIXTURE_ID,
+                            )
+                        });
+                    let _ = write_scene_snapshot_artifact(
+                        INDUCE_HAVOC_RENDER_FIXTURE_ID,
+                        Some(&scene_artifact_path),
+                        &scene_snapshot,
+                    );
+                    format!(
+                        "induce-havoc iteration {} phase `{phase_name}` failed during offscreen render; scene=`{}`",
+                        iteration + 1,
+                        scene_artifact_path.display()
+                    )
+                })?;
+            let (non_transparent_pixels, bright_pixels) = summarize_offscreen_image(&image);
+
+            last_image = Some(image);
+            last_scene_snapshot = Some(scene_snapshot);
+
+            if non_transparent_pixels == 0 || bright_pixels == 0 {
+                let image = last_image
+                    .as_ref()
+                    .expect("induce-havoc should retain the failing image");
+                let scene_snapshot = last_scene_snapshot
+                    .as_deref()
+                    .expect("induce-havoc should retain the failing scene snapshot");
+                let artifacts = write_failed_render_artifacts(
+                    INDUCE_HAVOC_RENDER_FIXTURE_ID,
+                    artifact_output,
+                    image,
+                    scene_snapshot,
+                )?;
+                let actual_path_text = artifacts.png.as_deref().unwrap_or("<not written>");
+                let snapshot_path_text =
+                    artifacts.scene_snapshot.as_deref().unwrap_or("<not written>");
+                eyre::bail!(
+                    "render fixture `{}` produced an empty or fully dark image during iteration {} phase `{phase_name}`; actual=`{actual_path_text}` scene=`{snapshot_path_text}`",
+                    INDUCE_HAVOC_RENDER_FIXTURE_ID,
+                    iteration + 1,
+                );
+            }
+        }
+    }
+
+    let image = last_image.expect("induce-havoc should render at least one frame");
+    let scene_snapshot = last_scene_snapshot.expect("induce-havoc should capture a scene snapshot");
+    let artifacts = write_failed_render_artifacts(
+        INDUCE_HAVOC_RENDER_FIXTURE_ID,
+        artifact_output,
+        &image,
+        &scene_snapshot,
+    )?;
+    let (non_transparent_pixels, bright_pixels) = summarize_offscreen_image(&image);
+
+    Ok(RenderOffscreenSelfTestReport {
+        fixture: INDUCE_HAVOC_RENDER_FIXTURE_ID.to_owned(),
+        backend: windows_d3d12_renderer::offscreen_render_backend_name().to_owned(),
+        checked_expected_outputs: false,
+        iterations: iterations * phases.len(),
+        expected_image_path: String::new(),
+        expected_scene_snapshot_path: String::new(),
+        artifact_path: artifacts.png,
+        diff_path: None,
+        scene_snapshot_artifact_path: artifacts.scene_snapshot,
+        image_width: image.width(),
+        image_height: image.height(),
+        non_transparent_pixels,
+        bright_pixels,
+        pixel_hash: pixel_hash(&image),
+        scene_snapshot_hash: text_hash(&scene_snapshot),
+        scene_snapshot_lines: scene_snapshot.lines().count(),
+        matched_expected: true,
+        matched_scene_snapshot: true,
+        updated_expected: false,
+    })
 }
 
 fn render_fixture_paths(fixture: &str) -> RenderFixturePaths {
@@ -501,6 +629,14 @@ fn resolve_fixture(fixture: Option<&str>) -> eyre::Result<&'static BuiltInRender
         })
 }
 
+fn induce_havoc_iteration_count() -> usize {
+    std::env::var(TEAMY_INDUCE_HAVOC_ITERATIONS_ENV)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .map(|count| count.clamp(1, 64))
+        .unwrap_or(DEFAULT_INDUCE_HAVOC_ITERATIONS)
+}
+
 fn expected_image_path(fixture: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
@@ -712,7 +848,11 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
 
 #[cfg(test)]
 pub(crate) fn build_reference_zero_angle_transformed_text_frame() -> RenderFrameModel {
-    build_reference_zero_angle_transformed_text_layout().frame()
+    build_reference_zero_angle_transformed_text_frame_runtime()
+}
+
+fn build_reference_zero_angle_transformed_text_frame_runtime() -> RenderFrameModel {
+    build_reference_text_layout(0.0, 0.0).frame()
 }
 
 pub(crate) fn build_reference_transformed_text_frame() -> RenderFrameModel {
