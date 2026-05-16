@@ -7,6 +7,9 @@ This specification covers the non-terminal window surfaces in Teamy Studio: the 
 windowing[launcher.startup.default]
 Launching Teamy Studio with no explicit terminal command must open a launcher window instead of immediately spawning a shell.
 
+windowing[launcher.startup.foreground]
+Launching Teamy Studio into the launcher window must bring that launcher window to the front so the app startup is visually obvious.
+
 windowing[launcher.buttons.large-image-cards]
 The launcher window must present large image-backed action cards for the primary entry points.
 

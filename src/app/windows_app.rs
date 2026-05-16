@@ -243,10 +243,7 @@ fn focus_launcher_scene_window(excluding: WindowHandle) {
     if !unsafe { IsWindowVisible(hwnd) }.as_bool() {
         return;
     }
-    unsafe {
-        let _ = ShowWindow(hwnd, SW_RESTORE);
-        let _ = SetForegroundWindow(hwnd);
-    }
+    WindowHandle::new(WindowThread::current(), hwnd).bring_to_front();
 }
 
 fn broadcast_demo_mode_state_changed() {
@@ -2122,6 +2119,14 @@ impl WindowHandle {
         let _ = unsafe { ShowWindow(self.hwnd, SW_RESTORE) };
     }
 
+    fn bring_to_front(self) {
+        self.window_thread.assert_window_thread();
+        // Safety: `self.hwnd` is a live top-level window owned by this process on `self.window_thread`.
+        let _ = unsafe { ShowWindow(self.hwnd, SW_RESTORE) };
+        // Safety: promoting this live top-level window to the foreground is valid during launch and refocus flows.
+        let _ = unsafe { SetForegroundWindow(self.hwnd) };
+    }
+
     fn is_zoomed(self) -> bool {
         self.window_thread.assert_window_thread();
         // Safety: querying the zoomed state of a live top-level window is valid.
@@ -3117,6 +3122,10 @@ fn run_scene_window(
         hwnd.show_no_activate();
     } else {
         hwnd.show();
+        if scene_kind == SceneWindowKind::Launcher {
+            // windowing[impl launcher.startup.foreground]
+            hwnd.bring_to_front();
+        }
     }
     with_scene_app_state(|state| render_scene_window_frame(state, hwnd, None, false))?;
     let _window_span = info_span!(
