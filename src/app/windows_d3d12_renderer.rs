@@ -40,7 +40,9 @@ use tracing::debug_span;
 use tracing::{info, info_span, instrument, warn};
 use ttf_parser::{Face, GlyphId, OutlineBuilder};
 use windows::Win32::Foundation::{E_FAIL, FreeLibrary, HANDLE, HWND, RECT, TRUE};
-use windows::Win32::Graphics::Direct3D::Fxc::{D3DCOMPILE_DEBUG, D3DCOMPILE_SKIP_OPTIMIZATION, D3DCompile};
+use windows::Win32::Graphics::Direct3D::Fxc::{
+    D3DCOMPILE_DEBUG, D3DCOMPILE_SKIP_OPTIMIZATION, D3DCompile,
+};
 use windows::Win32::Graphics::Direct3D::{
     D3D_FEATURE_LEVEL_11_0, D3D_INCLUDE_TYPE, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST, ID3DBlob,
     ID3DInclude, ID3DInclude_Impl,
@@ -843,9 +845,15 @@ impl D3d12PanelRenderer {
                 .in_scope(|| create_render_targets(&device, &swap_chain))?;
         let command_allocators = info_span!("create_command_allocators")
             .in_scope(|| create_command_allocators(&device))?;
-        let (srv_heap, curve_buffer, band_buffer, transformed_glyph_inverse_buffer, sprite_buffer, sprite_atlas) =
-            info_span!("create_shader_resources_and_srv")
-                .in_scope(|| create_shader_resources_and_srv(&device, Arc::clone(&sprite_atlas)))?;
+        let (
+            srv_heap,
+            curve_buffer,
+            band_buffer,
+            transformed_glyph_inverse_buffer,
+            sprite_buffer,
+            sprite_atlas,
+        ) = info_span!("create_shader_resources_and_srv")
+            .in_scope(|| create_shader_resources_and_srv(&device, Arc::clone(&sprite_atlas)))?;
         let root_signature =
             info_span!("create_root_signature").in_scope(|| create_root_signature(&device))?;
         await_renderer_startup_task(
@@ -1098,12 +1106,18 @@ impl D3d12PanelRenderer {
             .iter()
             .find_map(|scene| scene.transformed_glyph_clip_rect);
         self.transformed_glyph_debug_enabled = scenes.iter().any(|scene| {
-            scene.transformed_glyph_clip_rect.is_some() && !scene.overlay_transformed_panels.is_empty()
+            scene.transformed_glyph_clip_rect.is_some()
+                && !scene.overlay_transformed_panels.is_empty()
         });
         self.transformed_glyph_debug_hover = scenes
             .iter()
             .filter(|scene| scene.transformed_glyph_clip_rect.is_some())
-            .find_map(|scene| scene.overlay_transformed_panels.first().map(|panel| panel.data))
+            .find_map(|scene| {
+                scene
+                    .overlay_transformed_panels
+                    .first()
+                    .map(|panel| panel.data)
+            })
             .unwrap_or([0.0; 4]);
         self.transformed_text_projection = scenes
             .iter()
@@ -1140,8 +1154,8 @@ impl D3d12PanelRenderer {
 
         if let Some(scene) = frame.scene.as_ref() {
             self.transformed_glyph_clip_rect = scene.transformed_glyph_clip_rect;
-            self.transformed_glyph_debug_enabled =
-                scene.transformed_glyph_clip_rect.is_some() && !scene.overlay_transformed_panels.is_empty();
+            self.transformed_glyph_debug_enabled = scene.transformed_glyph_clip_rect.is_some()
+                && !scene.overlay_transformed_panels.is_empty();
             self.transformed_glyph_debug_hover = scene
                 .overlay_transformed_panels
                 .first()
@@ -1161,7 +1175,10 @@ impl D3d12PanelRenderer {
                 self.cached_fragment_vertices(scene, false, &mut scene_cache.scene_vertices)
             };
             let vertex_count = self.upload_cached_fragment_vertices(&[scene_vertices])?;
-            upload_transformed_glyph_inverse_data(&self.transformed_glyph_inverse_buffer, &[scene])?;
+            upload_transformed_glyph_inverse_data(
+                &self.transformed_glyph_inverse_buffer,
+                &[scene],
+            )?;
             scene_cache.last_frame = Some(frame.clone());
             return self.execute_prepared_frame(vertex_count);
         }
@@ -1569,19 +1586,25 @@ impl D3d12PanelRenderer {
         let next_band_capacity = required_band_capacity
             .max(self.band_buffer_capacity.saturating_mul(2))
             .max(MAX_BAND_UINT_COUNT);
-        let (srv_heap, curve_buffer, band_buffer, transformed_glyph_inverse_buffer, sprite_buffer, sprite_atlas) =
-            create_shader_resources_and_srv_with_capacities(
-                &self.device,
-                Arc::clone(&self.sprite_atlas),
-                next_curve_capacity,
-                next_band_capacity,
+        let (
+            srv_heap,
+            curve_buffer,
+            band_buffer,
+            transformed_glyph_inverse_buffer,
+            sprite_buffer,
+            sprite_atlas,
+        ) = create_shader_resources_and_srv_with_capacities(
+            &self.device,
+            Arc::clone(&self.sprite_atlas),
+            next_curve_capacity,
+            next_band_capacity,
+        )
+        .wrap_err_with(|| {
+            format!(
+                "failed to grow shader resources for curves={} bands={}",
+                next_curve_capacity, next_band_capacity
             )
-            .wrap_err_with(|| {
-                format!(
-                    "failed to grow shader resources for curves={} bands={}",
-                    next_curve_capacity, next_band_capacity
-                )
-            })?;
+        })?;
 
         self.srv_heap = srv_heap;
         self.curve_buffer = curve_buffer;
@@ -1598,15 +1621,16 @@ impl D3d12PanelRenderer {
         let elapsed_seconds = self.animation_start.elapsed().as_secs_f32();
         let mut params =
             build_shader_params(self.width as f32, self.height as f32, elapsed_seconds);
-        params.transformed_text_clip_rect = self.transformed_glyph_clip_rect.map_or(
-            [-1.0, -1.0, -1.0, -1.0],
-            |rect| [
-                rect.left as f32,
-                rect.top as f32,
-                rect.right as f32,
-                rect.bottom as f32,
-            ],
-        );
+        params.transformed_text_clip_rect =
+            self.transformed_glyph_clip_rect
+                .map_or([-1.0, -1.0, -1.0, -1.0], |rect| {
+                    [
+                        rect.left as f32,
+                        rect.top as f32,
+                        rect.right as f32,
+                        rect.bottom as f32,
+                    ]
+                });
         params.transformed_text_debug_hover = self.transformed_glyph_debug_hover;
         params.transformed_text_projection = self.transformed_text_projection;
         params.transformed_text_inverse_homography = self.transformed_text_inverse_homography;
@@ -1752,15 +1776,15 @@ fn build_scene_vertices_with_assets(
             .or_else(|| glyph_cache.get(&FALLBACK_GLYPH))
             .copied()
             .unwrap_or_else(|| SlugGlyph::empty(font));
-            append_transformed_text_quad(
-                &mut vertices,
-                glyph.corners,
-                glyph.corner_w,
-                glyph.local_bounds,
-                glyph.color,
-                slug_glyph,
-                glyph.debug_id,
-            );
+        append_transformed_text_quad(
+            &mut vertices,
+            glyph.corners,
+            glyph.corner_w,
+            glyph.local_bounds,
+            glyph.color,
+            slug_glyph,
+            glyph.debug_id,
+        );
     }
     for panel in &scene.overlay_panels {
         append_rect_with_data(
@@ -2740,7 +2764,9 @@ fn collect_scene_chars(scene: &RenderScene) -> Vec<char> {
 fn collect_scene_chars_from_fragments(scenes: &[&RenderScene]) -> Vec<char> {
     let glyph_capacity = scenes
         .iter()
-        .map(|scene| scene.glyphs.len() + scene.transformed_glyphs.len() + scene.overlay_glyphs.len())
+        .map(|scene| {
+            scene.glyphs.len() + scene.transformed_glyphs.len() + scene.overlay_glyphs.len()
+        })
         .sum::<usize>()
         + 1;
     let mut chars = Vec::with_capacity(glyph_capacity);
@@ -3042,7 +3068,10 @@ fn log_offscreen_dxgi_debug_messages(queue: &IDXGIInfoQueue, context: &str) {
     for index in 0..count {
         let mut message_size = 0;
         if unsafe { queue.GetMessage(DXGI_DEBUG_ALL, index, None, &mut message_size) }.is_err() {
-            warn!(context, index, "failed to query offscreen DXGI debug message size");
+            warn!(
+                context,
+                index, "failed to query offscreen DXGI debug message size"
+            );
             continue;
         }
 
@@ -3051,7 +3080,10 @@ fn log_offscreen_dxgi_debug_messages(queue: &IDXGIInfoQueue, context: &str) {
         if unsafe { queue.GetMessage(DXGI_DEBUG_ALL, index, Some(message_ptr), &mut message_size) }
             .is_err()
         {
-            warn!(context, index, "failed to read offscreen DXGI debug message");
+            warn!(
+                context,
+                index, "failed to read offscreen DXGI debug message"
+            );
             continue;
         }
 
@@ -3164,15 +3196,24 @@ pub fn render_frame_model_offscreen_image(
     );
     let curve_capacity = curve_data.len().max(MAX_CURVE_FLOAT4_COUNT);
     let band_capacity = band_data.len().max(MAX_BAND_UINT_COUNT);
-    let (srv_heap, curve_buffer, band_buffer, transformed_glyph_inverse_buffer, _sprite_buffer, sprite_atlas) =
-        create_shader_resources_and_srv_with_capacities(
-            &device,
-            sprite_atlas,
-            curve_capacity,
-            band_capacity,
-        )
-        .wrap_err("failed to create offscreen shader resources")?;
-    info!(curve_capacity, band_capacity, "allocated offscreen shader resources");
+    let (
+        srv_heap,
+        curve_buffer,
+        band_buffer,
+        transformed_glyph_inverse_buffer,
+        _sprite_buffer,
+        sprite_atlas,
+    ) = create_shader_resources_and_srv_with_capacities(
+        &device,
+        sprite_atlas,
+        curve_capacity,
+        band_capacity,
+    )
+    .wrap_err("failed to create offscreen shader resources")?;
+    info!(
+        curve_capacity,
+        band_capacity, "allocated offscreen shader resources"
+    );
     let vertex_fragments = scene_refs
         .iter()
         .map(|scene| build_scene_vertices_with_assets(scene, &sprite_atlas, &glyph_cache, &font))
@@ -3186,7 +3227,13 @@ pub fn render_frame_model_offscreen_image(
     upload_curve_data(&curve_buffer, curve_capacity, &curve_data)?;
     upload_band_data(&band_buffer, band_capacity, &band_data)?;
     upload_transformed_glyph_inverse_data(&transformed_glyph_inverse_buffer, &scene_refs)?;
-    upload_offscreen_shader_params(&shader_param_buffer, width, height, &sprite_atlas, &scene_refs)?;
+    upload_offscreen_shader_params(
+        &shader_param_buffer,
+        width,
+        height,
+        &sprite_atlas,
+        &scene_refs,
+    )?;
     info!("uploaded offscreen shader data");
 
     let viewport = D3D12_VIEWPORT {
@@ -3258,7 +3305,9 @@ pub fn render_frame_model_offscreen_image(
                     if let Some(queue) = &dxgi_info_queue {
                         log_offscreen_dxgi_debug_messages(queue, "offscreen render device removed");
                     }
-                    eyre::bail!("offscreen device was removed while waiting for completion: {error}");
+                    eyre::bail!(
+                        "offscreen device was removed while waiting for completion: {error}"
+                    );
                 }
                 if wait_started.elapsed().as_millis()
                     >= u128::from(OFFSCREEN_RENDER_FENCE_TIMEOUT_MS)
@@ -3489,11 +3538,7 @@ fn upload_curve_data(
     unsafe {
         let mut mapped = std::ptr::null_mut();
         curve_buffer.Map(0, None, Some(&mut mapped))?;
-        std::ptr::write_bytes(
-            mapped,
-            0,
-            curve_capacity * std::mem::size_of::<[f32; 4]>(),
-        );
+        std::ptr::write_bytes(mapped, 0, curve_capacity * std::mem::size_of::<[f32; 4]>());
         std::ptr::copy_nonoverlapping(
             curve_data.as_ptr(),
             mapped as *mut [f32; 4],
@@ -4044,10 +4089,7 @@ fn choose_band_split(
     best_split
 }
 
-fn load_directional_band_header(
-    band_data: &[u32],
-    entry_index: usize,
-) -> DirectionalBandHeader {
+fn load_directional_band_header(band_data: &[u32], entry_index: usize) -> DirectionalBandHeader {
     DirectionalBandHeader {
         count: band_data.get(entry_index).copied().unwrap_or_default(),
         descending_start: band_data.get(entry_index + 1).copied().unwrap_or_default(),
@@ -4214,8 +4256,10 @@ fn cpu_slug_coverage_single_sample(
         glyph.band_transform[3],
         glyph.band_count_y,
     ) as usize;
-    let horizontal_header =
-        load_directional_band_header(band_data, horizontal_band_header_index(glyph, horizontal_band));
+    let horizontal_header = load_directional_band_header(
+        band_data,
+        horizontal_band_header_index(glyph, horizontal_band),
+    );
     let horizontal_direction = if render_coord[0] < horizontal_header.split {
         CoverageRayDirection::Left
     } else {
@@ -4358,8 +4402,10 @@ fn cpu_slug_coverage_all_curves_single_sample(
         glyph.band_transform[3],
         glyph.band_count_y,
     ) as usize;
-    let horizontal_header =
-        load_directional_band_header(band_data, horizontal_band_header_index(glyph, horizontal_band));
+    let horizontal_header = load_directional_band_header(
+        band_data,
+        horizontal_band_header_index(glyph, horizontal_band),
+    );
     let horizontal_direction = if render_coord[0] < horizontal_header.split {
         CoverageRayDirection::Left
     } else {
@@ -5488,7 +5534,8 @@ fn compile_shader(
     let mut error = None;
     let include_handler = ShaderIncludeHandler::new(source_path);
     let include = ID3DInclude::new(&include_handler);
-    let source_name = CString::new(source_path).expect("embedded shader path should not contain NUL");
+    let source_name =
+        CString::new(source_path).expect("embedded shader path should not contain NUL");
     unsafe {
         D3DCompile(
             source_text.as_ptr() as *const c_void,
@@ -5570,9 +5617,7 @@ fn build_shader_params(width: f32, height: f32, elapsed_seconds: f32) -> ShaderP
     }
 }
 
-fn transformed_text_projection_for_scene(
-    scene: &RenderScene,
-) -> Option<[[f32; 4]; 2]> {
+fn transformed_text_projection_for_scene(scene: &RenderScene) -> Option<[[f32; 4]; 2]> {
     let basis = scene.transformed_text_plane_basis?;
     let (yaw_sin, yaw_cos) = basis.yaw_radians.sin_cos();
     let (pitch_sin, pitch_cos) = basis.pitch_radians.sin_cos();
@@ -5641,9 +5686,7 @@ fn solve_inverse_homography(
     Some(std::array::from_fn(|index| augmented[index][8]))
 }
 
-fn transformed_text_inverse_homography_for_scene(
-    scene: &RenderScene,
-) -> Option<[[f32; 4]; 2]> {
+fn transformed_text_inverse_homography_for_scene(scene: &RenderScene) -> Option<[[f32; 4]; 2]> {
     let basis = scene.transformed_text_plane_basis?;
     let inverse = solve_inverse_homography(basis.screen_corners, basis.local_corners)?;
     Some([
@@ -6255,7 +6298,8 @@ fn create_shader_resources_and_srv_with_capacities(
     let byte_len = (curve_data.len() * std::mem::size_of::<[f32; 4]>()) as u64;
     let band_data = vec![0_u32; band_capacity];
     let band_byte_len = (band_data.len() * std::mem::size_of::<u32>()) as u64;
-    let transformed_glyph_inverse_data = vec![[0.0_f32; 4]; MAX_TRANSFORMED_GLYPH_INVERSE_FLOAT4_COUNT];
+    let transformed_glyph_inverse_data =
+        vec![[0.0_f32; 4]; MAX_TRANSFORMED_GLYPH_INVERSE_FLOAT4_COUNT];
     let transformed_glyph_inverse_byte_len =
         (transformed_glyph_inverse_data.len() * std::mem::size_of::<[f32; 4]>()) as u64;
     let sprite_byte_len = (sprite_atlas.pixels.len() * std::mem::size_of::<u32>()) as u64;
@@ -6342,8 +6386,8 @@ fn create_shader_resources_and_srv_with_capacities(
             &mut transformed_glyph_inverse_buffer,
         )?
     };
-    let transformed_glyph_inverse_buffer: ID3D12Resource =
-        transformed_glyph_inverse_buffer.expect("transformed glyph inverse buffer should be initialized");
+    let transformed_glyph_inverse_buffer: ID3D12Resource = transformed_glyph_inverse_buffer
+        .expect("transformed glyph inverse buffer should be initialized");
 
     let mut sprite_buffer = None;
     unsafe {
@@ -6709,7 +6753,12 @@ fn append_transformed_panel_quad(
         return;
     }
 
-    let [top_left_corner, top_right_corner, bottom_right_corner, bottom_left_corner] = corners;
+    let [
+        top_left_corner,
+        top_right_corner,
+        bottom_right_corner,
+        bottom_left_corner,
+    ] = corners;
     let effect = effect as u32 as f32;
     let top_left = Vertex {
         position: [top_left_corner[0], top_left_corner[1], 0.0],
@@ -6918,18 +6967,16 @@ mod tests {
         CachedSceneVertices, FALLBACK_GLYPH, PanelEffect, RenderScene, Vertex,
         WindowChromeButtonsState, append_rect, append_slug_band_data, build_panel_scene,
         build_shader_params, can_reuse_cached_scene_vertices, collect_scene_chars,
-        compile_embedded_shaders,
-        composition_swap_chain_description, cpu_slug_coverage, cpu_slug_coverage_all_curves,
-        dirty_fragment_ranges, extract_glyph_curves, fragment_ranges_match, fragment_vertex_ranges,
-        load_terminal_font, preferred_title_bar_color, push_centered_text, push_glyph,
-        push_overlay_panel, push_panel, push_text_block, push_title_text,
-        load_snapshot_glyph, render_frame_model_offscreen_image, render_snapshot_glyph_into_image,
-        shader_compile_flags, solve_inverse_homography, terminal_scrollbar_geometry,
-        window_garden_shader_data,
+        compile_embedded_shaders, composition_swap_chain_description, cpu_slug_coverage,
+        cpu_slug_coverage_all_curves, dirty_fragment_ranges, extract_glyph_curves,
+        fragment_ranges_match, fragment_vertex_ranges, load_snapshot_glyph, load_terminal_font,
+        preferred_title_bar_color, push_centered_text, push_glyph, push_overlay_panel, push_panel,
+        push_text_block, push_title_text, render_frame_model_offscreen_image,
+        render_snapshot_glyph_into_image, shader_compile_flags, solve_inverse_homography,
+        terminal_scrollbar_geometry, window_garden_shader_data,
     };
     use crate::app::render_verification::{
-        build_driver_crash_repro_transformed_text_frame,
-        build_reference_transformed_text_frame,
+        build_driver_crash_repro_transformed_text_frame, build_reference_transformed_text_frame,
         build_reference_zero_angle_transformed_text_frame,
         build_reference_zero_angle_transformed_text_layout,
     };
@@ -6991,23 +7038,34 @@ mod tests {
     fn embedded_hlsl_compiles_vertex_and_pixel_entry_points() -> eyre::Result<()> {
         let shaders = compile_embedded_shaders(shader_compile_flags())?;
 
-        assert!(!shaders.vertex.is_empty(), "vertex shader bytecode should not be empty");
-        assert!(!shaders.pixel.is_empty(), "pixel shader bytecode should not be empty");
+        assert!(
+            !shaders.vertex.is_empty(),
+            "vertex shader bytecode should not be empty"
+        );
+        assert!(
+            !shaders.pixel.is_empty(),
+            "pixel shader bytecode should not be empty"
+        );
 
         Ok(())
     }
 
     #[test]
     fn inverse_homography_maps_projected_quad_back_to_local_space() {
-        let projected = [[144.0, 92.0], [222.0, 108.0], [210.0, 178.0], [128.0, 166.0]];
+        let projected = [
+            [144.0, 92.0],
+            [222.0, 108.0],
+            [210.0, 178.0],
+            [128.0, 166.0],
+        ];
         let local = [[-40.0, -16.0], [24.0, -16.0], [24.0, 40.0], [-40.0, 40.0]];
 
-        let coefficients = solve_inverse_homography(projected, local).expect("homography should solve");
+        let coefficients =
+            solve_inverse_homography(projected, local).expect("homography should solve");
 
         for (screen_point, local_point) in projected.into_iter().zip(local) {
-            let denominator = (coefficients[6] * screen_point[0])
-                + (coefficients[7] * screen_point[1])
-                + 1.0;
+            let denominator =
+                (coefficients[6] * screen_point[0]) + (coefficients[7] * screen_point[1]) + 1.0;
             let mapped_x = ((coefficients[0] * screen_point[0])
                 + (coefficients[1] * screen_point[1])
                 + coefficients[2])
@@ -7057,8 +7115,7 @@ mod tests {
         );
 
         assert_eq!(
-            mismatch_count,
-            0,
+            mismatch_count, 0,
             "zero-angle transformed text should exactly match the CPU glyph reference; mismatched pixels={mismatch_count}; {mismatch_summary}"
         );
 
@@ -7067,11 +7124,11 @@ mod tests {
 
     #[test]
     fn rotated_transformed_text_matches_cpu_glyph_reference() -> eyre::Result<()> {
-        let reference_layout = crate::app::render_verification::build_reference_transformed_text_layout();
+        let reference_layout =
+            crate::app::render_verification::build_reference_transformed_text_layout();
         let reference = render_reference_text_layout_cpu(&reference_layout)?;
-        let transformed = render_frame_model_offscreen_image(
-            &build_reference_transformed_text_frame(),
-        )?;
+        let transformed =
+            render_frame_model_offscreen_image(&build_reference_transformed_text_frame())?;
 
         assert_eq!(reference.dimensions(), transformed.dimensions());
 
@@ -7100,8 +7157,7 @@ mod tests {
         );
 
         assert_eq!(
-            mismatch_count,
-            0,
+            mismatch_count, 0,
             "rotated transformed text should match the CPU glyph reference; mismatched pixels={mismatch_count}; {mismatch_summary}"
         );
 
@@ -7113,19 +7169,20 @@ mod tests {
         const STRONG_YAW_TOLERANCE: u8 = 2;
         const STRONG_YAW_MAX_MISMATCH_PIXELS: usize = 16;
 
-        let reference_layout = crate::app::render_verification::build_reference_text_layout_with_config(
-            TerminalLayout {
-                client_width: 1040,
-                client_height: 680,
-                cell_width: 8,
-                cell_height: 16,
-                diagnostic_panel_visible: false,
-            },
-            "Lorem ipsum dolor sit amet, consectetur adipiscing elit.\nSed do eiusmod tempor incididunt ut labore et dolore magna aliqua.",
-            320.0,
-            -1.1,
-            0.0,
-        );
+        let reference_layout =
+            crate::app::render_verification::build_reference_text_layout_with_config(
+                TerminalLayout {
+                    client_width: 1040,
+                    client_height: 680,
+                    cell_width: 8,
+                    cell_height: 16,
+                    diagnostic_panel_visible: false,
+                },
+                "Lorem ipsum dolor sit amet, consectetur adipiscing elit.\nSed do eiusmod tempor incididunt ut labore et dolore magna aliqua.",
+                320.0,
+                -1.1,
+                0.0,
+            );
         let reference = render_reference_text_layout_cpu(&reference_layout)?;
         let transformed = render_frame_model_offscreen_image(&reference_layout.frame())?;
 
@@ -7165,9 +7222,8 @@ mod tests {
 
     #[test]
     fn near_identity_transformed_text_offscreen_render_completes() -> eyre::Result<()> {
-        let image = render_frame_model_offscreen_image(
-            &build_driver_crash_repro_transformed_text_frame(),
-        )?;
+        let image =
+            render_frame_model_offscreen_image(&build_driver_crash_repro_transformed_text_frame())?;
 
         let visible_pixel_count = image.pixels().filter(|pixel| pixel.0[3] > 0).count();
         assert!(
@@ -7180,9 +7236,7 @@ mod tests {
 
     #[test]
     fn rotated_transformed_text_offscreen_render_completes() -> eyre::Result<()> {
-        let image = render_frame_model_offscreen_image(
-            &build_reference_transformed_text_frame(),
-        )?;
+        let image = render_frame_model_offscreen_image(&build_reference_transformed_text_frame())?;
 
         let visible_pixel_count = image.pixels().filter(|pixel| pixel.0[3] > 0).count();
         assert!(
@@ -7218,7 +7272,8 @@ mod tests {
         let font = load_terminal_font()?;
         let face = Face::parse(&font.font_bytes, font.face_index)?;
         for glyph_quad in &reference_layout.transformed_scene.transformed_glyphs {
-            let (curves, band_data, glyph) = load_snapshot_glyph(&font, &face, glyph_quad.character)?;
+            let (curves, band_data, glyph) =
+                load_snapshot_glyph(&font, &face, glyph_quad.character)?;
             let local_points = [
                 [glyph_quad.local_bounds[0], glyph_quad.local_bounds[2]],
                 [glyph_quad.local_bounds[1], glyph_quad.local_bounds[2]],
@@ -7284,8 +7339,10 @@ mod tests {
                             glyph.y_min,
                         ),
                     ];
-                    let sample_x1 = apply_inverse_homography_point(inverse, [sample[0] + 1.0, sample[1]]);
-                    let sample_y1 = apply_inverse_homography_point(inverse, [sample[0], sample[1] + 1.0]);
+                    let sample_x1 =
+                        apply_inverse_homography_point(inverse, [sample[0] + 1.0, sample[1]]);
+                    let sample_y1 =
+                        apply_inverse_homography_point(inverse, [sample[0], sample[1] + 1.0]);
                     let render_coord_x1 = [
                         remap_range(
                             sample_x1[0],
@@ -7355,7 +7412,13 @@ mod tests {
         ]
     }
 
-    fn remap_range(value: f32, source_min: f32, source_max: f32, target_min: f32, target_max: f32) -> f32 {
+    fn remap_range(
+        value: f32,
+        source_min: f32,
+        source_max: f32,
+        target_min: f32,
+        target_max: f32,
+    ) -> f32 {
         let source_span = (source_max - source_min).max(1.0 / 65536.0);
         let t = (value - source_min) / source_span;
         target_min + ((target_max - target_min) * t)
@@ -7933,7 +7996,7 @@ mod tests {
             .count();
 
         assert_eq!(pin_button_count, 1);
-    assert_eq!(latency_button_count, 0);
+        assert_eq!(latency_button_count, 0);
         assert_eq!(diagnostics_button_count, 1);
         assert_eq!(minimize_button_count, 1);
         assert_eq!(maximize_button_count, 1);
@@ -8381,7 +8444,8 @@ mod tests {
                         glyph.y_min + (step_y * y as f32),
                     ];
                     let banded = cpu_slug_coverage(sample, 16.0, &curves, &band_data, glyph);
-                    let full = cpu_slug_coverage_all_curves(sample, 16.0, &curves, &band_data, glyph);
+                    let full =
+                        cpu_slug_coverage_all_curves(sample, 16.0, &curves, &band_data, glyph);
                     assert!(
                         (banded - full).abs() <= 0.0001,
                         "{character} coverage mismatch at ({}, {}): banded={banded} full={full}",
@@ -8708,7 +8772,10 @@ mod tests {
         let font = load_terminal_font()?;
         let (curve_data, band_data, glyph_cache) = super::build_slug_curve_buffer(&font, &chars)?;
 
-        assert!(!chars.is_empty(), "expected terminal font to expose unicode glyphs");
+        assert!(
+            !chars.is_empty(),
+            "expected terminal font to expose unicode glyphs"
+        );
         assert!(
             !curve_data.is_empty(),
             "expected curve data for the full terminal unicode glyph set"

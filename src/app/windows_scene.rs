@@ -36,12 +36,10 @@ use super::windows_audio_input::{
 };
 use super::windows_d3d12_renderer::{
     ButtonVisualState, PanelEffect, RenderScene, SpriteId, TransformedTextPlaneBasis,
-    WindowChromeButtonsState,
-    preferred_background_color, preferred_title_bar_color, push_centered_text, push_glyph,
-    push_overlay_panel, push_overlay_text_block, push_overlay_transformed_panel, push_panel,
-    push_panel_with_data, push_sprite, push_text_block, push_title_text,
-    push_transformed_glyph,
-    push_window_chrome_buttons, push_window_garden_frame,
+    WindowChromeButtonsState, preferred_background_color, preferred_title_bar_color,
+    push_centered_text, push_glyph, push_overlay_panel, push_overlay_text_block,
+    push_overlay_transformed_panel, push_panel, push_panel_with_data, push_sprite, push_text_block,
+    push_title_text, push_transformed_glyph, push_window_chrome_buttons, push_window_garden_frame,
 };
 use super::windows_terminal::{TerminalLayout, TerminalSelection};
 
@@ -260,9 +258,7 @@ impl TextRenderingPreset {
 pub const fn text_rendering_preset_for_action(action: SceneAction) -> Option<TextRenderingPreset> {
     match action {
         SceneAction::SelectTextRenderingPresetLoremIpsum => Some(TextRenderingPreset::LoremIpsum),
-        SceneAction::SelectTextRenderingPresetSpriteSheet => {
-            Some(TextRenderingPreset::SpriteSheet)
-        }
+        SceneAction::SelectTextRenderingPresetSpriteSheet => Some(TextRenderingPreset::SpriteSheet),
         SceneAction::SelectTextRenderingPresetAlphabet => Some(TextRenderingPreset::Alphabet),
         SceneAction::SelectTextRenderingPresetQuickBrownFox => {
             Some(TextRenderingPreset::QuickBrownFox)
@@ -1174,7 +1170,9 @@ pub fn text_rendering_plane_interaction_rect(layout: TerminalLayout) -> ClientRe
 
 #[must_use]
 pub fn text_rendering_editor_text_rect(layout: TerminalLayout) -> ClientRect {
-    text_rendering_workspace_layout(layout).content_rect.inset(18)
+    text_rendering_workspace_layout(layout)
+        .content_rect
+        .inset(18)
 }
 
 #[must_use]
@@ -1286,7 +1284,11 @@ pub fn build_text_rendering_editor_render_scene(
     let summary = format!(
         "Preset: {}   Focus: {}   Characters: {}   Plane: live",
         view_state.active_preset.label(),
-        if view_state.focused { "focused" } else { "idle" },
+        if view_state.focused {
+            "focused"
+        } else {
+            "idle"
+        },
         view_state.text.chars().count(),
     );
     push_text_block(
@@ -1428,10 +1430,30 @@ fn push_text_rendering_debug_overlay(
 
     let border_thickness = 2;
     let borders = [
-        ClientRect::new(clip_rect.left(), clip_rect.top(), clip_rect.right(), clip_rect.top() + border_thickness),
-        ClientRect::new(clip_rect.left(), clip_rect.bottom() - border_thickness, clip_rect.right(), clip_rect.bottom()),
-        ClientRect::new(clip_rect.left(), clip_rect.top(), clip_rect.left() + border_thickness, clip_rect.bottom()),
-        ClientRect::new(clip_rect.right() - border_thickness, clip_rect.top(), clip_rect.right(), clip_rect.bottom()),
+        ClientRect::new(
+            clip_rect.left(),
+            clip_rect.top(),
+            clip_rect.right(),
+            clip_rect.top() + border_thickness,
+        ),
+        ClientRect::new(
+            clip_rect.left(),
+            clip_rect.bottom() - border_thickness,
+            clip_rect.right(),
+            clip_rect.bottom(),
+        ),
+        ClientRect::new(
+            clip_rect.left(),
+            clip_rect.top(),
+            clip_rect.left() + border_thickness,
+            clip_rect.bottom(),
+        ),
+        ClientRect::new(
+            clip_rect.right() - border_thickness,
+            clip_rect.top(),
+            clip_rect.right(),
+            clip_rect.bottom(),
+        ),
     ];
     for border in borders {
         push_overlay_panel(
@@ -7352,15 +7374,25 @@ fn push_cursor_latency_half(
     );
     push_panel(
         scene,
-        ClientRect::new(half_rect.left(), half_rect.top(), half_rect.right(), half_rect.top() + 40)
-            .to_win32_rect(),
+        ClientRect::new(
+            half_rect.left(),
+            half_rect.top(),
+            half_rect.right(),
+            half_rect.top() + 40,
+        )
+        .to_win32_rect(),
         mix_rgba(background, accent, 0.45),
         PanelEffect::SceneBody,
     );
     push_centered_text(
         scene,
-        ClientRect::new(half_rect.left() + 14, half_rect.top() + 6, half_rect.right() - 14, half_rect.top() + 34)
-            .to_win32_rect(),
+        ClientRect::new(
+            half_rect.left() + 14,
+            half_rect.top() + 6,
+            half_rect.right() - 14,
+            half_rect.top() + 34,
+        )
+        .to_win32_rect(),
         &if lead_pixels > 0 {
             format!("{label}  latest  +{lead_pixels}px")
         } else {
@@ -7389,11 +7421,8 @@ fn push_cursor_latency_ripple_panel(
     source_point: ClientPoint,
     accent: [f32; 4],
 ) {
-    let origin_uv = map_cursor_latency_point(
-        source_fastest_rect,
-        source_match_os_rect,
-        source_point,
-    );
+    let origin_uv =
+        map_cursor_latency_point(source_fastest_rect, source_match_os_rect, source_point);
     let base = mix_rgba([0.05, 0.06, 0.08, 1.0], accent, 0.16);
     push_panel_with_data(
         scene,
@@ -7423,15 +7452,13 @@ fn map_cursor_latency_point(
     match_os_rect: ClientRect,
     point: ClientPoint,
 ) -> (f32, f32) {
-    let source_rect = point
-        .to_win32_point()
-        .map_or(fastest_rect, |pixel| {
-            if pixel.x >= match_os_rect.left() {
-                match_os_rect
-            } else {
-                fastest_rect
-            }
-        });
+    let source_rect = point.to_win32_point().map_or(fastest_rect, |pixel| {
+        if pixel.x >= match_os_rect.left() {
+            match_os_rect
+        } else {
+            fastest_rect
+        }
+    });
     let (point_x, point_y) = clamp_client_point_pixels(point, source_rect);
     let width = source_rect.width().max(1) as f32;
     let height = source_rect.height().max(1) as f32;
@@ -7470,7 +7497,11 @@ fn rgb_to_hsv(red: f32, green: f32, blue: f32) -> (f32, f32, f32) {
     } else {
         (((red - green) / delta) + 4.0) / 6.0
     };
-    let saturation = if max <= f32::EPSILON { 0.0 } else { delta / max };
+    let saturation = if max <= f32::EPSILON {
+        0.0
+    } else {
+        delta / max
+    };
     (hue, saturation, max)
 }
 
@@ -7574,9 +7605,9 @@ fn latency_overlay_rect(panel_rect: ClientRect, anchor: LatencyOverlayAnchor) ->
         LatencyOverlayAnchor::TopLeft
         | LatencyOverlayAnchor::Top
         | LatencyOverlayAnchor::TopRight => panel_rect.top() + margin,
-        LatencyOverlayAnchor::Left
-        | LatencyOverlayAnchor::Center
-        | LatencyOverlayAnchor::Right => panel_rect.top() + (panel_rect.height() - height) / 2,
+        LatencyOverlayAnchor::Left | LatencyOverlayAnchor::Center | LatencyOverlayAnchor::Right => {
+            panel_rect.top() + (panel_rect.height() - height) / 2
+        }
         LatencyOverlayAnchor::BottomLeft
         | LatencyOverlayAnchor::Bottom
         | LatencyOverlayAnchor::BottomRight => panel_rect.bottom() - height - margin,
@@ -7628,8 +7659,13 @@ fn push_latency_overlay_bars(
         };
         push_overlay_panel(
             scene,
-            ClientRect::new(left, graph_rect.bottom() - height - 2, x, graph_rect.bottom() - 2)
-                .to_win32_rect(),
+            ClientRect::new(
+                left,
+                graph_rect.bottom() - height - 2,
+                x,
+                graph_rect.bottom() - 2,
+            )
+            .to_win32_rect(),
             color,
             PanelEffect::TerminalFill,
         );

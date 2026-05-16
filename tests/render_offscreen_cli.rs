@@ -104,7 +104,10 @@ fn render_offscreen_command_lists_transformed_and_diagnostic_fixtures() {
     let output = run_teamy_studio(&["self-test", "render-offscreen", "--list-fixtures"]);
     let text = output_text(&output);
 
-    assert!(output.status.success(), "render-offscreen --list-fixtures failed:\n{text}");
+    assert!(
+        output.status.success(),
+        "render-offscreen --list-fixtures failed:\n{text}"
+    );
     assert!(
         text.contains("transformed-text-plane"),
         "transformed text render fixture was not exposed through the self-test CLI:\n{text}"

@@ -1033,7 +1033,8 @@ float4 apply_cursor_latency_ripple(float2 uv, float4 color, float4 state) {
 
 float4 PSMain(PsInput input) : SV_TARGET {
     if (input.effect > 11.5 && input.effect < 12.5) {
-        if (transformed_text_clip_rect.z >= 0.0
+        if (input.transformedFlag > 0.5
+            && transformed_text_clip_rect.z >= 0.0
             && (input.position.x < transformed_text_clip_rect.x
                 || input.position.y < transformed_text_clip_rect.y
                 || input.position.x >= transformed_text_clip_rect.z

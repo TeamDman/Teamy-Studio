@@ -188,9 +188,13 @@ pub fn run_render_offscreen_fixture(
     let scene_snapshot = windows_d3d12_renderer::render_frame_model_scene_snapshot(&frame);
     let (non_transparent_pixels, bright_pixels) = summarize_offscreen_image(&image);
     if non_transparent_pixels == 0 || bright_pixels == 0 {
-        let artifacts = write_failed_render_artifacts(fixture.id, artifact_output, &image, &scene_snapshot)?;
+        let artifacts =
+            write_failed_render_artifacts(fixture.id, artifact_output, &image, &scene_snapshot)?;
         let actual_path_text = artifacts.png.as_deref().unwrap_or("<not written>");
-        let snapshot_path_text = artifacts.scene_snapshot.as_deref().unwrap_or("<not written>");
+        let snapshot_path_text = artifacts
+            .scene_snapshot
+            .as_deref()
+            .unwrap_or("<not written>");
         eyre::bail!(
             "render fixture `{}` produced an empty or fully dark image; actual=`{actual_path_text}` scene=`{snapshot_path_text}`",
             fixture.id,
@@ -342,8 +346,10 @@ fn run_induce_havoc_render_fixture(
                     scene_snapshot,
                 )?;
                 let actual_path_text = artifacts.png.as_deref().unwrap_or("<not written>");
-                let snapshot_path_text =
-                    artifacts.scene_snapshot.as_deref().unwrap_or("<not written>");
+                let snapshot_path_text = artifacts
+                    .scene_snapshot
+                    .as_deref()
+                    .unwrap_or("<not written>");
                 eyre::bail!(
                     "render fixture `{}` produced an empty or fully dark image during iteration {} phase `{phase_name}`; actual=`{actual_path_text}` scene=`{snapshot_path_text}`",
                     INDUCE_HAVOC_RENDER_FIXTURE_ID,
@@ -932,7 +938,9 @@ fn build_reference_text_frame(
     if transformed {
         layout.frame()
     } else {
-        panic!("flat reference text frames are no longer supported; use CPU-composited glyph references in tests")
+        panic!(
+            "flat reference text frames are no longer supported; use CPU-composited glyph references in tests"
+        )
     }
 }
 
@@ -994,16 +1002,17 @@ pub(crate) fn build_reference_text_layout_with_config(
     yaw_radians: f32,
     pitch_radians: f32,
 ) -> ReferenceTextLayout {
-    let (_, plane_basis, glyphs) = super::windows_app::build_text_rendering_plane_verification_geometry(
-        layout,
-        text,
-        font_size_px / 28.0,
-        yaw_radians,
-        pitch_radians,
-        [0.0, 0.0],
-        [0.0, 0.0],
-        REFERENCE_TEXT_COLOR,
-    );
+    let (_, plane_basis, glyphs) =
+        super::windows_app::build_text_rendering_plane_verification_geometry(
+            layout,
+            text,
+            font_size_px / 28.0,
+            yaw_radians,
+            pitch_radians,
+            [0.0, 0.0],
+            [0.0, 0.0],
+            REFERENCE_TEXT_COLOR,
+        );
     let transformed_scene = build_reference_text_scene(layout, plane_basis, &glyphs);
     ReferenceTextLayout {
         layout,
@@ -1089,7 +1098,8 @@ fn project_reference_quad(
     let mut corners = [[0.0; 2]; 4];
     let mut corner_w = [0.0; 4];
     for (index, local_corner) in local_corners.into_iter().enumerate() {
-        let (screen, clip_w) = project_reference_point(local_corner, center, yaw_radians, pitch_radians);
+        let (screen, clip_w) =
+            project_reference_point(local_corner, center, yaw_radians, pitch_radians);
         corners[index] = screen;
         corner_w[index] = clip_w;
     }

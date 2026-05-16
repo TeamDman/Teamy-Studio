@@ -4,8 +4,8 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::c_void;
 use std::marker::PhantomData;
 use std::path::Path;
-use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
+use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 #[cfg(feature = "tracy")]
@@ -23,8 +23,8 @@ use uom::si::time::{nanosecond, second};
 use widestring::U16CString;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, CLEARTYPE_QUALITY, CreateFontIndirectW, DeleteObject, EndPaint, GetDC,
-    DEVMODEW, ENUM_CURRENT_SETTINGS, EnumDisplaySettingsW, GetDeviceCaps, GetMonitorInfoW,
+    BeginPaint, CLEARTYPE_QUALITY, CreateFontIndirectW, DEVMODEW, DeleteObject,
+    ENUM_CURRENT_SETTINGS, EndPaint, EnumDisplaySettingsW, GetDC, GetDeviceCaps, GetMonitorInfoW,
     GetTextExtentPoint32W, HFONT, LOGFONTW, MONITOR_FROM_FLAGS, MONITORINFO, MONITORINFOEXW,
     MonitorFromWindow, PAINTSTRUCT, ReleaseDC, SelectObject, VREFRESH,
 };
@@ -45,24 +45,22 @@ use windows::Win32::UI::Shell::{
     TBPFLAG, TaskbarList,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, EnumWindows, GetClassNameW,
-    CS_DBLCLKS,
-    GetClientRect, GetCursorPos, GetMessageW, GetSystemMetrics, GetWindowRect,
+    CS_DBLCLKS, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, EnumWindows,
+    GetClassNameW, GetClientRect, GetCursorPos, GetMessageW, GetSystemMetrics, GetWindowRect,
     GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, HTCAPTION, HTCLIENT,
     HTTRANSPARENT, HWND_NOTOPMOST, HWND_TOPMOST, IDC_ARROW, IDC_CROSS, IDC_HAND, IDC_HELP,
-    IDC_IBEAM, IDC_SIZEALL, IDC_SIZEWE, IDC_WAIT, IsWindowVisible, IsZoomed,
-    LoadCursorW, MSG, MoveWindow, PostMessageW, PostQuitMessage, RegisterClassExW,
-    SetForegroundWindow,
-    SM_CXPADDEDBORDER, SM_CXSCREEN, SM_CXSIZEFRAME, SM_CXVIRTUALSCREEN, SM_CYSCREEN,
-    SM_CYSIZEFRAME, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SW_HIDE, SW_MAXIMIZE,
-    SW_MINIMIZE, SW_RESTORE, SW_SHOW, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
-    SYSTEM_METRICS_INDEX, SendMessageW, SetCursor, SetCursorPos, SetTimer, SetWindowPos,
+    IDC_IBEAM, IDC_SIZEALL, IDC_SIZEWE, IDC_WAIT, IsWindowVisible, IsZoomed, LoadCursorW, MSG,
+    MoveWindow, PostMessageW, PostQuitMessage, RegisterClassExW, SM_CXPADDEDBORDER, SM_CXSCREEN,
+    SM_CXSIZEFRAME, SM_CXVIRTUALSCREEN, SM_CYSCREEN, SM_CYSIZEFRAME, SM_CYVIRTUALSCREEN,
+    SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SW_HIDE, SW_MAXIMIZE, SW_MINIMIZE, SW_RESTORE, SW_SHOW,
+    SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SYSTEM_METRICS_INDEX,
+    SendMessageW, SetCursor, SetCursorPos, SetForegroundWindow, SetTimer, SetWindowPos,
     SetWindowTextW, ShowWindow, TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CHAR,
     WM_CLOSE, WM_DESTROY, WM_DPICHANGED, WM_ENTERSIZEMOVE, WM_ERASEBKGND, WM_EXITSIZEMOVE,
-    WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN,
-    WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_MOVE, WM_NCCALCSIZE, WM_NCHITTEST,
-    WM_NCLBUTTONDOWN, WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SETFOCUS,
-    WM_SIZE, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WNDCLASSEXW, WS_EX_APPWINDOW,
+    WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_MOVE, WM_NCCALCSIZE,
+    WM_NCHITTEST, WM_NCLBUTTONDOWN, WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR,
+    WM_SETFOCUS, WM_SIZE, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WNDCLASSEXW, WS_EX_APPWINDOW,
     WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
     WS_EX_TRANSPARENT, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP, WS_THICKFRAME, WS_VISIBLE,
 };
@@ -472,7 +470,8 @@ struct TextRenderingPlaygroundHandle {
 impl TextRenderingPlaygroundHandle {
     fn new() -> eyre::Result<Self> {
         let sprite_sheet_characters = terminal_font_unicode_chars()?;
-        let sprite_sheet_sample = build_text_rendering_sprite_sheet_sample(&sprite_sheet_characters);
+        let sprite_sheet_sample =
+            build_text_rendering_sprite_sheet_sample(&sprite_sheet_characters);
         Ok(Self {
             shared: Arc::new(Mutex::new(TextRenderingPlaygroundSharedState {
                 session_id: NEXT_TEXT_RENDERING_SESSION_ID.fetch_add(1, AtomicOrdering::Relaxed),
@@ -624,7 +623,9 @@ impl LatencyOverlayState {
             .take(72)
             .copied()
             .collect::<Vec<_>>();
-        let latest_frame_ms = recent.first().map(|duration| duration.as_secs_f32() * 1000.0);
+        let latest_frame_ms = recent
+            .first()
+            .map(|duration| duration.as_secs_f32() * 1000.0);
         let average_fps = if recent.is_empty() {
             None
         } else {
@@ -677,11 +678,9 @@ impl CursorLatencyPlaygroundState {
         while self.samples.len() > CURSOR_LATENCY_MAX_HISTORY {
             self.samples.pop_front();
         }
-        while self
-            .samples
-            .front()
-            .is_some_and(|sample| now.duration_since(sample.captured_at) > CURSOR_LATENCY_MAX_SAMPLE_AGE)
-        {
+        while self.samples.front().is_some_and(|sample| {
+            now.duration_since(sample.captured_at) > CURSOR_LATENCY_MAX_SAMPLE_AGE
+        }) {
             self.samples.pop_front();
         }
         self.rendered_cursor_position = cursor_latency_projected_position(
@@ -709,7 +708,9 @@ impl CursorLatencyPlaygroundState {
         let lead_pixels = self
             .last_os_cursor_position
             .zip(fastest_cursor_position)
-            .map_or(0, |(os, rendered)| cursor_latency_distance_pixels(os, rendered));
+            .map_or(0, |(os, rendered)| {
+                cursor_latency_distance_pixels(os, rendered)
+            });
         windows_scene::CursorLatencyPlaygroundViewState {
             behavior: self.behavior,
             os_cursor_position: self.last_os_cursor_position,
@@ -745,7 +746,9 @@ fn cursor_latency_projected_position(
         return Some(latest.point);
     };
 
-    let sample_dt = latest.captured_at.saturating_duration_since(previous.captured_at);
+    let sample_dt = latest
+        .captured_at
+        .saturating_duration_since(previous.captured_at);
     if sample_dt.is_zero() {
         return Some(latest.point);
     }
@@ -754,12 +757,17 @@ fn cursor_latency_projected_position(
     let (previous_x, previous_y) = client_point_pixels(previous.point);
     let delta_x = (latest_x - previous_x) as f32;
     let delta_y = (latest_y - previous_y) as f32;
-    let lead_scale =
-        (lead_interval.as_secs_f32() / sample_dt.as_secs_f32()).clamp(0.0, 1.35);
+    let lead_scale = (lead_interval.as_secs_f32() / sample_dt.as_secs_f32()).clamp(0.0, 1.35);
     let projected_x = latest_x as f32 + delta_x * lead_scale;
     let projected_y = latest_y as f32 + delta_y * lead_scale;
-    let lead_x = (projected_x - latest_x as f32).clamp(-CURSOR_LATENCY_MAX_LEAD_PIXELS, CURSOR_LATENCY_MAX_LEAD_PIXELS);
-    let lead_y = (projected_y - latest_y as f32).clamp(-CURSOR_LATENCY_MAX_LEAD_PIXELS, CURSOR_LATENCY_MAX_LEAD_PIXELS);
+    let lead_x = (projected_x - latest_x as f32).clamp(
+        -CURSOR_LATENCY_MAX_LEAD_PIXELS,
+        CURSOR_LATENCY_MAX_LEAD_PIXELS,
+    );
+    let lead_y = (projected_y - latest_y as f32).clamp(
+        -CURSOR_LATENCY_MAX_LEAD_PIXELS,
+        CURSOR_LATENCY_MAX_LEAD_PIXELS,
+    );
 
     Some(ClientPoint::new(
         latest_x.saturating_add(lead_x.round() as i32),
@@ -779,7 +787,9 @@ fn cursor_latency_distance_pixels(left: ClientPoint, right: ClientPoint) -> i32 
     let (right_x, right_y) = client_point_pixels(right);
     let delta_x = right_x - left_x;
     let delta_y = right_y - left_y;
-    ((delta_x * delta_x + delta_y * delta_y) as f64).sqrt().round() as i32
+    ((delta_x * delta_x + delta_y * delta_y) as f64)
+        .sqrt()
+        .round() as i32
 }
 
 #[derive(Clone, Debug)]
@@ -1807,12 +1817,22 @@ fn open_text_rendering_playground_windows(
         (
             "teamy-studio-text-editor",
             SceneWindowKind::TextRenderingPlaygroundEditor,
-            ScreenRect::new(left + width + gap_x, top, left + (width * 2) + gap_x, top + height),
+            ScreenRect::new(
+                left + width + gap_x,
+                top,
+                left + (width * 2) + gap_x,
+                top + height,
+            ),
         ),
         (
             "teamy-studio-text-presets",
             SceneWindowKind::TextRenderingPlaygroundPresets,
-            ScreenRect::new(left, top + height + gap_y, left + width, top + (height * 2) + gap_y),
+            ScreenRect::new(
+                left,
+                top + height + gap_y,
+                left + width,
+                top + (height * 2) + gap_y,
+            ),
         ),
     ];
 
@@ -1832,7 +1852,11 @@ fn open_text_rendering_playground_windows(
                         ..SceneWindowInitialization::default()
                     },
                 ) {
-                    error!(?error, ?scene_kind, "failed to open text rendering playground window");
+                    error!(
+                        ?error,
+                        ?scene_kind,
+                        "failed to open text rendering playground window"
+                    );
                 }
             })
             .wrap_err("failed to spawn text rendering playground window thread")?;
@@ -2140,6 +2164,23 @@ impl WindowHandle {
         unsafe {
             SetWindowPos(
                 self.hwnd,
+                None,
+                rect.left(),
+                rect.top(),
+                rect.width(),
+                rect.height(),
+                SWP_NOACTIVATE | SWP_NOZORDER,
+            )
+        }
+        .wrap_err("failed to position window")
+    }
+
+    fn set_topmost_position_no_activate(self, rect: ScreenRect) -> eyre::Result<()> {
+        self.window_thread.assert_window_thread();
+        // Safety: SetWindowPos moves and sizes this live top-level window without activating it.
+        unsafe {
+            SetWindowPos(
+                self.hwnd,
                 Some(HWND_TOPMOST),
                 rect.left(),
                 rect.top(),
@@ -2148,7 +2189,7 @@ impl WindowHandle {
                 SWP_NOACTIVATE,
             )
         }
-        .wrap_err("failed to position toast window")
+        .wrap_err("failed to position topmost window")
     }
 
     fn destroy(self) {
@@ -2294,7 +2335,12 @@ fn run_focused_render_ticker(
         }
         if !pending_tick.swap(true, AtomicOrdering::AcqRel) {
             let posted = unsafe {
-                PostMessageW(Some(hwnd), FOCUSED_RENDER_TICK_MESSAGE, WPARAM(0), LPARAM(0))
+                PostMessageW(
+                    Some(hwnd),
+                    FOCUSED_RENDER_TICK_MESSAGE,
+                    WPARAM(0),
+                    LPARAM(0),
+                )
             }
             .is_ok();
             if !posted {
@@ -4029,7 +4075,7 @@ fn render_toast_host(state: &mut ToastHostState) -> eyre::Result<()> {
     let height = stack_height + LOG_TOAST_HOST_PADDING * 2;
     let source_hwnd = state.toasts.last().and_then(|toast| toast.source_hwnd);
     let rect = toast_window_rect(source_hwnd, width, height);
-    state.hwnd.set_position_no_activate(rect)?;
+    state.hwnd.set_topmost_position_no_activate(rect)?;
     state.hwnd.show_no_activate();
     state.renderer.resize(
         u32::try_from(width.max(1)).unwrap_or(1),
@@ -4497,7 +4543,7 @@ fn handle_scene_dpi_changed(hwnd: WindowHandle, lparam: LPARAM) -> LRESULT {
         apply_scene_dpi(state, window_dpi(hwnd))?;
         refresh_scene_focused_render_interval(state, hwnd)
     })
-        .and_then(|()| apply_suggested_dpi_rect(hwnd, lparam));
+    .and_then(|()| apply_suggested_dpi_rect(hwnd, lparam));
 
     match result {
         Ok(()) => LRESULT(0),
@@ -5341,7 +5387,10 @@ fn handle_scene_left_button_down(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Re
         }
 
         if state.diagnostics_visible
-            && !matches!(state.scene_kind, SceneWindowKind::TextRenderingPlaygroundPlane)
+            && !matches!(
+                state.scene_kind,
+                SceneWindowKind::TextRenderingPlaygroundPlane
+            )
             && let Some(cell) = scene_diagnostic_cell_from_client_point(
                 layout,
                 point,
@@ -5358,14 +5407,6 @@ fn handle_scene_left_button_down(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Re
             });
             state.diagnostic_selection_drag_point = Some(point);
             hwnd.capture_mouse();
-            return Ok(ScenePointerAction::RenderOnly);
-        }
-
-        if !state.diagnostics_visible
-            && state.scene_kind == SceneWindowKind::TextRenderingPlaygroundEditor
-        {
-            state.text_rendering_editor_focused =
-                windows_scene::text_rendering_editor_text_rect(layout).contains(point);
             return Ok(ScenePointerAction::RenderOnly);
         }
 
@@ -5863,6 +5904,21 @@ fn handle_scene_left_button_down(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Re
             return Ok(ScenePointerAction::BeginAudioInputTimeline);
         }
 
+        if !state.diagnostics_visible
+            && state.scene_kind == SceneWindowKind::TextRenderingPlaygroundEditor
+        {
+            if scene_drag_handle_contains(layout, point) {
+                state.diagnostic_selection = None;
+                state.pending_diagnostic_selection = None;
+                begin_system_window_drag(hwnd, point)?;
+                return Ok(ScenePointerAction::Handled);
+            }
+
+            state.text_rendering_editor_focused =
+                windows_scene::text_rendering_editor_text_rect(layout).contains(point);
+            return Ok(ScenePointerAction::RenderOnly);
+        }
+
         if scene_drag_handle_contains(layout, point) {
             state.diagnostic_selection = None;
             state.pending_diagnostic_selection = None;
@@ -6008,7 +6064,10 @@ fn handle_scene_left_button_up(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Resu
     let action = with_scene_app_state(|state| {
         state.pointer_position = Some(point);
         let pressed_target = state.pressed_target.take();
-        if matches!(pressed_target, Some(ScenePressedTarget::TextRenderingPlane(_))) {
+        if matches!(
+            pressed_target,
+            Some(ScenePressedTarget::TextRenderingPlane(_))
+        ) {
             state.text_rendering_drag = None;
             return Ok(ScenePointerAction::RenderOnly);
         }
@@ -6691,20 +6750,20 @@ fn handle_scene_right_button_up(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Res
         state.pointer_position = Some(point);
         let released = matches!(
             state.pressed_target,
-            Some(ScenePressedTarget::TextRenderingPlane(TextRenderingDragKind::Translate))
+            Some(ScenePressedTarget::TextRenderingPlane(
+                TextRenderingDragKind::Translate
+            ))
         );
         if released {
             let current = point.to_win32_point()?;
-            let stationary_click = state
-                .text_rendering_drag
-                .is_some_and(|drag| {
-                    drag.origin.to_win32_point().ok().is_some_and(|origin| {
-                        (origin.x - current.x).abs()
+            let stationary_click = state.text_rendering_drag.is_some_and(|drag| {
+                drag.origin.to_win32_point().ok().is_some_and(|origin| {
+                    (origin.x - current.x).abs()
+                        <= TEXT_RENDERING_DOUBLE_RIGHT_CLICK_MAX_MOVEMENT_PX as i32
+                        && (origin.y - current.y).abs()
                             <= TEXT_RENDERING_DOUBLE_RIGHT_CLICK_MAX_MOVEMENT_PX as i32
-                            && (origin.y - current.y).abs()
-                                <= TEXT_RENDERING_DOUBLE_RIGHT_CLICK_MAX_MOVEMENT_PX as i32
-                    })
-                });
+                })
+            });
             if stationary_click {
                 state.text_rendering_last_right_button_down_at = Some(Instant::now());
                 state.text_rendering_last_right_button_down_point = Some(point);
@@ -6818,11 +6877,10 @@ fn handle_scene_middle_button_down(hwnd: WindowHandle, lparam: LPARAM) -> eyre::
         state.chrome_tooltip.hide(hwnd);
         let layout = scene_client_layout(hwnd, state)?;
         if !matches!(
-                state.scene_kind,
-                SceneWindowKind::TextRenderingPlaygroundPlane
-                    | SceneWindowKind::TextRenderingPlaygroundSpriteSheet
-            )
-            || !windows_scene::text_rendering_plane_interaction_rect(layout).contains(point)
+            state.scene_kind,
+            SceneWindowKind::TextRenderingPlaygroundPlane
+                | SceneWindowKind::TextRenderingPlaygroundSpriteSheet
+        ) || !windows_scene::text_rendering_plane_interaction_rect(layout).contains(point)
         {
             return Ok(false);
         }
@@ -6867,7 +6925,9 @@ fn handle_scene_middle_button_up(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Re
         state.pointer_position = Some(point);
         let released = matches!(
             state.pressed_target,
-            Some(ScenePressedTarget::TextRenderingPlane(TextRenderingDragKind::Pan))
+            Some(ScenePressedTarget::TextRenderingPlane(
+                TextRenderingDragKind::Pan
+            ))
         );
         if released {
             state.pressed_target = None;
@@ -6908,30 +6968,34 @@ fn handle_scene_right_button_down(hwnd: WindowHandle, lparam: LPARAM) -> eyre::R
         }
 
         if matches!(
-                state.scene_kind,
-                SceneWindowKind::TextRenderingPlaygroundPlane
-                    | SceneWindowKind::TextRenderingPlaygroundSpriteSheet
-            )
-            && windows_scene::text_rendering_plane_interaction_rect(layout).contains(point)
+            state.scene_kind,
+            SceneWindowKind::TextRenderingPlaygroundPlane
+                | SceneWindowKind::TextRenderingPlaygroundSpriteSheet
+        ) && windows_scene::text_rendering_plane_interaction_rect(layout).contains(point)
         {
             let now = Instant::now();
             let current = point.to_win32_point()?;
-            let double_right_click = state
-                .text_rendering_last_right_button_down_at
-                .is_some_and(|clicked_at| {
-                    now.saturating_duration_since(clicked_at)
-                        <= TEXT_RENDERING_DOUBLE_RIGHT_CLICK_WINDOW
-                })
-                && state
-                    .text_rendering_last_right_button_down_point
-                    .is_some_and(|clicked_point| {
-                        clicked_point.to_win32_point().ok().is_some_and(|clicked_point| {
-                            (clicked_point.x - current.x).abs()
-                                <= TEXT_RENDERING_DOUBLE_RIGHT_CLICK_MAX_MOVEMENT_PX as i32
-                                && (clicked_point.y - current.y).abs()
-                                    <= TEXT_RENDERING_DOUBLE_RIGHT_CLICK_MAX_MOVEMENT_PX as i32
-                        })
-                    });
+            let double_right_click =
+                state
+                    .text_rendering_last_right_button_down_at
+                    .is_some_and(|clicked_at| {
+                        now.saturating_duration_since(clicked_at)
+                            <= TEXT_RENDERING_DOUBLE_RIGHT_CLICK_WINDOW
+                    })
+                    && state
+                        .text_rendering_last_right_button_down_point
+                        .is_some_and(|clicked_point| {
+                            clicked_point
+                                .to_win32_point()
+                                .ok()
+                                .is_some_and(|clicked_point| {
+                                    (clicked_point.x - current.x).abs()
+                                        <= TEXT_RENDERING_DOUBLE_RIGHT_CLICK_MAX_MOVEMENT_PX as i32
+                                        && (clicked_point.y - current.y).abs()
+                                            <= TEXT_RENDERING_DOUBLE_RIGHT_CLICK_MAX_MOVEMENT_PX
+                                                as i32
+                                })
+                        });
             if double_right_click {
                 if let Some(playground) = state.text_rendering_playground.as_ref().cloned() {
                     if let Ok(mut shared) = playground.shared.lock() {
@@ -7051,8 +7115,7 @@ fn handle_scene_mouse_wheel(
             state.scene_kind,
             SceneWindowKind::TextRenderingPlaygroundPlane
                 | SceneWindowKind::TextRenderingPlaygroundSpriteSheet
-        )
-        {
+        ) {
             let interaction_rect = windows_scene::text_rendering_plane_interaction_rect(layout);
             if !interaction_rect.contains(point) {
                 return Ok(false);
@@ -7064,7 +7127,8 @@ fn handle_scene_mouse_wheel(
             let point_pixels = point.to_win32_point()?;
             if let Some(playground) = state.text_rendering_playground.as_ref().cloned() {
                 if let Ok(mut shared) = playground.shared.lock()
-                    && let Some(viewport) = text_rendering_viewport_mut(&mut shared, state.scene_kind)
+                    && let Some(viewport) =
+                        text_rendering_viewport_mut(&mut shared, state.scene_kind)
                 {
                     let factor = if wheel_delta > 0 { 1.12 } else { 1.0 / 1.12 };
                     zoom_text_rendering_viewport_about_cursor(
@@ -7291,7 +7355,7 @@ fn handle_dpi_changed(hwnd: WindowHandle, lparam: LPARAM) -> LRESULT {
         apply_app_dpi(state, window_dpi(hwnd))?;
         refresh_app_focused_render_interval(state, hwnd)
     })
-        .and_then(|()| apply_suggested_dpi_rect(hwnd, lparam));
+    .and_then(|()| apply_suggested_dpi_rect(hwnd, lparam));
 
     match result {
         Ok(()) => LRESULT(0),
@@ -7819,7 +7883,9 @@ fn scene_window_chrome_buttons_state(
             layout.latency_button_rect(),
             state.pointer_position,
             state.pressed_target
-                == Some(ScenePressedTarget::ChromeButton(WindowChromeButton::Latency)),
+                == Some(ScenePressedTarget::ChromeButton(
+                    WindowChromeButton::Latency,
+                )),
             state.latency_overlay.last_f3_pressed_at,
             state.latency_overlay.is_visible(),
         ),
@@ -9009,7 +9075,11 @@ fn text_rendering_plane_view_state(
     shared: &TextRenderingPlaygroundSharedState,
 ) -> windows_scene::TextRenderingPlaneViewState {
     windows_scene::TextRenderingPlaneViewState {
-        glyph_count: shared.text.chars().filter(|character| *character != '\n').count(),
+        glyph_count: shared
+            .text
+            .chars()
+            .filter(|character| *character != '\n')
+            .count(),
         line_count: shared.text.lines().count().max(1),
         zoom: shared.plane_viewport.zoom,
         yaw_degrees: shared.plane_viewport.yaw_radians.to_degrees(),
@@ -9117,13 +9187,14 @@ fn inverse_rotate_text_rendering_vector_3d(
     ]
 }
 
-fn text_rendering_plane_center(
-    rect: ClientRect,
-    viewport: TextRenderingViewportState,
-) -> [f32; 2] {
+fn text_rendering_plane_center(rect: ClientRect, viewport: TextRenderingViewportState) -> [f32; 2] {
     [
-        (rect.left() + rect.width() / 2) as f32 + viewport.camera_offset[0] + viewport.plane_offset[0],
-        (rect.top() + rect.height() / 2) as f32 + viewport.camera_offset[1] + viewport.plane_offset[1],
+        (rect.left() + rect.width() / 2) as f32
+            + viewport.camera_offset[0]
+            + viewport.plane_offset[0],
+        (rect.top() + rect.height() / 2) as f32
+            + viewport.camera_offset[1]
+            + viewport.plane_offset[1],
     ]
 }
 
@@ -9200,8 +9271,8 @@ fn project_text_rendering_point(point: [f32; 3], center: [f32; 2]) -> [f32; 2] {
 }
 
 fn project_text_rendering_point_with_weight(point: [f32; 3], center: [f32; 2]) -> ([f32; 2], f32) {
-    let perspective = TEXT_RENDERING_CAMERA_DISTANCE
-        / (TEXT_RENDERING_CAMERA_DISTANCE - point[2]).max(80.0);
+    let perspective =
+        TEXT_RENDERING_CAMERA_DISTANCE / (TEXT_RENDERING_CAMERA_DISTANCE - point[2]).max(80.0);
     (
         [
             center[0] + (point[0] * perspective),
@@ -9264,7 +9335,8 @@ fn build_text_rendering_glyph_instances(
 
     let mut glyphs = Vec::new();
     for (row_index, line) in lines.iter().enumerate() {
-        let line_left = plane_origin[0] + ((max_line_advance - line_advances[row_index]) * scale * 0.5);
+        let line_left =
+            plane_origin[0] + ((max_line_advance - line_advances[row_index]) * scale * 0.5);
         let line_top = plane_origin[1] + (row_index as f32 * line_height);
         let mut pen_x_units = 0.0;
         for character in line.chars() {
@@ -9289,27 +9361,34 @@ fn build_text_rendering_glyph_instances(
             let right = line_left + (pen_x_units + glyph.x_max) * scale;
             let top = line_top + (font.ascender - glyph.y_max) * scale;
             let bottom = line_top + (font.ascender - glyph.y_min) * scale;
-            let transformed_corners = [
-                [left, top],
-                [right, top],
-                [right, bottom],
-                [left, bottom],
-            ]
-            .map(|corner| {
-                let translated = [corner[0] - center[0], corner[1] - center[1], 0.0];
-                let rotated = rotate_text_rendering_vector_3d(
-                    translated,
-                    viewport.yaw_radians,
-                    viewport.pitch_radians,
-                );
-                project_text_rendering_point_with_weight(rotated, center)
-            });
+            let transformed_corners = [[left, top], [right, top], [right, bottom], [left, bottom]]
+                .map(|corner| {
+                    let translated = [corner[0] - center[0], corner[1] - center[1], 0.0];
+                    let rotated = rotate_text_rendering_vector_3d(
+                        translated,
+                        viewport.yaw_radians,
+                        viewport.pitch_radians,
+                    );
+                    project_text_rendering_point_with_weight(rotated, center)
+                });
             let corners = transformed_corners.map(|(corner, _)| corner);
             let corner_w = transformed_corners.map(|(_, clip_w)| clip_w);
-            let min_x = corners.iter().map(|corner| corner[0]).fold(f32::INFINITY, f32::min);
-            let max_x = corners.iter().map(|corner| corner[0]).fold(f32::NEG_INFINITY, f32::max);
-            let min_y = corners.iter().map(|corner| corner[1]).fold(f32::INFINITY, f32::min);
-            let max_y = corners.iter().map(|corner| corner[1]).fold(f32::NEG_INFINITY, f32::max);
+            let min_x = corners
+                .iter()
+                .map(|corner| corner[0])
+                .fold(f32::INFINITY, f32::min);
+            let max_x = corners
+                .iter()
+                .map(|corner| corner[0])
+                .fold(f32::NEG_INFINITY, f32::max);
+            let min_y = corners
+                .iter()
+                .map(|corner| corner[1])
+                .fold(f32::INFINITY, f32::min);
+            let max_y = corners
+                .iter()
+                .map(|corner| corner[1])
+                .fold(f32::NEG_INFINITY, f32::max);
             if max_x >= cull_left
                 && min_x <= cull_right
                 && max_y >= cull_top
@@ -10973,7 +11052,8 @@ fn scene_toggle_pin(state: &mut SceneAppState, hwnd: WindowHandle) -> eyre::Resu
 
 fn execute_window_chrome_button(hwnd: WindowHandle, button: WindowChromeButton) {
     match button {
-        WindowChromeButton::Pin | WindowChromeButton::Latency | WindowChromeButton::Diagnostics => {}
+        WindowChromeButton::Pin | WindowChromeButton::Latency | WindowChromeButton::Diagnostics => {
+        }
         WindowChromeButton::Minimize => hwnd.minimize(),
         WindowChromeButton::MaximizeRestore => hwnd.toggle_maximize_restore(),
         WindowChromeButton::Close => hwnd.post_close(),
@@ -12321,7 +12401,10 @@ fn perform_scene_action(
     }
 }
 
-fn refresh_app_focused_render_interval(state: &mut AppState, hwnd: WindowHandle) -> eyre::Result<()> {
+fn refresh_app_focused_render_interval(
+    state: &mut AppState,
+    hwnd: WindowHandle,
+) -> eyre::Result<()> {
     state.focused_render_interval_ms = measure_focused_render_interval_ms(Some(hwnd.raw()));
     if state.window_focused {
         hwnd.set_focused_render_timer(state.focused_render_interval_ms)?;
@@ -14605,11 +14688,10 @@ fn scene_cursor_for_point(
     }
 
     if matches!(
-            state.scene_kind,
-            SceneWindowKind::TextRenderingPlaygroundPlane
-                | SceneWindowKind::TextRenderingPlaygroundSpriteSheet
-        )
-        && windows_scene::text_rendering_plane_interaction_rect(layout).contains(point)
+        state.scene_kind,
+        SceneWindowKind::TextRenderingPlaygroundPlane
+            | SceneWindowKind::TextRenderingPlaygroundSpriteSheet
+    ) && windows_scene::text_rendering_plane_interaction_rect(layout).contains(point)
     {
         return Some(IDC_SIZEALL);
     }
@@ -15250,8 +15332,13 @@ fn update_window_chrome_tooltip(
         return Ok(false);
     };
 
-    let tooltip_text =
-        window_chrome_button_tooltip_text(button, diagnostics_active, latency_active, maximized, pinned);
+    let tooltip_text = window_chrome_button_tooltip_text(
+        button,
+        diagnostics_active,
+        latency_active,
+        maximized,
+        pinned,
+    );
     let anchor_rect = client_rect_to_screen_rect(hwnd, window_chrome_button_rect(layout, button))?;
     let cursor_rect = pointer_cursor_screen_rect(hwnd, point)?;
     let monitor_bounds = monitor_work_rect(hwnd)?;
@@ -15271,8 +15358,11 @@ fn scene_action_tooltip(
     }
 
     let specs = windows_scene::scene_button_specs(state.scene_kind);
-    let (button_rect, max_button_size) =
-        scene_action_button_layout(state.scene_kind, layout, scaled_scene_button_size(state.dpi));
+    let (button_rect, max_button_size) = scene_action_button_layout(
+        state.scene_kind,
+        layout,
+        scaled_scene_button_size(state.dpi),
+    );
     let button_layouts =
         windows_scene::layout_scene_buttons(button_rect, specs.len(), max_button_size);
 
@@ -16029,9 +16119,7 @@ mod tests {
 
     #[test]
     fn sprite_sheet_sample_keeps_all_supported_glyphs() {
-        let characters = (0x21..0x221)
-            .filter_map(char::from_u32)
-            .collect::<Vec<_>>();
+        let characters = (0x21..0x221).filter_map(char::from_u32).collect::<Vec<_>>();
         let expected = characters
             .iter()
             .copied()
@@ -16626,7 +16714,10 @@ mod tests {
 
         overlay.handle_f3(now);
         assert!(overlay.visible);
-        assert_eq!(overlay.anchor, windows_scene::LatencyOverlayAnchor::TopRight);
+        assert_eq!(
+            overlay.anchor,
+            windows_scene::LatencyOverlayAnchor::TopRight
+        );
 
         overlay.handle_f3(now + Duration::from_millis(100));
         assert!(overlay.visible);
@@ -16651,7 +16742,10 @@ mod tests {
 
     #[test]
     fn focused_render_interval_prefers_short_period_for_high_refresh_displays() {
-        assert!(focused_render_interval_ms_for_refresh_hz(144) < focused_render_interval_ms_for_refresh_hz(60));
+        assert!(
+            focused_render_interval_ms_for_refresh_hz(144)
+                < focused_render_interval_ms_for_refresh_hz(60)
+        );
         assert!(focused_render_interval_ms_for_refresh_hz(240) <= 4);
     }
 
@@ -16920,18 +17014,19 @@ mod tests {
             cell_height: 16,
             diagnostic_panel_visible: false,
         };
-        let controls_rect = windows_scene::cursor_latency_playground_controls_rect(
-            layout.terminal_panel_rect(),
-        );
-        let play_area_point = ClientPoint::new(
-            controls_rect.left() + 80,
-            controls_rect.bottom() + 160,
-        );
+        let controls_rect =
+            windows_scene::cursor_latency_playground_controls_rect(layout.terminal_panel_rect());
+        let play_area_point =
+            ClientPoint::new(controls_rect.left() + 80, controls_rect.bottom() + 160);
 
         assert!(scene_action_tooltip(&state, layout, play_area_point).is_none());
         assert!(
-            scene_action_at_point(SceneWindowKind::CursorLatencyPlayground, layout, play_area_point)
-                .is_none()
+            scene_action_at_point(
+                SceneWindowKind::CursorLatencyPlayground,
+                layout,
+                play_area_point
+            )
+            .is_none()
         );
     }
 
