@@ -490,6 +490,97 @@ float slug_coverage_single_sample(float2 renderCoord, float bandStartFloat, floa
     );
 }
 
+float slug_coverage_single_sample_all_curves_with_pixels_per_em(
+    float2 renderCoord,
+    float bandStartFloat,
+    float4 glyphData,
+    float4 banding,
+    float2 pixelsPerEm
+) {
+    int curveStart = (int)glyphData.x;
+    int curveCount = (int)glyphData.y;
+    if (curveCount <= 0) {
+        return 0.0;
+    }
+
+    if (!is_finite_float2(renderCoord)) {
+        return 0.0;
+    }
+
+    uint bandStart = (uint)bandStartFloat;
+    uint bandMaxX = (uint)glyphData.z;
+    uint bandMaxY = (uint)glyphData.w;
+    float xcov = 0.0;
+    float ycov = 0.0;
+    float xwgt = 0.0;
+    float ywgt = 0.0;
+
+    uint horizontalBand = ClampBandIndex(renderCoord.y, banding.y, banding.w, bandMaxY);
+    uint4 horizontalEntry = LoadBandEntry(bandStart, horizontalBand);
+    bool horizontalLeftRay = renderCoord.x < asfloat(horizontalEntry.w);
+
+    uint verticalBandStart = bandStart + ((bandMaxY + 1U) * 4U);
+    uint verticalBand = ClampBandIndex(renderCoord.x, banding.x, banding.z, bandMaxX);
+    uint4 verticalEntry = LoadBandEntry(verticalBandStart, verticalBand);
+    bool verticalLeftRay = renderCoord.y < asfloat(verticalEntry.w);
+
+    [loop]
+    for (int curveOffset = 0; curveOffset < curveCount; curveOffset++) {
+        int baseIndex = curveStart + (curveOffset * 2);
+        float4 p12 = CurveData[baseIndex] - float4(renderCoord, renderCoord);
+        float2 p3 = CurveData[baseIndex + 1].xy - renderCoord;
+
+        float4 horizontalP12 = p12;
+        float2 horizontalP3 = p3;
+        horizontalP12.y += SLUG_HORIZONTAL_COVERAGE_EPSILON;
+        horizontalP12.w += SLUG_HORIZONTAL_COVERAGE_EPSILON;
+        horizontalP3.y += SLUG_HORIZONTAL_COVERAGE_EPSILON;
+
+        if (ShouldUseDegenerateLineFallback(horizontalP12, horizontalP3)) {
+            ApplyDegenerateHorizontalCoverage(horizontalP12.xy, horizontalP3, pixelsPerEm.x, horizontalLeftRay, xcov, xwgt);
+        } else {
+            uint hcode = CalcRootCode(horizontalP12.y, horizontalP12.w, horizontalP3.y);
+            if (hcode != 0U) {
+                float2 hr = SolveHorizPoly(horizontalP12, horizontalP3) * pixelsPerEm.x;
+                float2 hcov = horizontalLeftRay
+                    ? clamp(0.5.xx - hr, 0.0.xx, 1.0.xx)
+                    : clamp(hr + 0.5.xx, 0.0.xx, 1.0.xx);
+                if ((hcode & 1U) != 0U) {
+                    xcov += hcov.x;
+                    xwgt = max(xwgt, saturate(1.0 - abs(hr.x) * 2.0));
+                }
+                if (hcode > 1U) {
+                    xcov -= hcov.y;
+                    xwgt = max(xwgt, saturate(1.0 - abs(hr.y) * 2.0));
+                }
+            }
+        }
+
+        if (ShouldUseDegenerateLineFallback(p12, p3)) {
+            ApplyDegenerateVerticalCoverage(p12.xy, p3, pixelsPerEm.y, verticalLeftRay, ycov, ywgt);
+            continue;
+        }
+
+        uint vcode = CalcRootCode(p12.x, p12.z, p3.x);
+        if (vcode != 0U) {
+            float2 vr = SolveVertPoly(p12, p3) * pixelsPerEm.y;
+            float2 vcov = verticalLeftRay
+                ? clamp(0.5.xx - vr, 0.0.xx, 1.0.xx)
+                : clamp(vr + 0.5.xx, 0.0.xx, 1.0.xx);
+            if ((vcode & 1U) != 0U) {
+                ycov -= vcov.x;
+                ywgt = max(ywgt, saturate(1.0 - abs(vr.x) * 2.0));
+            }
+            if (vcode > 1U) {
+                ycov += vcov.y;
+                ywgt = max(ywgt, saturate(1.0 - abs(vr.y) * 2.0));
+            }
+        }
+    }
+
+    return CalcCoverage(xcov, ycov, xwgt, ywgt);
+}
+
 float slug_coverage_transformed(
     float2 screenPoint,
     float2 renderCoord,
@@ -535,28 +626,28 @@ float slug_coverage_transformed(
     float2 pixelsPerEm = 1.0 / emsPerPixel;
     float2 sampleStep = emsPerPixel * 0.25;
     float coverage = 0.0;
-    coverage += slug_coverage_single_sample_with_pixels_per_em(
+    coverage += slug_coverage_single_sample_all_curves_with_pixels_per_em(
         renderCoord + float2(-sampleStep.x, -sampleStep.y),
         bandStartFloat,
         glyphData,
         banding,
         pixelsPerEm
     );
-    coverage += slug_coverage_single_sample_with_pixels_per_em(
+    coverage += slug_coverage_single_sample_all_curves_with_pixels_per_em(
         renderCoord + float2(sampleStep.x, -sampleStep.y),
         bandStartFloat,
         glyphData,
         banding,
         pixelsPerEm
     );
-    coverage += slug_coverage_single_sample_with_pixels_per_em(
+    coverage += slug_coverage_single_sample_all_curves_with_pixels_per_em(
         renderCoord + float2(-sampleStep.x, sampleStep.y),
         bandStartFloat,
         glyphData,
         banding,
         pixelsPerEm
     );
-    coverage += slug_coverage_single_sample_with_pixels_per_em(
+    coverage += slug_coverage_single_sample_all_curves_with_pixels_per_em(
         renderCoord + float2(sampleStep.x, sampleStep.y),
         bandStartFloat,
         glyphData,
