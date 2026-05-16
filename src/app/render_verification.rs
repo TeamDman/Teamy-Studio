@@ -25,14 +25,22 @@ const INDUCE_HAVOC_PROFILE_EXTREME: &str = "extreme";
 const REFERENCE_TEXT_RENDER_TEXT: &str = "test";
 const DENSE_HAVOC_RENDER_TEXT: &str =
     "transformed text driver repro transformed text driver repro transformed text driver repro";
+#[cfg(test)]
+const DRIVER_CRASH_REPRO_TEXT: &str = "il";
 const REFERENCE_TEXT_FONT_SIZE_PX: f32 = 168.0;
 const DENSE_HAVOC_FONT_SIZE_PX: f32 = 208.0;
+#[cfg(test)]
+const DRIVER_CRASH_REPRO_FONT_SIZE_PX: f32 = 9.8;
 const REFERENCE_TEXT_CAMERA_DISTANCE: f32 = 1400.0;
 const REFERENCE_TEXT_NEAR_PLANE_DISTANCE: f32 = 80.0;
 const REFERENCE_TEXT_COLOR: [f32; 4] = [1.0, 1.0, 1.0, 1.0];
 const REFERENCE_TEXT_BACKGROUND: [f32; 4] = [0.0, 0.0, 0.0, 1.0];
 const REFERENCE_TEXT_YAW_RADIANS: f32 = -0.52;
 const REFERENCE_TEXT_PITCH_RADIANS: f32 = 0.31;
+#[cfg(test)]
+const DRIVER_CRASH_REPRO_YAW_RADIANS: f32 = -0.00009;
+#[cfg(test)]
+const DRIVER_CRASH_REPRO_PITCH_RADIANS: f32 = 0.0;
 
 #[derive(Clone, Debug)]
 pub(crate) struct ReferenceTextLayout {
@@ -952,6 +960,24 @@ fn build_dense_reference_transformed_text_frame() -> RenderFrameModel {
         DENSE_HAVOC_FONT_SIZE_PX,
         REFERENCE_TEXT_YAW_RADIANS,
         REFERENCE_TEXT_PITCH_RADIANS,
+    )
+    .frame()
+}
+
+#[cfg(test)]
+pub(crate) fn build_driver_crash_repro_transformed_text_frame() -> RenderFrameModel {
+    build_reference_text_layout_with_config(
+        windows_terminal::TerminalLayout {
+            client_width: 1920,
+            client_height: 1080,
+            cell_width: 8,
+            cell_height: 16,
+            diagnostic_panel_visible: false,
+        },
+        DRIVER_CRASH_REPRO_TEXT,
+        DRIVER_CRASH_REPRO_FONT_SIZE_PX,
+        DRIVER_CRASH_REPRO_YAW_RADIANS,
+        DRIVER_CRASH_REPRO_PITCH_RADIANS,
     )
     .frame()
 }

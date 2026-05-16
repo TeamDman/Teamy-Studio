@@ -97,14 +97,24 @@ float4 transformed_clip_from_screen(float2 screenPoint, float clipW) {
     return float4(ndc * clipW, clipW * 0.5, clipW);
 }
 
-float2 reconstruct_transformed_local_point(float2 screenPoint) {
+bool is_finite_float2(float2 value) {
+    return all(isfinite(value));
+}
+
+bool try_reconstruct_transformed_local_point(float2 screenPoint, out float2 localPoint) {
     float4 row0 = transformed_text_inverse_homography[0];
     float4 row1 = transformed_text_inverse_homography[1];
     float denominator = (row0.w * screenPoint.x) + (row1.w * screenPoint.y) + 1.0;
-    return float2(
+    if (!isfinite(denominator) || abs(denominator) <= (1.0 / 65536.0)) {
+        localPoint = 0.0.xx;
+        return false;
+    }
+
+    localPoint = float2(
         ((row0.x * screenPoint.x) + (row0.y * screenPoint.y) + row0.z) / denominator,
         ((row1.x * screenPoint.x) + (row1.y * screenPoint.y) + row1.z) / denominator
     );
+    return is_finite_float2(localPoint);
 }
 
 float remap_range(float value, float sourceMin, float sourceMax, float targetMin, float targetMax) {
@@ -141,7 +151,7 @@ PsInput VSMain(VsInput input) {
     }
 
     if (input.debugData.y > 0.5) {
-        output.position = transformed_clip_from_screen(position, max(input.position.z, 1.0 / 65536.0));
+        output.position = transformed_clip_from_screen(position, 1.0);
     } else {
         output.position.x = position.x * slug_matrix[0].x + position.y * slug_matrix[0].y + slug_matrix[0].w;
         output.position.y = position.x * slug_matrix[1].x + position.y * slug_matrix[1].y + slug_matrix[1].w;
@@ -278,17 +288,26 @@ uint4 LoadBandEntry(uint bandStart, uint bandIndex) {
     return uint4(BandData[entry], BandData[entry + 1U], BandData[entry + 2U], BandData[entry + 3U]);
 }
 
-float slug_coverage_single_sample(float2 renderCoord, float bandStartFloat, float4 glyphData, float4 banding) {
+float slug_coverage_single_sample_with_pixels_per_em(
+    float2 renderCoord,
+    float bandStartFloat,
+    float4 glyphData,
+    float4 banding,
+    float2 pixelsPerEm
+) {
     int curveStart = (int)glyphData.x;
     int curveCount = (int)glyphData.y;
     if (curveCount <= 0) {
         return 0.0;
     }
 
+    if (!is_finite_float2(renderCoord)) {
+        return 0.0;
+    }
+
     uint bandStart = (uint)bandStartFloat;
     uint bandMaxX = (uint)glyphData.z;
     uint bandMaxY = (uint)glyphData.w;
-    float2 pixelsPerEm = 1.0 / fwidth(renderCoord);
     float xcov = 0.0;
     float ycov = 0.0;
     float xwgt = 0.0;
@@ -389,8 +408,47 @@ float slug_coverage_single_sample(float2 renderCoord, float bandStartFloat, floa
     return CalcCoverage(xcov, ycov, xwgt, ywgt);
 }
 
+float slug_coverage_single_sample(float2 renderCoord, float bandStartFloat, float4 glyphData, float4 banding) {
+    float2 renderCoordWidth = fwidth(renderCoord);
+    if (!is_finite_float2(renderCoordWidth)) {
+        return 0.0;
+    }
+
+    float2 pixelsPerEm = 1.0 / max(abs(renderCoordWidth), float2(1.0 / 65536.0, 1.0 / 65536.0));
+    return slug_coverage_single_sample_with_pixels_per_em(
+        renderCoord,
+        bandStartFloat,
+        glyphData,
+        banding,
+        pixelsPerEm
+    );
+}
+
+float slug_coverage_transformed(float2 renderCoord, float bandStartFloat, float4 glyphData, float4 banding) {
+    if (!is_finite_float2(renderCoord)) {
+        return 0.0;
+    }
+
+    return slug_coverage_single_sample_with_pixels_per_em(
+        renderCoord,
+        bandStartFloat,
+        glyphData,
+        banding,
+        float2(1.0, 1.0)
+    );
+}
+
 float slug_coverage(float2 renderCoord, float bandStartFloat, float4 glyphData, float4 banding) {
-    float2 emsPerPixel = max(fwidth(renderCoord), float2(1.0 / 65536.0, 1.0 / 65536.0));
+    if (!is_finite_float2(renderCoord)) {
+        return 0.0;
+    }
+
+    float2 renderCoordWidth = fwidth(renderCoord);
+    if (!is_finite_float2(renderCoordWidth)) {
+        return 0.0;
+    }
+
+    float2 emsPerPixel = max(abs(renderCoordWidth), float2(1.0 / 65536.0, 1.0 / 65536.0));
     float2 sampleStep = emsPerPixel * 0.25;
     float coverage = 0.0;
     coverage += slug_coverage_single_sample(renderCoord + float2(-sampleStep.x, -sampleStep.y), bandStartFloat, glyphData, banding);
@@ -463,7 +521,16 @@ float4 slug_geometry_debug(float2 renderCoord, float4 glyphData, float debugId) 
         return float4(0.0, 0.0, 0.0, 0.0);
     }
 
-    float2 renderCoordWidth = max(fwidth(renderCoord), float2(1.0 / 4096.0, 1.0 / 4096.0));
+    if (!is_finite_float2(renderCoord)) {
+        return float4(0.0, 0.0, 0.0, 0.0);
+    }
+
+    float2 renderCoordWidth = fwidth(renderCoord);
+    if (!is_finite_float2(renderCoordWidth)) {
+        return float4(0.0, 0.0, 0.0, 0.0);
+    }
+
+    renderCoordWidth = max(abs(renderCoordWidth), float2(1.0 / 4096.0, 1.0 / 4096.0));
     float pixelsPerEm = 1.0 / min(renderCoordWidth.x, renderCoordWidth.y);
     float bestCurveDistancePx = 1e9;
     float bestHandleDistancePx = 1e9;
@@ -756,19 +823,13 @@ float4 PSMain(PsInput input) : SV_TARGET {
         }
         float2 renderCoord = input.uv;
         if (input.transformedFlag > 0.5) {
-            float2 localPoint = reconstruct_transformed_local_point(input.position.xy);
-            if (localPoint.x < input.localBounds.x
-                || localPoint.x > input.localBounds.y
-                || localPoint.y < input.localBounds.z
-                || localPoint.y > input.localBounds.w) {
+            if (!is_finite_float2(renderCoord)) {
                 discard;
             }
-            renderCoord = float2(
-                remap_range(localPoint.x, input.localBounds.x, input.localBounds.y, input.uvBounds.x, input.uvBounds.y),
-                remap_range(localPoint.y, input.localBounds.z, input.localBounds.w, input.uvBounds.z, input.uvBounds.w)
-            );
         }
-        float coverage = slug_coverage(renderCoord, input.glyph, input.glyphData, input.banding);
+        float coverage = input.transformedFlag > 0.5
+            ? slug_coverage_transformed(renderCoord, input.glyph, input.glyphData, input.banding)
+            : slug_coverage(renderCoord, input.glyph, input.glyphData, input.banding);
         float4 shaded = float4(input.color.rgb, input.color.a * coverage);
         if (scene_time.y > 0.5) {
             float4 geometry = slug_geometry_debug(renderCoord, input.glyphData, input.debugId);

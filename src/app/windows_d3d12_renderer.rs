@@ -6810,6 +6810,8 @@ mod tests {
         window_garden_shader_data,
     };
     use crate::app::render_verification::{
+        build_driver_crash_repro_transformed_text_frame,
+        build_reference_transformed_text_frame,
         build_reference_zero_angle_transformed_text_frame,
         build_reference_zero_angle_transformed_text_layout,
     };
@@ -6940,6 +6942,36 @@ mod tests {
             mismatch_count,
             0,
             "zero-angle transformed text should exactly match the CPU glyph reference; mismatched pixels={mismatch_count}; {mismatch_summary}"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn near_identity_transformed_text_offscreen_render_completes() -> eyre::Result<()> {
+        let image = render_frame_model_offscreen_image(
+            &build_driver_crash_repro_transformed_text_frame(),
+        )?;
+
+        let visible_pixel_count = image.pixels().filter(|pixel| pixel.0[3] > 0).count();
+        assert!(
+            visible_pixel_count > 0,
+            "near-identity transformed text repro should still render visible pixels"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn rotated_transformed_text_offscreen_render_completes() -> eyre::Result<()> {
+        let image = render_frame_model_offscreen_image(
+            &build_reference_transformed_text_frame(),
+        )?;
+
+        let visible_pixel_count = image.pixels().filter(|pixel| pixel.0[3] > 0).count();
+        assert!(
+            visible_pixel_count > 0,
+            "rotated transformed text fixture should still render visible pixels"
         );
 
         Ok(())
