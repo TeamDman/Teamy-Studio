@@ -1004,31 +1004,39 @@ float4 apply_timeline_add_text_track_button(float2 uv, float4 color, float4 stat
     return float4(rgb * glow, color.a);
 }
 
-float sd_equilateral_triangle_px(float2 pointPx, float radiusPx) {
-    float k = sqrt(3.0);
-    float2 p = pointPx;
-    p.x = abs(p.x) - radiusPx;
-    p.y = p.y + (radiusPx / k);
-    if (p.x + (k * p.y) > 0.0) {
-        p = float2(p.x - (k * p.y), (-k * p.x) - p.y) * 0.5;
-    }
-    p.x -= clamp(p.x, -2.0 * radiusPx, 0.0);
-    float distancePx = length(p);
-    return (p.y < 0.0) ? -distancePx : distancePx;
+float sd_box_px(float2 pointPx, float2 halfSizePx) {
+    float2 distancePx = abs(pointPx) - halfSizePx;
+    return length(max(distancePx, 0.0)) + min(max(distancePx.x, distancePx.y), 0.0);
+}
+
+float sd_cross_px(float2 pointPx, float armHalfLengthPx, float armHalfThicknessPx) {
+    float horizontal = sd_box_px(pointPx, float2(armHalfLengthPx, armHalfThicknessPx));
+    float vertical = sd_box_px(pointPx, float2(armHalfThicknessPx, armHalfLengthPx));
+    return min(horizontal, vertical);
 }
 
 float4 apply_cursor_latency_ripple(float2 uv, float4 color, float4 state) {
     float2 originUv = state.xy;
     float2 panelPx = max(state.zw, float2(1.0, 1.0));
     float2 pointPx = (uv - originUv) * panelPx;
-    float triangleRadiusPx = max(18.0, min(panelPx.x, panelPx.y) * 0.055);
-    float sdf = sd_equilateral_triangle_px(pointPx, triangleRadiusPx);
-    float ripple = 0.5 + (0.5 * cos(abs(sdf) * 0.165));
-    float edge = 1.0 - smoothstep(0.0, triangleRadiusPx * 0.9, abs(sdf));
-    float glow = 0.88 + (0.24 * ripple) + (0.16 * edge);
-    float stripe = 0.94 + (0.06 * sin((uv.y * panelPx.y * 0.035) - (PanelTime() * 1.2)));
-    float3 rgb = color.rgb * glow * stripe;
-    return float4(rgb, color.a);
+    float radiusPx = length(pointPx);
+    float armHalfLengthPx = max(19.0, min(panelPx.x, panelPx.y) * 0.0625);
+    float armHalfThicknessPx = 2.25;
+    float crossSdf = sd_cross_px(pointPx, armHalfLengthPx, armHalfThicknessPx);
+    float hardCross = 1.0 - step(0.75, abs(crossSdf));
+    float crossGlow = 1.0 - smoothstep(0.75, 4.0, abs(crossSdf));
+    float immediateZone = 1.0 - smoothstep(armHalfLengthPx + 4.0, armHalfLengthPx + 22.0, radiusPx);
+    float rippleEnvelope = smoothstep(armHalfLengthPx + 3.0, armHalfLengthPx + 18.0, radiusPx)
+        * (1.0 - smoothstep(min(panelPx.x, panelPx.y) * 0.30, min(panelPx.x, panelPx.y) * 0.62, radiusPx));
+    float ripplePhase = (radiusPx * 0.19) - (PanelTime() * 7.5);
+    float ripple = (0.5 + (0.5 * cos(ripplePhase))) * rippleEnvelope;
+    float scan = 0.97 + (0.03 * sin((uv.y * panelPx.y * 0.026) - (PanelTime() * 1.6)));
+    float3 crossTint = lerp(color.rgb, float3(1.0, 1.0, 1.0), 0.34 + (0.46 * hardCross));
+    float3 rgb = color.rgb * (0.84 + (0.12 * immediateZone));
+    rgb += color.rgb * (0.20 * ripple);
+    rgb += crossTint * ((0.62 * hardCross) + (0.28 * crossGlow));
+    float alpha = max(color.a * (0.96 + (0.18 * ripple)), (0.92 * hardCross) + (0.24 * crossGlow));
+    return float4(rgb * scan, saturate(alpha));
 }
 
 float4 PSMain(PsInput input) : SV_TARGET {

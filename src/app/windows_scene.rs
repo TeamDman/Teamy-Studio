@@ -7240,7 +7240,7 @@ pub fn build_cursor_latency_playground_render_scene(
             title_rect.bottom() + 38,
         )
         .to_win32_rect(),
-        "Fastest projects the cursor polygon ahead from recent motion to mimic the app-first presentation you observed in the DirectX experiment. Match OS pins that same polygon to the sampled OS cursor so the comparison is obvious.",
+        "Fastest projects a larger hard-edged crosshair ahead from recent motion to mimic the app-first presentation you observed in the DirectX experiment. Match OS pins that same crosshair to the sampled OS cursor so drift stays obvious nearby and at distance.",
         8,
         14,
         [0.74, 0.79, 0.85, 1.0],

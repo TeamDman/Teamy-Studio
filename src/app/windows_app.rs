@@ -380,6 +380,7 @@ struct TimelinePlaygroundState {
 const CURSOR_LATENCY_MAX_HISTORY: usize = 12;
 const CURSOR_LATENCY_MAX_SAMPLE_AGE: Duration = Duration::from_millis(180);
 const CURSOR_LATENCY_MAX_LEAD_PIXELS: f32 = 96.0;
+const CURSOR_LATENCY_FOCUSED_RENDER_TICK_INTERVAL_MS: u32 = 1;
 const LATENCY_OVERLAY_MAX_HISTORY: usize = 120;
 const LATENCY_OVERLAY_ROTATION_PAUSE: Duration = Duration::from_millis(500);
 
@@ -394,6 +395,7 @@ struct CursorLatencyPlaygroundState {
     behavior: windows_scene::CursorLatencyBehavior,
     last_os_cursor_position: Option<ClientPoint>,
     rendered_cursor_position: Option<ClientPoint>,
+    fastest_projection_interval: Duration,
     samples: VecDeque<CursorLatencySample>,
 }
 
@@ -662,6 +664,7 @@ impl CursorLatencyPlaygroundState {
             behavior: windows_scene::CursorLatencyBehavior::Fastest,
             last_os_cursor_position: None,
             rendered_cursor_position: None,
+            fastest_projection_interval: Duration::from_millis(16),
             samples: VecDeque::with_capacity(CURSOR_LATENCY_MAX_HISTORY),
         }
     }
@@ -687,10 +690,12 @@ impl CursorLatencyPlaygroundState {
         }) {
             self.samples.pop_front();
         }
+        self.fastest_projection_interval =
+            Duration::from_millis(u64::from(focused_render_interval_ms.max(1)));
         self.rendered_cursor_position = cursor_latency_projected_position(
             self.behavior,
             &self.samples,
-            Duration::from_millis(u64::from(focused_render_interval_ms.max(1))),
+            self.fastest_projection_interval,
         );
     }
 
@@ -702,12 +707,12 @@ impl CursorLatencyPlaygroundState {
         let fastest_cursor_position = cursor_latency_projected_position(
             windows_scene::CursorLatencyBehavior::Fastest,
             &self.samples,
-            Duration::from_millis(16),
+            self.fastest_projection_interval,
         );
         let match_os_cursor_position = cursor_latency_projected_position(
             windows_scene::CursorLatencyBehavior::MatchOs,
             &self.samples,
-            Duration::from_millis(16),
+            self.fastest_projection_interval,
         );
         let lead_pixels = self
             .last_os_cursor_position
@@ -740,46 +745,67 @@ fn cursor_latency_projected_position(
     }
 
     // cursorlatency[impl playground.fastest]
-    let previous = samples
-        .iter()
-        .rev()
-        .skip(1)
-        .find(|sample| sample.point != latest.point)
-        .copied();
-    let Some(previous) = previous else {
-        return Some(latest.point);
-    };
+    let mut segment_count = 0_u32;
+    let mut weighted_velocity_x = 0.0_f32;
+    let mut weighted_velocity_y = 0.0_f32;
+    let mut total_weight = 0.0_f32;
+    let mut newer = latest;
 
-    let sample_dt = latest
-        .captured_at
-        .saturating_duration_since(previous.captured_at);
-    if sample_dt.is_zero() {
+    for older in samples.iter().rev().skip(1).copied() {
+        if older.point == newer.point {
+            continue;
+        }
+
+        let sample_dt = newer
+            .captured_at
+            .saturating_duration_since(older.captured_at);
+        if sample_dt.is_zero() {
+            continue;
+        }
+
+        let (newer_x, newer_y) = client_point_pixels(newer.point);
+        let (older_x, older_y) = client_point_pixels(older.point);
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "cursor latency math projects integral pixel deltas into a bounded f32 viewport"
+        )]
+        let delta_x = (newer_x - older_x) as f32;
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "cursor latency math projects integral pixel deltas into a bounded f32 viewport"
+        )]
+        let delta_y = (newer_y - older_y) as f32;
+        let dt_seconds = sample_dt.as_secs_f32();
+        let weight = (4_u32.saturating_sub(segment_count)) as f32;
+        weighted_velocity_x += (delta_x / dt_seconds) * weight;
+        weighted_velocity_y += (delta_y / dt_seconds) * weight;
+        total_weight += weight;
+        segment_count += 1;
+        newer = older;
+
+        if segment_count >= 4 {
+            break;
+        }
+    }
+
+    if total_weight <= f32::EPSILON {
         return Some(latest.point);
     }
 
     let (latest_x, latest_y) = client_point_pixels(latest.point);
-    let (previous_x, previous_y) = client_point_pixels(previous.point);
-    #[expect(
-        clippy::cast_precision_loss,
-        reason = "cursor latency math projects integral pixel deltas into a bounded f32 viewport"
-    )]
-    let delta_x = (latest_x - previous_x) as f32;
-    #[expect(
-        clippy::cast_precision_loss,
-        reason = "cursor latency math projects integral pixel deltas into a bounded f32 viewport"
-    )]
-    let delta_y = (latest_y - previous_y) as f32;
-    let lead_scale = (lead_interval.as_secs_f32() / sample_dt.as_secs_f32()).clamp(0.0, 1.35);
+    let velocity_x = weighted_velocity_x / total_weight;
+    let velocity_y = weighted_velocity_y / total_weight;
+    let lead_seconds = lead_interval.as_secs_f32();
     #[expect(
         clippy::cast_precision_loss,
         reason = "screen-space cursor projection stays within practical desktop pixel ranges"
     )]
-    let projected_x = latest_x as f32 + delta_x * lead_scale;
+    let projected_x = latest_x as f32 + velocity_x * lead_seconds;
     #[expect(
         clippy::cast_precision_loss,
         reason = "screen-space cursor projection stays within practical desktop pixel ranges"
     )]
-    let projected_y = latest_y as f32 + delta_y * lead_scale;
+    let projected_y = latest_y as f32 + velocity_y * lead_seconds;
     #[expect(
         clippy::cast_precision_loss,
         reason = "screen-space cursor projection stays within practical desktop pixel ranges"
@@ -4684,6 +4710,14 @@ fn scene_needs_focused_timer_render(state: &SceneAppState) -> bool {
             || state.scene_opened_at.elapsed() < Duration::from_millis(300))
 }
 
+fn scene_focused_render_tick_interval_ms(state: &SceneAppState) -> u32 {
+    if state.scene_kind == SceneWindowKind::CursorLatencyPlayground {
+        CURSOR_LATENCY_FOCUSED_RENDER_TICK_INTERVAL_MS
+    } else {
+        state.focused_render_interval_ms
+    }
+}
+
 fn maybe_complete_model_warning_prepare(state: &mut SceneAppState) {
     let Some(started_at) = state.model_warning_prepare_started_at else {
         return;
@@ -4727,7 +4761,7 @@ fn handle_scene_focus_changed(hwnd: WindowHandle, focused: bool) -> LRESULT {
         state.window_focused = focused;
         if focused {
             refresh_scene_focused_render_interval(state, hwnd)?;
-            hwnd.set_focused_render_timer(state.focused_render_interval_ms)?;
+            hwnd.set_focused_render_timer(scene_focused_render_tick_interval_ms(state))?;
             render_scene_window_frame(state, hwnd, None, true)?;
         } else {
             hwnd.clear_focused_render_timer();
@@ -12527,7 +12561,7 @@ fn refresh_scene_focused_render_interval(
 ) -> eyre::Result<()> {
     state.focused_render_interval_ms = measure_focused_render_interval_ms(Some(hwnd.raw()));
     if state.window_focused {
-        hwnd.set_focused_render_timer(state.focused_render_interval_ms)?;
+        hwnd.set_focused_render_timer(scene_focused_render_tick_interval_ms(state))?;
     }
     Ok(())
 }
@@ -14890,6 +14924,10 @@ fn scene_cursor_for_point(
         return Some(IDC_HAND);
     }
 
+    if state.scene_kind == SceneWindowKind::CursorLatencyPlayground {
+        return Some(IDC_CROSS);
+    }
+
     if let Some(cell) = cursor_gallery_cell_at_point(state, layout, point) {
         // windowing[impl cursor-gallery.hover-cursor-shape]
         return Some(cursor_gallery_system_cursor(cell.spec.cursor));
@@ -16871,6 +16909,22 @@ mod tests {
         .expect("projection");
 
         assert_eq!(projected, ClientPoint::new(120, 212));
+    }
+
+    #[test]
+    fn cursor_latency_view_state_uses_latest_measured_projection_interval() {
+        let now = Instant::now();
+        let mut playground = CursorLatencyPlaygroundState::new();
+        playground.sync(Some(ClientPoint::new(100, 200)), now - Duration::from_millis(8), 8);
+        playground.sync(Some(ClientPoint::new(120, 200)), now, 8);
+
+        let expected = cursor_latency_projected_position(
+            windows_scene::CursorLatencyBehavior::Fastest,
+            &playground.samples,
+            Duration::from_millis(8),
+        );
+
+        assert_eq!(playground.view_state().fastest_cursor_position, expected);
     }
 
     #[test]
