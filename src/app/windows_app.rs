@@ -381,11 +381,6 @@ const CURSOR_LATENCY_FOCUSED_RENDER_TICK_INTERVAL_MS: u32 = 1;
 const LATENCY_OVERLAY_MAX_HISTORY: usize = 120;
 const LATENCY_OVERLAY_ROTATION_PAUSE: Duration = Duration::from_millis(500);
 
-#[derive(Debug)]
-struct CursorLatencyPlaygroundState {
-    behavior: windows_scene::CursorLatencyBehavior,
-}
-
 static NEXT_TEXT_RENDERING_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -642,14 +637,6 @@ impl LatencyOverlayState {
                 .map(|duration| duration.as_secs_f32() * 1000.0)
                 .collect(),
         })
-    }
-}
-
-impl CursorLatencyPlaygroundState {
-    fn new() -> Self {
-        Self {
-            behavior: windows_scene::CursorLatencyBehavior::Fastest,
-        }
     }
 }
 
@@ -1318,7 +1305,6 @@ struct SceneAppState {
     model_warning: Option<windows_scene::ModelWarningViewState>,
     model_warning_prepare_started_at: Option<Instant>,
     timeline_playground: Option<TimelinePlaygroundState>,
-    cursor_latency_playground: Option<CursorLatencyPlaygroundState>,
     text_rendering_playground: Option<TextRenderingPlaygroundHandle>,
     text_rendering_drag: Option<TextRenderingDragState>,
     text_rendering_editor_focused: bool,
@@ -2898,8 +2884,6 @@ fn run_scene_window(
     } else {
         None
     };
-    let cursor_latency_playground = (scene_kind == SceneWindowKind::CursorLatencyPlayground)
-        .then(CursorLatencyPlaygroundState::new);
     let text_rendering_playground = initialization.text_rendering_playground.take();
 
     SCENE_APP_STATE.with(|state| {
@@ -2921,7 +2905,6 @@ fn run_scene_window(
             model_warning: initialization.model_warning,
             model_warning_prepare_started_at: None,
             timeline_playground,
-            cursor_latency_playground,
             text_rendering_playground,
             text_rendering_drag: None,
             text_rendering_editor_focused: false,
@@ -4566,6 +4549,11 @@ fn handle_scene_focus_changed(hwnd: WindowHandle, focused: bool) -> LRESULT {
         state.window_focused = focused;
         if focused {
             refresh_scene_focused_render_interval(state, hwnd)?;
+            if state.scene_kind == SceneWindowKind::CursorLatencyPlayground
+                && let Some(renderer) = state.renderer.as_ref()
+            {
+                renderer.reactivate_low_latency_mode()?;
+            }
             hwnd.set_focused_render_timer(scene_focused_render_tick_interval_ms(state))?;
             render_scene_window_frame(state, hwnd, None, true)?;
         } else {
@@ -8083,24 +8071,12 @@ fn render_scene_window_frame(
         )
     } else if state.scene_kind == SceneWindowKind::CursorLatencyPlayground {
         let button_visual_states = scene_button_visual_states(state, layout);
-        let behavior = state
-            .cursor_latency_playground
-            .as_ref()
-            .expect("cursor latency playground scene has playground state")
-            .behavior;
         cursor_latency_frame = Some(CursorLatencyFrameModel {
-            behavior,
             button_states: button_visual_states.clone(),
         });
         let view_state = windows_scene::CursorLatencyPlaygroundViewState {
-            behavior,
             os_cursor_position: None,
             rendered_cursor_position: None,
-            fastest_cursor_position: None,
-            match_os_cursor_position: None,
-            trail_points: Vec::new(),
-            lead_pixels: 0,
-            sample_count: 0,
         };
         windows_scene::build_cursor_latency_playground_render_scene(
             layout,
@@ -8462,7 +8438,6 @@ fn scene_button_visual_states(
             let active = scene_action_active(spec.action)
                 || selected
                 || timeline_playground_action_active(state, spec.action)
-                || cursor_latency_playground_action_active(state, spec.action)
                 || text_rendering_preset_action_active(state, spec.action);
             (
                 spec.action,
@@ -8500,22 +8475,6 @@ fn timeline_playground_action_active(state: &SceneAppState, action: SceneAction)
         ) | (
             SceneAction::TimelinePlaygroundGroupingAll,
             TimelineGroupingMode::All
-        )
-    )
-}
-
-fn cursor_latency_playground_action_active(state: &SceneAppState, action: SceneAction) -> bool {
-    let Some(playground) = state.cursor_latency_playground.as_ref() else {
-        return false;
-    };
-    matches!(
-        (action, playground.behavior),
-        (
-            SceneAction::SetCursorLatencyBehaviorFastest,
-            windows_scene::CursorLatencyBehavior::Fastest,
-        ) | (
-            SceneAction::SetCursorLatencyBehaviorMatchOs,
-            windows_scene::CursorLatencyBehavior::MatchOs,
         )
     )
 }
@@ -12174,24 +12133,6 @@ fn perform_scene_action(
                 if let Some(playground) = state.timeline_playground.as_mut() {
                     playground.minimum_visible_pixels =
                         playground.minimum_visible_pixels.saturating_sub(1).max(1);
-                }
-                Ok(())
-            })?;
-            Ok(SceneActionDisposition::KeepOpen)
-        }
-        SceneAction::SetCursorLatencyBehaviorFastest => {
-            with_scene_app_state(|state| {
-                if let Some(playground) = state.cursor_latency_playground.as_mut() {
-                    playground.behavior = windows_scene::CursorLatencyBehavior::Fastest;
-                }
-                Ok(())
-            })?;
-            Ok(SceneActionDisposition::KeepOpen)
-        }
-        SceneAction::SetCursorLatencyBehaviorMatchOs => {
-            with_scene_app_state(|state| {
-                if let Some(playground) = state.cursor_latency_playground.as_mut() {
-                    playground.behavior = windows_scene::CursorLatencyBehavior::MatchOs;
                 }
                 Ok(())
             })?;
@@ -16004,7 +15945,6 @@ mod tests {
             model_warning: None,
             model_warning_prepare_started_at: None,
             timeline_playground: None,
-            cursor_latency_playground: None,
             text_rendering_playground: None,
             text_rendering_drag: None,
             text_rendering_editor_focused: false,
@@ -16094,7 +16034,6 @@ mod tests {
         let mut state = timeline_test_state(TimelineDocument::blank());
         state.scene_kind = SceneWindowKind::CursorLatencyPlayground;
         state.window_focused = true;
-        state.cursor_latency_playground = Some(CursorLatencyPlaygroundState::new());
 
         assert!(scene_needs_focused_timer_render(&state));
     }
@@ -16836,7 +16775,6 @@ mod tests {
             model_warning: None,
             model_warning_prepare_started_at: None,
             timeline_playground: None,
-            cursor_latency_playground: None,
             text_rendering_playground: None,
             text_rendering_drag: None,
             text_rendering_editor_focused: false,
@@ -16927,7 +16865,6 @@ mod tests {
             model_warning: None,
             model_warning_prepare_started_at: None,
             timeline_playground: None,
-            cursor_latency_playground: Some(CursorLatencyPlaygroundState::new()),
             text_rendering_playground: None,
             text_rendering_drag: None,
             text_rendering_editor_focused: false,
@@ -17020,7 +16957,6 @@ mod tests {
             model_warning: None,
             model_warning_prepare_started_at: None,
             timeline_playground: None,
-            cursor_latency_playground: None,
             text_rendering_playground: None,
             text_rendering_drag: None,
             text_rendering_editor_focused: false,
@@ -17104,7 +17040,6 @@ mod tests {
             model_warning: None,
             model_warning_prepare_started_at: None,
             timeline_playground: None,
-            cursor_latency_playground: None,
             text_rendering_playground: None,
             text_rendering_drag: None,
             text_rendering_editor_focused: false,

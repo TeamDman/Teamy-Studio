@@ -223,8 +223,6 @@ pub enum SceneAction {
     TimelinePlaygroundGroupingAll,
     IncreaseTimelinePlaygroundFolding,
     DecreaseTimelinePlaygroundFolding,
-    SetCursorLatencyBehaviorFastest,
-    SetCursorLatencyBehaviorMatchOs,
     SelectTextRenderingPresetLoremIpsum,
     SelectTextRenderingPresetSpriteSheet,
     SelectTextRenderingPresetAlphabet,
@@ -270,22 +268,10 @@ pub const fn text_rendering_preset_for_action(action: SceneAction) -> Option<Tex
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CursorLatencyBehavior {
-    Fastest,
-    MatchOs,
-}
-
 #[derive(Clone, Debug, PartialEq)]
 pub struct CursorLatencyPlaygroundViewState {
-    pub behavior: CursorLatencyBehavior,
     pub os_cursor_position: Option<ClientPoint>,
     pub rendered_cursor_position: Option<ClientPoint>,
-    pub fastest_cursor_position: Option<ClientPoint>,
-    pub match_os_cursor_position: Option<ClientPoint>,
-    pub trail_points: Vec<ClientPoint>,
-    pub lead_pixels: i32,
-    pub sample_count: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3081,24 +3067,7 @@ pub fn scene_button_specs(scene_kind: SceneWindowKind) -> &'static [SceneButtonS
                 color: [0.17, 0.20, 0.29, 1.0],
             },
         ],
-        SceneWindowKind::CursorLatencyPlayground => &[
-            SceneButtonSpec {
-                // cursorlatency[impl playground.behavior-controls]
-                action: SceneAction::SetCursorLatencyBehaviorFastest,
-                label: "Fastest",
-                tooltip: "Lead the cursor polygon to mimic app-first presentation",
-                sprite: SpriteId::CursorArrow,
-                color: [0.30, 0.18, 0.16, 1.0],
-            },
-            SceneButtonSpec {
-                // cursorlatency[impl playground.behavior-controls]
-                action: SceneAction::SetCursorLatencyBehaviorMatchOs,
-                label: "Match OS",
-                tooltip: "Keep the cursor polygon welded to the sampled OS cursor",
-                sprite: SpriteId::CursorArrow,
-                color: [0.16, 0.25, 0.29, 1.0],
-            },
-        ],
+        SceneWindowKind::CursorLatencyPlayground => &[],
         SceneWindowKind::TextRenderingPlaygroundPresets => &TEXT_RENDERING_PRESET_BUTTON_SPECS,
         SceneWindowKind::TimelineStart => &[
             SceneButtonSpec {
@@ -7240,63 +7209,30 @@ pub fn build_cursor_latency_playground_render_scene(
             title_rect.bottom() + 38,
         )
         .to_win32_rect(),
-        "Fastest late-latches a larger hard-edged crosshair after the renderer clears the frame-latency gate, so it can land on the freshest cursor sample we have. Match OS shows the previous latched sample as a simple one-frame-behind comparison.",
+        "Minimum latency late-latches a larger hard-edged crosshair after the renderer clears the frame-latency gate, so it can land on the freshest cursor sample we have.",
         8,
         14,
         [0.74, 0.79, 0.85, 1.0],
     );
-    let summary = format!(
-        "focus: {}\nfastest lead: {} px\nsamples: {}",
-        match view_state.behavior {
-            CursorLatencyBehavior::Fastest => "fastest",
-            CursorLatencyBehavior::MatchOs => "match os",
-        },
-        view_state.lead_pixels,
-        view_state.sample_count,
-    );
+    let summary = "mode: minimum latency\nlate-latched after frame gate";
     push_text_block(
         &mut scene,
         summary_rect.to_win32_rect(),
-        &summary,
+        summary,
         8,
         18,
         [0.90, 0.93, 0.98, 1.0],
     );
 
-    let gutter = 12;
-    let half_width = (canvas_rect.width() - gutter).max(0) / 2;
-    let fastest_rect = ClientRect::new(
-        canvas_rect.left(),
-        canvas_rect.top(),
-        canvas_rect.left() + half_width,
-        canvas_rect.bottom(),
-    );
-    let match_os_rect = ClientRect::new(
-        fastest_rect.right() + gutter,
-        canvas_rect.top(),
-        canvas_rect.right(),
-        canvas_rect.bottom(),
-    );
-    let match_color = preferred_title_bar_color(window_chrome_buttons_state.focused);
-    let fastest_color = hue_rotate_180(match_color);
+    let accent = hue_rotate_180(preferred_title_bar_color(window_chrome_buttons_state.focused));
     push_cursor_latency_half(
         &mut scene,
-        cursor_latency_half_content_rect(fastest_rect),
-        cursor_latency_half_content_rect(match_os_rect),
-        fastest_rect,
-        "Fastest",
-        fastest_color,
-        view_state.fastest_cursor_position,
-        view_state.lead_pixels,
-    );
-    push_cursor_latency_half(
-        &mut scene,
-        cursor_latency_half_content_rect(fastest_rect),
-        cursor_latency_half_content_rect(match_os_rect),
-        match_os_rect,
-        "Match OS",
-        match_color,
-        view_state.match_os_cursor_position,
+        cursor_latency_half_content_rect(canvas_rect),
+        cursor_latency_half_content_rect(canvas_rect),
+        canvas_rect,
+        "Minimum Latency",
+        accent,
+        view_state.rendered_cursor_position,
         0,
     );
 
@@ -10716,9 +10652,7 @@ mod tests {
         let specs = scene_button_specs(SceneWindowKind::CursorLatencyPlayground);
         let actions = specs.iter().map(|spec| spec.action).collect::<Vec<_>>();
 
-        assert_eq!(actions.len(), 2);
-        assert!(actions.contains(&SceneAction::SetCursorLatencyBehaviorFastest));
-        assert!(actions.contains(&SceneAction::SetCursorLatencyBehaviorMatchOs));
+        assert!(actions.is_empty());
     }
 
     #[test]

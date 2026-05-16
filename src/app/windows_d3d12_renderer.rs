@@ -20,7 +20,7 @@
     clippy::unused_self
 )]
 #![allow(clippy::wildcard_imports)]
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap};
 use std::ffi::{CStr, CString, c_void};
 use std::fmt::Write as _;
 use std::ops::Range;
@@ -68,14 +68,13 @@ use windows::core::{Error, Interface, Owned, PCSTR, PCWSTR, s};
 
 use super::cell_grid;
 use super::spatial::{ClientPoint, ClientRect, TerminalCellPoint};
-use super::windows_scene::{self, CursorLatencyBehavior, CursorLatencyPlaygroundViewState, SceneAction};
+use super::windows_scene::{self, CursorLatencyPlaygroundViewState, SceneAction};
 use super::windows_terminal::{
     SharedTerminalDisplayState, TerminalDisplayCursor, TerminalDisplayCursorStyle,
     TerminalDisplayRow, TerminalDisplayScrollbar, TerminalLayout, TerminalSelection,
 };
 
 const FRAME_COUNT: usize = 2;
-const CURSOR_LATENCY_HISTORY_SIZE: usize = 2;
 const MAX_PANEL_COUNT: usize = 8_192;
 const MAX_GLYPH_COUNT: usize = 8_192;
 const MAX_SPRITE_COUNT: usize = 256;
@@ -474,13 +473,13 @@ pub struct D3d12PanelRenderer {
     scissor_rect: RECT,
     width: u32,
     height: u32,
-    cursor_latency_samples: VecDeque<ClientPoint>,
     animation_start: Instant,
 }
 
 #[derive(Debug)]
 struct RenderThreadShared {
     pending_resize: Option<(u32, u32)>,
+    pending_reactivate_low_latency_mode: bool,
     pending_frame: Option<QueuedRenderFrame>,
     next_submission_id: u64,
     completed_submission_id: u64,
@@ -528,7 +527,6 @@ pub struct WindowChromeButtonsState {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct CursorLatencyFrameModel {
-    pub behavior: CursorLatencyBehavior,
     pub button_states: Vec<(SceneAction, ButtonVisualState)>,
 }
 
@@ -641,6 +639,7 @@ impl RenderThreadProxy {
         let shared = Arc::new((
             Mutex::new(RenderThreadShared {
                 pending_resize: None,
+                pending_reactivate_low_latency_mode: false,
                 pending_frame: None,
                 next_submission_id: 0,
                 completed_submission_id: 0,
@@ -732,6 +731,17 @@ impl RenderThreadProxy {
         Ok(())
     }
 
+    pub fn reactivate_low_latency_mode(&self) -> eyre::Result<()> {
+        self.check_error()?;
+        let (state_lock, wake) = &*self.shared;
+        let mut state = state_lock
+            .lock()
+            .map_err(|error| eyre::eyre!("failed to lock renderer thread state: {error}"))?;
+        state.pending_reactivate_low_latency_mode = true;
+        wake.notify_one();
+        Ok(())
+    }
+
     fn submit_render_frame_model(
         &self,
         frame: RenderFrameModel,
@@ -785,7 +795,7 @@ fn render_thread_main_loop(
 ) {
     let mut scene_cache = RenderThreadSceneCache::default();
     loop {
-        let (pending_resize, pending_frame) = {
+        let (pending_resize, pending_reactivate_low_latency_mode, pending_frame) = {
             let (state_lock, wake) = &**shared;
             let Ok(mut state) = state_lock.lock() else {
                 return;
@@ -793,6 +803,7 @@ fn render_thread_main_loop(
 
             while !state.shutdown
                 && state.pending_resize.is_none()
+                && !state.pending_reactivate_low_latency_mode
                 && state.pending_frame.is_none()
                 && state.error.is_none()
             {
@@ -806,7 +817,11 @@ fn render_thread_main_loop(
                 return;
             }
 
-            (state.pending_resize.take(), state.pending_frame.take())
+            (
+                state.pending_resize.take(),
+                std::mem::take(&mut state.pending_reactivate_low_latency_mode),
+                state.pending_frame.take(),
+            )
         };
 
         let result = (|| -> eyre::Result<()> {
@@ -814,6 +829,12 @@ fn render_thread_main_loop(
                 #[cfg(feature = "tracy")]
                 let _span = debug_span!("render_thread_resize_swap_chain").entered();
                 renderer.resize(width, height)?;
+            }
+
+            if pending_reactivate_low_latency_mode {
+                #[cfg(feature = "tracy")]
+                let _span = debug_span!("render_thread_reactivate_low_latency_mode").entered();
+                renderer.reactivate_low_latency_mode()?;
             }
 
             if let Some(queued_frame) = pending_frame.as_ref() {
@@ -1002,7 +1023,6 @@ impl D3d12PanelRenderer {
             scissor_rect,
             width,
             height,
-            cursor_latency_samples: VecDeque::with_capacity(CURSOR_LATENCY_HISTORY_SIZE),
             animation_start: Instant::now(),
         })
     }
@@ -1074,6 +1094,59 @@ impl D3d12PanelRenderer {
             right: width as i32,
             bottom: height as i32,
         };
+        Ok(())
+    }
+
+    fn reactivate_low_latency_mode(&mut self) -> eyre::Result<()> {
+        if self.presentation_mode != RendererPresentationMode::LowLatencyHwnd
+            || self.width == 0
+            || self.height == 0
+        {
+            return Ok(());
+        }
+
+        self.wait_for_gpu()?;
+        unsafe {
+            self.command_list.Reset(&self.command_allocators[0], None)?;
+            self.command_list.ClearState(None);
+            self.command_list.Close()?;
+        }
+        let command_allocators = create_command_allocators(&self.device)?;
+        let command_list =
+            create_closed_command_list(&self.device, &command_allocators[0], &self.pipeline_state)?;
+        self.command_allocators = command_allocators;
+        self.command_list = command_list;
+        let old_render_targets =
+            std::mem::replace(&mut self.render_targets, std::array::from_fn(|_| None));
+        drop(old_render_targets);
+        let old_rtv_heap =
+            std::mem::replace(&mut self.rtv_heap, create_empty_rtv_heap(&self.device)?);
+        drop(old_rtv_heap);
+        self.frame_latency_waitable_object = Owned::default();
+
+        let mut resize_flags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
+        if self.allow_tearing {
+            resize_flags |= DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
+        }
+        unsafe {
+            self.swap_chain.ResizeBuffers(
+                FRAME_COUNT as u32,
+                self.width,
+                self.height,
+                DXGI_FORMAT_B8G8R8A8_UNORM,
+                resize_flags,
+            )?
+        };
+        self.frame_latency_waitable_object =
+            unsafe { Owned::new(self.swap_chain.GetFrameLatencyWaitableObject()) };
+        unsafe { self.swap_chain.SetMaximumFrameLatency(1)? };
+
+        let (rtv_heap, rtv_descriptor_size, render_targets) =
+            create_render_targets(&self.device, &self.swap_chain)?;
+        self.rtv_heap = rtv_heap;
+        self.rtv_descriptor_size = rtv_descriptor_size;
+        self.render_targets = render_targets.map(Some);
+        self.frame_fence_values = [0; FRAME_COUNT];
         Ok(())
     }
 
@@ -1390,7 +1463,7 @@ impl D3d12PanelRenderer {
         let frame_index = unsafe { self.swap_chain.GetCurrentBackBufferIndex() as usize };
         self.wait_for_frame(frame_index)?;
 
-        let view_state = self.late_latched_cursor_latency_view_state(cursor_latency.behavior)?;
+        let view_state = self.late_latched_cursor_latency_view_state()?;
         let scene = windows_scene::build_cursor_latency_playground_render_scene(
             frame.layout,
             frame.window_chrome_buttons_state,
@@ -1412,25 +1485,9 @@ impl D3d12PanelRenderer {
         self.execute_prepared_frame_for_slot(vertex_count, frame_index)
     }
 
-    fn late_latched_cursor_latency_view_state(
-        &mut self,
-        behavior: CursorLatencyBehavior,
-    ) -> eyre::Result<CursorLatencyPlaygroundViewState> {
+    fn late_latched_cursor_latency_view_state(&mut self) -> eyre::Result<CursorLatencyPlaygroundViewState> {
         let sampled_cursor = self.sample_cursor_latency_position()?;
-        if let Some(point) = sampled_cursor {
-            self.cursor_latency_samples.push_back(point);
-            while self.cursor_latency_samples.len() > CURSOR_LATENCY_HISTORY_SIZE {
-                self.cursor_latency_samples.pop_front();
-            }
-        } else {
-            self.cursor_latency_samples.clear();
-        }
-
-        Ok(cursor_latency_view_state_from_samples(
-            behavior,
-            &self.cursor_latency_samples,
-            sampled_cursor,
-        ))
+        Ok(cursor_latency_view_state_from_sample(sampled_cursor))
     }
 
     fn sample_cursor_latency_position(&self) -> eyre::Result<Option<ClientPoint>> {
@@ -2030,49 +2087,13 @@ fn build_scene_vertices_with_assets(
     vertices
 }
 
-fn cursor_latency_view_state_from_samples(
-    behavior: CursorLatencyBehavior,
-    samples: &VecDeque<ClientPoint>,
+fn cursor_latency_view_state_from_sample(
     sampled_cursor: Option<ClientPoint>,
 ) -> CursorLatencyPlaygroundViewState {
-    let fastest_cursor_position = sampled_cursor;
-    let match_os_cursor_position = if samples.len() >= 2 {
-        samples.get(samples.len() - 2).copied()
-    } else {
-        sampled_cursor
-    };
-    let rendered_cursor_position = match behavior {
-        CursorLatencyBehavior::Fastest => fastest_cursor_position,
-        CursorLatencyBehavior::MatchOs => match_os_cursor_position,
-    };
-    let lead_pixels = fastest_cursor_position
-        .zip(match_os_cursor_position)
-        .map_or(0, |(fastest, matched)| cursor_latency_distance_pixels(fastest, matched));
-
     CursorLatencyPlaygroundViewState {
-        behavior,
         os_cursor_position: sampled_cursor,
-        rendered_cursor_position,
-        fastest_cursor_position,
-        match_os_cursor_position,
-        trail_points: samples.iter().copied().collect(),
-        lead_pixels,
-        sample_count: samples.len(),
+        rendered_cursor_position: sampled_cursor,
     }
-}
-
-fn cursor_latency_distance_pixels(left: ClientPoint, right: ClientPoint) -> i32 {
-    let left = left
-        .to_win32_point()
-        .expect("client points built from pixels must convert back to pixels");
-    let right = right
-        .to_win32_point()
-        .expect("client points built from pixels must convert back to pixels");
-    let delta_x = right.x - left.x;
-    let delta_y = right.y - left.y;
-    (f64::from(delta_x * delta_x + delta_y * delta_y)
-        .sqrt()
-        .round()) as i32
 }
 
 fn can_reuse_cached_scene_vertices(
@@ -7298,7 +7319,7 @@ mod tests {
         WindowChromeButtonsState, append_rect, append_slug_band_data, build_panel_scene,
         build_shader_params, can_reuse_cached_scene_vertices, collect_scene_chars,
         compile_embedded_shaders, composition_swap_chain_description,
-        cursor_latency_view_state_from_samples, cpu_slug_coverage,
+        cursor_latency_view_state_from_sample, cpu_slug_coverage,
         cpu_slug_coverage_all_curves, dirty_fragment_ranges, extract_glyph_curves,
         fragment_ranges_match, fragment_vertex_ranges, load_snapshot_glyph, load_terminal_font,
         preferred_title_bar_color, push_centered_text, push_glyph, push_overlay_panel, push_panel,
@@ -7312,12 +7333,10 @@ mod tests {
         build_reference_zero_angle_transformed_text_layout,
     };
     use crate::app::spatial::{ClientPoint, ClientRect};
-    use crate::app::windows_scene::CursorLatencyBehavior;
     use crate::app::windows_terminal::TerminalDisplayScrollbar;
     use crate::app::windows_terminal::TerminalLayout;
     use eyre::WrapErr;
     use image::RgbaImage;
-    use std::collections::VecDeque;
     use ttf_parser::{Face, OutlineBuilder};
     use windows::Win32::Foundation::RECT;
     use windows::Win32::Graphics::Dxgi::Common::DXGI_ALPHA_MODE_PREMULTIPLIED;
@@ -7356,34 +7375,11 @@ mod tests {
     }
 
     #[test]
-    fn cursor_latency_fastest_uses_latest_latched_sample() {
-        let samples = VecDeque::from([ClientPoint::new(100, 200), ClientPoint::new(120, 212)]);
+    fn cursor_latency_uses_latest_latched_sample() {
+        let view_state = cursor_latency_view_state_from_sample(Some(ClientPoint::new(120, 212)));
 
-        let view_state = cursor_latency_view_state_from_samples(
-            CursorLatencyBehavior::Fastest,
-            &samples,
-            Some(ClientPoint::new(120, 212)),
-        );
-
-        assert_eq!(view_state.fastest_cursor_position, Some(ClientPoint::new(120, 212)));
-        assert_eq!(view_state.match_os_cursor_position, Some(ClientPoint::new(100, 200)));
+        assert_eq!(view_state.os_cursor_position, Some(ClientPoint::new(120, 212)));
         assert_eq!(view_state.rendered_cursor_position, Some(ClientPoint::new(120, 212)));
-    }
-
-    #[test]
-    fn cursor_latency_match_os_uses_previous_latched_sample() {
-        let samples = VecDeque::from([ClientPoint::new(100, 200), ClientPoint::new(120, 212)]);
-
-        let view_state = cursor_latency_view_state_from_samples(
-            CursorLatencyBehavior::MatchOs,
-            &samples,
-            Some(ClientPoint::new(120, 212)),
-        );
-
-        assert_eq!(view_state.fastest_cursor_position, Some(ClientPoint::new(120, 212)));
-        assert_eq!(view_state.match_os_cursor_position, Some(ClientPoint::new(100, 200)));
-        assert_eq!(view_state.rendered_cursor_position, Some(ClientPoint::new(100, 200)));
-        assert!(view_state.lead_pixels > 0);
     }
 
     #[test]
