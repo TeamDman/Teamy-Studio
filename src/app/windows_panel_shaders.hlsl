@@ -29,6 +29,7 @@ struct PsInput {
 Buffer<float4> CurveData : register(t0);
 Buffer<uint> BandData : register(t1);
 Buffer<uint> SpriteAtlasData : register(t2);
+Buffer<float4> TransformedGlyphInverseData : register(t3);
 
 cbuffer ParamStruct : register(b0)
 {
@@ -101,11 +102,13 @@ bool is_finite_float2(float2 value) {
     return all(isfinite(value));
 }
 
-bool try_reconstruct_transformed_local_point(float2 screenPoint, out float2 localPoint) {
-    float4 row0 = transformed_text_inverse_homography[0];
-    float4 row1 = transformed_text_inverse_homography[1];
+bool try_reconstruct_transformed_local_point(float2 screenPoint, float debugId, out float2 localPoint) {
+    uint glyphIndex = (uint)max(debugId - 1.0, 0.0);
+    uint coefficientIndex = glyphIndex * 2U;
+    float4 row0 = TransformedGlyphInverseData[coefficientIndex];
+    float4 row1 = TransformedGlyphInverseData[coefficientIndex + 1U];
     float denominator = (row0.w * screenPoint.x) + (row1.w * screenPoint.y) + 1.0;
-    if (!isfinite(denominator) || abs(denominator) <= (1.0 / 65536.0)) {
+    if (!isfinite(denominator) || abs(denominator) <= (1.0 / 16777216.0)) {
         localPoint = 0.0.xx;
         return false;
     }
@@ -125,12 +128,21 @@ float remap_range(float value, float sourceMin, float sourceMax, float targetMin
 
 bool try_reconstruct_transformed_render_coord(
     float2 screenPoint,
+    float debugId,
     float4 localBounds,
     float4 uvBounds,
     out float2 renderCoord
 ) {
     float2 localPoint;
-    if (!try_reconstruct_transformed_local_point(screenPoint, localPoint)) {
+    if (!try_reconstruct_transformed_local_point(screenPoint, debugId, localPoint)) {
+        renderCoord = 0.0.xx;
+        return false;
+    }
+
+    if (localPoint.x < localBounds.x
+        || localPoint.x > localBounds.y
+        || localPoint.y < localBounds.z
+        || localPoint.y > localBounds.w) {
         renderCoord = 0.0.xx;
         return false;
     }
@@ -140,6 +152,41 @@ bool try_reconstruct_transformed_render_coord(
         remap_range(localPoint.y, localBounds.z, localBounds.w, uvBounds.z, uvBounds.w)
     );
     return is_finite_float2(renderCoord);
+}
+
+bool try_reconstruct_neighbor_render_coord(
+    float2 screenPoint,
+    float2 offset,
+    float debugId,
+    float4 localBounds,
+    float4 uvBounds,
+    float2 centerRenderCoord,
+    out float2 neighborRenderCoord
+) {
+    if (try_reconstruct_transformed_render_coord(
+            screenPoint + offset,
+            debugId,
+            localBounds,
+            uvBounds,
+            neighborRenderCoord
+        )) {
+        return true;
+    }
+
+    float2 oppositeRenderCoord;
+    if (try_reconstruct_transformed_render_coord(
+            screenPoint - offset,
+            debugId,
+            localBounds,
+            uvBounds,
+            oppositeRenderCoord
+        )) {
+        neighborRenderCoord = centerRenderCoord + (centerRenderCoord - oppositeRenderCoord);
+        return is_finite_float2(neighborRenderCoord);
+    }
+
+    neighborRenderCoord = centerRenderCoord;
+    return false;
 }
 
 float2 SlugDilate(float2 position, float2 texcoord, float2 normal, float4 jacobian, out float2 sampleCoord) {
@@ -443,23 +490,79 @@ float slug_coverage_single_sample(float2 renderCoord, float bandStartFloat, floa
     );
 }
 
-float slug_coverage_transformed(float2 renderCoord, float bandStartFloat, float4 glyphData, float4 banding) {
-    if (!is_finite_float2(renderCoord)) {
+float slug_coverage_transformed(
+    float2 screenPoint,
+    float2 renderCoord,
+    float debugId,
+    float4 localBounds,
+    float4 uvBounds,
+    float bandStartFloat,
+    float4 glyphData,
+    float4 banding
+) {
+    if (!is_finite_float2(renderCoord) || !is_finite_float2(screenPoint)) {
         return 0.0;
     }
 
-    float2 renderCoordWidth = fwidth(renderCoord);
-    if (!is_finite_float2(renderCoordWidth)) {
+    float2 renderCoordX1;
+    float2 renderCoordY1;
+    if (!try_reconstruct_neighbor_render_coord(
+            screenPoint,
+            float2(1.0, 0.0),
+            debugId,
+            localBounds,
+            uvBounds,
+            renderCoord,
+            renderCoordX1
+        )
+        || !try_reconstruct_neighbor_render_coord(
+            screenPoint,
+            float2(0.0, 1.0),
+            debugId,
+            localBounds,
+            uvBounds,
+            renderCoord,
+            renderCoordY1
+        )) {
         return 0.0;
     }
 
-    float2 emsPerPixel = max(abs(renderCoordWidth), float2(1.0 / 65536.0, 1.0 / 65536.0));
+    float2 emsPerPixel = float2(
+        abs(renderCoordX1.x - renderCoord.x) + abs(renderCoordY1.x - renderCoord.x),
+        abs(renderCoordX1.y - renderCoord.y) + abs(renderCoordY1.y - renderCoord.y)
+    );
+    emsPerPixel = max(emsPerPixel, float2(1.0 / 65536.0, 1.0 / 65536.0));
+    float2 pixelsPerEm = 1.0 / emsPerPixel;
     float2 sampleStep = emsPerPixel * 0.25;
     float coverage = 0.0;
-    coverage += slug_coverage_single_sample(renderCoord + float2(-sampleStep.x, -sampleStep.y), bandStartFloat, glyphData, banding);
-    coverage += slug_coverage_single_sample(renderCoord + float2(sampleStep.x, -sampleStep.y), bandStartFloat, glyphData, banding);
-    coverage += slug_coverage_single_sample(renderCoord + float2(-sampleStep.x, sampleStep.y), bandStartFloat, glyphData, banding);
-    coverage += slug_coverage_single_sample(renderCoord + float2(sampleStep.x, sampleStep.y), bandStartFloat, glyphData, banding);
+    coverage += slug_coverage_single_sample_with_pixels_per_em(
+        renderCoord + float2(-sampleStep.x, -sampleStep.y),
+        bandStartFloat,
+        glyphData,
+        banding,
+        pixelsPerEm
+    );
+    coverage += slug_coverage_single_sample_with_pixels_per_em(
+        renderCoord + float2(sampleStep.x, -sampleStep.y),
+        bandStartFloat,
+        glyphData,
+        banding,
+        pixelsPerEm
+    );
+    coverage += slug_coverage_single_sample_with_pixels_per_em(
+        renderCoord + float2(-sampleStep.x, sampleStep.y),
+        bandStartFloat,
+        glyphData,
+        banding,
+        pixelsPerEm
+    );
+    coverage += slug_coverage_single_sample_with_pixels_per_em(
+        renderCoord + float2(sampleStep.x, sampleStep.y),
+        bandStartFloat,
+        glyphData,
+        banding,
+        pixelsPerEm
+    );
     return coverage * 0.25;
 }
 
@@ -850,6 +953,7 @@ float4 PSMain(PsInput input) : SV_TARGET {
         if (input.transformedFlag > 0.5) {
             if (!try_reconstruct_transformed_render_coord(
                 input.position.xy,
+                input.debugId,
                 input.localBounds,
                 input.uvBounds,
                 renderCoord
@@ -858,7 +962,16 @@ float4 PSMain(PsInput input) : SV_TARGET {
             }
         }
         float coverage = input.transformedFlag > 0.5
-            ? slug_coverage_transformed(renderCoord, input.glyph, input.glyphData, input.banding)
+            ? slug_coverage_transformed(
+                input.position.xy,
+                renderCoord,
+                input.debugId,
+                input.localBounds,
+                input.uvBounds,
+                input.glyph,
+                input.glyphData,
+                input.banding
+            )
             : slug_coverage(renderCoord, input.glyph, input.glyphData, input.banding);
         float4 shaded = float4(input.color.rgb, input.color.a * coverage);
         if (scene_time.y > 0.5) {

@@ -80,6 +80,7 @@ const FALLBACK_GLYPH: char = '?';
 // explorer may require the renderer to grow the backing upload resources.
 const MAX_CURVE_FLOAT4_COUNT: usize = 262_144;
 const MAX_BAND_UINT_COUNT: usize = 1_048_576;
+const MAX_TRANSFORMED_GLYPH_INVERSE_FLOAT4_COUNT: usize = MAX_GLYPH_COUNT * 2;
 const TERMINAL_FONT_FAMILY: &str = "CaskaydiaCove Nerd Font Mono";
 const SLUG_GLYPH_DILATION_PX: f32 = 0.5;
 const SLUG_BAND_SIZE_FONT_UNITS: f32 = 64.0;
@@ -443,6 +444,7 @@ pub struct D3d12PanelRenderer {
     curve_buffer_capacity: usize,
     band_buffer: ID3D12Resource,
     band_buffer_capacity: usize,
+    transformed_glyph_inverse_buffer: ID3D12Resource,
     _sprite_buffer: ID3D12Resource,
     sprite_atlas: Arc<SpriteAtlas>,
     font: Arc<LoadedTerminalFont>,
@@ -841,7 +843,7 @@ impl D3d12PanelRenderer {
                 .in_scope(|| create_render_targets(&device, &swap_chain))?;
         let command_allocators = info_span!("create_command_allocators")
             .in_scope(|| create_command_allocators(&device))?;
-        let (srv_heap, curve_buffer, band_buffer, sprite_buffer, sprite_atlas) =
+        let (srv_heap, curve_buffer, band_buffer, transformed_glyph_inverse_buffer, sprite_buffer, sprite_atlas) =
             info_span!("create_shader_resources_and_srv")
                 .in_scope(|| create_shader_resources_and_srv(&device, Arc::clone(&sprite_atlas)))?;
         let root_signature =
@@ -919,6 +921,7 @@ impl D3d12PanelRenderer {
             curve_buffer_capacity: MAX_CURVE_FLOAT4_COUNT,
             band_buffer,
             band_buffer_capacity: MAX_BAND_UINT_COUNT,
+            transformed_glyph_inverse_buffer,
             _sprite_buffer: sprite_buffer,
             sprite_atlas,
             font,
@@ -1120,6 +1123,7 @@ impl D3d12PanelRenderer {
             let _span = debug_span!("update_scene_vertices").entered();
             self.update_scene_vertices_for_fragments(scenes)?
         };
+        upload_transformed_glyph_inverse_data(&self.transformed_glyph_inverse_buffer, scenes)?;
         self.execute_prepared_frame(vertex_count)
     }
 
@@ -1157,6 +1161,7 @@ impl D3d12PanelRenderer {
                 self.cached_fragment_vertices(scene, false, &mut scene_cache.scene_vertices)
             };
             let vertex_count = self.upload_cached_fragment_vertices(&[scene_vertices])?;
+            upload_transformed_glyph_inverse_data(&self.transformed_glyph_inverse_buffer, &[scene])?;
             scene_cache.last_frame = Some(frame.clone());
             return self.execute_prepared_frame(vertex_count);
         }
@@ -1564,7 +1569,7 @@ impl D3d12PanelRenderer {
         let next_band_capacity = required_band_capacity
             .max(self.band_buffer_capacity.saturating_mul(2))
             .max(MAX_BAND_UINT_COUNT);
-        let (srv_heap, curve_buffer, band_buffer, sprite_buffer, sprite_atlas) =
+        let (srv_heap, curve_buffer, band_buffer, transformed_glyph_inverse_buffer, sprite_buffer, sprite_atlas) =
             create_shader_resources_and_srv_with_capacities(
                 &self.device,
                 Arc::clone(&self.sprite_atlas),
@@ -1583,6 +1588,7 @@ impl D3d12PanelRenderer {
         self.curve_buffer_capacity = next_curve_capacity;
         self.band_buffer = band_buffer;
         self.band_buffer_capacity = next_band_capacity;
+        self.transformed_glyph_inverse_buffer = transformed_glyph_inverse_buffer;
         self._sprite_buffer = sprite_buffer;
         self.sprite_atlas = sprite_atlas;
         Ok(())
@@ -3158,7 +3164,7 @@ pub fn render_frame_model_offscreen_image(
     );
     let curve_capacity = curve_data.len().max(MAX_CURVE_FLOAT4_COUNT);
     let band_capacity = band_data.len().max(MAX_BAND_UINT_COUNT);
-    let (srv_heap, curve_buffer, band_buffer, _sprite_buffer, sprite_atlas) =
+    let (srv_heap, curve_buffer, band_buffer, transformed_glyph_inverse_buffer, _sprite_buffer, sprite_atlas) =
         create_shader_resources_and_srv_with_capacities(
             &device,
             sprite_atlas,
@@ -3179,6 +3185,7 @@ pub fn render_frame_model_offscreen_image(
     info!(vertex_count, "uploaded offscreen vertices");
     upload_curve_data(&curve_buffer, curve_capacity, &curve_data)?;
     upload_band_data(&band_buffer, band_capacity, &band_data)?;
+    upload_transformed_glyph_inverse_data(&transformed_glyph_inverse_buffer, &scene_refs)?;
     upload_offscreen_shader_params(&shader_param_buffer, width, height, &sprite_atlas, &scene_refs)?;
     info!("uploaded offscreen shader data");
 
@@ -3508,6 +3515,52 @@ fn upload_band_data(
         std::ptr::write_bytes(mapped, 0, band_capacity * std::mem::size_of::<u32>());
         std::ptr::copy_nonoverlapping(band_data.as_ptr(), mapped as *mut u32, band_data.len());
         band_buffer.Unmap(0, None);
+    }
+    Ok(())
+}
+
+fn build_transformed_glyph_inverse_data(scenes: &[&RenderScene]) -> Vec<[f32; 4]> {
+    let mut inverse_data = vec![[0.0_f32; 4]; MAX_TRANSFORMED_GLYPH_INVERSE_FLOAT4_COUNT];
+
+    for scene in scenes {
+        for glyph in &scene.transformed_glyphs {
+            let glyph_index = glyph.debug_id.max(1.0) as usize - 1;
+            let coefficient_index = glyph_index.saturating_mul(2);
+            if coefficient_index + 1 >= inverse_data.len() {
+                continue;
+            }
+
+            let local_points = [
+                [glyph.local_bounds[0], glyph.local_bounds[2]],
+                [glyph.local_bounds[1], glyph.local_bounds[2]],
+                [glyph.local_bounds[1], glyph.local_bounds[3]],
+                [glyph.local_bounds[0], glyph.local_bounds[3]],
+            ];
+            let Some(inverse) = solve_inverse_homography(glyph.corners, local_points) else {
+                continue;
+            };
+            inverse_data[coefficient_index] = [inverse[0], inverse[1], inverse[2], inverse[6]];
+            inverse_data[coefficient_index + 1] = [inverse[3], inverse[4], inverse[5], inverse[7]];
+        }
+    }
+
+    inverse_data
+}
+
+fn upload_transformed_glyph_inverse_data(
+    transformed_glyph_inverse_buffer: &ID3D12Resource,
+    scenes: &[&RenderScene],
+) -> eyre::Result<()> {
+    let inverse_data = build_transformed_glyph_inverse_data(scenes);
+    unsafe {
+        let mut mapped = std::ptr::null_mut();
+        transformed_glyph_inverse_buffer.Map(0, None, Some(&mut mapped))?;
+        std::ptr::copy_nonoverlapping(
+            inverse_data.as_ptr(),
+            mapped as *mut [f32; 4],
+            inverse_data.len(),
+        );
+        transformed_glyph_inverse_buffer.Unmap(0, None);
     }
     Ok(())
 }
@@ -5047,7 +5100,7 @@ fn create_empty_rtv_heap(device: &ID3D12Device) -> eyre::Result<ID3D12Descriptor
 fn create_root_signature(device: &ID3D12Device) -> eyre::Result<ID3D12RootSignature> {
     let descriptor_ranges = [D3D12_DESCRIPTOR_RANGE {
         RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
-        NumDescriptors: 3,
+        NumDescriptors: 4,
         BaseShaderRegister: 0,
         RegisterSpace: 0,
         OffsetInDescriptorsFromTableStart: D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND,
@@ -6174,6 +6227,7 @@ fn create_shader_resources_and_srv(
     ID3D12Resource,
     ID3D12Resource,
     ID3D12Resource,
+    ID3D12Resource,
     Arc<SpriteAtlas>,
 )> {
     create_shader_resources_and_srv_with_capacities(
@@ -6194,12 +6248,16 @@ fn create_shader_resources_and_srv_with_capacities(
     ID3D12Resource,
     ID3D12Resource,
     ID3D12Resource,
+    ID3D12Resource,
     Arc<SpriteAtlas>,
 )> {
     let curve_data = vec![[0.0_f32; 4]; curve_capacity];
     let byte_len = (curve_data.len() * std::mem::size_of::<[f32; 4]>()) as u64;
     let band_data = vec![0_u32; band_capacity];
     let band_byte_len = (band_data.len() * std::mem::size_of::<u32>()) as u64;
+    let transformed_glyph_inverse_data = vec![[0.0_f32; 4]; MAX_TRANSFORMED_GLYPH_INVERSE_FLOAT4_COUNT];
+    let transformed_glyph_inverse_byte_len =
+        (transformed_glyph_inverse_data.len() * std::mem::size_of::<[f32; 4]>()) as u64;
     let sprite_byte_len = (sprite_atlas.pixels.len() * std::mem::size_of::<u32>()) as u64;
 
     let mut curve_buffer = None;
@@ -6258,6 +6316,35 @@ fn create_shader_resources_and_srv_with_capacities(
     };
     let band_buffer: ID3D12Resource = band_buffer.expect("band buffer should be initialized");
 
+    let mut transformed_glyph_inverse_buffer = None;
+    unsafe {
+        device.CreateCommittedResource(
+            &D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_UPLOAD,
+                ..Default::default()
+            },
+            D3D12_HEAP_FLAG_NONE,
+            &D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: transformed_glyph_inverse_byte_len,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                ..Default::default()
+            },
+            D3D12_RESOURCE_STATE_GENERIC_READ,
+            None,
+            &mut transformed_glyph_inverse_buffer,
+        )?
+    };
+    let transformed_glyph_inverse_buffer: ID3D12Resource =
+        transformed_glyph_inverse_buffer.expect("transformed glyph inverse buffer should be initialized");
+
     let mut sprite_buffer = None;
     unsafe {
         device.CreateCommittedResource(
@@ -6302,6 +6389,15 @@ fn create_shader_resources_and_srv_with_capacities(
         std::ptr::copy_nonoverlapping(band_data.as_ptr(), band_mapped as *mut u32, band_data.len());
         band_buffer.Unmap(0, None);
 
+        let mut transformed_mapped = std::ptr::null_mut();
+        transformed_glyph_inverse_buffer.Map(0, None, Some(&mut transformed_mapped))?;
+        std::ptr::copy_nonoverlapping(
+            transformed_glyph_inverse_data.as_ptr(),
+            transformed_mapped as *mut [f32; 4],
+            transformed_glyph_inverse_data.len(),
+        );
+        transformed_glyph_inverse_buffer.Unmap(0, None);
+
         let mut sprite_mapped = std::ptr::null_mut();
         sprite_buffer.Map(0, None, Some(&mut sprite_mapped))?;
         std::ptr::copy_nonoverlapping(
@@ -6315,7 +6411,7 @@ fn create_shader_resources_and_srv_with_capacities(
     let srv_heap: ID3D12DescriptorHeap = unsafe {
         device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
             Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-            NumDescriptors: 3,
+            NumDescriptors: 4,
             Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
             ..Default::default()
         })?
@@ -6366,6 +6462,20 @@ fn create_shader_resources_and_srv_with_capacities(
         },
     };
 
+    let transformed_glyph_inverse_desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+        Format: DXGI_FORMAT_R32G32B32A32_FLOAT,
+        ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+        Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+        Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+            Buffer: D3D12_BUFFER_SRV {
+                FirstElement: 0,
+                NumElements: transformed_glyph_inverse_data.len() as u32,
+                StructureByteStride: 0,
+                Flags: D3D12_BUFFER_SRV_FLAG_NONE,
+            },
+        },
+    };
+
     unsafe {
         let heap_start = srv_heap.GetCPUDescriptorHandleForHeapStart();
         device.CreateShaderResourceView(&curve_buffer, Some(&curve_desc), heap_start);
@@ -6383,12 +6493,20 @@ fn create_shader_resources_and_srv_with_capacities(
                 ptr: heap_start.ptr + (descriptor_size * 2),
             },
         );
+        device.CreateShaderResourceView(
+            &transformed_glyph_inverse_buffer,
+            Some(&transformed_glyph_inverse_desc),
+            D3D12_CPU_DESCRIPTOR_HANDLE {
+                ptr: heap_start.ptr + (descriptor_size * 3),
+            },
+        );
     }
 
     Ok((
         srv_heap,
         curve_buffer,
         band_buffer,
+        transformed_glyph_inverse_buffer,
         sprite_buffer,
         sprite_atlas,
     ))
@@ -6985,6 +7103,61 @@ mod tests {
             mismatch_count,
             0,
             "rotated transformed text should match the CPU glyph reference; mismatched pixels={mismatch_count}; {mismatch_summary}"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn strong_yaw_zoomed_transformed_text_matches_cpu_glyph_reference() -> eyre::Result<()> {
+        const STRONG_YAW_TOLERANCE: u8 = 2;
+        const STRONG_YAW_MAX_MISMATCH_PIXELS: usize = 16;
+
+        let reference_layout = crate::app::render_verification::build_reference_text_layout_with_config(
+            TerminalLayout {
+                client_width: 1040,
+                client_height: 680,
+                cell_width: 8,
+                cell_height: 16,
+                diagnostic_panel_visible: false,
+            },
+            "Lorem ipsum dolor sit amet, consectetur adipiscing elit.\nSed do eiusmod tempor incididunt ut labore et dolore magna aliqua.",
+            320.0,
+            -1.1,
+            0.0,
+        );
+        let reference = render_reference_text_layout_cpu(&reference_layout)?;
+        let transformed = render_frame_model_offscreen_image(&reference_layout.frame())?;
+
+        assert_eq!(reference.dimensions(), transformed.dimensions());
+
+        let mut mismatch_count = 0_usize;
+        let mut first_mismatch = None;
+        for y in 0..reference.height() {
+            for x in 0..reference.width() {
+                let left = reference.get_pixel(x, y);
+                let right = transformed.get_pixel(x, y);
+                if rgba_matches_with_tolerance(*left, *right, STRONG_YAW_TOLERANCE) {
+                    continue;
+                }
+                mismatch_count += 1;
+                first_mismatch.get_or_insert((x, y, *left, *right));
+            }
+        }
+
+        let mismatch_summary = first_mismatch.map_or_else(
+            || "no mismatches".to_owned(),
+            |(x, y, left, right)| {
+                format!(
+                    "first mismatch at ({x}, {y}): plain={:?} transformed={:?}",
+                    left.0, right.0
+                )
+            },
+        );
+
+        assert!(
+            mismatch_count <= STRONG_YAW_MAX_MISMATCH_PIXELS,
+            "strong-yaw zoomed transformed text should stay close to the CPU glyph reference; mismatched pixels={mismatch_count}; {mismatch_summary}"
         );
 
         Ok(())

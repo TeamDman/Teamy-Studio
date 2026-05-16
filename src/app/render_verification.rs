@@ -987,7 +987,7 @@ pub(crate) fn build_driver_crash_repro_transformed_text_frame() -> RenderFrameMo
     .frame()
 }
 
-fn build_reference_text_layout_with_config(
+pub(crate) fn build_reference_text_layout_with_config(
     layout: windows_terminal::TerminalLayout,
     text: &str,
     font_size_px: f32,
