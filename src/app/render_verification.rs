@@ -914,6 +914,11 @@ pub(crate) fn build_reference_transformed_text_frame() -> RenderFrameModel {
 }
 
 #[cfg(test)]
+pub(crate) fn build_reference_transformed_text_layout() -> ReferenceTextLayout {
+    build_reference_text_layout(REFERENCE_TEXT_YAW_RADIANS, REFERENCE_TEXT_PITCH_RADIANS)
+}
+
+#[cfg(test)]
 pub(crate) fn build_reference_zero_angle_transformed_text_layout() -> ReferenceTextLayout {
     build_reference_text_layout(0.0, 0.0)
 }

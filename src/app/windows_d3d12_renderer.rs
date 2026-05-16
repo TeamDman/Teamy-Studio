@@ -6948,6 +6948,49 @@ mod tests {
     }
 
     #[test]
+    fn rotated_transformed_text_matches_cpu_glyph_reference() -> eyre::Result<()> {
+        let reference_layout = crate::app::render_verification::build_reference_transformed_text_layout();
+        let reference = render_reference_text_layout_cpu(&reference_layout)?;
+        let transformed = render_frame_model_offscreen_image(
+            &build_reference_transformed_text_frame(),
+        )?;
+
+        assert_eq!(reference.dimensions(), transformed.dimensions());
+
+        let mut mismatch_count = 0_usize;
+        let mut first_mismatch = None;
+        for y in 0..reference.height() {
+            for x in 0..reference.width() {
+                let left = reference.get_pixel(x, y);
+                let right = transformed.get_pixel(x, y);
+                if rgba_matches_with_tolerance(*left, *right, 1) {
+                    continue;
+                }
+                mismatch_count += 1;
+                first_mismatch.get_or_insert((x, y, *left, *right));
+            }
+        }
+
+        let mismatch_summary = first_mismatch.map_or_else(
+            || "no mismatches".to_owned(),
+            |(x, y, left, right)| {
+                format!(
+                    "first mismatch at ({x}, {y}): plain={:?} transformed={:?}",
+                    left.0, right.0
+                )
+            },
+        );
+
+        assert_eq!(
+            mismatch_count,
+            0,
+            "rotated transformed text should match the CPU glyph reference; mismatched pixels={mismatch_count}; {mismatch_summary}"
+        );
+
+        Ok(())
+    }
+
+    #[test]
     fn near_identity_transformed_text_offscreen_render_completes() -> eyre::Result<()> {
         let image = render_frame_model_offscreen_image(
             &build_driver_crash_repro_transformed_text_frame(),

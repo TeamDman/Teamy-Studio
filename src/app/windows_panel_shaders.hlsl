@@ -123,6 +123,25 @@ float remap_range(float value, float sourceMin, float sourceMax, float targetMin
     return targetMin + ((targetMax - targetMin) * t);
 }
 
+bool try_reconstruct_transformed_render_coord(
+    float2 screenPoint,
+    float4 localBounds,
+    float4 uvBounds,
+    out float2 renderCoord
+) {
+    float2 localPoint;
+    if (!try_reconstruct_transformed_local_point(screenPoint, localPoint)) {
+        renderCoord = 0.0.xx;
+        return false;
+    }
+
+    renderCoord = float2(
+        remap_range(localPoint.x, localBounds.x, localBounds.y, uvBounds.x, uvBounds.y),
+        remap_range(localPoint.y, localBounds.z, localBounds.w, uvBounds.z, uvBounds.w)
+    );
+    return is_finite_float2(renderCoord);
+}
+
 float2 SlugDilate(float2 position, float2 texcoord, float2 normal, float4 jacobian, out float2 sampleCoord) {
     float2 n = normalize(normal);
     float s = dot(slug_matrix[3].xy, position) + slug_matrix[3].w;
@@ -429,13 +448,19 @@ float slug_coverage_transformed(float2 renderCoord, float bandStartFloat, float4
         return 0.0;
     }
 
-    return slug_coverage_single_sample_with_pixels_per_em(
-        renderCoord,
-        bandStartFloat,
-        glyphData,
-        banding,
-        float2(1.0, 1.0)
-    );
+    float2 renderCoordWidth = fwidth(renderCoord);
+    if (!is_finite_float2(renderCoordWidth)) {
+        return 0.0;
+    }
+
+    float2 emsPerPixel = max(abs(renderCoordWidth), float2(1.0 / 65536.0, 1.0 / 65536.0));
+    float2 sampleStep = emsPerPixel * 0.25;
+    float coverage = 0.0;
+    coverage += slug_coverage_single_sample(renderCoord + float2(-sampleStep.x, -sampleStep.y), bandStartFloat, glyphData, banding);
+    coverage += slug_coverage_single_sample(renderCoord + float2(sampleStep.x, -sampleStep.y), bandStartFloat, glyphData, banding);
+    coverage += slug_coverage_single_sample(renderCoord + float2(-sampleStep.x, sampleStep.y), bandStartFloat, glyphData, banding);
+    coverage += slug_coverage_single_sample(renderCoord + float2(sampleStep.x, sampleStep.y), bandStartFloat, glyphData, banding);
+    return coverage * 0.25;
 }
 
 float slug_coverage(float2 renderCoord, float bandStartFloat, float4 glyphData, float4 banding) {
@@ -823,7 +848,12 @@ float4 PSMain(PsInput input) : SV_TARGET {
         }
         float2 renderCoord = input.uv;
         if (input.transformedFlag > 0.5) {
-            if (!is_finite_float2(renderCoord)) {
+            if (!try_reconstruct_transformed_render_coord(
+                input.position.xy,
+                input.localBounds,
+                input.uvBounds,
+                renderCoord
+            )) {
                 discard;
             }
         }
