@@ -4235,6 +4235,14 @@ fn sgr_mouse_wheel_sequence(cell: TerminalCellPoint, scroll_up: bool) -> String 
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::float_cmp,
+    reason = "terminal color tests pin exact RGBA outputs from deterministic palette conversions"
+)]
+#[expect(
+    clippy::default_trait_access,
+    reason = "test fixtures use Default::default in struct literals for brevity"
+)]
 mod tests {
     use super::{
         MIN_TERMINAL_PANEL_HEIGHT, PendingWin32CharKey, PromptInputState, SemanticPromptTracking,

@@ -4711,6 +4711,22 @@ fn unknown_model_error(model_name: &str) -> eyre::Report {
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::assertions_on_result_states,
+    reason = "image-model tests intentionally assert only the success state for validation helpers"
+)]
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "probe-model tests generate bounded synthetic float inputs from small integer ranges"
+)]
+#[expect(
+    clippy::default_trait_access,
+    reason = "device fixtures use Default::default for concise test setup"
+)]
+#[expect(
+    clippy::uninlined_format_args,
+    reason = "the skip message is kept literal-first to match the surrounding test output style"
+)]
 mod tests {
     use super::*;
 

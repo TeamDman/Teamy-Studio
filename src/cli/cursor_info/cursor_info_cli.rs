@@ -93,6 +93,10 @@ impl CursorInfoArgs {
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::default_trait_access,
+    reason = "CLI parser tests use Default::default in expected-value literals for brevity"
+)]
 mod tests {
     use crate::cli::cursor_info::CursorInfoArgs;
     use crate::cli::{Cli, Command};

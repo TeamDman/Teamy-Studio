@@ -1446,6 +1446,10 @@ fn hashed_non_zero_id(value: impl Hash, salt: u64) -> NonZeroU64 {
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::float_cmp,
+    reason = "timeline viewport tests pin exact duration-per-pixel values after inverse zoom operations"
+)]
 mod tests {
     use super::*;
     use tempfile::tempdir;

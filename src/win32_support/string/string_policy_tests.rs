@@ -54,12 +54,11 @@ fn win32_string_policy_disallows_manual_wide_string_patterns() {
         }
     });
 
-    if !violations.is_empty() {
-        panic!(
-            "manual Win32 string conversion escaped the helper layer:\n{}",
-            violations.join("\n")
-        );
-    }
+    assert!(
+        violations.is_empty(),
+        "manual Win32 string conversion escaped the helper layer:\n{}",
+        violations.join("\n")
+    );
 }
 
 fn collect_rust_files(root: &Path, visit: &mut impl FnMut(&Path)) {

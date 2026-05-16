@@ -31,8 +31,6 @@ const REFERENCE_TEXT_FONT_SIZE_PX: f32 = 168.0;
 const DENSE_HAVOC_FONT_SIZE_PX: f32 = 208.0;
 #[cfg(test)]
 const DRIVER_CRASH_REPRO_FONT_SIZE_PX: f32 = 9.8;
-const REFERENCE_TEXT_CAMERA_DISTANCE: f32 = 1400.0;
-const REFERENCE_TEXT_NEAR_PLANE_DISTANCE: f32 = 80.0;
 const REFERENCE_TEXT_COLOR: [f32; 4] = [1.0, 1.0, 1.0, 1.0];
 const REFERENCE_TEXT_BACKGROUND: [f32; 4] = [0.0, 0.0, 0.0, 1.0];
 const REFERENCE_TEXT_YAW_RADIANS: f32 = -0.52;
@@ -59,6 +57,8 @@ struct BuiltInRenderFixture {
     description: &'static str,
     build_frame: fn() -> RenderFrameModel,
 }
+
+type RenderFixturePhase = (&'static str, fn() -> RenderFrameModel);
 
 const BUILT_IN_RENDER_FIXTURES: &[BuiltInRenderFixture] = &[
     BuiltInRenderFixture {
@@ -95,6 +95,10 @@ pub struct RenderOffscreenFixtureListReport {
 }
 
 #[derive(Debug, Facet)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "the self-test report mirrors independent verification outcomes for CLI consumers"
+)]
 pub struct RenderOffscreenSelfTestReport {
     fixture: String,
     backend: String,
@@ -258,12 +262,16 @@ pub fn run_render_offscreen_fixture(
     Ok(report)
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "the diagnostic render loop keeps each failure path adjacent to the phase that produced it"
+)]
 fn run_induce_havoc_render_fixture(
     artifact_output: Option<&Path>,
 ) -> eyre::Result<RenderOffscreenSelfTestReport> {
     let iterations = induce_havoc_iteration_count();
     let profile = induce_havoc_profile();
-    let phases: Vec<(&str, fn() -> RenderFrameModel)> = match profile {
+    let phases: Vec<RenderFixturePhase> = match profile {
         InduceHavocProfile::Standard => vec![
             (
                 DEFAULT_RENDER_FIXTURE_ID,
@@ -309,13 +317,14 @@ fn run_induce_havoc_render_fixture(
             let scene_snapshot = windows_d3d12_renderer::render_frame_model_scene_snapshot(&frame);
             let image = windows_d3d12_renderer::render_frame_model_offscreen_image(&frame)
                 .wrap_err_with(|| {
-                    let scene_artifact_path = artifact_output
-                        .map(default_scene_snapshot_path_from_artifact)
-                        .unwrap_or_else(|| {
+                    let scene_artifact_path = artifact_output.map_or_else(
+                        || {
                             default_actual_scene_snapshot_artifact_path(
                                 INDUCE_HAVOC_RENDER_FIXTURE_ID,
                             )
-                        });
+                        },
+                        default_scene_snapshot_path_from_artifact,
+                    );
                     let _ = write_scene_snapshot_artifact(
                         INDUCE_HAVOC_RENDER_FIXTURE_ID,
                         Some(&scene_artifact_path),
@@ -505,12 +514,12 @@ fn write_failed_render_artifacts(
     image: &RgbaImage,
     scene_snapshot: &str,
 ) -> eyre::Result<ArtifactWrites> {
-    let actual_artifact_path = artifact_output
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| default_actual_artifact_path(fixture));
-    let actual_scene_snapshot_path = artifact_output
-        .map(default_scene_snapshot_path_from_artifact)
-        .unwrap_or_else(|| default_actual_scene_snapshot_artifact_path(fixture));
+    let actual_artifact_path =
+        artifact_output.map_or_else(|| default_actual_artifact_path(fixture), Path::to_path_buf);
+    let actual_scene_snapshot_path = artifact_output.map_or_else(
+        || default_actual_scene_snapshot_artifact_path(fixture),
+        default_scene_snapshot_path_from_artifact,
+    );
 
     let png = write_png_artifact(fixture, Some(&actual_artifact_path), image)?;
     let scene_snapshot =
@@ -693,8 +702,7 @@ fn induce_havoc_iteration_count() -> usize {
     std::env::var(TEAMY_INDUCE_HAVOC_ITERATIONS_ENV)
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
-        .map(|count| count.clamp(1, 64))
-        .unwrap_or(DEFAULT_INDUCE_HAVOC_ITERATIONS)
+        .map_or(DEFAULT_INDUCE_HAVOC_ITERATIONS, |count| count.clamp(1, 64))
 }
 
 fn expected_image_path(fixture: &str) -> PathBuf {
@@ -929,21 +937,6 @@ pub(crate) fn build_reference_zero_angle_transformed_text_layout() -> ReferenceT
     build_reference_text_layout(0.0, 0.0)
 }
 
-fn build_reference_text_frame(
-    yaw_radians: f32,
-    pitch_radians: f32,
-    transformed: bool,
-) -> RenderFrameModel {
-    let layout = build_reference_text_layout(yaw_radians, pitch_radians);
-    if transformed {
-        layout.frame()
-    } else {
-        panic!(
-            "flat reference text frames are no longer supported; use CPU-composited glyph references in tests"
-        )
-    }
-}
-
 fn build_reference_text_layout(yaw_radians: f32, pitch_radians: f32) -> ReferenceTextLayout {
     build_reference_text_layout_with_config(
         windows_terminal::TerminalLayout {
@@ -1087,46 +1080,6 @@ impl ReferenceTextLayout {
             terminal_visual_state: RendererTerminalVisualState::default(),
         }
     }
-}
-
-fn project_reference_quad(
-    local_corners: [[f32; 2]; 4],
-    center: [f32; 2],
-    yaw_radians: f32,
-    pitch_radians: f32,
-) -> ([[f32; 2]; 4], [f32; 4]) {
-    let mut corners = [[0.0; 2]; 4];
-    let mut corner_w = [0.0; 4];
-    for (index, local_corner) in local_corners.into_iter().enumerate() {
-        let (screen, clip_w) =
-            project_reference_point(local_corner, center, yaw_radians, pitch_radians);
-        corners[index] = screen;
-        corner_w[index] = clip_w;
-    }
-    (corners, corner_w)
-}
-
-fn project_reference_point(
-    local_point: [f32; 2],
-    center: [f32; 2],
-    yaw_radians: f32,
-    pitch_radians: f32,
-) -> ([f32; 2], f32) {
-    let (yaw_sin, yaw_cos) = yaw_radians.sin_cos();
-    let (pitch_sin, pitch_cos) = pitch_radians.sin_cos();
-    let yaw_x = (local_point[0] * yaw_cos) + 0.0 * yaw_sin;
-    let yaw_z = -(local_point[0] * yaw_sin) + 0.0 * yaw_cos;
-    let rotated_y = (local_point[1] * pitch_cos) - (yaw_z * pitch_sin);
-    let rotated_z = (local_point[1] * pitch_sin) + (yaw_z * pitch_cos);
-    let perspective = (1.0 - (rotated_z / REFERENCE_TEXT_CAMERA_DISTANCE))
-        .max(REFERENCE_TEXT_NEAR_PLANE_DISTANCE / REFERENCE_TEXT_CAMERA_DISTANCE);
-    (
-        [
-            center[0] + (yaw_x / perspective),
-            center[1] + (rotated_y / perspective),
-        ],
-        perspective,
-    )
 }
 
 fn build_basic_terminal_frame_fixture() -> RenderFrameModel {

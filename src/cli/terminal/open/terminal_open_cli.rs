@@ -102,6 +102,10 @@ impl TerminalOpenArgs {
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::default_trait_access,
+    reason = "CLI parser tests use Default::default in expected-value literals for brevity"
+)]
 mod tests {
     use crate::cli::terminal::open::{TerminalOpenArgs, TerminalOpenVtEngine};
     use crate::cli::terminal::{TerminalArgs, TerminalCommand};

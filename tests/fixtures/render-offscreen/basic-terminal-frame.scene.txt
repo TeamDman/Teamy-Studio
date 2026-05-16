@@ -1,5 +1,5 @@
 fragment_count=6
-[fragment 0] panels=10 glyphs=9 sprites=0 overlay_panels=0
+[fragment 0] panels=10 glyphs=9 transformed_glyphs=0 sprites=0 overlay_panels=0 overlay_glyphs=0
 panel 0 effect=BlueBackground rect=18,18,1022,662 color=0.165,0.647,0.408,0.500 data=0.000,0.000,0.000,0.000
 panel 1 effect=GardenFrame rect=0,0,1040,680 color=0.780,0.880,0.980,1.000 data=0.017,0.026,0.983,0.974
 panel 2 effect=TitleBar rect=18,18,1022,70 color=0.169,0.169,0.169,1.000 data=0.000,0.000,0.000,0.000
@@ -10,16 +10,16 @@ panel 6 effect=WindowChromeDiagnostics rect=826,23,868,65 color=0.120,0.130,0.17
 panel 7 effect=WindowChromeMinimize rect=874,23,916,65 color=0.120,0.130,0.170,1.000 data=0.000,0.000,0.000,0.000
 panel 8 effect=WindowChromeMaximize rect=922,23,964,65 color=0.120,0.130,0.170,1.000 data=0.000,0.000,0.000,0.000
 panel 9 effect=WindowChromeClose rect=970,23,1012,65 color=0.340,0.120,0.150,1.000 data=0.000,0.000,0.000,0.000
-glyph 0 char=U+0073 literal='s' rect=203,26,257,62 color=0.950,0.950,0.980,1.000
-glyph 1 char=U+0065 literal='e' rect=257,26,311,62 color=0.950,0.950,0.980,1.000
-glyph 2 char=U+006C literal='l' rect=311,26,365,62 color=0.950,0.950,0.980,1.000
-glyph 3 char=U+0066 literal='f' rect=365,26,419,62 color=0.950,0.950,0.980,1.000
-glyph 4 char=U+002D literal='-' rect=419,26,473,62 color=0.950,0.950,0.980,1.000
-glyph 5 char=U+0074 literal='t' rect=473,26,527,62 color=0.950,0.950,0.980,1.000
-glyph 6 char=U+0065 literal='e' rect=527,26,581,62 color=0.950,0.950,0.980,1.000
-glyph 7 char=U+0073 literal='s' rect=581,26,635,62 color=0.950,0.950,0.980,1.000
-glyph 8 char=U+0074 literal='t' rect=635,26,689,62 color=0.950,0.950,0.980,1.000
-[fragment 1] panels=1 glyphs=13 sprites=0 overlay_panels=0
+glyph 0 char=U+0073 literal='s' rect=226,26,280,62 color=0.950,0.950,0.980,1.000
+glyph 1 char=U+0065 literal='e' rect=280,26,334,62 color=0.950,0.950,0.980,1.000
+glyph 2 char=U+006C literal='l' rect=334,26,388,62 color=0.950,0.950,0.980,1.000
+glyph 3 char=U+0066 literal='f' rect=388,26,442,62 color=0.950,0.950,0.980,1.000
+glyph 4 char=U+002D literal='-' rect=442,26,496,62 color=0.950,0.950,0.980,1.000
+glyph 5 char=U+0074 literal='t' rect=496,26,550,62 color=0.950,0.950,0.980,1.000
+glyph 6 char=U+0065 literal='e' rect=550,26,604,62 color=0.950,0.950,0.980,1.000
+glyph 7 char=U+0073 literal='s' rect=604,26,658,62 color=0.950,0.950,0.980,1.000
+glyph 8 char=U+0074 literal='t' rect=658,26,712,62 color=0.950,0.950,0.980,1.000
+[fragment 1] panels=1 glyphs=13 transformed_glyphs=0 sprites=0 overlay_panels=0 overlay_glyphs=0
 panel 0 effect=TerminalFill rect=22,88,30,104 color=0.180,0.180,0.240,1.000 data=0.000,0.000,0.000,0.000
 glyph 0 char=U+0065 literal='e' rect=22,88,30,104 color=0.920,0.940,0.980,1.000
 glyph 1 char=U+0063 literal='c' rect=30,88,38,104 color=0.920,0.940,0.980,1.000
@@ -34,7 +34,7 @@ glyph 9 char=U+0072 literal='r' rect=102,88,110,104 color=0.920,0.940,0.980,1.00
 glyph 10 char=U+0065 literal='e' rect=110,88,118,104 color=0.920,0.940,0.980,1.000
 glyph 11 char=U+0065 literal='e' rect=118,88,126,104 color=0.920,0.940,0.980,1.000
 glyph 12 char=U+006E literal='n' rect=126,88,134,104 color=0.920,0.940,0.980,1.000
-[fragment 2] panels=0 glyphs=16 sprites=0 overlay_panels=0
+[fragment 2] panels=0 glyphs=16 transformed_glyphs=0 sprites=0 overlay_panels=0 overlay_glyphs=0
 glyph 0 char=U+0068 literal='h' rect=22,104,30,120 color=0.960,0.900,0.700,1.000
 glyph 1 char=U+0065 literal='e' rect=30,104,38,120 color=0.960,0.900,0.700,1.000
 glyph 2 char=U+0061 literal='a' rect=38,104,46,120 color=0.960,0.900,0.700,1.000
@@ -51,12 +51,12 @@ glyph 12 char=U+0065 literal='e' rect=126,104,134,120 color=0.960,0.900,0.700,1.
 glyph 13 char=U+0072 literal='r' rect=134,104,142,120 color=0.960,0.900,0.700,1.000
 glyph 14 char=U+0065 literal='e' rect=142,104,150,120 color=0.960,0.900,0.700,1.000
 glyph 15 char=U+0072 literal='r' rect=150,104,158,120 color=0.960,0.900,0.700,1.000
-[fragment 3] panels=0 glyphs=0 sprites=0 overlay_panels=1
+[fragment 3] panels=0 glyphs=0 transformed_glyphs=0 sprites=0 overlay_panels=1 overlay_glyphs=0
 overlay_panel 0 effect=TerminalCursor rect=86,104,94,120 color=0.960,0.450,1.000,0.420 data=0.000,0.000,0.000,0.000
-[fragment 4] panels=2 glyphs=0 sprites=0 overlay_panels=0
+[fragment 4] panels=2 glyphs=0 transformed_glyphs=0 sprites=0 overlay_panels=0 overlay_glyphs=0
 panel 0 effect=TerminalScrollbarTrack rect=1010,88,1018,492 color=0.280,0.100,0.400,0.900 data=0.000,0.000,0.000,0.000
 panel 1 effect=TerminalScrollbarThumb rect=1010,250,1018,346 color=0.920,0.550,1.000,0.960 data=0.000,0.000,0.000,0.000
-[fragment 5] panels=0 glyphs=24 sprites=0 overlay_panels=0
+[fragment 5] panels=0 glyphs=24 transformed_glyphs=0 sprites=0 overlay_panels=0 overlay_glyphs=0
 glyph 0 char=U+006F literal='o' rect=32,524,40,540 color=0.960,0.950,0.900,1.000
 glyph 1 char=U+0066 literal='f' rect=40,524,48,540 color=0.960,0.950,0.900,1.000
 glyph 2 char=U+0066 literal='f' rect=48,524,56,540 color=0.960,0.950,0.900,1.000

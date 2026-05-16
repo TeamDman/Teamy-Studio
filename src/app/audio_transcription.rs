@@ -871,6 +871,10 @@ fn duration_millis_u64(duration: std::time::Duration) -> u64 {
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::float_cmp,
+    reason = "the transcription tensor tests pin exact sentinel values in fixed fixture buffers"
+)]
 mod tests {
     use super::*;
 
@@ -1153,7 +1157,7 @@ mod tests {
             let queued = pool
                 .next_ready_request()
                 .expect("queued request should be available");
-            let request = audio_transcription_control_request_for_queued_request(&queued);
+            let request = audio_transcription_control_request_for_queued_request(queued);
 
             let roundtrip = audio_transcription_named_pipe_request_roundtrip(&pipe_path, &request);
             let mut child = std::process::Command::new("python")

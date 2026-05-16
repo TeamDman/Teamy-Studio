@@ -2044,6 +2044,18 @@ impl Drop for ComApartment {
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::float_cmp,
+    reason = "audio input tests pin exact timing values from deterministic fixture math"
+)]
+#[expect(
+    clippy::semicolon_outside_block,
+    reason = "the tests use scoped mutations to keep buffer setup visually local"
+)]
+#[expect(
+    clippy::field_reassign_with_default,
+    reason = "the tests stage runtime mutations incrementally to mirror live behavior"
+)]
 mod tests {
     use super::*;
 

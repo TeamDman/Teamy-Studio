@@ -166,6 +166,10 @@ fn should_ring_bell(now: Instant, last_bell_at: Option<Instant>) -> bool {
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::unchecked_time_subtraction,
+    reason = "these tests derive recent bell timestamps from a fresh baseline instant"
+)]
 mod tests {
     use std::path::PathBuf;
     use std::time::{Duration, Instant};

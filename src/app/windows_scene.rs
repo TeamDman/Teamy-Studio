@@ -1120,6 +1120,10 @@ pub fn build_scene_render_scene(
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[expect(
+    clippy::struct_field_names,
+    reason = "the workspace layout names make each rect's role explicit at call sites"
+)]
 struct TextRenderingWorkspaceLayout {
     body_rect: ClientRect,
     title_rect: ClientRect,
@@ -2874,7 +2878,7 @@ pub fn scene_button_specs(scene_kind: SceneWindowKind) -> &'static [SceneButtonS
                 color: [0.20, 0.18, 0.32, 1.0],
             },
             SceneButtonSpec {
-                // cursor-latency[impl launcher-button]
+                // cursorlatency[impl launcher-button]
                 action: SceneAction::OpenCursorLatencyPlayground,
                 label: "Cursor Latency Playground",
                 tooltip: "Compare app-drawn cursor behavior against the OS cursor",
@@ -3079,7 +3083,7 @@ pub fn scene_button_specs(scene_kind: SceneWindowKind) -> &'static [SceneButtonS
         ],
         SceneWindowKind::CursorLatencyPlayground => &[
             SceneButtonSpec {
-                // cursor-latency[impl playground.behavior-controls]
+                // cursorlatency[impl playground.behavior-controls]
                 action: SceneAction::SetCursorLatencyBehaviorFastest,
                 label: "Fastest",
                 tooltip: "Lead the cursor polygon to mimic app-first presentation",
@@ -3087,7 +3091,7 @@ pub fn scene_button_specs(scene_kind: SceneWindowKind) -> &'static [SceneButtonS
                 color: [0.30, 0.18, 0.16, 1.0],
             },
             SceneButtonSpec {
-                // cursor-latency[impl playground.behavior-controls]
+                // cursorlatency[impl playground.behavior-controls]
                 action: SceneAction::SetCursorLatencyBehaviorMatchOs,
                 label: "Match OS",
                 tooltip: "Keep the cursor polygon welded to the sampled OS cursor",
@@ -7125,7 +7129,15 @@ pub fn build_cursor_gallery_render_scene(
 }
 
 #[must_use]
-// cursor-latency[impl playground.window]
+// cursorlatency[impl playground.window]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the cursor latency playground scene is assembled as one cohesive render recipe"
+)]
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "the view state is consumed as an immutable snapshot from the caller's frame model"
+)]
 pub fn build_cursor_latency_playground_render_scene(
     layout: TerminalLayout,
     window_chrome_buttons_state: WindowChromeButtonsState,
@@ -7353,6 +7365,10 @@ fn push_cursor_gallery_glow(
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the split-screen cursor latency cards are described by explicit source and destination rectangles"
+)]
 fn push_cursor_latency_half(
     scene: &mut RenderScene,
     source_fastest_rect: ClientRect,
@@ -7363,8 +7379,8 @@ fn push_cursor_latency_half(
     source_point: Option<ClientPoint>,
     lead_pixels: i32,
 ) {
-    // cursor-latency[impl playground.split-halves]
-    // cursor-latency[impl playground.ripple-sdf]
+    // cursorlatency[impl playground.split-halves]
+    // cursorlatency[impl playground.ripple-sdf]
     let background = mix_rgba([0.05, 0.06, 0.08, 1.0], accent, 0.22);
     push_panel(
         scene,
@@ -7413,6 +7429,10 @@ fn push_cursor_latency_half(
     }
 }
 
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "cursor latency ripple shader data stores bounded pixel sizes as floats"
+)]
 fn push_cursor_latency_ripple_panel(
     scene: &mut RenderScene,
     source_fastest_rect: ClientRect,
@@ -7447,6 +7467,10 @@ fn cursor_latency_half_content_rect(half_rect: ClientRect) -> ClientRect {
     )
 }
 
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "cursor latency UV mapping converts integral client pixels into normalized floats"
+)]
 fn map_cursor_latency_point(
     fastest_rect: ClientRect,
     match_os_rect: ClientRect,
@@ -7515,13 +7539,18 @@ fn hsv_to_rgb(hue: f32, saturation: f32, value: f32) -> (f32, f32, f32) {
     let p = value * (1.0 - saturation);
     let q = value * (1.0 - saturation * fraction);
     let t = value * (1.0 - saturation * (1.0 - fraction));
-    match sector as i32 {
-        0 => (value, t, p),
-        1 => (q, value, p),
-        2 => (p, value, t),
-        3 => (p, q, value),
-        4 => (t, p, value),
-        _ => (value, p, q),
+    if sector < 1.0 {
+        (value, t, p)
+    } else if sector < 2.0 {
+        (q, value, p)
+    } else if sector < 3.0 {
+        (p, value, t)
+    } else if sector < 4.0 {
+        (p, q, value)
+    } else if sector < 5.0 {
+        (t, p, value)
+    } else {
+        (value, p, q)
     }
 }
 
@@ -7540,7 +7569,7 @@ pub fn push_latency_overlay(
     layout: TerminalLayout,
     view_state: &LatencyOverlayViewState,
 ) {
-    // cursor-latency[impl overlay.frame-graph]
+    // cursorlatency[impl overlay.frame-graph]
     let overlay_rect = latency_overlay_rect(layout.terminal_panel_rect(), view_state.anchor);
     let header_rect = ClientRect::new(
         overlay_rect.left() + 14,
@@ -7568,12 +7597,10 @@ pub fn push_latency_overlay(
     );
     let fps_text = view_state
         .average_fps
-        .map(|fps| format!("{:>3.0} fps", fps))
-        .unwrap_or_else(|| "--- fps".to_owned());
+        .map_or_else(|| "--- fps".to_owned(), |fps| format!("{fps:>3.0} fps"));
     let latest_text = view_state
         .latest_frame_ms
-        .map(|ms| format!("{ms:>4.1} ms"))
-        .unwrap_or_else(|| "--.- ms".to_owned());
+        .map_or_else(|| "--.- ms".to_owned(), |ms| format!("{ms:>4.1} ms"));
     push_overlay_text_block(
         scene,
         header_rect.to_win32_rect(),
@@ -7616,6 +7643,14 @@ fn latency_overlay_rect(panel_rect: ClientRect, anchor: LatencyOverlayAnchor) ->
     ClientRect::new(left, top, left + width, top + height)
 }
 
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "latency overlay reference lines project bounded graph dimensions into floats"
+)]
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "reference line y coordinates are rounded back into screen pixels"
+)]
 fn push_latency_overlay_reference_lines(scene: &mut RenderScene, graph_rect: ClientRect) {
     for target_ms in [16.67_f32, 33.33_f32] {
         let ratio = (target_ms / 50.0).clamp(0.0, 1.0);
@@ -7635,6 +7670,14 @@ fn push_latency_overlay_reference_lines(scene: &mut RenderScene, graph_rect: Cli
     }
 }
 
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "latency overlay bars project bounded graph dimensions into floats"
+)]
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "latency overlay bar dimensions are rounded back into screen pixels"
+)]
 fn push_latency_overlay_bars(
     scene: &mut RenderScene,
     graph_rect: ClientRect,
@@ -10407,6 +10450,22 @@ fn proximity_to_rect(rect: ClientRect, pointer: ClientPoint) -> f32 {
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::float_cmp,
+    reason = "render-scene tests pin exact colors and easing values for deterministic fixtures"
+)]
+#[expect(
+    clippy::unchecked_time_subtraction,
+    reason = "tests construct deterministic expired timestamps from freshly captured instants"
+)]
+#[expect(
+    clippy::redundant_closure_for_method_calls,
+    reason = "the ratatui buffer assertions read more clearly alongside neighboring closure-based filters"
+)]
+#[expect(
+    clippy::single_char_pattern,
+    reason = "single-character contains checks stay visually consistent with surrounding string assertions"
+)]
 mod tests {
     use crate::app::windows_d3d12_renderer::window_garden_shader_data;
 
@@ -10702,7 +10761,7 @@ mod tests {
         push_latency_overlay(&mut scene, layout, &view_state);
 
         let min_glyph_width = scene
-            .glyphs
+            .overlay_glyphs
             .iter()
             .map(|glyph| glyph.rect.right - glyph.rect.left)
             .min()

@@ -331,6 +331,10 @@ fn median_u64<T>(samples: &[T], selector: impl Fn(&T) -> u64) -> u64 {
 }
 
 #[cfg(all(test, feature = "ghostty"))]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "some replay tests use eyre::Result to share setup style with fallible terminal backends"
+)]
 mod tests {
     use std::fs;
     use std::path::PathBuf;

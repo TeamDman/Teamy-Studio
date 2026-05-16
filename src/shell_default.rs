@@ -351,6 +351,14 @@ mod tests {
     }
 
     impl EnvVarGuard {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "these tests serialize COMSPEC mutation with a process-wide mutex"
+        )]
+        #[expect(
+            clippy::semicolon_outside_block,
+            reason = "the unsafe environment mutation stays scoped inside a small helper"
+        )]
         fn set(key: &'static str, value: &str) -> Self {
             let original = std::env::var_os(key);
             // Safety: these tests serialize COMSPEC mutation with a process-wide mutex.
@@ -362,6 +370,10 @@ mod tests {
     }
 
     impl Drop for EnvVarGuard {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "these tests restore COMSPEC after serialized mutation"
+        )]
         fn drop(&mut self) {
             match self.original.as_ref() {
                 Some(value) => {

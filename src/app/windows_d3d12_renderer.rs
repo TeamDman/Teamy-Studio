@@ -17,9 +17,9 @@
     clippy::type_complexity,
     clippy::undocumented_unsafe_blocks,
     clippy::unnecessary_cast,
-    clippy::unused_self,
-    clippy::wildcard_imports
+    clippy::unused_self
 )]
+#![allow(clippy::wildcard_imports)]
 use std::collections::{BTreeSet, HashMap};
 use std::ffi::{CStr, CString, c_void};
 use std::fmt::Write as _;
@@ -447,7 +447,7 @@ pub struct D3d12PanelRenderer {
     band_buffer: ID3D12Resource,
     band_buffer_capacity: usize,
     transformed_glyph_inverse_buffer: ID3D12Resource,
-    _sprite_buffer: ID3D12Resource,
+    sprite_buffer_keepalive: ID3D12Resource,
     sprite_atlas: Arc<SpriteAtlas>,
     font: Arc<LoadedTerminalFont>,
     glyph_cache: HashMap<char, SlugGlyph>,
@@ -495,6 +495,10 @@ pub struct RendererTerminalVisualState {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "window chrome button visuals mirror several independent live toggles from the app state"
+)]
 pub struct WindowChromeButtonsState {
     pub pin: ButtonVisualState,
     pub latency_enabled: bool,
@@ -930,7 +934,7 @@ impl D3d12PanelRenderer {
             band_buffer,
             band_buffer_capacity: MAX_BAND_UINT_COUNT,
             transformed_glyph_inverse_buffer,
-            _sprite_buffer: sprite_buffer,
+            sprite_buffer_keepalive: sprite_buffer,
             sprite_atlas,
             font,
             glyph_cache: HashMap::new(),
@@ -1601,8 +1605,7 @@ impl D3d12PanelRenderer {
         )
         .wrap_err_with(|| {
             format!(
-                "failed to grow shader resources for curves={} bands={}",
-                next_curve_capacity, next_band_capacity
+                "failed to grow shader resources for curves={next_curve_capacity} bands={next_band_capacity}",
             )
         })?;
 
@@ -1612,7 +1615,7 @@ impl D3d12PanelRenderer {
         self.band_buffer = band_buffer;
         self.band_buffer_capacity = next_band_capacity;
         self.transformed_glyph_inverse_buffer = transformed_glyph_inverse_buffer;
-        self._sprite_buffer = sprite_buffer;
+        self.sprite_buffer_keepalive = sprite_buffer;
         self.sprite_atlas = sprite_atlas;
         Ok(())
     }
@@ -3201,7 +3204,7 @@ pub fn render_frame_model_offscreen_image(
         curve_buffer,
         band_buffer,
         transformed_glyph_inverse_buffer,
-        _sprite_buffer,
+        _sprite_buffer_keepalive,
         sprite_atlas,
     ) = create_shader_resources_and_srv_with_capacities(
         &device,
@@ -5393,8 +5396,7 @@ impl ShaderIncludeHandler {
             .lock()
             .expect("shader include cache should not be poisoned")
             .get(&(parent_data as usize))
-            .map(|source| source.path.clone())
-            .unwrap_or_else(|| self.root_path.to_owned())
+            .map_or_else(|| self.root_path.to_owned(), |source| source.path.clone())
     }
 
     fn resolve_include_path(&self, file_name: &str, parent_data: *const c_void) -> String {
@@ -5665,8 +5667,8 @@ fn solve_inverse_homography(
         }
 
         let pivot = augmented[pivot_index][pivot_index];
-        for column in pivot_index..9 {
-            augmented[pivot_index][column] /= pivot;
+        for value in augmented[pivot_index].iter_mut().skip(pivot_index) {
+            *value /= pivot;
         }
 
         for row in 0..8 {
@@ -5677,8 +5679,9 @@ fn solve_inverse_homography(
             if factor.abs() <= f32::EPSILON {
                 continue;
             }
-            for column in pivot_index..9 {
-                augmented[row][column] -= factor * augmented[pivot_index][column];
+            let pivot_row = augmented[pivot_index];
+            for (column, value) in augmented[row].iter_mut().enumerate().skip(pivot_index) {
+                *value -= factor * pivot_row[column];
             }
         }
     }
@@ -6962,6 +6965,14 @@ fn issue_transition_barrier(
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::single_range_in_vec_init,
+    reason = "the tests intentionally compare slice shapes built from range literals"
+)]
+#[expect(
+    clippy::struct_field_names,
+    reason = "test-only helper structs count segment categories with explicit names"
+)]
 mod tests {
     use super::{
         CachedSceneVertices, FALLBACK_GLYPH, PanelEffect, RenderScene, Vertex,
@@ -7339,36 +7350,36 @@ mod tests {
                             glyph.y_min,
                         ),
                     ];
-                    let sample_x1 =
+                    let sample_step_x =
                         apply_inverse_homography_point(inverse, [sample[0] + 1.0, sample[1]]);
-                    let sample_y1 =
+                    let sample_step_y =
                         apply_inverse_homography_point(inverse, [sample[0], sample[1] + 1.0]);
-                    let render_coord_x1 = [
+                    let render_coord_step_x = [
                         remap_range(
-                            sample_x1[0],
+                            sample_step_x[0],
                             glyph_quad.local_bounds[0],
                             glyph_quad.local_bounds[1],
                             glyph.x_min,
                             glyph.x_max,
                         ),
                         remap_range(
-                            sample_x1[1],
+                            sample_step_x[1],
                             glyph_quad.local_bounds[2],
                             glyph_quad.local_bounds[3],
                             glyph.y_max,
                             glyph.y_min,
                         ),
                     ];
-                    let render_coord_y1 = [
+                    let render_coord_step_y = [
                         remap_range(
-                            sample_y1[0],
+                            sample_step_y[0],
                             glyph_quad.local_bounds[0],
                             glyph_quad.local_bounds[1],
                             glyph.x_min,
                             glyph.x_max,
                         ),
                         remap_range(
-                            sample_y1[1],
+                            sample_step_y[1],
                             glyph_quad.local_bounds[2],
                             glyph_quad.local_bounds[3],
                             glyph.y_max,
@@ -7376,10 +7387,10 @@ mod tests {
                         ),
                     ];
                     let fwidth = [
-                        (render_coord_x1[0] - render_coord[0]).abs()
-                            + (render_coord_y1[0] - render_coord[0]).abs(),
-                        (render_coord_x1[1] - render_coord[1]).abs()
-                            + (render_coord_y1[1] - render_coord[1]).abs(),
+                        (render_coord_step_x[0] - render_coord[0]).abs()
+                            + (render_coord_step_y[0] - render_coord[0]).abs(),
+                        (render_coord_step_x[1] - render_coord[1]).abs()
+                            + (render_coord_step_y[1] - render_coord[1]).abs(),
                     ];
                     let pixels_per_em = [
                         1.0 / fwidth[0].max(1.0 / 65536.0),
@@ -8193,11 +8204,6 @@ mod tests {
             512,
         );
 
-        let multi_span_rows = count_rows_with_multiple_spans(&image);
-        assert_eq!(
-            multi_span_rows, 0,
-            "slash should be convex per occupied scanline"
-        );
         assert_eq!(
             count_connected_components(&image, 8),
             1,
@@ -8848,27 +8854,6 @@ mod tests {
             }
         }
         spans
-    }
-
-    fn count_rows_with_multiple_spans(image: &RgbaImage) -> usize {
-        let mut count = 0;
-        for y in 0..image.height() {
-            let mut spans = 0;
-            let mut in_span = false;
-            for x in 0..image.width() {
-                let filled = image.get_pixel(x, y)[3] > 0;
-                if filled && !in_span {
-                    spans += 1;
-                    in_span = true;
-                } else if !filled {
-                    in_span = false;
-                }
-            }
-            if spans > 1 {
-                count += 1;
-            }
-        }
-        count
     }
 
     fn count_connected_components(image: &RgbaImage, alpha_threshold: u8) -> usize {

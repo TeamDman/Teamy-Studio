@@ -20,7 +20,7 @@ use rfd::{FileDialog, MessageButtons, MessageDialog, MessageLevel};
 use tracing::{debug, error, info, info_span, instrument};
 use uom::si::f64::Time;
 use uom::si::time::{nanosecond, second};
-use widestring::U16CString;
+use widestring::{U16CStr, U16CString};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, CLEARTYPE_QUALITY, CreateFontIndirectW, DEVMODEW, DeleteObject,
@@ -240,6 +240,7 @@ fn focus_launcher_scene_window(excluding: WindowHandle) {
         return;
     };
     let hwnd = HWND(launcher.raw as *mut c_void);
+    // Safety: the scene window registry only stores HWND values captured from created scene windows.
     if !unsafe { IsWindowVisible(hwnd) }.as_bool() {
         return;
     }
@@ -529,6 +530,7 @@ impl TextRenderingPlaygroundHandle {
 
         for raw in windows {
             let target = HWND(raw as *mut c_void);
+            // Safety: the shared playground handle tracks HWND values for sibling scene windows and WM_CLOSE tolerates stale handles.
             let _ = unsafe { PostMessageW(Some(target), WM_CLOSE, WPARAM(0), LPARAM(0)) };
         }
     }
@@ -543,6 +545,7 @@ impl TextRenderingPlaygroundHandle {
 
         for raw in windows {
             let target = HWND(raw as *mut c_void);
+            // Safety: the shared playground handle tracks HWND values for sibling scene windows and PostMessageW tolerates stale handles.
             let _ = unsafe {
                 PostMessageW(
                     Some(target),
@@ -586,9 +589,9 @@ impl LatencyOverlayState {
     }
 
     fn handle_f3(&mut self, now: Instant) {
-        // cursor-latency[impl overlay.f3-toggle]
-        // cursor-latency[impl overlay.position-cycle]
-        // cursor-latency[impl overlay.hide-after-pause]
+        // cursorlatency[impl overlay.f3-toggle]
+        // cursorlatency[impl overlay.position-cycle]
+        // cursorlatency[impl overlay.hide-after-pause]
         if self.visible {
             if self
                 .last_f3_pressed_at
@@ -608,6 +611,10 @@ impl LatencyOverlayState {
         self.visible
     }
 
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "latency overlay samples are capped to a small UI history window"
+    )]
     fn view_state(&self) -> Option<windows_scene::LatencyOverlayViewState> {
         if !self.visible {
             return None;
@@ -728,11 +735,11 @@ fn cursor_latency_projected_position(
 ) -> Option<ClientPoint> {
     let latest = samples.back().copied()?;
     if behavior == windows_scene::CursorLatencyBehavior::MatchOs {
-        // cursor-latency[impl playground.match-os]
+        // cursorlatency[impl playground.match-os]
         return Some(latest.point);
     }
 
-    // cursor-latency[impl playground.fastest]
+    // cursorlatency[impl playground.fastest]
     let previous = samples
         .iter()
         .rev()
@@ -752,22 +759,54 @@ fn cursor_latency_projected_position(
 
     let (latest_x, latest_y) = client_point_pixels(latest.point);
     let (previous_x, previous_y) = client_point_pixels(previous.point);
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "cursor latency math projects integral pixel deltas into a bounded f32 viewport"
+    )]
     let delta_x = (latest_x - previous_x) as f32;
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "cursor latency math projects integral pixel deltas into a bounded f32 viewport"
+    )]
     let delta_y = (latest_y - previous_y) as f32;
     let lead_scale = (lead_interval.as_secs_f32() / sample_dt.as_secs_f32()).clamp(0.0, 1.35);
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "screen-space cursor projection stays within practical desktop pixel ranges"
+    )]
     let projected_x = latest_x as f32 + delta_x * lead_scale;
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "screen-space cursor projection stays within practical desktop pixel ranges"
+    )]
     let projected_y = latest_y as f32 + delta_y * lead_scale;
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "screen-space cursor projection stays within practical desktop pixel ranges"
+    )]
     let lead_x = (projected_x - latest_x as f32).clamp(
         -CURSOR_LATENCY_MAX_LEAD_PIXELS,
         CURSOR_LATENCY_MAX_LEAD_PIXELS,
     );
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "screen-space cursor projection stays within practical desktop pixel ranges"
+    )]
     let lead_y = (projected_y - latest_y as f32).clamp(
         -CURSOR_LATENCY_MAX_LEAD_PIXELS,
         CURSOR_LATENCY_MAX_LEAD_PIXELS,
     );
 
     Some(ClientPoint::new(
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "cursor lead pixels are rounded after being clamped to a small signed range"
+        )]
         latest_x.saturating_add(lead_x.round() as i32),
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "cursor lead pixels are rounded after being clamped to a small signed range"
+        )]
         latest_y.saturating_add(lead_y.round() as i32),
     ))
 }
@@ -784,9 +823,15 @@ fn cursor_latency_distance_pixels(left: ClientPoint, right: ClientPoint) -> i32 
     let (right_x, right_y) = client_point_pixels(right);
     let delta_x = right_x - left_x;
     let delta_y = right_y - left_y;
-    ((delta_x * delta_x + delta_y * delta_y) as f64)
-        .sqrt()
-        .round() as i32
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "pixel distances are rounded back into integral screen-space coordinates"
+    )]
+    {
+        f64::from(delta_x * delta_x + delta_y * delta_y)
+            .sqrt()
+            .round() as i32
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1587,7 +1632,7 @@ fn update_text_rendering_preset(
     state: &mut SceneAppState,
     preset: windows_scene::TextRenderingPreset,
 ) -> eyre::Result<()> {
-    let Some(playground) = state.text_rendering_playground.as_ref().cloned() else {
+    let Some(playground) = state.text_rendering_playground.clone() else {
         return Ok(());
     };
     let Ok(mut shared) = playground.shared.lock() else {
@@ -1659,6 +1704,10 @@ fn cached_text_rendering_glyph_instances<'a>(
         .map_or(&[], |cache| cache.glyphs.as_slice())
 }
 
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "text rendering projection works in UI-sized pixel coordinates"
+)]
 fn text_rendering_projection_basis(
     rect: ClientRect,
     text: &str,
@@ -1749,6 +1798,10 @@ fn text_rendering_debug_overlay_view_state(
     }
 }
 
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "hover debug data unprojects integral cursor pixels into scene-space floats"
+)]
 fn text_rendering_hovered_glyph_debug_data(
     clip_rect: ClientRect,
     viewport: TextRenderingViewportState,
@@ -2291,7 +2344,12 @@ fn restart_focused_render_ticker(hwnd: HWND, interval_ms: u32) -> eyre::Result<(
     let handle = thread::Builder::new()
         .name(format!("teamy-focused-render-ticker-{hwnd_key}"))
         .spawn(move || {
-            run_focused_render_ticker(hwnd_key, interval, thread_stop, thread_pending_tick)
+            run_focused_render_ticker(
+                hwnd_key,
+                interval,
+                thread_stop.as_ref(),
+                thread_pending_tick.as_ref(),
+            );
         })
         .map_err(|error| eyre::eyre!("failed to spawn focused render ticker: {error}"))?;
     focused_render_tickers()
@@ -2325,8 +2383,8 @@ fn stop_focused_render_ticker(hwnd: HWND) {
 fn run_focused_render_ticker(
     hwnd_raw: isize,
     interval: Duration,
-    stop: Arc<AtomicBool>,
-    pending_tick: Arc<AtomicBool>,
+    stop: &AtomicBool,
+    pending_tick: &AtomicBool,
 ) {
     let hwnd = HWND(hwnd_raw as *mut c_void);
     let mut next_tick = Instant::now() + interval;
@@ -2339,6 +2397,7 @@ fn run_focused_render_ticker(
             break;
         }
         if !pending_tick.swap(true, AtomicOrdering::AcqRel) {
+            // Safety: the ticker only posts a private wake message to the HWND that created it; failure is handled by clearing the pending flag.
             let posted = unsafe {
                 PostMessageW(
                     Some(hwnd),
@@ -3016,11 +3075,8 @@ fn run_scene_window(
     } else {
         None
     };
-    let cursor_latency_playground = if scene_kind == SceneWindowKind::CursorLatencyPlayground {
-        Some(CursorLatencyPlaygroundState::new())
-    } else {
-        None
-    };
+    let cursor_latency_playground = (scene_kind == SceneWindowKind::CursorLatencyPlayground)
+        .then(CursorLatencyPlaygroundState::new);
     let text_rendering_playground = initialization.text_rendering_playground.take();
 
     SCENE_APP_STATE.with(|state| {
@@ -6377,6 +6433,10 @@ fn handle_scene_left_button_up(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Resu
     clippy::too_many_lines,
     reason = "scene pointer move handling keeps the interaction state machines together for local reasoning"
 )]
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "pointer-driven text rendering interactions convert screen pixels into scene-space floats"
+)]
 fn handle_scene_mouse_move(
     hwnd: WindowHandle,
     wparam: WPARAM,
@@ -6418,7 +6478,7 @@ fn handle_scene_mouse_move(
         let Some(drag) = state.text_rendering_drag else {
             return Ok(false);
         };
-        let Some(playground) = state.text_rendering_playground.as_ref().cloned() else {
+        let Some(playground) = state.text_rendering_playground.clone() else {
             state.text_rendering_drag = None;
             state.pressed_target = None;
             return Ok(false);
@@ -6752,6 +6812,10 @@ fn handle_scene_mouse_move(
     Ok(false)
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "right-button release handles text, timeline, and diagnostics copy interactions in one pass"
+)]
 fn handle_scene_right_button_up(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Result<bool> {
     let point = ClientPoint::from_lparam(lparam);
 
@@ -6767,10 +6831,11 @@ fn handle_scene_right_button_up(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Res
             let current = point.to_win32_point()?;
             let stationary_click = state.text_rendering_drag.is_some_and(|drag| {
                 drag.origin.to_win32_point().ok().is_some_and(|origin| {
-                    (origin.x - current.x).abs()
-                        <= TEXT_RENDERING_DOUBLE_RIGHT_CLICK_MAX_MOVEMENT_PX as i32
-                        && (origin.y - current.y).abs()
-                            <= TEXT_RENDERING_DOUBLE_RIGHT_CLICK_MAX_MOVEMENT_PX as i32
+                    let max_movement =
+                        i32::try_from(TEXT_RENDERING_DOUBLE_RIGHT_CLICK_MAX_MOVEMENT_PX)
+                            .expect("double-right-click movement threshold must fit in i32");
+                    (origin.x - current.x).abs() <= max_movement
+                        && (origin.y - current.y).abs() <= max_movement
                 })
             });
             if stationary_click {
@@ -6953,6 +7018,10 @@ fn handle_scene_middle_button_up(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Re
 }
 
 // timeline[impl viewport.mouse-pan]
+#[expect(
+    clippy::too_many_lines,
+    reason = "right-button press keeps the pan and text-playground state transitions adjacent"
+)]
 fn handle_scene_right_button_down(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Result<bool> {
     let point = ClientPoint::from_lparam(lparam);
 
@@ -6964,7 +7033,7 @@ fn handle_scene_right_button_down(hwnd: WindowHandle, lparam: LPARAM) -> eyre::R
             && state.scene_kind == SceneWindowKind::TextRenderingPlaygroundEditor
             && windows_scene::text_rendering_editor_text_rect(layout).contains(point)
         {
-            if let Some(playground) = state.text_rendering_playground.as_ref().cloned()
+            if let Some(playground) = state.text_rendering_playground.clone()
                 && let Ok(mut shared) = playground.shared.lock()
             {
                 shared.text.clear();
@@ -6998,23 +7067,24 @@ fn handle_scene_right_button_down(hwnd: WindowHandle, lparam: LPARAM) -> eyre::R
                                 .to_win32_point()
                                 .ok()
                                 .is_some_and(|clicked_point| {
-                                    (clicked_point.x - current.x).abs()
-                                        <= TEXT_RENDERING_DOUBLE_RIGHT_CLICK_MAX_MOVEMENT_PX as i32
-                                        && (clicked_point.y - current.y).abs()
-                                            <= TEXT_RENDERING_DOUBLE_RIGHT_CLICK_MAX_MOVEMENT_PX
-                                                as i32
+                                    let max_movement = i32::try_from(
+                                        TEXT_RENDERING_DOUBLE_RIGHT_CLICK_MAX_MOVEMENT_PX,
+                                    )
+                                    .expect(
+                                        "double-right-click movement threshold must fit in i32",
+                                    );
+                                    (clicked_point.x - current.x).abs() <= max_movement
+                                        && (clicked_point.y - current.y).abs() <= max_movement
                                 })
                         });
             if double_right_click {
-                if let Some(playground) = state.text_rendering_playground.as_ref().cloned() {
-                    if let Ok(mut shared) = playground.shared.lock() {
-                        if let Some(viewport) =
-                            text_rendering_viewport_mut(&mut shared, state.scene_kind)
-                        {
-                            *viewport = TextRenderingViewportState::default();
-                            note_text_rendering_playground_interaction(&mut shared, now);
-                        }
-                    }
+                if let Some(playground) = state.text_rendering_playground.clone()
+                    && let Ok(mut shared) = playground.shared.lock()
+                    && let Some(viewport) =
+                        text_rendering_viewport_mut(&mut shared, state.scene_kind)
+                {
+                    *viewport = TextRenderingViewportState::default();
+                    note_text_rendering_playground_interaction(&mut shared, now);
                 }
                 state.text_rendering_last_right_button_down_at = None;
                 state.text_rendering_last_right_button_down_point = None;
@@ -7111,6 +7181,10 @@ fn handle_scene_right_button_down(hwnd: WindowHandle, lparam: LPARAM) -> eyre::R
     clippy::too_many_lines,
     reason = "scene mouse-wheel dispatch keeps logs, playground, and timeline zoom routing together"
 )]
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "text rendering zoom anchors are computed from integral cursor pixels"
+)]
 fn handle_scene_mouse_wheel(
     hwnd: WindowHandle,
     wparam: WPARAM,
@@ -7134,20 +7208,18 @@ fn handle_scene_mouse_wheel(
                 return Ok(true);
             }
             let point_pixels = point.to_win32_point()?;
-            if let Some(playground) = state.text_rendering_playground.as_ref().cloned() {
-                if let Ok(mut shared) = playground.shared.lock()
-                    && let Some(viewport) =
-                        text_rendering_viewport_mut(&mut shared, state.scene_kind)
-                {
-                    let factor = if wheel_delta > 0 { 1.12 } else { 1.0 / 1.12 };
-                    zoom_text_rendering_viewport_about_cursor(
-                        viewport,
-                        interaction_rect,
-                        [point_pixels.x as f32, point_pixels.y as f32],
-                        factor,
-                    );
-                    note_text_rendering_playground_interaction(&mut shared, Instant::now());
-                }
+            if let Some(playground) = state.text_rendering_playground.clone()
+                && let Ok(mut shared) = playground.shared.lock()
+                && let Some(viewport) = text_rendering_viewport_mut(&mut shared, state.scene_kind)
+            {
+                let factor = if wheel_delta > 0 { 1.12 } else { 1.0 / 1.12 };
+                zoom_text_rendering_viewport_about_cursor(
+                    viewport,
+                    interaction_rect,
+                    [point_pixels.x as f32, point_pixels.y as f32],
+                    factor,
+                );
+                note_text_rendering_playground_interaction(&mut shared, Instant::now());
             }
             render_scene_window_frame(state, hwnd, None, false)?;
             return Ok(true);
@@ -7281,9 +7353,9 @@ fn window_chrome_mouse_down_action(
     button_at_point: Option<WindowChromeButton>,
 ) -> WindowChromePointerAction {
     match button_at_point {
-        Some(WindowChromeButton::Pin) => WindowChromePointerAction::RenderOnly,
-        Some(WindowChromeButton::Latency) => WindowChromePointerAction::RenderOnly,
-        Some(WindowChromeButton::Diagnostics) => WindowChromePointerAction::RenderOnly,
+        Some(
+            WindowChromeButton::Pin | WindowChromeButton::Latency | WindowChromeButton::Diagnostics,
+        ) => WindowChromePointerAction::RenderOnly,
         Some(button) => WindowChromePointerAction::Execute(button),
         None => WindowChromePointerAction::NotHandled,
     }
@@ -7506,11 +7578,15 @@ fn handle_scene_char_message(
         {
             return Ok(false);
         }
-        let playground = state.text_rendering_playground.as_ref().cloned();
+        let playground = state.text_rendering_playground.clone();
+        let Some(playground) = playground.as_ref() else {
+            return Ok(false);
+        };
+        #[expect(
+            clippy::semicolon_outside_block,
+            reason = "the scoped playground lock keeps the broadcast outside the critical section"
+        )]
         {
-            let Some(playground) = playground.as_ref() else {
-                return Ok(false);
-            };
             let Ok(mut shared) = playground.shared.lock() else {
                 eyre::bail!("failed to lock text rendering playground state")
             };
@@ -7528,9 +7604,7 @@ fn handle_scene_char_message(
             }
             mark_text_rendering_playground_content_changed(&mut shared, Instant::now());
         }
-        if let Some(playground) = playground {
-            playground.broadcast_changed();
-        }
+        playground.broadcast_changed();
         render_scene_window_frame(state, hwnd, None, false)?;
         Ok(true)
     }) {
@@ -9098,6 +9172,10 @@ fn text_rendering_plane_view_state(
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "verification geometry matches the externally visible text-plane controls"
+)]
 pub(crate) fn build_text_rendering_plane_verification_geometry(
     layout: super::windows_terminal::TerminalLayout,
     text: &str,
@@ -9196,6 +9274,10 @@ fn inverse_rotate_text_rendering_vector_3d(
     ]
 }
 
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "text rendering plane centers are derived from UI-sized pixel rectangles"
+)]
 fn text_rendering_plane_center(rect: ClientRect, viewport: TextRenderingViewportState) -> [f32; 2] {
     [
         (rect.left() + rect.width() / 2) as f32
@@ -9291,6 +9373,14 @@ fn project_text_rendering_point_with_weight(point: [f32; 3], center: [f32; 2]) -
     )
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "glyph instance generation keeps projection, culling, and glyph metrics in one local pipeline"
+)]
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "glyph placement converts bounded pixel and index values into render-space floats"
+)]
 fn build_text_rendering_glyph_instances(
     rect: ClientRect,
     text: &str,
@@ -12482,10 +12572,14 @@ fn monitor_refresh_hz_for_window(hwnd: HWND) -> Option<u32> {
         dmSize: u16::try_from(std::mem::size_of::<DEVMODEW>()).ok()?,
         ..Default::default()
     };
-    // Safety: the monitor device name comes from GetMonitorInfoW and is null-terminated.
+    let device_name = U16CStr::from_slice_truncate(&info.szDevice)
+        .ok()?
+        .easy_pcwstr()
+        .ok()?;
+    // Safety: the monitor device name comes from GetMonitorInfoW and is copied into a temporary helper-owned PCWSTR buffer.
     if !unsafe {
         EnumDisplaySettingsW(
-            PCWSTR(info.szDevice.as_ptr()),
+            device_name.as_ref(),
             ENUM_CURRENT_SETTINGS,
             &raw mut device_mode,
         )
@@ -15327,6 +15421,14 @@ fn update_scene_virtual_cursor_tooltip(
 // behavior[impl window.appearance.chrome.tooltips.popover]
 // behavior[impl window.appearance.chrome.tooltips.cursor-clear]
 // behavior[impl window.appearance.chrome.tooltips.monitor-clamped]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the tooltip controller consumes the visible chrome state directly from the caller"
+)]
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "the tooltip text is driven by independent button toggles that already exist as booleans"
+)]
 fn update_window_chrome_tooltip(
     tooltip: &mut ChromeTooltipController,
     hwnd: WindowHandle,
@@ -15783,6 +15885,10 @@ fn audio_input_timeline_head_tooltip(
     ))
 }
 
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "tooltip wording mirrors independent window chrome toggle states"
+)]
 fn window_chrome_button_tooltip_text(
     button: WindowChromeButton,
     diagnostics_active: bool,
@@ -15995,7 +16101,23 @@ fn rects_intersect(a: ScreenRect, b: ScreenRect) -> bool {
     a.left() < b.right() && a.right() > b.left() && a.top() < b.bottom() && a.bottom() > b.top()
 }
 
+fn should_override_drag_cursor(in_move_size_loop: bool) -> bool {
+    !in_move_size_loop
+}
+
+fn should_render_from_poll_timer(in_move_size_loop: bool) -> bool {
+    in_move_size_loop
+}
+
 #[cfg(test)]
+#[expect(
+    clippy::float_cmp,
+    reason = "these unit tests pin exact f32 outputs for UI math and serialized metrics"
+)]
+#[expect(
+    clippy::unchecked_time_subtraction,
+    reason = "the tests construct deterministic historical instants from freshly captured baselines"
+)]
 mod tests {
     use crate::timeline::TimelineItemInput;
     use tracing_subscriber::prelude::*;
@@ -17854,12 +17976,4 @@ mod tests {
             Some(88)
         );
     }
-}
-
-fn should_override_drag_cursor(in_move_size_loop: bool) -> bool {
-    !in_move_size_loop
-}
-
-fn should_render_from_poll_timer(in_move_size_loop: bool) -> bool {
-    in_move_size_loop
 }

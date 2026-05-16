@@ -899,7 +899,7 @@ mod tests {
         let row_keys = dataset
             .items()
             .iter()
-            .map(|item| item.group_key())
+            .map(crate::timeline::dataset::TimelineItem::group_key)
             .collect::<std::collections::BTreeSet<_>>();
 
         assert_eq!(row_keys.len(), 2);
