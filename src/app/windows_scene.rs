@@ -7240,7 +7240,7 @@ pub fn build_cursor_latency_playground_render_scene(
             title_rect.bottom() + 38,
         )
         .to_win32_rect(),
-        "Fastest projects a larger hard-edged crosshair ahead from recent motion to mimic the app-first presentation you observed in the DirectX experiment. Match OS pins that same crosshair to the sampled OS cursor so drift stays obvious nearby and at distance.",
+        "Fastest late-latches a larger hard-edged crosshair after the renderer clears the frame-latency gate, so it can land on the freshest cursor sample we have. Match OS shows the previous latched sample as a simple one-frame-behind comparison.",
         8,
         14,
         [0.74, 0.79, 0.85, 1.0],
@@ -7377,7 +7377,7 @@ fn push_cursor_latency_half(
     label: &str,
     accent: [f32; 4],
     source_point: Option<ClientPoint>,
-    lead_pixels: i32,
+    _lead_pixels: i32,
 ) {
     // cursorlatency[impl playground.split-halves]
     // cursorlatency[impl playground.ripple-sdf]
@@ -7409,11 +7409,7 @@ fn push_cursor_latency_half(
             half_rect.top() + 34,
         )
         .to_win32_rect(),
-        &if lead_pixels > 0 {
-            format!("{label}  latest  +{lead_pixels}px")
-        } else {
-            format!("{label}  latest")
-        },
+        label,
         [0.97, 0.98, 1.0, 1.0],
     );
 

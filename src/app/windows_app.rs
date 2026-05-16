@@ -96,9 +96,9 @@ use super::windows_audio_input::{
 };
 use super::windows_cursor_info::{CursorInfoConfig, CursorInfoVirtualSession};
 use super::windows_d3d12_renderer::{
-    ButtonVisualState, RenderFrameModel, RenderScene, RenderThreadProxy,
-    RendererTerminalVisualState, WindowChromeButtonsState, terminal_font_layout_snapshot,
-    terminal_font_unicode_chars,
+    ButtonVisualState, CursorLatencyFrameModel, RenderFrameModel, RenderScene,
+    RenderThreadProxy, RendererPresentationMode, RendererTerminalVisualState, WindowChromeButtonsState,
+    terminal_font_layout_snapshot, terminal_font_unicode_chars,
 };
 use super::windows_demo_mode::{
     current_demo_mode_state, initialize_demo_mode_state, set_scramble_input_device_identifiers,
@@ -377,26 +377,13 @@ struct TimelinePlaygroundState {
     hover_detail_window: Option<TimelinePlaygroundDetailWindowHandle>,
 }
 
-const CURSOR_LATENCY_MAX_HISTORY: usize = 12;
-const CURSOR_LATENCY_MAX_SAMPLE_AGE: Duration = Duration::from_millis(180);
-const CURSOR_LATENCY_MAX_LEAD_PIXELS: f32 = 96.0;
 const CURSOR_LATENCY_FOCUSED_RENDER_TICK_INTERVAL_MS: u32 = 1;
 const LATENCY_OVERLAY_MAX_HISTORY: usize = 120;
 const LATENCY_OVERLAY_ROTATION_PAUSE: Duration = Duration::from_millis(500);
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct CursorLatencySample {
-    point: ClientPoint,
-    captured_at: Instant,
-}
-
 #[derive(Debug)]
 struct CursorLatencyPlaygroundState {
     behavior: windows_scene::CursorLatencyBehavior,
-    last_os_cursor_position: Option<ClientPoint>,
-    rendered_cursor_position: Option<ClientPoint>,
-    fastest_projection_interval: Duration,
-    samples: VecDeque<CursorLatencySample>,
 }
 
 static NEXT_TEXT_RENDERING_SESSION_ID: AtomicU64 = AtomicU64::new(1);
@@ -662,201 +649,7 @@ impl CursorLatencyPlaygroundState {
     fn new() -> Self {
         Self {
             behavior: windows_scene::CursorLatencyBehavior::Fastest,
-            last_os_cursor_position: None,
-            rendered_cursor_position: None,
-            fastest_projection_interval: Duration::from_millis(16),
-            samples: VecDeque::with_capacity(CURSOR_LATENCY_MAX_HISTORY),
         }
-    }
-
-    fn sync(
-        &mut self,
-        cursor_position: Option<ClientPoint>,
-        now: Instant,
-        focused_render_interval_ms: u32,
-    ) {
-        self.last_os_cursor_position = cursor_position;
-        if let Some(point) = cursor_position {
-            self.samples.push_back(CursorLatencySample {
-                point,
-                captured_at: now,
-            });
-        }
-        while self.samples.len() > CURSOR_LATENCY_MAX_HISTORY {
-            self.samples.pop_front();
-        }
-        while self.samples.front().is_some_and(|sample| {
-            now.duration_since(sample.captured_at) > CURSOR_LATENCY_MAX_SAMPLE_AGE
-        }) {
-            self.samples.pop_front();
-        }
-        self.fastest_projection_interval =
-            Duration::from_millis(u64::from(focused_render_interval_ms.max(1)));
-        self.rendered_cursor_position = cursor_latency_projected_position(
-            self.behavior,
-            &self.samples,
-            self.fastest_projection_interval,
-        );
-    }
-
-    fn trail_points(&self) -> Vec<ClientPoint> {
-        self.samples.iter().map(|sample| sample.point).collect()
-    }
-
-    fn view_state(&self) -> windows_scene::CursorLatencyPlaygroundViewState {
-        let fastest_cursor_position = cursor_latency_projected_position(
-            windows_scene::CursorLatencyBehavior::Fastest,
-            &self.samples,
-            self.fastest_projection_interval,
-        );
-        let match_os_cursor_position = cursor_latency_projected_position(
-            windows_scene::CursorLatencyBehavior::MatchOs,
-            &self.samples,
-            self.fastest_projection_interval,
-        );
-        let lead_pixels = self
-            .last_os_cursor_position
-            .zip(fastest_cursor_position)
-            .map_or(0, |(os, rendered)| {
-                cursor_latency_distance_pixels(os, rendered)
-            });
-        windows_scene::CursorLatencyPlaygroundViewState {
-            behavior: self.behavior,
-            os_cursor_position: self.last_os_cursor_position,
-            rendered_cursor_position: self.rendered_cursor_position,
-            fastest_cursor_position,
-            match_os_cursor_position,
-            trail_points: self.trail_points(),
-            lead_pixels,
-            sample_count: self.samples.len(),
-        }
-    }
-}
-
-fn cursor_latency_projected_position(
-    behavior: windows_scene::CursorLatencyBehavior,
-    samples: &VecDeque<CursorLatencySample>,
-    lead_interval: Duration,
-) -> Option<ClientPoint> {
-    let latest = samples.back().copied()?;
-    if behavior == windows_scene::CursorLatencyBehavior::MatchOs {
-        // cursorlatency[impl playground.match-os]
-        return Some(latest.point);
-    }
-
-    // cursorlatency[impl playground.fastest]
-    let mut segment_count = 0_u32;
-    let mut weighted_velocity_x = 0.0_f32;
-    let mut weighted_velocity_y = 0.0_f32;
-    let mut total_weight = 0.0_f32;
-    let mut newer = latest;
-
-    for older in samples.iter().rev().skip(1).copied() {
-        if older.point == newer.point {
-            continue;
-        }
-
-        let sample_dt = newer
-            .captured_at
-            .saturating_duration_since(older.captured_at);
-        if sample_dt.is_zero() {
-            continue;
-        }
-
-        let (newer_x, newer_y) = client_point_pixels(newer.point);
-        let (older_x, older_y) = client_point_pixels(older.point);
-        #[expect(
-            clippy::cast_precision_loss,
-            reason = "cursor latency math projects integral pixel deltas into a bounded f32 viewport"
-        )]
-        let delta_x = (newer_x - older_x) as f32;
-        #[expect(
-            clippy::cast_precision_loss,
-            reason = "cursor latency math projects integral pixel deltas into a bounded f32 viewport"
-        )]
-        let delta_y = (newer_y - older_y) as f32;
-        let dt_seconds = sample_dt.as_secs_f32();
-        let weight = (4_u32.saturating_sub(segment_count)) as f32;
-        weighted_velocity_x += (delta_x / dt_seconds) * weight;
-        weighted_velocity_y += (delta_y / dt_seconds) * weight;
-        total_weight += weight;
-        segment_count += 1;
-        newer = older;
-
-        if segment_count >= 4 {
-            break;
-        }
-    }
-
-    if total_weight <= f32::EPSILON {
-        return Some(latest.point);
-    }
-
-    let (latest_x, latest_y) = client_point_pixels(latest.point);
-    let velocity_x = weighted_velocity_x / total_weight;
-    let velocity_y = weighted_velocity_y / total_weight;
-    let lead_seconds = lead_interval.as_secs_f32();
-    #[expect(
-        clippy::cast_precision_loss,
-        reason = "screen-space cursor projection stays within practical desktop pixel ranges"
-    )]
-    let projected_x = latest_x as f32 + velocity_x * lead_seconds;
-    #[expect(
-        clippy::cast_precision_loss,
-        reason = "screen-space cursor projection stays within practical desktop pixel ranges"
-    )]
-    let projected_y = latest_y as f32 + velocity_y * lead_seconds;
-    #[expect(
-        clippy::cast_precision_loss,
-        reason = "screen-space cursor projection stays within practical desktop pixel ranges"
-    )]
-    let lead_x = (projected_x - latest_x as f32).clamp(
-        -CURSOR_LATENCY_MAX_LEAD_PIXELS,
-        CURSOR_LATENCY_MAX_LEAD_PIXELS,
-    );
-    #[expect(
-        clippy::cast_precision_loss,
-        reason = "screen-space cursor projection stays within practical desktop pixel ranges"
-    )]
-    let lead_y = (projected_y - latest_y as f32).clamp(
-        -CURSOR_LATENCY_MAX_LEAD_PIXELS,
-        CURSOR_LATENCY_MAX_LEAD_PIXELS,
-    );
-
-    Some(ClientPoint::new(
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "cursor lead pixels are rounded after being clamped to a small signed range"
-        )]
-        latest_x.saturating_add(lead_x.round() as i32),
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "cursor lead pixels are rounded after being clamped to a small signed range"
-        )]
-        latest_y.saturating_add(lead_y.round() as i32),
-    ))
-}
-
-fn client_point_pixels(point: ClientPoint) -> (i32, i32) {
-    let point = point
-        .to_win32_point()
-        .expect("client points built from pixel coordinates must convert back to pixels");
-    (point.x, point.y)
-}
-
-fn cursor_latency_distance_pixels(left: ClientPoint, right: ClientPoint) -> i32 {
-    let (left_x, left_y) = client_point_pixels(left);
-    let (right_x, right_y) = client_point_pixels(right);
-    let delta_x = right_x - left_x;
-    let delta_y = right_y - left_y;
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "pixel distances are rounded back into integral screen-space coordinates"
-    )]
-    {
-        f64::from(delta_x * delta_x + delta_y * delta_y)
-            .sqrt()
-            .round() as i32
     }
 }
 
@@ -1840,7 +1633,11 @@ fn text_rendering_hovered_glyph_debug_data(
     }
 
     let center = text_rendering_plane_center(clip_rect, viewport);
-    let (point_x, point_y) = client_point_pixels(point);
+    let point = point
+        .to_win32_point()
+        .expect("client points built from pixels must convert back to pixels");
+    let point_x = point.x;
+    let point_y = point.y;
     let local_point = unproject_text_rendering_screen_point_to_plane(
         viewport,
         center,
@@ -3176,7 +2973,14 @@ fn run_scene_window(
 
     let hwnd = create_scene_window(window_thread, scene_kind)?;
     register_scene_window(hwnd, scene_kind);
-    let renderer = RenderThreadProxy::new(hwnd.raw())?;
+    let renderer = RenderThreadProxy::new_with_mode(
+        hwnd.raw(),
+        if scene_kind == SceneWindowKind::CursorLatencyPlayground {
+            RendererPresentationMode::LowLatencyHwnd
+        } else {
+            RendererPresentationMode::Composed
+        },
+    )?;
     let chrome_tooltip = ChromeTooltipController::create(hwnd)?;
     with_scene_app_state(|state| {
         state.hwnd = Some(hwnd);
@@ -4199,6 +4003,7 @@ fn render_toast_host(state: &mut ToastHostState) -> eyre::Result<()> {
         diagnostic_text: String::new(),
         diagnostic_selection: None,
         window_chrome_buttons_state: WindowChromeButtonsState::default(),
+        cursor_latency: None,
         diagnostic_cell_width: state.terminal_cell_width,
         diagnostic_cell_height: state.terminal_cell_height,
         scene: Some(scene),
@@ -7904,6 +7709,7 @@ fn render_current_frame_with_options(
                 .then_some(state.diagnostic_selection)
                 .flatten(),
             window_chrome_buttons_state,
+            cursor_latency: None,
             diagnostic_cell_width: state.diagnostic_cell_width,
             diagnostic_cell_height: state.diagnostic_cell_height,
             scene: None,
@@ -8113,21 +7919,12 @@ fn render_scene_window_frame(
     if state.scene_kind == SceneWindowKind::Logs && !state.diagnostics_visible {
         sync_logs_scroll_offset(state, layout);
     }
-    if state.scene_kind == SceneWindowKind::CursorLatencyPlayground && !state.diagnostics_visible {
-        let sampled_cursor = cursor_client_point(hwnd).ok();
-        if let Some(playground) = state.cursor_latency_playground.as_mut() {
-            playground.sync(
-                sampled_cursor,
-                render_started_at,
-                state.focused_render_interval_ms,
-            );
-        }
-    }
     let window_chrome_buttons_state = scene_window_chrome_buttons_state(state, hwnd, layout);
     let scramble_input_device_identifiers = state
         .demo_mode_scramble_input_device_identifiers
         .is_enabled();
     let timeline_document = timeline_document_snapshot(state);
+    let mut cursor_latency_frame = None;
     let mut scene = if state.diagnostics_visible && state.scene_kind == SceneWindowKind::Launcher {
         windows_scene::build_launcher_diagnostic_render_scene(
             layout,
@@ -8286,11 +8083,25 @@ fn render_scene_window_frame(
         )
     } else if state.scene_kind == SceneWindowKind::CursorLatencyPlayground {
         let button_visual_states = scene_button_visual_states(state, layout);
-        let view_state = state
+        let behavior = state
             .cursor_latency_playground
             .as_ref()
             .expect("cursor latency playground scene has playground state")
-            .view_state();
+            .behavior;
+        cursor_latency_frame = Some(CursorLatencyFrameModel {
+            behavior,
+            button_states: button_visual_states.clone(),
+        });
+        let view_state = windows_scene::CursorLatencyPlaygroundViewState {
+            behavior,
+            os_cursor_position: None,
+            rendered_cursor_position: None,
+            fastest_cursor_position: None,
+            match_os_cursor_position: None,
+            trail_points: Vec::new(),
+            lead_pixels: 0,
+            sample_count: 0,
+        };
         windows_scene::build_cursor_latency_playground_render_scene(
             layout,
             window_chrome_buttons_state,
@@ -8467,6 +8278,7 @@ fn render_scene_window_frame(
         diagnostic_text: String::new(),
         diagnostic_selection: None,
         window_chrome_buttons_state,
+        cursor_latency: cursor_latency_frame,
         diagnostic_cell_width: state.diagnostic_cell_width,
         diagnostic_cell_height: state.diagnostic_cell_height,
         scene: Some(scene),
@@ -13138,6 +12950,7 @@ fn render_terminal_throughput_benchmark_frame(
         diagnostic_text,
         diagnostic_selection: None,
         window_chrome_buttons_state: WindowChromeButtonsState::default(),
+        cursor_latency: None,
         diagnostic_cell_width,
         diagnostic_cell_height,
         scene: None,
@@ -16860,71 +16673,6 @@ mod tests {
         assert_eq!(zoom_transition_progress(1.0), 1.0);
         assert!(zoom_transition_progress(0.25) > ease_in_out(0.25));
         assert!(zoom_transition_progress(0.5) > 0.5);
-    }
-
-    #[test]
-    fn cursor_latency_fastest_behavior_projects_ahead_of_recent_motion() {
-        let now = Instant::now();
-        let samples = VecDeque::from([
-            CursorLatencySample {
-                point: ClientPoint::new(100, 200),
-                captured_at: now - Duration::from_millis(16),
-            },
-            CursorLatencySample {
-                point: ClientPoint::new(120, 200),
-                captured_at: now,
-            },
-        ]);
-
-        let projected = cursor_latency_projected_position(
-            windows_scene::CursorLatencyBehavior::Fastest,
-            &samples,
-            Duration::from_millis(16),
-        )
-        .expect("projection");
-
-        assert!(client_point_pixels(projected).0 > 120);
-        assert_eq!(client_point_pixels(projected).1, 200);
-    }
-
-    #[test]
-    fn cursor_latency_match_os_behavior_stays_on_latest_sample() {
-        let now = Instant::now();
-        let samples = VecDeque::from([
-            CursorLatencySample {
-                point: ClientPoint::new(100, 200),
-                captured_at: now - Duration::from_millis(16),
-            },
-            CursorLatencySample {
-                point: ClientPoint::new(120, 212),
-                captured_at: now,
-            },
-        ]);
-
-        let projected = cursor_latency_projected_position(
-            windows_scene::CursorLatencyBehavior::MatchOs,
-            &samples,
-            Duration::from_millis(16),
-        )
-        .expect("projection");
-
-        assert_eq!(projected, ClientPoint::new(120, 212));
-    }
-
-    #[test]
-    fn cursor_latency_view_state_uses_latest_measured_projection_interval() {
-        let now = Instant::now();
-        let mut playground = CursorLatencyPlaygroundState::new();
-        playground.sync(Some(ClientPoint::new(100, 200)), now - Duration::from_millis(8), 8);
-        playground.sync(Some(ClientPoint::new(120, 200)), now, 8);
-
-        let expected = cursor_latency_projected_position(
-            windows_scene::CursorLatencyBehavior::Fastest,
-            &playground.samples,
-            Duration::from_millis(8),
-        );
-
-        assert_eq!(playground.view_state().fastest_cursor_position, expected);
     }
 
     #[test]

@@ -20,7 +20,7 @@
     clippy::unused_self
 )]
 #![allow(clippy::wildcard_imports)]
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::ffi::{CStr, CString, c_void};
 use std::fmt::Write as _;
 use std::ops::Range;
@@ -39,7 +39,7 @@ use image::{ImageBuffer, Rgba, RgbaImage};
 use tracing::debug_span;
 use tracing::{info, info_span, instrument, warn};
 use ttf_parser::{Face, GlyphId, OutlineBuilder};
-use windows::Win32::Foundation::{E_FAIL, FreeLibrary, HANDLE, HWND, RECT, TRUE};
+use windows::Win32::Foundation::{E_FAIL, FreeLibrary, HANDLE, HWND, POINT, RECT, TRUE};
 use windows::Win32::Graphics::Direct3D::Fxc::{
     D3DCOMPILE_DEBUG, D3DCOMPILE_SKIP_OPTIMIZATION, D3DCompile,
 };
@@ -59,20 +59,23 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::System::LibraryLoader::LoadLibraryW;
 use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObjectEx};
 use windows::Win32::UI::WindowsAndMessaging::{
-    DI_NORMAL, DestroyIcon, DrawIconEx, GetClientRect, HICON, IDC_ARROW, IDC_CROSS, IDC_HAND,
-    IDC_HELP, IDC_IBEAM, IDC_SIZEALL, IDC_WAIT, IMAGE_FLAGS, IMAGE_ICON, LoadCursorW, LoadImageW,
+    DI_NORMAL, DestroyIcon, DrawIconEx, GetClientRect, GetCursorPos, GetWindowRect, HICON,
+    IDC_ARROW, IDC_CROSS, IDC_HAND, IDC_HELP, IDC_IBEAM, IDC_SIZEALL, IDC_WAIT, IMAGE_FLAGS,
+    IMAGE_ICON, LoadCursorW, LoadImageW,
 };
 use windows::core::BOOL;
 use windows::core::{Error, Interface, Owned, PCSTR, PCWSTR, s};
 
 use super::cell_grid;
-use super::spatial::{ClientRect, TerminalCellPoint};
+use super::spatial::{ClientPoint, ClientRect, TerminalCellPoint};
+use super::windows_scene::{self, CursorLatencyBehavior, CursorLatencyPlaygroundViewState, SceneAction};
 use super::windows_terminal::{
     SharedTerminalDisplayState, TerminalDisplayCursor, TerminalDisplayCursorStyle,
     TerminalDisplayRow, TerminalDisplayScrollbar, TerminalLayout, TerminalSelection,
 };
 
 const FRAME_COUNT: usize = 2;
+const CURSOR_LATENCY_HISTORY_SIZE: usize = 2;
 const MAX_PANEL_COUNT: usize = 8_192;
 const MAX_GLYPH_COUNT: usize = 8_192;
 const MAX_SPRITE_COUNT: usize = 256;
@@ -104,6 +107,12 @@ static TERMINAL_FONT_LAYOUT_CACHE: OnceLock<Result<Arc<TerminalFontLayoutSnapsho
     OnceLock::new();
 static SPRITE_ATLAS_CACHE: OnceLock<Result<Arc<SpriteAtlas>, String>> = OnceLock::new();
 static COMPILED_SHADER_CACHE: OnceLock<Result<CompiledShaders, String>> = OnceLock::new();
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RendererPresentationMode {
+    Composed,
+    LowLatencyHwnd,
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -418,12 +427,15 @@ pub struct RenderScene {
 
 #[derive(Debug)]
 pub struct D3d12PanelRenderer {
+    hwnd: HWND,
+    presentation_mode: RendererPresentationMode,
+    allow_tearing: bool,
     _dxgi_factory: IDXGIFactory4,
     dxgi_info_queue: Option<IDXGIInfoQueue>,
     device: ID3D12Device,
-    _dcomp_device: IDCompositionDevice,
-    _dcomp_target: IDCompositionTarget,
-    _dcomp_visual: IDCompositionVisual,
+    _dcomp_device: Option<IDCompositionDevice>,
+    _dcomp_target: Option<IDCompositionTarget>,
+    _dcomp_visual: Option<IDCompositionVisual>,
     command_queue: ID3D12CommandQueue,
     swap_chain: IDXGISwapChain3,
     render_targets: [Option<ID3D12Resource>; FRAME_COUNT],
@@ -462,6 +474,7 @@ pub struct D3d12PanelRenderer {
     scissor_rect: RECT,
     width: u32,
     height: u32,
+    cursor_latency_samples: VecDeque<ClientPoint>,
     animation_start: Instant,
 }
 
@@ -513,6 +526,12 @@ pub struct WindowChromeButtonsState {
     pub focused: bool,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct CursorLatencyFrameModel {
+    pub behavior: CursorLatencyBehavior,
+    pub button_states: Vec<(SceneAction, ButtonVisualState)>,
+}
+
 #[derive(Clone, Debug)]
 pub struct RenderFrameModel {
     pub layout: TerminalLayout,
@@ -520,6 +539,7 @@ pub struct RenderFrameModel {
     pub diagnostic_text: String,
     pub diagnostic_selection: Option<TerminalSelection>,
     pub window_chrome_buttons_state: WindowChromeButtonsState,
+    pub cursor_latency: Option<CursorLatencyFrameModel>,
     pub diagnostic_cell_width: i32,
     pub diagnostic_cell_height: i32,
     pub scene: Option<RenderScene>,
@@ -537,6 +557,7 @@ impl PartialEq for RenderFrameModel {
             && self.diagnostic_text == other.diagnostic_text
             && self.diagnostic_selection == other.diagnostic_selection
             && self.window_chrome_buttons_state == other.window_chrome_buttons_state
+            && self.cursor_latency == other.cursor_latency
             && self.diagnostic_cell_width == other.diagnostic_cell_width
             && self.diagnostic_cell_height == other.diagnostic_cell_height
             && self.terminal_cell_width == other.terminal_cell_width
@@ -609,6 +630,14 @@ struct CachedCompositedVertices {
 impl RenderThreadProxy {
     #[instrument(level = "info", skip_all)]
     pub fn new(hwnd: HWND) -> eyre::Result<Self> {
+        Self::new_with_mode(hwnd, RendererPresentationMode::Composed)
+    }
+
+    #[instrument(level = "info", skip_all)]
+    pub fn new_with_mode(
+        hwnd: HWND,
+        presentation_mode: RendererPresentationMode,
+    ) -> eyre::Result<Self> {
         let shared = Arc::new((
             Mutex::new(RenderThreadShared {
                 pending_resize: None,
@@ -627,8 +656,10 @@ impl RenderThreadProxy {
         let worker = thread::Builder::new()
             .name("teamy-d3d12-renderer".to_owned())
             .spawn(move || {
-                let startup_result =
-                    D3d12PanelRenderer::new(HWND(raw_hwnd as *mut core::ffi::c_void));
+                let startup_result = D3d12PanelRenderer::new(
+                    HWND(raw_hwnd as *mut core::ffi::c_void),
+                    presentation_mode,
+                );
                 match startup_result {
                     Ok(mut renderer) => {
                         let _ = startup_tx.send(Ok(()));
@@ -820,7 +851,7 @@ fn render_thread_main_loop(
 
 impl D3d12PanelRenderer {
     #[instrument(level = "info", skip_all)]
-    pub fn new(hwnd: HWND) -> eyre::Result<Self> {
+    pub fn new(hwnd: HWND, presentation_mode: RendererPresentationMode) -> eyre::Result<Self> {
         let font_prewarm = maybe_spawn_terminal_font_prewarm()?;
         let sprite_atlas_prewarm = maybe_spawn_sprite_atlas_prewarm()?;
         let shader_prewarm = maybe_spawn_compiled_shader_prewarm()?;
@@ -831,11 +862,29 @@ impl D3d12PanelRenderer {
             info_span!("create_d3d12_command_queue").in_scope(|| create_command_queue(&device))?;
         let (width, height) =
             info_span!("query_renderer_client_size").in_scope(|| client_size(hwnd))?;
+        let allow_tearing = presentation_mode == RendererPresentationMode::LowLatencyHwnd
+            && supports_allow_tearing(&dxgi_factory);
         let swap_chain = info_span!("create_swap_chain", width, height)
-            .in_scope(|| create_swap_chain(&dxgi_factory, &command_queue, width, height))?;
+            .in_scope(|| {
+                create_swap_chain(
+                    &dxgi_factory,
+                    &command_queue,
+                    hwnd,
+                    width,
+                    height,
+                    presentation_mode,
+                    allow_tearing,
+                )
+            })?;
         unsafe { dxgi_factory.MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER)? };
-        let (dcomp_device, dcomp_target, dcomp_visual) = info_span!("attach_swap_chain_to_window")
-            .in_scope(|| attach_swap_chain_to_window(hwnd, &swap_chain))?;
+        let (dcomp_device, dcomp_target, dcomp_visual) =
+            if presentation_mode == RendererPresentationMode::Composed {
+                let (device, target, visual) = info_span!("attach_swap_chain_to_window")
+                    .in_scope(|| attach_swap_chain_to_window(hwnd, &swap_chain))?;
+                (Some(device), Some(target), Some(visual))
+            } else {
+                (None, None, None)
+            };
         unsafe { swap_chain.SetMaximumFrameLatency(1)? };
         let frame_latency_waitable_object =
             unsafe { Owned::new(swap_chain.GetFrameLatencyWaitableObject()) };
@@ -906,6 +955,9 @@ impl D3d12PanelRenderer {
         };
 
         Ok(Self {
+            hwnd,
+            presentation_mode,
+            allow_tearing,
             _dxgi_factory: dxgi_factory,
             dxgi_info_queue,
             device,
@@ -950,6 +1002,7 @@ impl D3d12PanelRenderer {
             scissor_rect,
             width,
             height,
+            cursor_latency_samples: VecDeque::with_capacity(CURSOR_LATENCY_HISTORY_SIZE),
             animation_start: Instant::now(),
         })
     }
@@ -985,13 +1038,17 @@ impl D3d12PanelRenderer {
                 .GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV)
         };
         self.frame_latency_waitable_object = Owned::default();
+        let mut resize_flags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
+        if self.presentation_mode == RendererPresentationMode::LowLatencyHwnd && self.allow_tearing {
+            resize_flags |= DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
+        }
         if let Err(error) = unsafe {
             self.swap_chain.ResizeBuffers(
                 FRAME_COUNT as u32,
                 width,
                 height,
                 DXGI_FORMAT_B8G8R8A8_UNORM,
-                DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT,
+                resize_flags,
             )
         } {
             self.log_dxgi_debug_messages("ResizeBuffers");
@@ -1182,6 +1239,10 @@ impl D3d12PanelRenderer {
         // Frame-model rendering updates shared upload buffers before command recording, so keep
         // the previous submission drained before producing the next frame.
         self.wait_for_last_submitted_frame()?;
+        if let Some(cursor_latency) = frame.cursor_latency.as_ref() {
+            scene_cache.last_frame = Some(frame.clone());
+            return self.render_cursor_latency_frame_model(frame, cursor_latency);
+        }
         if !force_redraw && !resized && scene_cache.last_frame.as_ref() == Some(frame) {
             return Ok(());
         }
@@ -1318,6 +1379,75 @@ impl D3d12PanelRenderer {
         scene_cache.last_frame = Some(frame.clone());
 
         self.execute_prepared_frame(vertex_count)
+    }
+
+    fn render_cursor_latency_frame_model(
+        &mut self,
+        frame: &RenderFrameModel,
+        cursor_latency: &CursorLatencyFrameModel,
+    ) -> eyre::Result<()> {
+        self.wait_for_frame_latency()?;
+        let frame_index = unsafe { self.swap_chain.GetCurrentBackBufferIndex() as usize };
+        self.wait_for_frame(frame_index)?;
+
+        let view_state = self.late_latched_cursor_latency_view_state(cursor_latency.behavior)?;
+        let scene = windows_scene::build_cursor_latency_playground_render_scene(
+            frame.layout,
+            frame.window_chrome_buttons_state,
+            view_state,
+            &cursor_latency.button_states,
+        );
+
+        self.transformed_glyph_clip_rect = None;
+        self.transformed_glyph_debug_enabled = false;
+        self.transformed_glyph_debug_hover = [0.0; 4];
+        self.transformed_text_projection = [[0.0; 4]; 2];
+        self.transformed_text_inverse_homography = [[0.0; 4]; 2];
+
+        let _ = self.update_slug_curves_for_fragments(&[&scene])?;
+        let scene_vertices = self.build_scene_vertices(&scene);
+        let vertex_count = self.upload_cached_fragment_vertices(&[scene_vertices.as_slice()])?;
+        upload_transformed_glyph_inverse_data(&self.transformed_glyph_inverse_buffer, &[&scene])?;
+
+        self.execute_prepared_frame_for_slot(vertex_count, frame_index)
+    }
+
+    fn late_latched_cursor_latency_view_state(
+        &mut self,
+        behavior: CursorLatencyBehavior,
+    ) -> eyre::Result<CursorLatencyPlaygroundViewState> {
+        let sampled_cursor = self.sample_cursor_latency_position()?;
+        if let Some(point) = sampled_cursor {
+            self.cursor_latency_samples.push_back(point);
+            while self.cursor_latency_samples.len() > CURSOR_LATENCY_HISTORY_SIZE {
+                self.cursor_latency_samples.pop_front();
+            }
+        } else {
+            self.cursor_latency_samples.clear();
+        }
+
+        Ok(cursor_latency_view_state_from_samples(
+            behavior,
+            &self.cursor_latency_samples,
+            sampled_cursor,
+        ))
+    }
+
+    fn sample_cursor_latency_position(&self) -> eyre::Result<Option<ClientPoint>> {
+        let mut point = POINT::default();
+        unsafe { GetCursorPos(&mut point) }.wrap_err("failed to query cursor position")?;
+
+        let mut window_rect = RECT::default();
+        unsafe { GetWindowRect(self.hwnd, &mut window_rect) }
+            .wrap_err("failed to query renderer window rectangle")?;
+
+        let x = point.x - window_rect.left;
+        let y = point.y - window_rect.top;
+        if x < 0 || y < 0 || x >= self.width as i32 || y >= self.height as i32 {
+            return Ok(None);
+        }
+
+        Ok(Some(ClientPoint::new(x, y)))
     }
 
     fn update_scene_vertices_for_fragments(&self, scenes: &[&RenderScene]) -> eyre::Result<usize> {
@@ -1465,6 +1595,15 @@ impl D3d12PanelRenderer {
             self.wait_for_frame(frame_index)?;
         }
 
+        self.execute_prepared_frame_for_slot(vertex_count, frame_index)
+    }
+
+    fn execute_prepared_frame_for_slot(
+        &mut self,
+        vertex_count: usize,
+        frame_index: usize,
+    ) -> eyre::Result<()> {
+
         let current_target = self.render_targets[frame_index]
             .as_ref()
             .ok_or_else(|| eyre::eyre!("render target was missing for current frame"))?;
@@ -1537,7 +1676,14 @@ impl D3d12PanelRenderer {
                 self.command_queue.ExecuteCommandLists(&command_lists);
             }
             self.ensure_live_device_active("device was removed after command submission")?;
-            if let Err(error) = unsafe { self.swap_chain.Present(0, DXGI_PRESENT(0)).ok() } {
+            let present_flags = if self.presentation_mode == RendererPresentationMode::LowLatencyHwnd
+                && self.allow_tearing
+            {
+                DXGI_PRESENT_ALLOW_TEARING
+            } else {
+                DXGI_PRESENT(0)
+            };
+            if let Err(error) = unsafe { self.swap_chain.Present(0, present_flags).ok() } {
                 return self.report_live_device_failure("swap-chain present failed", &error);
             }
         }
@@ -1882,6 +2028,51 @@ fn build_scene_vertices_with_assets(
         append_text_rect(&mut vertices, glyph.rect, glyph.color, slug_glyph, font);
     }
     vertices
+}
+
+fn cursor_latency_view_state_from_samples(
+    behavior: CursorLatencyBehavior,
+    samples: &VecDeque<ClientPoint>,
+    sampled_cursor: Option<ClientPoint>,
+) -> CursorLatencyPlaygroundViewState {
+    let fastest_cursor_position = sampled_cursor;
+    let match_os_cursor_position = if samples.len() >= 2 {
+        samples.get(samples.len() - 2).copied()
+    } else {
+        sampled_cursor
+    };
+    let rendered_cursor_position = match behavior {
+        CursorLatencyBehavior::Fastest => fastest_cursor_position,
+        CursorLatencyBehavior::MatchOs => match_os_cursor_position,
+    };
+    let lead_pixels = fastest_cursor_position
+        .zip(match_os_cursor_position)
+        .map_or(0, |(fastest, matched)| cursor_latency_distance_pixels(fastest, matched));
+
+    CursorLatencyPlaygroundViewState {
+        behavior,
+        os_cursor_position: sampled_cursor,
+        rendered_cursor_position,
+        fastest_cursor_position,
+        match_os_cursor_position,
+        trail_points: samples.iter().copied().collect(),
+        lead_pixels,
+        sample_count: samples.len(),
+    }
+}
+
+fn cursor_latency_distance_pixels(left: ClientPoint, right: ClientPoint) -> i32 {
+    let left = left
+        .to_win32_point()
+        .expect("client points built from pixels must convert back to pixels");
+    let right = right
+        .to_win32_point()
+        .expect("client points built from pixels must convert back to pixels");
+    let delta_x = right.x - left.x;
+    let delta_y = right.y - left.y;
+    (f64::from(delta_x * delta_x + delta_y * delta_y)
+        .sqrt()
+        .round()) as i32
 }
 
 fn can_reuse_cached_scene_vertices(
@@ -5124,14 +5315,69 @@ fn create_closed_command_list(
 fn create_swap_chain(
     factory: &IDXGIFactory4,
     command_queue: &ID3D12CommandQueue,
+    hwnd: HWND,
     width: u32,
     height: u32,
+    presentation_mode: RendererPresentationMode,
+    allow_tearing: bool,
 ) -> eyre::Result<IDXGISwapChain3> {
     let factory: IDXGIFactory2 = factory.cast()?;
-    let description = composition_swap_chain_description(width, height);
-    let swap_chain: IDXGISwapChain1 =
-        unsafe { factory.CreateSwapChainForComposition(command_queue, &description, None)? };
+    let swap_chain: IDXGISwapChain1 = match presentation_mode {
+        RendererPresentationMode::Composed => {
+            let description = composition_swap_chain_description(width, height);
+            unsafe { factory.CreateSwapChainForComposition(command_queue, &description, None)? }
+        }
+        RendererPresentationMode::LowLatencyHwnd => {
+            let description = low_latency_hwnd_swap_chain_description(width, height, allow_tearing);
+            unsafe { factory.CreateSwapChainForHwnd(command_queue, hwnd, &description, None, None)? }
+        }
+    };
     Ok(swap_chain.cast()?)
+}
+
+fn low_latency_hwnd_swap_chain_description(
+    width: u32,
+    height: u32,
+    allow_tearing: bool,
+) -> DXGI_SWAP_CHAIN_DESC1 {
+    let mut flags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT.0 as u32;
+    if allow_tearing {
+        flags |= DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING.0 as u32;
+    }
+
+    DXGI_SWAP_CHAIN_DESC1 {
+        Width: width,
+        Height: height,
+        Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+        Stereo: false.into(),
+        SampleDesc: DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
+        BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
+        BufferCount: FRAME_COUNT as u32,
+        Scaling: DXGI_SCALING_STRETCH,
+        SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
+        AlphaMode: DXGI_ALPHA_MODE_IGNORE,
+        Flags: flags,
+    }
+}
+
+fn supports_allow_tearing(factory: &IDXGIFactory4) -> bool {
+    let Ok(factory) = factory.cast::<IDXGIFactory5>() else {
+        return false;
+    };
+
+    let mut allow_tearing = BOOL::default();
+    unsafe {
+        factory.CheckFeatureSupport(
+            DXGI_FEATURE_PRESENT_ALLOW_TEARING,
+            &mut allow_tearing as *mut _ as *mut _,
+            std::mem::size_of_val(&allow_tearing) as u32,
+        )
+    }
+    .is_ok()
+        && allow_tearing.as_bool()
 }
 
 fn composition_swap_chain_description(width: u32, height: u32) -> DXGI_SWAP_CHAIN_DESC1 {
@@ -7051,7 +7297,8 @@ mod tests {
         CachedSceneVertices, FALLBACK_GLYPH, PanelEffect, RenderScene, Vertex,
         WindowChromeButtonsState, append_rect, append_slug_band_data, build_panel_scene,
         build_shader_params, can_reuse_cached_scene_vertices, collect_scene_chars,
-        compile_embedded_shaders, composition_swap_chain_description, cpu_slug_coverage,
+        compile_embedded_shaders, composition_swap_chain_description,
+        cursor_latency_view_state_from_samples, cpu_slug_coverage,
         cpu_slug_coverage_all_curves, dirty_fragment_ranges, extract_glyph_curves,
         fragment_ranges_match, fragment_vertex_ranges, load_snapshot_glyph, load_terminal_font,
         preferred_title_bar_color, push_centered_text, push_glyph, push_overlay_panel, push_panel,
@@ -7064,11 +7311,13 @@ mod tests {
         build_reference_zero_angle_transformed_text_frame,
         build_reference_zero_angle_transformed_text_layout,
     };
-    use crate::app::spatial::ClientRect;
+    use crate::app::spatial::{ClientPoint, ClientRect};
+    use crate::app::windows_scene::CursorLatencyBehavior;
     use crate::app::windows_terminal::TerminalDisplayScrollbar;
     use crate::app::windows_terminal::TerminalLayout;
     use eyre::WrapErr;
     use image::RgbaImage;
+    use std::collections::VecDeque;
     use ttf_parser::{Face, OutlineBuilder};
     use windows::Win32::Foundation::RECT;
     use windows::Win32::Graphics::Dxgi::Common::DXGI_ALPHA_MODE_PREMULTIPLIED;
@@ -7104,6 +7353,37 @@ mod tests {
         );
 
         assert_eq!(scene.glyphs.len(), 2);
+    }
+
+    #[test]
+    fn cursor_latency_fastest_uses_latest_latched_sample() {
+        let samples = VecDeque::from([ClientPoint::new(100, 200), ClientPoint::new(120, 212)]);
+
+        let view_state = cursor_latency_view_state_from_samples(
+            CursorLatencyBehavior::Fastest,
+            &samples,
+            Some(ClientPoint::new(120, 212)),
+        );
+
+        assert_eq!(view_state.fastest_cursor_position, Some(ClientPoint::new(120, 212)));
+        assert_eq!(view_state.match_os_cursor_position, Some(ClientPoint::new(100, 200)));
+        assert_eq!(view_state.rendered_cursor_position, Some(ClientPoint::new(120, 212)));
+    }
+
+    #[test]
+    fn cursor_latency_match_os_uses_previous_latched_sample() {
+        let samples = VecDeque::from([ClientPoint::new(100, 200), ClientPoint::new(120, 212)]);
+
+        let view_state = cursor_latency_view_state_from_samples(
+            CursorLatencyBehavior::MatchOs,
+            &samples,
+            Some(ClientPoint::new(120, 212)),
+        );
+
+        assert_eq!(view_state.fastest_cursor_position, Some(ClientPoint::new(120, 212)));
+        assert_eq!(view_state.match_os_cursor_position, Some(ClientPoint::new(100, 200)));
+        assert_eq!(view_state.rendered_cursor_position, Some(ClientPoint::new(100, 200)));
+        assert!(view_state.lead_pixels > 0);
     }
 
     #[test]
