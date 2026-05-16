@@ -635,7 +635,8 @@ impl RenderThreadProxy {
                         render_thread_main_loop(&shared_for_worker, &mut renderer);
                     }
                     Err(error) => {
-                        let message = format!("failed to create D3D12 renderer thread: {error}");
+                        let message =
+                            format!("failed to create D3D12 renderer thread: {error:#}");
                         if let Ok(mut state) = shared_for_worker.0.lock() {
                             state.error = Some(message.clone());
                         }
@@ -800,7 +801,7 @@ fn render_thread_main_loop(
 
         if let Err(error) = result {
             if let Ok(mut state) = shared.0.lock() {
-                state.error = Some(error.to_string());
+                state.error = Some(format!("{error:#}"));
                 shared.1.notify_all();
             }
             return;
@@ -1095,6 +1096,29 @@ impl D3d12PanelRenderer {
         }
     }
 
+    fn device_removed_reason_summary(&self) -> String {
+        match unsafe { self.device.GetDeviceRemovedReason() } {
+            Ok(()) => "GetDeviceRemovedReason returned S_OK".to_owned(),
+            Err(error) => format!("GetDeviceRemovedReason returned {error}"),
+        }
+    }
+
+    fn report_live_device_failure<T>(&self, context: &str, error: &Error) -> eyre::Result<T> {
+        self.log_dxgi_debug_messages(context);
+        Err(eyre::eyre!(
+            "{context}: {error}; {}",
+            self.device_removed_reason_summary()
+        ))
+    }
+
+    fn ensure_live_device_active(&self, context: &str) -> eyre::Result<()> {
+        if let Err(error) = unsafe { self.device.GetDeviceRemovedReason() } {
+            self.log_dxgi_debug_messages(context);
+            eyre::bail!("{context}: {error}");
+        }
+        Ok(())
+    }
+
     #[expect(
         dead_code,
         reason = "compatibility wrapper while callers migrate to fragment-based rendering"
@@ -1106,6 +1130,9 @@ impl D3d12PanelRenderer {
 
     #[cfg_attr(feature = "tracy", instrument(level = "debug", skip_all))]
     pub fn render_fragments(&mut self, scenes: &[&RenderScene]) -> eyre::Result<()> {
+        // Curve, band, inverse, and vertex uploads all reuse shared upload buffers, so the
+        // previous frame must be finished before we overwrite them for a new live frame.
+        self.wait_for_last_submitted_frame()?;
         self.transformed_glyph_clip_rect = scenes
             .iter()
             .find_map(|scene| scene.transformed_glyph_clip_rect);
@@ -1152,6 +1179,9 @@ impl D3d12PanelRenderer {
         resized: bool,
         scene_cache: &mut RenderThreadSceneCache,
     ) -> eyre::Result<()> {
+        // Frame-model rendering updates shared upload buffers before command recording, so keep
+        // the previous submission drained before producing the next frame.
+        self.wait_for_last_submitted_frame()?;
         if !force_redraw && !resized && scene_cache.last_frame.as_ref() == Some(frame) {
             return Ok(());
         }
@@ -1426,7 +1456,7 @@ impl D3d12PanelRenderer {
         {
             #[cfg(feature = "tracy")]
             let _span = debug_span!("wait_for_frame_sync").entered();
-            self.wait_for_frame_latency();
+            self.wait_for_frame_latency()?;
         }
         let frame_index = unsafe { self.swap_chain.GetCurrentBackBufferIndex() as usize };
         {
@@ -1505,7 +1535,10 @@ impl D3d12PanelRenderer {
             let _span = debug_span!("submit_and_present_frame").entered();
             unsafe {
                 self.command_queue.ExecuteCommandLists(&command_lists);
-                self.swap_chain.Present(0, DXGI_PRESENT(0)).ok()?;
+            }
+            self.ensure_live_device_active("device was removed after command submission")?;
+            if let Err(error) = unsafe { self.swap_chain.Present(0, DXGI_PRESENT(0)).ok() } {
+                return self.report_live_device_failure("swap-chain present failed", &error);
             }
         }
 
@@ -1657,14 +1690,16 @@ impl D3d12PanelRenderer {
         Ok(())
     }
 
-    fn wait_for_frame_latency(&self) {
+    fn wait_for_frame_latency(&self) -> eyre::Result<()> {
         if self.frame_latency_waitable_object.0.is_null() {
-            return;
+            return Ok(());
         }
 
         unsafe {
             WaitForSingleObjectEx(*self.frame_latency_waitable_object, INFINITE, false);
         }
+
+        self.ensure_live_device_active("device was removed while waiting for frame latency")
     }
 
     #[expect(
@@ -1685,18 +1720,56 @@ impl D3d12PanelRenderer {
         unsafe {
             if self.fence.GetCompletedValue() < fence_value {
                 self.fence
-                    .SetEventOnCompletion(fence_value, *self.fence_event)?;
+                    .SetEventOnCompletion(fence_value, *self.fence_event)
+                    .map_err(|error| {
+                        eyre::eyre!(
+                            "failed to register frame fence completion event: {error}; {}",
+                            self.device_removed_reason_summary()
+                        )
+                    })?;
                 WaitForSingleObjectEx(*self.fence_event, INFINITE, false);
             }
         }
 
+        self.ensure_live_device_active("device was removed while waiting for frame fence")?;
+
         Ok(())
+    }
+
+    fn wait_for_last_submitted_frame(&self) -> eyre::Result<()> {
+        let fence_value = self.next_fence_value.saturating_sub(1);
+        if fence_value == 0 {
+            return Ok(());
+        }
+
+        unsafe {
+            if self.fence.GetCompletedValue() < fence_value {
+                self.fence
+                    .SetEventOnCompletion(fence_value, *self.fence_event)
+                    .map_err(|error| {
+                        eyre::eyre!(
+                            "failed to wait for previous frame upload reuse point: {error}; {}",
+                            self.device_removed_reason_summary()
+                        )
+                    })?;
+                WaitForSingleObjectEx(*self.fence_event, INFINITE, false);
+            }
+        }
+
+        self.ensure_live_device_active("device was removed while waiting for previous frame completion")
     }
 
     fn signal_frame(&mut self, frame_index: usize) -> eyre::Result<()> {
         let fence_value = self.next_fence_value;
         unsafe {
-            self.command_queue.Signal(&self.fence, fence_value)?;
+            self.command_queue
+                .Signal(&self.fence, fence_value)
+                .map_err(|error| {
+                    eyre::eyre!(
+                        "failed to signal frame fence: {error}; {}",
+                        self.device_removed_reason_summary()
+                    )
+                })?;
         }
         self.frame_fence_values[frame_index] = fence_value;
         self.next_fence_value += 1;
@@ -7253,6 +7326,39 @@ mod tests {
         assert!(
             visible_pixel_count > 0,
             "rotated transformed text fixture should still render visible pixels"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn large_lorem_strong_yaw_transformed_text_offscreen_render_completes() -> eyre::Result<()> {
+        let reference_layout = crate::app::render_verification::build_reference_text_layout_with_config(
+            TerminalLayout {
+                client_width: 1040,
+                client_height: 680,
+                cell_width: 8,
+                cell_height: 16,
+                diagnostic_panel_visible: false,
+            },
+            concat!(
+                "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Quis ipsum suspendisse ultrices gravida dictum fusce ut placerat orci nulla pellentesque dignissim enim sit amet venenatis urna cursus eget nunc scelerisque viverra mauris in aliquam sem fringilla ut morbi tincidunt augue interdum velit.\n\n",
+                "Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Nunc pulvinar sapien et ligula ullamcorper malesuada proin libero nunc consequat interdum varius sit amet mattis vulputate enim nulla aliquet porttitor lacus luctus accumsan tortor posuere ac ut consequat semper viverra nam libero justo laoreet sit amet.\n\n",
+                "Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Integer feugiat scelerisque varius morbi enim nunc faucibus a pellentesque sit amet porttitor eget dolor morbi non arcu risus quis varius quam quisque id diam vel quam elementum pulvinar etiam non quam lacus suspendisse faucibus interdum posuere lorem.\n\n",
+                "Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum. Mauris ultrices eros in cursus turpis massa tincidunt dui ut ornare lectus sit amet est placerat in egestas erat imperdiet sed euismod nisi porta lorem mollis aliquam ut porttitor leo a diam sollicitudin tempor id eu nisl nunc mi ipsum faucibus vitae aliquet nec ullamcorper.\n\n",
+                "Habitant morbi tristique senectus et netus et malesuada fames ac turpis egestas sed tempus urna et pharetra pharetra massa massa ultricies mi quis hendrerit dolor magna eget est lorem ipsum dolor sit amet consectetur adipiscing elit duis tristique sollicitudin nibh sit amet commodo nulla facilisi nullam vehicula ipsum a arcu cursus vitae congue mauris.\n\n",
+                "Amet justo donec enim diam vulputate ut pharetra sit amet aliquam id diam maecenas ultricies mi eget mauris pharetra et ultrices neque ornare aenean euismod elementum nisi quis eleifend quam adipiscing vitae proin sagittis nisl rhoncus mattis rhoncus urna neque viverra justo nec ultrices dui sapien eget mi proin sed libero enim sed faucibus turpis in eu mi bibendum neque."
+            ),
+            320.0,
+            -1.1,
+            0.0,
+        );
+        let image = render_frame_model_offscreen_image(&reference_layout.frame())?;
+
+        let visible_pixel_count = image.pixels().filter(|pixel| pixel.0[3] > 0).count();
+        assert!(
+            visible_pixel_count > 0,
+            "large strong-yaw transformed text fixture should still render visible pixels"
         );
 
         Ok(())

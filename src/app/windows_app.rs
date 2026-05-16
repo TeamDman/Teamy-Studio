@@ -9472,6 +9472,16 @@ fn build_text_rendering_glyph_instances(
                 });
             let corners = transformed_corners.map(|(corner, _)| corner);
             let corner_w = transformed_corners.map(|(_, clip_w)| clip_w);
+            let projection_is_valid = corners
+                .iter()
+                .all(|corner| corner.iter().all(|value| value.is_finite()))
+                && corner_w
+                    .iter()
+                    .all(|clip_w| clip_w.is_finite() && *clip_w > 0.0);
+            if !projection_is_valid {
+                pen_x_units += advance;
+                continue;
+            }
             let min_x = corners
                 .iter()
                 .map(|corner| corner[0])
@@ -16236,6 +16246,31 @@ mod tests {
         state.cursor_latency_playground = Some(CursorLatencyPlaygroundState::new());
 
         assert!(scene_needs_focused_timer_render(&state));
+    }
+
+    #[test]
+    fn text_rendering_verification_geometry_stays_finite_at_extreme_angles() {
+        let (_view_state, plane_basis, glyphs) = build_text_rendering_plane_verification_geometry(
+            test_scene_layout(),
+            "TEAMY",
+            6.0,
+            1.45,
+            TEXT_RENDERING_PITCH_LIMIT_RADIANS,
+            [320.0, -180.0],
+            [0.0, 0.0],
+            [1.0, 1.0, 1.0, 1.0],
+        );
+
+        assert!(plane_basis.is_some());
+        assert!(!glyphs.is_empty());
+        assert!(glyphs.iter().all(|glyph| glyph
+            .corners
+            .iter()
+            .all(|corner| corner.iter().all(|value| value.is_finite()))));
+        assert!(glyphs.iter().all(|glyph| glyph
+            .corner_w
+            .iter()
+            .all(|clip_w| clip_w.is_finite() && *clip_w > 0.0)));
     }
 
     #[test]
