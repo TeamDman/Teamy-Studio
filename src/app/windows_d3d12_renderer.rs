@@ -528,6 +528,23 @@ pub struct WindowChromeButtonsState {
 #[derive(Clone, Debug, PartialEq)]
 pub struct CursorLatencyFrameModel {
     pub button_states: Vec<(SceneAction, ButtonVisualState)>,
+    pub brick: CursorLatencyBrickFrameModel,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CursorLatencyBrickFrameModel {
+    pub center: ClientPoint,
+    pub drag_offset: Option<[i32; 2]>,
+    pub hovered: bool,
+    pub dragging: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LateLatchedPointerVisual {
+    TimelinePlaygroundCursorGuide {
+        ruler_rect: ClientRect,
+        content_rect: ClientRect,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -538,6 +555,7 @@ pub struct RenderFrameModel {
     pub diagnostic_selection: Option<TerminalSelection>,
     pub window_chrome_buttons_state: WindowChromeButtonsState,
     pub cursor_latency: Option<CursorLatencyFrameModel>,
+    pub late_latched_pointer_visual: Option<LateLatchedPointerVisual>,
     pub diagnostic_cell_width: i32,
     pub diagnostic_cell_height: i32,
     pub scene: Option<RenderScene>,
@@ -556,6 +574,7 @@ impl PartialEq for RenderFrameModel {
             && self.diagnostic_selection == other.diagnostic_selection
             && self.window_chrome_buttons_state == other.window_chrome_buttons_state
             && self.cursor_latency == other.cursor_latency
+            && self.late_latched_pointer_visual == other.late_latched_pointer_visual
             && self.diagnostic_cell_width == other.diagnostic_cell_width
             && self.diagnostic_cell_height == other.diagnostic_cell_height
             && self.terminal_cell_width == other.terminal_cell_width
@@ -665,8 +684,7 @@ impl RenderThreadProxy {
                         render_thread_main_loop(&shared_for_worker, &mut renderer);
                     }
                     Err(error) => {
-                        let message =
-                            format!("failed to create D3D12 renderer thread: {error:#}");
+                        let message = format!("failed to create D3D12 renderer thread: {error:#}");
                         if let Ok(mut state) = shared_for_worker.0.lock() {
                             state.error = Some(message.clone());
                         }
@@ -885,18 +903,17 @@ impl D3d12PanelRenderer {
             info_span!("query_renderer_client_size").in_scope(|| client_size(hwnd))?;
         let allow_tearing = presentation_mode == RendererPresentationMode::LowLatencyHwnd
             && supports_allow_tearing(&dxgi_factory);
-        let swap_chain = info_span!("create_swap_chain", width, height)
-            .in_scope(|| {
-                create_swap_chain(
-                    &dxgi_factory,
-                    &command_queue,
-                    hwnd,
-                    width,
-                    height,
-                    presentation_mode,
-                    allow_tearing,
-                )
-            })?;
+        let swap_chain = info_span!("create_swap_chain", width, height).in_scope(|| {
+            create_swap_chain(
+                &dxgi_factory,
+                &command_queue,
+                hwnd,
+                width,
+                height,
+                presentation_mode,
+                allow_tearing,
+            )
+        })?;
         unsafe { dxgi_factory.MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER)? };
         let (dcomp_device, dcomp_target, dcomp_visual) =
             if presentation_mode == RendererPresentationMode::Composed {
@@ -1059,7 +1076,8 @@ impl D3d12PanelRenderer {
         };
         self.frame_latency_waitable_object = Owned::default();
         let mut resize_flags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
-        if self.presentation_mode == RendererPresentationMode::LowLatencyHwnd && self.allow_tearing {
+        if self.presentation_mode == RendererPresentationMode::LowLatencyHwnd && self.allow_tearing
+        {
             resize_flags |= DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
         }
         if let Err(error) = unsafe {
@@ -1316,6 +1334,11 @@ impl D3d12PanelRenderer {
             scene_cache.last_frame = Some(frame.clone());
             return self.render_cursor_latency_frame_model(frame, cursor_latency);
         }
+        if let Some(late_latched_pointer_visual) = frame.late_latched_pointer_visual {
+            scene_cache.last_frame = Some(frame.clone());
+            return self
+                .render_scene_with_late_latched_pointer_visual(frame, late_latched_pointer_visual);
+        }
         if !force_redraw && !resized && scene_cache.last_frame.as_ref() == Some(frame) {
             return Ok(());
         }
@@ -1463,13 +1486,19 @@ impl D3d12PanelRenderer {
         let frame_index = unsafe { self.swap_chain.GetCurrentBackBufferIndex() as usize };
         self.wait_for_frame(frame_index)?;
 
-        let view_state = self.late_latched_cursor_latency_view_state()?;
-        let scene = windows_scene::build_cursor_latency_playground_render_scene(
+        let view_state =
+            self.late_latched_cursor_latency_view_state(frame.layout, cursor_latency)?;
+        let mut scene = windows_scene::build_cursor_latency_playground_render_scene(
             frame.layout,
             frame.window_chrome_buttons_state,
             view_state,
             &cursor_latency.button_states,
         );
+        if let Some(base_scene) = frame.scene.as_ref() {
+            scene.overlay_panels = base_scene.overlay_panels.clone();
+            scene.overlay_transformed_panels = base_scene.overlay_transformed_panels.clone();
+            scene.overlay_glyphs = base_scene.overlay_glyphs.clone();
+        }
 
         self.transformed_glyph_clip_rect = None;
         self.transformed_glyph_debug_enabled = false;
@@ -1485,12 +1514,89 @@ impl D3d12PanelRenderer {
         self.execute_prepared_frame_for_slot(vertex_count, frame_index)
     }
 
-    fn late_latched_cursor_latency_view_state(&mut self) -> eyre::Result<CursorLatencyPlaygroundViewState> {
-        let sampled_cursor = self.sample_cursor_latency_position()?;
-        Ok(cursor_latency_view_state_from_sample(sampled_cursor))
+    fn render_scene_with_late_latched_pointer_visual(
+        &mut self,
+        frame: &RenderFrameModel,
+        late_latched_pointer_visual: LateLatchedPointerVisual,
+    ) -> eyre::Result<()> {
+        let Some(scene) = frame.scene.as_ref() else {
+            return Ok(());
+        };
+
+        self.wait_for_frame_latency()?;
+        let frame_index = unsafe { self.swap_chain.GetCurrentBackBufferIndex() as usize };
+        self.wait_for_frame(frame_index)?;
+
+        let sampled_pointer = self.sample_client_pointer_position()?;
+        let mut late_latched_scene = scene.clone();
+        apply_late_latched_pointer_visual(
+            &mut late_latched_scene,
+            late_latched_pointer_visual,
+            sampled_pointer,
+        );
+
+        self.transformed_glyph_clip_rect = late_latched_scene.transformed_glyph_clip_rect;
+        self.transformed_glyph_debug_enabled =
+            late_latched_scene.transformed_glyph_clip_rect.is_some()
+                && !late_latched_scene.overlay_transformed_panels.is_empty();
+        self.transformed_glyph_debug_hover = late_latched_scene
+            .overlay_transformed_panels
+            .first()
+            .map_or([0.0; 4], |panel| panel.data);
+        self.transformed_text_projection =
+            transformed_text_projection_for_scene(&late_latched_scene).unwrap_or([[0.0; 4]; 2]);
+        self.transformed_text_inverse_homography =
+            transformed_text_inverse_homography_for_scene(&late_latched_scene)
+                .unwrap_or([[0.0; 4]; 2]);
+
+        let _ = self.update_slug_curves_for_fragments(&[&late_latched_scene])?;
+        let scene_vertices = self.build_scene_vertices(&late_latched_scene);
+        let vertex_count = self.upload_cached_fragment_vertices(&[scene_vertices.as_slice()])?;
+        upload_transformed_glyph_inverse_data(
+            &self.transformed_glyph_inverse_buffer,
+            &[&late_latched_scene],
+        )?;
+
+        self.execute_prepared_frame_for_slot(vertex_count, frame_index)
     }
 
-    fn sample_cursor_latency_position(&self) -> eyre::Result<Option<ClientPoint>> {
+    fn late_latched_cursor_latency_view_state(
+        &mut self,
+        layout: TerminalLayout,
+        cursor_latency: &CursorLatencyFrameModel,
+    ) -> eyre::Result<CursorLatencyPlaygroundViewState> {
+        let sampled_cursor = self.sample_client_pointer_position()?;
+        let play_area_rect = windows_scene::cursor_latency_half_content_rect(
+            windows_scene::cursor_latency_playground_canvas_rect(layout.terminal_panel_rect()),
+        );
+        let brick_center =
+            cursor_latency
+                .brick
+                .drag_offset
+                .map_or(cursor_latency.brick.center, |offset| {
+                    let Some(sampled_cursor) = sampled_cursor else {
+                        return cursor_latency.brick.center;
+                    };
+                    let sampled_cursor = sampled_cursor
+                        .to_win32_point()
+                        .expect("client-space points must convert back to pixels");
+                    windows_scene::clamp_cursor_latency_brick_center(
+                        play_area_rect,
+                        ClientPoint::new(
+                            sampled_cursor.x + offset[0],
+                            sampled_cursor.y + offset[1],
+                        ),
+                    )
+                });
+        Ok(cursor_latency_view_state_from_sample(
+            sampled_cursor,
+            brick_center,
+            cursor_latency.brick.hovered,
+            cursor_latency.brick.dragging,
+        ))
+    }
+
+    fn sample_client_pointer_position(&self) -> eyre::Result<Option<ClientPoint>> {
         let mut point = POINT::default();
         unsafe { GetCursorPos(&mut point) }.wrap_err("failed to query cursor position")?;
 
@@ -1660,7 +1766,6 @@ impl D3d12PanelRenderer {
         vertex_count: usize,
         frame_index: usize,
     ) -> eyre::Result<()> {
-
         let current_target = self.render_targets[frame_index]
             .as_ref()
             .ok_or_else(|| eyre::eyre!("render target was missing for current frame"))?;
@@ -1733,7 +1838,8 @@ impl D3d12PanelRenderer {
                 self.command_queue.ExecuteCommandLists(&command_lists);
             }
             self.ensure_live_device_active("device was removed after command submission")?;
-            let present_flags = if self.presentation_mode == RendererPresentationMode::LowLatencyHwnd
+            let present_flags = if self.presentation_mode
+                == RendererPresentationMode::LowLatencyHwnd
                 && self.allow_tearing
             {
                 DXGI_PRESENT_ALLOW_TEARING
@@ -1959,7 +2065,9 @@ impl D3d12PanelRenderer {
             }
         }
 
-        self.ensure_live_device_active("device was removed while waiting for previous frame completion")
+        self.ensure_live_device_active(
+            "device was removed while waiting for previous frame completion",
+        )
     }
 
     fn signal_frame(&mut self, frame_index: usize) -> eyre::Result<()> {
@@ -2087,12 +2195,42 @@ fn build_scene_vertices_with_assets(
     vertices
 }
 
+fn apply_late_latched_pointer_visual(
+    scene: &mut RenderScene,
+    visual: LateLatchedPointerVisual,
+    sampled_pointer: Option<ClientPoint>,
+) {
+    match visual {
+        LateLatchedPointerVisual::TimelinePlaygroundCursorGuide {
+            ruler_rect,
+            content_rect,
+        } => windows_scene::append_timeline_playground_cursor_guide(
+            scene,
+            windows_scene::TimelinePlaygroundLayout {
+                body_rect: ClientRect::new(0, 0, 0, 0),
+                controls_rect: ClientRect::new(0, 0, 0, 0),
+                ruler_rect,
+                row_header_rect: ClientRect::new(0, 0, 0, 0),
+                content_rect,
+                vertical_scroll_offset: 0,
+            },
+            sampled_pointer,
+        ),
+    }
+}
+
 fn cursor_latency_view_state_from_sample(
     sampled_cursor: Option<ClientPoint>,
+    brick_center: ClientPoint,
+    brick_hovered: bool,
+    brick_dragging: bool,
 ) -> CursorLatencyPlaygroundViewState {
     CursorLatencyPlaygroundViewState {
         os_cursor_position: sampled_cursor,
         rendered_cursor_position: sampled_cursor,
+        brick_center,
+        brick_hovered,
+        brick_dragging,
     }
 }
 
@@ -5350,7 +5488,9 @@ fn create_swap_chain(
         }
         RendererPresentationMode::LowLatencyHwnd => {
             let description = low_latency_hwnd_swap_chain_description(width, height, allow_tearing);
-            unsafe { factory.CreateSwapChainForHwnd(command_queue, hwnd, &description, None, None)? }
+            unsafe {
+                factory.CreateSwapChainForHwnd(command_queue, hwnd, &description, None, None)?
+            }
         }
     };
     Ok(swap_chain.cast()?)
@@ -5393,7 +5533,7 @@ fn supports_allow_tearing(factory: &IDXGIFactory4) -> bool {
     unsafe {
         factory.CheckFeatureSupport(
             DXGI_FEATURE_PRESENT_ALLOW_TEARING,
-            &mut allow_tearing as *mut _ as *mut _,
+            (&mut allow_tearing as *mut BOOL).cast::<std::ffi::c_void>(),
             std::mem::size_of_val(&allow_tearing) as u32,
         )
     }
@@ -7318,14 +7458,13 @@ mod tests {
         CachedSceneVertices, FALLBACK_GLYPH, PanelEffect, RenderScene, Vertex,
         WindowChromeButtonsState, append_rect, append_slug_band_data, build_panel_scene,
         build_shader_params, can_reuse_cached_scene_vertices, collect_scene_chars,
-        compile_embedded_shaders, composition_swap_chain_description,
-        cursor_latency_view_state_from_sample, cpu_slug_coverage,
-        cpu_slug_coverage_all_curves, dirty_fragment_ranges, extract_glyph_curves,
-        fragment_ranges_match, fragment_vertex_ranges, load_snapshot_glyph, load_terminal_font,
-        preferred_title_bar_color, push_centered_text, push_glyph, push_overlay_panel, push_panel,
-        push_text_block, push_title_text, render_frame_model_offscreen_image,
-        render_snapshot_glyph_into_image, shader_compile_flags, solve_inverse_homography,
-        terminal_scrollbar_geometry, window_garden_shader_data,
+        compile_embedded_shaders, composition_swap_chain_description, cpu_slug_coverage,
+        cpu_slug_coverage_all_curves, cursor_latency_view_state_from_sample, dirty_fragment_ranges,
+        extract_glyph_curves, fragment_ranges_match, fragment_vertex_ranges, load_snapshot_glyph,
+        load_terminal_font, preferred_title_bar_color, push_centered_text, push_glyph,
+        push_overlay_panel, push_panel, push_text_block, push_title_text,
+        render_frame_model_offscreen_image, render_snapshot_glyph_into_image, shader_compile_flags,
+        solve_inverse_homography, terminal_scrollbar_geometry, window_garden_shader_data,
     };
     use crate::app::render_verification::{
         build_driver_crash_repro_transformed_text_frame, build_reference_transformed_text_frame,
@@ -7376,10 +7515,24 @@ mod tests {
 
     #[test]
     fn cursor_latency_uses_latest_latched_sample() {
-        let view_state = cursor_latency_view_state_from_sample(Some(ClientPoint::new(120, 212)));
+        let view_state = cursor_latency_view_state_from_sample(
+            Some(ClientPoint::new(120, 212)),
+            ClientPoint::new(96, 144),
+            true,
+            false,
+        );
 
-        assert_eq!(view_state.os_cursor_position, Some(ClientPoint::new(120, 212)));
-        assert_eq!(view_state.rendered_cursor_position, Some(ClientPoint::new(120, 212)));
+        assert_eq!(
+            view_state.os_cursor_position,
+            Some(ClientPoint::new(120, 212))
+        );
+        assert_eq!(
+            view_state.rendered_cursor_position,
+            Some(ClientPoint::new(120, 212))
+        );
+        assert_eq!(view_state.brick_center, ClientPoint::new(96, 144));
+        assert!(view_state.brick_hovered);
+        assert!(!view_state.brick_dragging);
     }
 
     #[test]
@@ -7609,26 +7762,27 @@ mod tests {
 
     #[test]
     fn large_lorem_strong_yaw_transformed_text_offscreen_render_completes() -> eyre::Result<()> {
-        let reference_layout = crate::app::render_verification::build_reference_text_layout_with_config(
-            TerminalLayout {
-                client_width: 1040,
-                client_height: 680,
-                cell_width: 8,
-                cell_height: 16,
-                diagnostic_panel_visible: false,
-            },
-            concat!(
-                "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Quis ipsum suspendisse ultrices gravida dictum fusce ut placerat orci nulla pellentesque dignissim enim sit amet venenatis urna cursus eget nunc scelerisque viverra mauris in aliquam sem fringilla ut morbi tincidunt augue interdum velit.\n\n",
-                "Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Nunc pulvinar sapien et ligula ullamcorper malesuada proin libero nunc consequat interdum varius sit amet mattis vulputate enim nulla aliquet porttitor lacus luctus accumsan tortor posuere ac ut consequat semper viverra nam libero justo laoreet sit amet.\n\n",
-                "Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Integer feugiat scelerisque varius morbi enim nunc faucibus a pellentesque sit amet porttitor eget dolor morbi non arcu risus quis varius quam quisque id diam vel quam elementum pulvinar etiam non quam lacus suspendisse faucibus interdum posuere lorem.\n\n",
-                "Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum. Mauris ultrices eros in cursus turpis massa tincidunt dui ut ornare lectus sit amet est placerat in egestas erat imperdiet sed euismod nisi porta lorem mollis aliquam ut porttitor leo a diam sollicitudin tempor id eu nisl nunc mi ipsum faucibus vitae aliquet nec ullamcorper.\n\n",
-                "Habitant morbi tristique senectus et netus et malesuada fames ac turpis egestas sed tempus urna et pharetra pharetra massa massa ultricies mi quis hendrerit dolor magna eget est lorem ipsum dolor sit amet consectetur adipiscing elit duis tristique sollicitudin nibh sit amet commodo nulla facilisi nullam vehicula ipsum a arcu cursus vitae congue mauris.\n\n",
-                "Amet justo donec enim diam vulputate ut pharetra sit amet aliquam id diam maecenas ultricies mi eget mauris pharetra et ultrices neque ornare aenean euismod elementum nisi quis eleifend quam adipiscing vitae proin sagittis nisl rhoncus mattis rhoncus urna neque viverra justo nec ultrices dui sapien eget mi proin sed libero enim sed faucibus turpis in eu mi bibendum neque."
-            ),
-            320.0,
-            -1.1,
-            0.0,
-        );
+        let reference_layout =
+            crate::app::render_verification::build_reference_text_layout_with_config(
+                TerminalLayout {
+                    client_width: 1040,
+                    client_height: 680,
+                    cell_width: 8,
+                    cell_height: 16,
+                    diagnostic_panel_visible: false,
+                },
+                concat!(
+                    "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Quis ipsum suspendisse ultrices gravida dictum fusce ut placerat orci nulla pellentesque dignissim enim sit amet venenatis urna cursus eget nunc scelerisque viverra mauris in aliquam sem fringilla ut morbi tincidunt augue interdum velit.\n\n",
+                    "Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Nunc pulvinar sapien et ligula ullamcorper malesuada proin libero nunc consequat interdum varius sit amet mattis vulputate enim nulla aliquet porttitor lacus luctus accumsan tortor posuere ac ut consequat semper viverra nam libero justo laoreet sit amet.\n\n",
+                    "Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Integer feugiat scelerisque varius morbi enim nunc faucibus a pellentesque sit amet porttitor eget dolor morbi non arcu risus quis varius quam quisque id diam vel quam elementum pulvinar etiam non quam lacus suspendisse faucibus interdum posuere lorem.\n\n",
+                    "Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum. Mauris ultrices eros in cursus turpis massa tincidunt dui ut ornare lectus sit amet est placerat in egestas erat imperdiet sed euismod nisi porta lorem mollis aliquam ut porttitor leo a diam sollicitudin tempor id eu nisl nunc mi ipsum faucibus vitae aliquet nec ullamcorper.\n\n",
+                    "Habitant morbi tristique senectus et netus et malesuada fames ac turpis egestas sed tempus urna et pharetra pharetra massa massa ultricies mi quis hendrerit dolor magna eget est lorem ipsum dolor sit amet consectetur adipiscing elit duis tristique sollicitudin nibh sit amet commodo nulla facilisi nullam vehicula ipsum a arcu cursus vitae congue mauris.\n\n",
+                    "Amet justo donec enim diam vulputate ut pharetra sit amet aliquam id diam maecenas ultricies mi eget mauris pharetra et ultrices neque ornare aenean euismod elementum nisi quis eleifend quam adipiscing vitae proin sagittis nisl rhoncus mattis rhoncus urna neque viverra justo nec ultrices dui sapien eget mi proin sed libero enim sed faucibus turpis in eu mi bibendum neque."
+                ),
+                320.0,
+                -1.1,
+                0.0,
+            );
         let image = render_frame_model_offscreen_image(&reference_layout.frame())?;
 
         let visible_pixel_count = image.pixels().filter(|pixel| pixel.0[3] > 0).count();

@@ -96,8 +96,9 @@ use super::windows_audio_input::{
 };
 use super::windows_cursor_info::{CursorInfoConfig, CursorInfoVirtualSession};
 use super::windows_d3d12_renderer::{
-    ButtonVisualState, CursorLatencyFrameModel, RenderFrameModel, RenderScene,
-    RenderThreadProxy, RendererPresentationMode, RendererTerminalVisualState, WindowChromeButtonsState,
+    ButtonVisualState, CursorLatencyBrickFrameModel, CursorLatencyFrameModel,
+    LateLatchedPointerVisual, RenderFrameModel, RenderScene, RenderThreadProxy,
+    RendererPresentationMode, RendererTerminalVisualState, WindowChromeButtonsState,
     terminal_font_layout_snapshot, terminal_font_unicode_chars,
 };
 use super::windows_demo_mode::{
@@ -381,6 +382,17 @@ const CURSOR_LATENCY_FOCUSED_RENDER_TICK_INTERVAL_MS: u32 = 1;
 const LATENCY_OVERLAY_MAX_HISTORY: usize = 120;
 const LATENCY_OVERLAY_ROTATION_PAUSE: Duration = Duration::from_millis(500);
 
+#[derive(Clone, Copy, Debug)]
+struct CursorLatencyBrickDragState {
+    center_offset_px: [i32; 2],
+}
+
+#[derive(Debug)]
+struct CursorLatencyPlaygroundState {
+    brick_center: ClientPoint,
+    brick_drag: Option<CursorLatencyBrickDragState>,
+}
+
 static NEXT_TEXT_RENDERING_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -400,6 +412,15 @@ impl Default for TextRenderingViewportState {
             pitch_radians: 0.0,
             camera_offset: [0.0, 0.0],
             plane_offset: [0.0, 0.0],
+        }
+    }
+}
+
+impl CursorLatencyPlaygroundState {
+    fn new() -> Self {
+        Self {
+            brick_center: ClientPoint::new(0, 0),
+            brick_drag: None,
         }
     }
 }
@@ -1241,6 +1262,7 @@ enum WindowChromeButton {
 enum ScenePressedTarget {
     ChromeButton(WindowChromeButton),
     Action(SceneAction),
+    CursorLatencyBrick,
     TextRenderingPlane(TextRenderingDragKind),
     TimelineTransportPlayPause,
     TimelineTranscriptionSettingsTarget(windows_scene::TimelineTranscriptionSettingsTarget),
@@ -1266,6 +1288,22 @@ enum ScenePressedTarget {
     DemoModeButton,
     DemoModeScrambleToggle,
     LogsControl(windows_scene::LogsWindowControl),
+}
+
+fn cursor_latency_play_area_rect(layout: TerminalLayout) -> ClientRect {
+    windows_scene::cursor_latency_half_content_rect(
+        windows_scene::cursor_latency_playground_canvas_rect(layout.terminal_panel_rect()),
+    )
+}
+
+fn cursor_latency_brick_rect_for_state(
+    state: &SceneAppState,
+    layout: TerminalLayout,
+) -> Option<ClientRect> {
+    let play_area_rect = cursor_latency_play_area_rect(layout);
+    state.cursor_latency_playground.as_ref().map(|playground| {
+        windows_scene::cursor_latency_brick_rect(play_area_rect, playground.brick_center)
+    })
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1305,6 +1343,7 @@ struct SceneAppState {
     model_warning: Option<windows_scene::ModelWarningViewState>,
     model_warning_prepare_started_at: Option<Instant>,
     timeline_playground: Option<TimelinePlaygroundState>,
+    cursor_latency_playground: Option<CursorLatencyPlaygroundState>,
     text_rendering_playground: Option<TextRenderingPlaygroundHandle>,
     text_rendering_drag: Option<TextRenderingDragState>,
     text_rendering_editor_focused: bool,
@@ -2884,6 +2923,8 @@ fn run_scene_window(
     } else {
         None
     };
+    let cursor_latency_playground = (scene_kind == SceneWindowKind::CursorLatencyPlayground)
+        .then(CursorLatencyPlaygroundState::new);
     let text_rendering_playground = initialization.text_rendering_playground.take();
 
     SCENE_APP_STATE.with(|state| {
@@ -2905,6 +2946,7 @@ fn run_scene_window(
             model_warning: initialization.model_warning,
             model_warning_prepare_started_at: None,
             timeline_playground,
+            cursor_latency_playground,
             text_rendering_playground,
             text_rendering_drag: None,
             text_rendering_editor_focused: false,
@@ -2956,14 +2998,8 @@ fn run_scene_window(
 
     let hwnd = create_scene_window(window_thread, scene_kind)?;
     register_scene_window(hwnd, scene_kind);
-    let renderer = RenderThreadProxy::new_with_mode(
-        hwnd.raw(),
-        if scene_kind == SceneWindowKind::CursorLatencyPlayground {
-            RendererPresentationMode::LowLatencyHwnd
-        } else {
-            RendererPresentationMode::Composed
-        },
-    )?;
+    let renderer =
+        RenderThreadProxy::new_with_mode(hwnd.raw(), RendererPresentationMode::LowLatencyHwnd)?;
     let chrome_tooltip = ChromeTooltipController::create(hwnd)?;
     with_scene_app_state(|state| {
         state.hwnd = Some(hwnd);
@@ -3987,6 +4023,7 @@ fn render_toast_host(state: &mut ToastHostState) -> eyre::Result<()> {
         diagnostic_selection: None,
         window_chrome_buttons_state: WindowChromeButtonsState::default(),
         cursor_latency: None,
+        late_latched_pointer_visual: None,
         diagnostic_cell_width: state.terminal_cell_width,
         diagnostic_cell_height: state.terminal_cell_height,
         scene: Some(scene),
@@ -4549,9 +4586,7 @@ fn handle_scene_focus_changed(hwnd: WindowHandle, focused: bool) -> LRESULT {
         state.window_focused = focused;
         if focused {
             refresh_scene_focused_render_interval(state, hwnd)?;
-            if state.scene_kind == SceneWindowKind::CursorLatencyPlayground
-                && let Some(renderer) = state.renderer.as_ref()
-            {
+            if let Some(renderer) = state.renderer.as_ref() {
                 renderer.reactivate_low_latency_mode()?;
             }
             hwnd.set_focused_render_timer(scene_focused_render_tick_interval_ms(state))?;
@@ -5086,6 +5121,8 @@ fn handle_scene_destroy_message(hwnd: WindowHandle) -> LRESULT {
         state.borrow().as_ref().is_some_and(|state| {
             matches!(
                 state.scene_kind,
+                SceneWindowKind::CursorLatencyPlayground
+                    |
                 SceneWindowKind::TextRenderingPlaygroundPlane
                     | SceneWindowKind::TextRenderingPlaygroundEditor
                     | SceneWindowKind::TextRenderingPlaygroundPresets
@@ -5322,6 +5359,24 @@ fn handle_scene_left_button_down(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Re
             state.pressed_target = Some(ScenePressedTarget::TextRenderingPlane(
                 TextRenderingDragKind::Rotate,
             ));
+            hwnd.capture_mouse();
+            return Ok(ScenePointerAction::RenderOnly);
+        }
+
+        if state.scene_kind == SceneWindowKind::CursorLatencyPlayground
+            && let Some(brick_rect) = cursor_latency_brick_rect_for_state(state, layout)
+            && brick_rect.contains(point)
+        {
+            let cursor_latency_state = state
+                .cursor_latency_playground
+                .as_mut()
+                .expect("cursor latency playground scene has playground state");
+            let center = cursor_latency_state.brick_center.to_win32_point()?;
+            let pointer = point.to_win32_point()?;
+            cursor_latency_state.brick_drag = Some(CursorLatencyBrickDragState {
+                center_offset_px: [center.x - pointer.x, center.y - pointer.y],
+            });
+            state.pressed_target = Some(ScenePressedTarget::CursorLatencyBrick);
             hwnd.capture_mouse();
             return Ok(ScenePointerAction::RenderOnly);
         }
@@ -5972,6 +6027,13 @@ fn handle_scene_left_button_up(hwnd: WindowHandle, lparam: LPARAM) -> eyre::Resu
             return Ok(ScenePointerAction::RenderOnly);
         }
 
+        if matches!(pressed_target, Some(ScenePressedTarget::CursorLatencyBrick)) {
+            if let Some(cursor_latency_state) = state.cursor_latency_playground.as_mut() {
+                cursor_latency_state.brick_drag = None;
+            }
+            return Ok(ScenePointerAction::RenderOnly);
+        }
+
         if let Some(ScenePressedTarget::TimelineTranscriptionSettingsTarget(target)) =
             pressed_target
         {
@@ -6348,6 +6410,63 @@ fn handle_scene_mouse_move(
         Ok(true)
     })?;
     if text_rendering_dragging {
+        with_scene_app_state(|state| render_scene_window_frame(state, hwnd, None, false))?;
+        return Ok(true);
+    }
+
+    let cursor_latency_dragging = with_scene_app_state(|state| {
+        if !matches!(
+            state.pressed_target,
+            Some(ScenePressedTarget::CursorLatencyBrick)
+        ) {
+            return Ok(false);
+        }
+        if (wparam.0 & 0x0001) == 0 {
+            if let Some(cursor_latency_state) = state.cursor_latency_playground.as_mut() {
+                cursor_latency_state.brick_drag = None;
+            }
+            state.pressed_target = None;
+            return Ok(true);
+        }
+        let layout = scene_client_layout(hwnd, state)?;
+        let play_area_rect = cursor_latency_play_area_rect(layout);
+        let cursor_latency_state = state
+            .cursor_latency_playground
+            .as_mut()
+            .expect("cursor latency playground scene has playground state");
+        let Some(drag) = cursor_latency_state.brick_drag else {
+            state.pressed_target = None;
+            return Ok(false);
+        };
+        let pointer = point.to_win32_point()?;
+        cursor_latency_state.brick_center = windows_scene::clamp_cursor_latency_brick_center(
+            play_area_rect,
+            ClientPoint::new(
+                pointer.x + drag.center_offset_px[0],
+                pointer.y + drag.center_offset_px[1],
+            ),
+        );
+        Ok(true)
+    })?;
+    if cursor_latency_dragging {
+        with_scene_app_state(|state| render_scene_window_frame(state, hwnd, None, false))?;
+        return Ok(true);
+    }
+
+    let cursor_latency_hover_changed = with_scene_app_state(|state| {
+        if state.scene_kind != SceneWindowKind::CursorLatencyPlayground {
+            return Ok(false);
+        }
+        let layout = scene_client_layout(hwnd, state)?;
+        let current_hovered = cursor_latency_brick_rect_for_state(state, layout)
+            .is_some_and(|rect| rect.contains(point));
+        let previous_hovered = previous_pointer.is_some_and(|previous| {
+            cursor_latency_brick_rect_for_state(state, layout)
+                .is_some_and(|rect| rect.contains(previous))
+        });
+        Ok(current_hovered != previous_hovered)
+    })?;
+    if cursor_latency_hover_changed {
         with_scene_app_state(|state| render_scene_window_frame(state, hwnd, None, false))?;
         return Ok(true);
     }
@@ -7698,6 +7817,7 @@ fn render_current_frame_with_options(
                 .flatten(),
             window_chrome_buttons_state,
             cursor_latency: None,
+            late_latched_pointer_visual: None,
             diagnostic_cell_width: state.diagnostic_cell_width,
             diagnostic_cell_height: state.diagnostic_cell_height,
             scene: None,
@@ -7913,6 +8033,7 @@ fn render_scene_window_frame(
         .is_enabled();
     let timeline_document = timeline_document_snapshot(state);
     let mut cursor_latency_frame = None;
+    let mut late_latched_pointer_visual = None;
     let mut scene = if state.diagnostics_visible && state.scene_kind == SceneWindowKind::Launcher {
         windows_scene::build_launcher_diagnostic_render_scene(
             layout,
@@ -8071,12 +8192,46 @@ fn render_scene_window_frame(
         )
     } else if state.scene_kind == SceneWindowKind::CursorLatencyPlayground {
         let button_visual_states = scene_button_visual_states(state, layout);
+        let play_area_rect = windows_scene::cursor_latency_half_content_rect(
+            windows_scene::cursor_latency_playground_canvas_rect(layout.terminal_panel_rect()),
+        );
+        let cursor_latency_state = state
+            .cursor_latency_playground
+            .as_mut()
+            .expect("cursor latency playground scene has playground state");
+        if cursor_latency_state.brick_center == ClientPoint::new(0, 0) {
+            cursor_latency_state.brick_center = windows_scene::clamp_cursor_latency_brick_center(
+                play_area_rect,
+                ClientPoint::new(
+                    play_area_rect.left() + (play_area_rect.width() / 3),
+                    play_area_rect.top() + (play_area_rect.height() / 2),
+                ),
+            );
+        }
+        let brick_hovered = state.pointer_position.is_some_and(|point| {
+            windows_scene::cursor_latency_brick_rect(
+                play_area_rect,
+                cursor_latency_state.brick_center,
+            )
+            .contains(point)
+        });
         cursor_latency_frame = Some(CursorLatencyFrameModel {
             button_states: button_visual_states.clone(),
+            brick: CursorLatencyBrickFrameModel {
+                center: cursor_latency_state.brick_center,
+                drag_offset: cursor_latency_state
+                    .brick_drag
+                    .map(|drag| drag.center_offset_px),
+                hovered: brick_hovered,
+                dragging: cursor_latency_state.brick_drag.is_some(),
+            },
         });
         let view_state = windows_scene::CursorLatencyPlaygroundViewState {
             os_cursor_position: None,
             rendered_cursor_position: None,
+            brick_center: cursor_latency_state.brick_center,
+            brick_hovered,
+            brick_dragging: cursor_latency_state.brick_drag.is_some(),
         };
         windows_scene::build_cursor_latency_playground_render_scene(
             layout,
@@ -8195,6 +8350,11 @@ fn render_scene_window_frame(
         playground.update_row_position_animation(&render_plan);
         let row_visual_positions = playground.row_visual_positions(&render_plan);
         playground.apply_row_position_animation();
+        late_latched_pointer_visual =
+            Some(LateLatchedPointerVisual::TimelinePlaygroundCursorGuide {
+                ruler_rect: playground_layout.ruler_rect,
+                content_rect: playground_layout.content_rect,
+            });
         windows_scene::build_timeline_playground_render_scene(
             layout,
             window_chrome_buttons_state,
@@ -8255,6 +8415,7 @@ fn render_scene_window_frame(
         diagnostic_selection: None,
         window_chrome_buttons_state,
         cursor_latency: cursor_latency_frame,
+        late_latched_pointer_visual,
         diagnostic_cell_width: state.diagnostic_cell_width,
         diagnostic_cell_height: state.diagnostic_cell_height,
         scene: Some(scene),
@@ -12892,6 +13053,7 @@ fn render_terminal_throughput_benchmark_frame(
         diagnostic_selection: None,
         window_chrome_buttons_state: WindowChromeButtonsState::default(),
         cursor_latency: None,
+        late_latched_pointer_visual: None,
         diagnostic_cell_width,
         diagnostic_cell_height,
         scene: None,
@@ -14678,6 +14840,13 @@ fn scene_cursor_for_point(
         return Some(IDC_HAND);
     }
 
+    if state.scene_kind == SceneWindowKind::CursorLatencyPlayground
+        && cursor_latency_brick_rect_for_state(state, layout)
+            .is_some_and(|rect| rect.contains(point))
+    {
+        return Some(IDC_SIZEALL);
+    }
+
     if state.scene_kind == SceneWindowKind::CursorLatencyPlayground {
         return Some(IDC_CROSS);
     }
@@ -15945,6 +16114,7 @@ mod tests {
             model_warning: None,
             model_warning_prepare_started_at: None,
             timeline_playground: None,
+            cursor_latency_playground: None,
             text_rendering_playground: None,
             text_rendering_drag: None,
             text_rendering_editor_focused: false,
@@ -16053,14 +16223,18 @@ mod tests {
 
         assert!(plane_basis.is_some());
         assert!(!glyphs.is_empty());
-        assert!(glyphs.iter().all(|glyph| glyph
-            .corners
-            .iter()
-            .all(|corner| corner.iter().all(|value| value.is_finite()))));
-        assert!(glyphs.iter().all(|glyph| glyph
-            .corner_w
-            .iter()
-            .all(|clip_w| clip_w.is_finite() && *clip_w > 0.0)));
+        assert!(glyphs.iter().all(|glyph| {
+            glyph
+                .corners
+                .iter()
+                .all(|corner| corner.iter().all(|value| value.is_finite()))
+        }));
+        assert!(glyphs.iter().all(|glyph| {
+            glyph
+                .corner_w
+                .iter()
+                .all(|clip_w| clip_w.is_finite() && *clip_w > 0.0)
+        }));
     }
 
     #[test]
@@ -16775,6 +16949,7 @@ mod tests {
             model_warning: None,
             model_warning_prepare_started_at: None,
             timeline_playground: None,
+            cursor_latency_playground: None,
             text_rendering_playground: None,
             text_rendering_drag: None,
             text_rendering_editor_focused: false,
@@ -16865,6 +17040,7 @@ mod tests {
             model_warning: None,
             model_warning_prepare_started_at: None,
             timeline_playground: None,
+            cursor_latency_playground: None,
             text_rendering_playground: None,
             text_rendering_drag: None,
             text_rendering_editor_focused: false,
@@ -16957,6 +17133,7 @@ mod tests {
             model_warning: None,
             model_warning_prepare_started_at: None,
             timeline_playground: None,
+            cursor_latency_playground: None,
             text_rendering_playground: None,
             text_rendering_drag: None,
             text_rendering_editor_focused: false,
@@ -17040,6 +17217,7 @@ mod tests {
             model_warning: None,
             model_warning_prepare_started_at: None,
             timeline_playground: None,
+            cursor_latency_playground: None,
             text_rendering_playground: None,
             text_rendering_drag: None,
             text_rendering_editor_focused: false,

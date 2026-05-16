@@ -272,7 +272,25 @@ pub const fn text_rendering_preset_for_action(action: SceneAction) -> Option<Tex
 pub struct CursorLatencyPlaygroundViewState {
     pub os_cursor_position: Option<ClientPoint>,
     pub rendered_cursor_position: Option<ClientPoint>,
+    pub brick_center: ClientPoint,
+    pub brick_hovered: bool,
+    pub brick_dragging: bool,
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[expect(
+    clippy::struct_field_names,
+    reason = "layout rect names stay explicit for scene construction"
+)]
+pub struct CursorLatencyPlaygroundLayout {
+    pub body_rect: ClientRect,
+    pub title_rect: ClientRect,
+    pub subtitle_rect: ClientRect,
+    pub summary_rect: ClientRect,
+    pub canvas_rect: ClientRect,
+}
+
+pub const CURSOR_LATENCY_BRICK_SIZE_PX: i32 = 72;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LatencyOverlayAnchor {
@@ -1723,12 +1741,12 @@ fn push_timeline_playground_data_bounds_dimming(
 }
 
 // timeline[impl playground.cursor-guide]
-fn push_timeline_playground_cursor_guide(
+pub fn append_timeline_playground_cursor_guide(
     scene: &mut RenderScene,
     layout: TimelinePlaygroundLayout,
-    view_state: TimelinePlaygroundViewState,
+    cursor_position: Option<ClientPoint>,
 ) {
-    let Some(point) = view_state.cursor_position else {
+    let Some(point) = cursor_position else {
         return;
     };
     if !layout.ruler_rect.contains(point) && !layout.content_rect.contains(point) {
@@ -1750,6 +1768,14 @@ fn push_timeline_playground_cursor_guide(
         [0.78, 0.86, 0.96, 0.42],
         PanelEffect::SceneButtonCard,
     );
+}
+
+fn push_timeline_playground_cursor_guide(
+    scene: &mut RenderScene,
+    layout: TimelinePlaygroundLayout,
+    view_state: TimelinePlaygroundViewState,
+) {
+    append_timeline_playground_cursor_guide(scene, layout, view_state.cursor_position);
 }
 
 #[must_use]
@@ -3067,7 +3093,21 @@ pub fn scene_button_specs(scene_kind: SceneWindowKind) -> &'static [SceneButtonS
                 color: [0.17, 0.20, 0.29, 1.0],
             },
         ],
-        SceneWindowKind::CursorLatencyPlayground => &[],
+        SceneWindowKind::CursorLatencyPlayground
+        | SceneWindowKind::CursorGallery
+        | SceneWindowKind::Timeline
+        | SceneWindowKind::DemoMode
+        | SceneWindowKind::Jobs
+        | SceneWindowKind::Logs
+        | SceneWindowKind::AudioDaemon
+        | SceneWindowKind::AudioInputDevicePicker
+        | SceneWindowKind::AudioInputDeviceDetails
+        | SceneWindowKind::TextRenderingPlaygroundPlane
+        | SceneWindowKind::TextRenderingPlaygroundEditor
+        | SceneWindowKind::TextRenderingPlaygroundSpriteSheet
+        | SceneWindowKind::TimelinePlaygroundDetail
+        | SceneWindowKind::TimelineTranscriptionSettings
+        | SceneWindowKind::ModelWarning => &[],
         SceneWindowKind::TextRenderingPlaygroundPresets => &TEXT_RENDERING_PRESET_BUTTON_SPECS,
         SceneWindowKind::TimelineStart => &[
             SceneButtonSpec {
@@ -3149,20 +3189,6 @@ pub fn scene_button_specs(scene_kind: SceneWindowKind) -> &'static [SceneButtonS
                 color: [0.23, 0.19, 0.30, 1.0],
             },
         ],
-        SceneWindowKind::CursorGallery
-        | SceneWindowKind::Timeline
-        | SceneWindowKind::DemoMode
-        | SceneWindowKind::Jobs
-        | SceneWindowKind::Logs
-        | SceneWindowKind::AudioDaemon
-        | SceneWindowKind::AudioInputDevicePicker
-        | SceneWindowKind::AudioInputDeviceDetails
-        | SceneWindowKind::TextRenderingPlaygroundPlane
-        | SceneWindowKind::TextRenderingPlaygroundEditor
-        | SceneWindowKind::TextRenderingPlaygroundSpriteSheet
-        | SceneWindowKind::TimelinePlaygroundDetail
-        | SceneWindowKind::TimelineTranscriptionSettings
-        | SceneWindowKind::ModelWarning => &[],
     }
 }
 
@@ -6961,6 +6987,15 @@ pub const fn cursor_gallery_sprite_specs() -> &'static [CursorGallerySpriteSpec]
     ]
 }
 
+fn cursor_gallery_title_rect(body_rect: ClientRect) -> ClientRect {
+    ClientRect::new(
+        body_rect.left(),
+        body_rect.top(),
+        body_rect.right(),
+        (body_rect.top() + 52).min(body_rect.bottom()),
+    )
+}
+
 #[must_use]
 pub fn cursor_gallery_cell_layouts(layout: TerminalLayout) -> Vec<CursorGalleryCellLayout> {
     let body_rect = layout.terminal_panel_rect().inset(30);
@@ -7111,82 +7146,21 @@ pub fn build_cursor_latency_playground_render_scene(
     layout: TerminalLayout,
     window_chrome_buttons_state: WindowChromeButtonsState,
     view_state: CursorLatencyPlaygroundViewState,
-    button_states: &[(SceneAction, ButtonVisualState)],
+    _button_states: &[(SceneAction, ButtonVisualState)],
 ) -> RenderScene {
     let mut scene = build_scene_shell(
         layout,
         SceneWindowKind::CursorLatencyPlayground,
         window_chrome_buttons_state,
     );
-    let specs = scene_button_specs(SceneWindowKind::CursorLatencyPlayground);
-    let controls_rect = cursor_latency_playground_controls_rect(layout.terminal_panel_rect());
-    let button_layouts = layout_scene_buttons(controls_rect, specs.len(), DEFAULT_MAX_BUTTON_SIZE);
-    for (index, spec) in specs.iter().enumerate() {
-        let button_layout = button_layouts[index];
-        let visual_state = button_states
-            .iter()
-            .find_map(|(action, state)| (*action == spec.action).then_some(*state))
-            .unwrap_or_default();
-        let card_color = if visual_state.active {
-            [
-                spec.color[0] + 0.08,
-                spec.color[1] + 0.08,
-                spec.color[2] + 0.08,
-                1.0,
-            ]
-        } else {
-            spec.color
-        };
-        push_panel_with_data(
-            &mut scene,
-            button_layout.card_rect.to_win32_rect(),
-            card_color,
-            PanelEffect::SceneButtonCard,
-            visual_state.shader_data(),
-        );
-        push_sprite(
-            &mut scene,
-            button_layout.sprite_rect.to_win32_rect(),
-            [1.0, 1.0, 1.0, 1.0],
-            spec.sprite,
-        );
-        push_centered_text(
-            &mut scene,
-            button_layout.label_rect.to_win32_rect(),
-            spec.label,
-            [0.97, 0.97, 0.99, 1.0],
-        );
-    }
-
-    let controls_bottom = button_layouts
-        .iter()
-        .map(|layout| layout.hit_rect().bottom())
-        .max()
-        .unwrap_or(controls_rect.bottom());
-    let body_rect = ClientRect::new(
-        layout.terminal_panel_rect().left() + 28,
-        controls_bottom + 10,
-        layout.terminal_panel_rect().right() - 28,
-        layout.terminal_panel_rect().bottom() - 22,
-    );
-    let title_rect = ClientRect::new(
-        body_rect.left(),
-        body_rect.top(),
-        body_rect.left() + 420,
-        body_rect.top() + 42,
-    );
-    let summary_rect = ClientRect::new(
-        body_rect.right() - 260,
-        body_rect.top() + 2,
-        body_rect.right(),
-        body_rect.top() + 56,
-    );
-    let canvas_rect = ClientRect::new(
-        body_rect.left(),
-        title_rect.bottom() + 44,
-        body_rect.right(),
-        body_rect.bottom(),
-    );
+    let body_layout = cursor_latency_playground_layout(ClientRect::new(
+        layout.terminal_panel_rect().left() + 12,
+        layout.terminal_panel_rect().top() + 12,
+        layout.terminal_panel_rect().right() - 12,
+        layout.terminal_panel_rect().bottom() - 12,
+    ));
+    let body_rect = body_layout.body_rect;
+    let canvas_rect = body_layout.canvas_rect;
 
     push_panel(
         &mut scene,
@@ -7194,46 +7168,27 @@ pub fn build_cursor_latency_playground_render_scene(
         [0.07, 0.08, 0.10, 1.0],
         PanelEffect::SceneBody,
     );
-    push_title_text(
-        &mut scene,
-        title_rect.to_win32_rect(),
-        "Cursor Latency Playground",
-        [0.96, 0.98, 1.0, 1.0],
-    );
-    push_text_block(
-        &mut scene,
-        ClientRect::new(
-            body_rect.left(),
-            title_rect.bottom() - 2,
-            body_rect.left() + 640,
-            title_rect.bottom() + 38,
-        )
-        .to_win32_rect(),
-        "Minimum latency late-latches a larger hard-edged crosshair after the renderer clears the frame-latency gate, so it can land on the freshest cursor sample we have.",
-        8,
-        14,
-        [0.74, 0.79, 0.85, 1.0],
-    );
-    let summary = "mode: minimum latency\nlate-latched after frame gate";
-    push_text_block(
-        &mut scene,
-        summary_rect.to_win32_rect(),
-        summary,
-        8,
-        18,
-        [0.90, 0.93, 0.98, 1.0],
-    );
 
-    let accent = hue_rotate_180(preferred_title_bar_color(window_chrome_buttons_state.focused));
+    let accent = hue_rotate_180(preferred_title_bar_color(
+        window_chrome_buttons_state.focused,
+    ));
     push_cursor_latency_half(
         &mut scene,
         cursor_latency_half_content_rect(canvas_rect),
         cursor_latency_half_content_rect(canvas_rect),
         canvas_rect,
-        "Minimum Latency",
+        "",
         accent,
         view_state.rendered_cursor_position,
         0,
+    );
+    push_cursor_latency_brick(
+        &mut scene,
+        cursor_latency_half_content_rect(canvas_rect),
+        view_state.brick_center,
+        accent,
+        view_state.brick_hovered,
+        view_state.brick_dragging,
     );
 
     scene
@@ -7249,19 +7204,70 @@ pub fn cursor_latency_playground_controls_rect(panel_rect: ClientRect) -> Client
     )
 }
 
+#[must_use]
+pub fn cursor_latency_playground_layout(panel_rect: ClientRect) -> CursorLatencyPlaygroundLayout {
+    let body_rect = panel_rect.inset(8);
+    let title_rect = ClientRect::new(body_rect.left(), body_rect.top(), body_rect.left(), body_rect.top());
+    let summary_rect = title_rect;
+    let subtitle_rect = title_rect;
+    let canvas_rect = body_rect;
+
+    CursorLatencyPlaygroundLayout {
+        body_rect,
+        title_rect,
+        subtitle_rect,
+        summary_rect,
+        canvas_rect,
+    }
+}
+
+#[must_use]
+pub fn cursor_latency_playground_canvas_rect(panel_rect: ClientRect) -> ClientRect {
+    cursor_latency_playground_layout(panel_rect).canvas_rect
+}
+
+#[must_use]
+pub fn clamp_cursor_latency_brick_center(
+    play_area_rect: ClientRect,
+    center: ClientPoint,
+) -> ClientPoint {
+    let half_size = CURSOR_LATENCY_BRICK_SIZE_PX / 2;
+    let pixel = center
+        .to_win32_point()
+        .expect("client-space points must convert back to pixels");
+    ClientPoint::new(
+        pixel.x.clamp(
+            play_area_rect.left() + half_size,
+            play_area_rect.right() - half_size,
+        ),
+        pixel.y.clamp(
+            play_area_rect.top() + half_size,
+            play_area_rect.bottom() - half_size,
+        ),
+    )
+}
+
+#[must_use]
+pub fn cursor_latency_brick_rect(
+    play_area_rect: ClientRect,
+    brick_center: ClientPoint,
+) -> ClientRect {
+    let brick_center = clamp_cursor_latency_brick_center(play_area_rect, brick_center)
+        .to_win32_point()
+        .expect("client-space points must convert back to pixels");
+    let half_size = CURSOR_LATENCY_BRICK_SIZE_PX / 2;
+    ClientRect::new(
+        brick_center.x - half_size,
+        brick_center.y - half_size,
+        brick_center.x + half_size,
+        brick_center.y + half_size,
+    )
+}
+
 fn client_rect_center(rect: ClientRect) -> ClientPoint {
     ClientPoint::new(
         rect.left() + (rect.width() / 2),
         rect.top() + (rect.height() / 2),
-    )
-}
-
-fn cursor_gallery_title_rect(body_rect: ClientRect) -> ClientRect {
-    ClientRect::new(
-        body_rect.left(),
-        body_rect.top(),
-        body_rect.right(),
-        (body_rect.top() + 52).min(body_rect.bottom()),
     )
 }
 
@@ -7310,7 +7316,7 @@ fn push_cursor_latency_half(
     source_fastest_rect: ClientRect,
     source_match_os_rect: ClientRect,
     half_rect: ClientRect,
-    label: &str,
+    _label: &str,
     accent: [f32; 4],
     source_point: Option<ClientPoint>,
     _lead_pixels: i32,
@@ -7326,27 +7332,9 @@ fn push_cursor_latency_half(
     );
     push_panel(
         scene,
-        ClientRect::new(
-            half_rect.left(),
-            half_rect.top(),
-            half_rect.right(),
-            half_rect.top() + 40,
-        )
-        .to_win32_rect(),
-        mix_rgba(background, accent, 0.45),
+        half_rect.to_win32_rect(),
+        mix_rgba(background, accent, 0.08),
         PanelEffect::SceneBody,
-    );
-    push_centered_text(
-        scene,
-        ClientRect::new(
-            half_rect.left() + 14,
-            half_rect.top() + 6,
-            half_rect.right() - 14,
-            half_rect.top() + 34,
-        )
-        .to_win32_rect(),
-        label,
-        [0.97, 0.98, 1.0, 1.0],
     );
 
     if let Some(point) = source_point {
@@ -7390,13 +7378,58 @@ fn push_cursor_latency_ripple_panel(
     );
 }
 
-fn cursor_latency_half_content_rect(half_rect: ClientRect) -> ClientRect {
-    ClientRect::new(
-        half_rect.left(),
-        half_rect.top() + 40,
-        half_rect.right(),
-        half_rect.bottom(),
-    )
+fn push_cursor_latency_brick(
+    scene: &mut RenderScene,
+    play_area_rect: ClientRect,
+    brick_center: ClientPoint,
+    accent: [f32; 4],
+    hovered: bool,
+    dragging: bool,
+) {
+    let brick_rect = cursor_latency_brick_rect(play_area_rect, brick_center);
+    let glow_alpha = if dragging {
+        0.38
+    } else if hovered {
+        0.26
+    } else {
+        0.16
+    };
+    for (inflate, alpha) in [(12, glow_alpha * 0.35), (6, glow_alpha * 0.7)] {
+        push_panel(
+            scene,
+            ClientRect::new(
+                brick_rect.left() - inflate,
+                brick_rect.top() - inflate,
+                brick_rect.right() + inflate,
+                brick_rect.bottom() + inflate,
+            )
+            .to_win32_rect(),
+            [accent[0], accent[1], accent[2], alpha],
+            PanelEffect::SceneBody,
+        );
+    }
+    push_panel(
+        scene,
+        brick_rect.to_win32_rect(),
+        if dragging {
+            mix_rgba([0.96, 0.98, 1.0, 1.0], accent, 0.48)
+        } else if hovered {
+            mix_rgba([0.88, 0.90, 0.96, 1.0], accent, 0.58)
+        } else {
+            mix_rgba([0.54, 0.58, 0.68, 1.0], accent, 0.62)
+        },
+        PanelEffect::SceneButtonCard,
+    );
+    push_panel(
+        scene,
+        brick_rect.inset(5).to_win32_rect(),
+        mix_rgba([0.10, 0.11, 0.14, 1.0], accent, 0.22),
+        PanelEffect::TerminalFill,
+    );
+}
+
+pub fn cursor_latency_half_content_rect(half_rect: ClientRect) -> ClientRect {
+    half_rect
 }
 
 #[expect(
