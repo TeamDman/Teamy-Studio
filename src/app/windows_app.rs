@@ -11889,6 +11889,21 @@ fn invoke_scene_action(
         });
     }
 
+    if action == SceneAction::ReactivateCursorLatencyMode {
+        return with_scene_app_state(|state| {
+            let Some(renderer) = state.renderer.as_ref() else {
+                return Ok(SceneActionDisposition::KeepOpen);
+            };
+            renderer.reactivate_low_latency_mode()?;
+            info!(
+                scene_kind = state.scene_kind.title(),
+                "manual low-latency reacquire requested"
+            );
+            render_scene_window_frame(state, hwnd, None, true)?;
+            Ok(SceneActionDisposition::KeepOpen)
+        });
+    }
+
     let (app_home, vt_engine) =
         with_scene_app_state(|state| Ok((state.app_home.clone(), state.vt_engine)))?;
     let disposition = perform_scene_action(&app_home, vt_engine, action)?;
@@ -11984,6 +11999,7 @@ fn perform_scene_action(
                 .wrap_err("failed to spawn Teamy Studio cursor latency playground thread")?;
             Ok(SceneActionDisposition::KeepOpen)
         }
+        SceneAction::ReactivateCursorLatencyMode => Ok(SceneActionDisposition::KeepOpen),
         SceneAction::OpenTextRenderingPlayground => {
             let app_home = app_home.clone();
             thread::Builder::new()
