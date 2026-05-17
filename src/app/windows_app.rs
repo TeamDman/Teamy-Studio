@@ -4638,6 +4638,14 @@ fn handle_scene_key_down_message(
             return Ok(SceneKeyAction::OpenLegacyRecordingDevices);
         }
 
+        if state.scene_kind == SceneWindowKind::CursorLatencyPlayground
+            && virtual_key == u32::from(b'R')
+        {
+            return Ok(SceneKeyAction::InvokeSceneAction(
+                SceneAction::ReactivateCursorLatencyMode,
+            ));
+        }
+
         if let Some(shortcut) = scene_window_shortcut_action(control_key_is_down(), virtual_key) {
             match shortcut {
                 SceneWindowShortcutAction::CopySelection => {

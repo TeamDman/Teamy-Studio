@@ -3094,17 +3094,8 @@ pub fn scene_button_specs(scene_kind: SceneWindowKind) -> &'static [SceneButtonS
                 color: [0.17, 0.20, 0.29, 1.0],
             },
         ],
-        SceneWindowKind::CursorLatencyPlayground => &[
-            SceneButtonSpec {
-                // cursorlatency[impl playground.manual-reactivate]
-                action: SceneAction::ReactivateCursorLatencyMode,
-                label: "Rebuild",
-                tooltip: "Reacquire low-latency presentation mode",
-                sprite: SpriteId::Terminal,
-                color: [0.23, 0.19, 0.30, 1.0],
-            },
-        ],
-        SceneWindowKind::CursorGallery
+        SceneWindowKind::CursorLatencyPlayground
+        | SceneWindowKind::CursorGallery
         | SceneWindowKind::Timeline
         | SceneWindowKind::DemoMode
         | SceneWindowKind::Jobs
@@ -7156,52 +7147,13 @@ pub fn build_cursor_latency_playground_render_scene(
     layout: TerminalLayout,
     window_chrome_buttons_state: WindowChromeButtonsState,
     view_state: CursorLatencyPlaygroundViewState,
-    button_states: &[(SceneAction, ButtonVisualState)],
+    _button_states: &[(SceneAction, ButtonVisualState)],
 ) -> RenderScene {
     let mut scene = build_scene_shell(
         layout,
         SceneWindowKind::CursorLatencyPlayground,
         window_chrome_buttons_state,
     );
-    let specs = scene_button_specs(SceneWindowKind::CursorLatencyPlayground);
-    let controls_rect = cursor_latency_playground_controls_rect(layout.terminal_panel_rect());
-    let button_layouts = layout_scene_buttons(controls_rect, specs.len(), DEFAULT_MAX_BUTTON_SIZE);
-    for (index, spec) in specs.iter().enumerate() {
-        let button_layout = button_layouts[index];
-        let visual_state = button_states
-            .iter()
-            .find_map(|(action, state)| (*action == spec.action).then_some(*state))
-            .unwrap_or_default();
-        let card_color = if visual_state.active {
-            [
-                spec.color[0] + 0.08,
-                spec.color[1] + 0.08,
-                spec.color[2] + 0.08,
-                1.0,
-            ]
-        } else {
-            spec.color
-        };
-        push_panel_with_data(
-            &mut scene,
-            button_layout.card_rect.to_win32_rect(),
-            card_color,
-            PanelEffect::SceneButtonCard,
-            visual_state.shader_data(),
-        );
-        push_sprite(
-            &mut scene,
-            button_layout.sprite_rect.to_win32_rect(),
-            [1.0, 1.0, 1.0, 1.0],
-            spec.sprite,
-        );
-        push_centered_text(
-            &mut scene,
-            button_layout.label_rect.to_win32_rect(),
-            spec.label,
-            [0.97, 0.97, 0.99, 1.0],
-        );
-    }
     let body_layout = cursor_latency_playground_layout(ClientRect::new(
         layout.terminal_panel_rect().left() + 12,
         layout.terminal_panel_rect().top() + 12,
@@ -7611,10 +7563,10 @@ pub fn push_latency_overlay(
     );
     let fps_text = view_state
         .average_fps
-        .map_or_else(|| "--- fps".to_owned(), |fps| format!("{fps:>3.0} fps"));
+        .map_or_else(|| "---- fps".to_owned(), |fps| format!("{fps:>4.0} fps"));
     let latest_text = view_state
         .latest_frame_ms
-        .map_or_else(|| "--.- ms".to_owned(), |ms| format!("{ms:>4.1} ms"));
+        .map_or_else(|| "---.- ms".to_owned(), |ms| format!("{ms:>5.1} ms"));
     push_overlay_text_block(
         scene,
         header_rect.to_win32_rect(),
@@ -7628,7 +7580,7 @@ pub fn push_latency_overlay(
 }
 
 fn latency_overlay_rect(panel_rect: ClientRect, anchor: LatencyOverlayAnchor) -> ClientRect {
-    let width = 238;
+    let width = 254;
     let height = 128;
     let margin = 18;
     let left = match anchor {
@@ -10734,7 +10686,7 @@ mod tests {
         let specs = scene_button_specs(SceneWindowKind::CursorLatencyPlayground);
         let actions = specs.iter().map(|spec| spec.action).collect::<Vec<_>>();
 
-        assert_eq!(actions, vec![SceneAction::ReactivateCursorLatencyMode]);
+        assert!(actions.is_empty());
     }
 
     #[test]

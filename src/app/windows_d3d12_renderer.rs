@@ -781,6 +781,7 @@ impl RenderThreadProxy {
         Ok(submission_id)
     }
 
+    #[track_caller]
     fn check_error(&self) -> eyre::Result<()> {
         let state = self
             .shared
@@ -788,7 +789,14 @@ impl RenderThreadProxy {
             .lock()
             .map_err(|error| eyre::eyre!("failed to lock renderer thread state: {error}"))?;
         if let Some(error) = state.error.as_ref() {
-            eyre::bail!(error.clone());
+            let caller = std::panic::Location::caller();
+            eyre::bail!(
+                "renderer thread error observed at {}:{}:{}: {}",
+                caller.file(),
+                caller.line(),
+                caller.column(),
+                error
+            );
         }
         Ok(())
     }
