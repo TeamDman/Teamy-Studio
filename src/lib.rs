@@ -50,7 +50,7 @@ pub fn main() -> Result<()> {
             next_time_key += 16;
             if clicked_class_id == Some(teamy_studio_cursor_gallery::CURSOR_GALLERY_BUTTON_CLASS_ID)
             {
-                teamy_studio_cursor_gallery::open_native_cursor_gallery_window()?;
+                teamy_studio_cursor_gallery::open_native_cursor_gallery_window_on_thread()?;
             }
             Ok(())
         },

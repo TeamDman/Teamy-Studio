@@ -17,7 +17,9 @@ use teamy_studio_shell::{
     LogicalWindowId, PresentPolicy, WindowCreateRequest, WindowCreatedEvent, WindowHostOptions,
 };
 
-pub use native_window::open_native_cursor_gallery_window;
+pub use native_window::{
+    open_native_cursor_gallery_window, open_native_cursor_gallery_window_on_thread,
+};
 
 pub const CURSOR_GALLERY_BUTTON_CLASS_ID: MainMenuButtonClassId =
     MainMenuButtonClassId::from_bytes([2; 16]);
@@ -141,7 +143,7 @@ pub fn create_window_request(open_intent: &CursorGalleryOpenIntent) -> WindowCre
     WindowCreateRequest {
         logical_window_id: open_intent.logical_window_id,
         title: "Cursor Gallery",
-        present_policy: PresentPolicy::LowLatencyHwnd,
+        present_policy: PresentPolicy::Composed,
         host_options: WindowHostOptions::standard_foreground(),
     }
 }

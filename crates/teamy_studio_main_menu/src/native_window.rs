@@ -2,6 +2,10 @@ use std::sync::{Mutex, OnceLock};
 
 use eyre::{Result, eyre};
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::Graphics::Dwm::{
+    DWMWA_BORDER_COLOR, DWMWA_COLOR_NONE, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND,
+    DwmSetWindowAttribute,
+};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, CreateSolidBrush, DeleteObject, EndPaint, FillRect, HDC, PAINTSTRUCT,
 };
@@ -12,8 +16,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     HTCLIENT, HTLEFT, HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT, IDC_ARROW, LoadCursorW, MSG,
     PostQuitMessage, RegisterClassW, SW_MAXIMIZE, SW_MINIMIZE, SW_SHOW, ShowWindow,
     SetWindowPos, TranslateMessage, WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND, WM_LBUTTONUP,
-    WM_NCCALCSIZE, WM_NCHITTEST, WM_PAINT, WNDCLASSW, WS_EX_APPWINDOW, WS_MAXIMIZEBOX,
-    WS_MINIMIZEBOX, WS_POPUP, WS_THICKFRAME, WS_VISIBLE, SWP_NOACTIVATE, SWP_NOZORDER,
+    WM_NCACTIVATE, WM_NCCALCSIZE, WM_NCHITTEST, WM_NCPAINT, WM_PAINT, WNDCLASSW,
+    WS_EX_APPWINDOW, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP, WS_THICKFRAME, WS_VISIBLE,
+    SWP_NOACTIVATE, SWP_NOZORDER,
 };
 use windows::core::{PCWSTR, w};
 
@@ -52,6 +57,8 @@ unsafe extern "system" fn main_menu_window_proc(
 ) -> LRESULT {
     match message {
         WM_NCCALCSIZE => LRESULT(0),
+        WM_NCACTIVATE => LRESULT(1),
+        WM_NCPAINT => LRESULT(0),
         WM_NCHITTEST => non_client_hit_test(hwnd, lparam),
         WM_ERASEBKGND => LRESULT(1),
         WM_DPICHANGED => handle_dpi_changed(hwnd, lparam),
@@ -175,10 +182,25 @@ fn perform_chrome_click(hwnd: HWND, action: ChromeClickAction) {
 }
 
 fn paint_main_menu_window(hwnd: HWND) -> LRESULT {
+    if d3d12_smoke_test_requested() {
+        return acknowledge_main_menu_paint(hwnd);
+    }
+
     let mut paint = PAINTSTRUCT::default();
     let hdc = unsafe { BeginPaint(hwnd, &mut paint) };
     if !hdc.0.is_null() {
         let _ = render_main_menu_scene(hdc, hwnd);
+        unsafe {
+            let _ = EndPaint(hwnd, &paint);
+        };
+    }
+    LRESULT(0)
+}
+
+fn acknowledge_main_menu_paint(hwnd: HWND) -> LRESULT {
+    let mut paint = PAINTSTRUCT::default();
+    let hdc = unsafe { BeginPaint(hwnd, &mut paint) };
+    if !hdc.0.is_null() {
         unsafe {
             let _ = EndPaint(hwnd, &paint);
         };
@@ -865,6 +887,8 @@ where
         let _ = ShowWindow(hwnd, SW_SHOW);
     }
 
+    configure_main_menu_window_chrome(hwnd)?;
+
     let smoke_bootstrap = if d3d12_smoke_test_requested() {
         let mut client_rect = RECT::default();
         unsafe { GetClientRect(hwnd, &mut client_rect) }.map_err(|error| {
@@ -926,6 +950,34 @@ where
         .lock()
         .expect("main menu window state should not be poisoned") = None;
     let _ = smoke_bootstrap;
+    Ok(())
+}
+
+fn configure_main_menu_window_chrome(hwnd: HWND) -> Result<()> {
+    let border_color = DWMWA_COLOR_NONE;
+    if let Err(error) = unsafe {
+        DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_BORDER_COLOR,
+            (&raw const border_color).cast(),
+            u32::try_from(std::mem::size_of_val(&border_color)).unwrap_or(u32::MAX),
+        )
+    } {
+        eprintln!("main menu DWM border-color override unavailable: {error}");
+    }
+
+    let corner_preference = DWMWCP_DONOTROUND;
+    if let Err(error) = unsafe {
+        DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_WINDOW_CORNER_PREFERENCE,
+            (&raw const corner_preference).cast(),
+            u32::try_from(std::mem::size_of_val(&corner_preference)).unwrap_or(u32::MAX),
+        )
+    } {
+        eprintln!("main menu DWM corner override unavailable: {error}");
+    }
+
     Ok(())
 }
 

@@ -241,26 +241,34 @@ float4 apply_garden_frame(float2 uv, float4 color, float4 contentBounds) {
         return float4(0.0, 0.0, 0.0, 0.0);
     }
 
-    float outerEdgePx = outer_edge_distance_px(uv);
-    float outerFeather = smoothstep(0.0, GARDEN_OUTER_FEATHER_PX, outerEdgePx);
-    float t = PanelTime();
-    float2 flowUv = uv * 7.0 + float2(t * 0.07, -t * 0.05);
-    float contour = fbm2d(flowUv + innerDistancePx * 0.03.xx);
-    float ribbon = 0.5 + (0.5 * sin((innerDistancePx * 0.26) - (t * 2.1) + (contour * 6.2)));
-    float innerTransition = smoothstep(0.0, GARDEN_INNER_SOFTEN_PX, innerDistancePx);
-    float rim = innerTransition * (1.0 - smoothstep(GARDEN_INNER_SOFTEN_PX, GARDEN_RIM_OUTER_PX, innerDistancePx));
-    float halo = exp(-abs(innerDistancePx - GARDEN_RING_OFFSET_PX) / GARDEN_RING_WIDTH_PX);
-    float2 outsideDistancePx = inner_rect_outside_distance_px(uv, contentBounds);
-    float cornerBlend = smoothstep(0.0, GARDEN_CORNER_SOFTEN_PX, min(outsideDistancePx.x, outsideDistancePx.y));
-    float alpha = saturate((rim * 0.20) + (halo * (0.16 + (0.08 * ribbon))) + (contour * 0.04));
-    alpha *= outerFeather * lerp(1.0, 0.82, cornerBlend) * color.a;
+    float2 uvPerPixel = float2(
+        max(abs(ddx(uv.x)) + abs(ddy(uv.x)), 1.0 / 65536.0),
+        max(abs(ddx(uv.y)) + abs(ddy(uv.y)), 1.0 / 65536.0)
+    );
+    float2 outerHalfPx = max((0.5.xx / uvPerPixel) - 1.0.xx, 1.0.xx);
+    float2 outerPointPx = (uv - 0.5.xx) / uvPerPixel;
+    float outerDistancePx = sdRoundedBox(
+        outerPointPx,
+        outerHalfPx,
+        GARDEN_OUTER_FEATHER_PX + GARDEN_CORNER_SOFTEN_PX * 0.5
+    );
+    if (outerDistancePx > 0.0) {
+        return float4(0.0, 0.0, 0.0, 0.0);
+    }
 
-    float3 cool = lerp(color.rgb * float3(0.76, 0.84, 0.96), float3(0.34, 0.68, 0.94), contour);
-    float3 warm = float3(1.00, 0.61, 0.43);
-    float3 glow = lerp(cool, warm, saturate((halo * 0.34) + (ribbon * 0.06)));
-    glow += color.rgb * (rim * 0.05);
-    glow += warm * (halo * 0.05 * ribbon);
-    glow *= lerp(1.0, 0.88, cornerBlend);
+    float outerInsetPx = max(-outerDistancePx, 0.0);
+    float bandProgress = innerDistancePx / max(innerDistancePx + outerInsetPx, 0.001);
+    float pixelNoise = hash21(floor(uv / uvPerPixel));
+    bandProgress = saturate(bandProgress + ((pixelNoise - 0.5) * 0.02));
+
+    float fade = 1.0 - smoothstep(0.0, 1.0, bandProgress);
+    float rim = 1.0 - smoothstep(0.0, GARDEN_INNER_SOFTEN_PX * 2.0, innerDistancePx);
+    float halo = exp(-innerDistancePx / max(GARDEN_OUTER_FEATHER_PX, 1.0));
+    float alpha = saturate((fade * 0.72) + (rim * 0.22) + (halo * 0.06)) * color.a;
+
+    float3 edgeColor = lerp(color.rgb * 0.48, color.rgb, 0.72);
+    float3 glow = lerp(color.rgb * 0.34, edgeColor, saturate((fade * 0.82) + (rim * 0.18)));
+    glow *= lerp(0.96, 1.02, rim);
 
     return float4(glow, alpha);
 }

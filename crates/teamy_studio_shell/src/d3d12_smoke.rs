@@ -20,7 +20,7 @@ pub fn smoke_bootstrap_text_renderer_for_scene(
 ) -> eyre::Result<TextRendererSmokeBootstrap> {
     let mut host = TextRendererHost::new(hwnd, scene)
         .wrap_err("failed to create reusable text renderer host for D3D12 smoke bootstrap")?;
-    host.present_scene_frame([0.02, 0.05, 0.08, 1.0])
+    host.present_scene_frame([0.0, 0.0, 0.0, 0.0])
         .wrap_err("failed to present initial scene frame for D3D12 smoke bootstrap")?;
 
     eprintln!(

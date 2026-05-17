@@ -13,13 +13,20 @@ use windows::Win32::Graphics::Direct3D12::{
     ID3D12GraphicsCommandList, ID3D12PipelineState, ID3D12Resource, ID3D12RootSignature,
     D3D12_VIEWPORT,
 };
+use windows::Win32::Graphics::DirectComposition::{
+    DCompositionCreateDevice, IDCompositionDevice, IDCompositionTarget, IDCompositionVisual,
+};
 use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory2, DXGI_ADAPTER_FLAG, DXGI_ADAPTER_FLAG_NONE, DXGI_ADAPTER_FLAG_SOFTWARE,
-    DXGI_CREATE_FACTORY_FLAGS, DXGI_ERROR_NOT_FOUND, DXGI_PRESENT, DXGI_SCALING_STRETCH,
-    DXGI_SWAP_CHAIN_DESC1, DXGI_SWAP_EFFECT_FLIP_DISCARD, DXGI_USAGE_RENDER_TARGET_OUTPUT,
-    IDXGIAdapter, IDXGIAdapter1, IDXGIFactory2, IDXGIFactory4, IDXGISwapChain1, IDXGISwapChain3,
+    DXGI_CREATE_FACTORY_FLAGS, DXGI_ERROR_NOT_FOUND, DXGI_MWA_NO_ALT_ENTER, DXGI_PRESENT,
+    DXGI_SCALING_STRETCH, DXGI_SWAP_CHAIN_DESC1,
+    DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT, DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL,
+    DXGI_USAGE_RENDER_TARGET_OUTPUT, IDXGIAdapter, IDXGIAdapter1, IDXGIDevice, IDXGIFactory2,
+    IDXGIFactory4, IDXGISwapChain1, IDXGISwapChain3,
 };
-use windows::Win32::Graphics::Dxgi::Common::{DXGI_ALPHA_MODE_IGNORE, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
+use windows::Win32::Graphics::Dxgi::Common::{
+    DXGI_ALPHA_MODE_PREMULTIPLIED, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC,
+};
 use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObjectEx};
 use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
 use windows::core::Interface;
@@ -41,6 +48,9 @@ pub struct TextRendererHost {
     pub hwnd: HWND,
     pub dxgi_factory: IDXGIFactory4,
     pub device: ID3D12Device,
+    pub dcomp_device: IDCompositionDevice,
+    pub dcomp_target: IDCompositionTarget,
+    pub dcomp_visual: IDCompositionVisual,
     pub command_queue: ID3D12CommandQueue,
     pub command_allocator: ID3D12CommandAllocator,
     pub command_list: ID3D12GraphicsCommandList,
@@ -90,8 +100,16 @@ impl TextRendererHost {
         .wrap_err("failed to create D3D12 command list")?;
         unsafe { command_list.Close() }.wrap_err("failed to close D3D12 command list")?;
         let (width, height) = client_size(hwnd)?;
-        let swap_chain = create_hwnd_swap_chain(&dxgi_factory, &command_queue, hwnd, width, height)
-            .wrap_err("failed to create HWND swap chain for text renderer host")?;
+        let swap_chain =
+            create_composition_swap_chain(&dxgi_factory, &command_queue, width, height)
+                .wrap_err("failed to create composition swap chain for text renderer host")?;
+        unsafe { dxgi_factory.MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER) }
+            .wrap_err("failed to configure DXGI window association for text renderer host")?;
+        let (dcomp_device, dcomp_target, dcomp_visual) =
+            attach_swap_chain_to_window(hwnd, &swap_chain)
+                .wrap_err("failed to attach composition swap chain to text renderer host window")?;
+        unsafe { swap_chain.SetMaximumFrameLatency(1) }
+            .wrap_err("failed to set text renderer host maximum frame latency")?;
         let (rtv_heap, rtv_descriptor_size, render_targets) =
             create_render_targets(&device, &swap_chain)
                 .wrap_err("failed to create render targets for text renderer host")?;
@@ -116,6 +134,9 @@ impl TextRendererHost {
             hwnd,
             dxgi_factory,
             device,
+            dcomp_device,
+            dcomp_target,
+            dcomp_visual,
             command_queue,
             command_allocator,
             command_list,
@@ -359,10 +380,9 @@ fn client_size(hwnd: HWND) -> eyre::Result<(u32, u32)> {
     Ok((width, height))
 }
 
-fn create_hwnd_swap_chain(
+fn create_composition_swap_chain(
     factory: &IDXGIFactory4,
     command_queue: &ID3D12CommandQueue,
-    hwnd: HWND,
     width: u32,
     height: u32,
 ) -> eyre::Result<IDXGISwapChain3> {
@@ -379,15 +399,35 @@ fn create_hwnd_swap_chain(
         BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
         BufferCount: FRAME_COUNT as u32,
         Scaling: DXGI_SCALING_STRETCH,
-        SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
-        AlphaMode: DXGI_ALPHA_MODE_IGNORE,
-        Flags: 0,
+        SwapEffect: DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL,
+        AlphaMode: DXGI_ALPHA_MODE_PREMULTIPLIED,
+        Flags: DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT.0 as u32,
     };
-    let swap_chain: IDXGISwapChain1 = unsafe {
-        factory.CreateSwapChainForHwnd(command_queue, hwnd, &description, None, None)
-    }
-    .wrap_err("failed to create DXGI swap chain for HWND")?;
+    let swap_chain: IDXGISwapChain1 =
+        unsafe { factory.CreateSwapChainForComposition(command_queue, &description, None) }
+            .wrap_err("failed to create DXGI composition swap chain")?;
     swap_chain.cast().wrap_err("failed to cast swap chain to IDXGISwapChain3")
+}
+
+fn attach_swap_chain_to_window(
+    hwnd: HWND,
+    swap_chain: &IDXGISwapChain3,
+) -> eyre::Result<(IDCompositionDevice, IDCompositionTarget, IDCompositionVisual)> {
+    let dcomp_device: IDCompositionDevice =
+        unsafe { DCompositionCreateDevice::<_, IDCompositionDevice>(None::<&IDXGIDevice>) }
+            .wrap_err("failed to create DirectComposition device")?;
+    let dcomp_target = unsafe { dcomp_device.CreateTargetForHwnd(hwnd, true) }
+        .wrap_err("failed to create DirectComposition target")?;
+    let dcomp_visual = unsafe { dcomp_device.CreateVisual() }
+        .wrap_err("failed to create DirectComposition visual")?;
+
+    unsafe {
+        dcomp_visual.SetContent(swap_chain)?;
+        dcomp_target.SetRoot(&dcomp_visual)?;
+        dcomp_device.Commit()?;
+    }
+
+    Ok((dcomp_device, dcomp_target, dcomp_visual))
 }
 
 fn create_render_targets(

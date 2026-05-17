@@ -310,7 +310,7 @@ pub fn create_native_window(request: &WindowCreateRequest) -> Result<NativeWindo
     ensure_shell_window_class_registered(request.host_options.chrome_kind)?;
 
     let instance = unsafe { GetModuleHandleW(None) }.wrap_err("failed to get module handle")?;
-    let native_host_plan = request.host_options.native_host_plan();
+    let native_host_plan = request.host_options.native_host_plan(request.present_policy);
     let ex_style = native_window_ex_style(native_host_plan);
     let style = native_window_style(native_host_plan);
     let (x, y) = centered_window_origin();
@@ -410,16 +410,17 @@ impl WindowHostOptions {
     }
 
     #[must_use]
-    pub const fn native_host_plan(self) -> NativeWindowHostPlan {
+    pub const fn native_host_plan(self, present_policy: PresentPolicy) -> NativeWindowHostPlan {
         let tool_window = matches!(self.chrome_kind, WindowChromeKind::Tool);
         let no_activate = matches!(self.activation, WindowActivationPolicy::NoActivate);
+        let no_redirection_bitmap = !matches!(present_policy, PresentPolicy::Composed);
 
         NativeWindowHostPlan {
             style: NativeWindowStylePlan {
                 app_window: !tool_window,
                 tool_window,
                 no_activate,
-                no_redirection_bitmap: true,
+                no_redirection_bitmap,
                 popup: true,
                 thick_frame: true,
                 minimize_box: !tool_window,
@@ -549,7 +550,7 @@ impl FeatureWindowHostScaffold {
             title: request.title,
             present_policy: request.present_policy,
             host_options: request.host_options,
-            native_host_plan: request.host_options.native_host_plan(),
+            native_host_plan: request.host_options.native_host_plan(request.present_policy),
             renderer_host_mode: request.present_policy.renderer_host_mode(),
             native_window_handle,
         });
@@ -812,6 +813,7 @@ mod tests {
     use super::{WINDOW_CREATE_REQUEST_EVENT_DEFINITION, WINDOW_CREATED_EVENT_DEFINITION};
     use teamy_studio_event_core::{PublishedEvent, WritableArena};
     use teamy_studio_timeline_core::{CanonicalTimeKey, ConstructedTimeline};
+    use windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE;
     use windows::Win32::UI::WindowsAndMessaging::{
         WS_EX_APPWINDOW, WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW,
         WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP, WS_THICKFRAME, WS_VISIBLE,
@@ -874,7 +876,7 @@ mod tests {
                     app_window: false,
                     tool_window: true,
                     no_activate: true,
-                    no_redirection_bitmap: true,
+                    no_redirection_bitmap: false,
                     popup: true,
                     thick_frame: true,
                     minimize_box: false,
@@ -894,7 +896,7 @@ mod tests {
     #[test]
     fn host_options_materialize_native_host_plan() {
         assert_eq!(
-            WindowHostOptions::standard_foreground().native_host_plan(),
+            WindowHostOptions::standard_foreground().native_host_plan(PresentPolicy::LowLatencyHwnd),
             NativeWindowHostPlan {
                 style: NativeWindowStylePlan {
                     app_window: true,
@@ -912,7 +914,7 @@ mod tests {
         );
         assert_eq!(
             WindowHostOptions::hidden_tool()
-                .native_host_plan()
+                .native_host_plan(PresentPolicy::Composed)
                 .initial_command,
             InitialWindowCommand::Hidden
         );
@@ -920,8 +922,10 @@ mod tests {
 
     #[test]
     fn native_host_plan_translates_to_win32_styles() {
-        let launcher_plan = WindowHostOptions::standard_foreground().native_host_plan();
-        let detail_plan = WindowHostOptions::tool_no_activate().native_host_plan();
+        let launcher_plan = WindowHostOptions::standard_foreground()
+            .native_host_plan(PresentPolicy::LowLatencyHwnd);
+        let detail_plan = WindowHostOptions::tool_no_activate()
+            .native_host_plan(PresentPolicy::LowLatencyHwnd);
 
         let launcher_ex_style = native_window_ex_style(launcher_plan);
         let launcher_style = native_window_style(launcher_plan);
@@ -948,6 +952,14 @@ mod tests {
         assert_eq!(detail_style & WS_VISIBLE, WS_VISIBLE);
         assert_eq!(detail_style & WS_POPUP, WS_POPUP);
         assert_eq!(detail_style & WS_THICKFRAME, WS_THICKFRAME);
+    }
+
+    #[test]
+    fn composed_native_host_plan_keeps_redirection_bitmap_enabled() {
+        let plan = WindowHostOptions::standard_foreground().native_host_plan(PresentPolicy::Composed);
+        let ex_style = native_window_ex_style(plan);
+
+        assert_eq!(ex_style & WS_EX_NOREDIRECTIONBITMAP, WINDOW_EX_STYLE(0));
     }
 
     #[test]

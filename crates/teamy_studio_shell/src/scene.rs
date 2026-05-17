@@ -1,4 +1,6 @@
+use windows::Win32::Graphics::Dwm::DwmGetColorizationColor;
 use windows::Win32::Foundation::RECT;
+use windows::core::BOOL;
 
 const MAX_PANEL_COUNT: usize = 8_192;
 const MAX_GLYPH_COUNT: usize = 8_192;
@@ -129,12 +131,11 @@ impl ShellSceneLayout {
 
     #[must_use]
     pub fn for_main_menu_with_dpi(client_width: i32, client_height: i32, dpi: u32) -> Self {
-        let content_inset = scale_for_dpi(8, dpi);
-        let title_bar_height = scale_for_dpi(34, dpi);
+        let content_inset = scale_for_dpi(18, dpi);
+        let title_bar_height = scale_for_dpi(52, dpi);
         let title_text_left = scale_for_dpi(72, dpi);
         let title_text_right = scale_for_dpi(144, dpi);
-        let body_inset = scale_for_dpi(12, dpi);
-        let body_top_gap = scale_for_dpi(10, dpi);
+        let body_top_gap = scale_for_dpi(14, dpi);
         let button_top_gap = scale_for_dpi(4, dpi);
         let button_size = scale_for_dpi(22, dpi);
         let right_inset = scale_for_dpi(4, dpi);
@@ -166,10 +167,10 @@ impl ShellSceneLayout {
             bottom: title_bar_rect.bottom - scale_for_dpi(3, dpi),
         };
         let body_rect = RECT {
-            left: content_frame_rect.left + body_inset,
+            left: content_frame_rect.left,
             top: title_bar_rect.bottom + body_top_gap,
-            right: content_frame_rect.right - body_inset,
-            bottom: content_frame_rect.bottom - body_inset,
+            right: content_frame_rect.right,
+            bottom: content_frame_rect.bottom,
         };
         let button_top = title_bar_rect.top + button_top_gap;
         let right = title_bar_rect.right - right_inset;
@@ -242,16 +243,40 @@ pub fn scale_for_dpi(value: i32, dpi: u32) -> i32 {
 
 #[must_use]
 pub fn preferred_background_color() -> [f32; 4] {
-    [0.24, 0.30, 0.40, 0.98]
+    preferred_background_color_from_dwm().unwrap_or([0.11, 0.44, 0.94, 0.5])
 }
 
 #[must_use]
 pub fn preferred_title_bar_color(focused: bool) -> [f32; 4] {
     if focused {
-        [0.16, 0.17, 0.19, 1.0]
+        preferred_background_color_with_alpha(1.0).unwrap_or([0.11, 0.44, 0.94, 1.0])
     } else {
-        [0.11, 0.12, 0.14, 1.0]
+        [43.0 / 255.0, 43.0 / 255.0, 43.0 / 255.0, 1.0]
     }
+}
+
+fn preferred_background_color_from_dwm() -> Option<[f32; 4]> {
+    preferred_background_color_with_alpha(0.5)
+}
+
+fn preferred_background_color_with_alpha(alpha: f32) -> Option<[f32; 4]> {
+    let mut colorization = 0_u32;
+    let mut opaque_blend = BOOL(0);
+    unsafe { DwmGetColorizationColor(&mut colorization, &mut opaque_blend) }.ok()?;
+    Some(colorization_color_to_rgba(colorization, alpha))
+}
+
+fn colorization_color_to_rgba(colorization: u32, alpha: f32) -> [f32; 4] {
+    let red = ((colorization >> 16) & 0xFF) as u8;
+    let green = ((colorization >> 8) & 0xFF) as u8;
+    let blue = (colorization & 0xFF) as u8;
+
+    [
+        f32::from(red) / 255.0,
+        f32::from(green) / 255.0,
+        f32::from(blue) / 255.0,
+        alpha,
+    ]
 }
 
 #[must_use]
@@ -272,7 +297,7 @@ pub fn push_window_garden_frame(scene: &mut RenderScene, layout: ShellSceneLayou
     push_panel_with_data(
         scene,
         layout.garden_rect,
-        [0.04, 0.05, 0.06, 1.0],
+        preferred_background_color_with_alpha(1.0).unwrap_or([0.11, 0.44, 0.94, 1.0]),
         PanelEffect::GardenFrame,
         window_garden_shader_data(layout),
     );
@@ -508,5 +533,20 @@ mod tests {
         assert_eq!(PanelEffect::SpriteImage as u32, 13);
         assert_eq!(PanelEffect::SceneButtonCard as u32, 14);
         assert_eq!(PanelEffect::SceneBody as u32, 15);
+    }
+
+    #[test]
+    fn main_menu_layout_matches_legacy_garden_and_body_spacing() {
+        let layout = ShellSceneLayout::for_main_menu(1280, 820);
+
+        assert_eq!(layout.content_frame_rect.left, 18);
+        assert_eq!(layout.content_frame_rect.top, 18);
+        assert_eq!(layout.garden_rect.left, 0);
+        assert_eq!(layout.garden_rect.top, 0);
+        assert_eq!(layout.title_bar_rect.bottom - layout.title_bar_rect.top, 52);
+        assert_eq!(layout.body_rect.left, layout.content_frame_rect.left);
+        assert_eq!(layout.body_rect.right, layout.content_frame_rect.right);
+        assert_eq!(layout.body_rect.bottom, layout.content_frame_rect.bottom);
+        assert_eq!(layout.body_rect.top - layout.title_bar_rect.bottom, 14);
     }
 }

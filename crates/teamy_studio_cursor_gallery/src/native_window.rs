@@ -1,4 +1,5 @@
 use std::sync::OnceLock;
+use std::thread;
 
 use eyre::{Result, eyre};
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
@@ -8,9 +9,10 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
     CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect,
-    GetWindowRect, HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTCAPTION, HTCLIENT, HTLEFT, HTRIGHT,
-    HTTOP, HTTOPLEFT, HTTOPRIGHT, IDC_ARROW, LoadCursorW, RegisterClassW, SetWindowPos,
-    SW_MAXIMIZE, SW_MINIMIZE, SW_SHOW, SWP_NOACTIVATE, SWP_NOZORDER, ShowWindow,
+    DispatchMessageW, GetMessageW, GetWindowRect, HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT,
+    HTCAPTION, HTCLIENT, HTLEFT, HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT, IDC_ARROW,
+    LoadCursorW, MSG, RegisterClassW, SetWindowPos, SW_MAXIMIZE, SW_MINIMIZE, SW_SHOW,
+    SWP_NOACTIVATE, SWP_NOZORDER, ShowWindow, TranslateMessage,
     WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND, WM_LBUTTONUP, WM_NCCALCSIZE, WM_NCHITTEST,
     WM_PAINT, WNDCLASSW, WS_EX_APPWINDOW, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP,
     WS_THICKFRAME, WS_VISIBLE,
@@ -112,6 +114,72 @@ pub fn open_native_cursor_gallery_window() -> Result<()> {
     }
 
     Ok(())
+}
+
+pub fn open_native_cursor_gallery_window_on_thread() -> Result<()> {
+    thread::Builder::new()
+        .name("teamy-cursor-gallery-ui".to_owned())
+        .spawn(run_cursor_gallery_window_thread)
+        .map_err(|error| eyre!("failed to spawn cursor gallery UI thread: {error}"))?;
+    Ok(())
+}
+
+fn run_cursor_gallery_window_thread() {
+    let hwnd = match open_native_cursor_gallery_window_inner() {
+        Ok(hwnd) => hwnd,
+        Err(_) => return,
+    };
+
+    let mut message = MSG::default();
+    loop {
+        let result = unsafe { GetMessageW(&mut message, None, 0, 0) }.0;
+        if result <= 0 {
+            break;
+        }
+
+        unsafe {
+            let _ = TranslateMessage(&message);
+            DispatchMessageW(&message);
+        }
+
+        if unsafe { windows::Win32::UI::WindowsAndMessaging::IsWindow(Some(hwnd)) }.as_bool() {
+            continue;
+        }
+        break;
+    }
+}
+
+fn open_native_cursor_gallery_window_inner() -> Result<HWND> {
+    initialize_dpi_awareness();
+    ensure_cursor_gallery_window_class_registered()?;
+
+    let instance = unsafe { GetModuleHandleW(None) }
+        .map_err(|error| eyre!("failed to get module handle: {error}"))?;
+    let dpi = system_dpi();
+
+    let hwnd = unsafe {
+        CreateWindowExW(
+            WS_EX_APPWINDOW,
+            CURSOR_GALLERY_WINDOW_CLASS_NAME,
+            CURSOR_GALLERY_WINDOW_TITLE,
+            WS_POPUP | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_VISIBLE,
+            180,
+            120,
+            scale_for_dpi(CURSOR_GALLERY_WINDOW_WIDTH, dpi),
+            scale_for_dpi(CURSOR_GALLERY_WINDOW_HEIGHT, dpi),
+            None,
+            None,
+            Some(instance.into()),
+            None,
+        )
+    }
+    .map_err(|error| eyre!("failed to create cursor gallery window: {error}"))?;
+
+    unsafe {
+        let _ = ShowWindow(hwnd, SW_SHOW);
+    }
+
+    Ok(hwnd)
 }
 
 fn handle_left_button_up(hwnd: HWND, lparam: LPARAM) -> Result<()> {
