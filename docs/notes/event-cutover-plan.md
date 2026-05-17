@@ -14,6 +14,43 @@ This document describes the implementation plan for the proposed architectural c
 
 The goal is to reduce compile times, improve architectural clarity, and establish a reusable event-driven foundation for future features.
 
+## Current implementation status
+
+Completed in the repository now:
+
+- the repo is a true Cargo workspace
+- the planned MVP crates exist under `crates/`
+- the root `teamy-studio` package is now a thin MVP composition binary
+- the old active `src/` and `tests/` surfaces were moved under `legacy/` with `git mv`
+- `legacy/` is excluded from active build and test validation
+- the root package now depends only on the MVP stack instead of the previous monolithic dependency set
+- `teamy_studio_main_menu` owns button-class registration types and static discovery
+- `teamy_studio_registration_core` owns event-definition and trigger registration slices plus startup validation
+- `teamy_studio_cursor_gallery` registers its button class and proves the pure event chain from menu click to window-create request
+- the root composition publishes that initial event chain into `teamy_studio_timeline_core`
+- the startup module now exposes a reusable bootstrapped session surface that accepts externally published events and pumps registered triggers to idle
+- `teamy_studio_shell` now owns an explicit `ShellRuntime` abstraction that encapsulates its host scaffold, shell reducer state, and host-stage pumping, and startup consumes that API instead of shell internals directly
+- shell window-create requests, hosted-window records, and lifecycle state now carry shell-owned host options for chrome kind, initial visibility, and activation policy
+- the shell host scaffold now materializes those host options into concrete native-host plans and renderer-host modes that mirror the legacy launcher/detail-window creation paths
+- the shell crate now translates those native-host plans into actual Win32 window style and extended-style flags, reducing the remaining gap to real native window creation
+- the shell crate now owns an opt-in native Win32 create/destroy path that registers shell window classes, creates real windows from shell request plans, and records native handles in hosted-window records
+- startup now has an explicit native-shell session/composition path that routes shell host stages through the native window-creation API without changing the default simulated MVP boot path
+- trigger runtimes now expose a fallible pump contract so cursors only advance after successful epoch processing, matching the intended shell and timeline semantics
+- the migrated main menu now carries the full legacy launcher button catalog, including titles and tooltips, via static registrations in the active workspace
+- the active binary now opens a lightweight native Win32 main-menu bridge window that displays the migrated launcher catalog instead of exiting after a synthetic startup flow
+- the bridge main-menu window now routes clicks into the startup/session event path, with currently migrated buttons left enabled and unmigrated buttons shown but disabled
+- the shell crate now owns a reusable scene-model surface for garden-frame, title-bar, custom-chrome, card, text, and sprite composition, and the main-menu crate now builds its launcher visuals against that shell-owned surface instead of raw Win32 child controls
+- the main-menu native host now custom-paints the shared scene model and performs hit testing against scene card layouts, which corrects the ownership model even though the renderer backend is not yet D3D12-backed
+
+Still pending:
+
+- real startup validation UX and gating instead of the current synchronous validation call
+- actual Win32/D3D12-backed window creation behind the shell host scaffold
+- async timeline ingestion, trigger cursors, and runtime pumping
+- feature-owned render/input loops and the real cursor-gallery window implementation
+- extracting the legacy D3D12 render thread and shader-backed scene renderer into shell-owned helpers so the main menu and feature crates can render the shared scene model through the real backend instead of the current custom-painted stopgap
+- richer event definitions with Facet-shaped public canonical event forms
+
 ---
 
 # 1. Motivations
@@ -202,7 +239,7 @@ Shell-provided selectable policies, such as:
 - late-latched pointer visual
 
 ### LogicalWindowId
-A shell-minted window identity used for correlation across feature and shell layers.
+A feature-minted logical window identity carried into shell requests and echoed back by shell lifecycle events for correlation.
 
 ---
 

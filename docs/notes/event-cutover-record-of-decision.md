@@ -138,7 +138,7 @@ This document captures the questions asked and the user’s responses during the
 **A.** Feature-defined request/window identities, no central scene enum.
 
 **Q45.** Who should mint `LogicalWindowId` values for feature windows: the feature crate or a shell helper?  
-**A.** Shell-provided minting capability.
+**A.** This was later superseded by Q113.
 
 **Q46.** Should downstream feature crates be allowed to depend on each other directly?  
 **A.** No; discourage feature crossing.
@@ -347,6 +347,9 @@ This document captures the questions asked and the user’s responses during the
 
 **Q114.** If shell fails to create a feature-minted logical window, should that failure be a typed event, a direct error, or both?  
 **A.** This was not answered in the conversation excerpt beyond presenting the options.
+
+**Q115.** Should shell window-create requests carry only title and present policy, or also shell-owned host behavior like chrome kind, initial visibility, and activation policy?  
+**A.** They should also carry shell-owned host behavior so real window creation decisions stay explicit in shell request types instead of being reconstructed implicitly at host-creation time.
 
 If you want, I can turn this into a cleaner formal document format next, for example:
 - a decision log with timestamps/sections,

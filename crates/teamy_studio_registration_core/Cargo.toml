@@ -1,0 +1,9 @@
+[package]
+name = "teamy_studio_registration_core"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+linkme = "0.3.35"
+teamy_studio_event_core = { path = "../teamy_studio_event_core" }

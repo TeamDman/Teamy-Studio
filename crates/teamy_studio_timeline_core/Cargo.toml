@@ -1,0 +1,8 @@
+[package]
+name = "teamy_studio_timeline_core"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+teamy_studio_event_core = { path = "../teamy_studio_event_core" }

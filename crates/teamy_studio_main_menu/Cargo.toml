@@ -1,0 +1,17 @@
+[package]
+name = "teamy_studio_main_menu"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+eyre = "0.6.12"
+linkme = "0.3.35"
+teamy_studio_event_core = { path = "../teamy_studio_event_core" }
+teamy_studio_registration_core = { path = "../teamy_studio_registration_core" }
+teamy_studio_shell = { path = "../teamy_studio_shell" }
+windows = { version = "0.61.3", features = [
+	"Win32_Foundation",
+	"Win32_System_LibraryLoader",
+	"Win32_UI_WindowsAndMessaging",
+] }
