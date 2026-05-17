@@ -7136,10 +7136,6 @@ pub fn build_cursor_gallery_render_scene(
 #[must_use]
 // cursorlatency[impl playground.window]
 #[expect(
-    clippy::too_many_lines,
-    reason = "the cursor latency playground scene is assembled as one cohesive render recipe"
-)]
-#[expect(
     clippy::needless_pass_by_value,
     reason = "the view state is consumed as an immutable snapshot from the caller's frame model"
 )]
@@ -7208,7 +7204,12 @@ pub fn cursor_latency_playground_controls_rect(panel_rect: ClientRect) -> Client
 #[must_use]
 pub fn cursor_latency_playground_layout(panel_rect: ClientRect) -> CursorLatencyPlaygroundLayout {
     let body_rect = panel_rect.inset(8);
-    let title_rect = ClientRect::new(body_rect.left(), body_rect.top(), body_rect.left(), body_rect.top());
+    let title_rect = ClientRect::new(
+        body_rect.left(),
+        body_rect.top(),
+        body_rect.left(),
+        body_rect.top(),
+    );
     let summary_rect = title_rect;
     let subtitle_rect = title_rect;
     let canvas_rect = body_rect;

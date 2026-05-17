@@ -5130,8 +5130,7 @@ fn handle_scene_destroy_message(hwnd: WindowHandle) -> LRESULT {
             matches!(
                 state.scene_kind,
                 SceneWindowKind::CursorLatencyPlayground
-                    |
-                SceneWindowKind::TextRenderingPlaygroundPlane
+                    | SceneWindowKind::TextRenderingPlaygroundPlane
                     | SceneWindowKind::TextRenderingPlaygroundEditor
                     | SceneWindowKind::TextRenderingPlaygroundPresets
             )
@@ -12007,7 +12006,9 @@ fn perform_scene_action(
                 .wrap_err("failed to spawn Teamy Studio cursor latency playground thread")?;
             Ok(SceneActionDisposition::KeepOpen)
         }
-        SceneAction::ReactivateCursorLatencyMode => Ok(SceneActionDisposition::KeepOpen),
+        SceneAction::ReactivateCursorLatencyMode | SceneAction::CreateBlankTimeline => {
+            Ok(SceneActionDisposition::KeepOpen)
+        }
         SceneAction::OpenTextRenderingPlayground => {
             let app_home = app_home.clone();
             thread::Builder::new()
@@ -12202,7 +12203,6 @@ fn perform_scene_action(
             })?;
             Ok(SceneActionDisposition::KeepOpen)
         }
-        SceneAction::CreateBlankTimeline => Ok(SceneActionDisposition::KeepOpen),
         SceneAction::PanTimelineLeft => {
             with_scene_app_state(|state| {
                 if state.scene_kind == SceneWindowKind::TimelinePlayground {

@@ -1503,9 +1503,11 @@ impl D3d12PanelRenderer {
             &cursor_latency.button_states,
         );
         if let Some(base_scene) = frame.scene.as_ref() {
-            scene.overlay_panels = base_scene.overlay_panels.clone();
-            scene.overlay_transformed_panels = base_scene.overlay_transformed_panels.clone();
-            scene.overlay_glyphs = base_scene.overlay_glyphs.clone();
+            scene.overlay_panels.clone_from(&base_scene.overlay_panels);
+            scene
+                .overlay_transformed_panels
+                .clone_from(&base_scene.overlay_transformed_panels);
+            scene.overlay_glyphs.clone_from(&base_scene.overlay_glyphs);
         }
 
         self.transformed_glyph_clip_rect = None;
