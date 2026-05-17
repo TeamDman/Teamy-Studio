@@ -1,1 +1,1 @@
-Get-Process teamy-studio | Stop-Process
+Get-Process teamy-studio | Stop-Process -ErrorAction SilentlyContinue
