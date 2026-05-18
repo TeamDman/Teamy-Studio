@@ -1,6 +1,7 @@
 use std::sync::{Mutex, OnceLock};
 
 use eyre::{Result, eyre};
+use tracing::{info, warn};
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{
     DWMWA_BORDER_COLOR, DWMWA_COLOR_NONE, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND,
@@ -947,14 +948,14 @@ where
             }
             let width = (client_rect.right - client_rect.left).max(0) as u32;
             let height = (client_rect.bottom - client_rect.top).max(0) as u32;
-            eprintln!(
-                "main menu D3D12 bootstrap generation={} hwnd={:?} size={}x{} dpi={} moving_or_sizing={}",
-                state.d3d12_bootstrap_generation,
-                hwnd,
+            info!(
+                hwnd = ?hwnd,
+                generation = state.d3d12_bootstrap_generation,
                 width,
                 height,
-                state.dpi,
-                state.moving_or_sizing,
+                dpi = state.dpi,
+                moving_or_sizing = state.moving_or_sizing,
+                "main menu D3D12 bootstrap"
             );
         }
         smoke_bootstrap = Some(build_smoke_bootstrap_for_main_menu(hwnd)?);
@@ -1043,7 +1044,7 @@ fn configure_main_menu_window_chrome(hwnd: HWND) -> Result<()> {
             u32::try_from(std::mem::size_of_val(&border_color)).unwrap_or(u32::MAX),
         )
     } {
-        eprintln!("main menu DWM border-color override unavailable: {error}");
+        warn!(error = %error, "main menu DWM border-color override unavailable");
     }
 
     let corner_preference = DWMWCP_DONOTROUND;
@@ -1055,7 +1056,7 @@ fn configure_main_menu_window_chrome(hwnd: HWND) -> Result<()> {
             u32::try_from(std::mem::size_of_val(&corner_preference)).unwrap_or(u32::MAX),
         )
     } {
-        eprintln!("main menu DWM corner override unavailable: {error}");
+        warn!(error = %error, "main menu DWM corner override unavailable");
     }
 
     Ok(())
@@ -1159,14 +1160,14 @@ fn drive_main_menu_smoke_path(
         {
             state.d3d12_active = true;
             state.d3d12_bootstrap_generation += 1;
-            eprintln!(
-                "main menu D3D12 bootstrap generation={} hwnd={:?} size={}x{} dpi={} moving_or_sizing={}",
-                state.d3d12_bootstrap_generation,
-                hwnd,
+            info!(
+                hwnd = ?hwnd,
+                generation = state.d3d12_bootstrap_generation,
                 width,
                 height,
-                state.dpi,
-                state.moving_or_sizing,
+                dpi = state.dpi,
+                moving_or_sizing = state.moving_or_sizing,
+                "main menu D3D12 bootstrap"
             );
         }
         unsafe {
@@ -1186,14 +1187,14 @@ fn drive_main_menu_smoke_path(
             .expect("main menu window state should not be poisoned")
             .as_ref()
             .map_or_else(system_dpi, |state| state.dpi);
-        eprintln!(
-            "main menu D3D12 resize hwnd={:?} from={}x{} to={}x{} dpi={}",
-            hwnd,
-            host.width,
-            host.height,
-            width,
-            height,
+        info!(
+            hwnd = ?hwnd,
+            from_width = host.width,
+            from_height = host.height,
+            to_width = width,
+            to_height = height,
             dpi,
+            "main menu D3D12 resize"
         );
         host.resize_swap_chain(width.max(1), height.max(1))?;
     }

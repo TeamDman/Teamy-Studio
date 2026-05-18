@@ -1,6 +1,7 @@
 use std::ffi::OsStr;
 
 use eyre::WrapErr;
+use tracing::info;
 use windows::Win32::Foundation::HWND;
 
 use crate::{RenderScene, TextRendererHost};
@@ -23,12 +24,13 @@ pub fn smoke_bootstrap_text_renderer_for_scene(
     host.present_scene_frame([0.0, 0.0, 0.0, 0.0])
         .wrap_err("failed to present initial scene frame for D3D12 smoke bootstrap")?;
 
-    eprintln!(
-        "D3D12 smoke bootstrap ready: hwnd={:?} vertices={} curves={} bands={} presented=1",
-        hwnd,
-        host.last_upload_batch.vertices.len(),
-        host.last_upload_batch.curve_upload_data.len(),
-        host.last_upload_batch.band_upload_data.len(),
+    info!(
+        hwnd = ?hwnd,
+        vertices = host.last_upload_batch.vertices.len(),
+        curves = host.last_upload_batch.curve_upload_data.len(),
+        bands = host.last_upload_batch.band_upload_data.len(),
+        presented = 1,
+        "D3D12 smoke bootstrap ready"
     );
 
     Ok(host)

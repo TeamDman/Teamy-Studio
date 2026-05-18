@@ -43,6 +43,8 @@ teamy_studio_main_menu = { path = "crates/teamy_studio_main_menu", optional = tr
 teamy_studio_registration_core = { path = "crates/teamy_studio_registration_core", optional = true }
 teamy_studio_shell = { path = "crates/teamy_studio_shell", optional = true }
 teamy_studio_timeline_core = { path = "crates/teamy_studio_timeline_core", optional = true }
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.19", features = ["fmt"] }
 
 [features]
 default = ["mvp"]
