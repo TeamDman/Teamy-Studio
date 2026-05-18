@@ -223,13 +223,17 @@ The asynchronous engine that pumps triggers over unseen events.
 ## 3.3 Registration core objects
 
 ### Trigger definition registration
-A static `linkme` registration describing a query trigger, including a stable opaque trigger-registration identity and auxiliary provenance metadata for diagnostics and implementation discovery.
+A static `linkme` registration describing a query trigger, including a stable opaque `TriggerRegistrationId`, the corresponding stable `TriggerDefinitionId`, and registration provenance metadata for diagnostics and implementation discovery.
 
 ### Event definition registration
-A static `linkme` registration describing an event definition, including auxiliary provenance metadata for diagnostics and implementation discovery.
+A static `linkme` registration describing an event definition, including registration provenance metadata for diagnostics and implementation discovery.
 
 ### Feature definition registration
-A static `linkme` registration describing a feature, its stable `FeatureId`, and auxiliary provenance metadata such as repository URL, repo-relative implementation path, and related source-location diagnostics.
+A static `linkme` registration describing a feature, its stable `FeatureId`, and registration provenance metadata.
+
+Feature definitions, event definitions, and trigger definitions should all reuse one common provenance metadata struct shape so the same fields can be copied across definition surfaces even when some fields are unused. Identity fields stay separate from this shared provenance metadata.
+
+Registrations should carry their own provenance metadata rather than being forced to reuse the exact same provenance instance as their corresponding definitions. For common static `linkme` registrations, registration provenance may default to the same values as definition provenance when they are effectively identical.
 
 ### Compatibility validation
 A startup/test-time check that a trigger’s declared public view shape matches the registered event definition shape.
@@ -237,6 +241,164 @@ A startup/test-time check that a trigger’s declared public view shape matches 
 This validation should be groupable by feature ownership so startup can validate just the triggers declared by a given feature against the full static set of registered event definitions.
 
 For now this should use exact Facet-shape equality rather than subset matching or implicit projections. The concrete payload type published for an event definition must match the declared public event shape exactly, and trigger subscribed shapes must match that same declared public shape exactly.
+
+Validation should walk the full discovered registry set and emit all discovered validation problems.
+
+Those validation problems should be emitted as structured Facet-reflectable failure values. JSON, Facet JSON, terminal display formatting, and other human-facing renderings should be layered on top rather than stored as the primary event contract.
+
+The failure essence should use one common top-level `ValidationFailure` type, with stage-specific detail represented by variants and structured fields rather than separate unrelated top-level failure payloads per validation stage.
+
+`ValidationFailure` should describe only the defect essence. Bootstrap stage, feature identity, registration identity, and other occurrence-specific context should live on the surrounding emitted validation event.
+
+If startup cannot continue, bootstrap should emit a thin `StartupFailedEvent` rather than replaying or re-encoding the detailed failure payloads; consumers that need detailed failures should observe the individual failure events directly. `StartupFailedEvent` should cover any fatal bootstrap-phase failure, not only validation failures, and should carry reusable event references to the exact prior failure events by event ID, event-definition ID, and exact timeline-relative timestamp hint. This in turn implies that private arenas own event-ID assignment before publication to the global timeline, and that event-reference timestamp hints are materialized by combining arena base timeline offset with each event's relative arena offset before publication so the reference stores the composed timeline offset rather than an arena-local offset. The timeline itself may optionally carry a wall-clock UTC start instant, but event references do not publish UTC instants and remain timeline-relative only. The reusable `EventReference` type belongs in `teamy_studio_timeline_core`, though no additional consumers need to be prescribed until concrete uses appear. If the full bootstrap phase completes cleanly, bootstrap should emit `StartupSucceededEvent`, and downstream continuation should depend on that explicit success event. `StartupSucceededEvent` should remain thin and should not mirror the failure-path backlink list.
+
+Timeline time should use application-owned newtypes as the public model rather than directly exposing `uom` quantities throughout the public API. `uom` may still be used internally if helpful, but the externally visible time model should stay application-owned and exact.
+
+That application-owned time model should be generic over representation and unit, with a default app-wide alias for the common case, rather than hard-coding the entire design to one fixed unit in every context.
+
+The default app-wide alias should be an `i128`-backed femtosecond-based instantiation.
+
+In public API spellings, those generic parameters should be named `Repr` and `Unit`, where `Repr` is the numeric carrier such as `i32` or `i128`, and `Unit` is the app-owned time-unit marker such as `Seconds` or `Femtoseconds`.
+
+The first public time model should center on timelines, timeline-relative offsets, arena-relative offsets, and timeline origins, with those types all sharing the same generic `Repr`/`Unit` parameters. `TimelineOrigin` should be an explicit small sum type from the start, and origins may be grounded, relative, or ungrounded rather than being forced to always mean a direct wall-clock instant. Relative origins should start with a constrained single-hop model rather than arbitrary recursive origin graphs, and the first implementation should define an opaque GUID-backed `TimelineId` that relative origins may reference. Every timeline should require a `TimelineId` at creation time, with ordinary creation and `Default` auto-generating one while explicit constructors may accept a supplied ID when needed. `TimelineId` should use the same GUID generation mechanism as the app's other opaque IDs. Human-facing timeline labels can be deferred for now and later supplied through localization keyed by those stable GUID identities. The first implementation should also include a minimal explicit API for translating offsets between timelines when origin relationships make that possible, and that API should return a small result object rather than only a bare converted offset. The relationship/proof metadata in that result should be a small strongly typed structured value that exposes only the resolved relationship used for the conversion. Identity types should implement `Arbitrary`. Dedicated public interval/range types can be deferred for now.
+
+The first implementation should prefer direct inherent methods on these time types rather than introducing a separate public conversion trait before real abstraction pressure exists.
+
+The first implementation should also include dedicated precision-validation tests from the start for arithmetic, offset composition, translation, round-tripping, and non-relatable cases.
+
+Those initial tests should combine focused unit coverage with a small property-style suite that synthesizes arbitrary identities and timelines without expanding immediately into a large generative matrix.
+
+That initial generated suite should cover both relatable and intentionally non-relatable timeline/origin combinations from the start.
+
+For relatable generated cases, the initial property-style suite should require round-trip translation invariants rather than only one-way success assertions.
+
+The first translation result type should keep invertibility implicit in v1 rather than adding a separate explicit invertibility field before the relationship model becomes richer.
+
+The first translation result type should also stay minimal, exposing only the translated offset plus the small resolved relationship metadata rather than a second canonical proof artifact.
+
+The first public translation API should center on a first-class timeline transformation object. Rather than a direct method on `TimelineOffset`, the API should first resolve and construct a transformation object between timelines and then explicitly apply that transformation to offsets. This is intentionally aligned with the design style used by the `sguaba` crate, where typed values remain in their owning coordinate systems while first-class transform objects represent the relationship between systems and get applied to those values.
+
+The first public constructor for that transformation object should live on `Timeline`.
+
+The first transformation type should expose only an apply-style operation in v1, while documentation may explicitly note that composition and inversion are possible future extensions.
+
+The first public names should be `TimelineTransform` for the type, `transform_to` for the constructor on `Timeline`, and `apply` for the operation that applies the transform to an offset.
+
+`Timeline::transform_to` should return a `Result` rather than an `Option`, so failed relationship resolution stays explicit and can preserve structured failure information.
+
+`TimelineTransformError` should preserve as much immediately available structured context as practical in v1, including the source and destination `TimelineId`s plus the resolved failure reason.
+
+Once a `TimelineTransform` has been successfully constructed, `apply` should be infallible in v1 and should directly return the translated offset.
+
+`TimelineTransform` should directly expose its source and destination `TimelineId`s in addition to carrying the minimal resolved data needed to apply the translation.
+
+The small resolved relationship metadata used to build a `TimelineTransform` should remain internal in v1 rather than being exposed directly on the public transform object.
+
+`TimelineTransform::apply` should return only the translated offset rather than bundling the already-exposed timeline IDs back into the return value.
+
+`TimelineTransform::apply` should take `&self` in v1 so transforms behave as reusable borrowed values rather than one-shot consumables.
+
+`TimelineTransform` should implement `Clone` in v1. Timeline IDs and offset types should use cheap value semantics and implement `Copy`.
+
+Timeline identity and other small value-centric public types should live in dedicated files such as `timeline_id.rs` rather than being buried inside one large timeline source file.
+
+That dedicated-file approach should also apply to `TimelineTransform`, `TimelineTransformError`, and other first-class public timeline types as they are introduced.
+
+Those dedicated files should live under a nested `timeline/` directory module rather than remaining as a flat set of files at the crate root.
+
+`timeline/mod.rs` should directly re-export the main public timeline types for callers, but v1 should not introduce a separate prelude module for this area.
+
+Those direct re-exports should cover the full public timeline surface for the subsystem, including error types and other first-class public timeline types that callers are expected to use.
+
+`timeline/mod.rs` should be the single intended stable public import surface for the subsystem, so deeper submodules remain free to change as internal organization details.
+
+Small public timeline value types should commit to a consistent derive surface from the start, including value-semantic derives where appropriate and `Facet` for reflection-oriented use.
+
+The first public timeline types should not commit to `Display` in v1; `Debug` plus explicit accessors should be sufficient until presentation and localization needs are more concrete.
+
+The first public timeline types should also explicitly avoid serde in v1 and rely on `Facet` for reflection-oriented needs instead.
+
+Public timeline types should implement `Default` only where there is an obvious semantically safe default, rather than treating technical defaultability as sufficient reason to expose it.
+
+Public timeline conversions should stay explicit unless they are lossless and semantically obvious; otherwise the API should prefer named constructors and methods over broad `From`/`Into` conveniences.
+
+Timeline offset arithmetic should use explicit named methods in v1 rather than broad `Add`/`Sub` operator overloading.
+
+The first public numeric surface should expose checked arithmetic methods only, with no saturating or wrapping variants in v1.
+
+If checked timeline arithmetic fails, that failure should bail and propagate upward rather than being locally recovered or converted into fallback values.
+
+Checked timeline arithmetic should use a dedicated `TimelineArithmeticError` type rather than being folded immediately into a broader shared timeline error surface.
+
+`TimelineArithmeticError` should preserve the operation kind and operand values that triggered the failure in addition to the failure reason.
+
+Checked timeline arithmetic methods should use standard Rust-style names such as `checked_add` and `checked_sub`.
+
+The initial checked arithmetic surface should also include `checked_neg`.
+
+The initial public offset API should also include small helper methods such as `is_zero`, `is_positive`, and `is_negative`.
+
+`TimelineOffset` should also expose an associated zero constant in v1.
+
+`TimelineOffset::ZERO` should be the only canonical zero surface in v1 rather than being paired with a redundant `zero()` constructor.
+
+`TimelineOffset` should start with one explicit primary constructor rather than multiple early convenience constructors for raw units or literals.
+
+That primary constructor should follow the UOM-style pattern where a generic unit argument determines the supplied time unit, rather than splitting into separate constructor names for femtoseconds, nanoseconds, seconds, and so on.
+
+That constructor should accept only typed unit markers in v1 rather than layering literal-oriented shortcuts on top.
+
+The first public time-unit surface should expose only a curated app-owned set of supported unit markers.
+
+The initial curated public set should start small, covering `Seconds`, `Milliseconds`, `Microseconds`, `Nanoseconds`, and `Femtoseconds`.
+
+That initial public unit set should remain limited to those decimal-step units in v1 rather than adding domain-specific named units.
+
+Conversions between those curated public units should remain explicit in v1 rather than being introduced through implicit or automatic conversion paths.
+
+That explicit conversion surface should use a generic `.get::<Unit>()` pattern rather than unit-specific conversion method names.
+
+`.get::<Unit>()` should return the raw numeric representation directly rather than wrapping the extracted value in another application-owned type.
+
+`.get::<Unit>()` should require exact representability in the requested unit in v1.
+
+V1 should omit lossy extraction APIs entirely.
+
+Exact `.get::<Unit>()` failures should use a dedicated extraction-specific error type rather than reusing `TimelineArithmeticError`.
+
+That extraction-specific error type should preserve the source unit, requested target unit, original raw value, and exactness failure reason.
+
+The public `.get::<Unit>()` surface should be strictly fallible in v1 and should not expose a panicking extraction variant.
+
+That extraction API should live directly on `TimelineOffset` as `.get::<Unit>()`.
+
+`TimelineOffset` should keep its storage-unit concept implicit in v1 rather than exposing a separate public storage-unit query API.
+
+Public timeline value types should expose raw values only through explicit APIs rather than through direct tuple/newtype field access.
+
+Public timeline value types should also avoid `repr(transparent)` and other representation-layout guarantees in v1.
+
+CLI and other input parsing should remain outside the core timeline model; parsing and validation should happen at the boundary before constructing these typed values.
+
+For reflection-oriented proxy forms, time-like values should canonicalize through `Facet` to the femtosecond-based representation rather than exposing multiple unit-shaped serial forms.
+
+GUID-like identity types should also share a common Facet proxy shape rather than each defining an ad hoc reflected form.
+
+Canonical Facet proxy commitments in v1 should remain limited to those time-like values and GUID-like identity types, not to more complex non-ID timeline structures such as `TimelineTransform`.
+
+The shared Facet proxy form for GUID-like identity types should be the canonical hyphenated lowercase string representation.
+
+Because Facet already supports `uuid::Uuid`, GUID-like app ID types should use that UUID-backed reflected form transparently rather than adding prefixes or wrapper proxy shapes of their own.
+
+Time-like Facet proxies should still keep separate category envelopes for offsets, durations, and instants even when they canonicalize numerically to femtoseconds.
+
+Those envelopes should stay minimal, containing only the category tag and the canonical femtosecond value.
+
+The category tag in those envelopes should use stable string tokens rather than a second reflected enum-like contract.
+
+The initial stable tokens for the first time-like proxy categories should be `offset`, `duration`, and `instant`.
+
+Those time-like proxy envelopes should also share one field name for the canonical femtosecond value.
 
 Across feature, event-definition, and trigger registrations, provenance metadata should be derived where possible from compile-time context rather than hard-coded, with repository URL as the main intentionally hard-coded field.
 
