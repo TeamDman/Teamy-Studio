@@ -3,8 +3,14 @@ use eyre::{Result, eyre};
 use facet::Facet;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
+use std::fs::File;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+#[cfg(feature = "tracy")]
+use tracing::Metadata;
 use tracing::level_filters::LevelFilter;
+#[cfg(feature = "tracy")]
+use tracing_subscriber::filter::FilterFn;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt::writer::BoxMakeWriter;
 use tracing_subscriber::prelude::*;
@@ -67,6 +73,9 @@ pub struct StartupBootstrapCli {
 pub enum BootstrapCliParseError {
     MissingValue { flag: &'static str },
     UnrecognizedArgument { argument: String },
+    HelpRequested { text: String },
+    VersionRequested { text: String },
+    CompletionsRequested { script: String },
 }
 
 impl Display for BootstrapCliParseError {
@@ -76,11 +85,28 @@ impl Display for BootstrapCliParseError {
             Self::UnrecognizedArgument { argument } => {
                 write!(formatter, "unrecognized startup argument: {argument}")
             }
+            Self::HelpRequested { text } | Self::VersionRequested { text } => {
+                write!(formatter, "{text}")
+            }
+            Self::CompletionsRequested { script } => write!(formatter, "{script}"),
         }
     }
 }
 
 impl Error for BootstrapCliParseError {}
+
+impl BootstrapCliParseError {
+    #[must_use]
+    pub const fn is_builtin_request(&self) -> bool {
+        matches!(
+            self,
+            Self::HelpRequested { .. }
+                | Self::VersionRequested { .. }
+                | Self::CompletionsRequested { .. }
+        )
+    }
+
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum StartupLoggingPlanError {
@@ -254,9 +280,126 @@ impl StartupBootstrapPlan {
     }
 }
 
+#[cfg(feature = "tracy")]
+fn exclude_tracy_frame_mark(meta: &Metadata<'_>) -> bool {
+    meta.fields().field("tracy.frame_mark").is_none()
+}
+
+fn startup_help_text() -> String {
+    format!(
+        "Teamy Studio\n\nUsage:\n  teamy-studio [OPTIONS]\n\nOptions:\n  --debug                    Enable debug logging\n  --log-filter <FILTER>      Override the tracing filter directive\n  --log-file <PATH>          Write NDJSON logs to a file or directory\n  -h, --help                 Print help and exit\n  -V, --version              Print version and exit\n  --completions <SHELL>      Print shell completions for bash, zsh, or fish\n"
+    )
+}
+
+fn startup_version_text() -> String {
+    format!("teamy-studio {}", env!("CARGO_PKG_VERSION"))
+}
+
+fn startup_completion_script(shell: &str) -> Option<String> {
+    match shell {
+        "bash" => Some(
+            r#"_teamy_studio()
+{
+    local cur
+    cur="${COMP_WORDS[COMP_CWORD]}"
+    COMPREPLY=( $(compgen -W '--debug --log-filter --log-file --help --version --completions' -- "$cur") )
+}
+complete -F _teamy_studio teamy-studio
+"#
+            .to_owned(),
+        ),
+        "zsh" => Some(
+            r#"#compdef teamy-studio
+_teamy_studio() {
+  _arguments \
+    '--debug[Enable debug logging]' \
+    '--log-filter[Override the tracing filter]:filter:' \
+    '--log-file[Write NDJSON logs]:path:_files' \
+    '--help[Print help and exit]' \
+    '--version[Print version and exit]' \
+    '--completions[Print shell completions]:shell:(bash zsh fish)'
+}
+_teamy_studio "$@"
+"#
+            .to_owned(),
+        ),
+        "fish" => Some(
+            r#"complete -c teamy-studio -l debug -d 'Enable debug logging'
+complete -c teamy-studio -l log-filter -r -d 'Override the tracing filter directive'
+complete -c teamy-studio -l log-file -r -d 'Write NDJSON logs to a file or directory'
+complete -c teamy-studio -s h -l help -d 'Print help and exit'
+complete -c teamy-studio -s V -l version -d 'Print version and exit'
+complete -c teamy-studio -l completions -r -f -a 'bash zsh fish' -d 'Print shell completions'
+"#
+            .to_owned(),
+        ),
+        _ => None,
+    }
+}
+
+fn detect_builtin_request(args: &[&str]) -> Option<BootstrapCliParseError> {
+    if args.iter().any(|arg| matches!(*arg, "--help" | "-h")) {
+        return Some(BootstrapCliParseError::HelpRequested {
+            text: startup_help_text(),
+        });
+    }
+
+    if args.iter().any(|arg| matches!(*arg, "--version" | "-V")) {
+        return Some(BootstrapCliParseError::VersionRequested {
+            text: startup_version_text(),
+        });
+    }
+
+    let mut index = 0;
+    while index < args.len() {
+        if args[index] == "--completions" {
+            let shell = match args.get(index + 1) {
+                Some(shell) => *shell,
+                None => {
+                    return Some(BootstrapCliParseError::MissingValue {
+                        flag: "--completions",
+                    });
+                }
+            };
+
+            return startup_completion_script(shell)
+                .map(|script| BootstrapCliParseError::CompletionsRequested { script })
+                .or_else(|| {
+                    Some(BootstrapCliParseError::UnrecognizedArgument {
+                        argument: shell.to_owned(),
+                    })
+                });
+        }
+        index += 1;
+    }
+
+    None
+}
+
+pub fn try_handle_builtin_bootstrap_cli_request(args: &[&str]) -> Result<bool> {
+    match detect_builtin_request(args) {
+        Some(BootstrapCliParseError::HelpRequested { text })
+        | Some(BootstrapCliParseError::VersionRequested { text }) => {
+            println!("{text}");
+            Ok(true)
+        }
+        Some(BootstrapCliParseError::CompletionsRequested { script }) => {
+            println!("{script}");
+            Ok(true)
+        }
+        Some(BootstrapCliParseError::MissingValue { .. })
+        | Some(BootstrapCliParseError::UnrecognizedArgument { .. })
+        | None => Ok(false),
+    }
+}
+
 pub fn parse_bootstrap_cli_args(
     args: &[&str],
 ) -> std::result::Result<StartupBootstrapCli, BootstrapCliParseError> {
+    if let Some(error) = detect_builtin_request(args) {
+        return Err(error);
+    }
+
     let mut global_args = GlobalArgs::default();
     let mut index = 0;
 
@@ -318,30 +461,57 @@ pub fn derive_bootstrap_plan(
 pub fn initialize_tracing_from_bootstrap_plan(
     bootstrap_plan: &StartupBootstrapPlan,
 ) -> Result<TracingInitializedEvent> {
-    let env_filter = EnvFilter::builder().parse(bootstrap_plan.logging.effective_filter_directive())?;
-    let stderr_layer = fmt::layer()
-        .with_file(cfg!(debug_assertions))
-        .with_line_number(cfg!(debug_assertions))
-        .with_target(true)
-        .with_writer(BoxMakeWriter::new(std::io::stderr))
-        .with_ansi(true)
-        .with_filter(env_filter);
+    let stderr_env_filter =
+        EnvFilter::builder().parse(bootstrap_plan.logging.effective_filter_directive())?;
+    let stderr_layer = if bootstrap_plan.logging.debug {
+        fmt::layer()
+            .with_file(cfg!(debug_assertions))
+            .with_line_number(cfg!(debug_assertions))
+            .with_target(true)
+            .with_writer(std::io::stderr)
+            .pretty()
+            .with_timer(tracing_subscriber::fmt::time::uptime())
+            .boxed()
+    } else {
+        fmt::layer()
+            .with_file(cfg!(debug_assertions))
+            .with_line_number(cfg!(debug_assertions))
+            .with_target(true)
+            .with_writer(std::io::stderr)
+            .pretty()
+            .without_time()
+            .boxed()
+    };
+    let stderr_layer = stderr_layer.with_filter(stderr_env_filter);
+    #[cfg(feature = "tracy")]
+    let stderr_layer = stderr_layer.with_filter(FilterFn::new(exclude_tracy_frame_mark));
 
     let subscriber = Registry::default().with(stderr_layer);
+    #[cfg(all(feature = "tracy", not(test)))]
+    let subscriber = subscriber.with(tracing_tracy::TracyLayer::default());
 
     if let Some(json_log_path) = &bootstrap_plan.logging.json_log_path {
         if let Some(parent) = json_log_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
 
-        let file = std::fs::File::create(json_log_path)?;
+        let file = File::create(json_log_path)?;
+        let file = Arc::new(Mutex::new(file));
+        let json_writer = BoxMakeWriter::new(move || {
+            file.lock()
+                .expect("failed to lock json log file")
+                .try_clone()
+                .expect("failed to clone json log file handle")
+        });
         let json_layer = fmt::layer()
             .json()
             .with_file(true)
             .with_line_number(true)
             .with_target(false)
-            .with_writer(file)
+            .with_writer(json_writer)
             .with_filter(EnvFilter::builder().parse(bootstrap_plan.logging.effective_filter_directive())?);
+        #[cfg(feature = "tracy")]
+        let json_layer = json_layer.with_filter(FilterFn::new(exclude_tracy_frame_mark));
 
         let subscriber_was_already_initialized =
             try_init_with_already_initialized(subscriber.with(json_layer).try_init())?;
@@ -411,7 +581,7 @@ mod tests {
         BootstrapCliParseError, BootstrapPlanError, GlobalArgs, LogFilterSelection,
         RawProcessStartupInputs, StartupGlobalArgsParsedEvent, StartupLoggingPlan,
         StartupLoggingPlanError, StartupBootstrapPlan, TracingInitializedEvent,
-        derive_bootstrap_plan, parse_bootstrap_cli_args,
+        derive_bootstrap_plan, parse_bootstrap_cli_args, try_handle_builtin_bootstrap_cli_request,
     };
     use chrono::{Local, TimeZone};
 
@@ -440,6 +610,40 @@ mod tests {
             parsed.global_args.log_file.as_deref(),
             Some("logs/teamy.ndjson")
         );
+    }
+
+    #[test]
+    fn bootstrap_cli_surfaces_help_requests() {
+        let error = parse_bootstrap_cli_args(&["--help"]).expect_err("help should short-circuit");
+
+        assert!(matches!(error, BootstrapCliParseError::HelpRequested { .. }));
+        assert!(error.to_string().contains("--help"));
+    }
+
+    #[test]
+    fn bootstrap_cli_surfaces_version_requests() {
+        let error = parse_bootstrap_cli_args(&["--version"])
+            .expect_err("version should short-circuit");
+
+        assert!(matches!(error, BootstrapCliParseError::VersionRequested { .. }));
+        assert!(error.to_string().contains(env!("CARGO_PKG_VERSION")));
+    }
+
+    #[test]
+    fn builtin_handler_marks_help_as_handled() {
+        let handled = try_handle_builtin_bootstrap_cli_request(&["--help"])
+            .expect("help should be handled without error");
+
+        assert!(handled);
+    }
+
+    #[test]
+    fn bootstrap_cli_surfaces_completion_requests() {
+        let error = parse_bootstrap_cli_args(&["--completions", "bash"])
+            .expect_err("completions should short-circuit");
+
+        assert!(matches!(error, BootstrapCliParseError::CompletionsRequested { .. }));
+        assert!(error.to_string().contains("teamy-studio"));
     }
 
     // tool[verify logging.filter.debug-conflicts-with-log-filter]

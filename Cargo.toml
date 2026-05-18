@@ -48,7 +48,7 @@ ghostty = []
 mvp = [
 	"dep:teamy_studio_startup",
 ]
-tracy = []
+tracy = ["teamy_studio_startup?/tracy"]
 
 [build-dependencies]
 embed-resource = "3.0.6"

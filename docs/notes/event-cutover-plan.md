@@ -1,5 +1,9 @@
 # Teamy Studio Workspace Cutover Plan
 
+See also:
+- startup-bootstrap-record-of-decision.md
+- event-cutover-record-of-decision.md
+
 ## Overview
 
 This document describes the implementation plan for the proposed architectural cutover:
@@ -72,10 +76,14 @@ Completed in the repository now:
 - the reusable raw-input session builders now share the same runtime-aware bootstrap/session helper as the real process entry path, so raw-input bootstrap/session assembly no longer diverges between `main_with_raw_inputs` and the reusable startup construction surface
 - reusable raw-input callers can now also retain the pre-session startup timeline when bootstrap derivation fails: the startup crate exposes an observed-bootstrap helper surface that returns either an `ObservedBootstrapPlan` or an `ObservedBootstrapPlanFailure` carrying the populated `StartupRuntime`
 - the real `main_with_raw_inputs` path now seeds interactive menu-click timestamps from the session runtime's next publish time instead of restarting at zero after bootstrap publication, preserving a single monotonic startup timeline across bootstrap, tracing init, and first interaction handling
+- the real startup entry path now restores builtin startup CLI short-circuits for `--help`, `--version`, and `--completions` before session construction, so `cargo run -- --help` no longer falls through into bootstrap parse failure or window startup
+- startup tracing initialization now mirrors the legacy stderr/file split more closely: stderr uses pretty formatting with debug-sensitive timing, optional NDJSON file output clones a stable writer handle, and the root `tracy` feature now forwards into `teamy_studio_startup` so Tracy-backed startup subscriber installation lives in the active bootstrap surface again
+- the live cursor-gallery launch path now uses the existing native-shell startup session instead of the extra cursor-gallery thread spawn, so the real entrypoint follows the same event-to-window-create path that the startup/session tests already exercise
 
 Still pending:
 
-- restoring the remaining legacy-quality startup bootstrap surface for Figue CLI parsing, builtin help/version/completions handling, richer structured log collection policies, and Tracy-backed profiler flows now that the typed startup-global argument, bootstrap-plan threading, and baseline tracing/file-sink installation slice exists in `teamy_studio_startup`
+- replacing the current startup-owned builtin CLI compatibility shim with direct Figue-backed parsing once the active Facet dependency stack is unified enough to admit that dependency without splitting the `facet_core` graph
+- restoring richer structured log collection policies on the active startup path beyond stderr plus optional NDJSON output
 - representing startup bootstrap as a timeline-driven chain beginning from raw process startup inputs and deriving parsed CLI, logging configuration, tracing initialization, validation state, and startup composition requests
 - real startup validation UX and gating using explicit per-feature validation events instead of the current synchronous validation call
 - actual Win32/D3D12-backed window creation behind the shell host scaffold

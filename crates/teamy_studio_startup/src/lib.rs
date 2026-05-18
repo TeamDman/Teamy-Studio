@@ -6,6 +6,7 @@ pub use bootstrap::{
     StartupBootstrapPlan, StartupGlobalArgsParsedEvent, StartupLoggingConfiguredEvent,
     StartupLoggingPlan, StartupLoggingPlanError, TracingInitializedEvent,
     derive_bootstrap_plan, initialize_tracing_from_bootstrap_plan, parse_bootstrap_cli_args,
+    try_handle_builtin_bootstrap_cli_request,
 };
 
 use eyre::{Result, eyre};
@@ -365,6 +366,13 @@ fn bootstrap_cli_parse_failed_event(
                 unrecognized_argument: Some(argument.clone()),
             }
         }
+        BootstrapCliParseError::HelpRequested { .. }
+        | BootstrapCliParseError::VersionRequested { .. }
+        | BootstrapCliParseError::CompletionsRequested { .. } => BootstrapCliParseFailedEvent {
+            argv: raw_inputs.argv.clone(),
+            missing_value_flag: None,
+            unrecognized_argument: None,
+        },
     }
 }
 
@@ -1302,7 +1310,9 @@ fn derive_bootstrap_plan_with_runtime(
     let parsed_cli = match parse_bootstrap_cli_args(&raw_inputs.argv_refs()) {
         Ok(parsed_cli) => parsed_cli,
         Err(error) => {
-            runtime.publish_bootstrap_cli_parse_failure_outcome(&raw_inputs, &error);
+            if !error.is_builtin_request() {
+                runtime.publish_bootstrap_cli_parse_failure_outcome(&raw_inputs, &error);
+            }
             return Err(BootstrapPlanError::CliParse(error));
         }
     };
@@ -1412,7 +1422,11 @@ fn next_main_menu_interaction_time_seed(runtime: &StartupRuntime) -> i128 {
 }
 
 pub fn main_with_raw_inputs(raw_inputs: RawProcessStartupInputs) -> Result<()> {
-    let mut session = observe_bootstrap_plan_from_raw_inputs(raw_inputs)
+    if try_handle_builtin_bootstrap_cli_request(&raw_inputs.argv_refs())? {
+        return Ok(());
+    }
+
+    let mut session = observe_bootstrap_plan_from_raw_inputs_with_native_shell(raw_inputs)
         .map_err(|error| eyre!(error.to_string()))?
         .into_mvp_session()?;
     initialize_tracing_for_session(&mut session)?;
@@ -1438,10 +1452,7 @@ pub fn main_with_raw_inputs(raw_inputs: RawProcessStartupInputs) -> Result<()> {
             next_time_key += 16;
             let _ = session.pump_to_idle(CanonicalTimeKey::from_femtoseconds(next_time_key), 8)?;
             next_time_key += 16;
-            if clicked_class_id == Some(teamy_studio_cursor_gallery::CURSOR_GALLERY_BUTTON_CLASS_ID)
-            {
-                teamy_studio_cursor_gallery::open_native_cursor_gallery_window_on_thread()?;
-            }
+            let _ = clicked_class_id;
             Ok(())
         },
     )

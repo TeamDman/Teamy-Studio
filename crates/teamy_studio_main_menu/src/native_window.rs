@@ -19,14 +19,15 @@ use windows::Win32::UI::Controls::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CS_DBLCLKS, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect,
-    GetMessageW, GetWindowRect, HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTCAPTION, HTCLIENT, HTLEFT,
-    HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT, IDC_ARROW, KillTimer, LoadCursorW, MSG, PostQuitMessage,
-    RegisterClassW, SW_MAXIMIZE, SW_MINIMIZE, SW_SHOW, SWP_NOACTIVATE, SWP_NOZORDER, SendMessageW,
-    SetTimer, SetWindowPos, ShowWindow, TranslateMessage, WINDOW_STYLE, WM_DESTROY, WM_DPICHANGED,
-    WM_ENTERSIZEMOVE, WM_ERASEBKGND, WM_EXITSIZEMOVE, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCACTIVATE,
+    GetMessageW, GetWindowRect, HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTCAPTION, HTCLIENT,
+    HTLEFT, HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT, IDC_ARROW, IsWindow, KillTimer,
+    LoadCursorW, MSG, PostQuitMessage, RegisterClassW, SW_MAXIMIZE, SW_MINIMIZE, SW_SHOW,
+    SWP_NOACTIVATE, SWP_NOZORDER, SendMessageW, SetTimer, SetWindowPos, ShowWindow,
+    TranslateMessage, WINDOW_STYLE, WM_DESTROY, WM_DPICHANGED, WM_ENTERSIZEMOVE,
+    WM_ERASEBKGND, WM_EXITSIZEMOVE, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCACTIVATE,
     WM_NCCALCSIZE, WM_NCHITTEST, WM_NCPAINT, WM_PAINT, WM_SIZE, WM_TIMER, WNDCLASSW,
-    WS_EX_APPWINDOW, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOPMOST, WS_MAXIMIZEBOX, WS_MINIMIZEBOX,
-    WS_POPUP, WS_THICKFRAME,
+    WS_EX_APPWINDOW, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOPMOST, WS_MAXIMIZEBOX,
+    WS_MINIMIZEBOX, WS_POPUP, WS_THICKFRAME,
 };
 use windows::core::{PCWSTR, PWSTR, w};
 
@@ -156,15 +157,16 @@ fn handle_left_button_up(hwnd: HWND, lparam: LPARAM) -> Result<()> {
     unsafe { GetClientRect(hwnd, &mut client_rect) }
         .map_err(|error| eyre!("failed to get client rect for hit testing: {error}"))?;
 
-    let window_state = main_menu_window_state()
-        .lock()
-        .expect("main menu window state should not be poisoned");
-    let Some(window_state) = window_state.as_ref() else {
-        return Ok(());
+    let (dpi, snapshot) = {
+        let window_state = main_menu_window_state()
+            .lock()
+            .expect("main menu window state should not be poisoned");
+        let Some(window_state) = window_state.as_ref() else {
+            return Ok(());
+        };
+        (window_state.dpi, window_state.snapshot.clone())
     };
 
-    let dpi = window_state.dpi;
-    let _ = window_state;
     let layout = ShellSceneLayout::for_main_menu_with_dpi(
         client_rect.right - client_rect.left,
         client_rect.bottom - client_rect.top,
@@ -176,17 +178,8 @@ fn handle_left_button_up(hwnd: HWND, lparam: LPARAM) -> Result<()> {
         return Ok(());
     }
 
-    let window_state = main_menu_window_state()
-        .lock()
-        .expect("main menu window state should not be poisoned");
-    let Some(window_state) = window_state.as_ref() else {
-        return Ok(());
-    };
-
-    let card_layouts =
-        layout_main_menu_button_cards(layout.body_rect, window_state.snapshot.buttons().len());
-    if let Some(button) = window_state
-        .snapshot
+    let card_layouts = layout_main_menu_button_cards(layout.body_rect, snapshot.buttons().len());
+    if let Some(button) = snapshot
         .buttons()
         .iter()
         .zip(card_layouts.iter())
@@ -978,6 +971,10 @@ where
         unsafe {
             let _ = TranslateMessage(&message);
             DispatchMessageW(&message);
+        }
+
+        if !unsafe { IsWindow(Some(hwnd)) }.as_bool() {
+            break;
         }
 
         if message.message == WM_DESTROY {

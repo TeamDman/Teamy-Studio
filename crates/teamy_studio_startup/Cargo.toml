@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2024"
 publish = false
 
+[features]
+default = []
+tracy = ["dep:tracing-tracy"]
+
 [dependencies]
 chrono = "0.4.42"
 eyre = "0.6.12"
@@ -17,6 +21,7 @@ teamy_studio_registration_core = { path = "../teamy_studio_registration_core" }
 teamy_studio_shell = { path = "../teamy_studio_shell" }
 teamy_studio_timeline_core = { path = "../teamy_studio_timeline_core" }
 tracing = "0.1.41"
+tracing-tracy = { version = "0.11.4", optional = true }
 tracing-subscriber = { version = "0.3.19", features = ["fmt", "env-filter", "json"] }
 
 [dev-dependencies]
