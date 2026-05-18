@@ -2,60 +2,45 @@
 #![deny(clippy::disallowed_macros)]
 
 #[cfg(feature = "mvp")]
-mod startup;
-
-#[cfg(feature = "mvp")]
-use eyre::Result;
-#[cfg(feature = "mvp")]
-pub use startup::{
-    AppComposition, StartupSession, build_mvp_composition, build_mvp_composition_with_native_shell,
-    build_mvp_session, build_mvp_session_with_native_shell,
+pub use teamy_studio_startup::{
+    AppComposition, BootstrapCliParseError, BootstrapPlanError, GlobalArgs,
+    ObservedBootstrapPlan, ObservedBootstrapPlanFailure,
+    LogFilterSelection, RawProcessStartupInputs,
+    BOOTSTRAP_CLI_PARSE_FAILED_EVENT_DEFINITION,
+    DEFAULT_CURSOR_GALLERY_FLOW_FAILED_EVENT_DEFINITION,
+    FEATURE_ACTIVATION_GATE_RESOLVED_EVENT_DEFINITION,
+    FEATURE_COMPATIBILITY_VALIDATED_EVENT_DEFINITION,
+    FEATURE_COMPATIBILITY_VALIDATION_COMPLETED_EVENT_DEFINITION,
+    FEATURE_COMPATIBILITY_VALIDATION_STARTED_EVENT_DEFINITION,
+    PROCESS_STARTUP_OBSERVED_EVENT_DEFINITION, STARTUP_FAILED_EVENT_DEFINITION,
+    REGISTRATION_VALIDATION_COMPLETED_EVENT_DEFINITION,
+    REGISTRATION_VALIDATION_STARTED_EVENT_DEFINITION,
+    STARTUP_GLOBAL_ARGS_PARSED_EVENT_DEFINITION,
+    STARTUP_LOGGING_PLAN_FAILED_EVENT_DEFINITION,
+    STARTUP_LOGGING_CONFIGURED_EVENT_DEFINITION, STARTUP_SUCCEEDED_EVENT_DEFINITION,
+    TRACING_INITIALIZATION_FAILED_EVENT_DEFINITION, TRACING_INITIALIZED_EVENT_DEFINITION,
+    ProcessStartupObservedEvent, BootstrapCliParseFailedEvent,
+    DefaultCursorGalleryFlowFailedEvent,
+    FeatureActivationGateResolvedEvent,
+    FeatureCompatibilityValidatedEvent, FeatureCompatibilityValidationCompletedEvent,
+    FeatureCompatibilityValidationStartedEvent,
+    RegistrationValidationCompletedEvent, RegistrationValidationStartedEvent,
+    StartupBootstrapCli, StartupBootstrapPlan, StartupFailedEvent,
+    StartupGlobalArgsParsedEvent, StartupLoggingConfiguredEvent, StartupLoggingPlan,
+    StartupLoggingPlanError, StartupLoggingPlanFailedEvent, StartupSession,
+    StartupSucceededEvent, TracingInitializationFailedEvent,
+    TracingInitializedEvent,
+    build_mvp_composition, build_mvp_composition_from_raw_inputs,
+    build_mvp_composition_with_native_shell, build_mvp_session,
+    build_mvp_session_from_bootstrap_plan, build_mvp_session_from_raw_inputs,
+    build_mvp_session_with_native_shell,
+    build_mvp_session_with_native_shell_from_bootstrap_plan,
+    build_mvp_session_with_native_shell_from_raw_inputs, derive_bootstrap_plan,
+    observe_bootstrap_plan_from_raw_inputs,
+    observe_bootstrap_plan_from_raw_inputs_with_native_shell,
+    initialize_tracing_from_bootstrap_plan, main, main_with_raw_inputs,
+    parse_bootstrap_cli_args,
 };
-#[cfg(feature = "mvp")]
-use teamy_studio_launcher_catalog as _;
-#[cfg(feature = "mvp")]
-use teamy_studio_timeline_core::CanonicalTimeKey;
-
-#[cfg(feature = "mvp")]
-/// Compose the MVP feature stack and publish the initial event chain.
-///
-/// # Errors
-///
-/// Returns an error if registration validation fails or if the MVP composition
-/// cannot produce the initial cursor-gallery open flow.
-pub fn main() -> Result<()> {
-    teamy_studio_shell::initialize_dpi_awareness();
-
-    let mut session = startup::build_mvp_session()?;
-    let menu_snapshot = session.menu_snapshot().clone();
-    let mut next_time_key = 0_i128;
-
-    teamy_studio_main_menu::run_native_main_menu_window_with_click_handler(
-        &menu_snapshot,
-        |logical_button_id| {
-            let clicked_class_id = menu_snapshot
-                .buttons()
-                .iter()
-                .find(|button| button.logical_button_id == logical_button_id)
-                .map(|button| button.class_id);
-            session.publish_main_menu_click(
-                logical_button_id,
-                0,
-                0,
-                1,
-                CanonicalTimeKey(next_time_key),
-            )?;
-            next_time_key += 16;
-            let _ = session.pump_to_idle(CanonicalTimeKey(next_time_key), 8)?;
-            next_time_key += 16;
-            if clicked_class_id == Some(teamy_studio_cursor_gallery::CURSOR_GALLERY_BUTTON_CLASS_ID)
-            {
-                teamy_studio_cursor_gallery::open_native_cursor_gallery_window_on_thread()?;
-            }
-            Ok(())
-        },
-    )
-}
 
 #[cfg(not(feature = "mvp"))]
 /// Entrypoint for configurations where the MVP feature stack is disabled.

@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
 	"crates/teamy_studio_fonts",
+	"crates/teamy_studio_startup",
 	"crates/teamy_studio_event_core",
 	"crates/teamy_studio_registration_core",
 	"crates/teamy_studio_timeline_core",
@@ -36,13 +37,7 @@ path = "src/main.rs"
 
 [dependencies]
 eyre = "0.6.12"
-teamy_studio_cursor_gallery = { path = "crates/teamy_studio_cursor_gallery", optional = true }
-teamy_studio_event_core = { path = "crates/teamy_studio_event_core", optional = true }
-teamy_studio_launcher_catalog = { path = "crates/teamy_studio_launcher_catalog", optional = true }
-teamy_studio_main_menu = { path = "crates/teamy_studio_main_menu", optional = true }
-teamy_studio_registration_core = { path = "crates/teamy_studio_registration_core", optional = true }
-teamy_studio_shell = { path = "crates/teamy_studio_shell", optional = true }
-teamy_studio_timeline_core = { path = "crates/teamy_studio_timeline_core", optional = true }
+teamy_studio_startup = { path = "crates/teamy_studio_startup", optional = true }
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.19", features = ["fmt"] }
 
@@ -51,13 +46,7 @@ default = ["mvp"]
 font-snapshot-tests = []
 ghostty = []
 mvp = [
-	"dep:teamy_studio_cursor_gallery",
-	"dep:teamy_studio_event_core",
-	"dep:teamy_studio_launcher_catalog",
-	"dep:teamy_studio_main_menu",
-	"dep:teamy_studio_registration_core",
-	"dep:teamy_studio_shell",
-	"dep:teamy_studio_timeline_core",
+	"dep:teamy_studio_startup",
 ]
 tracy = []
 

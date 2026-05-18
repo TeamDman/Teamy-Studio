@@ -2,7 +2,9 @@ use std::sync::Arc;
 
 use teamy_studio_fonts::LoadedTerminalFont;
 
-use crate::{RenderScene, SceneVertex, build_scene_text_atlas, build_scene_vertices_with_text_atlas};
+use crate::{
+    RenderScene, SceneVertex, build_scene_text_atlas, build_scene_vertices_with_text_atlas,
+};
 
 #[derive(Clone, Debug)]
 pub struct PreparedRenderScene {

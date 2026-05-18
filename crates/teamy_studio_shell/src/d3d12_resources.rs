@@ -1,8 +1,8 @@
 use std::mem::size_of;
 
 use windows::Win32::Graphics::Direct3D12::{
-    D3D12_HEAP_FLAG_NONE, D3D12_HEAP_PROPERTIES, D3D12_HEAP_TYPE_UPLOAD,
-    D3D12_RESOURCE_DESC, D3D12_RESOURCE_DIMENSION_BUFFER, D3D12_RESOURCE_STATE_GENERIC_READ,
+    D3D12_HEAP_FLAG_NONE, D3D12_HEAP_PROPERTIES, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_DESC,
+    D3D12_RESOURCE_DIMENSION_BUFFER, D3D12_RESOURCE_STATE_GENERIC_READ,
     D3D12_TEXTURE_LAYOUT_ROW_MAJOR, D3D12_VERTEX_BUFFER_VIEW, ID3D12Device, ID3D12Resource,
 };
 use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
@@ -72,13 +72,23 @@ pub fn create_scene_upload_buffers(
     unsafe {
         let mut mapped = std::ptr::null_mut();
         sprite_buffer.Map(0, None, Some(&mut mapped))?;
-        std::ptr::copy_nonoverlapping(sprite_pixels.as_ptr(), mapped as *mut u32, sprite_pixels.len());
+        std::ptr::copy_nonoverlapping(
+            sprite_pixels.as_ptr(),
+            mapped as *mut u32,
+            sprite_pixels.len(),
+        );
         sprite_buffer.Unmap(0, None);
     }
 
     Ok(SceneUploadResources {
-        curve_buffer: create_upload_buffer(device, curve_buffer_size_bytes(capacities.curve_capacity))?,
-        band_buffer: create_upload_buffer(device, band_buffer_size_bytes(capacities.band_capacity))?,
+        curve_buffer: create_upload_buffer(
+            device,
+            curve_buffer_size_bytes(capacities.curve_capacity),
+        )?,
+        band_buffer: create_upload_buffer(
+            device,
+            band_buffer_size_bytes(capacities.band_capacity),
+        )?,
         sprite_buffer,
         transformed_glyph_inverse_buffer: create_upload_buffer(
             device,
@@ -87,7 +97,10 @@ pub fn create_scene_upload_buffers(
     })
 }
 
-fn create_upload_buffer(device: &ID3D12Device, byte_len: u64) -> windows::core::Result<ID3D12Resource> {
+fn create_upload_buffer(
+    device: &ID3D12Device,
+    byte_len: u64,
+) -> windows::core::Result<ID3D12Resource> {
     let mut resource = None;
     unsafe {
         device.CreateCommittedResource(
@@ -124,8 +137,7 @@ mod tests {
 
     use super::{
         band_buffer_size_bytes, curve_buffer_size_bytes, scene_vertex_buffer_size_bytes,
-        sprite_buffer_size_bytes,
-        transformed_glyph_inverse_buffer_size_bytes,
+        sprite_buffer_size_bytes, transformed_glyph_inverse_buffer_size_bytes,
     };
     use crate::SceneVertex;
 
@@ -137,7 +149,10 @@ mod tests {
 
     #[test]
     fn shader_upload_buffer_sizes_scale_with_element_counts() {
-        assert_eq!(curve_buffer_size_bytes(7), (7 * size_of::<[f32; 4]>()) as u64);
+        assert_eq!(
+            curve_buffer_size_bytes(7),
+            (7 * size_of::<[f32; 4]>()) as u64
+        );
         assert_eq!(band_buffer_size_bytes(9), (9 * size_of::<u32>()) as u64);
     }
 

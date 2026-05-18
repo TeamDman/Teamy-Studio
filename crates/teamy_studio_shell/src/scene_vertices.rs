@@ -35,7 +35,8 @@ pub fn build_scene_vertices_with_text_atlas(
     scene: &RenderScene,
     text_atlas: &SceneTextAtlas,
 ) -> Vec<SceneVertex> {
-    let mut vertices = Vec::with_capacity((scene.panels.len() + scene.sprites.len() + scene.glyphs.len()) * 6);
+    let mut vertices =
+        Vec::with_capacity((scene.panels.len() + scene.sprites.len() + scene.glyphs.len()) * 6);
 
     for panel in &scene.panels {
         append_rect_with_data(

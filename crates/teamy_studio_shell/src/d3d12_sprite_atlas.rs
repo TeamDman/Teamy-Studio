@@ -137,7 +137,16 @@ fn draw_cursor_arrow_sprite(pixels: &mut [u32], atlas_width: u32, origin: (i32, 
         (7, 10, 1, 4),
     ];
     for (x, y, width, height) in blocks {
-        draw_grid_block(pixels, atlas_width, origin, x + 1, y + 1, width, height, shadow);
+        draw_grid_block(
+            pixels,
+            atlas_width,
+            origin,
+            x + 1,
+            y + 1,
+            width,
+            height,
+            shadow,
+        );
         draw_grid_block(pixels, atlas_width, origin, x, y, width, height, color);
     }
 }
@@ -204,18 +213,33 @@ fn stroke_rect(
     thickness: i32,
     color: [u8; 4],
 ) {
-    fill_rect(pixels, atlas_width, (rect.0, rect.1, rect.2, rect.1 + thickness), color);
-    fill_rect(pixels, atlas_width, (rect.0, rect.3 - thickness, rect.2, rect.3), color);
-    fill_rect(pixels, atlas_width, (rect.0, rect.1, rect.0 + thickness, rect.3), color);
-    fill_rect(pixels, atlas_width, (rect.2 - thickness, rect.1, rect.2, rect.3), color);
+    fill_rect(
+        pixels,
+        atlas_width,
+        (rect.0, rect.1, rect.2, rect.1 + thickness),
+        color,
+    );
+    fill_rect(
+        pixels,
+        atlas_width,
+        (rect.0, rect.3 - thickness, rect.2, rect.3),
+        color,
+    );
+    fill_rect(
+        pixels,
+        atlas_width,
+        (rect.0, rect.1, rect.0 + thickness, rect.3),
+        color,
+    );
+    fill_rect(
+        pixels,
+        atlas_width,
+        (rect.2 - thickness, rect.1, rect.2, rect.3),
+        color,
+    );
 }
 
-fn fill_rect(
-    pixels: &mut [u32],
-    atlas_width: u32,
-    rect: (i32, i32, i32, i32),
-    color: [u8; 4],
-) {
+fn fill_rect(pixels: &mut [u32], atlas_width: u32, rect: (i32, i32, i32, i32), color: [u8; 4]) {
     let atlas_height = i32::try_from(pixels.len() / atlas_width as usize).unwrap_or_default();
     let left = rect.0.clamp(0, atlas_width as i32);
     let top = rect.1.clamp(0, atlas_height);
@@ -268,7 +292,10 @@ mod tests {
     #[test]
     fn sprite_atlas_size_matches_buffer_size() {
         let (width, height) = sprite_atlas_dimensions();
-        assert_eq!(sprite_buffer_size_bytes(), u64::from(width) * u64::from(height) * 4);
+        assert_eq!(
+            sprite_buffer_size_bytes(),
+            u64::from(width) * u64::from(height) * 4
+        );
     }
 
     #[test]

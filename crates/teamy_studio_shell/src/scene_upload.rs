@@ -50,7 +50,12 @@ pub fn padded_curve_upload_data(
     prepared_scene: &PreparedRenderScene,
     capacities: ShaderResourceCapacities,
 ) -> Vec<[f32; 4]> {
-    let mut padded = vec![[0.0; 4]; capacities.curve_capacity.max(prepared_scene.curve_data.len())];
+    let mut padded = vec![
+        [0.0; 4];
+        capacities
+            .curve_capacity
+            .max(prepared_scene.curve_data.len())
+    ];
     padded[..prepared_scene.curve_data.len()].copy_from_slice(&prepared_scene.curve_data);
     padded
 }
@@ -126,7 +131,8 @@ mod tests {
             band_data: vec![0; DEFAULT_BAND_UINT_CAPACITY + 1],
         };
 
-        let next = ensure_shader_resource_capacities(ShaderResourceCapacities::default(), &prepared);
+        let next =
+            ensure_shader_resource_capacities(ShaderResourceCapacities::default(), &prepared);
 
         assert_eq!(next.curve_capacity, DEFAULT_CURVE_FLOAT4_CAPACITY * 2);
         assert_eq!(next.band_capacity, DEFAULT_BAND_UINT_CAPACITY * 2);

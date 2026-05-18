@@ -1,5 +1,5 @@
-use windows::Win32::Graphics::Dwm::DwmGetColorizationColor;
 use windows::Win32::Foundation::RECT;
+use windows::Win32::Graphics::Dwm::DwmGetColorizationColor;
 use windows::core::BOOL;
 
 const MAX_PANEL_COUNT: usize = 8_192;

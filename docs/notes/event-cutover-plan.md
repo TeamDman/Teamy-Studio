@@ -43,11 +43,39 @@ Completed in the repository now:
 - the shell crate now owns a reusable scene-model surface for garden-frame, title-bar, custom-chrome, card, text, and sprite composition, and the main-menu crate now builds its launcher visuals against that shell-owned surface instead of raw Win32 child controls
 - the main-menu native host now custom-paints the shared scene model and performs hit testing against scene card layouts, which corrects the ownership model even though the renderer backend is not yet D3D12-backed
 - the main-menu launch path now uses precompiled bundled shaders and opens directly into the native D3D12-backed renderer path rather than waiting on runtime shader compilation
+- `teamy_studio_timeline_core` now owns app-owned `TimelineOffset`, `ArenaOffset`, `TimelineId`, `TimelineOrigin`, `Timeline`, `TimelineTransform`, and `EventReference` value types instead of relying on raw `i128`-only time concepts for that model surface
+- the timeline model now uses explicit `Repr` and `Unit` generic parameters, with canonical `i128` femtosecond aliases for primary timeline offsets and keys
+- `Timeline::transform_to` and `TimelineTransform::apply` now provide the first constrained cross-timeline translation path for same-timeline, direct-relative, sibling-relative, and shared-grounding relationships
+- `teamy_studio_event_core::WritableArena` now assigns stable `EventId` values before sealing, and sealed epochs now preserve those IDs alongside their event payloads so later event references can point at exact emitted instances
+- `teamy_studio_timeline_core::EventReference` now stores `event_id`, `event_definition_id`, and an exact published timeline-relative offset hint, with helper composition from arena-base plus arena-relative offsets
+- `teamy_studio_timeline_core::ConstructedTimeline<PublishedEvent>` now exposes published event-record and event-reference helpers derived from the sealed epoch IDs plus the canonical published time key
+- `teamy_studio_timeline_core::TriggerRuntime` now has record-aware unseen/pump APIs so handlers can observe stable `EventId` values alongside the previously exposed cursor and payload data
+- the active startup/session/composition path now exposes published event records and event references directly, so the new event-reference machinery is no longer timeline-core-only scaffolding
+- the startup trigger stage now exercises the record-aware trigger runtime path even though the current handler logic still ignores the event IDs themselves
+- `teamy_studio_event_core` public identity types and the first concrete `teamy_studio_timeline_core` wrapper/value types now derive `Facet`, establishing the initial reflection surface for canonical IDs, canonical time keys, publication ordinals, trigger cursors, exact offsets, arena offsets, and event references
+- the GUID-like wrapper IDs in `teamy_studio_event_core` and `teamy_studio_timeline_core` now store `uuid::Uuid` directly while preserving the existing byte-based APIs, and the local `facet` dependency surface now enables its `uuid` support for those reflected forms
+- `TimelineOffset`, `ArenaOffset`, and `CanonicalTimeKey` now reflect through a shared tagged-femtosecond Facet proxy surface, so concrete offsets and instants no longer expose their internal unit-marker layout as the primary reflection contract
+- the active MVP composition path now publishes a thin registered `StartupSucceededEvent` that carries a real `CanonicalTimeKey` payload in a concrete published event, so the new time-like reflection surface is exercised outside timeline-core-only tests
+- the root startup surface now also owns a thin registered `StartupFailedEvent` payload with `EventReference` backlinks plus publish helpers for explicit and latest-reference failure emission, so startup outcome events now have a matched success/failure shape even before the dedicated bootstrap crate exists
+- the startup/session/outcome orchestration surface now lives in the dedicated `teamy_studio_startup` crate, and the root `teamy-studio` package has been reduced to a thin re-export layer plus binary shim again
+- `teamy_studio_startup` now owns a first typed bootstrap-input slice with raw process startup inputs, startup-global argument parsing for `--debug`, `--log-filter`, and `--log-file`, resolved logging-policy derivation that preserves the legacy conflict/default/path-resolution semantics in executable tests, and a bootstrap-owned tracing initialization helper with stderr plus optional NDJSON file sinks driven from that resolved plan
+- the active startup/session/composition builders now accept either explicit raw startup inputs or a pre-derived `StartupBootstrapPlan`, and both `StartupSession` and `AppComposition` preserve that resolved bootstrap plan so process-boundary inputs are no longer discarded before MVP startup/runtime orchestration begins
+- startup now publishes concrete early bootstrap events into the startup timeline for raw process observation and resolved logging configuration before the first menu-click event, so the visible event history now begins with bootstrap-state provenance rather than only with later interaction-derived events
+- the real `main_with_raw_inputs` bootstrap path now also emits a concrete `TracingInitializedEvent` after subscriber installation succeeds, so tracing initialization is no longer a purely procedural side effect with no corresponding startup-timeline event
+- bootstrap now also emits a concrete parsed-global-args event between raw process observation and resolved logging configuration, so the visible startup history preserves the distinction between raw process inputs, parsed startup policy, and derived logging behavior
+- bootstrap validation is now beginning to surface as explicit startup stage events: the current startup path publishes registration-validation start/completion events around `validate_registrations()`, so startup validation is no longer completely invisible synchronous work
+- feature compatibility validation is now also visible on the startup timeline: the startup path publishes feature-validation start/completion stage events plus a concrete per-feature validated event for the cursor-gallery feature, so the current feature-compatibility pass is no longer represented only by an internal menu-snapshot mutation
+- activation gating is now partially explicit as well: the current startup path publishes a per-feature activation-gate-resolved event for the cursor-gallery feature, and the programmatic main-menu click path now enforces the same validated-only gate that the native window hit-testing path already enforced
+- tracing initialization failures are now observable from the real startup entry path: `main_with_raw_inputs` builds the startup session before tracing initialization, and an invalid tracing setup now emits a concrete tracing-initialization-failed event plus a linked `StartupFailedEvent` instead of returning only a bare process error
+- raw bootstrap derivation failures are now partially observable too: `main_with_raw_inputs` derives the bootstrap plan against a pre-session `StartupRuntime`, so CLI parse failures and logging-plan derivation failures now emit concrete bootstrap failure events plus linked `StartupFailedEvent`s instead of failing before startup can describe what went wrong
+- the currently explicit startup failure branches now publish through startup-runtime failure-outcome helpers instead of each call site hand-rolling detail-event plus linked-failure emission, reducing branch-local startup choreography while preserving the same event order and backlink shape for bootstrap, tracing, and default cursor-gallery flow failures
+- the reusable raw-input session builders now share the same runtime-aware bootstrap/session helper as the real process entry path, so raw-input bootstrap/session assembly no longer diverges between `main_with_raw_inputs` and the reusable startup construction surface
+- reusable raw-input callers can now also retain the pre-session startup timeline when bootstrap derivation fails: the startup crate exposes an observed-bootstrap helper surface that returns either an `ObservedBootstrapPlan` or an `ObservedBootstrapPlanFailure` carrying the populated `StartupRuntime`
+- the real `main_with_raw_inputs` path now seeds interactive menu-click timestamps from the session runtime's next publish time instead of restarting at zero after bootstrap publication, preserving a single monotonic startup timeline across bootstrap, tracing init, and first interaction handling
 
 Still pending:
 
-- restoring the legacy-quality startup bootstrap surface for Figue CLI parsing, `--debug`, `--log-filter`, `--log-file`, structured log collection, and Tracy-backed profiler flows
-- moving startup/session orchestration out of the root package into a dedicated startup/bootstrap crate so the root binary is actually thin again
+- restoring the remaining legacy-quality startup bootstrap surface for Figue CLI parsing, builtin help/version/completions handling, richer structured log collection policies, and Tracy-backed profiler flows now that the typed startup-global argument, bootstrap-plan threading, and baseline tracing/file-sink installation slice exists in `teamy_studio_startup`
 - representing startup bootstrap as a timeline-driven chain beginning from raw process startup inputs and deriving parsed CLI, logging configuration, tracing initialization, validation state, and startup composition requests
 - real startup validation UX and gating using explicit per-feature validation events instead of the current synchronous validation call
 - actual Win32/D3D12-backed window creation behind the shell host scaffold
@@ -55,6 +83,8 @@ Still pending:
 - feature-owned render/input loops and the real cursor-gallery window implementation
 - extracting the legacy D3D12 render thread and shader-backed scene renderer into shell-owned helpers so the main menu and feature crates can render the shared scene model through the real backend instead of the current custom-painted stopgap
 - richer event definitions with Facet-shaped public canonical event forms
+- richer startup failure reporting with thin failure events that point back to concrete prior failure references
+- automatic failure publication across all bootstrap failure exits, not just the current root startup surface helpers and MVP cursor-gallery flow failure branch
 
 ---
 
@@ -183,8 +213,12 @@ A sealed batch of events produced by a privileged arena.
 ### Writable arena
 The mutable, feature-owned event arena used during execution.
 
+Writable arenas now also own event-instance ID assignment before publication, so sealing preserves stable `EventId` values for each event in the epoch.
+
 ### Sealed arena
 The immutable version of an arena batch handed to timeline ingestion.
+
+Sealed epochs should preserve both the event payloads and the event IDs assigned while the arena was still private.
 
 ### Publication handshake
 The contract between feature code and `timeline_core`:
@@ -206,6 +240,8 @@ An optional `DateTime<Utc>` anchor for wall-clock correlation.
 ### Canonical time key
 A `uom::Time` value with `i128` precision.
 
+The active implementation now represents this with an app-owned canonical femtosecond offset wrapper rather than a bare scalar key.
+
 ### Publication ordinal
 A monotonic ingest-assigned ordinal used to order eventually consistent published events.
 
@@ -217,6 +253,23 @@ A trigger’s `last_seen` state, expressed as:
 
 ### Trigger runtime
 The asynchronous engine that pumps triggers over unseen events.
+
+The active implementation now has both payload-only and record-aware pump surfaces so callers can opt into receiving stable `EventId` values for unseen published events.
+
+The active startup path now uses the record-aware pump surface for registered triggers.
+
+### Timeline offset model
+Application-owned `TimelineOffset<Repr, Unit>` and `ArenaOffset<Repr, Unit>` value types, with canonical `i128` femtosecond aliases for the common case.
+
+### Timeline transform
+A first-class `TimelineTransform<Repr, Unit>` built by `Timeline::transform_to(&other)` and applied through `transform.apply(offset)`.
+
+### Event reference
+A reusable `EventReference` containing `event_id`, `event_definition_id`, and an exact timeline-relative offset hint derived from arena-base plus arena-relative position.
+
+The current timeline implementation now exposes helper methods that build these references directly from published `PublishedEvent` epochs using the sealed epoch's stable event IDs and the published time key.
+
+The active startup/session/composition surface now also exposes these references directly for the currently published MVP event chain.
 
 ---
 
@@ -314,6 +367,8 @@ Those direct re-exports should cover the full public timeline surface for the su
 
 Small public timeline value types should commit to a consistent derive surface from the start, including value-semantic derives where appropriate and `Facet` for reflection-oriented use.
 
+The active implementation now satisfies that baseline derive commitment for the initial concrete wrapper/value types, while the stricter canonical Facet proxy-shape work remains a separate follow-up.
+
 The first public timeline types should not commit to `Display` in v1; `Debug` plus explicit accessors should be sufficient until presentation and localization needs are more concrete.
 
 The first public timeline types should also explicitly avoid serde in v1 and rely on `Facet` for reflection-oriented needs instead.
@@ -382,6 +437,8 @@ CLI and other input parsing should remain outside the core timeline model; parsi
 
 For reflection-oriented proxy forms, time-like values should canonicalize through `Facet` to the femtosecond-based representation rather than exposing multiple unit-shaped serial forms.
 
+The current code now does this for the first concrete time-like public types: `TimelineOffset`, `ArenaOffset`, and `CanonicalTimeKey` all reflect through a minimal tagged proxy containing a stable category token plus canonical femtoseconds.
+
 GUID-like identity types should also share a common Facet proxy shape rather than each defining an ad hoc reflected form.
 
 Canonical Facet proxy commitments in v1 should remain limited to those time-like values and GUID-like identity types, not to more complex non-ID timeline structures such as `TimelineTransform`.
@@ -390,7 +447,11 @@ The shared Facet proxy form for GUID-like identity types should be the canonical
 
 Because Facet already supports `uuid::Uuid`, GUID-like app ID types should use that UUID-backed reflected form transparently rather than adding prefixes or wrapper proxy shapes of their own.
 
+The current code now stores the relevant GUID-like wrapper IDs on `uuid::Uuid` directly and enables Facet's `uuid` support for the affected crates, so those wrappers no longer reflect through ad hoc byte-array storage.
+
 Time-like Facet proxies should still keep separate category envelopes for offsets, durations, and instants even when they canonicalize numerically to femtoseconds.
+
+The current implementation now covers the offset and instant envelopes; a distinct duration envelope remains future work if a first-class public duration type is added.
 
 Those envelopes should stay minimal, containing only the category tag and the canonical femtosecond value.
 

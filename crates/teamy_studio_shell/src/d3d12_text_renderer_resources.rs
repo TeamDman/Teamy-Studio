@@ -1,4 +1,6 @@
-use windows::Win32::Graphics::Direct3D12::{D3D12_VERTEX_BUFFER_VIEW, ID3D12Device, ID3D12Resource};
+use windows::Win32::Graphics::Direct3D12::{
+    D3D12_VERTEX_BUFFER_VIEW, ID3D12Device, ID3D12Resource,
+};
 
 use crate::{
     ShaderResourceCapacities, TextShaderResourceSet, create_scene_vertex_buffer,

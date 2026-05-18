@@ -1,0 +1,23 @@
+[package]
+name = "teamy_studio_startup"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+chrono = "0.4.42"
+eyre = "0.6.12"
+facet = "0.44.1"
+linkme = "0.3.36"
+teamy_studio_cursor_gallery = { path = "../teamy_studio_cursor_gallery" }
+teamy_studio_event_core = { path = "../teamy_studio_event_core" }
+teamy_studio_launcher_catalog = { path = "../teamy_studio_launcher_catalog" }
+teamy_studio_main_menu = { path = "../teamy_studio_main_menu" }
+teamy_studio_registration_core = { path = "../teamy_studio_registration_core" }
+teamy_studio_shell = { path = "../teamy_studio_shell" }
+teamy_studio_timeline_core = { path = "../teamy_studio_timeline_core" }
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.19", features = ["fmt", "env-filter", "json"] }
+
+[dev-dependencies]
+tempfile = "3.20.0"

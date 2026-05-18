@@ -4,19 +4,20 @@ use eyre::WrapErr;
 use windows::Win32::Foundation::{HANDLE, HWND, RECT};
 use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
 use windows::Win32::Graphics::Direct3D12::{
-    D3D12_COMMAND_LIST_TYPE_DIRECT, D3D12_COMMAND_QUEUE_DESC, D3D12_FENCE_FLAG_NONE,
-    D3D12_RESOURCE_BARRIER, D3D12_RESOURCE_BARRIER_0,
-    D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_BARRIER_FLAG_NONE,
-    D3D12_RESOURCE_BARRIER_TYPE_TRANSITION, D3D12_RESOURCE_STATE_PRESENT,
-    D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATES,
-    D3D12_RESOURCE_TRANSITION_BARRIER, D3D12CreateDevice, D3D12_CPU_DESCRIPTOR_HANDLE,
-    D3D12_DESCRIPTOR_HEAP_DESC, D3D12_DESCRIPTOR_HEAP_TYPE_RTV, ID3D12CommandAllocator,
+    D3D12_COMMAND_LIST_TYPE_DIRECT, D3D12_COMMAND_QUEUE_DESC, D3D12_CPU_DESCRIPTOR_HANDLE,
+    D3D12_DESCRIPTOR_HEAP_DESC, D3D12_DESCRIPTOR_HEAP_TYPE_RTV, D3D12_FENCE_FLAG_NONE,
+    D3D12_RESOURCE_BARRIER, D3D12_RESOURCE_BARRIER_0, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+    D3D12_RESOURCE_BARRIER_FLAG_NONE, D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+    D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATES,
+    D3D12_RESOURCE_TRANSITION_BARRIER, D3D12_VIEWPORT, D3D12CreateDevice, ID3D12CommandAllocator,
     ID3D12CommandList, ID3D12CommandQueue, ID3D12DescriptorHeap, ID3D12Device, ID3D12Fence,
     ID3D12GraphicsCommandList, ID3D12PipelineState, ID3D12Resource, ID3D12RootSignature,
-    D3D12_VIEWPORT,
 };
 use windows::Win32::Graphics::DirectComposition::{
     DCompositionCreateDevice, IDCompositionDevice, IDCompositionTarget, IDCompositionVisual,
+};
+use windows::Win32::Graphics::Dxgi::Common::{
+    DXGI_ALPHA_MODE_PREMULTIPLIED, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC,
 };
 use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory2, DXGI_ADAPTER_FLAG, DXGI_ADAPTER_FLAG_NONE, DXGI_ADAPTER_FLAG_SOFTWARE,
@@ -26,22 +27,19 @@ use windows::Win32::Graphics::Dxgi::{
     DXGI_USAGE_RENDER_TARGET_OUTPUT, IDXGIAdapter, IDXGIAdapter1, IDXGIDevice, IDXGIFactory2,
     IDXGIFactory4, IDXGISwapChain1, IDXGISwapChain3,
 };
-use windows::Win32::Graphics::Dxgi::Common::{
-    DXGI_ALPHA_MODE_PREMULTIPLIED, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC,
-};
 use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObjectEx};
 use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
 use windows::core::Interface;
 use windows::core::Owned;
 
+use crate::d3d12_text_pipeline::{
+    create_text_pipeline_state, create_text_root_signature, primitive_topology_triangle_list,
+    update_text_shader_params,
+};
 use crate::{
     PreparedSceneUploadBatch, RenderScene, ShaderResourceCapacities, TextRendererResources,
     build_prepared_scene_upload_batch, create_text_renderer_resources, prepare_render_scene,
     upload_band_data, upload_curve_data, upload_vertex_ranges,
-};
-use crate::d3d12_text_pipeline::{
-    create_text_pipeline_state, create_text_root_signature, primitive_topology_triangle_list,
-    update_text_shader_params,
 };
 
 const FRAME_COUNT: usize = 2;
@@ -91,12 +89,11 @@ pub fn create_text_renderer_device() -> eyre::Result<(IDXGIFactory4, ID3D12Devic
 impl TextRendererHost {
     pub fn new(hwnd: HWND, scene: &RenderScene) -> eyre::Result<Self> {
         let (dxgi_factory, device) = create_text_renderer_device()?;
-        let command_queue = create_command_queue(&device)
-            .wrap_err("failed to create D3D12 command queue")?;
-        let command_allocator: ID3D12CommandAllocator = unsafe {
-            device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
-        }
-        .wrap_err("failed to create D3D12 command allocator")?;
+        let command_queue =
+            create_command_queue(&device).wrap_err("failed to create D3D12 command queue")?;
+        let command_allocator: ID3D12CommandAllocator =
+            unsafe { device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT) }
+                .wrap_err("failed to create D3D12 command allocator")?;
         let command_list: ID3D12GraphicsCommandList = unsafe {
             device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &command_allocator, None)
         }
@@ -126,10 +123,8 @@ impl TextRendererHost {
 
         let prepared_scene = prepare_render_scene(scene)
             .wrap_err("failed to prepare initial render scene for text renderer host")?;
-        let upload_batch = build_prepared_scene_upload_batch(
-            &prepared_scene,
-            ShaderResourceCapacities::default(),
-        );
+        let upload_batch =
+            build_prepared_scene_upload_batch(&prepared_scene, ShaderResourceCapacities::default());
         let resources = create_text_renderer_resources(&device, upload_batch.capacities)
             .wrap_err("failed to create text renderer resources")?;
 
@@ -232,7 +227,8 @@ impl TextRendererHost {
 
         unsafe {
             self.command_allocator.Reset()?;
-            self.command_list.Reset(&self.command_allocator, &self.pipeline_state)?;
+            self.command_list
+                .Reset(&self.command_allocator, &self.pipeline_state)?;
             update_text_shader_params(
                 &self.resources.shader_param_buffer,
                 self.width,
@@ -250,7 +246,10 @@ impl TextRendererHost {
             );
             self.command_list.SetGraphicsRootDescriptorTable(
                 1,
-                self.resources.text_shader_resources.srv_heap.GetGPUDescriptorHandleForHeapStart(),
+                self.resources
+                    .text_shader_resources
+                    .srv_heap
+                    .GetGPUDescriptorHandleForHeapStart(),
             );
             self.command_list.RSSetViewports(&[self.viewport]);
             self.command_list.RSSetScissorRects(&[self.scissor_rect]);
@@ -305,7 +304,8 @@ impl TextRendererHost {
         unsafe {
             self.command_queue.Signal(&self.fence, fence_value)?;
             if self.fence.GetCompletedValue() < fence_value {
-                self.fence.SetEventOnCompletion(fence_value, *self.fence_event)?;
+                self.fence
+                    .SetEventOnCompletion(fence_value, *self.fence_event)?;
                 WaitForSingleObjectEx(*self.fence_event, INFINITE, false);
             }
         }
@@ -344,18 +344,17 @@ fn get_hardware_or_warp_adapter(factory: &IDXGIFactory4) -> eyre::Result<IDXGIAd
             Err(error) => return Err(error).wrap_err("failed to enumerate DXGI adapter"),
         };
 
-        let description = unsafe { adapter.GetDesc1() }
-            .wrap_err("failed to read DXGI adapter description")?;
-        let is_software =
-            (DXGI_ADAPTER_FLAG(description.Flags as i32) & DXGI_ADAPTER_FLAG_SOFTWARE)
-                != DXGI_ADAPTER_FLAG_NONE;
+        let description =
+            unsafe { adapter.GetDesc1() }.wrap_err("failed to read DXGI adapter description")?;
+        let is_software = (DXGI_ADAPTER_FLAG(description.Flags as i32)
+            & DXGI_ADAPTER_FLAG_SOFTWARE)
+            != DXGI_ADAPTER_FLAG_NONE;
         if is_software {
             continue;
         }
 
         let mut test_device: Option<ID3D12Device> = None;
-        if unsafe { D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_11_0, &mut test_device) }
-            .is_ok()
+        if unsafe { D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_11_0, &mut test_device) }.is_ok()
         {
             return Ok(adapter);
         }
@@ -450,13 +449,19 @@ fn create_composition_swap_chain(
     let swap_chain: IDXGISwapChain1 =
         unsafe { factory.CreateSwapChainForComposition(command_queue, &description, None) }
             .wrap_err("failed to create DXGI composition swap chain")?;
-    swap_chain.cast().wrap_err("failed to cast swap chain to IDXGISwapChain3")
+    swap_chain
+        .cast()
+        .wrap_err("failed to cast swap chain to IDXGISwapChain3")
 }
 
 fn attach_swap_chain_to_window(
     hwnd: HWND,
     swap_chain: &IDXGISwapChain3,
-) -> eyre::Result<(IDCompositionDevice, IDCompositionTarget, IDCompositionVisual)> {
+) -> eyre::Result<(
+    IDCompositionDevice,
+    IDCompositionTarget,
+    IDCompositionVisual,
+)> {
     let dcomp_device: IDCompositionDevice =
         unsafe { DCompositionCreateDevice::<_, IDCompositionDevice>(None::<&IDXGIDevice>) }
             .wrap_err("failed to create DirectComposition device")?;
@@ -477,7 +482,11 @@ fn attach_swap_chain_to_window(
 fn create_render_targets(
     device: &ID3D12Device,
     swap_chain: &IDXGISwapChain3,
-) -> eyre::Result<(ID3D12DescriptorHeap, u32, [Option<ID3D12Resource>; FRAME_COUNT])> {
+) -> eyre::Result<(
+    ID3D12DescriptorHeap,
+    u32,
+    [Option<ID3D12Resource>; FRAME_COUNT],
+)> {
     let rtv_heap: ID3D12DescriptorHeap = unsafe {
         device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
             Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV,

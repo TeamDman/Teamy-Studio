@@ -1,14 +1,14 @@
 mod d3d12_resources;
 mod d3d12_smoke;
 mod d3d12_sprite_atlas;
+mod d3d12_srv;
 mod d3d12_text_pipeline;
 mod d3d12_text_renderer_host;
 mod d3d12_text_renderer_proxy;
 mod d3d12_text_renderer_resources;
-mod d3d12_srv;
 mod d3d12_upload;
-mod scene_cache;
 mod scene;
+mod scene_cache;
 mod scene_packet;
 mod scene_upload;
 mod scene_upload_batch;
@@ -40,12 +40,10 @@ pub use d3d12_resources::{
     transformed_glyph_inverse_buffer_size_bytes,
 };
 pub use d3d12_smoke::create_text_renderer_host_for_scene;
+pub use d3d12_srv::{TextShaderResourceSet, create_text_shader_resource_set};
 pub use d3d12_text_renderer_host::{TextRendererHost, create_text_renderer_device};
 pub use d3d12_text_renderer_proxy::TextRendererThreadProxy;
-pub use d3d12_text_renderer_resources::{
-    TextRendererResources, create_text_renderer_resources,
-};
-pub use d3d12_srv::{TextShaderResourceSet, create_text_shader_resource_set};
+pub use d3d12_text_renderer_resources::{TextRendererResources, create_text_renderer_resources};
 pub use d3d12_upload::{
     upload_band_data, upload_cached_fragment_vertices, upload_curve_data, upload_vertex_ranges,
 };
@@ -279,10 +277,8 @@ fn wide_null_terminated(text: &str) -> Vec<u16> {
 }
 
 pub fn initialize_dpi_awareness() {
-    let _ = DPI_AWARENESS_INITIALIZED.get_or_init(|| {
-        unsafe {
-            let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-        }
+    let _ = DPI_AWARENESS_INITIALIZED.get_or_init(|| unsafe {
+        let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     });
 }
 
@@ -308,7 +304,9 @@ pub fn create_native_window(request: &WindowCreateRequest) -> Result<NativeWindo
     ensure_shell_window_class_registered(request.host_options.chrome_kind)?;
 
     let instance = unsafe { GetModuleHandleW(None) }.wrap_err("failed to get module handle")?;
-    let native_host_plan = request.host_options.native_host_plan(request.present_policy);
+    let native_host_plan = request
+        .host_options
+        .native_host_plan(request.present_policy);
     let ex_style = native_window_ex_style(native_host_plan);
     let style = native_window_style(native_host_plan);
     let (x, y) = centered_window_origin();
@@ -548,7 +546,9 @@ impl FeatureWindowHostScaffold {
             title: request.title,
             present_policy: request.present_policy,
             host_options: request.host_options,
-            native_host_plan: request.host_options.native_host_plan(request.present_policy),
+            native_host_plan: request
+                .host_options
+                .native_host_plan(request.present_policy),
             renderer_host_mode: request.present_policy.renderer_host_mode(),
             native_window_handle,
         });
@@ -894,7 +894,8 @@ mod tests {
     #[test]
     fn host_options_materialize_native_host_plan() {
         assert_eq!(
-            WindowHostOptions::standard_foreground().native_host_plan(PresentPolicy::LowLatencyHwnd),
+            WindowHostOptions::standard_foreground()
+                .native_host_plan(PresentPolicy::LowLatencyHwnd),
             NativeWindowHostPlan {
                 style: NativeWindowStylePlan {
                     app_window: true,
@@ -922,8 +923,8 @@ mod tests {
     fn native_host_plan_translates_to_win32_styles() {
         let launcher_plan = WindowHostOptions::standard_foreground()
             .native_host_plan(PresentPolicy::LowLatencyHwnd);
-        let detail_plan = WindowHostOptions::tool_no_activate()
-            .native_host_plan(PresentPolicy::LowLatencyHwnd);
+        let detail_plan =
+            WindowHostOptions::tool_no_activate().native_host_plan(PresentPolicy::LowLatencyHwnd);
 
         let launcher_ex_style = native_window_ex_style(launcher_plan);
         let launcher_style = native_window_style(launcher_plan);
@@ -954,7 +955,8 @@ mod tests {
 
     #[test]
     fn composed_native_host_plan_keeps_redirection_bitmap_enabled() {
-        let plan = WindowHostOptions::standard_foreground().native_host_plan(PresentPolicy::Composed);
+        let plan =
+            WindowHostOptions::standard_foreground().native_host_plan(PresentPolicy::Composed);
         let ex_style = native_window_ex_style(plan);
 
         assert_eq!(ex_style & WS_EX_NOREDIRECTIONBITMAP, WINDOW_EX_STYLE(0));
@@ -1076,7 +1078,7 @@ mod tests {
             &WINDOW_CREATE_REQUEST_EVENT_DEFINITION,
             request.clone(),
         ));
-        timeline.ingest(CanonicalTimeKey(10), epoch.seal());
+        timeline.ingest(CanonicalTimeKey::from_femtoseconds(10), epoch.seal());
 
         runtime.apply_published_event(&PublishedEvent::new(
             &WINDOW_CREATE_REQUEST_EVENT_DEFINITION,
@@ -1084,7 +1086,7 @@ mod tests {
         ));
 
         let emitted_epoch_count = runtime
-            .run_host_stage(&mut timeline, CanonicalTimeKey(11))
+            .run_host_stage(&mut timeline, CanonicalTimeKey::from_femtoseconds(11))
             .expect("simulated shell host stage should succeed");
 
         assert_eq!(emitted_epoch_count, 1);

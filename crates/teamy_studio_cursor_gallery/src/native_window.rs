@@ -8,22 +8,21 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect,
-    DispatchMessageW, GetMessageW, GetWindowRect, HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT,
-    HTCAPTION, HTCLIENT, HTLEFT, HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT, IDC_ARROW,
-    LoadCursorW, MSG, RegisterClassW, SetWindowPos, SW_MAXIMIZE, SW_MINIMIZE, SW_SHOW,
-    SWP_NOACTIVATE, SWP_NOZORDER, ShowWindow, TranslateMessage,
-    WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND, WM_LBUTTONUP, WM_NCCALCSIZE, WM_NCHITTEST,
-    WM_PAINT, WNDCLASSW, WS_EX_APPWINDOW, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP,
-    WS_THICKFRAME, WS_VISIBLE,
+    CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
+    GetClientRect, GetMessageW, GetWindowRect, HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTCAPTION,
+    HTCLIENT, HTLEFT, HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT, IDC_ARROW, LoadCursorW, MSG,
+    RegisterClassW, SW_MAXIMIZE, SW_MINIMIZE, SW_SHOW, SWP_NOACTIVATE, SWP_NOZORDER, SetWindowPos,
+    ShowWindow, TranslateMessage, WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND, WM_LBUTTONUP,
+    WM_NCCALCSIZE, WM_NCHITTEST, WM_PAINT, WNDCLASSW, WS_EX_APPWINDOW, WS_MAXIMIZEBOX,
+    WS_MINIMIZEBOX, WS_POPUP, WS_THICKFRAME, WS_VISIBLE,
 };
 use windows::core::{PCWSTR, w};
 
 use teamy_studio_shell::{
     GlyphQuad, PanelEffect, RenderScene, ShellSceneLayout, WindowChromeButtonsState,
-    initialize_dpi_awareness, preferred_background_color, preferred_title_bar_color,
-    push_panel, push_text_block, push_title_text, push_window_chrome_buttons,
-    push_window_garden_frame, scale_for_dpi, system_dpi, window_dpi,
+    initialize_dpi_awareness, preferred_background_color, preferred_title_bar_color, push_panel,
+    push_text_block, push_title_text, push_window_chrome_buttons, push_window_garden_frame,
+    scale_for_dpi, system_dpi, window_dpi,
 };
 
 const CURSOR_GALLERY_WINDOW_WIDTH: i32 = 1200;
@@ -341,7 +340,12 @@ fn draw_panel(hdc: HDC, panel: &teamy_studio_shell::PanelRect) -> Result<()> {
     match panel.effect {
         teamy_studio_shell::PanelEffect::BlueBackground => {
             stroke_rect(hdc, panel.rect, darken(panel.color, 0.32), 1)?;
-            stroke_rect(hdc, inset_rect(panel.rect, 1), lighten(panel.color, 0.06), 1)?;
+            stroke_rect(
+                hdc,
+                inset_rect(panel.rect, 1),
+                lighten(panel.color, 0.06),
+                1,
+            )?;
         }
         teamy_studio_shell::PanelEffect::TitleBar => {
             let bottom_highlight = RECT {
@@ -604,7 +608,8 @@ fn draw_bitmap_glyph(hdc: HDC, rect: RECT, character: char, color: [f32; 4]) -> 
                 left: origin_x + column * pixel_width,
                 top: origin_y + i32::try_from(row_index).unwrap_or_default() * pixel_height,
                 right: origin_x + (column + 1) * pixel_width,
-                bottom: origin_y + (i32::try_from(row_index).unwrap_or_default() + 1) * pixel_height,
+                bottom: origin_y
+                    + (i32::try_from(row_index).unwrap_or_default() + 1) * pixel_height,
             };
             fill_rect_with_color(hdc, block, color)?;
         }

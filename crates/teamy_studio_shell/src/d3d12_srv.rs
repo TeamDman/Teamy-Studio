@@ -5,13 +5,15 @@ use windows::Win32::Graphics::Direct3D12::{
     D3D12_SHADER_RESOURCE_VIEW_DESC_0, D3D12_SRV_DIMENSION_BUFFER, ID3D12DescriptorHeap,
     ID3D12Device,
 };
-use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R32G32B32A32_FLOAT, DXGI_FORMAT_R32_UINT};
+use windows::Win32::Graphics::Dxgi::Common::{
+    DXGI_FORMAT_R32_UINT, DXGI_FORMAT_R32G32B32A32_FLOAT,
+};
 
+use crate::d3d12_sprite_atlas::sprite_buffer_size_bytes;
 use crate::{
     SceneUploadResources, ShaderResourceCapacities, create_scene_upload_buffers,
     transformed_glyph_inverse_buffer_size_bytes,
 };
-use crate::d3d12_sprite_atlas::sprite_buffer_size_bytes;
 
 const TEXT_SHADER_SRV_DESCRIPTOR_COUNT: u32 = 4;
 
@@ -35,9 +37,8 @@ pub fn create_text_shader_resource_set(
             ..Default::default()
         })?
     };
-    let descriptor_size = unsafe {
-        device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
-    };
+    let descriptor_size =
+        unsafe { device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) };
 
     let curve_desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
         Format: DXGI_FORMAT_R32G32B32A32_FLOAT,

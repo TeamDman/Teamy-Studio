@@ -8,7 +8,10 @@ pub fn upload_cached_fragment_vertices(
     vertex_buffer: &ID3D12Resource,
     fragments: &[&[SceneVertex]],
 ) -> windows::core::Result<usize> {
-    let vertex_count = fragments.iter().map(|fragment| fragment.len()).sum::<usize>();
+    let vertex_count = fragments
+        .iter()
+        .map(|fragment| fragment.len())
+        .sum::<usize>();
 
     unsafe {
         let mut mapped = std::ptr::null_mut();

@@ -149,7 +149,9 @@ fn load_terminal_font() -> eyre::Result<LoadedTerminalFont> {
         .glyph_index(FALLBACK_GLYPH)
         .or_else(|| face.glyph_index('W'))
         .ok_or_else(|| eyre::eyre!("terminal font did not contain expected fallback glyphs"))?;
-    let cell_advance = face.glyph_hor_advance(fallback_id).map_or(1024.0, f32::from);
+    let cell_advance = face
+        .glyph_hor_advance(fallback_id)
+        .map_or(1024.0, f32::from);
     let units_per_em = f32::from(face.units_per_em());
     let ascender = f32::from(face.ascender());
     let descender = f32::from(face.descender());
@@ -323,26 +325,40 @@ fn append_slug_band_data(
     }
 
     for band in &mut horizontal_bands {
-        band.sort_by(|lhs, rhs| curve_extents[*rhs].max_x.total_cmp(&curve_extents[*lhs].max_x));
+        band.sort_by(|lhs, rhs| {
+            curve_extents[*rhs]
+                .max_x
+                .total_cmp(&curve_extents[*lhs].max_x)
+        });
     }
     for (ascending_band, descending_band) in horizontal_bands_ascending
         .iter_mut()
         .zip(horizontal_bands.iter())
     {
         *ascending_band = descending_band.clone();
-        ascending_band
-            .sort_by(|lhs, rhs| curve_extents[*lhs].min_x.total_cmp(&curve_extents[*rhs].min_x));
+        ascending_band.sort_by(|lhs, rhs| {
+            curve_extents[*lhs]
+                .min_x
+                .total_cmp(&curve_extents[*rhs].min_x)
+        });
     }
     for band in &mut vertical_bands {
-        band.sort_by(|lhs, rhs| curve_extents[*rhs].max_y.total_cmp(&curve_extents[*lhs].max_y));
+        band.sort_by(|lhs, rhs| {
+            curve_extents[*rhs]
+                .max_y
+                .total_cmp(&curve_extents[*lhs].max_y)
+        });
     }
     for (ascending_band, descending_band) in vertical_bands_ascending
         .iter_mut()
         .zip(vertical_bands.iter())
     {
         *ascending_band = descending_band.clone();
-        ascending_band
-            .sort_by(|lhs, rhs| curve_extents[*lhs].min_y.total_cmp(&curve_extents[*rhs].min_y));
+        ascending_band.sort_by(|lhs, rhs| {
+            curve_extents[*lhs]
+                .min_y
+                .total_cmp(&curve_extents[*rhs].min_y)
+        });
     }
 
     let table_start = band_data.len();
@@ -569,7 +585,9 @@ impl OutlineBuilder for QuadraticCurveBuilder {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_terminal_slug_atlas, terminal_font_layout_snapshot, terminal_font_unicode_chars};
+    use super::{
+        build_terminal_slug_atlas, terminal_font_layout_snapshot, terminal_font_unicode_chars,
+    };
 
     #[test]
     fn terminal_font_layout_snapshot_is_populated() -> eyre::Result<()> {

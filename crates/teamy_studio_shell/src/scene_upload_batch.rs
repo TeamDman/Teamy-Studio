@@ -1,7 +1,7 @@
 use std::ops::Range;
 
 use crate::{
-    PreparedRenderScene, ShaderResourceCapacities, SceneVertex, ensure_shader_resource_capacities,
+    PreparedRenderScene, SceneVertex, ShaderResourceCapacities, ensure_shader_resource_capacities,
     padded_band_upload_data, padded_curve_upload_data,
 };
 
@@ -58,7 +58,8 @@ mod tests {
             sprites: Vec::new(),
         })?;
 
-        let batch = build_prepared_scene_upload_batch(&prepared, ShaderResourceCapacities::default());
+        let batch =
+            build_prepared_scene_upload_batch(&prepared, ShaderResourceCapacities::default());
 
         assert_eq!(batch.vertices.len(), prepared.vertices.len());
         assert_eq!(batch.vertex_ranges, vec![0..prepared.vertices.len()]);

@@ -21,7 +21,10 @@ struct TextRendererThreadState {
 
 impl TextRendererThreadProxy {
     pub fn new(hwnd: HWND, initial_scene: RenderScene) -> eyre::Result<Self> {
-        let shared = Arc::new((Mutex::new(TextRendererThreadState::default()), Condvar::new()));
+        let shared = Arc::new((
+            Mutex::new(TextRendererThreadState::default()),
+            Condvar::new(),
+        ));
         let shared_for_worker = Arc::clone(&shared);
         let (startup_tx, startup_rx) = mpsc::sync_channel(1);
         let raw_hwnd = hwnd.0 as isize;
@@ -29,17 +32,16 @@ impl TextRendererThreadProxy {
         let worker = thread::Builder::new()
             .name("teamy-shell-text-renderer".to_owned())
             .spawn(move || {
-                let startup = TextRendererHost::new(
-                    HWND(raw_hwnd as *mut core::ffi::c_void),
-                    &initial_scene,
-                );
+                let startup =
+                    TextRendererHost::new(HWND(raw_hwnd as *mut core::ffi::c_void), &initial_scene);
                 match startup {
                     Ok(mut host) => {
                         let _ = startup_tx.send(Ok(()));
                         run_text_renderer_thread_loop(&shared_for_worker, &mut host);
                     }
                     Err(error) => {
-                        let message = format!("failed to create shell text renderer thread: {error:#}");
+                        let message =
+                            format!("failed to create shell text renderer thread: {error:#}");
                         if let Ok(mut state) = shared_for_worker.0.lock() {
                             state.error = Some(message.clone());
                         }
@@ -49,9 +51,9 @@ impl TextRendererThreadProxy {
             })
             .map_err(|error| eyre::eyre!("failed to spawn shell text renderer thread: {error}"))?;
 
-        startup_rx
-            .recv()
-            .map_err(|error| eyre::eyre!("text renderer thread failed to report startup: {error}"))??;
+        startup_rx.recv().map_err(|error| {
+            eyre::eyre!("text renderer thread failed to report startup: {error}")
+        })??;
 
         Ok(Self {
             shared,
@@ -98,11 +100,10 @@ impl TextRendererThreadProxy {
     }
 
     fn check_error(&self) -> eyre::Result<()> {
-        let state = self
-            .shared
-            .0
-            .lock()
-            .map_err(|error| eyre::eyre!("failed to lock text renderer thread state: {error}"))?;
+        let state =
+            self.shared.0.lock().map_err(|error| {
+                eyre::eyre!("failed to lock text renderer thread state: {error}")
+            })?;
         if let Some(error) = state.error.as_ref() {
             eyre::bail!(error.clone());
         }

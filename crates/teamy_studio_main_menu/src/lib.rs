@@ -21,6 +21,11 @@ impl MainMenuButtonClassId {
     pub const fn from_bytes(bytes: [u8; 16]) -> Self {
         Self(bytes)
     }
+
+    #[must_use]
+    pub const fn as_bytes(self) -> [u8; 16] {
+        self.0
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -138,7 +143,10 @@ impl MainMenuSnapshot {
     ) -> Option<MainMenuClickEvent> {
         self.buttons
             .iter()
-            .find(|button| button.logical_button_id == logical_button_id)
+            .find(|button| {
+                button.logical_button_id == logical_button_id
+                    && button.validation_state == FeatureValidationState::Validated
+            })
             .map(|button| MainMenuClickEvent {
                 logical_button_id: button.logical_button_id,
                 class_id: button.class_id,
@@ -224,7 +232,8 @@ mod tests {
 
     #[test]
     fn click_button_uses_registered_button_identity() {
-        let snapshot = MainMenuSnapshot::from_registrations(&[&CLICK_TEST_REGISTRATION]);
+        let mut snapshot = MainMenuSnapshot::from_registrations(&[&CLICK_TEST_REGISTRATION]);
+        snapshot.set_all_validation_states(FeatureValidationState::Validated);
 
         let click = snapshot
             .click_button(snapshot.buttons()[0].logical_button_id, 10, 20, 3)
@@ -234,6 +243,22 @@ mod tests {
         assert_eq!(click.pointer_x, 10);
         assert_eq!(click.pointer_y, 20);
         assert_eq!(click.layout_revision, 3);
+    }
+
+    #[test]
+    fn pending_button_cannot_publish_or_create_click_event() {
+        let snapshot = MainMenuSnapshot::from_registrations(&[&CLICK_TEST_REGISTRATION]);
+
+        assert!(
+            snapshot
+                .click_button(snapshot.buttons()[0].logical_button_id, 10, 20, 3)
+                .is_none()
+        );
+        assert!(
+            snapshot
+                .publish_click(snapshot.buttons()[0].logical_button_id, 10, 20, 3)
+                .is_none()
+        );
     }
 
     #[test]
@@ -250,7 +275,8 @@ mod tests {
 
     #[test]
     fn publish_click_wraps_button_click_as_published_event() {
-        let snapshot = MainMenuSnapshot::from_registrations(&[&CLICK_TEST_REGISTRATION]);
+        let mut snapshot = MainMenuSnapshot::from_registrations(&[&CLICK_TEST_REGISTRATION]);
+        snapshot.set_all_validation_states(FeatureValidationState::Validated);
 
         let published = snapshot
             .publish_click(snapshot.buttons()[0].logical_button_id, 10, 20, 3)

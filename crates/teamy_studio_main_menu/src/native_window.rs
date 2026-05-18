@@ -12,29 +12,28 @@ use windows::Win32::Graphics::Gdi::{
     BeginPaint, CreateSolidBrush, DeleteObject, EndPaint, FillRect, HDC, InvalidateRect,
     PAINTSTRUCT,
 };
-use windows::Win32::UI::Controls::{
-    TOOLTIPS_CLASSW, TTF_ABSOLUTE, TTF_TRACK, TTM_ADDTOOLW, TTM_SETMAXTIPWIDTH,
-    TTM_TRACKACTIVATE, TTM_TRACKPOSITION, TTM_UPDATETIPTEXTW, TTTOOLINFOW, TTS_ALWAYSTIP,
-    TTS_NOPREFIX,
-};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::UI::Controls::{
+    TOOLTIPS_CLASSW, TTF_ABSOLUTE, TTF_TRACK, TTM_ADDTOOLW, TTM_SETMAXTIPWIDTH, TTM_TRACKACTIVATE,
+    TTM_TRACKPOSITION, TTM_UPDATETIPTEXTW, TTS_ALWAYSTIP, TTS_NOPREFIX, TTTOOLINFOW,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CS_DBLCLKS, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-    GetClientRect, GetMessageW, GetWindowRect, HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTCAPTION,
-    HTCLIENT, HTLEFT, HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT, IDC_ARROW, KillTimer,
-    LoadCursorW, MSG, PostQuitMessage, RegisterClassW, ShowWindow, SW_MAXIMIZE, SW_MINIMIZE,
-    SW_SHOW, SendMessageW, SetTimer, SetWindowPos, TranslateMessage, WINDOW_STYLE,
-    WM_DESTROY, WM_DPICHANGED, WM_ENTERSIZEMOVE, WM_ERASEBKGND, WM_EXITSIZEMOVE,
-    WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCACTIVATE, WM_NCCALCSIZE, WM_NCHITTEST, WM_NCPAINT,
-    WM_PAINT, WM_SIZE, WM_TIMER, WNDCLASSW, WS_EX_APPWINDOW, WS_EX_TOPMOST, WS_MAXIMIZEBOX,
-    WS_EX_NOREDIRECTIONBITMAP, WS_MINIMIZEBOX, WS_POPUP, WS_THICKFRAME,
-    SWP_NOACTIVATE, SWP_NOZORDER,
+    CS_DBLCLKS, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect,
+    GetMessageW, GetWindowRect, HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTCAPTION, HTCLIENT, HTLEFT,
+    HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT, IDC_ARROW, KillTimer, LoadCursorW, MSG, PostQuitMessage,
+    RegisterClassW, SW_MAXIMIZE, SW_MINIMIZE, SW_SHOW, SWP_NOACTIVATE, SWP_NOZORDER, SendMessageW,
+    SetTimer, SetWindowPos, ShowWindow, TranslateMessage, WINDOW_STYLE, WM_DESTROY, WM_DPICHANGED,
+    WM_ENTERSIZEMOVE, WM_ERASEBKGND, WM_EXITSIZEMOVE, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCACTIVATE,
+    WM_NCCALCSIZE, WM_NCHITTEST, WM_NCPAINT, WM_PAINT, WM_SIZE, WM_TIMER, WNDCLASSW,
+    WS_EX_APPWINDOW, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOPMOST, WS_MAXIMIZEBOX, WS_MINIMIZEBOX,
+    WS_POPUP, WS_THICKFRAME,
 };
 use windows::core::{PCWSTR, PWSTR, w};
 
 use crate::{
-    FeatureValidationState, MainMenuLogicalButton, MainMenuLogicalButtonId, MainMenuSnapshot,
-    MainMenuSceneButtonState, build_main_menu_scene, layout_main_menu_button_cards,
+    FeatureValidationState, MainMenuLogicalButton, MainMenuLogicalButtonId,
+    MainMenuSceneButtonState, MainMenuSnapshot, build_main_menu_scene,
+    layout_main_menu_button_cards,
 };
 use teamy_studio_shell::{
     ButtonVisualState, GlyphQuad, RenderScene, ShellSceneLayout, SpriteId, SpriteQuad,
@@ -256,7 +255,12 @@ fn draw_panel(hdc: HDC, panel: &teamy_studio_shell::PanelRect) -> Result<()> {
     match panel.effect {
         teamy_studio_shell::PanelEffect::BlueBackground => {
             stroke_rect(hdc, panel.rect, darken(panel.color, 0.32), 1)?;
-            stroke_rect(hdc, inset_rect(panel.rect, 1), lighten(panel.color, 0.06), 1)?;
+            stroke_rect(
+                hdc,
+                inset_rect(panel.rect, 1),
+                lighten(panel.color, 0.06),
+                1,
+            )?;
         }
         teamy_studio_shell::PanelEffect::TitleBar => {}
         teamy_studio_shell::PanelEffect::SceneButtonCard => {
@@ -335,7 +339,9 @@ fn non_client_hit_test(hwnd: HWND, lparam: LPARAM) -> LRESULT {
         let window_state = main_menu_window_state()
             .lock()
             .expect("main menu window state should not be poisoned");
-        window_state.as_ref().map_or_else(system_dpi, |state| state.dpi)
+        window_state
+            .as_ref()
+            .map_or_else(system_dpi, |state| state.dpi)
     };
     let layout = ShellSceneLayout::for_main_menu_with_dpi(width, height, dpi);
     let client_point = POINT {
@@ -688,7 +694,8 @@ fn draw_bitmap_glyph(hdc: HDC, rect: RECT, character: char, color: [f32; 4]) -> 
                 left: origin_x + column * pixel_width,
                 top: origin_y + i32::try_from(row_index).unwrap_or_default() * pixel_height,
                 right: origin_x + (column + 1) * pixel_width,
-                bottom: origin_y + (i32::try_from(row_index).unwrap_or_default() + 1) * pixel_height,
+                bottom: origin_y
+                    + (i32::try_from(row_index).unwrap_or_default() + 1) * pixel_height,
             };
             fill_rect_with_color(hdc, block, color)?;
         }
@@ -947,7 +954,12 @@ where
     configure_main_menu_window_chrome(hwnd)?;
 
     unsafe {
-        let _ = SetTimer(Some(hwnd), MAIN_MENU_RENDER_TIMER_ID, MAIN_MENU_RENDER_INTERVAL_MS, None);
+        let _ = SetTimer(
+            Some(hwnd),
+            MAIN_MENU_RENDER_TIMER_ID,
+            MAIN_MENU_RENDER_INTERVAL_MS,
+            None,
+        );
     }
 
     let mut tooltip = MainMenuTooltipController::create(hwnd)
@@ -974,11 +986,12 @@ where
 
         update_main_menu_tooltip(&mut tooltip, hwnd)?;
 
-        if matches!(message.message, WM_MOUSEMOVE | WM_DPICHANGED | WM_SIZE | WM_ENTERSIZEMOVE | WM_EXITSIZEMOVE)
-        {
-            drive_main_menu_render_path(hwnd).map_err(|error| {
-                eyre!("failed to drive main menu D3D12 render path: {error:#}")
-            })?;
+        if matches!(
+            message.message,
+            WM_MOUSEMOVE | WM_DPICHANGED | WM_SIZE | WM_ENTERSIZEMOVE | WM_EXITSIZEMOVE
+        ) {
+            drive_main_menu_render_path(hwnd)
+                .map_err(|error| eyre!("failed to drive main menu D3D12 render path: {error:#}"))?;
         }
 
         let click_queue = CLICKED_BUTTON_IDS
@@ -1066,7 +1079,12 @@ fn build_live_main_menu_scene(hwnd: HWND) -> Result<RenderScene> {
     );
     let button_states = current_main_menu_button_states(&snapshot, layout, cursor_client_point);
     let chrome = chrome_state_with_pointer(chrome, layout, cursor_client_point);
-    Ok(build_main_menu_scene(&snapshot, layout, chrome, &button_states))
+    Ok(build_main_menu_scene(
+        &snapshot,
+        layout,
+        chrome,
+        &button_states,
+    ))
 }
 
 fn current_main_menu_button_states(
@@ -1083,7 +1101,10 @@ fn current_main_menu_button_states(
             (
                 button.logical_button_id,
                 MainMenuSceneButtonState {
-                    visual_state: button_visual_state_for_rect(card_layout.card_rect, cursor_client_point),
+                    visual_state: button_visual_state_for_rect(
+                        card_layout.card_rect,
+                        cursor_client_point,
+                    ),
                 },
             )
         })
@@ -1096,16 +1117,21 @@ fn chrome_state_with_pointer(
     cursor_client_point: Option<POINT>,
 ) -> WindowChromeButtonsState {
     chrome.pin = button_visual_state_for_rect(layout.pin_button_rect, cursor_client_point);
-    chrome.diagnostics = button_visual_state_for_rect(layout.diagnostics_button_rect, cursor_client_point);
+    chrome.diagnostics =
+        button_visual_state_for_rect(layout.diagnostics_button_rect, cursor_client_point);
     chrome.latency = button_visual_state_for_rect(layout.latency_button_rect, cursor_client_point);
-    chrome.minimize = button_visual_state_for_rect(layout.minimize_button_rect, cursor_client_point);
+    chrome.minimize =
+        button_visual_state_for_rect(layout.minimize_button_rect, cursor_client_point);
     chrome.maximize_restore =
         button_visual_state_for_rect(layout.maximize_restore_button_rect, cursor_client_point);
     chrome.close = button_visual_state_for_rect(layout.close_button_rect, cursor_client_point);
     chrome
 }
 
-fn button_visual_state_for_rect(rect: RECT, cursor_client_point: Option<POINT>) -> ButtonVisualState {
+fn button_visual_state_for_rect(
+    rect: RECT,
+    cursor_client_point: Option<POINT>,
+) -> ButtonVisualState {
     let hovered = cursor_client_point.is_some_and(|point| rect_contains(rect, point.x, point.y));
     ButtonVisualState {
         hover_near: if hovered { 1.0 } else { 0.0 },
@@ -1195,8 +1221,12 @@ fn main_menu_button_tooltip_request(hwnd: HWND) -> Result<Option<(MainMenuLogica
         .iter()
         .zip(card_layouts)
         .find_map(|(button, card_layout)| {
-            rect_contains(card_layout.card_rect, cursor_client_point.x, cursor_client_point.y)
-                .then_some(button.clone())
+            rect_contains(
+                card_layout.card_rect,
+                cursor_client_point.x,
+                cursor_client_point.y,
+            )
+            .then_some(button.clone())
         });
     let Some(button) = hovered else {
         return Ok(None);

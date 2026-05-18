@@ -5,4 +5,5 @@ edition = "2024"
 publish = false
 
 [dependencies]
-facet = "0.44.1"
+facet = { version = "0.44.1", features = ["uuid"] }
+uuid = { version = "1.18.1", features = ["v4"] }

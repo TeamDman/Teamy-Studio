@@ -3,13 +3,19 @@ use std::ffi::c_void;
 use windows::Win32::Foundation::TRUE;
 use windows::Win32::Graphics::Direct3D::{D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST, ID3DBlob};
 use windows::Win32::Graphics::Direct3D12::*;
-use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R32G32_FLOAT, DXGI_FORMAT_R32G32B32_FLOAT, DXGI_FORMAT_R32G32B32A32_FLOAT, DXGI_FORMAT_UNKNOWN, DXGI_SAMPLE_DESC};
+use windows::Win32::Graphics::Dxgi::Common::{
+    DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R32G32_FLOAT,
+    DXGI_FORMAT_R32G32B32_FLOAT, DXGI_FORMAT_R32G32B32A32_FLOAT, DXGI_FORMAT_UNKNOWN,
+    DXGI_SAMPLE_DESC,
+};
 use windows::core::s;
 
 use crate::d3d12_sprite_atlas::sprite_atlas_dimensions;
 
-const COMPILED_VERTEX_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/windows_panel_vs.cso"));
-const COMPILED_PIXEL_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/windows_panel_ps.cso"));
+const COMPILED_VERTEX_SHADER: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/windows_panel_vs.cso"));
+const COMPILED_PIXEL_SHADER: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/windows_panel_ps.cso"));
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -41,7 +47,12 @@ pub fn build_text_shader_params(width: f32, height: f32, elapsed_seconds: f32) -
         transformed_text_debug_hover: [0.0; 4],
         transformed_text_projection: [[0.0; 4]; 2],
         transformed_text_inverse_homography: [[0.0; 4]; 2],
-        sprite_atlas: [sprite_atlas_width as f32, sprite_atlas_height as f32, 0.0, 0.0],
+        sprite_atlas: [
+            sprite_atlas_width as f32,
+            sprite_atlas_height as f32,
+            0.0,
+            0.0,
+        ],
     }
 }
 
@@ -127,17 +138,71 @@ pub fn create_text_pipeline_state(
     root_signature: &ID3D12RootSignature,
 ) -> eyre::Result<ID3D12PipelineState> {
     let input_layout = [
-        D3D12_INPUT_ELEMENT_DESC { SemanticName: s!("POSITION"), Format: DXGI_FORMAT_R32G32B32_FLOAT, ..Default::default() },
-        D3D12_INPUT_ELEMENT_DESC { SemanticName: s!("COLOR"), Format: DXGI_FORMAT_R32G32B32A32_FLOAT, AlignedByteOffset: 12, ..Default::default() },
-        D3D12_INPUT_ELEMENT_DESC { SemanticName: s!("TEXCOORD"), Format: DXGI_FORMAT_R32G32_FLOAT, AlignedByteOffset: 28, ..Default::default() },
-        D3D12_INPUT_ELEMENT_DESC { SemanticName: s!("EFFECT"), Format: DXGI_FORMAT_R32_FLOAT, AlignedByteOffset: 36, ..Default::default() },
-        D3D12_INPUT_ELEMENT_DESC { SemanticName: s!("GLYPH"), Format: DXGI_FORMAT_R32_FLOAT, AlignedByteOffset: 40, ..Default::default() },
-        D3D12_INPUT_ELEMENT_DESC { SemanticName: s!("GLYPHDATA"), Format: DXGI_FORMAT_R32G32B32A32_FLOAT, AlignedByteOffset: 44, ..Default::default() },
-        D3D12_INPUT_ELEMENT_DESC { SemanticName: s!("BANDING"), Format: DXGI_FORMAT_R32G32B32A32_FLOAT, AlignedByteOffset: 60, ..Default::default() },
-        D3D12_INPUT_ELEMENT_DESC { SemanticName: s!("NORMAL"), Format: DXGI_FORMAT_R32G32_FLOAT, AlignedByteOffset: 76, ..Default::default() },
-        D3D12_INPUT_ELEMENT_DESC { SemanticName: s!("JACOBIAN"), Format: DXGI_FORMAT_R32G32B32A32_FLOAT, AlignedByteOffset: 84, ..Default::default() },
-        D3D12_INPUT_ELEMENT_DESC { SemanticName: s!("LOCALBOUNDS"), Format: DXGI_FORMAT_R32G32B32A32_FLOAT, AlignedByteOffset: 100, ..Default::default() },
-        D3D12_INPUT_ELEMENT_DESC { SemanticName: s!("VIEWPORT"), Format: DXGI_FORMAT_R32G32_FLOAT, AlignedByteOffset: 116, ..Default::default() },
+        D3D12_INPUT_ELEMENT_DESC {
+            SemanticName: s!("POSITION"),
+            Format: DXGI_FORMAT_R32G32B32_FLOAT,
+            ..Default::default()
+        },
+        D3D12_INPUT_ELEMENT_DESC {
+            SemanticName: s!("COLOR"),
+            Format: DXGI_FORMAT_R32G32B32A32_FLOAT,
+            AlignedByteOffset: 12,
+            ..Default::default()
+        },
+        D3D12_INPUT_ELEMENT_DESC {
+            SemanticName: s!("TEXCOORD"),
+            Format: DXGI_FORMAT_R32G32_FLOAT,
+            AlignedByteOffset: 28,
+            ..Default::default()
+        },
+        D3D12_INPUT_ELEMENT_DESC {
+            SemanticName: s!("EFFECT"),
+            Format: DXGI_FORMAT_R32_FLOAT,
+            AlignedByteOffset: 36,
+            ..Default::default()
+        },
+        D3D12_INPUT_ELEMENT_DESC {
+            SemanticName: s!("GLYPH"),
+            Format: DXGI_FORMAT_R32_FLOAT,
+            AlignedByteOffset: 40,
+            ..Default::default()
+        },
+        D3D12_INPUT_ELEMENT_DESC {
+            SemanticName: s!("GLYPHDATA"),
+            Format: DXGI_FORMAT_R32G32B32A32_FLOAT,
+            AlignedByteOffset: 44,
+            ..Default::default()
+        },
+        D3D12_INPUT_ELEMENT_DESC {
+            SemanticName: s!("BANDING"),
+            Format: DXGI_FORMAT_R32G32B32A32_FLOAT,
+            AlignedByteOffset: 60,
+            ..Default::default()
+        },
+        D3D12_INPUT_ELEMENT_DESC {
+            SemanticName: s!("NORMAL"),
+            Format: DXGI_FORMAT_R32G32_FLOAT,
+            AlignedByteOffset: 76,
+            ..Default::default()
+        },
+        D3D12_INPUT_ELEMENT_DESC {
+            SemanticName: s!("JACOBIAN"),
+            Format: DXGI_FORMAT_R32G32B32A32_FLOAT,
+            AlignedByteOffset: 84,
+            ..Default::default()
+        },
+        D3D12_INPUT_ELEMENT_DESC {
+            SemanticName: s!("LOCALBOUNDS"),
+            Format: DXGI_FORMAT_R32G32B32A32_FLOAT,
+            AlignedByteOffset: 100,
+            ..Default::default()
+        },
+        D3D12_INPUT_ELEMENT_DESC {
+            SemanticName: s!("VIEWPORT"),
+            Format: DXGI_FORMAT_R32G32_FLOAT,
+            AlignedByteOffset: 116,
+            ..Default::default()
+        },
     ];
 
     let blend_target = D3D12_RENDER_TARGET_BLEND_DESC {
@@ -187,8 +252,20 @@ pub fn create_text_pipeline_state(
         },
         PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
         NumRenderTargets: 1,
-        RTVFormats: [DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_UNKNOWN],
-        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        RTVFormats: [
+            DXGI_FORMAT_B8G8R8A8_UNORM,
+            DXGI_FORMAT_UNKNOWN,
+            DXGI_FORMAT_UNKNOWN,
+            DXGI_FORMAT_UNKNOWN,
+            DXGI_FORMAT_UNKNOWN,
+            DXGI_FORMAT_UNKNOWN,
+            DXGI_FORMAT_UNKNOWN,
+            DXGI_FORMAT_UNKNOWN,
+        ],
+        SampleDesc: DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
         ..Default::default()
     };
 
@@ -196,7 +273,8 @@ pub fn create_text_pipeline_state(
 }
 
 #[must_use]
-pub const fn primitive_topology_triangle_list() -> windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY {
+pub const fn primitive_topology_triangle_list()
+-> windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY {
     D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST
 }
 
