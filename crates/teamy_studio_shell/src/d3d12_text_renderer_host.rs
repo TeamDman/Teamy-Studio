@@ -1,3 +1,5 @@
+use std::time::Instant;
+
 use eyre::WrapErr;
 use windows::Win32::Foundation::{HANDLE, HWND, RECT};
 use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
@@ -57,12 +59,13 @@ pub struct TextRendererHost {
     pub swap_chain: IDXGISwapChain3,
     pub rtv_heap: ID3D12DescriptorHeap,
     pub rtv_descriptor_size: u32,
-    pub render_targets: [ID3D12Resource; FRAME_COUNT],
+    pub render_targets: [Option<ID3D12Resource>; FRAME_COUNT],
     pub fence: ID3D12Fence,
     pub fence_event: Owned<HANDLE>,
     pub next_fence_value: u64,
     pub root_signature: ID3D12RootSignature,
     pub pipeline_state: ID3D12PipelineState,
+    pub start_time: Instant,
     pub viewport: D3D12_VIEWPORT,
     pub scissor_rect: RECT,
     pub width: u32,
@@ -149,6 +152,7 @@ impl TextRendererHost {
             next_fence_value: 1,
             root_signature,
             pipeline_state,
+            start_time: Instant::now(),
             viewport: D3D12_VIEWPORT {
                 TopLeftX: 0.0,
                 TopLeftY: 0.0,
@@ -186,15 +190,55 @@ impl TextRendererHost {
         self.upload_last_batch()
     }
 
+    pub fn resize_swap_chain(&mut self, width: u32, height: u32) -> eyre::Result<()> {
+        if self.width == width && self.height == height {
+            return Ok(());
+        }
+
+        self.wait_for_gpu()?;
+        self.render_targets.fill(None);
+        unsafe {
+            self.swap_chain.ResizeBuffers(
+                FRAME_COUNT as u32,
+                width,
+                height,
+                DXGI_FORMAT_B8G8R8A8_UNORM,
+                DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT,
+            )
+        }
+        .wrap_err("failed to resize text renderer host swap chain")?;
+
+        let (rtv_heap, rtv_descriptor_size, render_targets) =
+            create_render_targets(&self.device, &self.swap_chain)
+                .wrap_err("failed to recreate render targets after swap-chain resize")?;
+        self.rtv_heap = rtv_heap;
+        self.rtv_descriptor_size = rtv_descriptor_size;
+        self.render_targets = render_targets;
+        self.width = width;
+        self.height = height;
+        self.viewport.Width = width as f32;
+        self.viewport.Height = height as f32;
+        self.scissor_rect.right = i32::try_from(width).unwrap_or(i32::MAX);
+        self.scissor_rect.bottom = i32::try_from(height).unwrap_or(i32::MAX);
+        Ok(())
+    }
+
     pub fn present_scene_frame(&mut self, clear_color: [f32; 4]) -> eyre::Result<()> {
         let frame_index = unsafe { self.swap_chain.GetCurrentBackBufferIndex() as usize };
-        let current_target = &self.render_targets[frame_index];
+        let current_target = self.render_targets[frame_index]
+            .as_ref()
+            .expect("current swap-chain back buffer should exist before present");
         let vertex_count = self.last_upload_batch.vertices.len();
 
         unsafe {
             self.command_allocator.Reset()?;
             self.command_list.Reset(&self.command_allocator, &self.pipeline_state)?;
-            update_text_shader_params(&self.resources.shader_param_buffer, self.width, self.height)?;
+            update_text_shader_params(
+                &self.resources.shader_param_buffer,
+                self.width,
+                self.height,
+                self.start_time.elapsed().as_secs_f32(),
+            )?;
 
             self.command_list
                 .SetDescriptorHeaps(&[Some(self.resources.text_shader_resources.srv_heap.clone())]);
@@ -433,7 +477,7 @@ fn attach_swap_chain_to_window(
 fn create_render_targets(
     device: &ID3D12Device,
     swap_chain: &IDXGISwapChain3,
-) -> eyre::Result<(ID3D12DescriptorHeap, u32, [ID3D12Resource; FRAME_COUNT])> {
+) -> eyre::Result<(ID3D12DescriptorHeap, u32, [Option<ID3D12Resource>; FRAME_COUNT])> {
     let rtv_heap: ID3D12DescriptorHeap = unsafe {
         device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
             Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
@@ -455,7 +499,7 @@ fn create_render_targets(
         *slot = Some(resource);
     }
 
-    Ok((rtv_heap, rtv_descriptor_size, render_targets.map(Option::unwrap)))
+    Ok((rtv_heap, rtv_descriptor_size, render_targets))
 }
 
 fn transition_barrier(

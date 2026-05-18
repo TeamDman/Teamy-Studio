@@ -60,8 +60,9 @@ pub fn update_text_shader_params(
     shader_param_buffer: &ID3D12Resource,
     width: u32,
     height: u32,
+    elapsed_seconds: f32,
 ) -> eyre::Result<()> {
-    let params = build_text_shader_params(width as f32, height as f32, 0.0);
+    let params = build_text_shader_params(width as f32, height as f32, elapsed_seconds);
     unsafe {
         let mut mapped = std::ptr::null_mut();
         shader_param_buffer.Map(0, None, Some(&mut mapped))?;

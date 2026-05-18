@@ -63,17 +63,6 @@ pub fn build_main_menu_scene(
     );
     push_panel(
         &mut scene,
-        RECT {
-            left: shell_layout.title_bar_rect.left,
-            top: shell_layout.title_bar_rect.bottom - 4,
-            right: shell_layout.title_bar_rect.right,
-            bottom: shell_layout.title_bar_rect.bottom,
-        },
-        [0.02, 0.30, 0.18, 0.98],
-        PanelEffect::GardenFrame,
-    );
-    push_panel(
-        &mut scene,
         shell_layout.body_rect,
         [0.08, 0.09, 0.11, 0.985],
         PanelEffect::SceneBody,

@@ -7,28 +7,37 @@ use windows::Win32::Graphics::Dwm::{
     DwmSetWindowAttribute,
 };
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, CreateSolidBrush, DeleteObject, EndPaint, FillRect, HDC, PAINTSTRUCT,
+    BeginPaint, CreateSolidBrush, DeleteObject, EndPaint, FillRect, HDC, InvalidateRect,
+    PAINTSTRUCT,
+};
+use windows::Win32::UI::Controls::{
+    TOOLTIPS_CLASSW, TTF_ABSOLUTE, TTF_TRACK, TTM_ADDTOOLW, TTM_SETMAXTIPWIDTH,
+    TTM_TRACKACTIVATE, TTM_TRACKPOSITION, TTM_UPDATETIPTEXTW, TTTOOLINFOW, TTS_ALWAYSTIP,
+    TTS_NOPREFIX,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
+    CS_DBLCLKS, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
     GetClientRect, GetMessageW, GetWindowRect, HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTCAPTION,
-    HTCLIENT, HTLEFT, HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT, IDC_ARROW, LoadCursorW, MSG,
-    PostQuitMessage, RegisterClassW, SW_MAXIMIZE, SW_MINIMIZE, SW_SHOW, ShowWindow,
-    SetWindowPos, TranslateMessage, WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND, WM_LBUTTONUP,
-    WM_NCACTIVATE, WM_NCCALCSIZE, WM_NCHITTEST, WM_NCPAINT, WM_PAINT, WNDCLASSW,
-    WS_EX_APPWINDOW, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP, WS_THICKFRAME, WS_VISIBLE,
+    HTCLIENT, HTLEFT, HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT, IDC_ARROW, KillTimer,
+    LoadCursorW, MSG, PostQuitMessage, RegisterClassW, ShowWindow, SW_MAXIMIZE, SW_MINIMIZE,
+    SW_SHOW, SendMessageW, SetTimer, SetWindowPos, TranslateMessage, WINDOW_STYLE,
+    WM_DESTROY, WM_DPICHANGED, WM_ENTERSIZEMOVE, WM_ERASEBKGND, WM_EXITSIZEMOVE,
+    WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCACTIVATE, WM_NCCALCSIZE, WM_NCHITTEST, WM_NCPAINT,
+    WM_PAINT, WM_SIZE, WM_TIMER, WNDCLASSW, WS_EX_APPWINDOW, WS_EX_TOPMOST, WS_MAXIMIZEBOX,
+    WS_EX_NOREDIRECTIONBITMAP, WS_MINIMIZEBOX, WS_POPUP, WS_THICKFRAME,
     SWP_NOACTIVATE, SWP_NOZORDER,
 };
-use windows::core::{PCWSTR, w};
+use windows::core::{PCWSTR, PWSTR, w};
 
 use crate::{
-    FeatureValidationState, MainMenuLogicalButtonId, MainMenuSnapshot, build_main_menu_scene,
-    layout_main_menu_button_cards,
+    FeatureValidationState, MainMenuLogicalButton, MainMenuLogicalButtonId, MainMenuSnapshot,
+    MainMenuSceneButtonState, build_main_menu_scene, layout_main_menu_button_cards,
 };
 use teamy_studio_shell::{
     GlyphQuad, RenderScene, ShellSceneLayout, SpriteId, SpriteQuad, WindowChromeButtonsState,
-    d3d12_smoke_test_requested, initialize_dpi_awareness, scale_for_dpi,
+    ButtonVisualState, TextRendererSmokeBootstrap, d3d12_smoke_test_requested,
+    initialize_dpi_awareness, scale_for_dpi,
     smoke_bootstrap_text_renderer_for_scene, system_dpi, window_dpi,
 };
 
@@ -37,6 +46,8 @@ const MAIN_MENU_WINDOW_HEIGHT: i32 = 760;
 const MAIN_MENU_WINDOW_CLASS_NAME: PCWSTR = w!("TeamyStudioMainMenuWindow");
 const MAIN_MENU_WINDOW_TITLE: PCWSTR = w!("Teamy Studio Main Menu");
 const RESIZE_BORDER_THICKNESS: i32 = 8;
+const MAIN_MENU_RENDER_TIMER_ID: usize = 1;
+const MAIN_MENU_RENDER_INTERVAL_MS: u32 = 16;
 
 static MAIN_MENU_WINDOW_CLASS_REGISTERED: OnceLock<()> = OnceLock::new();
 static CLICKED_BUTTON_IDS: OnceLock<Mutex<Vec<MainMenuLogicalButtonId>>> = OnceLock::new();
@@ -47,6 +58,16 @@ struct NativeMainMenuWindowState {
     snapshot: MainMenuSnapshot,
     chrome: WindowChromeButtonsState,
     dpi: u32,
+    cursor_client_point: Option<POINT>,
+    moving_or_sizing: bool,
+    d3d12_active: bool,
+    d3d12_bootstrap_generation: u32,
+}
+
+struct MainMenuTooltipController {
+    hwnd: HWND,
+    text: Vec<u16>,
+    visible: bool,
 }
 
 unsafe extern "system" fn main_menu_window_proc(
@@ -59,9 +80,22 @@ unsafe extern "system" fn main_menu_window_proc(
         WM_NCCALCSIZE => LRESULT(0),
         WM_NCACTIVATE => LRESULT(1),
         WM_NCPAINT => LRESULT(0),
+        WM_ENTERSIZEMOVE => {
+            set_main_menu_moving_or_sizing(true);
+            LRESULT(0)
+        }
+        WM_EXITSIZEMOVE => {
+            set_main_menu_moving_or_sizing(false);
+            LRESULT(0)
+        }
         WM_NCHITTEST => non_client_hit_test(hwnd, lparam),
         WM_ERASEBKGND => LRESULT(1),
-        WM_DPICHANGED => handle_dpi_changed(hwnd, lparam),
+        WM_DPICHANGED => handle_dpi_changed(hwnd, wparam, lparam),
+        WM_MOUSEMOVE => {
+            let _ = handle_mouse_move(hwnd, lparam);
+            LRESULT(0)
+        }
+        WM_TIMER if wparam.0 == MAIN_MENU_RENDER_TIMER_ID => LRESULT(0),
         WM_DESTROY => {
             unsafe { PostQuitMessage(0) };
             LRESULT(0)
@@ -79,6 +113,14 @@ fn main_menu_window_state() -> &'static Mutex<Option<NativeMainMenuWindowState>>
     MAIN_MENU_WINDOW_STATE.get_or_init(|| Mutex::new(None))
 }
 
+fn main_menu_d3d12_active() -> bool {
+    main_menu_window_state()
+        .lock()
+        .expect("main menu window state should not be poisoned")
+        .as_ref()
+        .is_some_and(|state| state.d3d12_active)
+}
+
 fn ensure_main_menu_window_class_registered() -> Result<()> {
     if MAIN_MENU_WINDOW_CLASS_REGISTERED.get().is_some() {
         return Ok(());
@@ -90,7 +132,7 @@ fn ensure_main_menu_window_class_registered() -> Result<()> {
         .map_err(|error| eyre!("failed to load arrow cursor: {error}"))?;
 
     let class = WNDCLASSW {
-        style: CS_HREDRAW | CS_VREDRAW,
+        style: CS_DBLCLKS,
         hInstance: instance.into(),
         lpszClassName: MAIN_MENU_WINDOW_CLASS_NAME,
         lpfnWndProc: Some(main_menu_window_proc),
@@ -182,7 +224,7 @@ fn perform_chrome_click(hwnd: HWND, action: ChromeClickAction) {
 }
 
 fn paint_main_menu_window(hwnd: HWND) -> LRESULT {
-    if d3d12_smoke_test_requested() {
+    if main_menu_d3d12_active() {
         return acknowledge_main_menu_paint(hwnd);
     }
 
@@ -209,32 +251,7 @@ fn acknowledge_main_menu_paint(hwnd: HWND) -> LRESULT {
 }
 
 fn render_main_menu_scene(hdc: HDC, hwnd: HWND) -> Result<()> {
-    let mut client_rect = RECT::default();
-    unsafe { GetClientRect(hwnd, &mut client_rect) }
-        .map_err(|error| eyre!("failed to get client rect for painting: {error}"))?;
-    let dpi = {
-        let window_state = main_menu_window_state()
-            .lock()
-            .expect("main menu window state should not be poisoned");
-        window_state.as_ref().map_or_else(system_dpi, |state| state.dpi)
-    };
-    let layout = ShellSceneLayout::for_main_menu_with_dpi(
-        client_rect.right - client_rect.left,
-        client_rect.bottom - client_rect.top,
-        dpi,
-    );
-
-    let (snapshot, chrome) = {
-        let window_state = main_menu_window_state()
-            .lock()
-            .expect("main menu window state should not be poisoned");
-        let Some(window_state) = window_state.as_ref() else {
-            return Ok(());
-        };
-        (window_state.snapshot.clone(), window_state.chrome)
-    };
-
-    let scene = build_main_menu_scene(&snapshot, layout, chrome, &[]);
+    let scene = build_live_main_menu_scene(hwnd)?;
     draw_scene(hdc, &scene)
 }
 
@@ -258,15 +275,7 @@ fn draw_panel(hdc: HDC, panel: &teamy_studio_shell::PanelRect) -> Result<()> {
             stroke_rect(hdc, panel.rect, darken(panel.color, 0.32), 1)?;
             stroke_rect(hdc, inset_rect(panel.rect, 1), lighten(panel.color, 0.06), 1)?;
         }
-        teamy_studio_shell::PanelEffect::TitleBar => {
-            let bottom_highlight = RECT {
-                left: panel.rect.left,
-                top: panel.rect.bottom - 1,
-                right: panel.rect.right,
-                bottom: panel.rect.bottom,
-            };
-            fill_rect_with_color(hdc, bottom_highlight, [0.02, 0.30, 0.18, 1.0])?;
-        }
+        teamy_studio_shell::PanelEffect::TitleBar => {}
         teamy_studio_shell::PanelEffect::SceneButtonCard => {
             stroke_rect(hdc, panel.rect, lighten(panel.color, 0.04), 1)?;
             fill_rect_with_color(hdc, inset_rect(panel.rect, 8), darken(panel.color, 0.52))?;
@@ -360,8 +369,8 @@ fn non_client_hit_test(hwnd: HWND, lparam: LPARAM) -> LRESULT {
     LRESULT(isize::try_from(HTCLIENT).unwrap_or_default())
 }
 
-fn handle_dpi_changed(hwnd: HWND, lparam: LPARAM) -> LRESULT {
-    let dpi = window_dpi(hwnd);
+fn handle_dpi_changed(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    let dpi = u32::try_from(wparam.0 & 0xFFFF).unwrap_or_else(|_| window_dpi(hwnd));
     if let Some(state) = main_menu_window_state()
         .lock()
         .expect("main menu window state should not be poisoned")
@@ -384,6 +393,41 @@ fn handle_dpi_changed(hwnd: HWND, lparam: LPARAM) -> LRESULT {
     }
 
     LRESULT(0)
+}
+
+fn handle_mouse_move(hwnd: HWND, lparam: LPARAM) -> Result<()> {
+    let point = POINT {
+        x: (lparam.0 & 0xFFFF) as i16 as i32,
+        y: ((lparam.0 >> 16) & 0xFFFF) as i16 as i32,
+    };
+    let mut client_rect = RECT::default();
+    unsafe { GetClientRect(hwnd, &mut client_rect) }
+        .map_err(|error| eyre!("failed to get client rect for main menu mouse move: {error}"))?;
+
+    let next_point = rect_contains(client_rect, point.x, point.y).then_some(point);
+    let mut window_state = main_menu_window_state()
+        .lock()
+        .expect("main menu window state should not be poisoned");
+    let Some(window_state) = window_state.as_mut() else {
+        return Ok(());
+    };
+    if window_state.cursor_client_point != next_point {
+        window_state.cursor_client_point = next_point;
+        unsafe {
+            let _ = InvalidateRect(Some(hwnd), None, false);
+        }
+    }
+    Ok(())
+}
+
+fn set_main_menu_moving_or_sizing(value: bool) {
+    if let Some(state) = main_menu_window_state()
+        .lock()
+        .expect("main menu window state should not be poisoned")
+        .as_mut()
+    {
+        state.moving_or_sizing = value;
+    }
 }
 
 fn resize_hit_test(width: i32, height: i32, x: i32, y: i32) -> Option<u32> {
@@ -852,6 +896,10 @@ where
                 ..Default::default()
             },
             dpi,
+            cursor_client_point: None,
+            moving_or_sizing: false,
+            d3d12_active: false,
+            d3d12_bootstrap_generation: 0,
         });
 
     let instance = unsafe { GetModuleHandleW(None) }
@@ -859,10 +907,10 @@ where
 
     let hwnd = unsafe {
         CreateWindowExW(
-            WS_EX_APPWINDOW,
+            WS_EX_APPWINDOW | WS_EX_NOREDIRECTIONBITMAP,
             MAIN_MENU_WINDOW_CLASS_NAME,
             MAIN_MENU_WINDOW_TITLE,
-            WS_POPUP | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_VISIBLE,
+            WS_POPUP | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX,
             120,
             80,
             scale_for_dpi(MAIN_MENU_WINDOW_WIDTH, dpi),
@@ -883,39 +931,49 @@ where
         state.dpi = window_dpi(hwnd);
     }
 
+    let d3d12_requested = d3d12_smoke_test_requested();
+    let mut smoke_bootstrap: Option<TextRendererSmokeBootstrap> = None;
+    if d3d12_requested {
+        if let Some(state) = main_menu_window_state()
+            .lock()
+            .expect("main menu window state should not be poisoned")
+            .as_mut()
+        {
+            state.d3d12_active = true;
+            state.d3d12_bootstrap_generation += 1;
+            let mut client_rect = RECT::default();
+            unsafe {
+                let _ = GetClientRect(hwnd, &mut client_rect);
+            }
+            let width = (client_rect.right - client_rect.left).max(0) as u32;
+            let height = (client_rect.bottom - client_rect.top).max(0) as u32;
+            eprintln!(
+                "main menu D3D12 bootstrap generation={} hwnd={:?} size={}x{} dpi={} moving_or_sizing={}",
+                state.d3d12_bootstrap_generation,
+                hwnd,
+                width,
+                height,
+                state.dpi,
+                state.moving_or_sizing,
+            );
+        }
+        smoke_bootstrap = Some(build_smoke_bootstrap_for_main_menu(hwnd)?);
+    }
+
     unsafe {
         let _ = ShowWindow(hwnd, SW_SHOW);
     }
 
     configure_main_menu_window_chrome(hwnd)?;
 
-    let smoke_bootstrap = if d3d12_smoke_test_requested() {
-        let mut client_rect = RECT::default();
-        unsafe { GetClientRect(hwnd, &mut client_rect) }.map_err(|error| {
-            eyre!("failed to get main menu client rect for D3D12 smoke bootstrap: {error}")
-        })?;
-        let (snapshot, chrome, dpi) = {
-            let window_state = main_menu_window_state()
-                .lock()
-                .expect("main menu window state should not be poisoned");
-            let state = window_state
-                .as_ref()
-                .expect("main menu window state should exist before smoke bootstrap");
-            (state.snapshot.clone(), state.chrome, state.dpi)
-        };
-        let layout = ShellSceneLayout::for_main_menu_with_dpi(
-            client_rect.right - client_rect.left,
-            client_rect.bottom - client_rect.top,
-            dpi,
-        );
-        let scene = build_main_menu_scene(&snapshot, layout, chrome, &[]);
-        Some(
-            smoke_bootstrap_text_renderer_for_scene(hwnd, &scene)
-                .map_err(|error| eyre!("failed to bootstrap main menu D3D12 smoke path: {error:#}"))?,
-        )
-    } else {
-        None
-    };
+    if d3d12_requested {
+        unsafe {
+            let _ = SetTimer(Some(hwnd), MAIN_MENU_RENDER_TIMER_ID, MAIN_MENU_RENDER_INTERVAL_MS, None);
+        }
+    }
+
+    let mut tooltip = MainMenuTooltipController::create(hwnd)
+        .map_err(|error| eyre!("failed to create main menu tooltip controller: {error:#}"))?;
 
     let mut message = MSG::default();
     loop {
@@ -930,6 +988,22 @@ where
         unsafe {
             let _ = TranslateMessage(&message);
             DispatchMessageW(&message);
+        }
+
+        if message.message == WM_DESTROY {
+            continue;
+        }
+
+        update_main_menu_tooltip(&mut tooltip, hwnd)?;
+
+        let timer_tick = message.message == WM_TIMER && message.wParam.0 == MAIN_MENU_RENDER_TIMER_ID;
+        if d3d12_requested
+            && (matches!(message.message, WM_MOUSEMOVE | WM_DPICHANGED | WM_SIZE | WM_ENTERSIZEMOVE | WM_EXITSIZEMOVE)
+                || timer_tick)
+        {
+            drive_main_menu_smoke_path(&mut smoke_bootstrap, hwnd).map_err(|error| {
+                eyre!("failed to drive main menu D3D12 smoke path: {error:#}")
+            })?;
         }
 
         let click_queue = CLICKED_BUTTON_IDS
@@ -949,6 +1023,12 @@ where
     *main_menu_window_state()
         .lock()
         .expect("main menu window state should not be poisoned") = None;
+    if d3d12_requested {
+        unsafe {
+            let _ = KillTimer(Some(hwnd), MAIN_MENU_RENDER_TIMER_ID);
+        }
+    }
+    tooltip.destroy();
     let _ = smoke_bootstrap;
     Ok(())
 }
@@ -979,6 +1059,313 @@ fn configure_main_menu_window_chrome(hwnd: HWND) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn build_smoke_bootstrap_for_main_menu(hwnd: HWND) -> Result<TextRendererSmokeBootstrap> {
+    let scene = build_live_main_menu_scene(hwnd)?;
+    smoke_bootstrap_text_renderer_for_scene(hwnd, &scene)
+}
+
+fn build_live_main_menu_scene(hwnd: HWND) -> Result<RenderScene> {
+    let mut client_rect = RECT::default();
+    unsafe { GetClientRect(hwnd, &mut client_rect) }
+        .map_err(|error| eyre!("failed to get main menu client rect: {error}"))?;
+    let (snapshot, chrome, dpi, cursor_client_point) = {
+        let window_state = main_menu_window_state()
+            .lock()
+            .expect("main menu window state should not be poisoned");
+        let state = window_state
+            .as_ref()
+            .expect("main menu window state should exist before building the main menu scene");
+        (
+            state.snapshot.clone(),
+            state.chrome,
+            state.dpi,
+            state.cursor_client_point,
+        )
+    };
+    let layout = ShellSceneLayout::for_main_menu_with_dpi(
+        client_rect.right - client_rect.left,
+        client_rect.bottom - client_rect.top,
+        dpi,
+    );
+    let button_states = current_main_menu_button_states(&snapshot, layout, cursor_client_point);
+    let chrome = chrome_state_with_pointer(chrome, layout, cursor_client_point);
+    Ok(build_main_menu_scene(&snapshot, layout, chrome, &button_states))
+}
+
+fn current_main_menu_button_states(
+    snapshot: &MainMenuSnapshot,
+    layout: ShellSceneLayout,
+    cursor_client_point: Option<POINT>,
+) -> Vec<(MainMenuLogicalButtonId, MainMenuSceneButtonState)> {
+    let card_layouts = layout_main_menu_button_cards(layout.body_rect, snapshot.buttons().len());
+    snapshot
+        .buttons()
+        .iter()
+        .zip(card_layouts)
+        .map(|(button, card_layout)| {
+            (
+                button.logical_button_id,
+                MainMenuSceneButtonState {
+                    visual_state: button_visual_state_for_rect(card_layout.card_rect, cursor_client_point),
+                },
+            )
+        })
+        .collect()
+}
+
+fn chrome_state_with_pointer(
+    mut chrome: WindowChromeButtonsState,
+    layout: ShellSceneLayout,
+    cursor_client_point: Option<POINT>,
+) -> WindowChromeButtonsState {
+    chrome.pin = button_visual_state_for_rect(layout.pin_button_rect, cursor_client_point);
+    chrome.diagnostics = button_visual_state_for_rect(layout.diagnostics_button_rect, cursor_client_point);
+    chrome.latency = button_visual_state_for_rect(layout.latency_button_rect, cursor_client_point);
+    chrome.minimize = button_visual_state_for_rect(layout.minimize_button_rect, cursor_client_point);
+    chrome.maximize_restore =
+        button_visual_state_for_rect(layout.maximize_restore_button_rect, cursor_client_point);
+    chrome.close = button_visual_state_for_rect(layout.close_button_rect, cursor_client_point);
+    chrome
+}
+
+fn button_visual_state_for_rect(rect: RECT, cursor_client_point: Option<POINT>) -> ButtonVisualState {
+    let hovered = cursor_client_point.is_some_and(|point| rect_contains(rect, point.x, point.y));
+    ButtonVisualState {
+        hover_near: if hovered { 1.0 } else { 0.0 },
+        hovered,
+        active: hovered,
+        ..Default::default()
+    }
+}
+
+fn drive_main_menu_smoke_path(
+    smoke_bootstrap: &mut Option<TextRendererSmokeBootstrap>,
+    hwnd: HWND,
+) -> Result<()> {
+    let mut client_rect = RECT::default();
+    unsafe { GetClientRect(hwnd, &mut client_rect) }
+        .map_err(|error| eyre!("failed to get main menu client rect for smoke path: {error}"))?;
+    let width = (client_rect.right - client_rect.left).max(0) as u32;
+    let height = (client_rect.bottom - client_rect.top).max(0) as u32;
+    let scene = build_live_main_menu_scene(hwnd)?;
+
+    if smoke_bootstrap.is_none() {
+        if let Some(state) = main_menu_window_state()
+            .lock()
+            .expect("main menu window state should not be poisoned")
+            .as_mut()
+        {
+            state.d3d12_active = true;
+            state.d3d12_bootstrap_generation += 1;
+            eprintln!(
+                "main menu D3D12 bootstrap generation={} hwnd={:?} size={}x{} dpi={} moving_or_sizing={}",
+                state.d3d12_bootstrap_generation,
+                hwnd,
+                width,
+                height,
+                state.dpi,
+                state.moving_or_sizing,
+            );
+        }
+        unsafe {
+            let _ = InvalidateRect(Some(hwnd), None, false);
+            let _ = SendMessageW(hwnd, WM_PAINT, Some(WPARAM(0)), Some(LPARAM(0)));
+        }
+        *smoke_bootstrap = Some(build_smoke_bootstrap_for_main_menu(hwnd)?);
+        return Ok(());
+    }
+
+    let host = smoke_bootstrap
+        .as_mut()
+        .expect("smoke bootstrap should exist after initialization");
+    if host.width != width || host.height != height {
+        let dpi = main_menu_window_state()
+            .lock()
+            .expect("main menu window state should not be poisoned")
+            .as_ref()
+            .map_or_else(system_dpi, |state| state.dpi);
+        eprintln!(
+            "main menu D3D12 resize hwnd={:?} from={}x{} to={}x{} dpi={}",
+            hwnd,
+            host.width,
+            host.height,
+            width,
+            height,
+            dpi,
+        );
+        host.resize_swap_chain(width.max(1), height.max(1))?;
+    }
+
+    host.upload_scene(&scene)?;
+    host.present_scene_frame([0.0, 0.0, 0.0, 0.0])
+}
+
+fn update_main_menu_tooltip(tooltip: &mut MainMenuTooltipController, hwnd: HWND) -> Result<()> {
+    let Some((button, position)) = main_menu_button_tooltip_request(hwnd)? else {
+        tooltip.hide(hwnd);
+        return Ok(());
+    };
+    tooltip.show_at(hwnd, button.tooltip, position)
+}
+
+fn main_menu_button_tooltip_request(hwnd: HWND) -> Result<Option<(MainMenuLogicalButton, POINT)>> {
+    let mut client_rect = RECT::default();
+    if unsafe { GetClientRect(hwnd, &mut client_rect) }.is_err() {
+        return Ok(None);
+    }
+    let (snapshot, dpi, cursor_client_point, moving_or_sizing) = {
+        let window_state = main_menu_window_state()
+            .lock()
+            .expect("main menu window state should not be poisoned");
+        let Some(state) = window_state.as_ref() else {
+            return Ok(None);
+        };
+        (
+            state.snapshot.clone(),
+            state.dpi,
+            state.cursor_client_point,
+            state.moving_or_sizing,
+        )
+    };
+    if moving_or_sizing {
+        return Ok(None);
+    }
+    let Some(cursor_client_point) = cursor_client_point else {
+        return Ok(None);
+    };
+    let layout = ShellSceneLayout::for_main_menu_with_dpi(
+        client_rect.right - client_rect.left,
+        client_rect.bottom - client_rect.top,
+        dpi,
+    );
+    let card_layouts = layout_main_menu_button_cards(layout.body_rect, snapshot.buttons().len());
+    let hovered = snapshot
+        .buttons()
+        .iter()
+        .zip(card_layouts)
+        .find_map(|(button, card_layout)| {
+            rect_contains(card_layout.card_rect, cursor_client_point.x, cursor_client_point.y)
+                .then_some(button.clone())
+        });
+    let Some(button) = hovered else {
+        return Ok(None);
+    };
+    let mut window_rect = RECT::default();
+    if unsafe { GetWindowRect(hwnd, &mut window_rect) }.is_err() {
+        return Ok(None);
+    }
+    Ok(Some((
+        button,
+        POINT {
+            x: window_rect.left + cursor_client_point.x + 16,
+            y: window_rect.top + cursor_client_point.y + 24,
+        },
+    )))
+}
+
+impl MainMenuTooltipController {
+    fn create(owner: HWND) -> Result<Self> {
+        let instance = unsafe { GetModuleHandleW(None) }
+            .map_err(|error| eyre!("failed to get module handle for main menu tooltip: {error}"))?;
+        let hwnd = unsafe {
+            CreateWindowExW(
+                WS_EX_TOPMOST,
+                TOOLTIPS_CLASSW,
+                PCWSTR::null(),
+                WINDOW_STYLE(WS_POPUP.0 | TTS_ALWAYSTIP | TTS_NOPREFIX),
+                0,
+                0,
+                0,
+                0,
+                Some(owner),
+                None,
+                Some(instance.into()),
+                None,
+            )
+        }
+        .map_err(|error| eyre!("failed to create main menu tooltip window: {error}"))?;
+        let mut controller = Self {
+            hwnd,
+            text: vec![0],
+            visible: false,
+        };
+        let tool = controller.tool_info(owner);
+        let tool_ptr: *const TTTOOLINFOW = &raw const tool;
+        unsafe {
+            let _ = SendMessageW(
+                hwnd,
+                TTM_ADDTOOLW,
+                Some(WPARAM(0)),
+                Some(LPARAM(tool_ptr as isize)),
+            );
+            let _ = SendMessageW(hwnd, TTM_SETMAXTIPWIDTH, Some(WPARAM(0)), Some(LPARAM(320)));
+        }
+        Ok(controller)
+    }
+
+    fn show_at(&mut self, owner: HWND, text: &str, position: POINT) -> Result<()> {
+        self.text = text.encode_utf16().chain(std::iter::once(0)).collect();
+        let tool = self.tool_info(owner);
+        let tool_ptr: *const TTTOOLINFOW = &raw const tool;
+        let packed_position = u32::from(position.x as u16) | (u32::from(position.y as u16) << 16);
+        unsafe {
+            let _ = SendMessageW(
+                self.hwnd,
+                TTM_UPDATETIPTEXTW,
+                Some(WPARAM(0)),
+                Some(LPARAM(tool_ptr as isize)),
+            );
+            let _ = SendMessageW(
+                self.hwnd,
+                TTM_TRACKPOSITION,
+                Some(WPARAM(0)),
+                Some(LPARAM(isize::try_from(packed_position).unwrap_or_default())),
+            );
+            let _ = SendMessageW(
+                self.hwnd,
+                TTM_TRACKACTIVATE,
+                Some(WPARAM(1)),
+                Some(LPARAM(tool_ptr as isize)),
+            );
+        }
+        self.visible = true;
+        Ok(())
+    }
+
+    fn hide(&mut self, owner: HWND) {
+        if !self.visible {
+            return;
+        }
+        let tool = self.tool_info(owner);
+        let tool_ptr: *const TTTOOLINFOW = &raw const tool;
+        unsafe {
+            let _ = SendMessageW(
+                self.hwnd,
+                TTM_TRACKACTIVATE,
+                Some(WPARAM(0)),
+                Some(LPARAM(tool_ptr as isize)),
+            );
+        }
+        self.visible = false;
+    }
+
+    fn destroy(&mut self) {
+        unsafe {
+            let _ = DestroyWindow(self.hwnd);
+        }
+    }
+
+    fn tool_info(&mut self, owner: HWND) -> TTTOOLINFOW {
+        TTTOOLINFOW {
+            cbSize: u32::try_from(std::mem::size_of::<TTTOOLINFOW>()).unwrap_or(u32::MAX),
+            uFlags: TTF_TRACK | TTF_ABSOLUTE,
+            hwnd: owner,
+            lpszText: PWSTR(self.text.as_mut_ptr()),
+            ..Default::default()
+        }
+    }
 }
 
 #[cfg(test)]

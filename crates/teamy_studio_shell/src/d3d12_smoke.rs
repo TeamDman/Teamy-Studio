@@ -5,13 +5,13 @@ use windows::Win32::Foundation::HWND;
 
 use crate::{RenderScene, TextRendererHost};
 
-const TEAMY_STUDIO_SMOKE_D3D12_ENV: &str = "TEAMY_STUDIO_SMOKE_D3D12";
+const TEAMY_STUDIO_DISABLE_D3D12_HYDRATION_ENV: &str = "TEAMY_STUDIO_DISABLE_D3D12_HYDRATION";
 
 pub type TextRendererSmokeBootstrap = TextRendererHost;
 
 #[must_use]
 pub fn d3d12_smoke_test_requested() -> bool {
-    env_var_truthy(std::env::var_os(TEAMY_STUDIO_SMOKE_D3D12_ENV).as_deref())
+    !env_var_truthy(std::env::var_os(TEAMY_STUDIO_DISABLE_D3D12_HYDRATION_ENV).as_deref())
 }
 
 pub fn smoke_bootstrap_text_renderer_for_scene(
@@ -42,7 +42,7 @@ fn env_var_truthy(value: Option<&OsStr>) -> bool {
 mod tests {
     use std::ffi::OsStr;
 
-    use super::env_var_truthy;
+    use super::{d3d12_smoke_test_requested, env_var_truthy, TEAMY_STUDIO_DISABLE_D3D12_HYDRATION_ENV};
 
     #[test]
     fn env_var_truthy_treats_zero_as_disabled() {
@@ -50,5 +50,27 @@ mod tests {
         assert!(!env_var_truthy(Some(OsStr::new(""))));
         assert!(!env_var_truthy(Some(OsStr::new("0"))));
         assert!(env_var_truthy(Some(OsStr::new("1"))));
+    }
+
+    #[test]
+    fn d3d12_hydration_defaults_on_unless_explicitly_disabled() {
+        unsafe {
+            std::env::remove_var(TEAMY_STUDIO_DISABLE_D3D12_HYDRATION_ENV);
+        }
+        assert!(d3d12_smoke_test_requested());
+
+        unsafe {
+            std::env::set_var(TEAMY_STUDIO_DISABLE_D3D12_HYDRATION_ENV, "1");
+        }
+        assert!(!d3d12_smoke_test_requested());
+
+        unsafe {
+            std::env::set_var(TEAMY_STUDIO_DISABLE_D3D12_HYDRATION_ENV, "0");
+        }
+        assert!(d3d12_smoke_test_requested());
+
+        unsafe {
+            std::env::remove_var(TEAMY_STUDIO_DISABLE_D3D12_HYDRATION_ENV);
+        }
     }
 }
