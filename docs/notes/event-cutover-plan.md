@@ -6,6 +6,7 @@ This document describes the implementation plan for the proposed architectural c
 
 - a true Cargo workspace
 - a thin root `teamy-studio` composition binary
+- a dedicated startup/bootstrap crate for process-boundary orchestration and startup events
 - a new event/timeline backbone
 - a shell crate that owns Windows/D3D12 scaffolding and shared latency-sensitive behavior
 - a `teamy_studio_main_menu` crate for launcher/menu behavior
@@ -41,10 +42,14 @@ Completed in the repository now:
 - the bridge main-menu window now routes clicks into the startup/session event path, with currently migrated buttons left enabled and unmigrated buttons shown but disabled
 - the shell crate now owns a reusable scene-model surface for garden-frame, title-bar, custom-chrome, card, text, and sprite composition, and the main-menu crate now builds its launcher visuals against that shell-owned surface instead of raw Win32 child controls
 - the main-menu native host now custom-paints the shared scene model and performs hit testing against scene card layouts, which corrects the ownership model even though the renderer backend is not yet D3D12-backed
+- the main-menu launch path now uses precompiled bundled shaders and opens directly into the native D3D12-backed renderer path rather than waiting on runtime shader compilation
 
 Still pending:
 
-- real startup validation UX and gating instead of the current synchronous validation call
+- restoring the legacy-quality startup bootstrap surface for Figue CLI parsing, `--debug`, `--log-filter`, `--log-file`, structured log collection, and Tracy-backed profiler flows
+- moving startup/session orchestration out of the root package into a dedicated startup/bootstrap crate so the root binary is actually thin again
+- representing startup bootstrap as a timeline-driven chain beginning from raw process startup inputs and deriving parsed CLI, logging configuration, tracing initialization, validation state, and startup composition requests
+- real startup validation UX and gating using explicit per-feature validation events instead of the current synchronous validation call
 - actual Win32/D3D12-backed window creation behind the shell host scaffold
 - async timeline ingestion, trigger cursors, and runtime pumping
 - feature-owned render/input loops and the real cursor-gallery window implementation
@@ -70,8 +75,9 @@ The new workspace is intended to:
 
 The proposal centers on a few clear boundaries:
 
+- process startup, CLI parsing, logging bootstrap, and validation orchestration belong in `startup`
 - event identity and publication belong in `event_core`
-- registration discovery belongs in `registration_core`
+- registration discovery for event definitions, query triggers, and feature definitions belongs in `registration_core`
 - timeline ingestion/query belongs in `timeline_core`
 - Windows/D3D12/platform support belongs in `shell`
 - launcher/menu behavior belongs in `main_menu`
@@ -109,6 +115,7 @@ That means:
 
 Use a `crates/` directory with matching crate/package names:
 
+- `crates/teamy_studio_startup`
 - `crates/teamy_studio_event_core`
 - `crates/teamy_studio_registration_core`
 - `crates/teamy_studio_timeline_core`
@@ -122,16 +129,25 @@ The root `teamy-studio` binary remains the product entrypoint, but becomes thin.
 
 The root binary should only do top-level orchestration:
 
-- initialize process-wide services
-- construct the primary application timeline
+- gather raw process startup inputs
+- hand those inputs to the startup/bootstrap crate
 - link in feature crates via Cargo features
-- initialize the main menu
-- start startup validation
-- launch the MVP product composition
+- launch the returned product composition
 
 It should not own feature logic.
 
-## 2.3 Legacy code handling
+## 2.3 Startup/bootstrap responsibilities
+
+The startup/bootstrap crate should own process-boundary orchestration that still needs to participate in the event system:
+
+- startup event definitions and registrations
+- Figue-backed CLI parsing
+- `--debug`, `--log-filter`, and `--log-file` handling
+- tracing subscriber installation, structured log collection, and Tracy integration
+- startup validation orchestration and activation gating
+- construction of the initial session/composition used by the product entrypoint
+
+## 2.4 Legacy code handling
 
 Move the old monolithic implementation into `legacy/` using `git mv`.
 
@@ -207,17 +223,47 @@ The asynchronous engine that pumps triggers over unseen events.
 ## 3.3 Registration core objects
 
 ### Trigger definition registration
-A static `linkme` registration describing a query trigger.
+A static `linkme` registration describing a query trigger, including a stable opaque trigger-registration identity and auxiliary provenance metadata for diagnostics and implementation discovery.
 
 ### Event definition registration
-A static `linkme` registration describing an event definition.
+A static `linkme` registration describing an event definition, including auxiliary provenance metadata for diagnostics and implementation discovery.
+
+### Feature definition registration
+A static `linkme` registration describing a feature, its stable `FeatureId`, and auxiliary provenance metadata such as repository URL, repo-relative implementation path, and related source-location diagnostics.
 
 ### Compatibility validation
 A startup/test-time check that a trigger’s declared public view shape matches the registered event definition shape.
 
+This validation should be groupable by feature ownership so startup can validate just the triggers declared by a given feature against the full static set of registered event definitions.
+
+For now this should use exact Facet-shape equality rather than subset matching or implicit projections. The concrete payload type published for an event definition must match the declared public event shape exactly, and trigger subscribed shapes must match that same declared public shape exactly.
+
+Across feature, event-definition, and trigger registrations, provenance metadata should be derived where possible from compile-time context rather than hard-coded, with repository URL as the main intentionally hard-coded field.
+
+Event definitions, event-definition registrations, dispatched global events, trigger definitions, and trigger registrations should remain intentionally separate concepts. Global published events should carry a stable event-definition identity plus a type-erased Facet-reflectable payload so observing crates do not need direct dependencies on the concrete event types emitted by other crates.
+
 ---
 
-## 3.4 Shell objects
+## 3.4 Startup objects
+
+### `ProcessStartupObservedEvent`
+The first canonical startup event containing raw process inputs such as command-line arguments, selected environment variables, and process metadata.
+
+### `CommandLineArgumentsParsedEvent`
+The derived typed CLI event emitted after Figue parses the raw startup inputs.
+
+### `LoggingConfigurationResolvedEvent`
+The derived startup event that captures the resolved logging configuration, including `--debug`, `--log-filter`, `--log-file`, and environment-driven defaults.
+
+### `TracingInitializedEvent`
+The event proving that the tracing subscriber stack and structured log collection are installed.
+
+### Startup/bootstrap runtime
+The startup-owned runtime that pumps startup trigger stages until logging, validation, and initial composition are ready.
+
+---
+
+## 3.5 Shell objects
 
 ### Feature window host scaffold
 An opinionated Windows/D3D12 host scaffold with:
@@ -243,7 +289,7 @@ A feature-minted logical window identity carried into shell requests and echoed 
 
 ---
 
-## 3.5 Main menu objects
+## 3.6 Main menu objects
 
 ### Main menu button class
 A declarative registration describing a class of buttons.
@@ -266,7 +312,7 @@ A launcher-visible state such as:
 
 ---
 
-## 3.6 Cursor gallery objects
+## 3.7 Cursor gallery objects
 
 ### Cursor gallery feature arena
 The feature-owned event arena and UI thread state for the first feature slice.
@@ -339,6 +385,7 @@ Add:
 - `linkme`-backed static registration slices
 - event definition registry items
 - trigger registration items
+- feature definition registry items
 - startup validation helpers
 - shape compatibility validation using Facet reflection
 
@@ -354,7 +401,46 @@ Add:
 
 ---
 
-## Phase 3: Build the shell crate
+## Phase 3: Build the startup/bootstrap crate
+
+### 3.1 Move startup orchestration out of the root package
+Create `teamy_studio_startup` and migrate the current startup/session composition logic out of the root crate.
+
+### 3.2 Represent process bootstrap on the timeline
+Add startup event definitions and trigger registrations for:
+
+- raw process startup observation
+- Figue CLI parsing
+- logging configuration resolution
+- tracing initialization
+- startup validation/gating
+- startup composition request/ready events
+
+### 3.3 Restore the legacy-quality logging and profiler surface
+Restore enough of the legacy bootstrap to support:
+
+- `--debug`
+- `--log-filter`
+- `--log-file`
+- structured log collection
+- Tracy integration used by `run-profiler.ps1`
+
+### 3.4 Keep process-boundary effects explicit
+The startup crate may perform imperative process-boundary effects, but those effects should be driven by startup events and captured as derived startup events so the sequence remains reconstructable.
+
+### 3.5 Publish the sealed bootstrap arena losslessly
+When bootstrap completes, publish the full sealed bootstrap arena into the primary app timeline rather than reducing it to a smaller canonical startup subset.
+
+This startup history is expected to be noisy, but that is acceptable because the long-term timeline is already intended to carry a very large volume of events. After publication, the private bootstrap arena can be discarded.
+
+### 3.6 Make default app launch an observed behavior
+The startup crate should publish both the raw startup observation and the parsed Figue CLI structure into the global timeline.
+
+Default interactive behaviors, including opening the main menu when no subcommand is present, should be derived by observers of that published CLI state rather than hard-coded as root-level fallback logic.
+
+---
+
+## Phase 4: Build the shell crate
 
 ### 3.1 Centralize Windows/D3D12 support
 Move or rewrite shared Windows machinery into shell-owned helpers and scaffold types.
@@ -387,7 +473,7 @@ Include explicit selectable behaviors for:
 
 ---
 
-## Phase 4: Build the main menu crate
+## Phase 5: Build the main menu crate
 
 ### 4.1 Move menu ownership into `teamy_studio_main_menu`
 This crate should own:
@@ -422,7 +508,7 @@ Menu click events should preserve:
 
 ---
 
-## Phase 5: Build the first feature crate: cursor gallery
+## Phase 6: Build the first feature crate: cursor gallery
 
 ### 5.1 Rebuild cursor gallery from scratch
 Do not migrate it by dragging the old implementation wholesale.
@@ -447,7 +533,7 @@ The shell should render the feature’s frame model using shared graphics suppor
 
 ---
 
-## Phase 6: Wire menu to feature activation
+## Phase 7: Wire menu to feature activation
 
 ### 6.1 Register cursor gallery in the menu
 Add a button class in `teamy_studio_cursor_gallery` and make the main menu discover it via `linkme`.
@@ -467,7 +553,7 @@ The click path should be an event chain, not direct imperative window creation f
 
 ---
 
-## Phase 7: Startup validation and gating
+## Phase 8: Startup validation and gating
 
 ### 7.1 Startup validation in the root binary
 The root binary should orchestrate validation of linked features and registered queries.
@@ -475,8 +561,12 @@ The root binary should orchestrate validation of linked features and registered 
 ### 7.2 Validate per feature
 Validation should be grouped by the feature that owns the query trigger.
 
+Each feature should emit its own validation lifecycle events instead of relying on a single aggregate activation result.
+
 ### 7.3 Gate activation
 Features may be visible before validation, but activation should be blocked until validation succeeds.
+
+This gating is lazy and dependency-specific: behaviors should wait only on the validation or activation events for the particular features they depend on.
 
 ### 7.4 Graceful failure
 If validation fails:
@@ -504,6 +594,7 @@ These are the first practical implementation tasks.
 ## Step 3: Stand up the foundation crates
 Start with:
 
+- `teamy_studio_startup`
 - `teamy_studio_event_core`
 - `teamy_studio_registration_core`
 - `teamy_studio_timeline_core`
@@ -531,6 +622,12 @@ Implement only the minimum needed API surface.
 - add trigger runtime
 - add validation for trigger registrations
 
+## Step 6.5: Restore startup observability before broad feature migration
+- rebuild the Figue CLI surface in the startup crate
+- restore `--debug`, `--log-filter`, and `--log-file`
+- restore structured log collection and Tracy integration used by `run-profiler.ps1`
+- represent startup bootstrap on the global timeline from raw startup inputs onward
+
 ## Step 7: Verify the first end-to-end slice
 The first complete proof should be:
 
@@ -550,12 +647,13 @@ If you want the most efficient order, do it like this:
 
 1. workspace skeleton
 2. foundation crates
-3. shell scaffold
-4. main menu crate
-5. cursor gallery crate
-6. validation plumbing
-7. first end-to-end build
-8. move more legacy code out of `legacy/`
+3. startup/bootstrap crate
+4. shell scaffold
+5. main menu crate
+6. cursor gallery crate
+7. validation plumbing
+8. first end-to-end build
+9. move more legacy code out of `legacy/`
 
 This order minimizes the chance of designing abstractions too early.
 

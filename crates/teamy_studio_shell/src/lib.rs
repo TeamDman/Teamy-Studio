@@ -39,9 +39,7 @@ pub use d3d12_resources::{
     create_shader_param_buffer, curve_buffer_size_bytes, scene_vertex_buffer_size_bytes,
     transformed_glyph_inverse_buffer_size_bytes,
 };
-pub use d3d12_smoke::{
-    TextRendererSmokeBootstrap, d3d12_smoke_test_requested, smoke_bootstrap_text_renderer_for_scene,
-};
+pub use d3d12_smoke::create_text_renderer_host_for_scene;
 pub use d3d12_text_renderer_host::{TextRendererHost, create_text_renderer_device};
 pub use d3d12_text_renderer_proxy::TextRendererThreadProxy;
 pub use d3d12_text_renderer_resources::{
