@@ -589,6 +589,7 @@ pub struct StartupSession {
     registration_snapshot: RegistrationSnapshot,
     menu_snapshot: MainMenuSnapshot,
     runtime: StartupRuntime,
+    tracing_observation_layer: Option<TracingObservationLayer>,
 }
 
 #[derive(Debug)]
@@ -1432,6 +1433,15 @@ impl StartupSession {
         Ok(emitted_epoch_count)
     }
 
+    pub fn drain_tracing_observations(&mut self) -> usize {
+        let Some(tracing_observation_layer) = &self.tracing_observation_layer else {
+            return 0;
+        };
+        self.runtime.publish_tracing_observed_records(
+            tracing_observation_layer.drain_observed_records(TRACING_OBSERVATION_DRAIN_LIMIT),
+        )
+    }
+
     #[must_use]
     pub fn cursor_gallery_state(&self) -> &CursorGalleryState {
         self.runtime.cursor_gallery_state()
@@ -1596,6 +1606,7 @@ fn build_mvp_session_with_runtime(
         registration_snapshot,
         menu_snapshot,
         runtime,
+        tracing_observation_layer: None,
     })
 }
 
@@ -1718,20 +1729,15 @@ pub fn main() -> Result<()> {
 
 const TRACING_OBSERVATION_DRAIN_LIMIT: usize = 64;
 
-fn initialize_tracing_for_session(
-    session: &mut StartupSession,
-) -> Result<Option<TracingObservationLayer>> {
+fn initialize_tracing_for_session(session: &mut StartupSession) -> Result<()> {
     match initialize_tracing_with_observation_from_bootstrap_plan(session.bootstrap_plan()) {
         Ok(tracing_initialization) => {
             session
                 .runtime
                 .publish_tracing_initialized(tracing_initialization.initialized_event);
-            session.runtime.publish_tracing_observed_records(
-                tracing_initialization
-                    .observation_layer
-                    .drain_observed_records(TRACING_OBSERVATION_DRAIN_LIMIT),
-            );
-            Ok(Some(tracing_initialization.observation_layer))
+            session.tracing_observation_layer = Some(tracing_initialization.observation_layer);
+            session.drain_tracing_observations();
+            Ok(())
         }
         Err(error) => {
             let bootstrap_plan = session.bootstrap_plan().clone();
@@ -1741,15 +1747,6 @@ fn initialize_tracing_for_session(
             Err(error)
         }
     }
-}
-
-fn drain_tracing_observations_for_session(
-    session: &mut StartupSession,
-    observation_layer: &TracingObservationLayer,
-) -> usize {
-    session.runtime.publish_tracing_observed_records(
-        observation_layer.drain_observed_records(TRACING_OBSERVATION_DRAIN_LIMIT),
-    )
 }
 
 fn next_main_menu_interaction_time_seed(runtime: &StartupRuntime) -> i128 {
@@ -1793,7 +1790,7 @@ pub fn main_with_raw_inputs(raw_inputs: RawProcessStartupInputs) -> Result<()> {
     let mut session = observe_bootstrap_plan_from_raw_inputs_with_native_shell(raw_inputs)
         .map_err(|error| eyre!(error.to_string()))?
         .into_mvp_session()?;
-    let tracing_observation_layer = initialize_tracing_for_session(&mut session)?;
+    initialize_tracing_for_session(&mut session)?;
     teamy_studio_shell::initialize_dpi_awareness();
     let menu_snapshot = session.menu_snapshot().clone();
     let mut next_time_key = next_main_menu_interaction_time_seed(&session.runtime);
@@ -1839,14 +1836,11 @@ pub fn main_with_raw_inputs(raw_inputs: RawProcessStartupInputs) -> Result<()> {
                 ?logical_button_id,
                 emitted_epoch_count, next_time_key, "pumped main menu click to idle"
             );
-            if let Some(tracing_observation_layer) = &tracing_observation_layer {
-                let observed_count =
-                    drain_tracing_observations_for_session(&mut session, tracing_observation_layer);
-                trace!(
-                    observed_count,
-                    "drained tracing observations after main menu click"
-                );
-            }
+            let observed_count = session.drain_tracing_observations();
+            trace!(
+                observed_count,
+                "drained tracing observations after main menu click"
+            );
             next_time_key += 16;
             Ok(())
         },
@@ -1875,12 +1869,12 @@ mod tests {
         StartupFailedEvent, StartupGlobalArgsParsedEvent, StartupLoggingConfiguredEvent,
         StartupLoggingPlanFailedEvent, StartupRuntime, StartupSucceededEvent,
         TRACING_INITIALIZATION_FAILED_EVENT_DEFINITION, TRACING_INITIALIZED_EVENT_DEFINITION,
-        TRACING_RECORD_OBSERVED_EVENT_DEFINITION, TracingInitializationFailedEvent,
-        TracingInitializedEvent, TracingRecordObservedEvent, build_mvp_composition,
-        build_mvp_composition_from_raw_inputs, build_mvp_session,
-        build_mvp_session_from_bootstrap_plan, build_mvp_session_from_raw_inputs,
-        build_mvp_session_with_native_shell, derive_bootstrap_plan,
-        derive_bootstrap_plan_with_runtime, initialize_tracing_for_session,
+        TRACING_OBSERVATION_DRAIN_LIMIT, TRACING_RECORD_OBSERVED_EVENT_DEFINITION,
+        TracingInitializationFailedEvent, TracingInitializedEvent, TracingObservationLayer,
+        TracingRecordObservedEvent, build_mvp_composition, build_mvp_composition_from_raw_inputs,
+        build_mvp_session, build_mvp_session_from_bootstrap_plan,
+        build_mvp_session_from_raw_inputs, build_mvp_session_with_native_shell,
+        derive_bootstrap_plan, derive_bootstrap_plan_with_runtime, initialize_tracing_for_session,
         next_main_menu_interaction_time_seed, observe_bootstrap_plan_from_raw_inputs,
         unimplemented_main_menu_dialog,
     };
@@ -1901,6 +1895,7 @@ mod tests {
         WINDOW_CREATED_EVENT_DEFINITION, WindowHostOptions,
     };
     use teamy_studio_timeline_core::CanonicalTimeKey;
+    use tracing_subscriber::prelude::*;
 
     #[test]
     fn environment_variables_uses_legacy_placeholder_copy() {
@@ -2752,6 +2747,53 @@ mod tests {
             TRACING_RECORD_OBSERVED_EVENT_DEFINITION.id
         );
         assert_eq!(observed.level, "INFO");
+    }
+
+    #[test]
+    fn startup_session_drains_tracing_observations_in_bounded_order() {
+        let mut session = build_mvp_session().expect("mvp session should build");
+        let observation_layer = TracingObservationLayer::new();
+        let observation_handle = observation_layer.clone();
+        session.tracing_observation_layer = Some(observation_layer.clone());
+        let subscriber = tracing_subscriber::Registry::default().with(observation_layer);
+
+        tracing::subscriber::with_default(subscriber, || {
+            for sequence in 0_u64..70 {
+                tracing::info!(sequence, "synthetic observed tracing record");
+            }
+            tracing::info!(
+                teamy.timeline_reemit = true,
+                event_schema_name = "teamy_studio.startup.succeeded",
+                "timeline event re-emitted to tracing"
+            );
+        });
+
+        let first_drain_count = session.drain_tracing_observations();
+        let second_drain_count = session.drain_tracing_observations();
+        let composition = session.into_composition();
+        let observed_sequences = composition
+            .timeline
+            .published_epochs()
+            .iter()
+            .filter_map(|(_, epoch)| {
+                epoch.events()[0]
+                    .downcast_ref::<TracingRecordObservedEvent>()
+                    .and_then(|event| {
+                        event
+                            .fields
+                            .iter()
+                            .find(|field| field.name == "sequence")
+                            .map(|field| field.value.clone())
+                    })
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(first_drain_count, TRACING_OBSERVATION_DRAIN_LIMIT);
+        assert_eq!(second_drain_count, 6);
+        assert!(observation_handle.observed_records().is_empty());
+        assert_eq!(observed_sequences.len(), 70);
+        assert_eq!(observed_sequences.first().map(String::as_str), Some("0"));
+        assert_eq!(observed_sequences.last().map(String::as_str), Some("69"));
     }
 
     #[test]

@@ -100,6 +100,8 @@ Completed in the repository now:
 - startup now owns a first `TracingObservationLayer` foundation that captures ordinary tracing records into typed `TracingRecordObservedEvent` values and ignores records marked `teamy.timeline_reemit = true`, proving the loop-prevention marker can be consumed
 - startup tracing initialization now installs the tracing observation layer, returns a drainable observation handle, and the live main-menu click path drains a bounded batch of unmarked tracing records into explicit `TracingRecordObservedEvent` timeline publications
 - `TracingRecordObservedEvent` is intentionally non-log-facing in its event definition, so publishing observed tracing records does not immediately re-emit them and create an observation loop
+- `StartupSession` now owns the optional tracing-observation handle and exposes a bounded `drain_tracing_observations()` method, so observation draining no longer requires the live main-menu callback to carry tracing-layer plumbing directly
+- tracing-observation tests now cover bounded drain ordering, maximum batch size, and loop prevention for re-emitted timeline records
 
 Still pending:
 
@@ -113,7 +115,7 @@ Still pending:
 - async timeline ingestion, trigger cursors, and runtime pumping
 - feature-owned render/input loops and the real cursor-gallery window implementation
 - feature-owned event definitions that carry explicit log intent/level metadata plus the authoritative timeline-to-tracing re-emission bridge and tracing-observation loop-prevention markers needed to make timeline publication, rather than direct tracing macros, the long-term source of truth for product logs
-- a richer tracing-observation drain policy; observed records can now be published into the startup/app timeline in bounded batches from the live click path, but there is not yet a dedicated bootstrap-arena handoff or periodic runtime drain stage
+- a richer tracing-observation drain policy; observed records can now be published into the startup/app timeline through a session-owned bounded drain method, but there is not yet a dedicated bootstrap-arena handoff or named runtime stage alongside trigger and shell host pumping
 - extracting the legacy D3D12 render thread and shader-backed scene renderer into shell-owned helpers so the main menu and feature crates can render the shared scene model through the real backend instead of the current custom-painted stopgap
 - richer event definitions with Facet-shaped public canonical event forms
 - richer startup failure reporting with thin failure events that point back to concrete prior failure references
@@ -127,9 +129,9 @@ This section is the preferred starting point for the next agentic work session a
 Current baseline:
 
 - the active branch is `event-cutover`
-- the last committed checkpoint is `c6f9af6`, `Add tracing observation foundation`
-- the working tree now has the live tracing-observation wiring slice implemented but not committed
-- `.\check-all.ps1` passed after wiring the observation layer into startup tracing initialization and publishing bounded observed-record batches
+- the last committed checkpoint is `f4a3503`, `Wire tracing observation into startup`
+- the working tree now has the session-owned tracing-observation drain policy slice implemented but not committed
+- `.\check-all.ps1` passed after moving tracing observation draining behind `StartupSession::drain_tracing_observations()`
 - Tracey-with-an-E is reference-only at `docs/reference/tracey/.config/tracey/config.styx`
 - `docs/spec/` documents are historical/planning material unless a newer record-of-decision re-promotes them
 
@@ -137,9 +139,9 @@ Recommended next implementation thread:
 
 1. Start by running `git status --short` and `.\check-all.ps1` to confirm the baseline is still clean and green.
 2. Read `development-workflow-record-of-decision.md`, `startup-bootstrap-record-of-decision.md`, and `timeline-authoritative-logging-record-of-decision.md`.
-3. Implement a larger tracing-observation drain policy chunk: move draining out of the ad hoc main-menu click callback and into an explicit startup/runtime stage that can be invoked after bootstrap initialization, after startup validation, and after interaction pumping.
-4. Keep the observed-record publication bounded and deterministic. Add tests that prove drain ordering, maximum batch size, and that publishing `TracingRecordObservedEvent` does not itself create a re-emitted tracing record.
-5. Expected observable `cargo run -- --log-filter trace` differences for that next chunk: successful startup should still launch the native main menu; observed direct tracing records may appear at more predictable points in the startup timeline rather than only after menu clicks; trace output should still show `teamy.timeline_reemit = true` records for log-worthy timeline events without duplicated observation loops; the number of observed-record publications per drain should be bounded and stable.
+3. Implement a larger runtime-stage integration chunk: add a named tracing-observation pump stage beside registered-trigger and shell-host stages, and have `pump_to_idle` invoke it in a deterministic order with its own stage count.
+4. Preserve bounded behavior: each tracing-observation stage should publish at most `TRACING_OBSERVATION_DRAIN_LIMIT` records, and tests should cover mixed trigger/shell/tracing pumping without loops.
+5. Expected observable `cargo run -- --log-filter trace` differences for that next chunk: successful startup should still launch the native main menu; observed direct tracing records may be drained during ordinary `pump_to_idle` instead of only through hand-placed calls; trace output should still show `teamy.timeline_reemit = true` records for log-worthy timeline events without duplicated observation loops; stage counts in trace diagnostics may include tracing-observation batches.
 6. Do not start Figue restoration in the same slice. When CLI restoration begins later, preserve the legacy `teamy-figue` plus `facet = 0.44.1` compatibility constraint or write a new compatibility decision first.
 7. Update this plan before ending the session, especially the `Current implementation status`, `Still pending`, and this continuation section.
 
