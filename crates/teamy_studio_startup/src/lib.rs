@@ -1426,14 +1426,18 @@ impl StartupSession {
             emitted_epoch_count += shell_emitted;
             next_time_key += 1;
 
-            if registered_emitted == 0 && shell_emitted == 0 {
+            let tracing_observation_emitted = self.run_tracing_observation_stage();
+            emitted_epoch_count += tracing_observation_emitted;
+            next_time_key += 1;
+
+            if registered_emitted == 0 && shell_emitted == 0 && tracing_observation_emitted == 0 {
                 break;
             }
         }
         Ok(emitted_epoch_count)
     }
 
-    pub fn drain_tracing_observations(&mut self) -> usize {
+    pub fn run_tracing_observation_stage(&mut self) -> usize {
         let Some(tracing_observation_layer) = &self.tracing_observation_layer else {
             return 0;
         };
@@ -1736,7 +1740,7 @@ fn initialize_tracing_for_session(session: &mut StartupSession) -> Result<()> {
                 .runtime
                 .publish_tracing_initialized(tracing_initialization.initialized_event);
             session.tracing_observation_layer = Some(tracing_initialization.observation_layer);
-            session.drain_tracing_observations();
+            session.run_tracing_observation_stage();
             Ok(())
         }
         Err(error) => {
@@ -1835,11 +1839,6 @@ pub fn main_with_raw_inputs(raw_inputs: RawProcessStartupInputs) -> Result<()> {
             info!(
                 ?logical_button_id,
                 emitted_epoch_count, next_time_key, "pumped main menu click to idle"
-            );
-            let observed_count = session.drain_tracing_observations();
-            trace!(
-                observed_count,
-                "drained tracing observations after main menu click"
             );
             next_time_key += 16;
             Ok(())
@@ -2750,7 +2749,7 @@ mod tests {
     }
 
     #[test]
-    fn startup_session_drains_tracing_observations_in_bounded_order() {
+    fn startup_session_tracing_observation_stage_drains_in_bounded_order() {
         let mut session = build_mvp_session().expect("mvp session should build");
         let observation_layer = TracingObservationLayer::new();
         let observation_handle = observation_layer.clone();
@@ -2768,8 +2767,8 @@ mod tests {
             );
         });
 
-        let first_drain_count = session.drain_tracing_observations();
-        let second_drain_count = session.drain_tracing_observations();
+        let first_drain_count = session.run_tracing_observation_stage();
+        let second_drain_count = session.run_tracing_observation_stage();
         let composition = session.into_composition();
         let observed_sequences = composition
             .timeline
@@ -2794,6 +2793,36 @@ mod tests {
         assert_eq!(observed_sequences.len(), 70);
         assert_eq!(observed_sequences.first().map(String::as_str), Some("0"));
         assert_eq!(observed_sequences.last().map(String::as_str), Some("69"));
+    }
+
+    #[test]
+    fn pump_to_idle_runs_tracing_observation_stage() {
+        let mut session = build_mvp_session().expect("mvp session should build");
+        let observation_layer = TracingObservationLayer::new();
+        let observation_handle = observation_layer.clone();
+        session.tracing_observation_layer = Some(observation_layer.clone());
+        let subscriber = tracing_subscriber::Registry::default().with(observation_layer);
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(source = "pump_to_idle_test", "observed from pump");
+        });
+
+        let emitted_epoch_count = session
+            .pump_to_idle(CanonicalTimeKey::from_femtoseconds(500), 4)
+            .expect("pump should process tracing observation stage");
+        let composition = session.into_composition();
+        let observed_count = composition
+            .timeline
+            .published_epochs()
+            .iter()
+            .filter(|(_, epoch)| {
+                epoch.events()[0].definition().id == TRACING_RECORD_OBSERVED_EVENT_DEFINITION.id
+            })
+            .count();
+
+        assert_eq!(emitted_epoch_count, 1);
+        assert_eq!(observed_count, 1);
+        assert!(observation_handle.observed_records().is_empty());
     }
 
     #[test]
