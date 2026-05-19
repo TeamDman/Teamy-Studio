@@ -19,7 +19,7 @@ pub use bootstrap::{
     try_handle_builtin_bootstrap_cli_request,
 };
 
-use eyre::{Report, Result, eyre};
+use eyre::{Report, Result, WrapErr, eyre};
 use facet::Facet;
 use linkme::distributed_slice;
 use std::collections::BTreeMap;
@@ -64,6 +64,13 @@ use timeline_window_scene::{
     next_live_app_timeline_window_id, store_live_app_timeline_window_dataset,
 };
 use tracing::{Level, event, info, trace};
+use windows::Win32::Globalization::GetACP;
+use windows::Win32::System::Console::{
+    CONSOLE_MODE, ENABLE_VIRTUAL_TERMINAL_PROCESSING, GetConsoleMode, GetStdHandle,
+    STD_OUTPUT_HANDLE, SetConsoleMode,
+};
+
+const UTF8_CODEPAGE: u32 = 65001;
 
 pub static STARTUP_SUCCEEDED_EVENT_DEFINITION: EventDefinition = EventDefinition {
     id: EventDefinitionId::from_bytes([0x01; 16]),
@@ -2352,7 +2359,43 @@ fn prepare_native_main_menu_session_from_raw_inputs(
 }
 
 pub fn main() -> Result<()> {
+    color_eyre::install()?;
+    let _ = enable_ansi_support();
+    emit_utf8_codepage_warning_if_needed();
     main_with_raw_inputs(RawProcessStartupInputs::capture_from_env())
+}
+
+fn enable_ansi_support() -> Result<()> {
+    // Safety: querying the current process stdout handle does not require additional invariants.
+    let handle = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) }
+        .map_err(Report::from)
+        .wrap_err("failed to get standard output handle")?;
+    if handle.is_invalid() {
+        return Err(Report::from(windows::core::Error::from_win32()))
+            .wrap_err("STD_OUTPUT_HANDLE is invalid");
+    }
+
+    let mut mode = CONSOLE_MODE::default();
+    // Safety: `mode` is a valid out-pointer for the queried console handle.
+    unsafe { GetConsoleMode(handle, &raw mut mode) }
+        .map_err(Report::from)
+        .wrap_err("failed to get console mode")?;
+    // Safety: updating the console mode for the current stdout handle is valid.
+    unsafe { SetConsoleMode(handle, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING) }
+        .map_err(Report::from)
+        .wrap_err("failed to set console mode")?;
+    Ok(())
+}
+
+fn emit_utf8_codepage_warning_if_needed() {
+    // Safety: `GetACP` is a process-global codepage query with no pointer arguments.
+    if unsafe { GetACP() } == UTF8_CODEPAGE {
+        return;
+    }
+    eprintln!("warning: the current system codepage is not UTF-8; text may degrade into '?'");
+    eprintln!(
+        "warning: control panel -> Clock and Region -> Region -> Administrative -> Check Beta: Use Unicode UTF-8 for worldwide language support."
+    );
 }
 
 const TRACING_OBSERVATION_DRAIN_LIMIT: usize = 64;

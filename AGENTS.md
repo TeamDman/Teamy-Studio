@@ -29,6 +29,7 @@ The most important files right now are:
 - [event-cutover-record-of-decision.md](docs/notes/event-cutover-record-of-decision.md)
 - [startup-bootstrap-record-of-decision.md](docs/notes/startup-bootstrap-record-of-decision.md)
 - [timeline-authoritative-logging-record-of-decision.md](docs/notes/timeline-authoritative-logging-record-of-decision.md)
+- [timeline-viewer-hci-record-of-decision.md](docs/notes/timeline-viewer-hci-record-of-decision.md)
 - [development-workflow-record-of-decision.md](docs/notes/development-workflow-record-of-decision.md)
 
 These are the latest notes where I have provided answers to questions designed to elicit the desired shape of the future of the project.

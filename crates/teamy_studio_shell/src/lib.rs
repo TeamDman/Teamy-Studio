@@ -39,14 +39,14 @@ use windows::Win32::Graphics::Gdi::{BeginPaint, EndPaint, PAINTSTRUCT};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
     BringWindowToTop, CS_DBLCLKS, CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect,
-    GetSystemMetrics, GetWindowRect, HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTCAPTION, HTCLIENT,
-    HTLEFT, HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT, IDC_ARROW, KillTimer, LoadCursorW,
-    RegisterClassExW, SM_CXSCREEN, SM_CYSCREEN, SW_MAXIMIZE, SW_MINIMIZE, SW_SHOW, SW_SHOWNA,
-    SetCursor, SetTimer, SetWindowPos, ShowWindow, WINDOW_EX_STYLE, WINDOW_STYLE, WM_DESTROY,
-    WM_DPICHANGED, WM_ERASEBKGND, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCACTIVATE,
-    WM_NCCALCSIZE, WM_NCHITTEST, WM_NCPAINT, WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_TIMER,
-    WNDCLASSEXW, WS_EX_APPWINDOW, WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW,
-    WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP, WS_THICKFRAME, WS_VISIBLE,
+    GetCursorPos, GetSystemMetrics, GetWindowRect, HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT,
+    HTCAPTION, HTCLIENT, HTLEFT, HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT, IDC_ARROW, KillTimer,
+    LoadCursorW, RegisterClassExW, SM_CXSCREEN, SM_CYSCREEN, SW_MAXIMIZE, SW_MINIMIZE, SW_SHOW,
+    SW_SHOWNA, SetCursor, SetTimer, SetWindowPos, ShowWindow, WINDOW_EX_STYLE, WINDOW_STYLE,
+    WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
+    WM_NCACTIVATE, WM_NCCALCSIZE, WM_NCHITTEST, WM_NCPAINT, WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP,
+    WM_TIMER, WNDCLASSEXW, WS_EX_APPWINDOW, WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP,
+    WS_EX_TOOLWINDOW, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP, WS_THICKFRAME, WS_VISIBLE,
 };
 use windows::core::{PCWSTR, w};
 
@@ -422,13 +422,14 @@ fn build_live_shell_window_scene(hwnd: HWND) -> Result<Option<RenderScene>> {
         return Ok(None);
     };
     let layout = shell_window_layout(hwnd, state.dpi)?;
+    let cursor_client_point = query_shell_cursor_client_point(hwnd).or(state.cursor_client_point);
     Ok(Some((registration.build_scene)(
         FeatureWindowSceneContext {
             title: state.title,
             layout,
             dpi: state.dpi,
-            chrome: chrome_state_with_pointer(state.chrome, layout, state.cursor_client_point),
-            cursor_client_point: state.cursor_client_point,
+            chrome: chrome_state_with_pointer(state.chrome, layout, cursor_client_point),
+            cursor_client_point,
         },
     )))
 }
@@ -443,12 +444,13 @@ fn shell_window_scene_context(hwnd: HWND) -> Result<Option<FeatureWindowSceneCon
         return Ok(None);
     };
     let layout = shell_window_layout(hwnd, state.dpi)?;
+    let cursor_client_point = query_shell_cursor_client_point(hwnd).or(state.cursor_client_point);
     Ok(Some(FeatureWindowSceneContext {
         title: state.title,
         layout,
         dpi: state.dpi,
-        chrome: chrome_state_with_pointer(state.chrome, layout, state.cursor_client_point),
-        cursor_client_point: state.cursor_client_point,
+        chrome: chrome_state_with_pointer(state.chrome, layout, cursor_client_point),
+        cursor_client_point,
     }))
 }
 
@@ -597,6 +599,7 @@ fn handle_shell_mouse_wheel(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) -> Resul
         x: (lparam.0 & 0xFFFF) as i16 as i32,
         y: ((lparam.0 >> 16) & 0xFFFF) as i16 as i32,
     };
+    let point = screen_to_shell_client_point(hwnd, point);
     let delta = ((wparam.0 >> 16) & 0xFFFF) as i16;
 
     if let Some(state) = shell_window_states()
@@ -617,6 +620,25 @@ fn handle_shell_mouse_wheel(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) -> Resul
     }
 
     Ok(())
+}
+
+fn screen_to_shell_client_point(hwnd: HWND, screen_point: POINT) -> POINT {
+    let mut window_rect = RECT::default();
+    if unsafe { GetWindowRect(hwnd, &mut window_rect) }.is_err() {
+        return screen_point;
+    }
+    POINT {
+        x: screen_point.x - window_rect.left,
+        y: screen_point.y - window_rect.top,
+    }
+}
+
+fn query_shell_cursor_client_point(hwnd: HWND) -> Option<POINT> {
+    let mut screen_point = POINT::default();
+    if unsafe { GetCursorPos(&mut screen_point) }.is_err() {
+        return None;
+    }
+    Some(screen_to_shell_client_point(hwnd, screen_point))
 }
 
 fn handle_shell_right_button_down(hwnd: HWND, lparam: LPARAM) -> Result<()> {
