@@ -859,12 +859,14 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "tracing-tracy",
+ "windows",
 ]
 
 [[package]]
 name = "teamy_studio_timeline_core"
 version = "0.1.0"
 dependencies = [
+ "eyre",
  "facet",
  "teamy_studio_event_core",
  "uuid",

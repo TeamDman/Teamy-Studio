@@ -23,6 +23,7 @@ teamy_studio_timeline_core = { path = "../teamy_studio_timeline_core" }
 tracing = "0.1.41"
 tracing-tracy = { version = "0.11.4", optional = true }
 tracing-subscriber = { version = "0.3.19", features = ["fmt", "env-filter", "json"] }
+windows = { version = "0.61.3", features = ["Win32_Foundation"] }
 
 [dev-dependencies]
 tempfile = "3.20.0"

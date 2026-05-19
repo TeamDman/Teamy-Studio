@@ -92,6 +92,12 @@ pub static CURSOR_GALLERY_WINDOW_SCENE: FeatureWindowSceneRegistration =
         title: "Cursor Gallery",
         build_scene: build_cursor_gallery_window_scene,
         cursor_for_point: Some(cursor_gallery_cursor_for_point),
+        on_left_click: None,
+        on_mouse_wheel: None,
+        on_right_button_down: None,
+        on_right_drag: None,
+        on_right_button_up: None,
+        on_frame_tick: None,
     };
 
 fn build_cursor_gallery_window_scene(context: FeatureWindowSceneContext) -> RenderScene {

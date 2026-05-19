@@ -21,6 +21,38 @@ This document describes the implementation plan for the proposed architectural c
 
 The goal is to reduce compile times, improve architectural clarity, and establish a reusable event-driven foundation for future features.
 
+## Guiding product goal
+
+A concrete product-level target for this cutover is that the main menu's `Timeline` surface should be able to open and inspect Teamy Studio's own live published app timeline while the app is running.
+
+That means:
+
+- the app timeline must remain authoritative enough to back a user-facing inspection surface, not only tests, smoke summaries, tracing output, or synthetic examples
+- the main menu's `Timeline` entry should eventually observe the real running app timeline produced by startup, menu, shell, and feature publication rather than remaining a placeholder
+- the separate `Timeline Playground` surface may remain useful for synthetic experiments, but it is not the end-state replacement for a live app-timeline viewer
+
+## Legacy grounding for the live timeline goal
+
+This is not a greenfield viewer target. The cutover should inherit the high-volume timeline techniques that already exist in the repository's legacy code and design notes instead of reintroducing a naive all-items renderer and then rediscovering the same constraints later.
+
+Use these references as carry-forward prior art:
+
+- [../../AGENTS.md](../../AGENTS.md) records that the old implementation already used tracing subscribers and built a custom nanosecond-precision event timeline viewer, so the rewrite should recover those strengths rather than settling for smoke summaries, trace logs, or synthetic-only timeline demos.
+- [timeline-display-model-plan.md](timeline-display-model-plan.md) captures the display-model requirements that matter for huge event/span volumes: viewport-derived queries, row derivation from grouping rather than sparse raw IDs, folded span/event clusters, interactive aggregates, offscreen row virtualization, live tracing/log mode, and a render-plan model that is separate from raw timeline data.
+- [timeline-profiler-plan.md](timeline-profiler-plan.md) captures the core performance guardrails for large captures: per-track interval indexes, building only visible render primitives, coarse aggregation for sub-pixel events, and Tracy spans around parse, index, visible-query, and render-build phases.
+- [computer-metaphor-and-paint-overlay-plan.md](computer-metaphor-and-paint-overlay-plan.md) keeps the longer-term product direction explicit: timelines are shared product surfaces over event streams, replay buffers, and history, not only internal diagnostics.
+- [../../legacy/src/logs.rs](../../legacy/src/logs.rs) already contains the legacy live tracing/log projection path, including timeline dataset projection from app subscriber output, thread-key grouping, and cached snapshot reuse when the underlying records do not change.
+- [../../legacy/src/timeline/query.rs](../../legacy/src/timeline/query.rs) and [../../legacy/src/timeline/playground.rs](../../legacy/src/timeline/playground.rs) already contain the render-plan/query split, derived rows, minimum-visible-pixel folding, folded span/event clusters, and interactive cluster detail behavior that kept dense timelines inspectable.
+- [../../legacy/src/timeline/mod.rs](../../legacy/src/timeline/mod.rs) and [../../legacy/src/timeline/time.rs](../../legacy/src/timeline/time.rs) already capture typed viewport/time projection and strict timeline-time rules that should be preserved rather than collapsed back into ad hoc pixel math.
+
+For this cutover, treat the following as non-optional constraints for the future live main-menu timeline viewer:
+
+- do not rebuild every event/span into render primitives on every view update; visible-query plus aggregation/indexing behavior is the baseline
+- do not treat folded clusters as a lossy optimization; they must remain interactive and explorable
+- do not treat the `Timeline Playground` as sufficient proof of the product goal; the `Timeline` entry must eventually observe the real running app timeline
+- do not drop cached live snapshot reuse when the underlying timeline records have not changed
+- do not claim parity until the viewer stays responsive on realistic large captures and high-volume live tracing/span streams, not only on toy datasets
+
 ## Current implementation status
 
 Completed in the repository now:
@@ -83,6 +115,7 @@ Completed in the repository now:
 - the live cursor-gallery launch path now uses the existing native-shell startup session instead of the extra cursor-gallery thread spawn, so the real entrypoint follows the same event-to-window-create path that the startup/session tests already exercise
 - the shell host now owns a feature-window scene registration surface for composed native hosted windows, and the cursor gallery uses that path to render custom chrome, transparency-compatible D3D12 content, adaptive wrapped cursor cards, and stock system-cursor hover overrides instead of the previous blank placeholder host
 - startup timeline publication now emits trace-level tracing records from the central publish seam, so `--log-filter trace` can show authoritative event emission without relying only on ad hoc caller-local logging
+- the active main-menu `Timeline` surface now opens a live app-timeline window backed by the primary published-event timeline projection, with pan/zoom/fit controls, arena-derived rows, folded cluster counts, recent published-event summaries, and event-definition log-intent fields in the projected dataset
 - Tracey-with-an-E has been demoted from the active validation gate to historical reference documentation under `docs/reference/tracey`, and `check-all.ps1` no longer runs `tracey query status`
 - the strict clippy debt that blocked the post-Tracey validation pass has been cleared, including the `teamy_studio_fonts` lints and the next surfaced shell/startup lints
 - `check-all.ps1` passed after the Tracey demotion and validation-cleanup work, covering format, clippy, all-feature build, tests, and default-feature build
@@ -110,6 +143,20 @@ Completed in the repository now:
 - `cargo run -- --startup-smoke --log-filter trace` has been manually verified to print a summary with direct observed tracing counts and `contains_timeline_reemit_marker: false` while trace output still shows separate `teamy.timeline_reemit = true` event-derived records
 - startup smoke inspection now returns a typed `StartupSmokeSummary` that includes tracing-observation counts plus core MVP success facts such as startup-success presence, cursor-gallery window count, shell hosted-window count, and total published epoch count, and the CLI smoke output prints that expanded summary without opening a native window
 - the startup smoke path now also preserves and prints typed failure summaries for observed bootstrap and tracing-initialization failures before returning a nonzero exit, so `--startup-smoke` no longer drops its observed startup timeline on those failure paths
+- the startup smoke path now preserves bootstrap, session-construction, tracing-initialization, and default cursor-gallery flow failures through a single `ObservedStartupSmokeFailure` surface that retains either the pre-session runtime or the live session for later summary and event inspection, eliminating the previous branch-local smoke wrappers
+- startup now publishes an explicit `StartupCompositionReadyEvent` after validation/gating, plus explicit `DefaultCursorGalleryFlowRequestedEvent` and `NativeMainMenuLaunchRequestedEvent` records in the active launch paths, so the transition from validated startup state into concrete startup composition requests is no longer purely implicit procedural control flow
+- startup now owns a real static feature registration plus a trigger on `StartupCompositionReadyEvent`, and the default cursor-gallery composition path now derives its request/click emission from that published ready state instead of publishing the request directly from imperative startup flow; the native main-menu preparation path similarly derives its launch-request event by pumping the ready-trigger path after tracing initialization
+- the startup composition observer rules now live in a dedicated `composition_observer` module inside `teamy_studio_startup`, so the startup crate no longer mixes the ready-state event and the concrete follow-on observer registrations/handlers in one local file slice
+- the startup composition observer policy now remains crate-local intentionally through a dedicated `StartupCompositionPolicy` value owned by `composition_observer`, and the startup session builders now accept that policy surface directly instead of translating a startup-local launch enum into ready-event fields inline
+- startup session construction now derives composition policy from semantic entry kinds plus `StartupBootstrapPlan` state through `derive_startup_composition_policy(...)`, rather than selecting direct policy constructors at each call site
+- startup now publishes an explicit `StartupCompositionPolicyDerivedEvent` before `StartupCompositionReadyEvent`, so the choice of session-only/default-composition/native-main-menu startup policy is itself visible on the startup timeline
+- `main_with_raw_inputs(...)` now decides whether to take the startup-smoke path by observing parsed bootstrap state and reading `bootstrap_plan.global_args.startup_smoke`, rather than scanning raw `argv` for `--startup-smoke` directly
+- observed-bootstrap callers now have reusable helper surfaces for default composition and startup-smoke summary construction, and the raw-input wrappers for those paths now delegate through that observed-bootstrap state instead of re-splitting bootstrap/session assembly inline
+- native main-menu session preparation now also has an observed-bootstrap helper variant, so the raw-input native-menu path and the real process-entry path share the same post-bootstrap native-session assembly logic
+- `teamy_studio_shell::ShellRuntime` now supports a guarded native-hosting upgrade for pristine runtimes, and startup uses that seam to carry one observed-bootstrap result through smoke, native-main-menu session preparation, and the real `main_with_raw_inputs(...)` process-entry path instead of re-observing bootstrap with a separately constructed native shell runtime
+- `teamy_studio_timeline_core` now also owns an active non-legacy timeline dataset/query/render-plan surface for large event volumes, including canonical time ranges, dataset compaction/indexes, visible-range render planning, grouping-derived rows, folded event/span clusters, and projection from `ConstructedTimeline<PublishedEvent>` into that dataset
+- the main menu's `Timeline` button no longer bottoms out only in a generic placeholder path: it now publishes through the ordinary startup/session timeline flow, projects the active app timeline into the new timeline-core dataset/query model, and opens a real native shell-hosted `Timeline` window that renders visible rows, folded clusters, and recent published events from the running app timeline
+- the live `Timeline` window now keeps dataset-backed visible-range state and exposes first explicit viewer controls for pan-left, pan-right, zoom-in, zoom-out, and fit-to-content through the active shell-hosted feature-window path rather than staying a fixed full-bounds snapshot
 
 Still pending:
 
@@ -117,12 +164,13 @@ Still pending:
 - replacing the current startup-owned builtin CLI compatibility shim with direct Figue-backed parsing once the active Facet dependency stack is unified enough to admit that dependency without splitting the `facet_core` graph
 - preserving the legacy `teamy-figue`/Facet compatibility constraint when Figue parsing is restored, rather than blindly upgrading into an incompatible Facet graph
 - restoring richer structured log collection policies on the active startup path beyond stderr plus optional NDJSON output
-- representing startup bootstrap as a timeline-driven chain beginning from raw process startup inputs and deriving parsed CLI, logging configuration, tracing initialization, validation state, and startup composition requests
+- representing startup bootstrap as a fully timeline-driven chain beginning from raw process startup inputs and deriving parsed CLI, logging configuration, tracing initialization, validation state, and startup composition requests; the current path now derives startup composition policy from semantic entry kinds plus parsed bootstrap state, publishes that derivation explicitly, and reuses one observed-bootstrap result across smoke and native-main-menu entry paths, but startup composition still pivots into imperative session/tracing orchestration after bootstrap rather than deriving the full startup run from published events alone
 - real startup validation UX and gating using explicit per-feature validation events instead of the current synchronous validation call; the first identity-bearing registry surfaces now exist, but validation is still a synchronous startup pass
 - actual Win32/D3D12-backed window creation behind the shell host scaffold
 - async timeline ingestion, trigger cursors, and runtime pumping
 - feature-owned render/input loops and the real cursor-gallery window implementation
 - feature-owned event definitions that carry explicit log intent/level metadata plus the authoritative timeline-to-tracing re-emission bridge and tracing-observation loop-prevention markers needed to make timeline publication, rather than direct tracing macros, the long-term source of truth for product logs
+- enriching the new live `Timeline` window into a real legacy-grade viewer rather than stopping at the first explicit control pass; left-click pan/zoom/fit controls now exist, but the roadmap still needs mouse-wheel zoom, right-drag pan, negative-time overscan, vertical row panning, grouping or folding controls, hover or pinned detail, folded-cluster inspection, explicit refresh or session ownership beyond startup-local shared state, and the legacy cached-live-snapshot discipline captured in [timeline-display-model-plan.md](timeline-display-model-plan.md), [timeline-profiler-plan.md](timeline-profiler-plan.md), [../../legacy/src/logs.rs](../../legacy/src/logs.rs), and [../../legacy/src/timeline/query.rs](../../legacy/src/timeline/query.rs)
 - a richer tracing-observation inspection surface; observed records now have a programmatic `AppComposition` summary, a typed `StartupSmokeSummary`, and a CLI-facing startup smoke command that covers both success and current early failure paths, but no polished user-facing UI yet
 - extracting the legacy D3D12 render thread and shader-backed scene renderer into shell-owned helpers so the main menu and feature crates can render the shared scene model through the real backend instead of the current custom-painted stopgap
 - richer event definitions with Facet-shaped public canonical event forms
@@ -137,9 +185,31 @@ This section is the preferred starting point for the next agentic work session a
 Current baseline:
 
 - the active branch is `event-cutover`
-- the latest completed startup-smoke slice extends `StartupSmokeSummary` with failure-state facts and preserves observed bootstrap/tracing failure timelines for smoke-mode reporting
+- the latest completed startup-smoke slice unifies smoke failure preservation behind `ObservedStartupSmokeFailure`, which now carries either the observed runtime or observed session so smoke-mode callers can inspect summaries and event history for bootstrap, session-construction, tracing, and default cursor-gallery flow failures through one surface
+- the latest startup-orchestration slice adds three explicit transition milestones to the active startup narrative: `StartupCompositionReadyEvent`, `DefaultCursorGalleryFlowRequestedEvent`, and `NativeMainMenuLaunchRequestedEvent`
+- the latest startup-orchestration slice now also registers a startup-owned trigger path that derives the default cursor-gallery request/click and native main-menu launch request from `StartupCompositionReadyEvent`, and startup validation now includes the startup feature owner used by those trigger registrations
+- the latest startup-orchestration slice also extracts those startup-composition observer registrations and handlers into a dedicated `composition_observer` module, narrowing the remaining gap between startup state publication and observer-policy ownership
+- the latest startup-orchestration slice also keeps startup-composition policy crate-local on purpose through a dedicated `StartupCompositionPolicy` surface in `composition_observer`, removing the old startup-local auto-launch enum from the session builders while preserving the same ready-event and trigger-driven behavior
+- the latest startup-orchestration slice now derives that crate-local startup composition policy from semantic entry kinds plus parsed bootstrap state, publishes a new `StartupCompositionPolicyDerivedEvent`, and uses observed bootstrap state rather than a raw-argument scan to decide whether `main_with_raw_inputs(...)` should take the smoke path
+- the latest startup-orchestration slice also adds reusable observed-bootstrap helper paths for default composition, startup-smoke summary, and native main-menu session preparation, and now upgrades pristine observed bootstrap runtimes into native hosting on demand so the real process-entry path carries one observed-bootstrap result end to end
+- the guiding timeline UX target is now explicit: the main menu's `Timeline` entry should eventually open a live inspector over the running app's own published timeline, with `Timeline Playground` remaining a separate synthetic experiment surface
+- that timeline UX target is now also explicitly grounded in legacy prior art and current design notes: live tracing projection and cached snapshot reuse in [../../legacy/src/logs.rs](../../legacy/src/logs.rs), render-plan/query/folding behavior in [../../legacy/src/timeline/query.rs](../../legacy/src/timeline/query.rs) and [../../legacy/src/timeline/playground.rs](../../legacy/src/timeline/playground.rs), and the repo's existing display/performance requirements in [timeline-display-model-plan.md](timeline-display-model-plan.md) and [timeline-profiler-plan.md](timeline-profiler-plan.md)
+- the active codebase now has the first non-legacy live app-timeline display foundation: `teamy_studio_timeline_core` owns dataset/query/projection surfaces for active published events, and the main menu's `Timeline` button now opens a real shell-hosted `Timeline` window that renders the running app timeline through dataset-backed viewer state instead of a pure placeholder dialog
 - `\.\check-all.ps1` passed after adding `--startup-smoke`
+- `cargo test -p teamy_studio_timeline_core -- --nocapture` passes after porting the active dataset/query/folding/projection model for published app events
+- `cargo test -p teamy_studio_startup live_app_timeline_preview -- --nocapture` passes after wiring the main-menu Timeline button preview to the active published app timeline
+- `cargo test -p teamy_studio_startup timeline_button_click_opens_live_app_timeline_window -- --nocapture` passes after replacing the Timeline placeholder path with a real shell-hosted live Timeline window request
+- `cargo test -p teamy_studio_startup timeline_window_pan_and_zoom_controls_recompute_visible_range -- --nocapture` passes after moving the live Timeline window to dataset-backed viewport state with explicit pan/zoom/fit controls
 - `cargo test -p teamy_studio_startup startup_smoke -- --nocapture` passes after extending `StartupSmokeSummary` with failure-state facts and observed failure preservation
+- `cargo test -p teamy_studio_startup startup_smoke -- --nocapture` still passes after replacing the branch-local observed smoke wrappers with the unified `ObservedStartupSmokeFailure` state carrier
+- `cargo test -p teamy_studio_startup mvp_composition -- --nocapture` passes after adding the explicit startup ready/request events to the default composition path
+- `cargo test -p teamy_studio_startup native_main_menu_session_preparation -- --nocapture` passes after refactoring native main-menu startup preparation to publish a launch-request event without opening a window
+- `cargo test -p teamy_studio_startup mvp_session_can_accept_external_menu_clicks -- --nocapture` passes after updating the generic session path expectations for the startup-owned feature validation event and the shifted ready-event timeline shape
+- `cargo test -p teamy_studio_startup mvp_composition -- --nocapture`, `cargo test -p teamy_studio_startup native_main_menu_session_preparation -- --nocapture`, and `cargo test -p teamy_studio_startup mvp_session_can_accept_external_menu_clicks -- --nocapture` still pass after extracting the startup composition observer module
+- those same focused startup tests still pass after replacing the startup-local `StartupAutoLaunchTarget` enum with the crate-local `StartupCompositionPolicy` value owned by `composition_observer`
+- `cargo test -p teamy_studio_startup mvp_composition -- --nocapture`, `cargo test -p teamy_studio_startup native_main_menu_session_preparation -- --nocapture`, `cargo test -p teamy_studio_startup mvp_session_can_accept_external_menu_clicks -- --nocapture`, `cargo test -p teamy_studio_startup startup_smoke -- --nocapture`, and `cargo test -p teamy_studio_startup observed_bootstrap_plan_exposes_bootstrap_records_before_session_construction -- --nocapture` all still pass after adding `StartupCompositionPolicyDerivedEvent` and switching `main_with_raw_inputs(...)` to parsed-bootstrap smoke detection
+- `cargo test -p teamy_studio_startup observed_bootstrap_plan -- --nocapture` now covers the observed-bootstrap helper paths directly, including the new invariant that pristine observed bootstrap state can be upgraded to native shell hosting before session construction
+- `cargo test -p teamy_studio_shell native_hosting -- --nocapture` passes after adding the guarded native-hosting upgrade and its pristine/non-pristine regression coverage
 - `cargo run -- --startup-smoke --log-filter trace` exits successfully, avoids opening a native window, and prints startup-success/window/epoch facts plus the new failure-state fields
 - `cargo run -- --startup-smoke --wat` now prints a failure summary with the preserved bootstrap failure timeline before exiting nonzero
 - Tracey-with-an-E is reference-only at `docs/reference/tracey/.config/tracey/config.styx`
@@ -148,8 +218,8 @@ Current baseline:
 Recommended next implementation thread:
 
 1. Start by running `git status --short` and `.\check-all.ps1` to confirm the baseline is still clean and green.
-2. Read `development-workflow-record-of-decision.md`, `startup-bootstrap-record-of-decision.md`, and `timeline-authoritative-logging-record-of-decision.md`.
-3. If you stay on the smoke thread, the next adjacent refinement is to decide whether session-construction and default cursor-gallery flow failures should also be preserved through a single observed smoke outcome type instead of the current branch-local wrappers.
+2. Read `development-workflow-record-of-decision.md`, `startup-bootstrap-record-of-decision.md`, `timeline-authoritative-logging-record-of-decision.md`, [timeline-display-model-plan.md](timeline-display-model-plan.md), and [timeline-profiler-plan.md](timeline-profiler-plan.md), then skim [../../legacy/src/logs.rs](../../legacy/src/logs.rs), [../../legacy/src/timeline/query.rs](../../legacy/src/timeline/query.rs), and [../../legacy/src/timeline/playground.rs](../../legacy/src/timeline/playground.rs) before treating the live `Timeline` entry as a new implementation problem.
+3. If you stay on startup orchestration, the next higher-leverage refinement is to keep turning the new shell-hosted live Timeline window into a proper interactive viewer: the first explicit pan/zoom/fit controls now exist, so the next steps should keep the running app timeline authoritative while adding mouse-wheel zoom, right-drag pan, vertical row panning, grouping or folding controls, hover or pinned detail, folded-cluster inspection, and a dedicated owner for refresh and cached-live-snapshot behavior rather than regressing to full-data-per-frame rendering.
 4. Default `cargo run -- --log-filter trace` should still launch the native main menu; do not let smoke-only formatting or failure-summary behavior leak into the normal windowed path.
 5. Do not start Figue restoration in the same slice. When CLI restoration begins later, preserve the legacy `teamy-figue` plus `facet = 0.44.1` compatibility constraint or write a new compatibility decision first.
 6. Update this plan before ending the session, especially the `Current implementation status`, `Still pending`, and this continuation section.
@@ -1005,3 +1075,22 @@ Here is the most practical immediate checklist:
 - [ ] implement `main_menu`
 - [ ] implement the fresh `cursor_gallery`
 - [ ] run root validation after each milestone
+
+## Timeline viewer alignment status
+
+- The active `Timeline` window is on the right architectural path because it consumes the primary app timeline through `teamy_studio_timeline_core::TimelineDataset` and `TimelineRenderPlan` instead of inventing window-local event storage.
+- The active viewer is not yet legacy-parity and should not be evaluated as such: it currently projects published app events as instant markers, not tracing span lifecycles, live tracing messages, Tracy capture zones/messages, or audio/transcription intervals.
+- The legacy tracing-oriented viewer remains the stronger interaction reference: `legacy/src/logs.rs` captured tracing events and closed spans into a cached timeline dataset, and `legacy/src/timeline/query.rs` / `legacy/src/timeline/playground.rs` preserved hover/pin details, foldable interactive clusters, thread grouping, nested lanes, and viewport-driven projection.
+- The HCI parity bar is especially important: active timeline work should prioritize zero-lag cursor positional awareness, immediate hover feedback, cursor-anchored mouse-wheel zoom, zoom animation that compounds under fast wheel input, right-button drag panning, and interaction paths that respect swapchain/present latency instead of treating the viewer as static diagnostics text.
+- The active shell scene-registration seam now exposes mouse wheel, right-button drag, and frame-tick callbacks, and the live `Timeline` window uses those callbacks for cursor-anchored wheel zoom, stepped zoom animation, and right-button horizontal panning over the lane surface.
+- The event viewer must remain a Teamy timeline viewer. Tracing logs should become visible only after they have been ingested into Teamy's timeline model as timeline events; the viewer should not gain a separate tracing-specific render path. Timeline-to-tracing re-emission remains useful for stderr/file logging, but those tracing records must carry a stable loop-prevention field such as `teamy.timeline_reemit = true` so the tracing-to-timeline observer does not republish them.
+- The immediate implementation direction should be to port the legacy live tracing adapter shape into the active crates without reviving the monolith: capture tracing events/spans into explicit timeline events or a dedicated observability adapter, then feed the existing active render-plan path.
+
+## Next timeline viewer implementation guidance
+
+1. Keep the HCI path first-class: add active hover hit-testing over timeline items/clusters, native tooltip/detail feedback, row-local cursor guides, right-drag vertical panning, and cursor-latency-aware present behavior before widening the data volume too far.
+2. Add the timeline-to-tracing bridge from Teamy timeline events to tracing records, driven by explicit log intent/level metadata and marked with `teamy.timeline_reemit = true`.
+3. Add the tracing-to-timeline observer path that ignores marked re-emissions and ingests ordinary tracing records as Teamy timeline events.
+4. Add hover or selected-item detail for the active `Timeline` surface using resolved dataset fields, event IDs, event-definition IDs, log intent, arena names, and representative cluster metadata.
+5. Add vertical row navigation/virtualization to the active `Timeline` surface before increasing event volume.
+6. Promote tracing span lifecycle visibility before Tracy-file import work, because app-self-inspection is the guiding product goal for the cutover.

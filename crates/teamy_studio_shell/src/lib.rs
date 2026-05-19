@@ -19,7 +19,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
-use eyre::{Result, WrapErr};
+use eyre::{Result, WrapErr, eyre};
 use linkme::distributed_slice;
 use teamy_studio_event_core::{
     EventDefinition, EventDefinitionId, EventLogIntent, PublishedEvent, WritableArena,
@@ -43,10 +43,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
     HTLEFT, HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT, IDC_ARROW, KillTimer, LoadCursorW,
     RegisterClassExW, SM_CXSCREEN, SM_CYSCREEN, SW_MAXIMIZE, SW_MINIMIZE, SW_SHOW, SW_SHOWNA,
     SetCursor, SetTimer, SetWindowPos, ShowWindow, WINDOW_EX_STYLE, WINDOW_STYLE, WM_DESTROY,
-    WM_DPICHANGED, WM_ERASEBKGND, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCACTIVATE, WM_NCCALCSIZE,
-    WM_NCHITTEST, WM_NCPAINT, WM_PAINT, WM_TIMER, WNDCLASSEXW, WS_EX_APPWINDOW, WS_EX_NOACTIVATE,
-    WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP,
-    WS_THICKFRAME, WS_VISIBLE,
+    WM_DPICHANGED, WM_ERASEBKGND, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCACTIVATE,
+    WM_NCCALCSIZE, WM_NCHITTEST, WM_NCPAINT, WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_TIMER,
+    WNDCLASSEXW, WS_EX_APPWINDOW, WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW,
+    WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP, WS_THICKFRAME, WS_VISIBLE,
 };
 use windows::core::{PCWSTR, w};
 
@@ -117,6 +117,12 @@ pub struct FeatureWindowSceneRegistration {
     pub title: &'static str,
     pub build_scene: fn(FeatureWindowSceneContext) -> RenderScene,
     pub cursor_for_point: Option<fn(FeatureWindowSceneContext, POINT) -> Option<PCWSTR>>,
+    pub on_left_click: Option<fn(FeatureWindowSceneContext, POINT) -> bool>,
+    pub on_mouse_wheel: Option<fn(FeatureWindowSceneContext, POINT, i16) -> bool>,
+    pub on_right_button_down: Option<fn(FeatureWindowSceneContext, POINT) -> bool>,
+    pub on_right_drag: Option<fn(FeatureWindowSceneContext, POINT) -> bool>,
+    pub on_right_button_up: Option<fn(FeatureWindowSceneContext, POINT) -> bool>,
+    pub on_frame_tick: Option<fn(FeatureWindowSceneContext) -> bool>,
 }
 
 #[distributed_slice]
@@ -282,11 +288,24 @@ unsafe extern "system" fn shell_window_proc(
             LRESULT(0)
         }
         WM_TIMER if wparam.0 == SHELL_RENDER_TIMER_ID => {
+            let _ = handle_shell_frame_tick(hwnd);
             let _ = drive_shell_render_path(hwnd);
             LRESULT(0)
         }
         WM_LBUTTONUP => {
             let _ = handle_shell_left_button_up(hwnd, lparam);
+            LRESULT(0)
+        }
+        WM_MOUSEWHEEL => {
+            let _ = handle_shell_mouse_wheel(hwnd, wparam, lparam);
+            LRESULT(0)
+        }
+        WM_RBUTTONDOWN => {
+            let _ = handle_shell_right_button_down(hwnd, lparam);
+            LRESULT(0)
+        }
+        WM_RBUTTONUP => {
+            let _ = handle_shell_right_button_up(hwnd, lparam);
             LRESULT(0)
         }
         WM_PAINT => paint_shell_window(hwnd),
@@ -561,8 +580,98 @@ fn handle_shell_mouse_move(hwnd: HWND, lparam: LPARAM) -> Result<()> {
     {
         state.cursor_client_point = Some(point);
     }
+    if let Some(context) = shell_window_scene_context(hwnd)?
+        && let Some(registration) = feature_window_scene_registration(context.title)
+        && let Some(handler) = registration.on_right_drag
+        && handler(context, point)
+    {
+        update_shell_window_cursor(hwnd, point)?;
+        return drive_shell_render_path(hwnd);
+    }
     update_shell_window_cursor(hwnd, point)?;
     drive_shell_render_path(hwnd)
+}
+
+fn handle_shell_mouse_wheel(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) -> Result<()> {
+    let point = POINT {
+        x: (lparam.0 & 0xFFFF) as i16 as i32,
+        y: ((lparam.0 >> 16) & 0xFFFF) as i16 as i32,
+    };
+    let delta = ((wparam.0 >> 16) & 0xFFFF) as i16;
+
+    if let Some(state) = shell_window_states()
+        .lock()
+        .expect("shell window state should not be poisoned")
+        .get_mut(&(hwnd.0 as isize))
+    {
+        state.cursor_client_point = Some(point);
+    }
+
+    if let Some(context) = shell_window_scene_context(hwnd)?
+        && let Some(registration) = feature_window_scene_registration(context.title)
+        && let Some(handler) = registration.on_mouse_wheel
+        && handler(context, point, delta)
+    {
+        update_shell_window_cursor(hwnd, point)?;
+        return drive_shell_render_path(hwnd);
+    }
+
+    Ok(())
+}
+
+fn handle_shell_right_button_down(hwnd: HWND, lparam: LPARAM) -> Result<()> {
+    let point = POINT {
+        x: (lparam.0 & 0xFFFF) as i16 as i32,
+        y: ((lparam.0 >> 16) & 0xFFFF) as i16 as i32,
+    };
+    let handled = shell_window_scene_context(hwnd)?
+        .and_then(|context| {
+            feature_window_scene_registration(context.title).and_then(|registration| {
+                registration
+                    .on_right_button_down
+                    .map(|handler| handler(context, point))
+            })
+        })
+        .unwrap_or(false);
+    if handled {
+        update_shell_window_cursor(hwnd, point)?;
+        drive_shell_render_path(hwnd)?;
+    }
+    Ok(())
+}
+
+fn handle_shell_right_button_up(hwnd: HWND, lparam: LPARAM) -> Result<()> {
+    let point = POINT {
+        x: (lparam.0 & 0xFFFF) as i16 as i32,
+        y: ((lparam.0 >> 16) & 0xFFFF) as i16 as i32,
+    };
+    let handled = shell_window_scene_context(hwnd)?
+        .and_then(|context| {
+            feature_window_scene_registration(context.title).and_then(|registration| {
+                registration
+                    .on_right_button_up
+                    .map(|handler| handler(context, point))
+            })
+        })
+        .unwrap_or(false);
+    if handled {
+        update_shell_window_cursor(hwnd, point)?;
+        drive_shell_render_path(hwnd)?;
+    }
+    Ok(())
+}
+
+fn handle_shell_frame_tick(hwnd: HWND) -> Result<()> {
+    let Some(context) = shell_window_scene_context(hwnd)? else {
+        return Ok(());
+    };
+    let Some(registration) = feature_window_scene_registration(context.title) else {
+        return Ok(());
+    };
+    if let Some(handler) = registration.on_frame_tick {
+        let _ = handler(context);
+    }
+    Ok(())
 }
 
 fn handle_shell_left_button_up(hwnd: HWND, lparam: LPARAM) -> Result<()> {
@@ -591,7 +700,21 @@ fn handle_shell_left_button_up(hwnd: HWND, lparam: LPARAM) -> Result<()> {
             | ShellChromeClickAction::Diagnostics
             | ShellChromeClickAction::Latency => {}
         }
+        return drive_shell_render_path(hwnd);
     }
+
+    let Some(context) = shell_window_scene_context(hwnd)? else {
+        return Ok(());
+    };
+
+    if let Some(registration) = feature_window_scene_registration(context.title)
+        && let Some(handler) = registration.on_left_click
+        && handler(context, point)
+    {
+        update_shell_window_cursor(hwnd, point)?;
+        return drive_shell_render_path(hwnd);
+    }
+
     Ok(())
 }
 
@@ -1252,6 +1375,32 @@ impl ShellRuntime {
         self.host_mode
     }
 
+    /// Enable native hosting on a pristine shell runtime before any window
+    /// requests or hosted windows exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if shell state or hosted windows have already been
+    /// materialized, because switching host mode after that point would make
+    /// runtime ownership ambiguous.
+    pub fn enable_native_hosting_for_pristine_runtime(&mut self) -> Result<()> {
+        if self.host_mode == ShellHostMode::Native {
+            return Ok(());
+        }
+
+        if !self.state.pending_requests().is_empty()
+            || !self.state.windows().is_empty()
+            || !self.hosted_windows().is_empty()
+        {
+            return Err(eyre!(
+                "cannot enable native hosting after shell runtime has observed or materialized windows"
+            ));
+        }
+
+        self.host_mode = ShellHostMode::Native;
+        Ok(())
+    }
+
     /// Destroy any native windows currently owned by the shell runtime.
     ///
     /// # Errors
@@ -1586,5 +1735,44 @@ mod tests {
             timeline.published_epochs()[1].1.events()[0].definition().id,
             WINDOW_CREATED_EVENT_DEFINITION.id
         );
+    }
+
+    #[test]
+    fn pristine_shell_runtime_can_enable_native_hosting() {
+        let mut runtime = ShellRuntime::new();
+
+        runtime
+            .enable_native_hosting_for_pristine_runtime()
+            .expect("pristine shell runtime should allow native-hosting upgrade");
+
+        assert_eq!(runtime.host_mode(), ShellHostMode::Native);
+    }
+
+    #[test]
+    fn shell_runtime_rejects_native_hosting_upgrade_after_observing_requests() {
+        let request = WindowCreateRequest {
+            logical_window_id: LogicalWindowId::new(99),
+            title: "Cursor Gallery",
+            present_policy: PresentPolicy::LowLatencyHwnd,
+            host_options: WindowHostOptions::standard_foreground(),
+        };
+        let mut runtime = ShellRuntime::new();
+
+        runtime.apply_published_event(&PublishedEvent::new(
+            &WINDOW_CREATE_REQUEST_EVENT_DEFINITION,
+            request,
+        ));
+
+        let error = runtime
+            .enable_native_hosting_for_pristine_runtime()
+            .expect_err(
+                "shell runtime should reject native-hosting upgrade after observing requests",
+            );
+
+        assert_eq!(
+            error.to_string(),
+            "cannot enable native hosting after shell runtime has observed or materialized windows"
+        );
+        assert_eq!(runtime.host_mode(), ShellHostMode::Simulated);
     }
 }

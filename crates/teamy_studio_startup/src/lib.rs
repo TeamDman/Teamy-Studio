@@ -1,4 +1,12 @@
 pub mod bootstrap;
+mod composition_observer;
+mod timeline_window_scene;
+
+pub use composition_observer::STARTUP_FEATURE_ID;
+pub(crate) use composition_observer::{
+    STARTUP_FEATURE_TITLE, StartupCompositionEntryKind, StartupCompositionPolicy,
+    derive_startup_composition_policy,
+};
 
 pub use bootstrap::{
     BootstrapCliParseError, BootstrapPlanError, GlobalArgs, LogFilterSelection,
@@ -41,9 +49,19 @@ use teamy_studio_registration_core::{
     RegistrationSnapshot, RegistrationValidationError, TriggerDefinitionId, TriggerRegistrationId,
     registration_provenance, snapshot, trigger_registrations_for, validate_registrations,
 };
-use teamy_studio_shell::{HostedWindowRecord, ShellRuntime, ShellState};
+use teamy_studio_shell::{
+    HostedWindowRecord, LogicalWindowId, ShellRuntime, ShellState,
+    WINDOW_CREATE_REQUEST_EVENT_DEFINITION,
+};
 use teamy_studio_timeline_core::{
-    CanonicalTimeKey, ConstructedTimeline, EventId, EventReference, TriggerCursor, TriggerRuntime,
+    CanonicalTimeKey, ConstructedTimeline, EventId, EventReference, TimelineGroupingMode,
+    TimelineItemKind, TimelineRenderItem, TimelineViewportQuery, TriggerCursor, TriggerRuntime,
+};
+use timeline_window_scene::{
+    LIVE_APP_TIMELINE_WINDOW_TITLE, LiveAppTimelineWindowRenderItem,
+    LiveAppTimelineWindowRenderItemKind, LiveAppTimelineWindowRowSnapshot,
+    LiveAppTimelineWindowSnapshot, live_app_timeline_window_request,
+    next_live_app_timeline_window_id, store_live_app_timeline_window_dataset,
 };
 use tracing::{Level, event, info, trace};
 
@@ -173,6 +191,35 @@ pub static TRACING_RECORD_OBSERVED_EVENT_DEFINITION: EventDefinition = EventDefi
     schema_name: "teamy_studio.startup.tracing_record_observed",
     schema_version: 1,
     log_intent: EventLogIntent::NONE,
+};
+
+pub static STARTUP_COMPOSITION_POLICY_DERIVED_EVENT_DEFINITION: EventDefinition = EventDefinition {
+    id: EventDefinitionId::from_bytes([0x1A; 16]),
+    schema_name: "teamy_studio.startup.composition_policy_derived",
+    schema_version: 1,
+    log_intent: EventLogIntent::INFO,
+};
+
+pub static STARTUP_COMPOSITION_READY_EVENT_DEFINITION: EventDefinition = EventDefinition {
+    id: EventDefinitionId::from_bytes([0x14; 16]),
+    schema_name: "teamy_studio.startup.composition_ready",
+    schema_version: 1,
+    log_intent: EventLogIntent::INFO,
+};
+
+pub static DEFAULT_CURSOR_GALLERY_FLOW_REQUESTED_EVENT_DEFINITION: EventDefinition =
+    EventDefinition {
+        id: EventDefinitionId::from_bytes([0x15; 16]),
+        schema_name: "teamy_studio.startup.default_cursor_gallery_flow_requested",
+        schema_version: 1,
+        log_intent: EventLogIntent::INFO,
+    };
+
+pub static NATIVE_MAIN_MENU_LAUNCH_REQUESTED_EVENT_DEFINITION: EventDefinition = EventDefinition {
+    id: EventDefinitionId::from_bytes([0x16; 16]),
+    schema_name: "teamy_studio.startup.native_main_menu_launch_requested",
+    schema_version: 1,
+    log_intent: EventLogIntent::INFO,
 };
 
 const STARTUP_BOOTSTRAP_CLI_PARSE_FAILED_REASON: &str = "startup bootstrap cli parse failed";
@@ -311,6 +358,34 @@ pub static TRACING_RECORD_OBSERVED_EVENT_REGISTRATION: EventDefinitionRegistrati
         provenance: registration_provenance!(),
     };
 
+#[distributed_slice(EVENT_DEFINITION_REGISTRATIONS)]
+pub static STARTUP_COMPOSITION_POLICY_DERIVED_EVENT_REGISTRATION: EventDefinitionRegistration =
+    EventDefinitionRegistration {
+        definition: &STARTUP_COMPOSITION_POLICY_DERIVED_EVENT_DEFINITION,
+        provenance: registration_provenance!(),
+    };
+
+#[distributed_slice(EVENT_DEFINITION_REGISTRATIONS)]
+pub static STARTUP_COMPOSITION_READY_EVENT_REGISTRATION: EventDefinitionRegistration =
+    EventDefinitionRegistration {
+        definition: &STARTUP_COMPOSITION_READY_EVENT_DEFINITION,
+        provenance: registration_provenance!(),
+    };
+
+#[distributed_slice(EVENT_DEFINITION_REGISTRATIONS)]
+pub static DEFAULT_CURSOR_GALLERY_FLOW_REQUESTED_EVENT_REGISTRATION: EventDefinitionRegistration =
+    EventDefinitionRegistration {
+        definition: &DEFAULT_CURSOR_GALLERY_FLOW_REQUESTED_EVENT_DEFINITION,
+        provenance: registration_provenance!(),
+    };
+
+#[distributed_slice(EVENT_DEFINITION_REGISTRATIONS)]
+pub static NATIVE_MAIN_MENU_LAUNCH_REQUESTED_EVENT_REGISTRATION: EventDefinitionRegistration =
+    EventDefinitionRegistration {
+        definition: &NATIVE_MAIN_MENU_LAUNCH_REQUESTED_EVENT_DEFINITION,
+        provenance: registration_provenance!(),
+    };
+
 #[derive(Clone, Debug, Eq, Facet, PartialEq)]
 pub struct StartupSucceededEvent {
     pub completed_at: CanonicalTimeKey,
@@ -361,6 +436,39 @@ pub struct FeatureActivationGateResolvedEvent {
     pub feature_id: FeatureId,
     pub feature_title: &'static str,
     pub allows_activation: bool,
+}
+
+#[derive(Clone, Debug, Eq, Facet, PartialEq)]
+pub struct StartupCompositionPolicyDerivedEvent {
+    pub entry_kind: &'static str,
+    pub startup_smoke_requested: bool,
+    pub default_cursor_gallery_button_id_raw: Option<u64>,
+    pub request_native_main_menu_launch: bool,
+}
+
+#[derive(Clone, Debug, Eq, Facet, PartialEq)]
+pub struct StartupCompositionReadyEvent {
+    pub button_count: u64,
+    pub validated_button_count: u64,
+    pub pending_button_count: u64,
+    pub failed_button_count: u64,
+    pub default_cursor_gallery_button_id_raw: Option<u64>,
+    pub request_native_main_menu_launch: bool,
+}
+
+#[derive(Clone, Debug, Eq, Facet, PartialEq)]
+pub struct DefaultCursorGalleryFlowRequestedEvent {
+    pub feature_id: FeatureId,
+    pub feature_title: &'static str,
+    pub source_button_id_raw: u64,
+}
+
+#[derive(Clone, Debug, Eq, Facet, PartialEq)]
+pub struct NativeMainMenuLaunchRequestedEvent {
+    pub button_count: u64,
+    pub validated_button_count: u64,
+    pub pending_button_count: u64,
+    pub failed_button_count: u64,
 }
 
 #[derive(Clone, Debug, Eq, Facet, PartialEq)]
@@ -436,21 +544,15 @@ pub struct StartupSmokeSummary {
 }
 
 #[derive(Debug)]
-pub struct ObservedStartupSessionFailure {
-    error: Report,
-    runtime: StartupRuntime,
-}
-
-#[derive(Debug)]
-pub struct ObservedDefaultCursorGalleryFlowFailure {
-    error: Report,
-    session: StartupSession,
+pub enum ObservedStartupSmokeState {
+    Runtime(Box<StartupRuntime>),
+    Session(Box<StartupSession>),
 }
 
 #[derive(Debug)]
 pub struct ObservedStartupSmokeFailure {
     error: Report,
-    summary: StartupSmokeSummary,
+    state: ObservedStartupSmokeState,
 }
 
 fn startup_smoke_summary_from_runtime(
@@ -533,50 +635,87 @@ impl AppComposition {
     }
 }
 
-impl ObservedStartupSessionFailure {
-    #[must_use]
-    pub fn runtime(&self) -> &StartupRuntime {
-        &self.runtime
-    }
-
+impl ObservedStartupSmokeState {
     #[must_use]
     pub fn startup_smoke_summary(&self) -> StartupSmokeSummary {
-        self.runtime.startup_smoke_summary()
+        match self {
+            Self::Runtime(runtime) => runtime.startup_smoke_summary(),
+            Self::Session(session) => session.startup_smoke_summary(),
+        }
     }
 }
-
-impl Display for ObservedStartupSessionFailure {
-    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
-        Display::fmt(&self.error, formatter)
-    }
-}
-
-impl Error for ObservedStartupSessionFailure {}
-
-impl ObservedDefaultCursorGalleryFlowFailure {
-    #[must_use]
-    pub fn session(&self) -> &StartupSession {
-        &self.session
-    }
-
-    #[must_use]
-    pub fn startup_smoke_summary(&self) -> StartupSmokeSummary {
-        self.session.startup_smoke_summary()
-    }
-}
-
-impl Display for ObservedDefaultCursorGalleryFlowFailure {
-    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
-        Display::fmt(&self.error, formatter)
-    }
-}
-
-impl Error for ObservedDefaultCursorGalleryFlowFailure {}
 
 impl ObservedStartupSmokeFailure {
+    fn from_runtime(error: impl Into<Report>, runtime: StartupRuntime) -> Self {
+        Self {
+            error: error.into(),
+            state: ObservedStartupSmokeState::Runtime(Box::new(runtime)),
+        }
+    }
+
+    fn from_session(error: impl Into<Report>, session: StartupSession) -> Self {
+        Self {
+            error: error.into(),
+            state: ObservedStartupSmokeState::Session(Box::new(session)),
+        }
+    }
+
+    pub fn error(&self) -> &Report {
+        &self.error
+    }
+
     #[must_use]
-    pub fn summary(&self) -> &StartupSmokeSummary {
-        &self.summary
+    pub fn runtime(&self) -> Option<&StartupRuntime> {
+        match &self.state {
+            ObservedStartupSmokeState::Runtime(runtime) => Some(runtime),
+            ObservedStartupSmokeState::Session(_) => None,
+        }
+    }
+
+    #[must_use]
+    pub fn session(&self) -> Option<&StartupSession> {
+        match &self.state {
+            ObservedStartupSmokeState::Runtime(_) => None,
+            ObservedStartupSmokeState::Session(session) => Some(session),
+        }
+    }
+
+    #[must_use]
+    pub fn state(&self) -> &ObservedStartupSmokeState {
+        &self.state
+    }
+
+    #[must_use]
+    pub fn published_event_records(&self) -> Vec<(TriggerCursor, EventId, &PublishedEvent)> {
+        match &self.state {
+            ObservedStartupSmokeState::Runtime(runtime) => runtime.published_event_records(),
+            ObservedStartupSmokeState::Session(session) => session.published_event_records(),
+        }
+    }
+
+    #[must_use]
+    pub fn event_references(&self) -> Vec<EventReference> {
+        match &self.state {
+            ObservedStartupSmokeState::Runtime(runtime) => runtime.event_references(),
+            ObservedStartupSmokeState::Session(session) => session.event_references(),
+        }
+    }
+
+    #[must_use]
+    pub fn latest_event_references(&self) -> Vec<EventReference> {
+        match &self.state {
+            ObservedStartupSmokeState::Runtime(runtime) => runtime.latest_event_references(),
+            ObservedStartupSmokeState::Session(session) => session.latest_event_references(),
+        }
+    }
+
+    #[must_use]
+    pub fn summary(&self) -> StartupSmokeSummary {
+        self.state.startup_smoke_summary()
+    }
+
+    fn into_report(self) -> Report {
+        self.error
     }
 }
 
@@ -586,7 +725,24 @@ impl Display for ObservedStartupSmokeFailure {
     }
 }
 
-impl Error for ObservedStartupSmokeFailure {}
+impl Error for ObservedStartupSmokeFailure {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        self.error.source()
+    }
+}
+
+fn menu_validation_counts(menu_snapshot: &MainMenuSnapshot) -> (u64, u64, u64) {
+    menu_snapshot
+        .buttons()
+        .iter()
+        .fold((0_u64, 0_u64, 0_u64), |counts, button| {
+            match button.validation_state {
+                FeatureValidationState::Validated => (counts.0 + 1, counts.1, counts.2),
+                FeatureValidationState::Pending => (counts.0, counts.1 + 1, counts.2),
+                FeatureValidationState::Failed => (counts.0, counts.1, counts.2 + 1),
+            }
+        })
+}
 
 fn bootstrap_cli_parse_failed_event(
     raw_inputs: &RawProcessStartupInputs,
@@ -795,17 +951,73 @@ impl ObservedBootstrapPlan {
     }
 
     pub fn into_mvp_session(self) -> Result<StartupSession> {
-        build_mvp_session_with_runtime(self.bootstrap_plan, self.runtime, true)
+        build_mvp_session_with_runtime(
+            self.bootstrap_plan,
+            self.runtime,
+            true,
+            StartupCompositionEntryKind::SessionOnly,
+        )
     }
 
-    #[expect(
-        clippy::result_large_err,
-        reason = "smoke-only observed session construction preserves runtime state so failure summaries can inspect the startup timeline"
-    )]
     pub fn into_mvp_session_observed(
         self,
-    ) -> std::result::Result<StartupSession, ObservedStartupSessionFailure> {
-        build_mvp_session_with_runtime_observed(self.bootstrap_plan, self.runtime, true)
+    ) -> std::result::Result<StartupSession, ObservedStartupSmokeFailure> {
+        build_mvp_session_with_runtime_observed(
+            self.bootstrap_plan,
+            self.runtime,
+            true,
+            StartupCompositionEntryKind::SessionOnly,
+        )
+    }
+
+    pub fn with_native_shell_hosting(mut self) -> Self {
+        self.runtime
+            .enable_native_shell_hosting_for_pristine_runtime()
+            .expect("bootstrap observation should leave shell hosting pristine");
+        self
+    }
+
+    pub fn into_mvp_session_with_native_shell(self) -> Result<StartupSession> {
+        self.with_native_shell_hosting().into_mvp_session()
+    }
+
+    pub fn into_default_composition(self) -> Result<AppComposition> {
+        let cursor_gallery_button = default_cursor_gallery_button_id();
+        let session = build_mvp_session_with_runtime(
+            self.bootstrap_plan,
+            self.runtime,
+            true,
+            StartupCompositionEntryKind::DefaultComposition {
+                source_button_id_raw: cursor_gallery_button.raw(),
+            },
+        )?;
+        run_default_cursor_gallery_flow(session)
+    }
+
+    pub fn into_startup_smoke_summary(
+        self,
+    ) -> std::result::Result<StartupSmokeSummary, ObservedStartupSmokeFailure> {
+        let cursor_gallery_button = default_cursor_gallery_button_id();
+        let mut session = build_mvp_session_with_runtime_observed(
+            self.bootstrap_plan,
+            self.runtime,
+            true,
+            StartupCompositionEntryKind::DefaultComposition {
+                source_button_id_raw: cursor_gallery_button.raw(),
+            },
+        )?;
+        if let Err(error) = initialize_tracing_for_session(&mut session) {
+            return Err(ObservedStartupSmokeFailure::from_session(error, session));
+        }
+        info!("running startup smoke composition");
+        match run_default_cursor_gallery_flow_observed(session) {
+            Ok(composition) => Ok(composition.startup_smoke_summary()),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub fn into_native_main_menu_session(self) -> Result<StartupSession> {
+        prepare_native_main_menu_session_from_observed_bootstrap(self.with_native_shell_hosting())
     }
 
     #[must_use]
@@ -953,6 +1165,11 @@ impl StartupRuntime {
         }
     }
 
+    pub fn enable_native_shell_hosting_for_pristine_runtime(&mut self) -> Result<()> {
+        self.shell_runtime
+            .enable_native_hosting_for_pristine_runtime()
+    }
+
     pub fn publish(
         &mut self,
         arena_name: &'static str,
@@ -984,6 +1201,89 @@ impl StartupRuntime {
             "teamy_studio.startup",
             time_key,
             PublishedEvent::new(&STARTUP_SUCCEEDED_EVENT_DEFINITION, event),
+        );
+    }
+
+    pub(crate) fn publish_startup_composition_ready(
+        &mut self,
+        button_count: u64,
+        validated_button_count: u64,
+        pending_button_count: u64,
+        failed_button_count: u64,
+        policy: StartupCompositionPolicy,
+    ) {
+        let time_key = self.next_publish_time_key();
+        self.publish(
+            "teamy_studio.startup",
+            time_key,
+            PublishedEvent::new(
+                &STARTUP_COMPOSITION_READY_EVENT_DEFINITION,
+                StartupCompositionReadyEvent {
+                    button_count,
+                    validated_button_count,
+                    pending_button_count,
+                    failed_button_count,
+                    default_cursor_gallery_button_id_raw: policy
+                        .default_cursor_gallery_button_id_raw(),
+                    request_native_main_menu_launch: policy.request_native_main_menu_launch(),
+                },
+            ),
+        );
+    }
+
+    pub(crate) fn publish_startup_composition_policy_derived(
+        &mut self,
+        event: StartupCompositionPolicyDerivedEvent,
+    ) {
+        let time_key = self.next_publish_time_key();
+        self.publish(
+            "teamy_studio.startup",
+            time_key,
+            PublishedEvent::new(&STARTUP_COMPOSITION_POLICY_DERIVED_EVENT_DEFINITION, event),
+        );
+    }
+
+    pub fn publish_default_cursor_gallery_flow_requested(
+        &mut self,
+        feature_id: FeatureId,
+        feature_title: &'static str,
+        source_button_id_raw: u64,
+    ) {
+        let time_key = self.next_publish_time_key();
+        self.publish(
+            "teamy_studio.startup",
+            time_key,
+            PublishedEvent::new(
+                &DEFAULT_CURSOR_GALLERY_FLOW_REQUESTED_EVENT_DEFINITION,
+                DefaultCursorGalleryFlowRequestedEvent {
+                    feature_id,
+                    feature_title,
+                    source_button_id_raw,
+                },
+            ),
+        );
+    }
+
+    pub fn publish_native_main_menu_launch_requested(
+        &mut self,
+        button_count: u64,
+        validated_button_count: u64,
+        pending_button_count: u64,
+        failed_button_count: u64,
+    ) {
+        let time_key = self.next_publish_time_key();
+        self.publish(
+            "teamy_studio.startup",
+            time_key,
+            PublishedEvent::new(
+                &NATIVE_MAIN_MENU_LAUNCH_REQUESTED_EVENT_DEFINITION,
+                NativeMainMenuLaunchRequestedEvent {
+                    button_count,
+                    validated_button_count,
+                    pending_button_count,
+                    failed_button_count,
+                },
+            ),
         );
     }
 
@@ -1503,15 +1803,12 @@ impl StartupRuntime {
     }
 }
 
-#[expect(
-    clippy::result_large_err,
-    reason = "smoke-only observed session construction preserves runtime state so failure summaries can inspect the startup timeline"
-)]
 fn build_mvp_session_with_runtime_observed(
     bootstrap_plan: StartupBootstrapPlan,
     mut runtime: StartupRuntime,
     bootstrap_events_already_published: bool,
-) -> std::result::Result<StartupSession, ObservedStartupSessionFailure> {
+    composition_entry_kind: StartupCompositionEntryKind,
+) -> std::result::Result<StartupSession, ObservedStartupSmokeFailure> {
     if !bootstrap_events_already_published {
         runtime.publish_bootstrap_plan_events(&bootstrap_plan);
     }
@@ -1519,10 +1816,7 @@ fn build_mvp_session_with_runtime_observed(
     runtime.publish_registration_validation_started(pre_validation_snapshot);
     if let Err(error) = validate_registrations() {
         runtime.publish_registration_validation_failure_outcome(&error);
-        return Err(ObservedStartupSessionFailure {
-            error: error.into(),
-            runtime,
-        });
+        return Err(ObservedStartupSmokeFailure::from_runtime(error, runtime));
     }
     let registration_snapshot = snapshot();
     runtime.publish_registration_validation_completed(registration_snapshot);
@@ -1532,6 +1826,7 @@ fn build_mvp_session_with_runtime_observed(
     runtime.publish_feature_compatibility_validation_started(
         registration_snapshot.feature_count as u64,
     );
+    runtime.publish_feature_compatibility_validated(STARTUP_FEATURE_ID, STARTUP_FEATURE_TITLE);
     menu_snapshot.set_validation_state_for_class_id(
         CURSOR_GALLERY_BUTTON_CLASS_ID,
         FeatureValidationState::Validated,
@@ -1540,10 +1835,10 @@ fn build_mvp_session_with_runtime_observed(
         match menu_snapshot.button_by_class_id(CURSOR_GALLERY_BUTTON_CLASS_ID) {
             Some(button) => button,
             None => {
-                return Err(ObservedStartupSessionFailure {
-                    error: eyre!("cursor gallery button was not registered for feature validation"),
+                return Err(ObservedStartupSmokeFailure::from_runtime(
+                    eyre!("cursor gallery button was not registered for feature validation"),
                     runtime,
-                });
+                ));
             }
         };
     runtime.publish_feature_compatibility_validated(
@@ -1553,13 +1848,25 @@ fn build_mvp_session_with_runtime_observed(
     runtime.publish_feature_compatibility_validation_completed(
         registration_snapshot.feature_count as u64,
         0,
-        1,
+        2,
         0,
     );
     runtime.publish_feature_activation_gate_resolved(
         CURSOR_GALLERY_FEATURE_ID,
         cursor_gallery_button.title,
         cursor_gallery_button.validation_state == FeatureValidationState::Validated,
+    );
+    let (validated_button_count, pending_button_count, failed_button_count) =
+        menu_validation_counts(&menu_snapshot);
+    let policy_derivation =
+        derive_startup_composition_policy(&bootstrap_plan, composition_entry_kind);
+    runtime.publish_startup_composition_policy_derived(policy_derivation.event.clone());
+    runtime.publish_startup_composition_ready(
+        menu_snapshot.buttons().len() as u64,
+        validated_button_count,
+        pending_button_count,
+        failed_button_count,
+        policy_derivation.policy,
     );
 
     Ok(StartupSession {
@@ -1602,16 +1909,6 @@ impl StartupSession {
             "publishing timeline event"
         );
         self.runtime.publish(arena_name, time_key, event);
-    }
-
-    pub fn publish_startup_failed(
-        &mut self,
-        time_key: CanonicalTimeKey,
-        reason: &'static str,
-        failure_references: Vec<EventReference>,
-    ) {
-        self.runtime
-            .publish_startup_failed(time_key, reason, failure_references);
     }
 
     pub fn publish_startup_failed_from_latest_references(
@@ -1764,10 +2061,15 @@ pub fn observe_bootstrap_plan_from_raw_inputs(
 pub fn observe_bootstrap_plan_from_raw_inputs_with_native_shell(
     raw_inputs: RawProcessStartupInputs,
 ) -> std::result::Result<ObservedBootstrapPlan, ObservedBootstrapPlanFailure> {
-    observe_bootstrap_plan_from_raw_inputs_with_runtime(
-        raw_inputs,
-        StartupRuntime::new_with_native_shell(),
-    )
+    match observe_bootstrap_plan_from_raw_inputs(raw_inputs) {
+        Ok(observed_bootstrap) => Ok(observed_bootstrap.with_native_shell_hosting()),
+        Err(mut error) => {
+            let _ = error
+                .runtime
+                .enable_native_shell_hosting_for_pristine_runtime();
+            Err(error)
+        }
+    }
 }
 
 pub fn build_mvp_session_from_raw_inputs(
@@ -1781,15 +2083,20 @@ pub fn build_mvp_session_from_raw_inputs(
 pub fn build_mvp_session_with_native_shell_from_raw_inputs(
     raw_inputs: RawProcessStartupInputs,
 ) -> Result<StartupSession> {
-    observe_bootstrap_plan_from_raw_inputs_with_native_shell(raw_inputs)
+    observe_bootstrap_plan_from_raw_inputs(raw_inputs)
         .map_err(|error| eyre!(error.to_string()))?
-        .into_mvp_session()
+        .into_mvp_session_with_native_shell()
 }
 
 pub fn build_mvp_session_from_bootstrap_plan(
     bootstrap_plan: StartupBootstrapPlan,
 ) -> Result<StartupSession> {
-    build_mvp_session_with_runtime(bootstrap_plan, StartupRuntime::new(), false)
+    build_mvp_session_with_runtime(
+        bootstrap_plan,
+        StartupRuntime::new(),
+        false,
+        StartupCompositionEntryKind::SessionOnly,
+    )
 }
 
 pub fn build_mvp_session_with_native_shell_from_bootstrap_plan(
@@ -1799,6 +2106,7 @@ pub fn build_mvp_session_with_native_shell_from_bootstrap_plan(
         bootstrap_plan,
         StartupRuntime::new_with_native_shell(),
         false,
+        StartupCompositionEntryKind::SessionOnly,
     )
 }
 
@@ -1806,13 +2114,15 @@ fn build_mvp_session_with_runtime(
     bootstrap_plan: StartupBootstrapPlan,
     runtime: StartupRuntime,
     bootstrap_events_already_published: bool,
+    composition_entry_kind: StartupCompositionEntryKind,
 ) -> Result<StartupSession> {
     build_mvp_session_with_runtime_observed(
         bootstrap_plan,
         runtime,
         bootstrap_events_already_published,
+        composition_entry_kind,
     )
-    .map_err(|error| error.error)
+    .map_err(ObservedStartupSmokeFailure::into_report)
 }
 
 #[expect(
@@ -1880,55 +2190,55 @@ fn derive_bootstrap_plan_with_runtime(
     })
 }
 
+fn default_cursor_gallery_button_id() -> MainMenuLogicalButtonId {
+    MainMenuSnapshot::from_registrations(&registered_button_classes())
+        .button_by_class_id(CURSOR_GALLERY_BUTTON_CLASS_ID)
+        .expect("cursor gallery button should exist for default startup composition")
+        .logical_button_id
+}
+
 pub fn build_mvp_composition() -> Result<AppComposition> {
-    let session = build_mvp_session()?;
+    let cursor_gallery_button = default_cursor_gallery_button_id();
+    let session = build_mvp_session_with_runtime(
+        StartupBootstrapPlan::empty(),
+        StartupRuntime::new(),
+        false,
+        StartupCompositionEntryKind::DefaultComposition {
+            source_button_id_raw: cursor_gallery_button.raw(),
+        },
+    )?;
     run_default_cursor_gallery_flow(session)
 }
 
 pub fn build_mvp_composition_with_native_shell() -> Result<AppComposition> {
-    let session = build_mvp_session_with_native_shell()?;
+    let cursor_gallery_button = default_cursor_gallery_button_id();
+    let session = build_mvp_session_with_runtime(
+        StartupBootstrapPlan::empty(),
+        StartupRuntime::new_with_native_shell(),
+        false,
+        StartupCompositionEntryKind::DefaultComposition {
+            source_button_id_raw: cursor_gallery_button.raw(),
+        },
+    )?;
     run_default_cursor_gallery_flow(session)
 }
 
 pub fn build_mvp_composition_from_raw_inputs(
     raw_inputs: RawProcessStartupInputs,
 ) -> Result<AppComposition> {
-    let session = build_mvp_session_from_raw_inputs(raw_inputs)?;
-    run_default_cursor_gallery_flow(session)
+    observe_bootstrap_plan_from_raw_inputs(raw_inputs)
+        .map_err(|error| eyre!(error.to_string()))?
+        .into_default_composition()
 }
 
-#[expect(
-    clippy::result_large_err,
-    reason = "smoke-only observed cursor-gallery flow preserves the session so failure summaries can inspect emitted startup events"
-)]
 fn run_default_cursor_gallery_flow_observed(
     mut session: StartupSession,
-) -> std::result::Result<AppComposition, ObservedDefaultCursorGalleryFlowFailure> {
-    let clicked_button = match session
-        .menu_snapshot()
-        .button_by_class_id(CURSOR_GALLERY_BUTTON_CLASS_ID)
-        .cloned()
-    {
-        Some(clicked_button) => clicked_button,
-        None => {
-            return Err(ObservedDefaultCursorGalleryFlowFailure {
-                error: eyre!("cursor gallery button was not registered for the MVP composition"),
-                session,
-            });
-        }
-    };
-
-    let click_time_key = session.runtime.next_publish_time_key();
-    if let Err(error) =
-        session.publish_main_menu_click(clicked_button.logical_button_id, 64, 32, 1, click_time_key)
-    {
-        return Err(ObservedDefaultCursorGalleryFlowFailure { error, session });
-    }
+) -> std::result::Result<AppComposition, ObservedStartupSmokeFailure> {
     let pump_start_time_key = session.runtime.next_publish_time_key();
     let emitted_epoch_count = match session.pump_to_idle(pump_start_time_key, 8) {
         Ok(emitted_epoch_count) => emitted_epoch_count,
         Err(error) => {
-            return Err(ObservedDefaultCursorGalleryFlowFailure { error, session });
+            return Err(ObservedStartupSmokeFailure::from_session(error, session));
         }
     };
 
@@ -1943,10 +2253,10 @@ fn run_default_cursor_gallery_flow_observed(
                 session.cursor_gallery_state().windows().len(),
                 session.shell_state().windows().len(),
             );
-        return Err(ObservedDefaultCursorGalleryFlowFailure {
-            error: eyre!(DEFAULT_CURSOR_GALLERY_FLOW_FAILURE_REASON),
+        return Err(ObservedStartupSmokeFailure::from_session(
+            eyre!(DEFAULT_CURSOR_GALLERY_FLOW_FAILURE_REASON),
             session,
-        });
+        ));
     }
 
     let success_time_key = session.runtime.next_publish_time_key();
@@ -1956,43 +2266,19 @@ fn run_default_cursor_gallery_flow_observed(
 }
 
 fn run_default_cursor_gallery_flow(session: StartupSession) -> Result<AppComposition> {
-    run_default_cursor_gallery_flow_observed(session).map_err(|error| error.error)
+    run_default_cursor_gallery_flow_observed(session)
+        .map_err(ObservedStartupSmokeFailure::into_report)
 }
 
 pub fn build_startup_smoke_summary_from_raw_inputs(
     raw_inputs: RawProcessStartupInputs,
 ) -> std::result::Result<StartupSmokeSummary, ObservedStartupSmokeFailure> {
-    let observed_bootstrap = match observe_bootstrap_plan_from_raw_inputs(raw_inputs) {
-        Ok(observed_bootstrap) => observed_bootstrap,
+    match observe_bootstrap_plan_from_raw_inputs(raw_inputs) {
+        Ok(observed_bootstrap) => observed_bootstrap.into_startup_smoke_summary(),
         Err(error) => {
-            return Err(ObservedStartupSmokeFailure {
-                error: eyre!(error.to_string()),
-                summary: error.runtime().startup_smoke_summary(),
-            });
+            let (error, runtime) = error.into_parts();
+            Err(ObservedStartupSmokeFailure::from_runtime(error, runtime))
         }
-    };
-    let mut session = match observed_bootstrap.into_mvp_session_observed() {
-        Ok(session) => session,
-        Err(error) => {
-            return Err(ObservedStartupSmokeFailure {
-                error: eyre!(error.to_string()),
-                summary: error.startup_smoke_summary(),
-            });
-        }
-    };
-    if let Err(error) = initialize_tracing_for_session(&mut session) {
-        return Err(ObservedStartupSmokeFailure {
-            error,
-            summary: session.startup_smoke_summary(),
-        });
-    }
-    info!("running startup smoke composition");
-    match run_default_cursor_gallery_flow_observed(session) {
-        Ok(composition) => Ok(composition.startup_smoke_summary()),
-        Err(error) => Err(ObservedStartupSmokeFailure {
-            error: eyre!(error.to_string()),
-            summary: error.startup_smoke_summary(),
-        }),
     }
 }
 
@@ -2041,6 +2327,30 @@ fn format_startup_smoke_summary(summary: &StartupSmokeSummary) -> String {
     output
 }
 
+fn prepare_native_main_menu_session_from_observed_bootstrap(
+    observed_bootstrap: ObservedBootstrapPlan,
+) -> Result<StartupSession> {
+    let (bootstrap_plan, runtime) = observed_bootstrap.into_parts();
+    let mut session = build_mvp_session_with_runtime(
+        bootstrap_plan,
+        runtime,
+        true,
+        StartupCompositionEntryKind::ExplicitNativeMainMenu,
+    )?;
+    initialize_tracing_for_session(&mut session)?;
+    let _ = session.pump_to_idle(session.runtime.next_publish_time_key(), 1)?;
+    Ok(session)
+}
+
+#[cfg(test)]
+fn prepare_native_main_menu_session_from_raw_inputs(
+    raw_inputs: RawProcessStartupInputs,
+) -> Result<StartupSession> {
+    observe_bootstrap_plan_from_raw_inputs(raw_inputs)
+        .map_err(|error| eyre!(error.to_string()))?
+        .into_native_main_menu_session()
+}
+
 pub fn main() -> Result<()> {
     main_with_raw_inputs(RawProcessStartupInputs::capture_from_env())
 }
@@ -2067,15 +2377,263 @@ fn initialize_tracing_for_session(session: &mut StartupSession) -> Result<()> {
     }
 }
 
-fn startup_smoke_requested(raw_inputs: &RawProcessStartupInputs) -> bool {
-    raw_inputs
-        .argv
-        .iter()
-        .any(|argument| argument == "--startup-smoke")
-}
-
 fn next_main_menu_interaction_time_seed(runtime: &StartupRuntime) -> i128 {
     runtime.next_publish_time_key().raw_femtoseconds()
+}
+
+fn publish_main_menu_click_and_pump_to_idle(
+    session: &mut StartupSession,
+    logical_button_id: MainMenuLogicalButtonId,
+    next_time_key: &mut i128,
+) -> Result<usize> {
+    info!(
+        ?logical_button_id,
+        time_key = *next_time_key,
+        "publishing main menu click event"
+    );
+    session.publish_main_menu_click(
+        logical_button_id,
+        0,
+        0,
+        1,
+        CanonicalTimeKey::from_femtoseconds(*next_time_key),
+    )?;
+    *next_time_key += 16;
+    let emitted_epoch_count =
+        session.pump_to_idle(CanonicalTimeKey::from_femtoseconds(*next_time_key), 8)?;
+    info!(
+        ?logical_button_id,
+        emitted_epoch_count,
+        next_time_key = *next_time_key,
+        "pumped main menu click to idle"
+    );
+    *next_time_key += 16;
+    Ok(emitted_epoch_count)
+}
+
+fn build_live_app_timeline_window_snapshot(
+    session: &StartupSession,
+) -> LiveAppTimelineWindowSnapshot {
+    let dataset = session.runtime.timeline.projected_timeline_dataset();
+    let mut snapshot = LiveAppTimelineWindowSnapshot {
+        published_item_count: dataset.items().len(),
+        ..LiveAppTimelineWindowSnapshot::default()
+    };
+
+    let Some(bounds) = dataset.time_bounds() else {
+        return LiveAppTimelineWindowSnapshot {
+            published_item_count: dataset.items().len(),
+            ..LiveAppTimelineWindowSnapshot::with_empty_message(
+                "No published timeline events have been recorded yet.",
+            )
+        };
+    };
+
+    let plan = dataset.render_plan(
+        &TimelineViewportQuery::try_new(bounds.start(), bounds.end(), bounds.end(), 120)
+            .expect("dataset bounds should define a valid viewport query")
+            .with_grouping_mode(TimelineGroupingMode::SourceKey)
+            .with_minimum_visible_pixels(2),
+    );
+
+    let mut row_indices = BTreeMap::new();
+    let mut rows = Vec::new();
+    for row in plan.rows() {
+        let label = match row.key() {
+            teamy_studio_timeline_core::TimelineRenderRowKey::Interned(id) => dataset
+                .resolve_string(id)
+                .unwrap_or("<unresolved row>")
+                .to_owned(),
+            teamy_studio_timeline_core::TimelineRenderRowKey::All => "all".to_owned(),
+        };
+        row_indices.insert(row.id(), rows.len());
+        rows.push(LiveAppTimelineWindowRowSnapshot {
+            label,
+            render_items: Vec::new(),
+        });
+    }
+
+    let mut folded_event_cluster_count = 0_usize;
+    let mut folded_span_cluster_count = 0_usize;
+
+    for item in plan.items() {
+        let (row_id, render_item) = match item {
+            TimelineRenderItem::Span(span) => (
+                span.row_id(),
+                LiveAppTimelineWindowRenderItem {
+                    kind: LiveAppTimelineWindowRenderItemKind::Span,
+                    start_femtoseconds: span.range().start().raw_femtoseconds(),
+                    end_femtoseconds: span.range().end().raw_femtoseconds(),
+                    lane_index: span.lane_index(),
+                    count: 1,
+                },
+            ),
+            TimelineRenderItem::Event(event) => (
+                event.row_id(),
+                LiveAppTimelineWindowRenderItem {
+                    kind: LiveAppTimelineWindowRenderItemKind::Event,
+                    start_femtoseconds: event.at().raw_femtoseconds(),
+                    end_femtoseconds: event.at().raw_femtoseconds(),
+                    lane_index: 0,
+                    count: 1,
+                },
+            ),
+            TimelineRenderItem::FoldedSpanCluster(cluster) => {
+                folded_span_cluster_count += 1;
+                (
+                    cluster.row_id(),
+                    LiveAppTimelineWindowRenderItem {
+                        kind: LiveAppTimelineWindowRenderItemKind::FoldedSpanCluster,
+                        start_femtoseconds: cluster.range().start().raw_femtoseconds(),
+                        end_femtoseconds: cluster.range().end().raw_femtoseconds(),
+                        lane_index: 0,
+                        count: cluster.count(),
+                    },
+                )
+            }
+            TimelineRenderItem::FoldedEventCluster(cluster) => {
+                folded_event_cluster_count += 1;
+                (
+                    cluster.row_id(),
+                    LiveAppTimelineWindowRenderItem {
+                        kind: LiveAppTimelineWindowRenderItemKind::FoldedEventCluster,
+                        start_femtoseconds: cluster.range().start().raw_femtoseconds(),
+                        end_femtoseconds: cluster.range().end().raw_femtoseconds(),
+                        lane_index: 0,
+                        count: cluster.count(),
+                    },
+                )
+            }
+        };
+
+        if let Some(row_index) = row_indices.get(&row_id).copied() {
+            rows[row_index].render_items.push(render_item);
+        }
+    }
+
+    snapshot.visible_start_femtoseconds = bounds.start().raw_femtoseconds();
+    snapshot.visible_end_femtoseconds = bounds.end().raw_femtoseconds();
+    snapshot.visible_row_count = plan.rows().len();
+    snapshot.visible_render_item_count = plan.items().len();
+    snapshot.folded_event_cluster_count = folded_event_cluster_count;
+    snapshot.folded_span_cluster_count = folded_span_cluster_count;
+    snapshot.rows = rows;
+
+    for item in dataset.items().iter().rev().take(8) {
+        let label = dataset
+            .resolve_string(item.label())
+            .unwrap_or("<unresolved label>");
+        let source = dataset
+            .resolve_string(item.source_key())
+            .unwrap_or("<unresolved source>");
+        let timestamp = match item.kind() {
+            TimelineItemKind::Span(span) => span.start().raw_femtoseconds(),
+            TimelineItemKind::Event(event) => event.at().raw_femtoseconds(),
+        };
+        snapshot
+            .recent_events
+            .push(format!("{timestamp}: {source} :: {label}"));
+    }
+
+    snapshot
+}
+
+#[cfg(test)]
+fn build_live_app_timeline_preview_description(session: &StartupSession) -> String {
+    let snapshot = build_live_app_timeline_window_snapshot(session);
+    let mut output = String::from("Live app timeline preview\n");
+    output.push_str(&format!(
+        "published_items: {}\n",
+        snapshot.published_item_count
+    ));
+
+    if let Some(message) = &snapshot.empty_message {
+        output.push_str(message);
+        output.push('\n');
+        return output;
+    }
+
+    output.push_str(&format!(
+        "visible_range_femtoseconds: {}..{}\n",
+        snapshot.visible_start_femtoseconds, snapshot.visible_end_femtoseconds
+    ));
+    output.push_str(&format!("visible_rows: {}\n", snapshot.visible_row_count));
+    output.push_str(&format!(
+        "visible_render_items: {}\n",
+        snapshot.visible_render_item_count
+    ));
+    output.push_str(&format!(
+        "folded_event_clusters: {}\n",
+        snapshot.folded_event_cluster_count
+    ));
+    output.push_str(&format!(
+        "folded_span_clusters: {}\n",
+        snapshot.folded_span_cluster_count
+    ));
+
+    output.push_str("\nVisible rows:\n");
+    for row in snapshot.rows.iter().take(8) {
+        output.push_str(&format!(
+            "- {}: {} render items\n",
+            row.label,
+            row.render_items.len()
+        ));
+    }
+
+    output.push_str("\nRecent published events:\n");
+    for event in snapshot.recent_events.iter().take(8) {
+        output.push_str("- ");
+        output.push_str(event);
+        output.push('\n');
+    }
+
+    output
+}
+
+fn refresh_live_app_timeline_window_snapshot(session: &StartupSession) {
+    store_live_app_timeline_window_dataset(session.runtime.timeline.projected_timeline_dataset());
+}
+
+fn publish_live_app_timeline_window_request_and_pump_to_idle(
+    session: &mut StartupSession,
+    next_time_key: &mut i128,
+) -> Result<LogicalWindowId> {
+    let logical_window_id = next_live_app_timeline_window_id();
+    let request = live_app_timeline_window_request(logical_window_id);
+    session.publish_event(
+        "teamy_studio.timeline_window",
+        CanonicalTimeKey::from_femtoseconds(*next_time_key),
+        PublishedEvent::new(&WINDOW_CREATE_REQUEST_EVENT_DEFINITION, request),
+    );
+    *next_time_key += 16;
+    let _ = session.pump_to_idle(CanonicalTimeKey::from_femtoseconds(*next_time_key), 8)?;
+    *next_time_key += 16;
+    Ok(logical_window_id)
+}
+
+fn handle_timeline_button_click(
+    session: &mut StartupSession,
+    logical_button_id: MainMenuLogicalButtonId,
+    next_time_key: &mut i128,
+) -> Result<()> {
+    let emitted_epoch_count =
+        publish_main_menu_click_and_pump_to_idle(session, logical_button_id, next_time_key)?;
+    refresh_live_app_timeline_window_snapshot(session);
+    let logical_window_id =
+        publish_live_app_timeline_window_request_and_pump_to_idle(session, next_time_key)?;
+    refresh_live_app_timeline_window_snapshot(session);
+    let snapshot = build_live_app_timeline_window_snapshot(session);
+
+    info!(
+        ?logical_button_id,
+        emitted_epoch_count,
+        logical_window_id = logical_window_id.raw(),
+        title = LIVE_APP_TIMELINE_WINDOW_TITLE,
+        visible_row_count = snapshot.visible_row_count,
+        visible_render_item_count = snapshot.visible_render_item_count,
+        "opened live app timeline window"
+    );
+    Ok(())
 }
 
 fn unimplemented_main_menu_dialog(
@@ -2112,23 +2670,28 @@ pub fn main_with_raw_inputs(raw_inputs: RawProcessStartupInputs) -> Result<()> {
         return Ok(());
     }
 
-    if startup_smoke_requested(&raw_inputs) {
-        match build_startup_smoke_summary_from_raw_inputs(raw_inputs) {
+    let observed_bootstrap = observe_bootstrap_plan_from_raw_inputs(raw_inputs)
+        .map_err(|error| eyre!(error.to_string()))?;
+
+    if observed_bootstrap
+        .bootstrap_plan()
+        .global_args
+        .startup_smoke
+    {
+        match observed_bootstrap.into_startup_smoke_summary() {
             Ok(summary) => {
                 print!("{}", format_startup_smoke_summary(&summary));
                 return Ok(());
             }
             Err(error) => {
-                print!("{}", format_startup_smoke_summary(error.summary()));
-                return Err(error.into());
+                let summary = error.summary();
+                print!("{}", format_startup_smoke_summary(&summary));
+                return Err(eyre!(error.to_string()));
             }
         }
     }
 
-    let mut session = observe_bootstrap_plan_from_raw_inputs_with_native_shell(raw_inputs)
-        .map_err(|error| eyre!(error.to_string()))?
-        .into_mvp_session()?;
-    initialize_tracing_for_session(&mut session)?;
+    let mut session = observed_bootstrap.into_native_main_menu_session()?;
     teamy_studio_shell::initialize_dpi_awareness();
     let menu_snapshot = session.menu_snapshot().clone();
     let mut next_time_key = next_main_menu_interaction_time_seed(&session.runtime);
@@ -2148,6 +2711,14 @@ pub fn main_with_raw_inputs(raw_inputs: RawProcessStartupInputs) -> Result<()> {
                     title,
                     "startup received main menu click callback"
                 );
+                if class_id == TIMELINE_BUTTON_CLASS_ID {
+                    handle_timeline_button_click(
+                        &mut session,
+                        logical_button_id,
+                        &mut next_time_key,
+                    )?;
+                    return Ok(());
+                }
                 if let Some((title, description)) = unimplemented_main_menu_dialog(class_id, title)
                 {
                     info!(title, description, "showing unimplemented main menu dialog");
@@ -2155,26 +2726,12 @@ pub fn main_with_raw_inputs(raw_inputs: RawProcessStartupInputs) -> Result<()> {
                     return Ok(());
                 }
             }
-            info!(
-                ?logical_button_id,
-                time_key = next_time_key,
-                "publishing main menu click event"
-            );
-            session.publish_main_menu_click(
+            let _ = publish_main_menu_click_and_pump_to_idle(
+                &mut session,
                 logical_button_id,
-                0,
-                0,
-                1,
-                CanonicalTimeKey::from_femtoseconds(next_time_key),
+                &mut next_time_key,
             )?;
-            next_time_key += 16;
-            let emitted_epoch_count =
-                session.pump_to_idle(CanonicalTimeKey::from_femtoseconds(next_time_key), 8)?;
-            info!(
-                ?logical_button_id,
-                emitted_epoch_count, next_time_key, "pumped main menu click to idle"
-            );
-            next_time_key += 16;
+            refresh_live_app_timeline_window_snapshot(&session);
             Ok(())
         },
     )
@@ -2184,41 +2741,48 @@ pub fn main_with_raw_inputs(raw_inputs: RawProcessStartupInputs) -> Result<()> {
 mod tests {
     use super::{
         AppComposition, BOOTSTRAP_CLI_PARSE_FAILED_EVENT_DEFINITION, BootstrapCliParseFailedEvent,
-        DEFAULT_CURSOR_GALLERY_FLOW_FAILED_EVENT_DEFINITION, DefaultCursorGalleryFlowFailedEvent,
+        DEFAULT_CURSOR_GALLERY_FLOW_FAILED_EVENT_DEFINITION,
+        DEFAULT_CURSOR_GALLERY_FLOW_REQUESTED_EVENT_DEFINITION,
+        DefaultCursorGalleryFlowFailedEvent, DefaultCursorGalleryFlowRequestedEvent,
         FEATURE_ACTIVATION_GATE_RESOLVED_EVENT_DEFINITION,
         FEATURE_COMPATIBILITY_VALIDATED_EVENT_DEFINITION,
         FEATURE_COMPATIBILITY_VALIDATION_COMPLETED_EVENT_DEFINITION,
         FEATURE_COMPATIBILITY_VALIDATION_STARTED_EVENT_DEFINITION,
         FeatureActivationGateResolvedEvent, FeatureCompatibilityValidatedEvent,
         FeatureCompatibilityValidationCompletedEvent, FeatureCompatibilityValidationStartedEvent,
+        NATIVE_MAIN_MENU_LAUNCH_REQUESTED_EVENT_DEFINITION, NativeMainMenuLaunchRequestedEvent,
         PROCESS_STARTUP_OBSERVED_EVENT_DEFINITION, ProcessStartupObservedEvent,
         REGISTRATION_VALIDATION_COMPLETED_EVENT_DEFINITION,
         REGISTRATION_VALIDATION_FAILED_EVENT_DEFINITION,
         REGISTRATION_VALIDATION_STARTED_EVENT_DEFINITION, RawProcessStartupInputs,
         RegistrationValidationCompletedEvent, RegistrationValidationFailedEvent,
-        RegistrationValidationStartedEvent, STARTUP_FAILED_EVENT_DEFINITION,
-        STARTUP_GLOBAL_ARGS_PARSED_EVENT_DEFINITION, STARTUP_LOGGING_CONFIGURED_EVENT_DEFINITION,
-        STARTUP_LOGGING_PLAN_FAILED_EVENT_DEFINITION, STARTUP_SUCCEEDED_EVENT_DEFINITION,
-        StartupBootstrapPlan, StartupFailedEvent, StartupGlobalArgsParsedEvent,
-        StartupLoggingConfiguredEvent, StartupLoggingPlanFailedEvent, StartupRuntime,
-        StartupSession, StartupSucceededEvent, TRACING_INITIALIZATION_FAILED_EVENT_DEFINITION,
-        TRACING_INITIALIZED_EVENT_DEFINITION, TRACING_OBSERVATION_DRAIN_LIMIT,
-        TRACING_RECORD_OBSERVED_EVENT_DEFINITION, TracingInitializationFailedEvent,
-        TracingInitializedEvent, TracingObservationLayer, TracingObservedField,
-        TracingRecordObservedEvent, build_mvp_composition, build_mvp_composition_from_raw_inputs,
-        build_mvp_session, build_mvp_session_from_bootstrap_plan,
-        build_mvp_session_from_raw_inputs, build_mvp_session_with_native_shell,
-        build_startup_smoke_summary_from_raw_inputs, derive_bootstrap_plan,
-        derive_bootstrap_plan_with_runtime, format_startup_smoke_summary,
-        initialize_tracing_for_session, next_main_menu_interaction_time_seed,
-        observe_bootstrap_plan_from_raw_inputs, unimplemented_main_menu_dialog,
+        RegistrationValidationStartedEvent, STARTUP_COMPOSITION_POLICY_DERIVED_EVENT_DEFINITION,
+        STARTUP_COMPOSITION_READY_EVENT_DEFINITION, STARTUP_FAILED_EVENT_DEFINITION,
+        STARTUP_FEATURE_ID, STARTUP_FEATURE_TITLE, STARTUP_GLOBAL_ARGS_PARSED_EVENT_DEFINITION,
+        STARTUP_LOGGING_CONFIGURED_EVENT_DEFINITION, STARTUP_LOGGING_PLAN_FAILED_EVENT_DEFINITION,
+        STARTUP_SUCCEEDED_EVENT_DEFINITION, StartupBootstrapPlan,
+        StartupCompositionPolicyDerivedEvent, StartupCompositionReadyEvent, StartupFailedEvent,
+        StartupGlobalArgsParsedEvent, StartupLoggingConfiguredEvent, StartupLoggingPlanFailedEvent,
+        StartupRuntime, StartupSession, StartupSucceededEvent,
+        TRACING_INITIALIZATION_FAILED_EVENT_DEFINITION, TRACING_INITIALIZED_EVENT_DEFINITION,
+        TRACING_OBSERVATION_DRAIN_LIMIT, TRACING_RECORD_OBSERVED_EVENT_DEFINITION,
+        TracingInitializationFailedEvent, TracingInitializedEvent, TracingObservationLayer,
+        TracingObservedField, TracingRecordObservedEvent,
+        build_live_app_timeline_preview_description, build_mvp_composition,
+        build_mvp_composition_from_raw_inputs, build_mvp_session,
+        build_mvp_session_from_bootstrap_plan, build_mvp_session_from_raw_inputs,
+        build_mvp_session_with_native_shell, build_startup_smoke_summary_from_raw_inputs,
+        derive_bootstrap_plan, derive_bootstrap_plan_with_runtime, format_startup_smoke_summary,
+        handle_timeline_button_click, initialize_tracing_for_session,
+        next_main_menu_interaction_time_seed, observe_bootstrap_plan_from_raw_inputs,
+        prepare_native_main_menu_session_from_raw_inputs, unimplemented_main_menu_dialog,
     };
     use teamy_studio_cursor_gallery::{
         CURSOR_GALLERY_BUTTON_CLASS_ID, CURSOR_GALLERY_OPEN_INTENT_DEFINITION,
     };
     use teamy_studio_event_core::{EventLogIntent, EventLogLevel};
     use teamy_studio_launcher_catalog::{
-        ENVIRONMENT_VARIABLES_BUTTON_CLASS_ID, TERMINAL_BUTTON_CLASS_ID,
+        ENVIRONMENT_VARIABLES_BUTTON_CLASS_ID, TERMINAL_BUTTON_CLASS_ID, TIMELINE_BUTTON_CLASS_ID,
     };
     use teamy_studio_main_menu::{
         FeatureValidationState, MAIN_MENU_CLICKED_EVENT_DEFINITION, MainMenuSnapshot,
@@ -2228,11 +2792,13 @@ mod tests {
         TriggerRegistrationId, registration_provenance,
     };
     use teamy_studio_shell::{
-        InitialWindowCommand, RendererHostMode, WINDOW_CREATE_REQUEST_EVENT_DEFINITION,
-        WINDOW_CREATED_EVENT_DEFINITION, WindowHostOptions,
+        InitialWindowCommand, RendererHostMode, ShellHostMode,
+        WINDOW_CREATE_REQUEST_EVENT_DEFINITION, WINDOW_CREATED_EVENT_DEFINITION, WindowHostOptions,
     };
     use teamy_studio_timeline_core::CanonicalTimeKey;
     use tracing_subscriber::prelude::*;
+
+    use super::timeline_window_scene::LIVE_APP_TIMELINE_WINDOW_TITLE;
 
     #[test]
     fn environment_variables_uses_legacy_placeholder_copy() {
@@ -2348,166 +2914,62 @@ mod tests {
         assert!(composition.shell_state.pending_requests().is_empty());
         assert_eq!(composition.shell_state.windows().len(), 1);
         assert!(composition.bootstrap_plan().raw_inputs.argv.is_empty());
-        assert_eq!(published.len(), 14);
-        assert_eq!(published_records.len(), 14);
-        assert_eq!(event_references.len(), 14);
+        assert_eq!(published.len(), 17);
+        assert_eq!(published_records.len(), 18);
+        assert_eq!(event_references.len(), 18);
         assert_eq!(latest_event_references.len(), 1);
-        assert_eq!(published[0].1.events().len(), 1);
-        assert_eq!(published[1].1.events().len(), 1);
-        assert_eq!(published[2].1.events().len(), 1);
-        assert_eq!(published[3].1.events().len(), 1);
-        assert_eq!(published[4].1.events().len(), 1);
-        assert_eq!(published[5].1.events().len(), 1);
-        assert_eq!(published[6].1.events().len(), 1);
-        assert_eq!(published[7].1.events().len(), 1);
-        assert_eq!(published[8].1.events().len(), 1);
-        assert_eq!(published[9].1.events().len(), 1);
-        assert_eq!(published[10].1.events().len(), 1);
-        assert_eq!(published[11].1.events().len(), 1);
-        assert_eq!(published[12].1.events().len(), 1);
-        assert_eq!(published[13].1.events().len(), 1);
-        assert_eq!(published_records[0].0.time_key.raw_femtoseconds(), 0);
-        assert_eq!(published_records[1].0.time_key.raw_femtoseconds(), 1);
-        assert_eq!(published_records[2].0.time_key.raw_femtoseconds(), 2);
-        assert_eq!(published_records[3].0.time_key.raw_femtoseconds(), 3);
-        assert_eq!(published_records[4].0.time_key.raw_femtoseconds(), 4);
-        assert_eq!(published_records[5].0.time_key.raw_femtoseconds(), 5);
-        assert_eq!(published_records[6].0.time_key.raw_femtoseconds(), 6);
-        assert_eq!(published_records[7].0.time_key.raw_femtoseconds(), 7);
-        assert_eq!(published_records[8].0.time_key.raw_femtoseconds(), 8);
-        assert_eq!(published_records[9].0.time_key.raw_femtoseconds(), 9);
-        assert_eq!(published_records[10].0.time_key.raw_femtoseconds(), 10);
-        assert_eq!(published_records[11].0.time_key.raw_femtoseconds(), 12);
-        assert_eq!(published_records[12].0.time_key.raw_femtoseconds(), 13);
-        assert_eq!(published_records[13].0.time_key.raw_femtoseconds(), 14);
-        assert_eq!(
-            published[0].1.events()[0].definition().id,
-            PROCESS_STARTUP_OBSERVED_EVENT_DEFINITION.id
-        );
-        assert_eq!(
-            published[1].1.events()[0].definition().id,
-            STARTUP_GLOBAL_ARGS_PARSED_EVENT_DEFINITION.id
-        );
-        assert_eq!(
-            published[2].1.events()[0].definition().id,
-            STARTUP_LOGGING_CONFIGURED_EVENT_DEFINITION.id
-        );
-        assert_eq!(
-            published[3].1.events()[0].definition().id,
-            REGISTRATION_VALIDATION_STARTED_EVENT_DEFINITION.id
-        );
-        assert_eq!(
-            published[4].1.events()[0].definition().id,
-            REGISTRATION_VALIDATION_COMPLETED_EVENT_DEFINITION.id
-        );
-        assert_eq!(
-            published[5].1.events()[0].definition().id,
-            FEATURE_COMPATIBILITY_VALIDATION_STARTED_EVENT_DEFINITION.id
-        );
-        assert_eq!(
-            published[6].1.events()[0].definition().id,
-            FEATURE_COMPATIBILITY_VALIDATED_EVENT_DEFINITION.id
-        );
-        assert_eq!(
-            published[7].1.events()[0].definition().id,
-            FEATURE_COMPATIBILITY_VALIDATION_COMPLETED_EVENT_DEFINITION.id
-        );
-        assert_eq!(
-            published[8].1.events()[0].definition().id,
-            FEATURE_ACTIVATION_GATE_RESOLVED_EVENT_DEFINITION.id
-        );
-        assert_eq!(
-            published[9].1.events()[0].definition().id,
-            MAIN_MENU_CLICKED_EVENT_DEFINITION.id
-        );
-        assert_eq!(
-            published[10].1.events()[0].definition().id,
-            CURSOR_GALLERY_OPEN_INTENT_DEFINITION.id
-        );
-        assert_eq!(
-            published[11].1.events()[0].definition().id,
-            WINDOW_CREATE_REQUEST_EVENT_DEFINITION.id
-        );
-        assert_eq!(
-            published[12].1.events()[0].definition().id,
-            WINDOW_CREATED_EVENT_DEFINITION.id
-        );
-        assert_eq!(
-            published[13].1.events()[0].definition().id,
-            STARTUP_SUCCEEDED_EVENT_DEFINITION.id
-        );
-        assert_eq!(
-            event_references[0].event_definition_id,
-            PROCESS_STARTUP_OBSERVED_EVENT_DEFINITION.id
-        );
-        assert_eq!(
-            event_references[1].event_definition_id,
-            STARTUP_GLOBAL_ARGS_PARSED_EVENT_DEFINITION.id
-        );
-        assert_eq!(
-            event_references[2].event_definition_id,
-            STARTUP_LOGGING_CONFIGURED_EVENT_DEFINITION.id
-        );
-        assert_eq!(
-            event_references[3].event_definition_id,
-            REGISTRATION_VALIDATION_STARTED_EVENT_DEFINITION.id
-        );
-        assert_eq!(
-            event_references[4].event_definition_id,
-            REGISTRATION_VALIDATION_COMPLETED_EVENT_DEFINITION.id
-        );
-        assert_eq!(
-            event_references[5].event_definition_id,
-            FEATURE_COMPATIBILITY_VALIDATION_STARTED_EVENT_DEFINITION.id
-        );
-        assert_eq!(
-            event_references[6].event_definition_id,
-            FEATURE_COMPATIBILITY_VALIDATED_EVENT_DEFINITION.id
-        );
-        assert_eq!(
-            event_references[7].event_definition_id,
-            FEATURE_COMPATIBILITY_VALIDATION_COMPLETED_EVENT_DEFINITION.id
-        );
-        assert_eq!(
-            event_references[8].event_definition_id,
-            FEATURE_ACTIVATION_GATE_RESOLVED_EVENT_DEFINITION.id
-        );
-        assert_eq!(
-            event_references[9].event_definition_id,
-            MAIN_MENU_CLICKED_EVENT_DEFINITION.id
-        );
-        assert_eq!(
-            event_references[10].event_definition_id,
-            CURSOR_GALLERY_OPEN_INTENT_DEFINITION.id
-        );
-        assert_eq!(
-            event_references[11].event_definition_id,
-            WINDOW_CREATE_REQUEST_EVENT_DEFINITION.id
-        );
-        assert_eq!(
-            event_references[12].event_definition_id,
-            WINDOW_CREATED_EVENT_DEFINITION.id
-        );
-        assert_eq!(
-            event_references[13].event_definition_id,
-            STARTUP_SUCCEEDED_EVENT_DEFINITION.id
-        );
-        assert_eq!(event_references[0].timeline_offset_hint.raw_value(), 0);
-        assert_eq!(event_references[1].timeline_offset_hint.raw_value(), 1);
-        assert_eq!(event_references[2].timeline_offset_hint.raw_value(), 2);
-        assert_eq!(event_references[3].timeline_offset_hint.raw_value(), 3);
-        assert_eq!(event_references[4].timeline_offset_hint.raw_value(), 4);
-        assert_eq!(event_references[5].timeline_offset_hint.raw_value(), 5);
-        assert_eq!(event_references[6].timeline_offset_hint.raw_value(), 6);
-        assert_eq!(event_references[7].timeline_offset_hint.raw_value(), 7);
-        assert_eq!(event_references[8].timeline_offset_hint.raw_value(), 8);
-        assert_eq!(event_references[9].timeline_offset_hint.raw_value(), 9);
-        assert_eq!(event_references[10].timeline_offset_hint.raw_value(), 10);
-        assert_eq!(event_references[11].timeline_offset_hint.raw_value(), 12);
-        assert_eq!(event_references[12].timeline_offset_hint.raw_value(), 13);
-        assert_eq!(event_references[13].timeline_offset_hint.raw_value(), 14);
-        assert_eq!(latest_event_references[0], event_references[13]);
+        let published_definition_times = published_records
+            .iter()
+            .map(|(cursor, _, event)| (event.definition().id, cursor.time_key.raw_femtoseconds()))
+            .collect::<Vec<_>>();
+        let reference_definition_times = event_references
+            .iter()
+            .map(|reference| {
+                (
+                    reference.event_definition_id,
+                    reference.timeline_offset_hint.raw_value(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(published_definition_times, reference_definition_times);
+        assert_eq!(latest_event_references[0], event_references[17]);
 
+        let definition_ids = published_records
+            .iter()
+            .map(|(_, _, event)| event.definition().id)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            definition_ids,
+            vec![
+                PROCESS_STARTUP_OBSERVED_EVENT_DEFINITION.id,
+                STARTUP_GLOBAL_ARGS_PARSED_EVENT_DEFINITION.id,
+                STARTUP_LOGGING_CONFIGURED_EVENT_DEFINITION.id,
+                REGISTRATION_VALIDATION_STARTED_EVENT_DEFINITION.id,
+                REGISTRATION_VALIDATION_COMPLETED_EVENT_DEFINITION.id,
+                FEATURE_COMPATIBILITY_VALIDATION_STARTED_EVENT_DEFINITION.id,
+                FEATURE_COMPATIBILITY_VALIDATED_EVENT_DEFINITION.id,
+                FEATURE_COMPATIBILITY_VALIDATED_EVENT_DEFINITION.id,
+                FEATURE_COMPATIBILITY_VALIDATION_COMPLETED_EVENT_DEFINITION.id,
+                FEATURE_ACTIVATION_GATE_RESOLVED_EVENT_DEFINITION.id,
+                STARTUP_COMPOSITION_POLICY_DERIVED_EVENT_DEFINITION.id,
+                STARTUP_COMPOSITION_READY_EVENT_DEFINITION.id,
+                DEFAULT_CURSOR_GALLERY_FLOW_REQUESTED_EVENT_DEFINITION.id,
+                MAIN_MENU_CLICKED_EVENT_DEFINITION.id,
+                CURSOR_GALLERY_OPEN_INTENT_DEFINITION.id,
+                WINDOW_CREATE_REQUEST_EVENT_DEFINITION.id,
+                WINDOW_CREATED_EVENT_DEFINITION.id,
+                STARTUP_SUCCEEDED_EVENT_DEFINITION.id,
+            ]
+        );
+        assert_eq!(published_definition_times[0].1, 0);
+        assert_eq!(published_definition_times[10].1, 10);
+        assert_eq!(published_definition_times[11].1, 11);
+        assert_eq!(published_definition_times[12].1, 12);
+        assert_eq!(published_definition_times[13].1, 12);
+        assert_eq!(published_definition_times[14].1, 15);
+        assert_eq!(published_definition_times[15].1, 18);
+        assert_eq!(published_definition_times[16].1, 19);
+        assert_eq!(published_definition_times[17].1, 20);
         let process_startup_observed = published[0].1.events()[0]
             .downcast_ref::<ProcessStartupObservedEvent>()
             .expect("bootstrap observed payload should be present");
@@ -2551,26 +3013,35 @@ mod tests {
         let feature_validation_started = published[5].1.events()[0]
             .downcast_ref::<FeatureCompatibilityValidationStartedEvent>()
             .expect("feature validation start payload should be present");
-        assert_eq!(feature_validation_started.feature_count, 1);
+        assert_eq!(feature_validation_started.feature_count, 2);
 
-        let feature_validated = published[6].1.events()[0]
+        let startup_feature_validated = published[6].1.events()[0]
             .downcast_ref::<FeatureCompatibilityValidatedEvent>()
-            .expect("feature validated payload should be present");
+            .expect("startup feature validated payload should be present");
+        assert_eq!(startup_feature_validated.feature_id, STARTUP_FEATURE_ID);
+        assert_eq!(
+            startup_feature_validated.feature_title,
+            STARTUP_FEATURE_TITLE
+        );
+
+        let feature_validated = published[7].1.events()[0]
+            .downcast_ref::<FeatureCompatibilityValidatedEvent>()
+            .expect("cursor gallery feature validated payload should be present");
         assert_eq!(
             feature_validated.feature_id,
             teamy_studio_cursor_gallery::CURSOR_GALLERY_FEATURE_ID
         );
         assert_eq!(feature_validated.feature_title, "Cursor Gallery");
 
-        let feature_validation_completed = published[7].1.events()[0]
+        let feature_validation_completed = published[8].1.events()[0]
             .downcast_ref::<FeatureCompatibilityValidationCompletedEvent>()
             .expect("feature validation completion payload should be present");
-        assert_eq!(feature_validation_completed.feature_count, 1);
+        assert_eq!(feature_validation_completed.feature_count, 2);
         assert_eq!(feature_validation_completed.pending_count, 0);
-        assert_eq!(feature_validation_completed.validated_count, 1);
+        assert_eq!(feature_validation_completed.validated_count, 2);
         assert_eq!(feature_validation_completed.failed_count, 0);
 
-        let feature_activation_gate = published[8].1.events()[0]
+        let feature_activation_gate = published[9].1.events()[0]
             .downcast_ref::<FeatureActivationGateResolvedEvent>()
             .expect("feature activation gate payload should be present");
         assert_eq!(
@@ -2580,11 +3051,48 @@ mod tests {
         assert_eq!(feature_activation_gate.feature_title, "Cursor Gallery");
         assert!(feature_activation_gate.allows_activation);
 
-        let startup_succeeded = published[13].1.events()[0]
+        let startup_policy_derived = published[10].1.events()[0]
+            .downcast_ref::<StartupCompositionPolicyDerivedEvent>()
+            .expect("startup composition policy payload should be present");
+        assert_eq!(startup_policy_derived.entry_kind, "default_composition");
+        assert!(!startup_policy_derived.startup_smoke_requested);
+        assert!(
+            startup_policy_derived
+                .default_cursor_gallery_button_id_raw
+                .is_some()
+        );
+        assert!(!startup_policy_derived.request_native_main_menu_launch);
+
+        let startup_ready = published[11].1.events()[0]
+            .downcast_ref::<StartupCompositionReadyEvent>()
+            .expect("startup composition ready payload should be present");
+        assert_eq!(startup_ready.button_count, 16);
+        assert_eq!(startup_ready.validated_button_count, 1);
+        assert!(startup_ready.pending_button_count >= 1);
+        assert_eq!(startup_ready.failed_button_count, 0);
+        assert!(startup_ready.default_cursor_gallery_button_id_raw.is_some());
+        assert!(!startup_ready.request_native_main_menu_launch);
+
+        let default_flow_requested = published[12].1.events()[0]
+            .downcast_ref::<DefaultCursorGalleryFlowRequestedEvent>()
+            .expect("default cursor-gallery flow request payload should be present");
+        assert_eq!(
+            default_flow_requested.feature_id,
+            teamy_studio_cursor_gallery::CURSOR_GALLERY_FEATURE_ID
+        );
+        assert_eq!(default_flow_requested.feature_title, "Cursor Gallery");
+        assert_eq!(
+            default_flow_requested.source_button_id_raw,
+            startup_ready
+                .default_cursor_gallery_button_id_raw
+                .expect("default flow should retain the cursor-gallery button id")
+        );
+
+        let startup_succeeded = published[16].1.events()[0]
             .downcast_ref::<StartupSucceededEvent>()
             .expect("startup success payload should be present");
-        assert_eq!(startup_succeeded.completed_at.raw_femtoseconds(), 14);
-        assert_eq!(startup_succeeded.prior_epoch_count, 13);
+        assert_eq!(startup_succeeded.completed_at.raw_femtoseconds(), 20);
+        assert_eq!(startup_succeeded.prior_epoch_count, 16);
     }
 
     #[test]
@@ -2656,7 +3164,7 @@ mod tests {
         assert!(emitted_epoch_count >= 1);
         assert_eq!(
             session_record_times,
-            vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 50, 51, 53, 54]
+            vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 50, 51, 54, 55]
         );
         assert_eq!(
             session_reference_definitions,
@@ -2671,20 +3179,23 @@ mod tests {
                     5
                 ),
                 (FEATURE_COMPATIBILITY_VALIDATED_EVENT_DEFINITION.id, 6),
+                (FEATURE_COMPATIBILITY_VALIDATED_EVENT_DEFINITION.id, 7),
                 (
                     FEATURE_COMPATIBILITY_VALIDATION_COMPLETED_EVENT_DEFINITION.id,
-                    7
+                    8
                 ),
-                (FEATURE_ACTIVATION_GATE_RESOLVED_EVENT_DEFINITION.id, 8),
+                (FEATURE_ACTIVATION_GATE_RESOLVED_EVENT_DEFINITION.id, 9),
+                (STARTUP_COMPOSITION_POLICY_DERIVED_EVENT_DEFINITION.id, 10),
+                (STARTUP_COMPOSITION_READY_EVENT_DEFINITION.id, 11),
                 (MAIN_MENU_CLICKED_EVENT_DEFINITION.id, 50),
                 (CURSOR_GALLERY_OPEN_INTENT_DEFINITION.id, 51),
-                (WINDOW_CREATE_REQUEST_EVENT_DEFINITION.id, 53),
-                (WINDOW_CREATED_EVENT_DEFINITION.id, 54),
+                (WINDOW_CREATE_REQUEST_EVENT_DEFINITION.id, 54),
+                (WINDOW_CREATED_EVENT_DEFINITION.id, 55),
             ]
         );
         assert_eq!(
             latest_session_reference_definitions,
-            vec![(WINDOW_CREATED_EVENT_DEFINITION.id, 54)]
+            vec![(WINDOW_CREATED_EVENT_DEFINITION.id, 55)]
         );
         assert_eq!(
             composition
@@ -2698,7 +3209,7 @@ mod tests {
         assert_eq!(composition.shell_hosted_windows.len(), 1);
         assert_eq!(composition.shell_state.windows().len(), 1);
         assert_eq!(
-            composition.timeline.published_epochs()[9]
+            composition.timeline.published_epochs()[12]
                 .0
                 .time_key
                 .raw_femtoseconds(),
@@ -2837,6 +3348,90 @@ mod tests {
     }
 
     #[test]
+    fn observed_bootstrap_plan_can_build_default_composition() {
+        let composition = observe_bootstrap_plan_from_raw_inputs(RawProcessStartupInputs {
+            argv: vec!["--log-filter".to_owned(), "trace".to_owned()],
+            rust_log: Some("warn".to_owned()),
+        })
+        .expect("valid startup args should produce an observed bootstrap plan")
+        .into_default_composition()
+        .expect("observed bootstrap plan should build the default composition");
+
+        assert_eq!(
+            composition.bootstrap_plan().raw_inputs.argv,
+            vec!["--log-filter".to_owned(), "trace".to_owned()]
+        );
+        assert_eq!(
+            composition
+                .bootstrap_plan()
+                .logging
+                .effective_filter_directive(),
+            "trace"
+        );
+        assert_eq!(composition.cursor_gallery_state.windows().len(), 1);
+        assert_eq!(composition.shell_hosted_windows.len(), 1);
+    }
+
+    #[test]
+    fn observed_bootstrap_plan_can_build_startup_smoke_summary() {
+        let summary = observe_bootstrap_plan_from_raw_inputs(RawProcessStartupInputs {
+            argv: vec![
+                "--startup-smoke".to_owned(),
+                "--log-filter".to_owned(),
+                "trace".to_owned(),
+            ],
+            rust_log: None,
+        })
+        .expect("valid startup smoke args should produce an observed bootstrap plan")
+        .into_startup_smoke_summary()
+        .expect("observed bootstrap plan should build a smoke summary");
+
+        assert!(summary.contains_startup_succeeded_event);
+        assert!(!summary.contains_startup_failed_event);
+        assert_eq!(summary.latest_startup_failure_reason, None);
+        assert_eq!(summary.cursor_gallery_window_count, 1);
+        assert_eq!(summary.shell_hosted_window_count, 1);
+    }
+
+    #[test]
+    fn observed_bootstrap_plan_can_enable_native_shell_before_session_construction() {
+        let observed_bootstrap = observe_bootstrap_plan_from_raw_inputs(RawProcessStartupInputs {
+            argv: vec!["--log-filter".to_owned(), "trace".to_owned()],
+            rust_log: None,
+        })
+        .expect("valid startup args should produce an observed bootstrap plan")
+        .with_native_shell_hosting();
+
+        assert_eq!(
+            observed_bootstrap.runtime().shell_runtime.host_mode(),
+            ShellHostMode::Native
+        );
+        assert!(
+            observed_bootstrap
+                .runtime()
+                .shell_runtime
+                .state()
+                .windows()
+                .is_empty()
+        );
+        assert!(
+            observed_bootstrap
+                .runtime()
+                .shell_runtime
+                .state()
+                .pending_requests()
+                .is_empty()
+        );
+        assert!(
+            observed_bootstrap
+                .runtime()
+                .shell_runtime
+                .hosted_windows()
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn mvp_composition_preserves_explicit_bootstrap_inputs() {
         let composition = build_mvp_composition_from_raw_inputs(RawProcessStartupInputs {
             argv: vec!["--log-filter".to_owned(), "trace".to_owned()],
@@ -2855,6 +3450,101 @@ mod tests {
                 .effective_filter_directive(),
             "trace"
         );
+    }
+
+    #[test]
+    fn native_main_menu_session_preparation_publishes_launch_request_event() {
+        let session = prepare_native_main_menu_session_from_raw_inputs(RawProcessStartupInputs {
+            argv: vec!["--log-filter".to_owned(), "trace".to_owned()],
+            rust_log: None,
+        })
+        .expect("native main-menu session should prepare without opening a window");
+
+        let published = session.runtime.timeline.published_epochs();
+        let launch_requested = published
+            .last()
+            .expect("native main-menu launch request should be the latest startup event")
+            .1
+            .events()[0]
+            .downcast_ref::<NativeMainMenuLaunchRequestedEvent>()
+            .expect("native main-menu launch request payload should be present");
+
+        assert_eq!(
+            published
+                .last()
+                .expect("latest event should exist")
+                .1
+                .events()[0]
+                .definition()
+                .id,
+            NATIVE_MAIN_MENU_LAUNCH_REQUESTED_EVENT_DEFINITION.id
+        );
+        assert_eq!(launch_requested.button_count, 16);
+        assert_eq!(launch_requested.validated_button_count, 1);
+        assert!(launch_requested.pending_button_count >= 1);
+        assert_eq!(launch_requested.failed_button_count, 0);
+    }
+
+    #[test]
+    fn live_app_timeline_preview_description_reports_active_startup_timeline() {
+        let session = prepare_native_main_menu_session_from_raw_inputs(RawProcessStartupInputs {
+            argv: vec!["--log-filter".to_owned(), "trace".to_owned()],
+            rust_log: None,
+        })
+        .expect("native main-menu session should prepare without opening a window");
+
+        let description = build_live_app_timeline_preview_description(&session);
+
+        assert!(description.contains("Live app timeline preview"));
+        assert!(description.contains("published_items:"));
+        assert!(description.contains("Visible rows:"));
+        assert!(description.contains("Recent published events:"));
+        assert!(description.contains("teamy_studio.startup.bootstrap"));
+        assert!(description.contains("teamy_studio.startup"));
+        assert!(description.contains("teamy_studio.startup.native_main_menu_launch_requested"));
+    }
+
+    #[test]
+    fn timeline_button_click_opens_live_app_timeline_window() {
+        let mut session =
+            prepare_native_main_menu_session_from_raw_inputs(RawProcessStartupInputs {
+                argv: vec!["--log-filter".to_owned(), "trace".to_owned()],
+                rust_log: None,
+            })
+            .expect("native main-menu session should prepare without opening a window");
+        let button = session
+            .menu_snapshot()
+            .button_by_class_id(TIMELINE_BUTTON_CLASS_ID)
+            .expect("timeline button should exist")
+            .clone();
+        let mut next_time_key = next_main_menu_interaction_time_seed(&session.runtime);
+
+        handle_timeline_button_click(&mut session, button.logical_button_id, &mut next_time_key)
+            .expect("timeline button should open a live timeline window");
+
+        assert_eq!(session.shell_state().windows().len(), 1);
+        assert_eq!(session.shell_hosted_windows().len(), 1);
+        assert_eq!(
+            session.shell_state().windows()[0].title,
+            LIVE_APP_TIMELINE_WINDOW_TITLE
+        );
+        assert_eq!(
+            session.shell_hosted_windows()[0].title,
+            LIVE_APP_TIMELINE_WINDOW_TITLE
+        );
+        assert!(session.published_event_records().iter().any(
+            |(_, _, event)| event.definition().id == WINDOW_CREATE_REQUEST_EVENT_DEFINITION.id
+        ));
+        assert!(
+            session
+                .published_event_records()
+                .iter()
+                .any(|(_, _, event)| event.definition().id == WINDOW_CREATED_EVENT_DEFINITION.id)
+        );
+
+        session
+            .destroy_native_windows()
+            .expect("timeline window should clean up");
     }
 
     #[test]
@@ -2922,7 +3612,7 @@ mod tests {
             .expect("session should publish a click event");
 
         let failure_references = session.event_references();
-        session.publish_startup_failed(
+        session.runtime.publish_startup_failed(
             CanonicalTimeKey::from_femtoseconds(101),
             "test startup failure",
             failure_references.clone(),
@@ -3218,6 +3908,8 @@ mod tests {
             rust_log: None,
         })
         .expect_err("invalid smoke args should preserve a failure summary");
+        assert!(error.runtime().is_some());
+        assert!(error.session().is_none());
         let summary = error.summary();
 
         assert!(!summary.contains_startup_succeeded_event);
@@ -3242,6 +3934,8 @@ mod tests {
             rust_log: None,
         })
         .expect_err("invalid tracing filter should preserve a failure summary");
+        assert!(error.runtime().is_none());
+        assert!(error.session().is_some());
         let summary = error.summary();
 
         assert!(!summary.contains_startup_succeeded_event);
@@ -3252,7 +3946,7 @@ mod tests {
         );
         assert_eq!(summary.cursor_gallery_window_count, 0);
         assert_eq!(summary.shell_hosted_window_count, 0);
-        assert_eq!(summary.total_published_epoch_count, 11);
+        assert_eq!(summary.total_published_epoch_count, 14);
     }
 
     #[test]

@@ -1,3 +1,8 @@
+mod canonical_time_range;
+mod published_event_projection;
+mod timeline_dataset;
+mod timeline_query;
+
 use facet::Facet;
 use teamy_studio_event_core::{
     CanonicalEvent, EventId as CoreEventId, PublishedEvent, SealedArenaEpoch,
@@ -5,6 +10,10 @@ use teamy_studio_event_core::{
 
 pub mod timeline;
 
+pub use canonical_time_range::CanonicalTimeRange;
+pub use published_event_projection::{
+    PublishedEventProjectionSummary, project_published_event_timeline_dataset,
+};
 pub use timeline::{
     ArenaOffset, EventId, EventReference, Femtoseconds, Microseconds, Milliseconds, Nanoseconds,
     Seconds, TimeUnit, Timeline, TimelineArithmeticError, TimelineArithmeticFailureReason,
@@ -12,6 +21,17 @@ pub use timeline::{
     TimelineTransform, TimelineTransformError, TimelineTransformFailureReason,
     TimelineUnitConversionError, TimelineUnitConversionFailureReason, TimelineUnitExtractionError,
     TimelineUnitExtractionFailureReason,
+};
+pub use timeline_dataset::{
+    TimelineCompactionReport, TimelineDataset, TimelineDatasetRevision, TimelineEventItem,
+    TimelineField, TimelineFieldInputValue, TimelineFieldValue, TimelineInternedStringId,
+    TimelineItem, TimelineItemId, TimelineItemInput, TimelineItemKind, TimelineItemSequence,
+    TimelineObjectRef, TimelineSpanItem, TimelineWriteLogEntry,
+};
+pub use timeline_query::{
+    TimelineGroupingMode, TimelineRenderCluster, TimelineRenderEvent, TimelineRenderItem,
+    TimelineRenderPlan, TimelineRenderRow, TimelineRenderRowId, TimelineRenderRowKey,
+    TimelineRenderSpan, TimelineViewportQuery,
 };
 
 pub type CanonicalArenaOffset = ArenaOffset<i128, Femtoseconds>;
