@@ -1761,6 +1761,35 @@ fn run_default_cursor_gallery_flow(mut session: StartupSession) -> Result<AppCom
     Ok(session.into_composition())
 }
 
+pub fn build_startup_smoke_summary_from_raw_inputs(
+    raw_inputs: RawProcessStartupInputs,
+) -> Result<TracingObservationSummary> {
+    let mut session = observe_bootstrap_plan_from_raw_inputs(raw_inputs)
+        .map_err(|error| eyre!(error.to_string()))?
+        .into_mvp_session()?;
+    initialize_tracing_for_session(&mut session)?;
+    info!("running startup smoke composition");
+    let composition = run_default_cursor_gallery_flow(session)?;
+    Ok(composition.tracing_observation_summary())
+}
+
+fn format_tracing_observation_summary(summary: &TracingObservationSummary) -> String {
+    let mut output = String::new();
+    output.push_str("Tracing observation summary\n");
+    output.push_str(&format!(
+        "total_observed_records: {}\n",
+        summary.total_observed_records
+    ));
+    output.push_str(&format!(
+        "contains_timeline_reemit_marker: {}\n",
+        summary.contains_timeline_reemit_marker
+    ));
+    for (level, count) in &summary.counts_by_level {
+        output.push_str(&format!("level.{level}: {count}\n"));
+    }
+    output
+}
+
 pub fn main() -> Result<()> {
     main_with_raw_inputs(RawProcessStartupInputs::capture_from_env())
 }
@@ -1822,6 +1851,15 @@ fn unimplemented_main_menu_dialog(
 
 pub fn main_with_raw_inputs(raw_inputs: RawProcessStartupInputs) -> Result<()> {
     if try_handle_builtin_bootstrap_cli_request(&raw_inputs.argv_refs())? {
+        return Ok(());
+    }
+
+    let startup_smoke_requested = parse_bootstrap_cli_args(&raw_inputs.argv_refs())
+        .map(|parsed| parsed.global_args.startup_smoke)
+        .unwrap_or(false);
+    if startup_smoke_requested {
+        let summary = build_startup_smoke_summary_from_raw_inputs(raw_inputs)?;
+        print!("{}", format_tracing_observation_summary(&summary));
         return Ok(());
     }
 
@@ -1908,9 +1946,10 @@ mod tests {
         TracingRecordObservedEvent, build_mvp_composition, build_mvp_composition_from_raw_inputs,
         build_mvp_session, build_mvp_session_from_bootstrap_plan,
         build_mvp_session_from_raw_inputs, build_mvp_session_with_native_shell,
-        derive_bootstrap_plan, derive_bootstrap_plan_with_runtime, initialize_tracing_for_session,
-        next_main_menu_interaction_time_seed, observe_bootstrap_plan_from_raw_inputs,
-        unimplemented_main_menu_dialog,
+        build_startup_smoke_summary_from_raw_inputs, derive_bootstrap_plan,
+        derive_bootstrap_plan_with_runtime, format_tracing_observation_summary,
+        initialize_tracing_for_session, next_main_menu_interaction_time_seed,
+        observe_bootstrap_plan_from_raw_inputs, unimplemented_main_menu_dialog,
     };
     use teamy_studio_cursor_gallery::{
         CURSOR_GALLERY_BUTTON_CLASS_ID, CURSOR_GALLERY_OPEN_INTENT_DEFINITION,
@@ -2848,6 +2887,40 @@ mod tests {
 
         assert_eq!(summary.total_observed_records, 1);
         assert!(summary.contains_timeline_reemit_marker);
+    }
+
+    #[test]
+    fn tracing_observation_summary_formats_for_startup_smoke_output() {
+        let mut summary = super::TracingObservationSummary {
+            total_observed_records: 3,
+            contains_timeline_reemit_marker: false,
+            ..super::TracingObservationSummary::default()
+        };
+        summary.counts_by_level.insert("INFO".to_owned(), 2);
+        summary.counts_by_level.insert("WARN".to_owned(), 1);
+
+        let output = format_tracing_observation_summary(&summary);
+
+        assert!(output.contains("Tracing observation summary"));
+        assert!(output.contains("total_observed_records: 3"));
+        assert!(output.contains("contains_timeline_reemit_marker: false"));
+        assert!(output.contains("level.INFO: 2"));
+        assert!(output.contains("level.WARN: 1"));
+    }
+
+    #[test]
+    fn startup_smoke_summary_runs_without_native_window() {
+        let summary = build_startup_smoke_summary_from_raw_inputs(RawProcessStartupInputs {
+            argv: vec![
+                "--startup-smoke".to_owned(),
+                "--log-filter".to_owned(),
+                "trace".to_owned(),
+            ],
+            rust_log: None,
+        })
+        .expect("startup smoke should build simulated MVP composition");
+
+        assert!(!summary.contains_timeline_reemit_marker);
     }
 
     #[test]

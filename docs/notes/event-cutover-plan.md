@@ -106,6 +106,8 @@ Completed in the repository now:
 - the live main-menu click path now relies on `pump_to_idle` for tracing-observation draining instead of performing a separate post-pump drain
 - `AppComposition` now exposes a `tracing_observation_summary()` inspection API that reports total observed tracing records, counts by tracing level, and whether any observed record contains the `teamy.timeline_reemit` marker
 - tracing-observation summary tests now provide a programmatic loop-prevention check without parsing stderr output
+- the startup compatibility CLI now accepts `--startup-smoke`, which runs a non-window MVP startup smoke path, prints the tracing-observation summary, and exits without opening the native main menu
+- `cargo run -- --startup-smoke --log-filter trace` has been manually verified to print a summary with direct observed tracing counts and `contains_timeline_reemit_marker: false` while trace output still shows separate `teamy.timeline_reemit = true` event-derived records
 
 Still pending:
 
@@ -119,7 +121,7 @@ Still pending:
 - async timeline ingestion, trigger cursors, and runtime pumping
 - feature-owned render/input loops and the real cursor-gallery window implementation
 - feature-owned event definitions that carry explicit log intent/level metadata plus the authoritative timeline-to-tracing re-emission bridge and tracing-observation loop-prevention markers needed to make timeline publication, rather than direct tracing macros, the long-term source of truth for product logs
-- a richer tracing-observation inspection surface; observed records now have a programmatic `AppComposition` summary, but there is not yet a CLI-facing smoke command or visible diagnostic surface for that summary
+- a richer tracing-observation inspection surface; observed records now have a programmatic `AppComposition` summary and CLI-facing startup smoke command, but no polished user-facing UI yet
 - extracting the legacy D3D12 render thread and shader-backed scene renderer into shell-owned helpers so the main menu and feature crates can render the shared scene model through the real backend instead of the current custom-painted stopgap
 - richer event definitions with Facet-shaped public canonical event forms
 - richer startup failure reporting with thin failure events that point back to concrete prior failure references
@@ -133,9 +135,10 @@ This section is the preferred starting point for the next agentic work session a
 Current baseline:
 
 - the active branch is `event-cutover`
-- the last committed checkpoint is `38e9eca`, `Run tracing observation as a pump stage`
-- the working tree now has the tracing-observation inspection API slice implemented but not committed
-- `.\check-all.ps1` passed after adding `AppComposition::tracing_observation_summary()`
+- the last committed checkpoint is `1a8e66b`, `Add tracing observation inspection summary`
+- the working tree now has the `--startup-smoke` CLI smoke path implemented but not committed
+- `.\check-all.ps1` passed after adding `--startup-smoke`
+- `cargo run -- --startup-smoke --log-filter trace` exits successfully and prints the tracing-observation summary without opening a native window
 - Tracey-with-an-E is reference-only at `docs/reference/tracey/.config/tracey/config.styx`
 - `docs/spec/` documents are historical/planning material unless a newer record-of-decision re-promotes them
 
@@ -143,9 +146,9 @@ Recommended next implementation thread:
 
 1. Start by running `git status --short` and `.\check-all.ps1` to confirm the baseline is still clean and green.
 2. Read `development-workflow-record-of-decision.md`, `startup-bootstrap-record-of-decision.md`, and `timeline-authoritative-logging-record-of-decision.md`.
-3. Commit the tracing-observation inspection API slice if the working tree remains green.
-4. Then implement a larger command/test-facing smoke slice: add a non-window startup smoke path, likely test-only or debug-only at first, that builds an MVP composition from raw inputs, drains/pumps tracing observation, and returns the `TracingObservationSummary` for assertions without launching the native main menu.
-5. Expected observable `cargo run -- --log-filter trace` differences for that next chunk: the default command should still launch the native main menu; if a new explicit smoke/debug command is exposed, it should print or return the tracing-observation summary and exit instead of opening a window; event-derived records should continue to carry `teamy.timeline_reemit = true` in trace output without being counted as observed direct tracing records.
+3. Commit the `--startup-smoke` slice if the working tree remains green.
+4. Then implement a larger startup smoke refinement chunk: add a typed `StartupSmokeSummary` that includes tracing-observation summary plus core MVP success facts such as startup success presence, cursor-gallery window count, shell hosted-window count, and total published epoch count.
+5. Expected observable `cargo run -- --startup-smoke --log-filter trace` differences for that next chunk: the command should still exit without opening a native window, but the printed summary should include MVP success/window/epoch counts in addition to tracing observation counts. Default `cargo run -- --log-filter trace` should still launch the native main menu.
 6. Do not start Figue restoration in the same slice. When CLI restoration begins later, preserve the legacy `teamy-figue` plus `facet = 0.44.1` compatibility constraint or write a new compatibility decision first.
 7. Update this plan before ending the session, especially the `Current implementation status`, `Still pending`, and this continuation section.
 

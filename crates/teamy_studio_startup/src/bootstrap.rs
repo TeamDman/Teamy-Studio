@@ -68,6 +68,8 @@ pub struct GlobalArgs {
     pub log_filter: Option<String>,
 
     pub log_file: Option<String>,
+
+    pub startup_smoke: bool,
 }
 
 #[derive(Clone, Debug, Default, Eq, Facet, PartialEq)]
@@ -159,6 +161,7 @@ pub struct StartupGlobalArgsParsedEvent {
     pub debug: bool,
     pub log_filter: Option<String>,
     pub log_file: Option<String>,
+    pub startup_smoke: bool,
 }
 
 impl GlobalArgs {
@@ -168,6 +171,7 @@ impl GlobalArgs {
             debug: self.debug,
             log_filter: self.log_filter.clone(),
             log_file: self.log_file.clone(),
+            startup_smoke: self.startup_smoke,
         }
     }
 }
@@ -406,7 +410,7 @@ fn exclude_tracy_frame_mark(meta: &Metadata<'_>) -> bool {
 }
 
 fn startup_help_text() -> String {
-    "Teamy Studio\n\nUsage:\n  teamy-studio [OPTIONS]\n\nOptions:\n  --debug                    Enable debug logging\n  --log-filter <FILTER>      Override the tracing filter directive\n  --log-file <PATH>          Write NDJSON logs to a file or directory\n  -h, --help                 Print help and exit\n  -V, --version              Print version and exit\n  --completions <SHELL>      Print shell completions for bash, zsh, or fish\n".to_owned()
+    "Teamy Studio\n\nUsage:\n  teamy-studio [OPTIONS]\n\nOptions:\n  --debug                    Enable debug logging\n  --log-filter <FILTER>      Override the tracing filter directive\n  --log-file <PATH>          Write NDJSON logs to a file or directory\n  --startup-smoke            Run a non-window startup smoke check and print tracing observation summary\n  -h, --help                 Print help and exit\n  -V, --version              Print version and exit\n  --completions <SHELL>      Print shell completions for bash, zsh, or fish\n".to_owned()
 }
 
 fn startup_version_text() -> String {
@@ -420,7 +424,7 @@ fn startup_completion_script(shell: &str) -> Option<String> {
 {
     local cur
     cur="${COMP_WORDS[COMP_CWORD]}"
-    COMPREPLY=( $(compgen -W '--debug --log-filter --log-file --help --version --completions' -- "$cur") )
+    COMPREPLY=( $(compgen -W '--debug --log-filter --log-file --startup-smoke --help --version --completions' -- "$cur") )
 }
 complete -F _teamy_studio teamy-studio
 "#
@@ -433,6 +437,7 @@ _teamy_studio() {
     '--debug[Enable debug logging]' \
     '--log-filter[Override the tracing filter]:filter:' \
     '--log-file[Write NDJSON logs]:path:_files' \
+    '--startup-smoke[Run startup smoke check]' \
     '--help[Print help and exit]' \
     '--version[Print version and exit]' \
     '--completions[Print shell completions]:shell:(bash zsh fish)'
@@ -445,6 +450,7 @@ _teamy_studio "$@"
             r#"complete -c teamy-studio -l debug -d 'Enable debug logging'
 complete -c teamy-studio -l log-filter -r -d 'Override the tracing filter directive'
 complete -c teamy-studio -l log-file -r -d 'Write NDJSON logs to a file or directory'
+complete -c teamy-studio -l startup-smoke -d 'Run startup smoke check'
 complete -c teamy-studio -s h -l help -d 'Print help and exit'
 complete -c teamy-studio -s V -l version -d 'Print version and exit'
 complete -c teamy-studio -l completions -r -f -a 'bash zsh fish' -d 'Print shell completions'
@@ -542,6 +548,10 @@ pub fn parse_bootstrap_cli_args(
                     .ok_or(BootstrapCliParseError::MissingValue { flag: "--log-file" })?;
                 global_args.log_file = Some((*value).to_owned());
                 index += 2;
+            }
+            "--startup-smoke" => {
+                global_args.startup_smoke = true;
+                index += 1;
             }
             unknown => {
                 return Err(BootstrapCliParseError::UnrecognizedArgument {
@@ -731,6 +741,7 @@ mod tests {
         assert!(parsed.global_args.debug);
         assert_eq!(parsed.global_args.log_filter, None);
         assert_eq!(parsed.global_args.log_file, None);
+        assert!(!parsed.global_args.startup_smoke);
     }
 
     #[test]
@@ -744,6 +755,14 @@ mod tests {
             parsed.global_args.log_file.as_deref(),
             Some("logs/teamy.ndjson")
         );
+    }
+
+    #[test]
+    fn bootstrap_cli_parses_startup_smoke_flag() {
+        let parsed = parse_bootstrap_cli_args(&["--startup-smoke"])
+            .expect("startup smoke flag should parse");
+
+        assert!(parsed.global_args.startup_smoke);
     }
 
     #[test]
@@ -797,6 +816,7 @@ mod tests {
                 debug: true,
                 log_filter: Some("trace".to_owned()),
                 log_file: None,
+                startup_smoke: false,
             },
             None,
             fixed_now(),
@@ -1026,12 +1046,14 @@ mod tests {
             debug: true,
             log_filter: Some("trace".to_owned()),
             log_file: Some("logs/teamy.ndjson".to_owned()),
+            startup_smoke: true,
         }
         .to_parsed_event();
 
         assert!(event.debug);
         assert_eq!(event.log_filter.as_deref(), Some("trace"));
         assert_eq!(event.log_file.as_deref(), Some("logs/teamy.ndjson"));
+        assert!(event.startup_smoke);
     }
 
     #[test]
