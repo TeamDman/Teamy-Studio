@@ -11,7 +11,7 @@ pub use bootstrap::{
     try_handle_builtin_bootstrap_cli_request,
 };
 
-use eyre::{Result, eyre};
+use eyre::{Report, Result, eyre};
 use facet::Facet;
 use linkme::distributed_slice;
 use std::collections::BTreeMap;
@@ -424,6 +424,79 @@ pub struct TracingObservationSummary {
     pub contains_timeline_reemit_marker: bool,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct StartupSmokeSummary {
+    pub tracing_observations: TracingObservationSummary,
+    pub contains_startup_succeeded_event: bool,
+    pub contains_startup_failed_event: bool,
+    pub latest_startup_failure_reason: Option<String>,
+    pub cursor_gallery_window_count: usize,
+    pub shell_hosted_window_count: usize,
+    pub total_published_epoch_count: usize,
+}
+
+#[derive(Debug)]
+pub struct ObservedStartupSessionFailure {
+    error: Report,
+    runtime: StartupRuntime,
+}
+
+#[derive(Debug)]
+pub struct ObservedDefaultCursorGalleryFlowFailure {
+    error: Report,
+    session: StartupSession,
+}
+
+#[derive(Debug)]
+pub struct ObservedStartupSmokeFailure {
+    error: Report,
+    summary: StartupSmokeSummary,
+}
+
+fn startup_smoke_summary_from_runtime(
+    timeline: &ConstructedTimeline<PublishedEvent>,
+    cursor_gallery_state: &CursorGalleryState,
+    shell_hosted_window_count: usize,
+) -> StartupSmokeSummary {
+    let mut summary = StartupSmokeSummary {
+        cursor_gallery_window_count: cursor_gallery_state.windows().len(),
+        shell_hosted_window_count,
+        total_published_epoch_count: timeline.published_epochs().len(),
+        ..StartupSmokeSummary::default()
+    };
+
+    for (_, epoch) in timeline.published_epochs() {
+        for event in epoch.events() {
+            if let Some(observed_record) = event.downcast_ref::<TracingRecordObservedEvent>() {
+                summary.tracing_observations.total_observed_records += 1;
+                *summary
+                    .tracing_observations
+                    .counts_by_level
+                    .entry(observed_record.level.clone())
+                    .or_default() += 1;
+                if observed_record
+                    .fields
+                    .iter()
+                    .any(|field| field.name == TIMELINE_TO_TRACING_REEMIT_MARKER_FIELD)
+                {
+                    summary.tracing_observations.contains_timeline_reemit_marker = true;
+                }
+            }
+
+            if event.definition().id == STARTUP_SUCCEEDED_EVENT_DEFINITION.id {
+                summary.contains_startup_succeeded_event = true;
+            }
+
+            if let Some(startup_failed) = event.downcast_ref::<StartupFailedEvent>() {
+                summary.contains_startup_failed_event = true;
+                summary.latest_startup_failure_reason = Some(startup_failed.reason.to_owned());
+            }
+        }
+    }
+
+    summary
+}
+
 impl AppComposition {
     #[must_use]
     pub fn bootstrap_plan(&self) -> &StartupBootstrapPlan {
@@ -447,30 +520,73 @@ impl AppComposition {
 
     #[must_use]
     pub fn tracing_observation_summary(&self) -> TracingObservationSummary {
-        let mut summary = TracingObservationSummary::default();
-        for (_, epoch) in self.timeline.published_epochs() {
-            for event in epoch.events() {
-                let Some(observed_record) = event.downcast_ref::<TracingRecordObservedEvent>()
-                else {
-                    continue;
-                };
-                summary.total_observed_records += 1;
-                *summary
-                    .counts_by_level
-                    .entry(observed_record.level.clone())
-                    .or_default() += 1;
-                if observed_record
-                    .fields
-                    .iter()
-                    .any(|field| field.name == "teamy.timeline_reemit")
-                {
-                    summary.contains_timeline_reemit_marker = true;
-                }
-            }
-        }
-        summary
+        self.startup_smoke_summary().tracing_observations
+    }
+
+    #[must_use]
+    pub fn startup_smoke_summary(&self) -> StartupSmokeSummary {
+        startup_smoke_summary_from_runtime(
+            &self.timeline,
+            &self.cursor_gallery_state,
+            self.shell_hosted_windows.len(),
+        )
     }
 }
+
+impl ObservedStartupSessionFailure {
+    #[must_use]
+    pub fn runtime(&self) -> &StartupRuntime {
+        &self.runtime
+    }
+
+    #[must_use]
+    pub fn startup_smoke_summary(&self) -> StartupSmokeSummary {
+        self.runtime.startup_smoke_summary()
+    }
+}
+
+impl Display for ObservedStartupSessionFailure {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        Display::fmt(&self.error, formatter)
+    }
+}
+
+impl Error for ObservedStartupSessionFailure {}
+
+impl ObservedDefaultCursorGalleryFlowFailure {
+    #[must_use]
+    pub fn session(&self) -> &StartupSession {
+        &self.session
+    }
+
+    #[must_use]
+    pub fn startup_smoke_summary(&self) -> StartupSmokeSummary {
+        self.session.startup_smoke_summary()
+    }
+}
+
+impl Display for ObservedDefaultCursorGalleryFlowFailure {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        Display::fmt(&self.error, formatter)
+    }
+}
+
+impl Error for ObservedDefaultCursorGalleryFlowFailure {}
+
+impl ObservedStartupSmokeFailure {
+    #[must_use]
+    pub fn summary(&self) -> &StartupSmokeSummary {
+        &self.summary
+    }
+}
+
+impl Display for ObservedStartupSmokeFailure {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        Display::fmt(&self.error, formatter)
+    }
+}
+
+impl Error for ObservedStartupSmokeFailure {}
 
 fn bootstrap_cli_parse_failed_event(
     raw_inputs: &RawProcessStartupInputs,
@@ -680,6 +796,16 @@ impl ObservedBootstrapPlan {
 
     pub fn into_mvp_session(self) -> Result<StartupSession> {
         build_mvp_session_with_runtime(self.bootstrap_plan, self.runtime, true)
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "smoke-only observed session construction preserves runtime state so failure summaries can inspect the startup timeline"
+    )]
+    pub fn into_mvp_session_observed(
+        self,
+    ) -> std::result::Result<StartupSession, ObservedStartupSessionFailure> {
+        build_mvp_session_with_runtime_observed(self.bootstrap_plan, self.runtime, true)
     }
 
     #[must_use]
@@ -1349,6 +1475,15 @@ impl StartupRuntime {
     }
 
     #[must_use]
+    pub fn startup_smoke_summary(&self) -> StartupSmokeSummary {
+        startup_smoke_summary_from_runtime(
+            &self.timeline,
+            &self.cursor_gallery_state,
+            self.shell_runtime.hosted_windows().len(),
+        )
+    }
+
+    #[must_use]
     pub fn into_parts(
         self,
     ) -> (
@@ -1366,6 +1501,74 @@ impl StartupRuntime {
             shell_state,
         )
     }
+}
+
+#[expect(
+    clippy::result_large_err,
+    reason = "smoke-only observed session construction preserves runtime state so failure summaries can inspect the startup timeline"
+)]
+fn build_mvp_session_with_runtime_observed(
+    bootstrap_plan: StartupBootstrapPlan,
+    mut runtime: StartupRuntime,
+    bootstrap_events_already_published: bool,
+) -> std::result::Result<StartupSession, ObservedStartupSessionFailure> {
+    if !bootstrap_events_already_published {
+        runtime.publish_bootstrap_plan_events(&bootstrap_plan);
+    }
+    let pre_validation_snapshot = snapshot();
+    runtime.publish_registration_validation_started(pre_validation_snapshot);
+    if let Err(error) = validate_registrations() {
+        runtime.publish_registration_validation_failure_outcome(&error);
+        return Err(ObservedStartupSessionFailure {
+            error: error.into(),
+            runtime,
+        });
+    }
+    let registration_snapshot = snapshot();
+    runtime.publish_registration_validation_completed(registration_snapshot);
+
+    let button_classes = registered_button_classes();
+    let mut menu_snapshot = MainMenuSnapshot::from_registrations(&button_classes);
+    runtime.publish_feature_compatibility_validation_started(
+        registration_snapshot.feature_count as u64,
+    );
+    menu_snapshot.set_validation_state_for_class_id(
+        CURSOR_GALLERY_BUTTON_CLASS_ID,
+        FeatureValidationState::Validated,
+    );
+    let cursor_gallery_button =
+        match menu_snapshot.button_by_class_id(CURSOR_GALLERY_BUTTON_CLASS_ID) {
+            Some(button) => button,
+            None => {
+                return Err(ObservedStartupSessionFailure {
+                    error: eyre!("cursor gallery button was not registered for feature validation"),
+                    runtime,
+                });
+            }
+        };
+    runtime.publish_feature_compatibility_validated(
+        CURSOR_GALLERY_FEATURE_ID,
+        cursor_gallery_button.title,
+    );
+    runtime.publish_feature_compatibility_validation_completed(
+        registration_snapshot.feature_count as u64,
+        0,
+        1,
+        0,
+    );
+    runtime.publish_feature_activation_gate_resolved(
+        CURSOR_GALLERY_FEATURE_ID,
+        cursor_gallery_button.title,
+        cursor_gallery_button.validation_state == FeatureValidationState::Validated,
+    );
+
+    Ok(StartupSession {
+        bootstrap_plan,
+        registration_snapshot,
+        menu_snapshot,
+        runtime,
+        tracing_observation_layer: None,
+    })
 }
 
 impl StartupSession {
@@ -1511,6 +1714,11 @@ impl StartupSession {
     }
 
     #[must_use]
+    pub fn startup_smoke_summary(&self) -> StartupSmokeSummary {
+        self.runtime.startup_smoke_summary()
+    }
+
+    #[must_use]
     pub fn into_composition(self) -> AppComposition {
         let (timeline, cursor_gallery_state, shell_hosted_windows, shell_state) =
             self.runtime.into_parts();
@@ -1596,56 +1804,15 @@ pub fn build_mvp_session_with_native_shell_from_bootstrap_plan(
 
 fn build_mvp_session_with_runtime(
     bootstrap_plan: StartupBootstrapPlan,
-    mut runtime: StartupRuntime,
+    runtime: StartupRuntime,
     bootstrap_events_already_published: bool,
 ) -> Result<StartupSession> {
-    if !bootstrap_events_already_published {
-        runtime.publish_bootstrap_plan_events(&bootstrap_plan);
-    }
-    let pre_validation_snapshot = snapshot();
-    runtime.publish_registration_validation_started(pre_validation_snapshot);
-    if let Err(error) = validate_registrations() {
-        runtime.publish_registration_validation_failure_outcome(&error);
-        return Err(error.into());
-    }
-    let registration_snapshot = snapshot();
-    runtime.publish_registration_validation_completed(registration_snapshot);
-
-    let button_classes = registered_button_classes();
-    let mut menu_snapshot = MainMenuSnapshot::from_registrations(&button_classes);
-    runtime.publish_feature_compatibility_validation_started(
-        registration_snapshot.feature_count as u64,
-    );
-    menu_snapshot.set_validation_state_for_class_id(
-        CURSOR_GALLERY_BUTTON_CLASS_ID,
-        FeatureValidationState::Validated,
-    );
-    let cursor_gallery_button = menu_snapshot
-        .button_by_class_id(CURSOR_GALLERY_BUTTON_CLASS_ID)
-        .ok_or_else(|| eyre!("cursor gallery button was not registered for feature validation"))?;
-    runtime.publish_feature_compatibility_validated(
-        CURSOR_GALLERY_FEATURE_ID,
-        cursor_gallery_button.title,
-    );
-    runtime.publish_feature_compatibility_validation_completed(
-        registration_snapshot.feature_count as u64,
-        0,
-        1,
-        0,
-    );
-    runtime.publish_feature_activation_gate_resolved(
-        CURSOR_GALLERY_FEATURE_ID,
-        cursor_gallery_button.title,
-        cursor_gallery_button.validation_state == FeatureValidationState::Validated,
-    );
-
-    Ok(StartupSession {
+    build_mvp_session_with_runtime_observed(
         bootstrap_plan,
-        registration_snapshot,
-        menu_snapshot,
         runtime,
-        tracing_observation_layer: None,
-    })
+        bootstrap_events_already_published,
+    )
+    .map_err(|error| error.error)
 }
 
 #[expect(
@@ -1730,16 +1897,40 @@ pub fn build_mvp_composition_from_raw_inputs(
     run_default_cursor_gallery_flow(session)
 }
 
-fn run_default_cursor_gallery_flow(mut session: StartupSession) -> Result<AppComposition> {
-    let clicked_button = session
+#[expect(
+    clippy::result_large_err,
+    reason = "smoke-only observed cursor-gallery flow preserves the session so failure summaries can inspect emitted startup events"
+)]
+fn run_default_cursor_gallery_flow_observed(
+    mut session: StartupSession,
+) -> std::result::Result<AppComposition, ObservedDefaultCursorGalleryFlowFailure> {
+    let clicked_button = match session
         .menu_snapshot()
         .button_by_class_id(CURSOR_GALLERY_BUTTON_CLASS_ID)
         .cloned()
-        .ok_or_else(|| eyre!("cursor gallery button was not registered for the MVP composition"))?;
+    {
+        Some(clicked_button) => clicked_button,
+        None => {
+            return Err(ObservedDefaultCursorGalleryFlowFailure {
+                error: eyre!("cursor gallery button was not registered for the MVP composition"),
+                session,
+            });
+        }
+    };
 
     let click_time_key = session.runtime.next_publish_time_key();
-    session.publish_main_menu_click(clicked_button.logical_button_id, 64, 32, 1, click_time_key)?;
-    let emitted_epoch_count = session.pump_to_idle(session.runtime.next_publish_time_key(), 8)?;
+    if let Err(error) =
+        session.publish_main_menu_click(clicked_button.logical_button_id, 64, 32, 1, click_time_key)
+    {
+        return Err(ObservedDefaultCursorGalleryFlowFailure { error, session });
+    }
+    let pump_start_time_key = session.runtime.next_publish_time_key();
+    let emitted_epoch_count = match session.pump_to_idle(pump_start_time_key, 8) {
+        Ok(emitted_epoch_count) => emitted_epoch_count,
+        Err(error) => {
+            return Err(ObservedDefaultCursorGalleryFlowFailure { error, session });
+        }
+    };
 
     if emitted_epoch_count == 0
         || session.cursor_gallery_state().windows().is_empty()
@@ -1752,7 +1943,10 @@ fn run_default_cursor_gallery_flow(mut session: StartupSession) -> Result<AppCom
                 session.cursor_gallery_state().windows().len(),
                 session.shell_state().windows().len(),
             );
-        return Err(eyre!(DEFAULT_CURSOR_GALLERY_FLOW_FAILURE_REASON));
+        return Err(ObservedDefaultCursorGalleryFlowFailure {
+            error: eyre!(DEFAULT_CURSOR_GALLERY_FLOW_FAILURE_REASON),
+            session,
+        });
     }
 
     let success_time_key = session.runtime.next_publish_time_key();
@@ -1761,30 +1955,87 @@ fn run_default_cursor_gallery_flow(mut session: StartupSession) -> Result<AppCom
     Ok(session.into_composition())
 }
 
-pub fn build_startup_smoke_summary_from_raw_inputs(
-    raw_inputs: RawProcessStartupInputs,
-) -> Result<TracingObservationSummary> {
-    let mut session = observe_bootstrap_plan_from_raw_inputs(raw_inputs)
-        .map_err(|error| eyre!(error.to_string()))?
-        .into_mvp_session()?;
-    initialize_tracing_for_session(&mut session)?;
-    info!("running startup smoke composition");
-    let composition = run_default_cursor_gallery_flow(session)?;
-    Ok(composition.tracing_observation_summary())
+fn run_default_cursor_gallery_flow(session: StartupSession) -> Result<AppComposition> {
+    run_default_cursor_gallery_flow_observed(session).map_err(|error| error.error)
 }
 
-fn format_tracing_observation_summary(summary: &TracingObservationSummary) -> String {
+pub fn build_startup_smoke_summary_from_raw_inputs(
+    raw_inputs: RawProcessStartupInputs,
+) -> std::result::Result<StartupSmokeSummary, ObservedStartupSmokeFailure> {
+    let observed_bootstrap = match observe_bootstrap_plan_from_raw_inputs(raw_inputs) {
+        Ok(observed_bootstrap) => observed_bootstrap,
+        Err(error) => {
+            return Err(ObservedStartupSmokeFailure {
+                error: eyre!(error.to_string()),
+                summary: error.runtime().startup_smoke_summary(),
+            });
+        }
+    };
+    let mut session = match observed_bootstrap.into_mvp_session_observed() {
+        Ok(session) => session,
+        Err(error) => {
+            return Err(ObservedStartupSmokeFailure {
+                error: eyre!(error.to_string()),
+                summary: error.startup_smoke_summary(),
+            });
+        }
+    };
+    if let Err(error) = initialize_tracing_for_session(&mut session) {
+        return Err(ObservedStartupSmokeFailure {
+            error,
+            summary: session.startup_smoke_summary(),
+        });
+    }
+    info!("running startup smoke composition");
+    match run_default_cursor_gallery_flow_observed(session) {
+        Ok(composition) => Ok(composition.startup_smoke_summary()),
+        Err(error) => Err(ObservedStartupSmokeFailure {
+            error: eyre!(error.to_string()),
+            summary: error.startup_smoke_summary(),
+        }),
+    }
+}
+
+fn format_startup_smoke_summary(summary: &StartupSmokeSummary) -> String {
     let mut output = String::new();
+    output.push_str("Startup smoke summary\n");
+    output.push_str(&format!(
+        "contains_startup_succeeded_event: {}\n",
+        summary.contains_startup_succeeded_event
+    ));
+    output.push_str(&format!(
+        "contains_startup_failed_event: {}\n",
+        summary.contains_startup_failed_event
+    ));
+    output.push_str(&format!(
+        "latest_startup_failure_reason: {}\n",
+        summary
+            .latest_startup_failure_reason
+            .as_deref()
+            .unwrap_or("none")
+    ));
+    output.push_str(&format!(
+        "cursor_gallery_window_count: {}\n",
+        summary.cursor_gallery_window_count
+    ));
+    output.push_str(&format!(
+        "shell_hosted_window_count: {}\n",
+        summary.shell_hosted_window_count
+    ));
+    output.push_str(&format!(
+        "total_published_epoch_count: {}\n",
+        summary.total_published_epoch_count
+    ));
     output.push_str("Tracing observation summary\n");
     output.push_str(&format!(
         "total_observed_records: {}\n",
-        summary.total_observed_records
+        summary.tracing_observations.total_observed_records
     ));
     output.push_str(&format!(
         "contains_timeline_reemit_marker: {}\n",
-        summary.contains_timeline_reemit_marker
+        summary.tracing_observations.contains_timeline_reemit_marker
     ));
-    for (level, count) in &summary.counts_by_level {
+    for (level, count) in &summary.tracing_observations.counts_by_level {
         output.push_str(&format!("level.{level}: {count}\n"));
     }
     output
@@ -1814,6 +2065,13 @@ fn initialize_tracing_for_session(session: &mut StartupSession) -> Result<()> {
             Err(error)
         }
     }
+}
+
+fn startup_smoke_requested(raw_inputs: &RawProcessStartupInputs) -> bool {
+    raw_inputs
+        .argv
+        .iter()
+        .any(|argument| argument == "--startup-smoke")
 }
 
 fn next_main_menu_interaction_time_seed(runtime: &StartupRuntime) -> i128 {
@@ -1854,13 +2112,17 @@ pub fn main_with_raw_inputs(raw_inputs: RawProcessStartupInputs) -> Result<()> {
         return Ok(());
     }
 
-    let startup_smoke_requested = parse_bootstrap_cli_args(&raw_inputs.argv_refs())
-        .map(|parsed| parsed.global_args.startup_smoke)
-        .unwrap_or(false);
-    if startup_smoke_requested {
-        let summary = build_startup_smoke_summary_from_raw_inputs(raw_inputs)?;
-        print!("{}", format_tracing_observation_summary(&summary));
-        return Ok(());
+    if startup_smoke_requested(&raw_inputs) {
+        match build_startup_smoke_summary_from_raw_inputs(raw_inputs) {
+            Ok(summary) => {
+                print!("{}", format_startup_smoke_summary(&summary));
+                return Ok(());
+            }
+            Err(error) => {
+                print!("{}", format_startup_smoke_summary(error.summary()));
+                return Err(error.into());
+            }
+        }
     }
 
     let mut session = observe_bootstrap_plan_from_raw_inputs_with_native_shell(raw_inputs)
@@ -1947,7 +2209,7 @@ mod tests {
         build_mvp_session, build_mvp_session_from_bootstrap_plan,
         build_mvp_session_from_raw_inputs, build_mvp_session_with_native_shell,
         build_startup_smoke_summary_from_raw_inputs, derive_bootstrap_plan,
-        derive_bootstrap_plan_with_runtime, format_tracing_observation_summary,
+        derive_bootstrap_plan_with_runtime, format_startup_smoke_summary,
         initialize_tracing_for_session, next_main_menu_interaction_time_seed,
         observe_bootstrap_plan_from_raw_inputs, unimplemented_main_menu_dialog,
     };
@@ -2890,17 +3152,37 @@ mod tests {
     }
 
     #[test]
-    fn tracing_observation_summary_formats_for_startup_smoke_output() {
-        let mut summary = super::TracingObservationSummary {
+    fn startup_smoke_summary_formats_for_startup_smoke_output() {
+        let mut tracing_observations = super::TracingObservationSummary {
             total_observed_records: 3,
             contains_timeline_reemit_marker: false,
             ..super::TracingObservationSummary::default()
         };
-        summary.counts_by_level.insert("INFO".to_owned(), 2);
-        summary.counts_by_level.insert("WARN".to_owned(), 1);
+        tracing_observations
+            .counts_by_level
+            .insert("INFO".to_owned(), 2);
+        tracing_observations
+            .counts_by_level
+            .insert("WARN".to_owned(), 1);
+        let summary = super::StartupSmokeSummary {
+            tracing_observations,
+            contains_startup_succeeded_event: true,
+            contains_startup_failed_event: false,
+            latest_startup_failure_reason: None,
+            cursor_gallery_window_count: 1,
+            shell_hosted_window_count: 1,
+            total_published_epoch_count: 14,
+        };
 
-        let output = format_tracing_observation_summary(&summary);
+        let output = format_startup_smoke_summary(&summary);
 
+        assert!(output.contains("Startup smoke summary"));
+        assert!(output.contains("contains_startup_succeeded_event: true"));
+        assert!(output.contains("contains_startup_failed_event: false"));
+        assert!(output.contains("latest_startup_failure_reason: none"));
+        assert!(output.contains("cursor_gallery_window_count: 1"));
+        assert!(output.contains("shell_hosted_window_count: 1"));
+        assert!(output.contains("total_published_epoch_count: 14"));
         assert!(output.contains("Tracing observation summary"));
         assert!(output.contains("total_observed_records: 3"));
         assert!(output.contains("contains_timeline_reemit_marker: false"));
@@ -2920,7 +3202,57 @@ mod tests {
         })
         .expect("startup smoke should build simulated MVP composition");
 
-        assert!(!summary.contains_timeline_reemit_marker);
+        assert!(summary.contains_startup_succeeded_event);
+        assert!(!summary.contains_startup_failed_event);
+        assert_eq!(summary.latest_startup_failure_reason, None);
+        assert_eq!(summary.cursor_gallery_window_count, 1);
+        assert_eq!(summary.shell_hosted_window_count, 1);
+        assert!(summary.total_published_epoch_count >= 1);
+        assert!(!summary.tracing_observations.contains_timeline_reemit_marker);
+    }
+
+    #[test]
+    fn startup_smoke_summary_preserves_bootstrap_failure_timeline() {
+        let error = build_startup_smoke_summary_from_raw_inputs(RawProcessStartupInputs {
+            argv: vec!["--startup-smoke".to_owned(), "--wat".to_owned()],
+            rust_log: None,
+        })
+        .expect_err("invalid smoke args should preserve a failure summary");
+        let summary = error.summary();
+
+        assert!(!summary.contains_startup_succeeded_event);
+        assert!(summary.contains_startup_failed_event);
+        assert_eq!(
+            summary.latest_startup_failure_reason.as_deref(),
+            Some("startup bootstrap cli parse failed")
+        );
+        assert_eq!(summary.cursor_gallery_window_count, 0);
+        assert_eq!(summary.shell_hosted_window_count, 0);
+        assert_eq!(summary.total_published_epoch_count, 3);
+    }
+
+    #[test]
+    fn startup_smoke_summary_preserves_tracing_initialization_failure_timeline() {
+        let error = build_startup_smoke_summary_from_raw_inputs(RawProcessStartupInputs {
+            argv: vec![
+                "--startup-smoke".to_owned(),
+                "--log-filter".to_owned(),
+                "{".to_owned(),
+            ],
+            rust_log: None,
+        })
+        .expect_err("invalid tracing filter should preserve a failure summary");
+        let summary = error.summary();
+
+        assert!(!summary.contains_startup_succeeded_event);
+        assert!(summary.contains_startup_failed_event);
+        assert_eq!(
+            summary.latest_startup_failure_reason.as_deref(),
+            Some("startup tracing initialization failed")
+        );
+        assert_eq!(summary.cursor_gallery_window_count, 0);
+        assert_eq!(summary.shell_hosted_window_count, 0);
+        assert_eq!(summary.total_published_epoch_count, 11);
     }
 
     #[test]

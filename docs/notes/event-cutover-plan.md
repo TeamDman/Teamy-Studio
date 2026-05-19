@@ -108,6 +108,8 @@ Completed in the repository now:
 - tracing-observation summary tests now provide a programmatic loop-prevention check without parsing stderr output
 - the startup compatibility CLI now accepts `--startup-smoke`, which runs a non-window MVP startup smoke path, prints the tracing-observation summary, and exits without opening the native main menu
 - `cargo run -- --startup-smoke --log-filter trace` has been manually verified to print a summary with direct observed tracing counts and `contains_timeline_reemit_marker: false` while trace output still shows separate `teamy.timeline_reemit = true` event-derived records
+- startup smoke inspection now returns a typed `StartupSmokeSummary` that includes tracing-observation counts plus core MVP success facts such as startup-success presence, cursor-gallery window count, shell hosted-window count, and total published epoch count, and the CLI smoke output prints that expanded summary without opening a native window
+- the startup smoke path now also preserves and prints typed failure summaries for observed bootstrap and tracing-initialization failures before returning a nonzero exit, so `--startup-smoke` no longer drops its observed startup timeline on those failure paths
 
 Still pending:
 
@@ -121,7 +123,7 @@ Still pending:
 - async timeline ingestion, trigger cursors, and runtime pumping
 - feature-owned render/input loops and the real cursor-gallery window implementation
 - feature-owned event definitions that carry explicit log intent/level metadata plus the authoritative timeline-to-tracing re-emission bridge and tracing-observation loop-prevention markers needed to make timeline publication, rather than direct tracing macros, the long-term source of truth for product logs
-- a richer tracing-observation inspection surface; observed records now have a programmatic `AppComposition` summary and CLI-facing startup smoke command, but no polished user-facing UI yet
+- a richer tracing-observation inspection surface; observed records now have a programmatic `AppComposition` summary, a typed `StartupSmokeSummary`, and a CLI-facing startup smoke command that covers both success and current early failure paths, but no polished user-facing UI yet
 - extracting the legacy D3D12 render thread and shader-backed scene renderer into shell-owned helpers so the main menu and feature crates can render the shared scene model through the real backend instead of the current custom-painted stopgap
 - richer event definitions with Facet-shaped public canonical event forms
 - richer startup failure reporting with thin failure events that point back to concrete prior failure references
@@ -135,10 +137,11 @@ This section is the preferred starting point for the next agentic work session a
 Current baseline:
 
 - the active branch is `event-cutover`
-- the last committed checkpoint is `1a8e66b`, `Add tracing observation inspection summary`
-- the working tree now has the `--startup-smoke` CLI smoke path implemented but not committed
-- `.\check-all.ps1` passed after adding `--startup-smoke`
-- `cargo run -- --startup-smoke --log-filter trace` exits successfully and prints the tracing-observation summary without opening a native window
+- the latest completed startup-smoke slice extends `StartupSmokeSummary` with failure-state facts and preserves observed bootstrap/tracing failure timelines for smoke-mode reporting
+- `\.\check-all.ps1` passed after adding `--startup-smoke`
+- `cargo test -p teamy_studio_startup startup_smoke -- --nocapture` passes after extending `StartupSmokeSummary` with failure-state facts and observed failure preservation
+- `cargo run -- --startup-smoke --log-filter trace` exits successfully, avoids opening a native window, and prints startup-success/window/epoch facts plus the new failure-state fields
+- `cargo run -- --startup-smoke --wat` now prints a failure summary with the preserved bootstrap failure timeline before exiting nonzero
 - Tracey-with-an-E is reference-only at `docs/reference/tracey/.config/tracey/config.styx`
 - `docs/spec/` documents are historical/planning material unless a newer record-of-decision re-promotes them
 
@@ -146,11 +149,10 @@ Recommended next implementation thread:
 
 1. Start by running `git status --short` and `.\check-all.ps1` to confirm the baseline is still clean and green.
 2. Read `development-workflow-record-of-decision.md`, `startup-bootstrap-record-of-decision.md`, and `timeline-authoritative-logging-record-of-decision.md`.
-3. Commit the `--startup-smoke` slice if the working tree remains green.
-4. Then implement a larger startup smoke refinement chunk: add a typed `StartupSmokeSummary` that includes tracing-observation summary plus core MVP success facts such as startup success presence, cursor-gallery window count, shell hosted-window count, and total published epoch count.
-5. Expected observable `cargo run -- --startup-smoke --log-filter trace` differences for that next chunk: the command should still exit without opening a native window, but the printed summary should include MVP success/window/epoch counts in addition to tracing observation counts. Default `cargo run -- --log-filter trace` should still launch the native main menu.
-6. Do not start Figue restoration in the same slice. When CLI restoration begins later, preserve the legacy `teamy-figue` plus `facet = 0.44.1` compatibility constraint or write a new compatibility decision first.
-7. Update this plan before ending the session, especially the `Current implementation status`, `Still pending`, and this continuation section.
+3. If you stay on the smoke thread, the next adjacent refinement is to decide whether session-construction and default cursor-gallery flow failures should also be preserved through a single observed smoke outcome type instead of the current branch-local wrappers.
+4. Default `cargo run -- --log-filter trace` should still launch the native main menu; do not let smoke-only formatting or failure-summary behavior leak into the normal windowed path.
+5. Do not start Figue restoration in the same slice. When CLI restoration begins later, preserve the legacy `teamy-figue` plus `facet = 0.44.1` compatibility constraint or write a new compatibility decision first.
+6. Update this plan before ending the session, especially the `Current implementation status`, `Still pending`, and this continuation section.
 
 ---
 
