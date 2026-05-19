@@ -68,10 +68,25 @@ That pin mattered because newer Figue/Facet combinations can split or mismatch t
 
 The active startup crate should not blindly add or upgrade Figue. Restoring Figue-backed parsing should first preserve a single compatible Facet stack, or explicitly document a new compatibility decision before changing dependency versions.
 
+### D8. Clean-context handoff belongs in the active plan.
+
+Before ending an agentic work session, the agent should update `docs/notes/event-cutover-plan.md` with enough current state for a future clean-context agent to continue without reconstructing the whole conversation.
+
+That handoff should include:
+
+- whether `.\check-all.ps1` is currently green
+- the most relevant current blocker, if any
+- which record-of-decision documents are driving the next slice
+- the recommended next small implementation thread
+- any dependency or workflow traps discovered during the session
+
+The handoff does not replace the record-of-decision documents. It is a tactical index into them.
+
 ## Consequences
 
 - Tracey requirement markers may remain in source and docs as historical context.
 - `docs/spec/` is no longer the dominant authority over active development.
 - Current records of decision plus the codebase are the dominant inputs for planning.
 - `check-all.ps1` no longer depends on a globally installed `tracey` executable.
+- `event-cutover-plan.md` should be treated as the current tactical handoff surface for clean-context continuation.
 - Future cleanup may remove or rewrite obsolete Tracey-era instructions in older notes, but that is not required before continuing the architecture cutover.

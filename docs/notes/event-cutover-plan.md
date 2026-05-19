@@ -84,10 +84,12 @@ Completed in the repository now:
 - the shell host now owns a feature-window scene registration surface for composed native hosted windows, and the cursor gallery uses that path to render custom chrome, transparency-compatible D3D12 content, adaptive wrapped cursor cards, and stock system-cursor hover overrides instead of the previous blank placeholder host
 - startup timeline publication now emits trace-level tracing records from the central publish seam, so `--log-filter trace` can show authoritative event emission without relying only on ad hoc caller-local logging
 - Tracey-with-an-E has been demoted from the active validation gate to historical reference documentation under `docs/reference/tracey`, and `check-all.ps1` no longer runs `tracey query status`
+- the strict clippy debt that blocked the post-Tracey validation pass has been cleared, including the `teamy_studio_fonts` lints and the next surfaced shell/startup lints
+- `check-all.ps1` passed after the Tracey demotion and validation-cleanup work, covering format, clippy, all-feature build, tests, and default-feature build
 
 Still pending:
 
-- keeping `check-all.ps1` green during the cutover; the current observed blocker is strict clippy debt in `teamy_studio_fonts`
+- keeping `check-all.ps1` green during the cutover; there is no currently known validation blocker after the latest pass
 - replacing the current startup-owned builtin CLI compatibility shim with direct Figue-backed parsing once the active Facet dependency stack is unified enough to admit that dependency without splitting the `facet_core` graph
 - preserving the legacy `teamy-figue`/Facet compatibility constraint when Figue parsing is restored, rather than blindly upgrading into an incompatible Facet graph
 - restoring richer structured log collection policies on the active startup path beyond stderr plus optional NDJSON output
@@ -101,6 +103,32 @@ Still pending:
 - richer event definitions with Facet-shaped public canonical event forms
 - richer startup failure reporting with thin failure events that point back to concrete prior failure references
 - automatic failure publication across all bootstrap failure exits, not just the current root startup surface helpers and MVP cursor-gallery flow failure branch
+
+## Clean-context continuation notes
+
+This section is the preferred starting point for the next agentic work session after reading `AGENTS.md`.
+
+Current baseline:
+
+- the active branch is `event-cutover`
+- the last committed checkpoint before this note was `60f9ea1`, `Capture event cutover workflow state`
+- the working tree was clean immediately after that commit
+- `.\check-all.ps1` passed after Tracey was removed from the active gate
+- Tracey-with-an-E is reference-only at `docs/reference/tracey/.config/tracey/config.styx`
+- `docs/spec/` documents are historical/planning material unless a newer record-of-decision re-promotes them
+
+Recommended next implementation thread:
+
+1. Start by running `git status --short` and `.\check-all.ps1` to confirm the baseline is still clean and green.
+2. Read `development-workflow-record-of-decision.md`, `startup-bootstrap-record-of-decision.md`, and `timeline-authoritative-logging-record-of-decision.md`.
+3. Prefer a small foundation slice over broad feature migration. The best next slice is likely registration identity/provenance:
+   - add stable `FeatureId`
+   - add a feature-definition `linkme` registry in `teamy_studio_registration_core`
+   - add stable trigger definition/registration IDs
+   - prepare provenance metadata surfaces without turning registrations into semantic config objects
+4. If working on CLI restoration instead, do not add arbitrary new Figue/Facet versions. Preserve the legacy `teamy-figue` plus `facet = 0.44.1` compatibility constraint or write a new compatibility decision first.
+5. If working on logging, follow the authoritative-timeline path: event-definition log metadata first, then timeline-to-tracing re-emission with loop-prevention markers.
+6. Update this plan before ending the session, especially the `Current implementation status`, `Still pending`, and this continuation section.
 
 ---
 
