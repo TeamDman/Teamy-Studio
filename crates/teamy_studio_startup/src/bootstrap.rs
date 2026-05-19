@@ -200,6 +200,12 @@ pub struct TracingInitializedEvent {
     pub subscriber_was_already_initialized: bool,
 }
 
+#[derive(Clone, Debug)]
+pub struct TracingInitialization {
+    pub initialized_event: TracingInitializedEvent,
+    pub observation_layer: TracingObservationLayer,
+}
+
 #[derive(Clone, Debug, Eq, Facet, PartialEq)]
 pub struct TracingObservedField {
     pub name: String,
@@ -231,6 +237,15 @@ impl TracingObservationLayer {
             .lock()
             .expect("tracing observation records mutex should not be poisoned")
             .clone()
+    }
+
+    pub fn drain_observed_records(&self, max_records: usize) -> Vec<TracingRecordObservedEvent> {
+        let mut records = self
+            .observed_records
+            .lock()
+            .expect("tracing observation records mutex should not be poisoned");
+        let drain_count = records.len().min(max_records);
+        records.drain(0..drain_count).collect()
     }
 }
 
@@ -562,6 +577,12 @@ pub fn derive_bootstrap_plan(
 pub fn initialize_tracing_from_bootstrap_plan(
     bootstrap_plan: &StartupBootstrapPlan,
 ) -> Result<TracingInitializedEvent> {
+    Ok(initialize_tracing_with_observation_from_bootstrap_plan(bootstrap_plan)?.initialized_event)
+}
+
+pub fn initialize_tracing_with_observation_from_bootstrap_plan(
+    bootstrap_plan: &StartupBootstrapPlan,
+) -> Result<TracingInitialization> {
     let stderr_env_filter =
         EnvFilter::builder().parse(bootstrap_plan.logging.effective_filter_directive())?;
     let stderr_layer = if bootstrap_plan.logging.debug {
@@ -587,7 +608,10 @@ pub fn initialize_tracing_from_bootstrap_plan(
     #[cfg(feature = "tracy")]
     let stderr_layer = stderr_layer.with_filter(FilterFn::new(exclude_tracy_frame_mark));
 
-    let subscriber = Registry::default().with(stderr_layer);
+    let observation_layer = TracingObservationLayer::new();
+    let subscriber = Registry::default()
+        .with(observation_layer.clone())
+        .with(stderr_layer);
     #[cfg(all(feature = "tracy", not(test)))]
     let subscriber = subscriber.with(tracing_tracy::TracyLayer::default());
 
@@ -618,16 +642,22 @@ pub fn initialize_tracing_from_bootstrap_plan(
 
         let subscriber_was_already_initialized =
             try_init_with_already_initialized(subscriber.with(json_layer).try_init())?;
-        return Ok(bootstrap_plan
-            .logging
-            .to_tracing_initialized_event(subscriber_was_already_initialized));
+        return Ok(TracingInitialization {
+            initialized_event: bootstrap_plan
+                .logging
+                .to_tracing_initialized_event(subscriber_was_already_initialized),
+            observation_layer,
+        });
     }
 
     let subscriber_was_already_initialized =
         try_init_with_already_initialized(subscriber.try_init())?;
-    Ok(bootstrap_plan
-        .logging
-        .to_tracing_initialized_event(subscriber_was_already_initialized))
+    Ok(TracingInitialization {
+        initialized_event: bootstrap_plan
+            .logging
+            .to_tracing_initialized_event(subscriber_was_already_initialized),
+        observation_layer,
+    })
 }
 
 fn try_init_with_already_initialized(
@@ -967,6 +997,26 @@ mod tests {
             );
         });
 
+        assert!(handle.observed_records().is_empty());
+    }
+
+    #[test]
+    fn tracing_observation_layer_drains_bounded_records() {
+        let layer = TracingObservationLayer::new();
+        let handle = layer.clone();
+        let subscriber = Registry::default().with(layer);
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(sequence = 1_u64, "first record");
+            tracing::info!(sequence = 2_u64, "second record");
+        });
+
+        let drained = handle.drain_observed_records(1);
+        assert_eq!(drained.len(), 1);
+        assert_eq!(handle.observed_records().len(), 1);
+
+        let drained = handle.drain_observed_records(8);
+        assert_eq!(drained.len(), 1);
         assert!(handle.observed_records().is_empty());
     }
 

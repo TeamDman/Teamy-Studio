@@ -98,6 +98,8 @@ Completed in the repository now:
 - startup event definitions now declare log intent for bootstrap, validation, success, and failure events, while non-startup feature/shell/menu events currently remain non-log-facing by default
 - `StartupRuntime::publish` now re-emits log-worthy published events through tracing with a `teamy.timeline_reemit = true` marker and event-definition identity/schema fields, making timeline publication the source of those product-log records
 - startup now owns a first `TracingObservationLayer` foundation that captures ordinary tracing records into typed `TracingRecordObservedEvent` values and ignores records marked `teamy.timeline_reemit = true`, proving the loop-prevention marker can be consumed
+- startup tracing initialization now installs the tracing observation layer, returns a drainable observation handle, and the live main-menu click path drains a bounded batch of unmarked tracing records into explicit `TracingRecordObservedEvent` timeline publications
+- `TracingRecordObservedEvent` is intentionally non-log-facing in its event definition, so publishing observed tracing records does not immediately re-emit them and create an observation loop
 
 Still pending:
 
@@ -111,7 +113,7 @@ Still pending:
 - async timeline ingestion, trigger cursors, and runtime pumping
 - feature-owned render/input loops and the real cursor-gallery window implementation
 - feature-owned event definitions that carry explicit log intent/level metadata plus the authoritative timeline-to-tracing re-emission bridge and tracing-observation loop-prevention markers needed to make timeline publication, rather than direct tracing macros, the long-term source of truth for product logs
-- tracing-observation publication back into the event system; the observation layer can now construct typed observed-record values and ignore re-emitted timeline records, but those observed records are not yet published into a startup/bootstrap arena or app timeline
+- a richer tracing-observation drain policy; observed records can now be published into the startup/app timeline in bounded batches from the live click path, but there is not yet a dedicated bootstrap-arena handoff or periodic runtime drain stage
 - extracting the legacy D3D12 render thread and shader-backed scene renderer into shell-owned helpers so the main menu and feature crates can render the shared scene model through the real backend instead of the current custom-painted stopgap
 - richer event definitions with Facet-shaped public canonical event forms
 - richer startup failure reporting with thin failure events that point back to concrete prior failure references
@@ -125,9 +127,9 @@ This section is the preferred starting point for the next agentic work session a
 Current baseline:
 
 - the active branch is `event-cutover`
-- the last committed checkpoint is `da7031e`, `Add registration identity and timeline log metadata`
-- the working tree now has the first tracing-observation foundation slice implemented but not committed
-- `.\check-all.ps1` passed after adding the tracing observation layer and loop-prevention marker tests
+- the last committed checkpoint is `c6f9af6`, `Add tracing observation foundation`
+- the working tree now has the live tracing-observation wiring slice implemented but not committed
+- `.\check-all.ps1` passed after wiring the observation layer into startup tracing initialization and publishing bounded observed-record batches
 - Tracey-with-an-E is reference-only at `docs/reference/tracey/.config/tracey/config.styx`
 - `docs/spec/` documents are historical/planning material unless a newer record-of-decision re-promotes them
 
@@ -135,9 +137,9 @@ Recommended next implementation thread:
 
 1. Start by running `git status --short` and `.\check-all.ps1` to confirm the baseline is still clean and green.
 2. Read `development-workflow-record-of-decision.md`, `startup-bootstrap-record-of-decision.md`, and `timeline-authoritative-logging-record-of-decision.md`.
-3. Implement the larger live tracing-observation wiring chunk: install `TracingObservationLayer` during startup tracing initialization, preserve a handle to drained observed records, and publish a bounded batch of unmarked tracing observations into startup/app timeline through an explicit startup-owned observation event path.
-4. Keep loop prevention central: observed records with `teamy.timeline_reemit = true` must remain ignored, and tests should prove that timeline re-emission does not recursively create tracing-observed events.
-5. Expected observable `cargo run -- --log-filter trace` differences for that next chunk: successful startup should still launch the native main menu; direct transitional tracing records may appear in the timeline as observed tracing records if drained/published; event-derived records with `teamy.timeline_reemit = true` should remain visible in trace output but must not be republished; trace output may include a single install/drain diagnostic for the observation bridge, but it should not create repeated duplicate startup records.
+3. Implement a larger tracing-observation drain policy chunk: move draining out of the ad hoc main-menu click callback and into an explicit startup/runtime stage that can be invoked after bootstrap initialization, after startup validation, and after interaction pumping.
+4. Keep the observed-record publication bounded and deterministic. Add tests that prove drain ordering, maximum batch size, and that publishing `TracingRecordObservedEvent` does not itself create a re-emitted tracing record.
+5. Expected observable `cargo run -- --log-filter trace` differences for that next chunk: successful startup should still launch the native main menu; observed direct tracing records may appear at more predictable points in the startup timeline rather than only after menu clicks; trace output should still show `teamy.timeline_reemit = true` records for log-worthy timeline events without duplicated observation loops; the number of observed-record publications per drain should be bounded and stable.
 6. Do not start Figue restoration in the same slice. When CLI restoration begins later, preserve the legacy `teamy-figue` plus `facet = 0.44.1` compatibility constraint or write a new compatibility decision first.
 7. Update this plan before ending the session, especially the `Current implementation status`, `Still pending`, and this continuation section.
 

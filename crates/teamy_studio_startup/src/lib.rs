@@ -4,8 +4,10 @@ pub use bootstrap::{
     BootstrapCliParseError, BootstrapPlanError, GlobalArgs, LogFilterSelection,
     ProcessStartupObservedEvent, RawProcessStartupInputs, StartupBootstrapCli,
     StartupBootstrapPlan, StartupGlobalArgsParsedEvent, StartupLoggingConfiguredEvent,
-    StartupLoggingPlan, StartupLoggingPlanError, TracingInitializedEvent, derive_bootstrap_plan,
-    initialize_tracing_from_bootstrap_plan, parse_bootstrap_cli_args,
+    StartupLoggingPlan, StartupLoggingPlanError, TracingInitialization, TracingInitializedEvent,
+    TracingObservationLayer, TracingRecordObservedEvent, derive_bootstrap_plan,
+    initialize_tracing_from_bootstrap_plan,
+    initialize_tracing_with_observation_from_bootstrap_plan, parse_bootstrap_cli_args,
     try_handle_builtin_bootstrap_cli_request,
 };
 
@@ -165,6 +167,13 @@ pub static REGISTRATION_VALIDATION_FAILED_EVENT_DEFINITION: EventDefinition = Ev
     log_intent: EventLogIntent::ERROR,
 };
 
+pub static TRACING_RECORD_OBSERVED_EVENT_DEFINITION: EventDefinition = EventDefinition {
+    id: EventDefinitionId::from_bytes([0x13; 16]),
+    schema_name: "teamy_studio.startup.tracing_record_observed",
+    schema_version: 1,
+    log_intent: EventLogIntent::NONE,
+};
+
 const STARTUP_BOOTSTRAP_CLI_PARSE_FAILED_REASON: &str = "startup bootstrap cli parse failed";
 const STARTUP_LOGGING_PLAN_DERIVATION_FAILED_REASON: &str =
     "startup logging plan derivation failed";
@@ -291,6 +300,13 @@ pub static STARTUP_LOGGING_PLAN_FAILED_EVENT_REGISTRATION: EventDefinitionRegist
 pub static REGISTRATION_VALIDATION_FAILED_EVENT_REGISTRATION: EventDefinitionRegistration =
     EventDefinitionRegistration {
         definition: &REGISTRATION_VALIDATION_FAILED_EVENT_DEFINITION,
+        provenance: registration_provenance!(),
+    };
+
+#[distributed_slice(EVENT_DEFINITION_REGISTRATIONS)]
+pub static TRACING_RECORD_OBSERVED_EVENT_REGISTRATION: EventDefinitionRegistration =
+    EventDefinitionRegistration {
+        definition: &TRACING_RECORD_OBSERVED_EVENT_DEFINITION,
         provenance: registration_provenance!(),
     };
 
@@ -891,6 +907,23 @@ impl StartupRuntime {
             time_key,
             PublishedEvent::new(&TRACING_INITIALIZED_EVENT_DEFINITION, tracing_initialized),
         );
+    }
+
+    pub fn publish_tracing_observed_records(
+        &mut self,
+        observed_records: Vec<TracingRecordObservedEvent>,
+    ) -> usize {
+        let mut published_count = 0;
+        for observed_record in observed_records {
+            let time_key = self.next_publish_time_key();
+            self.publish(
+                "teamy_studio.startup.tracing_observation",
+                time_key,
+                PublishedEvent::new(&TRACING_RECORD_OBSERVED_EVENT_DEFINITION, observed_record),
+            );
+            published_count += 1;
+        }
+        published_count
     }
 
     pub fn publish_tracing_initialization_failed(
@@ -1683,13 +1716,22 @@ pub fn main() -> Result<()> {
     main_with_raw_inputs(RawProcessStartupInputs::capture_from_env())
 }
 
-fn initialize_tracing_for_session(session: &mut StartupSession) -> Result<()> {
-    match initialize_tracing_from_bootstrap_plan(session.bootstrap_plan()) {
-        Ok(tracing_initialized) => {
+const TRACING_OBSERVATION_DRAIN_LIMIT: usize = 64;
+
+fn initialize_tracing_for_session(
+    session: &mut StartupSession,
+) -> Result<Option<TracingObservationLayer>> {
+    match initialize_tracing_with_observation_from_bootstrap_plan(session.bootstrap_plan()) {
+        Ok(tracing_initialization) => {
             session
                 .runtime
-                .publish_tracing_initialized(tracing_initialized);
-            Ok(())
+                .publish_tracing_initialized(tracing_initialization.initialized_event);
+            session.runtime.publish_tracing_observed_records(
+                tracing_initialization
+                    .observation_layer
+                    .drain_observed_records(TRACING_OBSERVATION_DRAIN_LIMIT),
+            );
+            Ok(Some(tracing_initialization.observation_layer))
         }
         Err(error) => {
             let bootstrap_plan = session.bootstrap_plan().clone();
@@ -1699,6 +1741,15 @@ fn initialize_tracing_for_session(session: &mut StartupSession) -> Result<()> {
             Err(error)
         }
     }
+}
+
+fn drain_tracing_observations_for_session(
+    session: &mut StartupSession,
+    observation_layer: &TracingObservationLayer,
+) -> usize {
+    session.runtime.publish_tracing_observed_records(
+        observation_layer.drain_observed_records(TRACING_OBSERVATION_DRAIN_LIMIT),
+    )
 }
 
 fn next_main_menu_interaction_time_seed(runtime: &StartupRuntime) -> i128 {
@@ -1742,7 +1793,7 @@ pub fn main_with_raw_inputs(raw_inputs: RawProcessStartupInputs) -> Result<()> {
     let mut session = observe_bootstrap_plan_from_raw_inputs_with_native_shell(raw_inputs)
         .map_err(|error| eyre!(error.to_string()))?
         .into_mvp_session()?;
-    initialize_tracing_for_session(&mut session)?;
+    let tracing_observation_layer = initialize_tracing_for_session(&mut session)?;
     teamy_studio_shell::initialize_dpi_awareness();
     let menu_snapshot = session.menu_snapshot().clone();
     let mut next_time_key = next_main_menu_interaction_time_seed(&session.runtime);
@@ -1788,6 +1839,14 @@ pub fn main_with_raw_inputs(raw_inputs: RawProcessStartupInputs) -> Result<()> {
                 ?logical_button_id,
                 emitted_epoch_count, next_time_key, "pumped main menu click to idle"
             );
+            if let Some(tracing_observation_layer) = &tracing_observation_layer {
+                let observed_count =
+                    drain_tracing_observations_for_session(&mut session, tracing_observation_layer);
+                trace!(
+                    observed_count,
+                    "drained tracing observations after main menu click"
+                );
+            }
             next_time_key += 16;
             Ok(())
         },
@@ -1816,7 +1875,8 @@ mod tests {
         StartupFailedEvent, StartupGlobalArgsParsedEvent, StartupLoggingConfiguredEvent,
         StartupLoggingPlanFailedEvent, StartupRuntime, StartupSucceededEvent,
         TRACING_INITIALIZATION_FAILED_EVENT_DEFINITION, TRACING_INITIALIZED_EVENT_DEFINITION,
-        TracingInitializationFailedEvent, TracingInitializedEvent, build_mvp_composition,
+        TRACING_RECORD_OBSERVED_EVENT_DEFINITION, TracingInitializationFailedEvent,
+        TracingInitializedEvent, TracingRecordObservedEvent, build_mvp_composition,
         build_mvp_composition_from_raw_inputs, build_mvp_session,
         build_mvp_session_from_bootstrap_plan, build_mvp_session_from_raw_inputs,
         build_mvp_session_with_native_shell, derive_bootstrap_plan,
@@ -1884,6 +1944,10 @@ mod tests {
         );
         assert_eq!(
             CURSOR_GALLERY_OPEN_INTENT_DEFINITION.log_intent,
+            EventLogIntent::NONE
+        );
+        assert_eq!(
+            TRACING_RECORD_OBSERVED_EVENT_DEFINITION.log_intent,
             EventLogIntent::NONE
         );
     }
@@ -2661,6 +2725,33 @@ mod tests {
         assert_eq!(latest_event.effective_filter_directive, "info");
         assert_eq!(latest_event.json_log_path, None);
         assert!(!latest_event.subscriber_was_already_initialized);
+    }
+
+    #[test]
+    fn startup_runtime_can_publish_tracing_observed_records() {
+        let mut runtime = StartupRuntime::new();
+
+        let published_count =
+            runtime.publish_tracing_observed_records(vec![TracingRecordObservedEvent {
+                target: "teamy_studio_startup::tests".to_owned(),
+                name: "event crates/teamy_studio_startup/src/lib.rs:1".to_owned(),
+                level: "INFO".to_owned(),
+                fields: Vec::new(),
+            }]);
+
+        let (timeline, _, _, _) = runtime.into_parts();
+        let published = timeline.published_epochs();
+        let observed = published[0].1.events()[0]
+            .downcast_ref::<TracingRecordObservedEvent>()
+            .expect("tracing observed payload should be present");
+
+        assert_eq!(published_count, 1);
+        assert_eq!(published.len(), 1);
+        assert_eq!(
+            published[0].1.events()[0].definition().id,
+            TRACING_RECORD_OBSERVED_EVENT_DEFINITION.id
+        );
+        assert_eq!(observed.level, "INFO");
     }
 
     #[test]
