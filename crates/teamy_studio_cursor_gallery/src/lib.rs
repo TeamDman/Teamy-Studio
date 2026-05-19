@@ -4,14 +4,15 @@ mod scene;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use linkme::distributed_slice;
-use teamy_studio_event_core::{EventDefinition, EventDefinitionId, PublishedEvent};
+use teamy_studio_event_core::{EventDefinition, EventDefinitionId, EventLogIntent, PublishedEvent};
 use teamy_studio_main_menu::{
     MAIN_MENU_BUTTON_CLASS_REGISTRATIONS, MAIN_MENU_CLICKED_EVENT_DEFINITION,
     MainMenuButtonClassId, MainMenuButtonClassRegistration, MainMenuClickEvent,
 };
 use teamy_studio_registration_core::{
-    EVENT_DEFINITION_REGISTRATIONS, EventDefinitionRegistration, TRIGGER_REGISTRATIONS,
-    TriggerRegistration,
+    EVENT_DEFINITION_REGISTRATIONS, EventDefinitionRegistration, FEATURE_DEFINITION_REGISTRATIONS,
+    FeatureDefinitionRegistration, FeatureId, TRIGGER_REGISTRATIONS, TriggerDefinitionId,
+    TriggerRegistration, TriggerRegistrationId, registration_provenance,
 };
 use teamy_studio_shell::WINDOW_CREATE_REQUEST_EVENT_DEFINITION;
 use teamy_studio_shell::{
@@ -24,6 +25,20 @@ pub use native_window::{
 
 pub const CURSOR_GALLERY_BUTTON_CLASS_ID: MainMenuButtonClassId =
     MainMenuButtonClassId::from_bytes([2; 16]);
+
+pub const CURSOR_GALLERY_FEATURE_ID: FeatureId = FeatureId::from_bytes([0x22; 16]);
+
+pub const CURSOR_GALLERY_OPEN_TRIGGER_DEFINITION_ID: TriggerDefinitionId =
+    TriggerDefinitionId::from_bytes([0x23; 16]);
+
+pub const CURSOR_GALLERY_OPEN_TRIGGER_REGISTRATION_ID: TriggerRegistrationId =
+    TriggerRegistrationId::from_bytes([0x24; 16]);
+
+pub const CURSOR_GALLERY_CREATE_WINDOW_TRIGGER_DEFINITION_ID: TriggerDefinitionId =
+    TriggerDefinitionId::from_bytes([0x25; 16]);
+
+pub const CURSOR_GALLERY_CREATE_WINDOW_TRIGGER_REGISTRATION_ID: TriggerRegistrationId =
+    TriggerRegistrationId::from_bytes([0x26; 16]);
 
 static NEXT_LOGICAL_WINDOW_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -39,16 +54,25 @@ pub static CURSOR_GALLERY_BUTTON_CLASS_REGISTRATION: MainMenuButtonClassRegistra
 pub static CURSOR_GALLERY_MAIN_MENU_BUTTON: MainMenuButtonClassRegistration =
     CURSOR_GALLERY_BUTTON_CLASS_REGISTRATION;
 
+#[distributed_slice(FEATURE_DEFINITION_REGISTRATIONS)]
+pub static CURSOR_GALLERY_FEATURE_REGISTRATION: FeatureDefinitionRegistration =
+    FeatureDefinitionRegistration {
+        feature_id: CURSOR_GALLERY_FEATURE_ID,
+        provenance: registration_provenance!(),
+    };
+
 pub static CURSOR_GALLERY_OPEN_INTENT_DEFINITION: EventDefinition = EventDefinition {
     id: EventDefinitionId::from_bytes([0x21; 16]),
     schema_name: "teamy_studio.cursor_gallery.open_intent",
     schema_version: 1,
+    log_intent: EventLogIntent::NONE,
 };
 
 #[distributed_slice(EVENT_DEFINITION_REGISTRATIONS)]
 pub static CURSOR_GALLERY_OPEN_INTENT_REGISTRATION: EventDefinitionRegistration =
     EventDefinitionRegistration {
         definition: &CURSOR_GALLERY_OPEN_INTENT_DEFINITION,
+        provenance: registration_provenance!(),
     };
 
 fn handle_main_menu_click_trigger(event: &PublishedEvent) -> Vec<PublishedEvent> {
@@ -62,8 +86,12 @@ fn handle_main_menu_click_trigger(event: &PublishedEvent) -> Vec<PublishedEvent>
 
 #[distributed_slice(TRIGGER_REGISTRATIONS)]
 pub static CURSOR_GALLERY_OPEN_TRIGGER: TriggerRegistration = TriggerRegistration {
+    registration_id: CURSOR_GALLERY_OPEN_TRIGGER_REGISTRATION_ID,
+    definition_id: CURSOR_GALLERY_OPEN_TRIGGER_DEFINITION_ID,
+    owner_feature_id: CURSOR_GALLERY_FEATURE_ID,
     name: "teamy_studio.cursor_gallery.open_from_main_menu_click",
     event_definition: &MAIN_MENU_CLICKED_EVENT_DEFINITION,
+    provenance: registration_provenance!(),
     handler: handle_main_menu_click_trigger,
 };
 
@@ -78,8 +106,12 @@ fn handle_open_intent_trigger(event: &PublishedEvent) -> Vec<PublishedEvent> {
 
 #[distributed_slice(TRIGGER_REGISTRATIONS)]
 pub static CURSOR_GALLERY_CREATE_WINDOW_TRIGGER: TriggerRegistration = TriggerRegistration {
+    registration_id: CURSOR_GALLERY_CREATE_WINDOW_TRIGGER_REGISTRATION_ID,
+    definition_id: CURSOR_GALLERY_CREATE_WINDOW_TRIGGER_DEFINITION_ID,
+    owner_feature_id: CURSOR_GALLERY_FEATURE_ID,
     name: "teamy_studio.cursor_gallery.create_window_from_open_intent",
     event_definition: &CURSOR_GALLERY_OPEN_INTENT_DEFINITION,
+    provenance: registration_provenance!(),
     handler: handle_open_intent_trigger,
 };
 

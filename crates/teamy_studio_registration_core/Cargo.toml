@@ -5,5 +5,7 @@ edition = "2024"
 publish = false
 
 [dependencies]
+facet = { version = "0.44.1", features = ["uuid"] }
 linkme = "0.3.35"
 teamy_studio_event_core = { path = "../teamy_studio_event_core" }
+uuid = { version = "1.18.1", features = ["v4"] }

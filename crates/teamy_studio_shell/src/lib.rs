@@ -21,8 +21,12 @@ use std::sync::{Mutex, OnceLock};
 
 use eyre::{Result, WrapErr};
 use linkme::distributed_slice;
-use teamy_studio_event_core::{EventDefinition, EventDefinitionId, PublishedEvent, WritableArena};
-use teamy_studio_registration_core::{EVENT_DEFINITION_REGISTRATIONS, EventDefinitionRegistration};
+use teamy_studio_event_core::{
+    EventDefinition, EventDefinitionId, EventLogIntent, PublishedEvent, WritableArena,
+};
+use teamy_studio_registration_core::{
+    EVENT_DEFINITION_REGISTRATIONS, EventDefinitionRegistration, registration_provenance,
+};
 use teamy_studio_timeline_core::{CanonicalTimeKey, ConstructedTimeline, TriggerRuntime};
 use tracing::warn;
 use windows::Win32::Foundation::HINSTANCE;
@@ -937,12 +941,14 @@ pub static WINDOW_CREATE_REQUEST_EVENT_DEFINITION: EventDefinition = EventDefini
     id: EventDefinitionId::from_bytes([0x31; 16]),
     schema_name: "teamy_studio.shell.window_create_request",
     schema_version: 1,
+    log_intent: EventLogIntent::NONE,
 };
 
 #[distributed_slice(EVENT_DEFINITION_REGISTRATIONS)]
 pub static WINDOW_CREATE_REQUEST_EVENT_REGISTRATION: EventDefinitionRegistration =
     EventDefinitionRegistration {
         definition: &WINDOW_CREATE_REQUEST_EVENT_DEFINITION,
+        provenance: registration_provenance!(),
     };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -957,12 +963,14 @@ pub static WINDOW_CREATED_EVENT_DEFINITION: EventDefinition = EventDefinition {
     id: EventDefinitionId::from_bytes([0x32; 16]),
     schema_name: "teamy_studio.shell.window_created",
     schema_version: 1,
+    log_intent: EventLogIntent::NONE,
 };
 
 #[distributed_slice(EVENT_DEFINITION_REGISTRATIONS)]
 pub static WINDOW_CREATED_EVENT_REGISTRATION: EventDefinitionRegistration =
     EventDefinitionRegistration {
         definition: &WINDOW_CREATED_EVENT_DEFINITION,
+        provenance: registration_provenance!(),
     };
 
 #[derive(Clone, Debug, Eq, PartialEq)]

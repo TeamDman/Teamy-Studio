@@ -86,6 +86,17 @@ Completed in the repository now:
 - Tracey-with-an-E has been demoted from the active validation gate to historical reference documentation under `docs/reference/tracey`, and `check-all.ps1` no longer runs `tracey query status`
 - the strict clippy debt that blocked the post-Tracey validation pass has been cleared, including the `teamy_studio_fonts` lints and the next surfaced shell/startup lints
 - `check-all.ps1` passed after the Tracey demotion and validation-cleanup work, covering format, clippy, all-feature build, tests, and default-feature build
+- `teamy_studio_registration_core` now owns initial `FeatureId`, `TriggerDefinitionId`, and `TriggerRegistrationId` GUID wrapper types with Facet reflection, plus a static feature-definition `linkme` registry alongside the existing event-definition and trigger-registration registries
+- trigger registrations now carry stable trigger registration identity, stable trigger definition identity, and owner feature identity, and startup registration validation now rejects duplicate feature IDs, duplicate trigger IDs, trigger definitions with duplicate IDs, and triggers owned by unregistered features
+- `teamy_studio_cursor_gallery` now registers its stable feature identity and annotates its two trigger registrations with stable trigger-definition/registration IDs
+- startup feature compatibility and activation-gate events now report the cursor-gallery `FeatureId` rather than using the main-menu button class ID as a feature stand-in
+- `teamy_studio_registration_core` now also owns an auxiliary `RegistrationProvenance` diagnostic surface plus a `registration_provenance!()` macro that captures repository URL, source file path, module path, source line/column, and optional compile-time revision
+- active feature, event-definition, and trigger registrations in the MVP stack now carry provenance metadata while keeping their stable identity fields separate from diagnostic context
+- registration validation failures now preserve occurrence-rich diagnostic context, including relevant feature IDs, event-definition IDs, trigger definition/registration IDs, trigger names, and registration provenance
+- startup now publishes a concrete `RegistrationValidationFailedEvent` before a linked `StartupFailedEvent` when registration validation fails, matching the existing detail-event-plus-backlink failure pattern used by bootstrap, logging, tracing, and cursor-gallery startup flow failures
+- `teamy_studio_event_core::EventDefinition` now carries explicit `EventLogIntent` metadata with app-owned log levels, establishing the first event-definition-owned logging policy surface
+- startup event definitions now declare log intent for bootstrap, validation, success, and failure events, while non-startup feature/shell/menu events currently remain non-log-facing by default
+- `StartupRuntime::publish` now re-emits log-worthy published events through tracing with a `teamy.timeline_reemit = true` marker and event-definition identity/schema fields, making timeline publication the source of those product-log records
 
 Still pending:
 
@@ -94,15 +105,17 @@ Still pending:
 - preserving the legacy `teamy-figue`/Facet compatibility constraint when Figue parsing is restored, rather than blindly upgrading into an incompatible Facet graph
 - restoring richer structured log collection policies on the active startup path beyond stderr plus optional NDJSON output
 - representing startup bootstrap as a timeline-driven chain beginning from raw process startup inputs and deriving parsed CLI, logging configuration, tracing initialization, validation state, and startup composition requests
-- real startup validation UX and gating using explicit per-feature validation events instead of the current synchronous validation call
+- real startup validation UX and gating using explicit per-feature validation events instead of the current synchronous validation call; the first identity-bearing registry surfaces now exist, but validation is still a synchronous startup pass
 - actual Win32/D3D12-backed window creation behind the shell host scaffold
 - async timeline ingestion, trigger cursors, and runtime pumping
 - feature-owned render/input loops and the real cursor-gallery window implementation
 - feature-owned event definitions that carry explicit log intent/level metadata plus the authoritative timeline-to-tracing re-emission bridge and tracing-observation loop-prevention markers needed to make timeline publication, rather than direct tracing macros, the long-term source of truth for product logs
+- tracing-observation back into the event system; timeline-to-tracing re-emission now marks records for loop prevention, but no tracing subscriber layer currently consumes that marker and publishes ordinary tracing records back into the timeline
 - extracting the legacy D3D12 render thread and shader-backed scene renderer into shell-owned helpers so the main menu and feature crates can render the shared scene model through the real backend instead of the current custom-painted stopgap
 - richer event definitions with Facet-shaped public canonical event forms
 - richer startup failure reporting with thin failure events that point back to concrete prior failure references
 - automatic failure publication across all bootstrap failure exits, not just the current root startup surface helpers and MVP cursor-gallery flow failure branch
+- richer user-facing rendering of startup validation diagnostics; validation failures are now represented on the timeline with IDs and provenance, but command-line text output is still largely the current error string unless trace publication output is inspected
 
 ## Clean-context continuation notes
 
@@ -112,8 +125,8 @@ Current baseline:
 
 - the active branch is `event-cutover`
 - the last committed checkpoint before this note was `60f9ea1`, `Capture event cutover workflow state`
-- the working tree was clean immediately after that commit
-- `.\check-all.ps1` passed after Tracey was removed from the active gate
+- the working tree now has the registration identity, provenance, startup validation diagnostics, and first authoritative logging foundation slices implemented but not committed
+- `.\check-all.ps1` passed after adding event-definition log intent and timeline-to-tracing re-emission from startup publication
 - Tracey-with-an-E is reference-only at `docs/reference/tracey/.config/tracey/config.styx`
 - `docs/spec/` documents are historical/planning material unless a newer record-of-decision re-promotes them
 
@@ -121,14 +134,11 @@ Recommended next implementation thread:
 
 1. Start by running `git status --short` and `.\check-all.ps1` to confirm the baseline is still clean and green.
 2. Read `development-workflow-record-of-decision.md`, `startup-bootstrap-record-of-decision.md`, and `timeline-authoritative-logging-record-of-decision.md`.
-3. Prefer a small foundation slice over broad feature migration. The best next slice is likely registration identity/provenance:
-   - add stable `FeatureId`
-   - add a feature-definition `linkme` registry in `teamy_studio_registration_core`
-   - add stable trigger definition/registration IDs
-   - prepare provenance metadata surfaces without turning registrations into semantic config objects
-4. If working on CLI restoration instead, do not add arbitrary new Figue/Facet versions. Preserve the legacy `teamy-figue` plus `facet = 0.44.1` compatibility constraint or write a new compatibility decision first.
-5. If working on logging, follow the authoritative-timeline path: event-definition log metadata first, then timeline-to-tracing re-emission with loop-prevention markers.
-6. Update this plan before ending the session, especially the `Current implementation status`, `Still pending`, and this continuation section.
+3. Implement a larger tracing-observation foundation chunk: add a startup-owned tracing layer or subscriber-side helper that can recognize ordinary tracing records, ignore records marked with `teamy.timeline_reemit = true`, and convert unmarked tracing records into a first typed tracing-observed event shape for later publication.
+4. Keep the first observation path conservative: prove marker detection and event construction in tests first, then wire it only where it will not perturb current app startup semantics.
+5. Expected observable `cargo run -- --log-filter trace` differences for that next chunk: successful startup should still launch the native main menu; event-derived re-emission records should remain visible with `teamy.timeline_reemit = true`; direct transitional tracing records such as menu-click diagnostics may become candidates for future timeline observation, but marked event-derived records should not be duplicated. If the observation layer is wired into the live subscriber during the chunk, trace output may include one additional diagnostic line showing that the tracing-observation layer was installed; it should not create an infinite loop or repeated duplicate startup records.
+6. Do not start Figue restoration in the same slice. When CLI restoration begins later, preserve the legacy `teamy-figue` plus `facet = 0.44.1` compatibility constraint or write a new compatibility decision first.
+7. Update this plan before ending the session, especially the `Current implementation status`, `Still pending`, and this continuation section.
 
 ---
 

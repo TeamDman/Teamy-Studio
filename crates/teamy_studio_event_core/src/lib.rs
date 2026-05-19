@@ -46,10 +46,50 @@ impl EventDefinitionId {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Facet, PartialEq)]
+#[repr(u8)]
+pub enum EventLogLevel {
+    Trace,
+    Debug,
+    Info,
+    Warn,
+    Error,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Facet, PartialEq)]
+pub struct EventLogIntent {
+    pub level: Option<EventLogLevel>,
+}
+
+impl EventLogIntent {
+    pub const NONE: Self = Self { level: None };
+    pub const TRACE: Self = Self {
+        level: Some(EventLogLevel::Trace),
+    };
+    pub const DEBUG: Self = Self {
+        level: Some(EventLogLevel::Debug),
+    };
+    pub const INFO: Self = Self {
+        level: Some(EventLogLevel::Info),
+    };
+    pub const WARN: Self = Self {
+        level: Some(EventLogLevel::Warn),
+    };
+    pub const ERROR: Self = Self {
+        level: Some(EventLogLevel::Error),
+    };
+
+    #[must_use]
+    pub const fn is_log_worthy(self) -> bool {
+        self.level.is_some()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Facet, PartialEq)]
 pub struct EventDefinition {
     pub id: EventDefinitionId,
     pub schema_name: &'static str,
     pub schema_version: u32,
+    pub log_intent: EventLogIntent,
 }
 
 pub trait PublicEventShape<'facet>: Facet<'facet> {}
@@ -192,6 +232,7 @@ mod tests {
         id: EventDefinitionId::from_bytes([2; 16]),
         schema_name: "test.published",
         schema_version: 1,
+        log_intent: super::EventLogIntent::NONE,
     };
 
     #[derive(Clone, Debug, Eq, Facet, PartialEq)]
@@ -205,6 +246,7 @@ mod tests {
             id: EventDefinitionId::from_bytes([1; 16]),
             schema_name: "test.event",
             schema_version: 1,
+            log_intent: super::EventLogIntent::NONE,
         };
         let mut arena = WritableArena::new(definition.schema_name);
         arena.push_with_id(EventId::from_bytes([9; 16]), TestEvent { value: 7 });
@@ -241,6 +283,7 @@ mod tests {
 
         assert_facet::<EventId>();
         assert_facet::<EventDefinitionId>();
+        assert_facet::<super::EventLogIntent>();
         assert_facet::<EventDefinition>();
     }
 }

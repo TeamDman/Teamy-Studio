@@ -306,7 +306,7 @@ mod tests {
     };
     use crate::timeline::{TIME_LIKE_CATEGORY_INSTANT, TimeLikeFacetProxy};
     use teamy_studio_event_core::{
-        EventDefinition, EventDefinitionId, EventId, PublishedEvent, WritableArena,
+        EventDefinition, EventDefinitionId, EventId, EventLogIntent, PublishedEvent, WritableArena,
     };
 
     #[derive(Clone, Debug, Eq, PartialEq)]
@@ -318,6 +318,7 @@ mod tests {
         id: EventDefinitionId::from_bytes([0x41; 16]),
         schema_name: "timeline.test.published",
         schema_version: 1,
+        log_intent: EventLogIntent::NONE,
     };
 
     #[test]

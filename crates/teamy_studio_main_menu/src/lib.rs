@@ -2,8 +2,10 @@ mod native_window;
 mod scene;
 
 use linkme::distributed_slice;
-use teamy_studio_event_core::{EventDefinition, EventDefinitionId, PublishedEvent};
-use teamy_studio_registration_core::{EVENT_DEFINITION_REGISTRATIONS, EventDefinitionRegistration};
+use teamy_studio_event_core::{EventDefinition, EventDefinitionId, EventLogIntent, PublishedEvent};
+use teamy_studio_registration_core::{
+    EVENT_DEFINITION_REGISTRATIONS, EventDefinitionRegistration, registration_provenance,
+};
 
 pub use native_window::{
     run_native_main_menu_window, run_native_main_menu_window_with_click_handler,
@@ -61,12 +63,14 @@ pub static MAIN_MENU_CLICKED_EVENT_DEFINITION: EventDefinition = EventDefinition
     id: EventDefinitionId::from_bytes([0x10; 16]),
     schema_name: "teamy_studio.main_menu.clicked",
     schema_version: 1,
+    log_intent: EventLogIntent::NONE,
 };
 
 #[distributed_slice(EVENT_DEFINITION_REGISTRATIONS)]
 pub static MAIN_MENU_CLICKED_EVENT_REGISTRATION: EventDefinitionRegistration =
     EventDefinitionRegistration {
         definition: &MAIN_MENU_CLICKED_EVENT_DEFINITION,
+        provenance: registration_provenance!(),
     };
 
 #[derive(Clone, Debug, Eq, PartialEq)]

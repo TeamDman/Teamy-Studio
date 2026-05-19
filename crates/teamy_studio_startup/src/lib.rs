@@ -14,9 +14,12 @@ use facet::Facet;
 use linkme::distributed_slice;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
-use teamy_studio_cursor_gallery::CURSOR_GALLERY_BUTTON_CLASS_ID;
 use teamy_studio_cursor_gallery::CursorGalleryState;
-use teamy_studio_event_core::{EventDefinition, EventDefinitionId, PublishedEvent, WritableArena};
+use teamy_studio_cursor_gallery::{CURSOR_GALLERY_BUTTON_CLASS_ID, CURSOR_GALLERY_FEATURE_ID};
+use teamy_studio_event_core::{
+    EventDefinition, EventDefinitionId, EventLogIntent, EventLogLevel, PublishedEvent,
+    WritableArena,
+};
 use teamy_studio_launcher_catalog as _;
 use teamy_studio_launcher_catalog::{
     APPLICATION_WINDOWS_BUTTON_CLASS_ID, AUDIO_DAEMON_BUTTON_CLASS_ID,
@@ -31,61 +34,70 @@ use teamy_studio_main_menu::{
     registered_button_classes, show_main_menu_info_dialog,
 };
 use teamy_studio_registration_core::{
-    EVENT_DEFINITION_REGISTRATIONS, EventDefinitionRegistration, RegistrationSnapshot, snapshot,
-    trigger_registrations_for, validate_registrations,
+    EVENT_DEFINITION_REGISTRATIONS, EventDefinitionRegistration, FeatureId, RegistrationProvenance,
+    RegistrationSnapshot, RegistrationValidationError, TriggerDefinitionId, TriggerRegistrationId,
+    registration_provenance, snapshot, trigger_registrations_for, validate_registrations,
 };
 use teamy_studio_shell::{HostedWindowRecord, ShellRuntime, ShellState};
 use teamy_studio_timeline_core::{
     CanonicalTimeKey, ConstructedTimeline, EventId, EventReference, TriggerCursor, TriggerRuntime,
 };
-use tracing::{info, trace};
+use tracing::{Level, event, info, trace};
 
 pub static STARTUP_SUCCEEDED_EVENT_DEFINITION: EventDefinition = EventDefinition {
     id: EventDefinitionId::from_bytes([0x01; 16]),
     schema_name: "teamy_studio.startup.succeeded",
     schema_version: 1,
+    log_intent: EventLogIntent::INFO,
 };
 
 pub static STARTUP_FAILED_EVENT_DEFINITION: EventDefinition = EventDefinition {
     id: EventDefinitionId::from_bytes([0x02; 16]),
     schema_name: "teamy_studio.startup.failed",
     schema_version: 1,
+    log_intent: EventLogIntent::ERROR,
 };
 
 pub static PROCESS_STARTUP_OBSERVED_EVENT_DEFINITION: EventDefinition = EventDefinition {
     id: EventDefinitionId::from_bytes([0x03; 16]),
     schema_name: "teamy_studio.startup.process_startup_observed",
     schema_version: 1,
+    log_intent: EventLogIntent::TRACE,
 };
 
 pub static STARTUP_GLOBAL_ARGS_PARSED_EVENT_DEFINITION: EventDefinition = EventDefinition {
     id: EventDefinitionId::from_bytes([0x08; 16]),
     schema_name: "teamy_studio.startup.global_args_parsed",
     schema_version: 1,
+    log_intent: EventLogIntent::TRACE,
 };
 
 pub static STARTUP_LOGGING_CONFIGURED_EVENT_DEFINITION: EventDefinition = EventDefinition {
     id: EventDefinitionId::from_bytes([0x04; 16]),
     schema_name: "teamy_studio.startup.logging_configured",
     schema_version: 1,
+    log_intent: EventLogIntent::DEBUG,
 };
 
 pub static TRACING_INITIALIZED_EVENT_DEFINITION: EventDefinition = EventDefinition {
     id: EventDefinitionId::from_bytes([0x05; 16]),
     schema_name: "teamy_studio.startup.tracing_initialized",
     schema_version: 1,
+    log_intent: EventLogIntent::INFO,
 };
 
 pub static REGISTRATION_VALIDATION_STARTED_EVENT_DEFINITION: EventDefinition = EventDefinition {
     id: EventDefinitionId::from_bytes([0x06; 16]),
     schema_name: "teamy_studio.startup.registration_validation_started",
     schema_version: 1,
+    log_intent: EventLogIntent::DEBUG,
 };
 
 pub static REGISTRATION_VALIDATION_COMPLETED_EVENT_DEFINITION: EventDefinition = EventDefinition {
     id: EventDefinitionId::from_bytes([0x07; 16]),
     schema_name: "teamy_studio.startup.registration_validation_completed",
     schema_version: 1,
+    log_intent: EventLogIntent::DEBUG,
 };
 
 pub static FEATURE_COMPATIBILITY_VALIDATION_STARTED_EVENT_DEFINITION: EventDefinition =
@@ -93,12 +105,14 @@ pub static FEATURE_COMPATIBILITY_VALIDATION_STARTED_EVENT_DEFINITION: EventDefin
         id: EventDefinitionId::from_bytes([0x09; 16]),
         schema_name: "teamy_studio.startup.feature_compatibility_validation_started",
         schema_version: 1,
+        log_intent: EventLogIntent::DEBUG,
     };
 
 pub static FEATURE_COMPATIBILITY_VALIDATED_EVENT_DEFINITION: EventDefinition = EventDefinition {
     id: EventDefinitionId::from_bytes([0x0A; 16]),
     schema_name: "teamy_studio.startup.feature_compatibility_validated",
     schema_version: 1,
+    log_intent: EventLogIntent::DEBUG,
 };
 
 pub static FEATURE_COMPATIBILITY_VALIDATION_COMPLETED_EVENT_DEFINITION: EventDefinition =
@@ -106,139 +120,178 @@ pub static FEATURE_COMPATIBILITY_VALIDATION_COMPLETED_EVENT_DEFINITION: EventDef
         id: EventDefinitionId::from_bytes([0x0B; 16]),
         schema_name: "teamy_studio.startup.feature_compatibility_validation_completed",
         schema_version: 1,
+        log_intent: EventLogIntent::DEBUG,
     };
 
 pub static FEATURE_ACTIVATION_GATE_RESOLVED_EVENT_DEFINITION: EventDefinition = EventDefinition {
     id: EventDefinitionId::from_bytes([0x0C; 16]),
     schema_name: "teamy_studio.startup.feature_activation_gate_resolved",
     schema_version: 1,
+    log_intent: EventLogIntent::DEBUG,
 };
 
 pub static TRACING_INITIALIZATION_FAILED_EVENT_DEFINITION: EventDefinition = EventDefinition {
     id: EventDefinitionId::from_bytes([0x0D; 16]),
     schema_name: "teamy_studio.startup.tracing_initialization_failed",
     schema_version: 1,
+    log_intent: EventLogIntent::ERROR,
 };
 
 pub static DEFAULT_CURSOR_GALLERY_FLOW_FAILED_EVENT_DEFINITION: EventDefinition = EventDefinition {
     id: EventDefinitionId::from_bytes([0x0E; 16]),
     schema_name: "teamy_studio.startup.default_cursor_gallery_flow_failed",
     schema_version: 1,
+    log_intent: EventLogIntent::ERROR,
 };
 
 pub static BOOTSTRAP_CLI_PARSE_FAILED_EVENT_DEFINITION: EventDefinition = EventDefinition {
     id: EventDefinitionId::from_bytes([0x0F; 16]),
     schema_name: "teamy_studio.startup.bootstrap_cli_parse_failed",
     schema_version: 1,
+    log_intent: EventLogIntent::ERROR,
 };
 
 pub static STARTUP_LOGGING_PLAN_FAILED_EVENT_DEFINITION: EventDefinition = EventDefinition {
     id: EventDefinitionId::from_bytes([0x11; 16]),
     schema_name: "teamy_studio.startup.logging_plan_failed",
     schema_version: 1,
+    log_intent: EventLogIntent::ERROR,
+};
+
+pub static REGISTRATION_VALIDATION_FAILED_EVENT_DEFINITION: EventDefinition = EventDefinition {
+    id: EventDefinitionId::from_bytes([0x12; 16]),
+    schema_name: "teamy_studio.startup.registration_validation_failed",
+    schema_version: 1,
+    log_intent: EventLogIntent::ERROR,
 };
 
 const STARTUP_BOOTSTRAP_CLI_PARSE_FAILED_REASON: &str = "startup bootstrap cli parse failed";
 const STARTUP_LOGGING_PLAN_DERIVATION_FAILED_REASON: &str =
     "startup logging plan derivation failed";
 const STARTUP_TRACING_INITIALIZATION_FAILED_REASON: &str = "startup tracing initialization failed";
+const STARTUP_REGISTRATION_VALIDATION_FAILED_REASON: &str =
+    "startup registration validation failed";
 const DEFAULT_CURSOR_GALLERY_FLOW_FAILURE_REASON: &str =
     "registered triggers did not produce the default cursor-gallery window flow";
+const TIMELINE_TO_TRACING_REEMIT_MARKER_FIELD: &str = "teamy.timeline_reemit";
 
 #[distributed_slice(EVENT_DEFINITION_REGISTRATIONS)]
 pub static STARTUP_SUCCEEDED_EVENT_REGISTRATION: EventDefinitionRegistration =
     EventDefinitionRegistration {
         definition: &STARTUP_SUCCEEDED_EVENT_DEFINITION,
+        provenance: registration_provenance!(),
     };
 
 #[distributed_slice(EVENT_DEFINITION_REGISTRATIONS)]
 pub static STARTUP_FAILED_EVENT_REGISTRATION: EventDefinitionRegistration =
     EventDefinitionRegistration {
         definition: &STARTUP_FAILED_EVENT_DEFINITION,
+        provenance: registration_provenance!(),
     };
 
 #[distributed_slice(EVENT_DEFINITION_REGISTRATIONS)]
 pub static PROCESS_STARTUP_OBSERVED_EVENT_REGISTRATION: EventDefinitionRegistration =
     EventDefinitionRegistration {
         definition: &PROCESS_STARTUP_OBSERVED_EVENT_DEFINITION,
+        provenance: registration_provenance!(),
     };
 
 #[distributed_slice(EVENT_DEFINITION_REGISTRATIONS)]
 pub static STARTUP_GLOBAL_ARGS_PARSED_EVENT_REGISTRATION: EventDefinitionRegistration =
     EventDefinitionRegistration {
         definition: &STARTUP_GLOBAL_ARGS_PARSED_EVENT_DEFINITION,
+        provenance: registration_provenance!(),
     };
 
 #[distributed_slice(EVENT_DEFINITION_REGISTRATIONS)]
 pub static STARTUP_LOGGING_CONFIGURED_EVENT_REGISTRATION: EventDefinitionRegistration =
     EventDefinitionRegistration {
         definition: &STARTUP_LOGGING_CONFIGURED_EVENT_DEFINITION,
+        provenance: registration_provenance!(),
     };
 
 #[distributed_slice(EVENT_DEFINITION_REGISTRATIONS)]
 pub static TRACING_INITIALIZED_EVENT_REGISTRATION: EventDefinitionRegistration =
     EventDefinitionRegistration {
         definition: &TRACING_INITIALIZED_EVENT_DEFINITION,
+        provenance: registration_provenance!(),
     };
 
 #[distributed_slice(EVENT_DEFINITION_REGISTRATIONS)]
 pub static REGISTRATION_VALIDATION_STARTED_EVENT_REGISTRATION: EventDefinitionRegistration =
     EventDefinitionRegistration {
         definition: &REGISTRATION_VALIDATION_STARTED_EVENT_DEFINITION,
+        provenance: registration_provenance!(),
     };
 
 #[distributed_slice(EVENT_DEFINITION_REGISTRATIONS)]
 pub static REGISTRATION_VALIDATION_COMPLETED_EVENT_REGISTRATION: EventDefinitionRegistration =
     EventDefinitionRegistration {
         definition: &REGISTRATION_VALIDATION_COMPLETED_EVENT_DEFINITION,
+        provenance: registration_provenance!(),
     };
 
 #[distributed_slice(EVENT_DEFINITION_REGISTRATIONS)]
 pub static FEATURE_COMPATIBILITY_VALIDATION_STARTED_EVENT_REGISTRATION:
     EventDefinitionRegistration = EventDefinitionRegistration {
     definition: &FEATURE_COMPATIBILITY_VALIDATION_STARTED_EVENT_DEFINITION,
+    provenance: registration_provenance!(),
 };
 
 #[distributed_slice(EVENT_DEFINITION_REGISTRATIONS)]
 pub static FEATURE_COMPATIBILITY_VALIDATED_EVENT_REGISTRATION: EventDefinitionRegistration =
     EventDefinitionRegistration {
         definition: &FEATURE_COMPATIBILITY_VALIDATED_EVENT_DEFINITION,
+        provenance: registration_provenance!(),
     };
 
 #[distributed_slice(EVENT_DEFINITION_REGISTRATIONS)]
 pub static FEATURE_COMPATIBILITY_VALIDATION_COMPLETED_EVENT_REGISTRATION:
     EventDefinitionRegistration = EventDefinitionRegistration {
     definition: &FEATURE_COMPATIBILITY_VALIDATION_COMPLETED_EVENT_DEFINITION,
+    provenance: registration_provenance!(),
 };
 
 #[distributed_slice(EVENT_DEFINITION_REGISTRATIONS)]
 pub static FEATURE_ACTIVATION_GATE_RESOLVED_EVENT_REGISTRATION: EventDefinitionRegistration =
     EventDefinitionRegistration {
         definition: &FEATURE_ACTIVATION_GATE_RESOLVED_EVENT_DEFINITION,
+        provenance: registration_provenance!(),
     };
 
 #[distributed_slice(EVENT_DEFINITION_REGISTRATIONS)]
 pub static TRACING_INITIALIZATION_FAILED_EVENT_REGISTRATION: EventDefinitionRegistration =
     EventDefinitionRegistration {
         definition: &TRACING_INITIALIZATION_FAILED_EVENT_DEFINITION,
+        provenance: registration_provenance!(),
     };
 
 #[distributed_slice(EVENT_DEFINITION_REGISTRATIONS)]
 pub static DEFAULT_CURSOR_GALLERY_FLOW_FAILED_EVENT_REGISTRATION: EventDefinitionRegistration =
     EventDefinitionRegistration {
         definition: &DEFAULT_CURSOR_GALLERY_FLOW_FAILED_EVENT_DEFINITION,
+        provenance: registration_provenance!(),
     };
 
 #[distributed_slice(EVENT_DEFINITION_REGISTRATIONS)]
 pub static BOOTSTRAP_CLI_PARSE_FAILED_EVENT_REGISTRATION: EventDefinitionRegistration =
     EventDefinitionRegistration {
         definition: &BOOTSTRAP_CLI_PARSE_FAILED_EVENT_DEFINITION,
+        provenance: registration_provenance!(),
     };
 
 #[distributed_slice(EVENT_DEFINITION_REGISTRATIONS)]
 pub static STARTUP_LOGGING_PLAN_FAILED_EVENT_REGISTRATION: EventDefinitionRegistration =
     EventDefinitionRegistration {
         definition: &STARTUP_LOGGING_PLAN_FAILED_EVENT_DEFINITION,
+        provenance: registration_provenance!(),
+    };
+
+#[distributed_slice(EVENT_DEFINITION_REGISTRATIONS)]
+pub static REGISTRATION_VALIDATION_FAILED_EVENT_REGISTRATION: EventDefinitionRegistration =
+    EventDefinitionRegistration {
+        definition: &REGISTRATION_VALIDATION_FAILED_EVENT_DEFINITION,
+        provenance: registration_provenance!(),
     };
 
 #[derive(Clone, Debug, Eq, Facet, PartialEq)]
@@ -274,7 +327,7 @@ pub struct FeatureCompatibilityValidationStartedEvent {
 
 #[derive(Clone, Debug, Eq, Facet, PartialEq)]
 pub struct FeatureCompatibilityValidatedEvent {
-    pub feature_class_id: [u8; 16],
+    pub feature_id: FeatureId,
     pub feature_title: &'static str,
 }
 
@@ -288,7 +341,7 @@ pub struct FeatureCompatibilityValidationCompletedEvent {
 
 #[derive(Clone, Debug, Eq, Facet, PartialEq)]
 pub struct FeatureActivationGateResolvedEvent {
-    pub feature_class_id: [u8; 16],
+    pub feature_id: FeatureId,
     pub feature_title: &'static str,
     pub allows_activation: bool,
 }
@@ -321,6 +374,19 @@ pub struct StartupLoggingPlanFailedEvent {
     pub log_file: Option<String>,
     pub rust_log: Option<String>,
     pub conflicting_log_filter: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, Facet, PartialEq)]
+pub struct RegistrationValidationFailedEvent {
+    pub reason: String,
+    pub feature_id: Option<FeatureId>,
+    pub event_definition_id: Option<EventDefinitionId>,
+    pub trigger_registration_id: Option<TriggerRegistrationId>,
+    pub trigger_definition_id: Option<TriggerDefinitionId>,
+    pub trigger_name: Option<&'static str>,
+    pub first_provenance: Option<RegistrationProvenance>,
+    pub duplicate_provenance: Option<RegistrationProvenance>,
+    pub trigger_provenance: Option<RegistrationProvenance>,
 }
 
 #[derive(Debug)]
@@ -399,15 +465,106 @@ fn startup_logging_plan_failed_event(
     }
 }
 
-fn feature_validation_state_counts(menu_snapshot: &MainMenuSnapshot) -> (u64, u64, u64) {
-    menu_snapshot.buttons().iter().fold(
-        (0_u64, 0_u64, 0_u64),
-        |(pending_count, validated_count, failed_count), button| match button.validation_state {
-            FeatureValidationState::Pending => (pending_count + 1, validated_count, failed_count),
-            FeatureValidationState::Validated => (pending_count, validated_count + 1, failed_count),
-            FeatureValidationState::Failed => (pending_count, validated_count, failed_count + 1),
+fn registration_validation_failed_event(
+    error: &RegistrationValidationError,
+) -> RegistrationValidationFailedEvent {
+    match error {
+        RegistrationValidationError::DuplicateFeatureId {
+            feature_id,
+            first_provenance,
+            duplicate_provenance,
+        } => RegistrationValidationFailedEvent {
+            reason: error.to_string(),
+            feature_id: Some(*feature_id),
+            event_definition_id: None,
+            trigger_registration_id: None,
+            trigger_definition_id: None,
+            trigger_name: None,
+            first_provenance: Some(*first_provenance),
+            duplicate_provenance: Some(*duplicate_provenance),
+            trigger_provenance: None,
         },
-    )
+        RegistrationValidationError::DuplicateEventDefinitionId {
+            event_definition_id,
+            first_provenance,
+            duplicate_provenance,
+        } => RegistrationValidationFailedEvent {
+            reason: error.to_string(),
+            feature_id: None,
+            event_definition_id: Some(*event_definition_id),
+            trigger_registration_id: None,
+            trigger_definition_id: None,
+            trigger_name: None,
+            first_provenance: Some(*first_provenance),
+            duplicate_provenance: Some(*duplicate_provenance),
+            trigger_provenance: None,
+        },
+        RegistrationValidationError::DuplicateTriggerRegistrationId {
+            trigger_registration_id,
+            first_provenance,
+            duplicate_provenance,
+        } => RegistrationValidationFailedEvent {
+            reason: error.to_string(),
+            feature_id: None,
+            event_definition_id: None,
+            trigger_registration_id: Some(*trigger_registration_id),
+            trigger_definition_id: None,
+            trigger_name: None,
+            first_provenance: Some(*first_provenance),
+            duplicate_provenance: Some(*duplicate_provenance),
+            trigger_provenance: None,
+        },
+        RegistrationValidationError::DuplicateTriggerDefinitionId {
+            trigger_definition_id,
+            first_provenance,
+            duplicate_provenance,
+        } => RegistrationValidationFailedEvent {
+            reason: error.to_string(),
+            feature_id: None,
+            event_definition_id: None,
+            trigger_registration_id: None,
+            trigger_definition_id: Some(*trigger_definition_id),
+            trigger_name: None,
+            first_provenance: Some(*first_provenance),
+            duplicate_provenance: Some(*duplicate_provenance),
+            trigger_provenance: None,
+        },
+        RegistrationValidationError::TriggerOwnedByUnregisteredFeature {
+            trigger_name,
+            trigger_registration_id,
+            trigger_definition_id,
+            feature_id,
+            trigger_provenance,
+        } => RegistrationValidationFailedEvent {
+            reason: error.to_string(),
+            feature_id: Some(*feature_id),
+            event_definition_id: None,
+            trigger_registration_id: Some(*trigger_registration_id),
+            trigger_definition_id: Some(*trigger_definition_id),
+            trigger_name: Some(*trigger_name),
+            first_provenance: None,
+            duplicate_provenance: None,
+            trigger_provenance: Some(*trigger_provenance),
+        },
+        RegistrationValidationError::TriggerTargetsUnregisteredDefinition {
+            trigger_name,
+            trigger_registration_id,
+            trigger_definition_id,
+            owner_feature_id,
+            event_definition_id,
+            trigger_provenance,
+        } => RegistrationValidationFailedEvent {
+            reason: error.to_string(),
+            feature_id: Some(*owner_feature_id),
+            event_definition_id: Some(*event_definition_id),
+            trigger_registration_id: Some(*trigger_registration_id),
+            trigger_definition_id: Some(*trigger_definition_id),
+            trigger_name: Some(*trigger_name),
+            first_provenance: None,
+            duplicate_provenance: None,
+            trigger_provenance: Some(*trigger_provenance),
+        },
+    }
 }
 
 #[derive(Debug)]
@@ -524,6 +681,80 @@ impl Error for ObservedBootstrapPlanFailure {
     }
 }
 
+fn reemit_log_worthy_event_to_tracing(
+    arena_name: &'static str,
+    time_key: CanonicalTimeKey,
+    event: &PublishedEvent,
+) {
+    let definition = event.definition();
+    let Some(level) = definition.log_intent.level else {
+        return;
+    };
+
+    let timeline_reemit_marker = true;
+    let event_schema_name = definition.schema_name;
+    let event_schema_version = definition.schema_version;
+    let time_key_femtoseconds = time_key.raw_femtoseconds();
+
+    match level {
+        EventLogLevel::Trace => event!(
+            Level::TRACE,
+            teamy.timeline_reemit = timeline_reemit_marker,
+            marker_field = TIMELINE_TO_TRACING_REEMIT_MARKER_FIELD,
+            arena_name,
+            event_definition_id = ?definition.id,
+            event_schema_name,
+            event_schema_version,
+            time_key_femtoseconds,
+            "timeline event re-emitted to tracing"
+        ),
+        EventLogLevel::Debug => event!(
+            Level::DEBUG,
+            teamy.timeline_reemit = timeline_reemit_marker,
+            marker_field = TIMELINE_TO_TRACING_REEMIT_MARKER_FIELD,
+            arena_name,
+            event_definition_id = ?definition.id,
+            event_schema_name,
+            event_schema_version,
+            time_key_femtoseconds,
+            "timeline event re-emitted to tracing"
+        ),
+        EventLogLevel::Info => event!(
+            Level::INFO,
+            teamy.timeline_reemit = timeline_reemit_marker,
+            marker_field = TIMELINE_TO_TRACING_REEMIT_MARKER_FIELD,
+            arena_name,
+            event_definition_id = ?definition.id,
+            event_schema_name,
+            event_schema_version,
+            time_key_femtoseconds,
+            "timeline event re-emitted to tracing"
+        ),
+        EventLogLevel::Warn => event!(
+            Level::WARN,
+            teamy.timeline_reemit = timeline_reemit_marker,
+            marker_field = TIMELINE_TO_TRACING_REEMIT_MARKER_FIELD,
+            arena_name,
+            event_definition_id = ?definition.id,
+            event_schema_name,
+            event_schema_version,
+            time_key_femtoseconds,
+            "timeline event re-emitted to tracing"
+        ),
+        EventLogLevel::Error => event!(
+            Level::ERROR,
+            teamy.timeline_reemit = timeline_reemit_marker,
+            marker_field = TIMELINE_TO_TRACING_REEMIT_MARKER_FIELD,
+            arena_name,
+            event_definition_id = ?definition.id,
+            event_schema_name,
+            event_schema_version,
+            time_key_femtoseconds,
+            "timeline event re-emitted to tracing"
+        ),
+    }
+}
+
 impl StartupRuntime {
     #[must_use]
     pub fn new() -> Self {
@@ -551,6 +782,7 @@ impl StartupRuntime {
         time_key: CanonicalTimeKey,
         event: PublishedEvent,
     ) {
+        reemit_log_worthy_event_to_tracing(arena_name, time_key, &event);
         let mut epoch = WritableArena::new(arena_name);
         epoch.push(event);
         self.timeline.ingest(time_key, epoch.seal());
@@ -800,6 +1032,29 @@ impl StartupRuntime {
         );
     }
 
+    pub fn publish_registration_validation_failed(&mut self, error: &RegistrationValidationError) {
+        let time_key = self.next_publish_time_key();
+        self.publish(
+            "teamy_studio.startup.validation",
+            time_key,
+            PublishedEvent::new(
+                &REGISTRATION_VALIDATION_FAILED_EVENT_DEFINITION,
+                registration_validation_failed_event(error),
+            ),
+        );
+    }
+
+    pub fn publish_registration_validation_failure_outcome(
+        &mut self,
+        error: &RegistrationValidationError,
+    ) {
+        self.publish_registration_validation_failed(error);
+        self.publish_startup_failed_from_latest_references_now(
+            STARTUP_REGISTRATION_VALIDATION_FAILED_REASON,
+            1,
+        );
+    }
+
     pub fn publish_tracing_initialization_failure_outcome(
         &mut self,
         bootstrap_plan: &StartupBootstrapPlan,
@@ -879,7 +1134,7 @@ impl StartupRuntime {
 
     pub fn publish_feature_compatibility_validated(
         &mut self,
-        feature_class_id: [u8; 16],
+        feature_id: FeatureId,
         feature_title: &'static str,
     ) {
         let time_key = self.next_publish_time_key();
@@ -889,7 +1144,7 @@ impl StartupRuntime {
             PublishedEvent::new(
                 &FEATURE_COMPATIBILITY_VALIDATED_EVENT_DEFINITION,
                 FeatureCompatibilityValidatedEvent {
-                    feature_class_id,
+                    feature_id,
                     feature_title,
                 },
             ),
@@ -898,11 +1153,11 @@ impl StartupRuntime {
 
     pub fn publish_feature_compatibility_validation_completed(
         &mut self,
-        menu_snapshot: &MainMenuSnapshot,
+        feature_count: u64,
+        pending_count: u64,
+        validated_count: u64,
+        failed_count: u64,
     ) {
-        let feature_count = menu_snapshot.buttons().len() as u64;
-        let (pending_count, validated_count, failed_count) =
-            feature_validation_state_counts(menu_snapshot);
         let time_key = self.next_publish_time_key();
         self.publish(
             "teamy_studio.startup.validation",
@@ -921,7 +1176,7 @@ impl StartupRuntime {
 
     pub fn publish_feature_activation_gate_resolved(
         &mut self,
-        feature_class_id: [u8; 16],
+        feature_id: FeatureId,
         feature_title: &'static str,
         allows_activation: bool,
     ) {
@@ -932,7 +1187,7 @@ impl StartupRuntime {
             PublishedEvent::new(
                 &FEATURE_ACTIVATION_GATE_RESOLVED_EVENT_DEFINITION,
                 FeatureActivationGateResolvedEvent {
-                    feature_class_id,
+                    feature_id,
                     feature_title,
                     allows_activation,
                 },
@@ -1268,13 +1523,18 @@ fn build_mvp_session_with_runtime(
     }
     let pre_validation_snapshot = snapshot();
     runtime.publish_registration_validation_started(pre_validation_snapshot);
-    validate_registrations()?;
+    if let Err(error) = validate_registrations() {
+        runtime.publish_registration_validation_failure_outcome(&error);
+        return Err(error.into());
+    }
     let registration_snapshot = snapshot();
     runtime.publish_registration_validation_completed(registration_snapshot);
 
     let button_classes = registered_button_classes();
     let mut menu_snapshot = MainMenuSnapshot::from_registrations(&button_classes);
-    runtime.publish_feature_compatibility_validation_started(menu_snapshot.buttons().len() as u64);
+    runtime.publish_feature_compatibility_validation_started(
+        registration_snapshot.feature_count as u64,
+    );
     menu_snapshot.set_validation_state_for_class_id(
         CURSOR_GALLERY_BUTTON_CLASS_ID,
         FeatureValidationState::Validated,
@@ -1283,12 +1543,17 @@ fn build_mvp_session_with_runtime(
         .button_by_class_id(CURSOR_GALLERY_BUTTON_CLASS_ID)
         .ok_or_else(|| eyre!("cursor gallery button was not registered for feature validation"))?;
     runtime.publish_feature_compatibility_validated(
-        cursor_gallery_button.class_id.as_bytes(),
+        CURSOR_GALLERY_FEATURE_ID,
         cursor_gallery_button.title,
     );
-    runtime.publish_feature_compatibility_validation_completed(&menu_snapshot);
+    runtime.publish_feature_compatibility_validation_completed(
+        registration_snapshot.feature_count as u64,
+        0,
+        1,
+        0,
+    );
     runtime.publish_feature_activation_gate_resolved(
-        cursor_gallery_button.class_id.as_bytes(),
+        CURSOR_GALLERY_FEATURE_ID,
         cursor_gallery_button.title,
         cursor_gallery_button.validation_state == FeatureValidationState::Validated,
     );
@@ -1542,28 +1807,35 @@ mod tests {
         FeatureCompatibilityValidationCompletedEvent, FeatureCompatibilityValidationStartedEvent,
         PROCESS_STARTUP_OBSERVED_EVENT_DEFINITION, ProcessStartupObservedEvent,
         REGISTRATION_VALIDATION_COMPLETED_EVENT_DEFINITION,
+        REGISTRATION_VALIDATION_FAILED_EVENT_DEFINITION,
         REGISTRATION_VALIDATION_STARTED_EVENT_DEFINITION, RawProcessStartupInputs,
-        RegistrationValidationCompletedEvent, RegistrationValidationStartedEvent,
-        STARTUP_FAILED_EVENT_DEFINITION, STARTUP_GLOBAL_ARGS_PARSED_EVENT_DEFINITION,
-        STARTUP_LOGGING_CONFIGURED_EVENT_DEFINITION, STARTUP_LOGGING_PLAN_FAILED_EVENT_DEFINITION,
-        STARTUP_SUCCEEDED_EVENT_DEFINITION, StartupFailedEvent, StartupGlobalArgsParsedEvent,
-        StartupLoggingConfiguredEvent, StartupLoggingPlanFailedEvent, StartupRuntime,
-        StartupSucceededEvent, TRACING_INITIALIZATION_FAILED_EVENT_DEFINITION,
-        TRACING_INITIALIZED_EVENT_DEFINITION, TracingInitializationFailedEvent,
-        TracingInitializedEvent, build_mvp_composition, build_mvp_composition_from_raw_inputs,
-        build_mvp_session, build_mvp_session_from_bootstrap_plan,
-        build_mvp_session_from_raw_inputs, build_mvp_session_with_native_shell,
-        derive_bootstrap_plan, derive_bootstrap_plan_with_runtime, initialize_tracing_for_session,
+        RegistrationValidationCompletedEvent, RegistrationValidationFailedEvent,
+        RegistrationValidationStartedEvent, STARTUP_FAILED_EVENT_DEFINITION,
+        STARTUP_GLOBAL_ARGS_PARSED_EVENT_DEFINITION, STARTUP_LOGGING_CONFIGURED_EVENT_DEFINITION,
+        STARTUP_LOGGING_PLAN_FAILED_EVENT_DEFINITION, STARTUP_SUCCEEDED_EVENT_DEFINITION,
+        StartupFailedEvent, StartupGlobalArgsParsedEvent, StartupLoggingConfiguredEvent,
+        StartupLoggingPlanFailedEvent, StartupRuntime, StartupSucceededEvent,
+        TRACING_INITIALIZATION_FAILED_EVENT_DEFINITION, TRACING_INITIALIZED_EVENT_DEFINITION,
+        TracingInitializationFailedEvent, TracingInitializedEvent, build_mvp_composition,
+        build_mvp_composition_from_raw_inputs, build_mvp_session,
+        build_mvp_session_from_bootstrap_plan, build_mvp_session_from_raw_inputs,
+        build_mvp_session_with_native_shell, derive_bootstrap_plan,
+        derive_bootstrap_plan_with_runtime, initialize_tracing_for_session,
         next_main_menu_interaction_time_seed, observe_bootstrap_plan_from_raw_inputs,
         unimplemented_main_menu_dialog,
     };
     use teamy_studio_cursor_gallery::{
         CURSOR_GALLERY_BUTTON_CLASS_ID, CURSOR_GALLERY_OPEN_INTENT_DEFINITION,
     };
+    use teamy_studio_event_core::{EventLogIntent, EventLogLevel};
     use teamy_studio_launcher_catalog::{
         ENVIRONMENT_VARIABLES_BUTTON_CLASS_ID, TERMINAL_BUTTON_CLASS_ID,
     };
     use teamy_studio_main_menu::{FeatureValidationState, MAIN_MENU_CLICKED_EVENT_DEFINITION};
+    use teamy_studio_registration_core::{
+        FeatureId, RegistrationValidationError, TriggerDefinitionId, TriggerRegistrationId,
+        registration_provenance,
+    };
     use teamy_studio_shell::{
         InitialWindowCommand, RendererHostMode, WINDOW_CREATE_REQUEST_EVENT_DEFINITION,
         WINDOW_CREATED_EVENT_DEFINITION, WindowHostOptions,
@@ -1592,6 +1864,28 @@ mod tests {
 
         assert_eq!(dialog.0, "Terminal");
         assert_eq!(dialog.1, "Terminal is not implemented yet.");
+    }
+
+    #[test]
+    fn startup_event_definitions_carry_log_intent_for_reemission() {
+        assert_eq!(
+            PROCESS_STARTUP_OBSERVED_EVENT_DEFINITION.log_intent,
+            EventLogIntent::TRACE
+        );
+        assert_eq!(
+            REGISTRATION_VALIDATION_FAILED_EVENT_DEFINITION
+                .log_intent
+                .level,
+            Some(EventLogLevel::Error)
+        );
+        assert_eq!(
+            STARTUP_SUCCEEDED_EVENT_DEFINITION.log_intent.level,
+            Some(EventLogLevel::Info)
+        );
+        assert_eq!(
+            CURSOR_GALLERY_OPEN_INTENT_DEFINITION.log_intent,
+            EventLogIntent::NONE
+        );
     }
 
     #[test]
@@ -1861,22 +2155,22 @@ mod tests {
         let feature_validation_started = published[5].1.events()[0]
             .downcast_ref::<FeatureCompatibilityValidationStartedEvent>()
             .expect("feature validation start payload should be present");
-        assert_eq!(feature_validation_started.feature_count, 16);
+        assert_eq!(feature_validation_started.feature_count, 1);
 
         let feature_validated = published[6].1.events()[0]
             .downcast_ref::<FeatureCompatibilityValidatedEvent>()
             .expect("feature validated payload should be present");
         assert_eq!(
-            feature_validated.feature_class_id,
-            teamy_studio_cursor_gallery::CURSOR_GALLERY_BUTTON_CLASS_ID.as_bytes()
+            feature_validated.feature_id,
+            teamy_studio_cursor_gallery::CURSOR_GALLERY_FEATURE_ID
         );
         assert_eq!(feature_validated.feature_title, "Cursor Gallery");
 
         let feature_validation_completed = published[7].1.events()[0]
             .downcast_ref::<FeatureCompatibilityValidationCompletedEvent>()
             .expect("feature validation completion payload should be present");
-        assert_eq!(feature_validation_completed.feature_count, 16);
-        assert_eq!(feature_validation_completed.pending_count, 15);
+        assert_eq!(feature_validation_completed.feature_count, 1);
+        assert_eq!(feature_validation_completed.pending_count, 0);
         assert_eq!(feature_validation_completed.validated_count, 1);
         assert_eq!(feature_validation_completed.failed_count, 0);
 
@@ -1884,8 +2178,8 @@ mod tests {
             .downcast_ref::<FeatureActivationGateResolvedEvent>()
             .expect("feature activation gate payload should be present");
         assert_eq!(
-            feature_activation_gate.feature_class_id,
-            teamy_studio_cursor_gallery::CURSOR_GALLERY_BUTTON_CLASS_ID.as_bytes()
+            feature_activation_gate.feature_id,
+            teamy_studio_cursor_gallery::CURSOR_GALLERY_FEATURE_ID
         );
         assert_eq!(feature_activation_gate.feature_title, "Cursor Gallery");
         assert!(feature_activation_gate.allows_activation);
@@ -2523,6 +2817,94 @@ mod tests {
             STARTUP_LOGGING_PLAN_FAILED_EVENT_DEFINITION.id
         );
         assert_eq!(error.to_string(), "cannot specify log filter with --debug");
+    }
+
+    #[test]
+    fn registration_validation_failure_event_preserves_ids_and_provenance() {
+        let trigger_provenance = registration_provenance!();
+        let error = RegistrationValidationError::TriggerTargetsUnregisteredDefinition {
+            trigger_name: "teamy_studio.test.missing_event_target",
+            trigger_registration_id: TriggerRegistrationId::from_bytes([0x71; 16]),
+            trigger_definition_id: TriggerDefinitionId::from_bytes([0x72; 16]),
+            owner_feature_id: FeatureId::from_bytes([0x73; 16]),
+            event_definition_id: teamy_studio_event_core::EventDefinitionId::from_bytes([0x74; 16]),
+            trigger_provenance,
+        };
+
+        let event = super::registration_validation_failed_event(&error);
+
+        assert_eq!(
+            event.reason,
+            "trigger teamy_studio.test.missing_event_target targets unregistered event definition EventDefinitionId(74747474-7474-7474-7474-747474747474)"
+        );
+        assert_eq!(event.feature_id, Some(FeatureId::from_bytes([0x73; 16])));
+        assert_eq!(
+            event.event_definition_id,
+            Some(teamy_studio_event_core::EventDefinitionId::from_bytes(
+                [0x74; 16]
+            ))
+        );
+        assert_eq!(
+            event.trigger_registration_id,
+            Some(TriggerRegistrationId::from_bytes([0x71; 16]))
+        );
+        assert_eq!(
+            event.trigger_definition_id,
+            Some(TriggerDefinitionId::from_bytes([0x72; 16]))
+        );
+        assert_eq!(
+            event.trigger_name,
+            Some("teamy_studio.test.missing_event_target")
+        );
+        assert_eq!(event.trigger_provenance, Some(trigger_provenance));
+    }
+
+    #[test]
+    fn registration_validation_failure_outcome_publishes_detail_before_startup_failure() {
+        let trigger_provenance = registration_provenance!();
+        let error = RegistrationValidationError::TriggerOwnedByUnregisteredFeature {
+            trigger_name: "teamy_studio.test.unowned_trigger",
+            trigger_registration_id: TriggerRegistrationId::from_bytes([0x81; 16]),
+            trigger_definition_id: TriggerDefinitionId::from_bytes([0x82; 16]),
+            feature_id: FeatureId::from_bytes([0x83; 16]),
+            trigger_provenance,
+        };
+        let mut runtime = StartupRuntime::new();
+
+        runtime.publish_registration_validation_failure_outcome(&error);
+
+        let (timeline, _, _, _) = runtime.into_parts();
+        let published = timeline.published_epochs();
+        let detail = published[0].1.events()[0]
+            .downcast_ref::<RegistrationValidationFailedEvent>()
+            .expect("registration validation detail payload should be present");
+        let startup_failure = published[1].1.events()[0]
+            .downcast_ref::<StartupFailedEvent>()
+            .expect("startup failure payload should be present");
+
+        assert_eq!(published.len(), 2);
+        assert_eq!(
+            published[0].1.events()[0].definition().id,
+            REGISTRATION_VALIDATION_FAILED_EVENT_DEFINITION.id
+        );
+        assert_eq!(
+            published[1].1.events()[0].definition().id,
+            STARTUP_FAILED_EVENT_DEFINITION.id
+        );
+        assert_eq!(
+            detail.trigger_registration_id,
+            Some(TriggerRegistrationId::from_bytes([0x81; 16]))
+        );
+        assert_eq!(detail.trigger_provenance, Some(trigger_provenance));
+        assert_eq!(
+            startup_failure.reason,
+            "startup registration validation failed"
+        );
+        assert_eq!(startup_failure.failure_references.len(), 1);
+        assert_eq!(
+            startup_failure.failure_references[0].event_definition_id,
+            REGISTRATION_VALIDATION_FAILED_EVENT_DEFINITION.id
+        );
     }
 
     #[test]
