@@ -177,10 +177,6 @@ Invoke-Step -Label "tests" -Action {
 	}
 }
 
-Invoke-Step -Label "tracey status" -Action {
-	tracey query status
-}
-
 Invoke-Step -Label "build (default features)" -Action {
 	Stop-TeamyStudioProcessIfRunning
 	if ($VerboseBuild) {

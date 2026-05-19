@@ -103,7 +103,10 @@ mod tests {
             .transform_to(&destination)
             .expect("grounded timelines should be relatable");
 
-        assert_eq!(transform.apply(TimelineOffset::from_raw(3)), TimelineOffset::from_raw(9));
+        assert_eq!(
+            transform.apply(TimelineOffset::from_raw(3)),
+            TimelineOffset::from_raw(9)
+        );
     }
 
     #[test]
@@ -121,7 +124,10 @@ mod tests {
             .transform_to(&destination)
             .expect("direct relative timelines should be relatable");
 
-        assert_eq!(transform.apply(TimelineOffset::from_raw(7)), TimelineOffset::from_raw(12));
+        assert_eq!(
+            transform.apply(TimelineOffset::from_raw(7)),
+            TimelineOffset::from_raw(12)
+        );
     }
 
     #[test]
@@ -146,7 +152,10 @@ mod tests {
             .transform_to(&destination)
             .expect("siblings under the same parent should be relatable");
 
-        assert_eq!(transform.apply(TimelineOffset::from_raw(2)), TimelineOffset::from_raw(10));
+        assert_eq!(
+            transform.apply(TimelineOffset::from_raw(2)),
+            TimelineOffset::from_raw(10)
+        );
     }
 
     #[test]

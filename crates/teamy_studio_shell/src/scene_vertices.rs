@@ -24,7 +24,6 @@ pub struct SceneVertex {
     pub padding: [f32; 2],
 }
 
-#[must_use]
 pub fn build_scene_vertices(scene: &RenderScene) -> eyre::Result<Vec<SceneVertex>> {
     let text_atlas = build_scene_text_atlas(scene)?;
     Ok(build_scene_vertices_with_text_atlas(scene, &text_atlas))
@@ -103,6 +102,12 @@ fn sprite_uv_rect(sprite: SpriteId) -> [f32; 4] {
         SpriteId::Storage => [0.25, 0.0, 0.5, 0.25],
         SpriteId::Audio => [0.5, 0.0, 0.75, 0.25],
         SpriteId::CursorArrow => [0.75, 0.0, 1.0, 0.25],
+        SpriteId::CursorHand => [0.0, 0.25, 0.25, 0.5],
+        SpriteId::CursorIBeam => [0.25, 0.25, 0.5, 0.5],
+        SpriteId::CursorCross => [0.5, 0.25, 0.75, 0.5],
+        SpriteId::CursorWait => [0.75, 0.25, 1.0, 0.5],
+        SpriteId::CursorSizeAll => [0.0, 0.5, 0.25, 0.75],
+        SpriteId::CursorHelp => [0.25, 0.5, 0.5, 0.75],
     }
 }
 

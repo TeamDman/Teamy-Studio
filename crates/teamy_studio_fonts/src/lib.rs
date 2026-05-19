@@ -3,6 +3,7 @@ use std::sync::{Arc, OnceLock};
 
 use eyre::WrapErr;
 use fontdb::{Database, Family, Query, Source};
+use num_traits::ToPrimitive;
 use ttf_parser::{Face, GlyphId, OutlineBuilder};
 
 const FALLBACK_GLYPH: char = '?';
@@ -79,6 +80,25 @@ struct CurveExtents {
     max_y: f32,
 }
 
+type SlugCurveBuffer = (Vec<[f32; 4]>, Vec<u32>, HashMap<char, SlugGlyph>);
+type SlugBandSet = Vec<Vec<usize>>;
+
+#[derive(Clone, Copy)]
+struct SlugBandTablePlan<'a> {
+    descending_bands: &'a [Vec<usize>],
+    ascending_bands: &'a [Vec<usize>],
+    curve_extents: &'a [CurveExtents],
+    table_start: usize,
+    fallback_min: f32,
+    fallback_max: f32,
+}
+
+/// Returns the cached terminal font used by the shell text renderer.
+///
+/// # Errors
+///
+/// Returns an error if the configured terminal font cannot be found, loaded, or
+/// parsed from the system font database.
 pub fn cached_terminal_font() -> eyre::Result<Arc<LoadedTerminalFont>> {
     TERMINAL_FONT_CACHE
         .get_or_init(|| {
@@ -91,6 +111,11 @@ pub fn cached_terminal_font() -> eyre::Result<Arc<LoadedTerminalFont>> {
         .map_err(|error| eyre::eyre!(error.clone()))
 }
 
+/// Returns a cached layout snapshot for the terminal font.
+///
+/// # Errors
+///
+/// Returns an error if the terminal font cannot be loaded or parsed.
 pub fn terminal_font_layout_snapshot() -> eyre::Result<Arc<TerminalFontLayoutSnapshot>> {
     TERMINAL_FONT_LAYOUT_CACHE
         .get_or_init(|| {
@@ -103,6 +128,11 @@ pub fn terminal_font_layout_snapshot() -> eyre::Result<Arc<TerminalFontLayoutSna
         .map_err(|error| eyre::eyre!(error.clone()))
 }
 
+/// Enumerates the Unicode characters supported by the configured terminal font.
+///
+/// # Errors
+///
+/// Returns an error if the terminal font cannot be loaded or parsed.
 pub fn terminal_font_unicode_chars() -> eyre::Result<Vec<char>> {
     let font = load_terminal_font()?;
     let face = Face::parse(&font.font_bytes, font.face_index)
@@ -110,6 +140,11 @@ pub fn terminal_font_unicode_chars() -> eyre::Result<Vec<char>> {
     Ok(collect_font_unicode_chars(&face))
 }
 
+/// Builds slug-compatible curve and band data for the requested characters.
+///
+/// # Errors
+///
+/// Returns an error if the terminal font cannot be loaded or parsed.
 pub fn build_terminal_slug_atlas(chars: &[char]) -> eyre::Result<SlugAtlasData> {
     let font = cached_terminal_font()?;
     let (curve_data, band_data, glyphs) = build_slug_curve_buffer(font.as_ref(), chars)?;
@@ -200,7 +235,7 @@ fn build_terminal_font_layout_snapshot() -> eyre::Result<TerminalFontLayoutSnaps
 fn build_slug_curve_buffer(
     font: &LoadedTerminalFont,
     chars: &[char],
-) -> eyre::Result<(Vec<[f32; 4]>, Vec<u32>, HashMap<char, SlugGlyph>)> {
+) -> eyre::Result<SlugCurveBuffer> {
     let face = Face::parse(&font.font_bytes, font.face_index)
         .wrap_err("failed to parse terminal font for slug curve build")?;
     let fallback_id = face
@@ -324,97 +359,106 @@ fn append_slug_band_data(
         }
     }
 
-    for band in &mut horizontal_bands {
-        band.sort_by(|lhs, rhs| {
-            curve_extents[*rhs]
-                .max_x
-                .total_cmp(&curve_extents[*lhs].max_x)
-        });
-    }
-    for (ascending_band, descending_band) in horizontal_bands_ascending
-        .iter_mut()
-        .zip(horizontal_bands.iter())
-    {
-        *ascending_band = descending_band.clone();
-        ascending_band.sort_by(|lhs, rhs| {
-            curve_extents[*lhs]
-                .min_x
-                .total_cmp(&curve_extents[*rhs].min_x)
-        });
-    }
-    for band in &mut vertical_bands {
-        band.sort_by(|lhs, rhs| {
-            curve_extents[*rhs]
-                .max_y
-                .total_cmp(&curve_extents[*lhs].max_y)
-        });
-    }
-    for (ascending_band, descending_band) in vertical_bands_ascending
-        .iter_mut()
-        .zip(vertical_bands.iter())
-    {
-        *ascending_band = descending_band.clone();
-        ascending_band.sort_by(|lhs, rhs| {
-            curve_extents[*lhs]
-                .min_y
-                .total_cmp(&curve_extents[*rhs].min_y)
-        });
-    }
+    sort_slug_bands(
+        &curve_extents,
+        &mut horizontal_bands,
+        &mut horizontal_bands_ascending,
+        |extents| extents.max_x,
+        |extents| extents.min_x,
+    );
+    sort_slug_bands(
+        &curve_extents,
+        &mut vertical_bands,
+        &mut vertical_bands_ascending,
+        |extents| extents.max_y,
+        |extents| extents.min_y,
+    );
 
     let table_start = band_data.len();
     let table_len = ((band_count_x + band_count_y) as usize) * 4;
     band_data.resize(table_start + table_len, 0);
 
-    for (band_index, band) in horizontal_bands.iter().enumerate() {
-        let ascending_band = &horizontal_bands_ascending[band_index];
-        let split = choose_band_split(
-            band,
-            ascending_band,
-            &curve_extents,
-            |extents| extents.max_x,
-            |extents| extents.min_x,
-            glyph.x_min,
-            glyph.x_max,
-        );
-        let entry_index = table_start + (band_index * 4);
-        band_data[entry_index] = u32::try_from(band.len()).unwrap_or(u32::MAX);
-        band_data[entry_index + 1] = u32::try_from(band_data.len()).unwrap_or(u32::MAX);
-        for curve_index in band {
-            band_data.push(u32::try_from(*curve_index).unwrap_or(u32::MAX));
-        }
-        band_data[entry_index + 2] = u32::try_from(band_data.len()).unwrap_or(u32::MAX);
-        for curve_index in ascending_band {
-            band_data.push(u32::try_from(*curve_index).unwrap_or(u32::MAX));
-        }
-        band_data[entry_index + 3] = split.to_bits();
-    }
-
+    append_slug_band_table(
+        SlugBandTablePlan {
+            descending_bands: &horizontal_bands,
+            ascending_bands: &horizontal_bands_ascending,
+            curve_extents: &curve_extents,
+            table_start,
+            fallback_min: glyph.x_min,
+            fallback_max: glyph.x_max,
+        },
+        band_data,
+        |extents| extents.max_x,
+        |extents| extents.min_x,
+    );
     let vertical_table_start = table_start + (band_count_y as usize * 4);
-    for (band_index, band) in vertical_bands.iter().enumerate() {
-        let ascending_band = &vertical_bands_ascending[band_index];
-        let split = choose_band_split(
-            band,
-            ascending_band,
-            &curve_extents,
-            |extents| extents.max_y,
-            |extents| extents.min_y,
-            glyph.y_min,
-            glyph.y_max,
-        );
-        let entry_index = vertical_table_start + (band_index * 4);
-        band_data[entry_index] = u32::try_from(band.len()).unwrap_or(u32::MAX);
-        band_data[entry_index + 1] = u32::try_from(band_data.len()).unwrap_or(u32::MAX);
-        for curve_index in band {
-            band_data.push(u32::try_from(*curve_index).unwrap_or(u32::MAX));
-        }
-        band_data[entry_index + 2] = u32::try_from(band_data.len()).unwrap_or(u32::MAX);
-        for curve_index in ascending_band {
-            band_data.push(u32::try_from(*curve_index).unwrap_or(u32::MAX));
-        }
-        band_data[entry_index + 3] = split.to_bits();
-    }
+    append_slug_band_table(
+        SlugBandTablePlan {
+            descending_bands: &vertical_bands,
+            ascending_bands: &vertical_bands_ascending,
+            curve_extents: &curve_extents,
+            table_start: vertical_table_start,
+            fallback_min: glyph.y_min,
+            fallback_max: glyph.y_max,
+        },
+        band_data,
+        |extents| extents.max_y,
+        |extents| extents.min_y,
+    );
 
     (band_count_x, band_count_y, band_transform)
+}
+
+fn sort_slug_bands(
+    curve_extents: &[CurveExtents],
+    descending_bands: &mut SlugBandSet,
+    ascending_bands: &mut SlugBandSet,
+    descending_value: impl Fn(CurveExtents) -> f32,
+    ascending_value: impl Fn(CurveExtents) -> f32,
+) {
+    for band in &mut *descending_bands {
+        band.sort_by(|lhs, rhs| {
+            descending_value(curve_extents[*rhs]).total_cmp(&descending_value(curve_extents[*lhs]))
+        });
+    }
+    for (ascending_band, descending_band) in ascending_bands.iter_mut().zip(descending_bands.iter())
+    {
+        *ascending_band = descending_band.clone();
+        ascending_band.sort_by(|lhs, rhs| {
+            ascending_value(curve_extents[*lhs]).total_cmp(&ascending_value(curve_extents[*rhs]))
+        });
+    }
+}
+
+fn append_slug_band_table(
+    plan: SlugBandTablePlan<'_>,
+    band_data: &mut Vec<u32>,
+    descending_value: impl Fn(CurveExtents) -> f32 + Copy,
+    ascending_value: impl Fn(CurveExtents) -> f32 + Copy,
+) {
+    for (band_index, band) in plan.descending_bands.iter().enumerate() {
+        let ascending_band = &plan.ascending_bands[band_index];
+        let split = choose_band_split(
+            band,
+            ascending_band,
+            plan.curve_extents,
+            descending_value,
+            ascending_value,
+            plan.fallback_min,
+            plan.fallback_max,
+        );
+        let entry_index = plan.table_start + (band_index * 4);
+        band_data[entry_index] = u32::try_from(band.len()).unwrap_or(u32::MAX);
+        band_data[entry_index + 1] = u32::try_from(band_data.len()).unwrap_or(u32::MAX);
+        for curve_index in band {
+            band_data.push(u32::try_from(*curve_index).unwrap_or(u32::MAX));
+        }
+        band_data[entry_index + 2] = u32::try_from(band_data.len()).unwrap_or(u32::MAX);
+        for curve_index in ascending_band {
+            band_data.push(u32::try_from(*curve_index).unwrap_or(u32::MAX));
+        }
+        band_data[entry_index + 3] = split.to_bits();
+    }
 }
 
 fn choose_band_split(
@@ -463,12 +507,16 @@ fn curve_extents(curve: QuadraticCurve) -> CurveExtents {
 }
 
 fn compute_band_count(span: f32) -> u32 {
-    ((span.max(1.0) / SLUG_BAND_SIZE_FONT_UNITS).ceil() as u32).clamp(1, 255)
+    (span.max(1.0) / SLUG_BAND_SIZE_FONT_UNITS)
+        .ceil()
+        .clamp(1.0, 255.0)
+        .to_u32()
+        .unwrap_or(255)
 }
 
 fn compute_band_scale(min_value: f32, max_value: f32, band_count: u32) -> f32 {
     let _ = min_value;
-    band_count.max(1) as f32 / (max_value - min_value).max(1.0)
+    band_count.max(1).to_f32().unwrap_or(1.0) / (max_value - min_value).max(1.0)
 }
 
 fn compute_band_offset(min_value: f32, max_value: f32, band_count: u32) -> f32 {
@@ -476,9 +524,12 @@ fn compute_band_offset(min_value: f32, max_value: f32, band_count: u32) -> f32 {
 }
 
 fn band_index(value: f32, scale: f32, offset: f32, band_count: u32) -> u32 {
+    let max_band = band_count.saturating_sub(1).to_f32().unwrap_or(0.0);
     ((value * scale) + offset)
         .trunc()
-        .clamp(0.0, band_count.saturating_sub(1) as f32) as u32
+        .clamp(0.0, max_band)
+        .to_u32()
+        .unwrap_or(0)
 }
 
 fn collect_font_unicode_chars(face: &Face<'_>) -> Vec<char> {
@@ -520,11 +571,15 @@ impl QuadraticCurveBuilder {
     }
 
     fn close_contour(&mut self) {
-        if self.current != self.start {
+        if !same_point(self.current, self.start) {
             self.line_to_curve(self.start[0], self.start[1]);
         }
         self.contours += 1;
     }
+}
+
+fn same_point(lhs: [f32; 2], rhs: [f32; 2]) -> bool {
+    lhs[0].to_bits() == rhs[0].to_bits() && lhs[1].to_bits() == rhs[1].to_bits()
 }
 
 impl OutlineBuilder for QuadraticCurveBuilder {

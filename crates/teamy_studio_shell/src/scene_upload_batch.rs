@@ -26,7 +26,7 @@ pub fn build_prepared_scene_upload_batch(
         vertex_ranges: if vertex_count == 0 {
             Vec::new()
         } else {
-            vec![0..vertex_count]
+            std::iter::once(0..vertex_count).collect()
         },
         capacities,
         curve_upload_data: padded_curve_upload_data(prepared_scene, capacities),

@@ -1,5 +1,5 @@
 use super::{
-    TimeUnit, TimelineId, TimelineOrigin, TimelineOffset, TimelineRepr, TimelineTransform,
+    TimeUnit, TimelineId, TimelineOffset, TimelineOrigin, TimelineRepr, TimelineTransform,
     TimelineTransformError, TimelineTransformFailureReason,
 };
 
@@ -64,7 +64,10 @@ where
             ));
         }
 
-        if let TimelineOrigin::Relative { timeline_id, offset } = source_origin
+        if let TimelineOrigin::Relative {
+            timeline_id,
+            offset,
+        } = source_origin
             && timeline_id == destination.id
         {
             return Ok(TimelineTransform::new(
@@ -75,7 +78,10 @@ where
             ));
         }
 
-        if let TimelineOrigin::Relative { timeline_id, offset } = destination_origin
+        if let TimelineOrigin::Relative {
+            timeline_id,
+            offset,
+        } = destination_origin
             && timeline_id == self.id
         {
             let delta = offset.checked_neg().map_err(|_| TimelineTransformError {
@@ -103,16 +109,16 @@ where
                     anchor_offset: destination_anchor,
                 },
             ) => {
-                let delta = source_anchor
-                    .checked_sub(destination_anchor)
-                    .map_err(|_| TimelineTransformError {
+                let delta = source_anchor.checked_sub(destination_anchor).map_err(|_| {
+                    TimelineTransformError {
                         source_timeline_id: self.id,
                         destination_timeline_id: destination.id,
                         reason: TimelineTransformFailureReason::ArithmeticOverflow {
                             source_origin,
                             destination_origin,
                         },
-                    })?;
+                    }
+                })?;
                 Ok(TimelineTransform::new(
                     self.id,
                     destination.id,
@@ -130,16 +136,16 @@ where
                     offset: destination_offset,
                 },
             ) if source_parent == destination_parent => {
-                let delta = source_offset
-                    .checked_sub(destination_offset)
-                    .map_err(|_| TimelineTransformError {
+                let delta = source_offset.checked_sub(destination_offset).map_err(|_| {
+                    TimelineTransformError {
                         source_timeline_id: self.id,
                         destination_timeline_id: destination.id,
                         reason: TimelineTransformFailureReason::ArithmeticOverflow {
                             source_origin,
                             destination_origin,
                         },
-                    })?;
+                    }
+                })?;
                 Ok(TimelineTransform::new(
                     self.id,
                     destination.id,

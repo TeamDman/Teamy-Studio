@@ -197,9 +197,8 @@ mod tests {
     use super::TimelineOffset;
     use crate::timeline::{
         Femtoseconds, Nanoseconds, Seconds, TIME_LIKE_CATEGORY_INSTANT, TimeLikeFacetProxy,
-        TimelineArithmeticFailureReason,
-        TimelineArithmeticOperation, TimelineUnitConversionFailureReason,
-        TimelineUnitExtractionFailureReason,
+        TimelineArithmeticFailureReason, TimelineArithmeticOperation,
+        TimelineUnitConversionFailureReason, TimelineUnitExtractionFailureReason,
     };
 
     #[test]
@@ -332,6 +331,9 @@ mod tests {
         })
         .expect_err("instant proxy should not deserialize into an offset");
 
-        assert_eq!(error, "time-like facet proxy category did not match an offset");
+        assert_eq!(
+            error,
+            "time-like facet proxy category did not match an offset"
+        );
     }
 }

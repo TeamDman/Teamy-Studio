@@ -76,7 +76,9 @@ Run the standard validation flow with:
 ./check-all.ps1
 ```
 
-That script runs formatting, clippy, build, tests, and local tracey validation.
+That script runs formatting, clippy, builds, and tests for the active workspace.
+Historical Tracey-with-an-E wiring is preserved under `docs/reference/tracey`,
+but it is no longer part of the default quality gate.
 
 For Tracy profiling, run:
 
@@ -89,9 +91,9 @@ For Tracy profiling, run:
 
 ```text
 . # Some files omitted
-├── .config/tracey/config.styx # Local tracey specification wiring
 ├── build.rs # Adds exe resources and embeds git revision
 ├── Cargo.toml # Package metadata and dependency wiring
+├── docs/reference/tracey # Historical Tracey specification wiring
 ├── docs/spec # Human-readable requirements for the repository and CLI
 ├── resources # Windows resources used by build.rs
 ├── src/app # Application startup and Win32 window logic

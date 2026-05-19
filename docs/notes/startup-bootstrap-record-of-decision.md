@@ -1455,7 +1455,9 @@ This makes the startup timeline read as an explicit branch:
 
 ## Current migration gap being addressed
 
-The active workspace currently has:
+This section described the gap when startup-bootstrap restoration began. It is now partly historical rather than fully current.
+
+At the start of this milestone, the active workspace had:
 
 - only a minimal `tracing_subscriber::fmt()` setup in `src/main.rs`
 - no active Figue CLI surface
@@ -1464,6 +1466,8 @@ The active workspace currently has:
 - no restored Tracy integration even though `run-profiler.ps1` still assumes it
 
 The legacy implementation already contains the reference behavior for these surfaces.
+
+As of the active rewrite on May 18, 2026, `--debug`, `--log-filter`, `--log-file`, stderr tracing, optional NDJSON logging, Tracy feature forwarding, and startup timeline events for parsed args/logging/tracing outcomes have partial active implementations. The remaining CLI-specific gap is to replace the current hand-rolled compatibility parser with Figue-backed parsing without splitting the Facet dependency graph.
 
 ## Follow-up questions still open
 

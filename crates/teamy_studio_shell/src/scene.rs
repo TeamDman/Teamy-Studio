@@ -81,6 +81,12 @@ pub enum SpriteId {
     Storage,
     Audio,
     CursorArrow,
+    CursorHand,
+    CursorIBeam,
+    CursorCross,
+    CursorWait,
+    CursorSizeAll,
+    CursorHelp,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]

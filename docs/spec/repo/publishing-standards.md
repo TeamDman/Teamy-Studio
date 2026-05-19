@@ -1,6 +1,8 @@
 # Publishing Standards
 
-This document translates the repository review standards into local tracey requirements for Teamy Studio.
+This document originally translated repository review standards into local Tracey requirements for Teamy Studio.
+
+Tracey is now preserved as historical reference rather than active authority. Current development direction is governed by `docs/notes/*record-of-decision.md`, especially `docs/notes/development-workflow-record-of-decision.md`.
 
 ## Readme
 
@@ -22,7 +24,7 @@ repo[license.present]
 The repository must contain a license file.
 
 repo[tracey.specification.present]
-The repository must contain a local tracey specification that can be used to audit the project.
+The repository may preserve the historical Tracey specification as reference documentation, but it is no longer an active validation gate.
 
 repo[implementation.present]
 The repository must contain an implementation of the project it describes.

@@ -4,8 +4,8 @@ pub use bootstrap::{
     BootstrapCliParseError, BootstrapPlanError, GlobalArgs, LogFilterSelection,
     ProcessStartupObservedEvent, RawProcessStartupInputs, StartupBootstrapCli,
     StartupBootstrapPlan, StartupGlobalArgsParsedEvent, StartupLoggingConfiguredEvent,
-    StartupLoggingPlan, StartupLoggingPlanError, TracingInitializedEvent,
-    derive_bootstrap_plan, initialize_tracing_from_bootstrap_plan, parse_bootstrap_cli_args,
+    StartupLoggingPlan, StartupLoggingPlanError, TracingInitializedEvent, derive_bootstrap_plan,
+    initialize_tracing_from_bootstrap_plan, parse_bootstrap_cli_args,
     try_handle_builtin_bootstrap_cli_request,
 };
 
@@ -17,8 +17,18 @@ use std::fmt::{Display, Formatter};
 use teamy_studio_cursor_gallery::CURSOR_GALLERY_BUTTON_CLASS_ID;
 use teamy_studio_cursor_gallery::CursorGalleryState;
 use teamy_studio_event_core::{EventDefinition, EventDefinitionId, PublishedEvent, WritableArena};
+use teamy_studio_launcher_catalog as _;
+use teamy_studio_launcher_catalog::{
+    APPLICATION_WINDOWS_BUTTON_CLASS_ID, AUDIO_DAEMON_BUTTON_CLASS_ID,
+    AUDIO_DEVICES_BUTTON_CLASS_ID, AUDIO_PICKER_BUTTON_CLASS_ID, CURSOR_INFO_BUTTON_CLASS_ID,
+    DEMO_MODE_BUTTON_CLASS_ID, ENVIRONMENT_VARIABLES_BUTTON_CLASS_ID, JOBS_BUTTON_CLASS_ID,
+    LOGS_BUTTON_CLASS_ID, STORAGE_BUTTON_CLASS_ID, TERMINAL_BUTTON_CLASS_ID,
+    TEXT_RENDERING_PLAYGROUND_BUTTON_CLASS_ID, TIMELINE_BUTTON_CLASS_ID,
+    TIMELINE_PLAYGROUND_BUTTON_CLASS_ID,
+};
 use teamy_studio_main_menu::{
-    FeatureValidationState, MainMenuLogicalButtonId, MainMenuSnapshot, registered_button_classes,
+    FeatureValidationState, MainMenuButtonClassId, MainMenuLogicalButtonId, MainMenuSnapshot,
+    registered_button_classes, show_main_menu_info_dialog,
 };
 use teamy_studio_registration_core::{
     EVENT_DEFINITION_REGISTRATIONS, EventDefinitionRegistration, RegistrationSnapshot, snapshot,
@@ -26,10 +36,9 @@ use teamy_studio_registration_core::{
 };
 use teamy_studio_shell::{HostedWindowRecord, ShellRuntime, ShellState};
 use teamy_studio_timeline_core::{
-    CanonicalTimeKey, ConstructedTimeline, EventId, EventReference, TriggerCursor,
-    TriggerRuntime,
+    CanonicalTimeKey, ConstructedTimeline, EventId, EventReference, TriggerCursor, TriggerRuntime,
 };
-use teamy_studio_launcher_catalog as _;
+use tracing::{info, trace};
 
 pub static STARTUP_SUCCEEDED_EVENT_DEFINITION: EventDefinition = EventDefinition {
     id: EventDefinitionId::from_bytes([0x01; 16]),
@@ -111,12 +120,11 @@ pub static TRACING_INITIALIZATION_FAILED_EVENT_DEFINITION: EventDefinition = Eve
     schema_version: 1,
 };
 
-pub static DEFAULT_CURSOR_GALLERY_FLOW_FAILED_EVENT_DEFINITION: EventDefinition =
-    EventDefinition {
-        id: EventDefinitionId::from_bytes([0x0E; 16]),
-        schema_name: "teamy_studio.startup.default_cursor_gallery_flow_failed",
-        schema_version: 1,
-    };
+pub static DEFAULT_CURSOR_GALLERY_FLOW_FAILED_EVENT_DEFINITION: EventDefinition = EventDefinition {
+    id: EventDefinitionId::from_bytes([0x0E; 16]),
+    schema_name: "teamy_studio.startup.default_cursor_gallery_flow_failed",
+    schema_version: 1,
+};
 
 pub static BOOTSTRAP_CLI_PARSE_FAILED_EVENT_DEFINITION: EventDefinition = EventDefinition {
     id: EventDefinitionId::from_bytes([0x0F; 16]),
@@ -133,8 +141,7 @@ pub static STARTUP_LOGGING_PLAN_FAILED_EVENT_DEFINITION: EventDefinition = Event
 const STARTUP_BOOTSTRAP_CLI_PARSE_FAILED_REASON: &str = "startup bootstrap cli parse failed";
 const STARTUP_LOGGING_PLAN_DERIVATION_FAILED_REASON: &str =
     "startup logging plan derivation failed";
-const STARTUP_TRACING_INITIALIZATION_FAILED_REASON: &str =
-    "startup tracing initialization failed";
+const STARTUP_TRACING_INITIALIZATION_FAILED_REASON: &str = "startup tracing initialization failed";
 const DEFAULT_CURSOR_GALLERY_FLOW_FAILURE_REASON: &str =
     "registered triggers did not produce the default cursor-gallery window flow";
 
@@ -189,8 +196,8 @@ pub static REGISTRATION_VALIDATION_COMPLETED_EVENT_REGISTRATION: EventDefinition
 #[distributed_slice(EVENT_DEFINITION_REGISTRATIONS)]
 pub static FEATURE_COMPATIBILITY_VALIDATION_STARTED_EVENT_REGISTRATION:
     EventDefinitionRegistration = EventDefinitionRegistration {
-        definition: &FEATURE_COMPATIBILITY_VALIDATION_STARTED_EVENT_DEFINITION,
-    };
+    definition: &FEATURE_COMPATIBILITY_VALIDATION_STARTED_EVENT_DEFINITION,
+};
 
 #[distributed_slice(EVENT_DEFINITION_REGISTRATIONS)]
 pub static FEATURE_COMPATIBILITY_VALIDATED_EVENT_REGISTRATION: EventDefinitionRegistration =
@@ -201,8 +208,8 @@ pub static FEATURE_COMPATIBILITY_VALIDATED_EVENT_REGISTRATION: EventDefinitionRe
 #[distributed_slice(EVENT_DEFINITION_REGISTRATIONS)]
 pub static FEATURE_COMPATIBILITY_VALIDATION_COMPLETED_EVENT_REGISTRATION:
     EventDefinitionRegistration = EventDefinitionRegistration {
-        definition: &FEATURE_COMPATIBILITY_VALIDATION_COMPLETED_EVENT_DEFINITION,
-    };
+    definition: &FEATURE_COMPATIBILITY_VALIDATION_COMPLETED_EVENT_DEFINITION,
+};
 
 #[distributed_slice(EVENT_DEFINITION_REGISTRATIONS)]
 pub static FEATURE_ACTIVATION_GATE_RESOLVED_EVENT_REGISTRATION: EventDefinitionRegistration =
@@ -359,13 +366,11 @@ fn bootstrap_cli_parse_failed_event(
             missing_value_flag: Some((*flag).to_owned()),
             unrecognized_argument: None,
         },
-        BootstrapCliParseError::UnrecognizedArgument { argument } => {
-            BootstrapCliParseFailedEvent {
-                argv: raw_inputs.argv.clone(),
-                missing_value_flag: None,
-                unrecognized_argument: Some(argument.clone()),
-            }
-        }
+        BootstrapCliParseError::UnrecognizedArgument { argument } => BootstrapCliParseFailedEvent {
+            argv: raw_inputs.argv.clone(),
+            missing_value_flag: None,
+            unrecognized_argument: Some(argument.clone()),
+        },
         BootstrapCliParseError::HelpRequested { .. }
         | BootstrapCliParseError::VersionRequested { .. }
         | BootstrapCliParseError::CompletionsRequested { .. } => BootstrapCliParseFailedEvent {
@@ -398,12 +403,8 @@ fn feature_validation_state_counts(menu_snapshot: &MainMenuSnapshot) -> (u64, u6
     menu_snapshot.buttons().iter().fold(
         (0_u64, 0_u64, 0_u64),
         |(pending_count, validated_count, failed_count), button| match button.validation_state {
-            FeatureValidationState::Pending => {
-                (pending_count + 1, validated_count, failed_count)
-            }
-            FeatureValidationState::Validated => {
-                (pending_count, validated_count + 1, failed_count)
-            }
+            FeatureValidationState::Pending => (pending_count + 1, validated_count, failed_count),
+            FeatureValidationState::Validated => (pending_count, validated_count + 1, failed_count),
             FeatureValidationState::Failed => (pending_count, validated_count, failed_count + 1),
         },
     )
@@ -557,12 +558,12 @@ impl StartupRuntime {
 
     #[must_use]
     pub fn next_publish_time_key(&self) -> CanonicalTimeKey {
-        self.timeline
-            .published_event_records()
-            .last()
-            .map_or(CanonicalTimeKey::ZERO, |(cursor, _, _)| {
+        self.timeline.published_event_records().last().map_or(
+            CanonicalTimeKey::ZERO,
+            |(cursor, _, _)| {
                 CanonicalTimeKey::from_femtoseconds(cursor.time_key.raw_femtoseconds() + 1)
-            })
+            },
+        )
     }
 
     pub fn publish_startup_succeeded(&mut self, time_key: CanonicalTimeKey) {
@@ -651,10 +652,7 @@ impl StartupRuntime {
         );
     }
 
-    pub fn publish_tracing_initialized(
-        &mut self,
-        tracing_initialized: TracingInitializedEvent,
-    ) {
+    pub fn publish_tracing_initialized(&mut self, tracing_initialized: TracingInitializedEvent) {
         let time_key = self.next_publish_time_key();
         self.publish(
             "teamy_studio.startup.bootstrap",
@@ -675,9 +673,7 @@ impl StartupRuntime {
             PublishedEvent::new(
                 &TRACING_INITIALIZATION_FAILED_EVENT_DEFINITION,
                 TracingInitializationFailedEvent {
-                    effective_filter_directive: bootstrap_plan
-                        .logging
-                        .effective_filter_directive(),
+                    effective_filter_directive: bootstrap_plan.logging.effective_filter_directive(),
                     json_log_path: bootstrap_plan
                         .logging
                         .json_log_path
@@ -1071,6 +1067,14 @@ impl StartupSession {
         time_key: CanonicalTimeKey,
         event: PublishedEvent,
     ) {
+        trace!(
+            arena_name,
+            time_key = time_key.raw_femtoseconds(),
+            schema_name = event.definition().schema_name,
+            schema_version = event.definition().schema_version,
+            definition_id = ?event.definition_id(),
+            "publishing timeline event"
+        );
         self.runtime.publish(arena_name, time_key, event);
     }
 
@@ -1090,8 +1094,11 @@ impl StartupSession {
         reason: &'static str,
         max_references: usize,
     ) {
-        self.runtime
-            .publish_startup_failed_from_latest_references(time_key, reason, max_references);
+        self.runtime.publish_startup_failed_from_latest_references(
+            time_key,
+            reason,
+            max_references,
+        );
     }
 
     pub fn publish_main_menu_click(
@@ -1196,12 +1203,20 @@ pub fn build_mvp_session_with_native_shell() -> Result<StartupSession> {
     build_mvp_session_with_native_shell_from_bootstrap_plan(StartupBootstrapPlan::empty())
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "bootstrap derivation failures intentionally return the populated startup runtime so callers can inspect the pre-session timeline"
+)]
 pub fn observe_bootstrap_plan_from_raw_inputs(
     raw_inputs: RawProcessStartupInputs,
 ) -> std::result::Result<ObservedBootstrapPlan, ObservedBootstrapPlanFailure> {
     observe_bootstrap_plan_from_raw_inputs_with_runtime(raw_inputs, StartupRuntime::new())
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "bootstrap derivation failures intentionally return the populated startup runtime so callers can inspect the pre-session timeline"
+)]
 pub fn observe_bootstrap_plan_from_raw_inputs_with_native_shell(
     raw_inputs: RawProcessStartupInputs,
 ) -> std::result::Result<ObservedBootstrapPlan, ObservedBootstrapPlanFailure> {
@@ -1211,7 +1226,9 @@ pub fn observe_bootstrap_plan_from_raw_inputs_with_native_shell(
     )
 }
 
-pub fn build_mvp_session_from_raw_inputs(raw_inputs: RawProcessStartupInputs) -> Result<StartupSession> {
+pub fn build_mvp_session_from_raw_inputs(
+    raw_inputs: RawProcessStartupInputs,
+) -> Result<StartupSession> {
     observe_bootstrap_plan_from_raw_inputs(raw_inputs)
         .map_err(|error| eyre!(error.to_string()))?
         .into_mvp_session()
@@ -1234,7 +1251,11 @@ pub fn build_mvp_session_from_bootstrap_plan(
 pub fn build_mvp_session_with_native_shell_from_bootstrap_plan(
     bootstrap_plan: StartupBootstrapPlan,
 ) -> Result<StartupSession> {
-    build_mvp_session_with_runtime(bootstrap_plan, StartupRuntime::new_with_native_shell(), false)
+    build_mvp_session_with_runtime(
+        bootstrap_plan,
+        StartupRuntime::new_with_native_shell(),
+        false,
+    )
 }
 
 fn build_mvp_session_with_runtime(
@@ -1280,20 +1301,21 @@ fn build_mvp_session_with_runtime(
     })
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "bootstrap derivation failures intentionally return the populated startup runtime so callers can inspect the pre-session timeline"
+)]
 fn observe_bootstrap_plan_from_raw_inputs_with_runtime(
     raw_inputs: RawProcessStartupInputs,
     mut runtime: StartupRuntime,
 ) -> std::result::Result<ObservedBootstrapPlan, ObservedBootstrapPlanFailure> {
-    let bootstrap_plan = match derive_bootstrap_plan_with_runtime(
-        raw_inputs,
-        chrono::Local::now(),
-        &mut runtime,
-    ) {
-        Ok(bootstrap_plan) => bootstrap_plan,
-        Err(error) => {
-            return Err(ObservedBootstrapPlanFailure { error, runtime });
-        }
-    };
+    let bootstrap_plan =
+        match derive_bootstrap_plan_with_runtime(raw_inputs, chrono::Local::now(), &mut runtime) {
+            Ok(bootstrap_plan) => bootstrap_plan,
+            Err(error) => {
+                return Err(ObservedBootstrapPlanFailure { error, runtime });
+            }
+        };
     Ok(ObservedBootstrapPlan {
         bootstrap_plan,
         runtime,
@@ -1369,24 +1391,20 @@ fn run_default_cursor_gallery_flow(mut session: StartupSession) -> Result<AppCom
         .ok_or_else(|| eyre!("cursor gallery button was not registered for the MVP composition"))?;
 
     let click_time_key = session.runtime.next_publish_time_key();
-    session.publish_main_menu_click(
-        clicked_button.logical_button_id,
-        64,
-        32,
-        1,
-        click_time_key,
-    )?;
+    session.publish_main_menu_click(clicked_button.logical_button_id, 64, 32, 1, click_time_key)?;
     let emitted_epoch_count = session.pump_to_idle(session.runtime.next_publish_time_key(), 8)?;
 
     if emitted_epoch_count == 0
         || session.cursor_gallery_state().windows().is_empty()
         || session.shell_state().windows().is_empty()
     {
-        session.runtime.publish_default_cursor_gallery_flow_failure_outcome(
-            emitted_epoch_count,
-            session.cursor_gallery_state().windows().len(),
-            session.shell_state().windows().len(),
-        );
+        session
+            .runtime
+            .publish_default_cursor_gallery_flow_failure_outcome(
+                emitted_epoch_count,
+                session.cursor_gallery_state().windows().len(),
+                session.shell_state().windows().len(),
+            );
         return Err(eyre!(DEFAULT_CURSOR_GALLERY_FLOW_FAILURE_REASON));
     }
 
@@ -1403,15 +1421,16 @@ pub fn main() -> Result<()> {
 fn initialize_tracing_for_session(session: &mut StartupSession) -> Result<()> {
     match initialize_tracing_from_bootstrap_plan(session.bootstrap_plan()) {
         Ok(tracing_initialized) => {
-            session.runtime.publish_tracing_initialized(tracing_initialized);
+            session
+                .runtime
+                .publish_tracing_initialized(tracing_initialized);
             Ok(())
         }
         Err(error) => {
             let bootstrap_plan = session.bootstrap_plan().clone();
-            session.runtime.publish_tracing_initialization_failure_outcome(
-                &bootstrap_plan,
-                error.to_string(),
-            );
+            session
+                .runtime
+                .publish_tracing_initialization_failure_outcome(&bootstrap_plan, error.to_string());
             Err(error)
         }
     }
@@ -1419,6 +1438,35 @@ fn initialize_tracing_for_session(session: &mut StartupSession) -> Result<()> {
 
 fn next_main_menu_interaction_time_seed(runtime: &StartupRuntime) -> i128 {
     runtime.next_publish_time_key().raw_femtoseconds()
+}
+
+fn unimplemented_main_menu_dialog(
+    class_id: MainMenuButtonClassId,
+    title: &'static str,
+) -> Option<(&'static str, String)> {
+    let description = match class_id {
+        STORAGE_BUTTON_CLASS_ID => "Storage is not implemented yet.".to_owned(),
+        ENVIRONMENT_VARIABLES_BUTTON_CLASS_ID => {
+            "The environment-variable inspector is not implemented yet.".to_owned()
+        }
+        APPLICATION_WINDOWS_BUTTON_CLASS_ID => {
+            "The application-window inspector is not implemented yet.".to_owned()
+        }
+        TERMINAL_BUTTON_CLASS_ID
+        | CURSOR_INFO_BUTTON_CLASS_ID
+        | TEXT_RENDERING_PLAYGROUND_BUTTON_CLASS_ID
+        | DEMO_MODE_BUTTON_CLASS_ID
+        | AUDIO_PICKER_BUTTON_CLASS_ID
+        | AUDIO_DAEMON_BUTTON_CLASS_ID
+        | JOBS_BUTTON_CLASS_ID
+        | LOGS_BUTTON_CLASS_ID
+        | AUDIO_DEVICES_BUTTON_CLASS_ID
+        | TIMELINE_BUTTON_CLASS_ID
+        | TIMELINE_PLAYGROUND_BUTTON_CLASS_ID => format!("{title} is not implemented yet."),
+        _ => return None,
+    };
+
+    Some((title, description))
 }
 
 pub fn main_with_raw_inputs(raw_inputs: RawProcessStartupInputs) -> Result<()> {
@@ -1437,11 +1485,30 @@ pub fn main_with_raw_inputs(raw_inputs: RawProcessStartupInputs) -> Result<()> {
     teamy_studio_main_menu::run_native_main_menu_window_with_click_handler(
         &menu_snapshot,
         |logical_button_id| {
-            let clicked_class_id = menu_snapshot
+            let clicked_button = menu_snapshot
                 .buttons()
                 .iter()
                 .find(|button| button.logical_button_id == logical_button_id)
-                .map(|button| button.class_id);
+                .map(|button| (button.class_id, button.title));
+            if let Some((class_id, title)) = clicked_button {
+                info!(
+                    ?logical_button_id,
+                    ?class_id,
+                    title,
+                    "startup received main menu click callback"
+                );
+                if let Some((title, description)) = unimplemented_main_menu_dialog(class_id, title)
+                {
+                    info!(title, description, "showing unimplemented main menu dialog");
+                    show_main_menu_info_dialog(title, &description)?;
+                    return Ok(());
+                }
+            }
+            info!(
+                ?logical_button_id,
+                time_key = next_time_key,
+                "publishing main menu click event"
+            );
             session.publish_main_menu_click(
                 logical_button_id,
                 0,
@@ -1450,9 +1517,13 @@ pub fn main_with_raw_inputs(raw_inputs: RawProcessStartupInputs) -> Result<()> {
                 CanonicalTimeKey::from_femtoseconds(next_time_key),
             )?;
             next_time_key += 16;
-            let _ = session.pump_to_idle(CanonicalTimeKey::from_femtoseconds(next_time_key), 8)?;
+            let emitted_epoch_count =
+                session.pump_to_idle(CanonicalTimeKey::from_femtoseconds(next_time_key), 8)?;
+            info!(
+                ?logical_button_id,
+                emitted_epoch_count, next_time_key, "pumped main menu click to idle"
+            );
             next_time_key += 16;
-            let _ = clicked_class_id;
             Ok(())
         },
     )
@@ -1461,48 +1532,75 @@ pub fn main_with_raw_inputs(raw_inputs: RawProcessStartupInputs) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppComposition, BOOTSTRAP_CLI_PARSE_FAILED_EVENT_DEFINITION,
-        PROCESS_STARTUP_OBSERVED_EVENT_DEFINITION,
+        AppComposition, BOOTSTRAP_CLI_PARSE_FAILED_EVENT_DEFINITION, BootstrapCliParseFailedEvent,
+        DEFAULT_CURSOR_GALLERY_FLOW_FAILED_EVENT_DEFINITION, DefaultCursorGalleryFlowFailedEvent,
         FEATURE_ACTIVATION_GATE_RESOLVED_EVENT_DEFINITION,
-        DEFAULT_CURSOR_GALLERY_FLOW_FAILED_EVENT_DEFINITION,
         FEATURE_COMPATIBILITY_VALIDATED_EVENT_DEFINITION,
         FEATURE_COMPATIBILITY_VALIDATION_COMPLETED_EVENT_DEFINITION,
         FEATURE_COMPATIBILITY_VALIDATION_STARTED_EVENT_DEFINITION,
+        FeatureActivationGateResolvedEvent, FeatureCompatibilityValidatedEvent,
+        FeatureCompatibilityValidationCompletedEvent, FeatureCompatibilityValidationStartedEvent,
+        PROCESS_STARTUP_OBSERVED_EVENT_DEFINITION, ProcessStartupObservedEvent,
         REGISTRATION_VALIDATION_COMPLETED_EVENT_DEFINITION,
-        REGISTRATION_VALIDATION_STARTED_EVENT_DEFINITION,
+        REGISTRATION_VALIDATION_STARTED_EVENT_DEFINITION, RawProcessStartupInputs,
+        RegistrationValidationCompletedEvent, RegistrationValidationStartedEvent,
         STARTUP_FAILED_EVENT_DEFINITION, STARTUP_GLOBAL_ARGS_PARSED_EVENT_DEFINITION,
-        STARTUP_LOGGING_CONFIGURED_EVENT_DEFINITION,
-        STARTUP_LOGGING_PLAN_FAILED_EVENT_DEFINITION,
-        STARTUP_SUCCEEDED_EVENT_DEFINITION, TRACING_INITIALIZATION_FAILED_EVENT_DEFINITION,
-        TRACING_INITIALIZED_EVENT_DEFINITION,
-        BootstrapCliParseFailedEvent,
-        FeatureActivationGateResolvedEvent,
-        DefaultCursorGalleryFlowFailedEvent,
-        FeatureCompatibilityValidatedEvent, FeatureCompatibilityValidationCompletedEvent,
-        FeatureCompatibilityValidationStartedEvent,
-        RawProcessStartupInputs, RegistrationValidationCompletedEvent,
-        RegistrationValidationStartedEvent, StartupGlobalArgsParsedEvent,
-        ProcessStartupObservedEvent, StartupFailedEvent, StartupLoggingConfiguredEvent,
-        StartupLoggingPlanFailedEvent,
-        StartupSucceededEvent, TracingInitializationFailedEvent, TracingInitializedEvent,
-        StartupRuntime,
-        build_mvp_composition,
-        build_mvp_composition_from_raw_inputs, build_mvp_session,
-        build_mvp_session_from_bootstrap_plan,
+        STARTUP_LOGGING_CONFIGURED_EVENT_DEFINITION, STARTUP_LOGGING_PLAN_FAILED_EVENT_DEFINITION,
+        STARTUP_SUCCEEDED_EVENT_DEFINITION, StartupFailedEvent, StartupGlobalArgsParsedEvent,
+        StartupLoggingConfiguredEvent, StartupLoggingPlanFailedEvent, StartupRuntime,
+        StartupSucceededEvent, TRACING_INITIALIZATION_FAILED_EVENT_DEFINITION,
+        TRACING_INITIALIZED_EVENT_DEFINITION, TracingInitializationFailedEvent,
+        TracingInitializedEvent, build_mvp_composition, build_mvp_composition_from_raw_inputs,
+        build_mvp_session, build_mvp_session_from_bootstrap_plan,
         build_mvp_session_from_raw_inputs, build_mvp_session_with_native_shell,
-        derive_bootstrap_plan,
-        derive_bootstrap_plan_with_runtime,
-        initialize_tracing_for_session,
-        next_main_menu_interaction_time_seed,
-        observe_bootstrap_plan_from_raw_inputs,
+        derive_bootstrap_plan, derive_bootstrap_plan_with_runtime, initialize_tracing_for_session,
+        next_main_menu_interaction_time_seed, observe_bootstrap_plan_from_raw_inputs,
+        unimplemented_main_menu_dialog,
     };
-    use teamy_studio_cursor_gallery::CURSOR_GALLERY_OPEN_INTENT_DEFINITION;
+    use teamy_studio_cursor_gallery::{
+        CURSOR_GALLERY_BUTTON_CLASS_ID, CURSOR_GALLERY_OPEN_INTENT_DEFINITION,
+    };
+    use teamy_studio_launcher_catalog::{
+        ENVIRONMENT_VARIABLES_BUTTON_CLASS_ID, TERMINAL_BUTTON_CLASS_ID,
+    };
     use teamy_studio_main_menu::{FeatureValidationState, MAIN_MENU_CLICKED_EVENT_DEFINITION};
     use teamy_studio_shell::{
         InitialWindowCommand, RendererHostMode, WINDOW_CREATE_REQUEST_EVENT_DEFINITION,
         WINDOW_CREATED_EVENT_DEFINITION, WindowHostOptions,
     };
     use teamy_studio_timeline_core::CanonicalTimeKey;
+
+    #[test]
+    fn environment_variables_uses_legacy_placeholder_copy() {
+        let dialog = unimplemented_main_menu_dialog(
+            ENVIRONMENT_VARIABLES_BUTTON_CLASS_ID,
+            "Environment Variables",
+        )
+        .expect("environment variables should show placeholder dialog");
+
+        assert_eq!(dialog.0, "Environment Variables");
+        assert_eq!(
+            dialog.1,
+            "The environment-variable inspector is not implemented yet."
+        );
+    }
+
+    #[test]
+    fn generic_unimplemented_buttons_get_title_based_placeholder_copy() {
+        let dialog = unimplemented_main_menu_dialog(TERMINAL_BUTTON_CLASS_ID, "Terminal")
+            .expect("terminal should show placeholder dialog until implemented");
+
+        assert_eq!(dialog.0, "Terminal");
+        assert_eq!(dialog.1, "Terminal is not implemented yet.");
+    }
+
+    #[test]
+    fn cursor_gallery_does_not_use_unimplemented_placeholder_dialog() {
+        assert!(
+            unimplemented_main_menu_dialog(CURSOR_GALLERY_BUTTON_CLASS_ID, "Cursor Gallery")
+                .is_none()
+        );
+    }
 
     #[test]
     fn mvp_composition_publishes_pure_event_chain() {
@@ -1736,7 +1834,10 @@ mod tests {
         let startup_logging_configured = published[2].1.events()[0]
             .downcast_ref::<StartupLoggingConfiguredEvent>()
             .expect("bootstrap logging payload should be present");
-        assert_eq!(startup_logging_configured.effective_filter_directive, "info");
+        assert_eq!(
+            startup_logging_configured.effective_filter_directive,
+            "info"
+        );
         assert_eq!(startup_logging_configured.json_log_path, None);
 
         let registration_validation_started = published[3].1.events()[0]
@@ -1863,19 +1964,28 @@ mod tests {
         let composition = session.into_composition();
 
         assert!(emitted_epoch_count >= 1);
-        assert_eq!(session_record_times, vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 50, 51, 53, 54]);
+        assert_eq!(
+            session_record_times,
+            vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 50, 51, 53, 54]
+        );
         assert_eq!(
             session_reference_definitions,
             vec![
-            (PROCESS_STARTUP_OBSERVED_EVENT_DEFINITION.id, 0),
-            (STARTUP_GLOBAL_ARGS_PARSED_EVENT_DEFINITION.id, 1),
-            (STARTUP_LOGGING_CONFIGURED_EVENT_DEFINITION.id, 2),
-            (REGISTRATION_VALIDATION_STARTED_EVENT_DEFINITION.id, 3),
-            (REGISTRATION_VALIDATION_COMPLETED_EVENT_DEFINITION.id, 4),
-            (FEATURE_COMPATIBILITY_VALIDATION_STARTED_EVENT_DEFINITION.id, 5),
-            (FEATURE_COMPATIBILITY_VALIDATED_EVENT_DEFINITION.id, 6),
-            (FEATURE_COMPATIBILITY_VALIDATION_COMPLETED_EVENT_DEFINITION.id, 7),
-            (FEATURE_ACTIVATION_GATE_RESOLVED_EVENT_DEFINITION.id, 8),
+                (PROCESS_STARTUP_OBSERVED_EVENT_DEFINITION.id, 0),
+                (STARTUP_GLOBAL_ARGS_PARSED_EVENT_DEFINITION.id, 1),
+                (STARTUP_LOGGING_CONFIGURED_EVENT_DEFINITION.id, 2),
+                (REGISTRATION_VALIDATION_STARTED_EVENT_DEFINITION.id, 3),
+                (REGISTRATION_VALIDATION_COMPLETED_EVENT_DEFINITION.id, 4),
+                (
+                    FEATURE_COMPATIBILITY_VALIDATION_STARTED_EVENT_DEFINITION.id,
+                    5
+                ),
+                (FEATURE_COMPATIBILITY_VALIDATED_EVENT_DEFINITION.id, 6),
+                (
+                    FEATURE_COMPATIBILITY_VALIDATION_COMPLETED_EVENT_DEFINITION.id,
+                    7
+                ),
+                (FEATURE_ACTIVATION_GATE_RESOLVED_EVENT_DEFINITION.id, 8),
                 (MAIN_MENU_CLICKED_EVENT_DEFINITION.id, 50),
                 (CURSOR_GALLERY_OPEN_INTENT_DEFINITION.id, 51),
                 (WINDOW_CREATE_REQUEST_EVENT_DEFINITION.id, 53),
@@ -1910,7 +2020,11 @@ mod tests {
     #[test]
     fn mvp_session_preserves_explicit_bootstrap_inputs() {
         let session = build_mvp_session_from_raw_inputs(RawProcessStartupInputs {
-            argv: vec!["--debug".to_owned(), "--log-file".to_owned(), "logs/teamy.ndjson".to_owned()],
+            argv: vec![
+                "--debug".to_owned(),
+                "--log-file".to_owned(),
+                "logs/teamy.ndjson".to_owned(),
+            ],
             rust_log: Some("warn".to_owned()),
         })
         .expect("session should build from explicit bootstrap inputs");
@@ -1925,7 +2039,10 @@ mod tests {
         );
         assert_eq!(session.bootstrap_plan().global_args.debug, true);
         assert_eq!(
-            session.bootstrap_plan().logging.effective_filter_directive(),
+            session
+                .bootstrap_plan()
+                .logging
+                .effective_filter_directive(),
             "warn"
         );
     }
@@ -1948,15 +2065,30 @@ mod tests {
             .downcast_ref::<StartupFailedEvent>()
             .expect("startup failure payload should be present");
 
-        assert_eq!(bootstrap_error.to_string(), "unrecognized startup argument: --wat");
+        assert_eq!(
+            bootstrap_error.to_string(),
+            "unrecognized startup argument: --wat"
+        );
         assert_eq!(published.len(), 3);
-        assert_eq!(published[0].1.events()[0].definition().id, PROCESS_STARTUP_OBSERVED_EVENT_DEFINITION.id);
-        assert_eq!(published[1].1.events()[0].definition().id, BOOTSTRAP_CLI_PARSE_FAILED_EVENT_DEFINITION.id);
-        assert_eq!(published[2].1.events()[0].definition().id, STARTUP_FAILED_EVENT_DEFINITION.id);
+        assert_eq!(
+            published[0].1.events()[0].definition().id,
+            PROCESS_STARTUP_OBSERVED_EVENT_DEFINITION.id
+        );
+        assert_eq!(
+            published[1].1.events()[0].definition().id,
+            BOOTSTRAP_CLI_PARSE_FAILED_EVENT_DEFINITION.id
+        );
+        assert_eq!(
+            published[2].1.events()[0].definition().id,
+            STARTUP_FAILED_EVENT_DEFINITION.id
+        );
         assert_eq!(detail.unrecognized_argument.as_deref(), Some("--wat"));
         assert_eq!(startup_failure.reason, "startup bootstrap cli parse failed");
         assert_eq!(startup_failure.failure_references.len(), 1);
-        assert_eq!(startup_failure.failure_references[0].event_definition_id, BOOTSTRAP_CLI_PARSE_FAILED_EVENT_DEFINITION.id);
+        assert_eq!(
+            startup_failure.failure_references[0].event_definition_id,
+            BOOTSTRAP_CLI_PARSE_FAILED_EVENT_DEFINITION.id
+        );
     }
 
     #[test]
@@ -1999,10 +2131,19 @@ mod tests {
             vec![(STARTUP_LOGGING_CONFIGURED_EVENT_DEFINITION.id, 2)]
         );
         assert_eq!(
-            session.bootstrap_plan().logging.effective_filter_directive(),
+            session
+                .bootstrap_plan()
+                .logging
+                .effective_filter_directive(),
             "trace"
         );
-        assert_eq!(session.published_event_records()[0].0.time_key.raw_femtoseconds(), 0);
+        assert_eq!(
+            session.published_event_records()[0]
+                .0
+                .time_key
+                .raw_femtoseconds(),
+            0
+        );
     }
 
     #[test]
@@ -2018,7 +2159,10 @@ mod tests {
             vec!["--log-filter".to_owned(), "trace".to_owned()]
         );
         assert_eq!(
-            composition.bootstrap_plan().logging.effective_filter_directive(),
+            composition
+                .bootstrap_plan()
+                .logging
+                .effective_filter_directive(),
             "trace"
         );
     }
@@ -2106,11 +2250,20 @@ mod tests {
 
         assert_eq!(published.len(), 11);
         assert_eq!(
-            published.last().expect("failure epoch should exist").0.time_key.raw_femtoseconds(),
+            published
+                .last()
+                .expect("failure epoch should exist")
+                .0
+                .time_key
+                .raw_femtoseconds(),
             101
         );
         assert_eq!(
-            published.last().expect("failure epoch should exist").1.events()[0]
+            published
+                .last()
+                .expect("failure epoch should exist")
+                .1
+                .events()[0]
                 .definition()
                 .id,
             STARTUP_FAILED_EVENT_DEFINITION.id
@@ -2169,17 +2322,24 @@ mod tests {
             failure.failure_references[0].event_definition_id,
             teamy_studio_main_menu::MAIN_MENU_CLICKED_EVENT_DEFINITION.id
         );
-        assert_eq!(failure.failure_references[0].timeline_offset_hint.raw_value(), 201);
+        assert_eq!(
+            failure.failure_references[0]
+                .timeline_offset_hint
+                .raw_value(),
+            201
+        );
     }
 
     #[test]
     fn startup_runtime_can_publish_tracing_initialized_event() {
         let mut session = build_mvp_session().expect("mvp session should build");
-        session.runtime.publish_tracing_initialized(TracingInitializedEvent {
-            effective_filter_directive: "info".to_owned(),
-            json_log_path: None,
-            subscriber_was_already_initialized: false,
-        });
+        session
+            .runtime
+            .publish_tracing_initialized(TracingInitializedEvent {
+                effective_filter_directive: "info".to_owned(),
+                json_log_path: None,
+                subscriber_was_already_initialized: false,
+            });
 
         let composition = session.into_composition();
         let latest_event = composition
@@ -2246,7 +2406,10 @@ mod tests {
         assert_eq!(tracing_failure.effective_filter_directive, "{");
         assert_eq!(tracing_failure.json_log_path, None);
         assert!(tracing_failure.reason.contains("directive"));
-        assert_eq!(startup_failure.reason, "startup tracing initialization failed");
+        assert_eq!(
+            startup_failure.reason,
+            "startup tracing initialization failed"
+        );
         assert_eq!(startup_failure.failure_references.len(), 1);
         assert_eq!(
             startup_failure.failure_references[0].event_definition_id,
@@ -2278,15 +2441,27 @@ mod tests {
             .expect("startup failure payload should be present");
 
         assert_eq!(published.len(), 3);
-        assert_eq!(published[0].1.events()[0].definition().id, PROCESS_STARTUP_OBSERVED_EVENT_DEFINITION.id);
-        assert_eq!(published[1].1.events()[0].definition().id, BOOTSTRAP_CLI_PARSE_FAILED_EVENT_DEFINITION.id);
-        assert_eq!(published[2].1.events()[0].definition().id, STARTUP_FAILED_EVENT_DEFINITION.id);
+        assert_eq!(
+            published[0].1.events()[0].definition().id,
+            PROCESS_STARTUP_OBSERVED_EVENT_DEFINITION.id
+        );
+        assert_eq!(
+            published[1].1.events()[0].definition().id,
+            BOOTSTRAP_CLI_PARSE_FAILED_EVENT_DEFINITION.id
+        );
+        assert_eq!(
+            published[2].1.events()[0].definition().id,
+            STARTUP_FAILED_EVENT_DEFINITION.id
+        );
         assert_eq!(detail.argv, vec!["--wat".to_owned()]);
         assert_eq!(detail.missing_value_flag, None);
         assert_eq!(detail.unrecognized_argument.as_deref(), Some("--wat"));
         assert_eq!(startup_failure.reason, "startup bootstrap cli parse failed");
         assert_eq!(startup_failure.failure_references.len(), 1);
-        assert_eq!(startup_failure.failure_references[0].event_definition_id, BOOTSTRAP_CLI_PARSE_FAILED_EVENT_DEFINITION.id);
+        assert_eq!(
+            startup_failure.failure_references[0].event_definition_id,
+            BOOTSTRAP_CLI_PARSE_FAILED_EVENT_DEFINITION.id
+        );
         assert_eq!(error.to_string(), "unrecognized startup argument: --wat");
     }
 
@@ -2317,18 +2492,36 @@ mod tests {
             .expect("startup failure payload should be present");
 
         assert_eq!(published.len(), 4);
-        assert_eq!(published[0].1.events()[0].definition().id, PROCESS_STARTUP_OBSERVED_EVENT_DEFINITION.id);
-        assert_eq!(published[1].1.events()[0].definition().id, STARTUP_GLOBAL_ARGS_PARSED_EVENT_DEFINITION.id);
-        assert_eq!(published[2].1.events()[0].definition().id, STARTUP_LOGGING_PLAN_FAILED_EVENT_DEFINITION.id);
-        assert_eq!(published[3].1.events()[0].definition().id, STARTUP_FAILED_EVENT_DEFINITION.id);
+        assert_eq!(
+            published[0].1.events()[0].definition().id,
+            PROCESS_STARTUP_OBSERVED_EVENT_DEFINITION.id
+        );
+        assert_eq!(
+            published[1].1.events()[0].definition().id,
+            STARTUP_GLOBAL_ARGS_PARSED_EVENT_DEFINITION.id
+        );
+        assert_eq!(
+            published[2].1.events()[0].definition().id,
+            STARTUP_LOGGING_PLAN_FAILED_EVENT_DEFINITION.id
+        );
+        assert_eq!(
+            published[3].1.events()[0].definition().id,
+            STARTUP_FAILED_EVENT_DEFINITION.id
+        );
         assert!(detail.debug);
         assert_eq!(detail.log_filter.as_deref(), Some("trace"));
         assert_eq!(detail.log_file, None);
         assert_eq!(detail.rust_log.as_deref(), Some("warn"));
         assert_eq!(detail.conflicting_log_filter.as_deref(), Some("trace"));
-        assert_eq!(startup_failure.reason, "startup logging plan derivation failed");
+        assert_eq!(
+            startup_failure.reason,
+            "startup logging plan derivation failed"
+        );
         assert_eq!(startup_failure.failure_references.len(), 1);
-        assert_eq!(startup_failure.failure_references[0].event_definition_id, STARTUP_LOGGING_PLAN_FAILED_EVENT_DEFINITION.id);
+        assert_eq!(
+            startup_failure.failure_references[0].event_definition_id,
+            STARTUP_LOGGING_PLAN_FAILED_EVENT_DEFINITION.id
+        );
         assert_eq!(error.to_string(), "cannot specify log filter with --debug");
     }
 
@@ -2376,11 +2569,13 @@ mod tests {
     #[test]
     fn main_menu_interaction_time_seed_advances_past_bootstrap_events() {
         let mut session = build_mvp_session().expect("mvp session should build");
-        session.runtime.publish_tracing_initialized(TracingInitializedEvent {
-            effective_filter_directive: "info".to_owned(),
-            json_log_path: None,
-            subscriber_was_already_initialized: false,
-        });
+        session
+            .runtime
+            .publish_tracing_initialized(TracingInitializedEvent {
+                effective_filter_directive: "info".to_owned(),
+                json_log_path: None,
+                subscriber_was_already_initialized: false,
+            });
 
         assert_eq!(next_main_menu_interaction_time_seed(&session.runtime), 10);
     }

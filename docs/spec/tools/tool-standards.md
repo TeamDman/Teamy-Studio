@@ -1,6 +1,8 @@
 # Tool Standards
 
-This document translates the applicable command-line and logging standards into local tracey requirements for Teamy Studio.
+This document originally translated the applicable command-line and logging standards into local Tracey requirements for Teamy Studio.
+
+Tracey is now preserved as historical reference rather than active authority. Current development direction is governed by `docs/notes/*record-of-decision.md`, especially `docs/notes/development-workflow-record-of-decision.md`.
 
 ## Command Line Interface
 

@@ -59,9 +59,7 @@ mod tests {
     use facet::Facet;
 
     use super::ArenaOffset;
-    use crate::timeline::{
-        Femtoseconds, Seconds, TimeLikeFacetProxy, TimelineOffset,
-    };
+    use crate::timeline::{Femtoseconds, Seconds, TimeLikeFacetProxy, TimelineOffset};
 
     #[test]
     fn arena_offset_converts_from_source_units() {

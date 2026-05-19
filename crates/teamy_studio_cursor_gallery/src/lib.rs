@@ -1,4 +1,5 @@
 mod native_window;
+mod scene;
 
 use std::sync::atomic::{AtomicU64, Ordering};
 

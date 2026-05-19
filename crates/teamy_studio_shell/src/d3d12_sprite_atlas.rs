@@ -33,6 +33,12 @@ fn build_sprite_atlas() -> Vec<u32> {
     draw_storage_sprite(&mut pixels, width, slot_origin(1));
     draw_audio_sprite(&mut pixels, width, slot_origin(2));
     draw_cursor_arrow_sprite(&mut pixels, width, slot_origin(3));
+    draw_cursor_hand_sprite(&mut pixels, width, slot_origin(4));
+    draw_cursor_ibeam_sprite(&mut pixels, width, slot_origin(5));
+    draw_cursor_cross_sprite(&mut pixels, width, slot_origin(6));
+    draw_cursor_wait_sprite(&mut pixels, width, slot_origin(7));
+    draw_cursor_size_all_sprite(&mut pixels, width, slot_origin(8));
+    draw_cursor_help_sprite(&mut pixels, width, slot_origin(9));
     pixels
 }
 
@@ -48,9 +54,27 @@ fn draw_terminal_sprite(pixels: &mut [u32], atlas_width: u32, origin: (i32, i32)
     let screen = inset_rect(bezel, 3);
     fill_rect(pixels, atlas_width, bezel, [46, 61, 82, 255]);
     fill_rect(pixels, atlas_width, screen, [8, 15, 26, 255]);
-    draw_grid_block(pixels, atlas_width, origin, 1, 1, 1, 1, [87, 212, 255, 255]);
-    draw_grid_block(pixels, atlas_width, origin, 2, 2, 1, 1, [87, 212, 255, 255]);
-    draw_grid_block(pixels, atlas_width, origin, 4, 4, 3, 1, [87, 212, 255, 255]);
+    draw_grid_block(
+        pixels,
+        atlas_width,
+        origin,
+        (1, 1, 1, 1),
+        [87, 212, 255, 255],
+    );
+    draw_grid_block(
+        pixels,
+        atlas_width,
+        origin,
+        (2, 2, 1, 1),
+        [87, 212, 255, 255],
+    );
+    draw_grid_block(
+        pixels,
+        atlas_width,
+        origin,
+        (4, 4, 3, 1),
+        [87, 212, 255, 255],
+    );
     fill_rect(
         pixels,
         atlas_width,
@@ -141,13 +165,126 @@ fn draw_cursor_arrow_sprite(pixels: &mut [u32], atlas_width: u32, origin: (i32, 
             pixels,
             atlas_width,
             origin,
-            x + 1,
-            y + 1,
-            width,
-            height,
+            (x + 1, y + 1, width, height),
             shadow,
         );
-        draw_grid_block(pixels, atlas_width, origin, x, y, width, height, color);
+        draw_grid_block(pixels, atlas_width, origin, (x, y, width, height), color);
+    }
+}
+
+fn draw_cursor_hand_sprite(pixels: &mut [u32], atlas_width: u32, origin: (i32, i32)) {
+    let color = [255, 255, 255, 255];
+    let shadow = [16, 22, 30, 120];
+    let blocks = [
+        (6, 2, 1, 8),
+        (8, 1, 1, 9),
+        (10, 2, 1, 8),
+        (12, 3, 1, 7),
+        (5, 9, 9, 2),
+        (4, 11, 10, 2),
+        (4, 13, 8, 2),
+        (5, 15, 6, 1),
+    ];
+    draw_sprite_blocks(pixels, atlas_width, origin, &blocks, color, shadow);
+}
+
+fn draw_cursor_ibeam_sprite(pixels: &mut [u32], atlas_width: u32, origin: (i32, i32)) {
+    let color = [255, 255, 255, 255];
+    let shadow = [16, 22, 30, 120];
+    let blocks = [(4, 2, 8, 1), (4, 13, 8, 1), (7, 3, 2, 10)];
+    draw_sprite_blocks(pixels, atlas_width, origin, &blocks, color, shadow);
+}
+
+fn draw_cursor_cross_sprite(pixels: &mut [u32], atlas_width: u32, origin: (i32, i32)) {
+    let color = [255, 255, 255, 255];
+    let shadow = [16, 22, 30, 120];
+    let blocks = [
+        (7, 1, 2, 14),
+        (1, 7, 14, 2),
+        (4, 4, 2, 2),
+        (10, 4, 2, 2),
+        (4, 10, 2, 2),
+        (10, 10, 2, 2),
+    ];
+    draw_sprite_blocks(pixels, atlas_width, origin, &blocks, color, shadow);
+}
+
+fn draw_cursor_wait_sprite(pixels: &mut [u32], atlas_width: u32, origin: (i32, i32)) {
+    let ring = [255, 255, 255, 255];
+    let accent = [255, 255, 255, 160];
+    let shadow = [16, 22, 30, 120];
+    let blocks = [
+        (5, 1, 6, 1),
+        (5, 14, 6, 1),
+        (6, 2, 4, 1),
+        (6, 13, 4, 1),
+        (3, 4, 1, 2),
+        (12, 4, 1, 2),
+        (3, 10, 1, 2),
+        (12, 10, 1, 2),
+        (4, 3, 1, 1),
+        (11, 3, 1, 1),
+        (4, 12, 1, 1),
+        (11, 12, 1, 1),
+        (7, 4, 2, 5),
+        (8, 8, 3, 2),
+    ];
+    draw_sprite_blocks(pixels, atlas_width, origin, &blocks[..12], ring, shadow);
+    draw_sprite_blocks(pixels, atlas_width, origin, &blocks[12..], accent, shadow);
+}
+
+fn draw_cursor_size_all_sprite(pixels: &mut [u32], atlas_width: u32, origin: (i32, i32)) {
+    let color = [255, 255, 255, 255];
+    let shadow = [16, 22, 30, 120];
+    let blocks = [
+        (7, 1, 2, 14),
+        (1, 7, 14, 2),
+        (6, 1, 4, 2),
+        (6, 13, 4, 2),
+        (1, 6, 2, 4),
+        (13, 6, 2, 4),
+    ];
+    draw_sprite_blocks(pixels, atlas_width, origin, &blocks, color, shadow);
+}
+
+fn draw_cursor_help_sprite(pixels: &mut [u32], atlas_width: u32, origin: (i32, i32)) {
+    let color = [255, 255, 255, 255];
+    let shadow = [16, 22, 30, 120];
+    let blocks = [
+        (5, 2, 5, 1),
+        (4, 3, 1, 2),
+        (10, 3, 1, 2),
+        (8, 4, 1, 2),
+        (7, 6, 2, 1),
+        (7, 8, 2, 1),
+        (7, 11, 2, 2),
+    ];
+    draw_sprite_blocks(pixels, atlas_width, origin, &blocks, color, shadow);
+}
+
+fn draw_sprite_blocks(
+    pixels: &mut [u32],
+    atlas_width: u32,
+    origin: (i32, i32),
+    blocks: &[(i32, i32, i32, i32)],
+    color: [u8; 4],
+    shadow: [u8; 4],
+) {
+    for (x, y, width, height) in blocks {
+        draw_grid_block(
+            pixels,
+            atlas_width,
+            origin,
+            (x + 1, y + 1, *width, *height),
+            shadow,
+        );
+        draw_grid_block(
+            pixels,
+            atlas_width,
+            origin,
+            (*x, *y, *width, *height),
+            color,
+        );
     }
 }
 
@@ -187,12 +324,10 @@ fn draw_grid_block(
     pixels: &mut [u32],
     atlas_width: u32,
     origin: (i32, i32),
-    x: i32,
-    y: i32,
-    width: i32,
-    height: i32,
+    rect: (i32, i32, i32, i32),
     color: [u8; 4],
 ) {
+    let (x, y, width, height) = rect;
     fill_rect(
         pixels,
         atlas_width,

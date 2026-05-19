@@ -1,3 +1,8 @@
+#![expect(
+    dead_code,
+    reason = "the GDI scene painter is retained as a diagnostic fallback while the D3D12-backed menu renderer settles"
+)]
+
 use std::cell::RefCell;
 use std::sync::{Mutex, OnceLock};
 
@@ -19,17 +24,17 @@ use windows::Win32::UI::Controls::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CS_DBLCLKS, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect,
-    GetMessageW, GetWindowRect, HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTCAPTION, HTCLIENT,
-    HTLEFT, HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT, IDC_ARROW, IsWindow, KillTimer,
-    LoadCursorW, MSG, PostQuitMessage, RegisterClassW, SW_MAXIMIZE, SW_MINIMIZE, SW_SHOW,
-    SWP_NOACTIVATE, SWP_NOZORDER, SendMessageW, SetTimer, SetWindowPos, ShowWindow,
-    TranslateMessage, WINDOW_STYLE, WM_DESTROY, WM_DPICHANGED, WM_ENTERSIZEMOVE,
-    WM_ERASEBKGND, WM_EXITSIZEMOVE, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCACTIVATE,
+    GetMessageW, GetWindowRect, HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTCAPTION, HTCLIENT, HTLEFT,
+    HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT, IDC_ARROW, IsWindow, KillTimer, LoadCursorW,
+    MB_ICONINFORMATION, MB_OK, MESSAGEBOX_STYLE, MSG, MessageBoxW, PostQuitMessage, RegisterClassW,
+    SW_MAXIMIZE, SW_MINIMIZE, SW_SHOW, SWP_NOACTIVATE, SWP_NOZORDER, SendMessageW, SetTimer,
+    SetWindowPos, ShowWindow, TranslateMessage, WINDOW_STYLE, WM_DESTROY, WM_DPICHANGED,
+    WM_ENTERSIZEMOVE, WM_ERASEBKGND, WM_EXITSIZEMOVE, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCACTIVATE,
     WM_NCCALCSIZE, WM_NCHITTEST, WM_NCPAINT, WM_PAINT, WM_SIZE, WM_TIMER, WNDCLASSW,
-    WS_EX_APPWINDOW, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOPMOST, WS_MAXIMIZEBOX,
-    WS_MINIMIZEBOX, WS_POPUP, WS_THICKFRAME,
+    WS_EX_APPWINDOW, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOPMOST, WS_MAXIMIZEBOX, WS_MINIMIZEBOX,
+    WS_POPUP, WS_THICKFRAME,
 };
-use windows::core::{PCWSTR, PWSTR, w};
+use windows::core::{HSTRING, PCWSTR, PWSTR, w};
 
 use crate::{
     FeatureValidationState, MainMenuLogicalButton, MainMenuLogicalButtonId,
@@ -120,6 +125,22 @@ fn main_menu_window_state() -> &'static Mutex<Option<NativeMainMenuWindowState>>
     MAIN_MENU_WINDOW_STATE.get_or_init(|| Mutex::new(None))
 }
 
+pub fn show_main_menu_info_dialog(title: &str, description: &str) -> Result<()> {
+    let title = HSTRING::from(title);
+    let description = HSTRING::from(description);
+
+    unsafe {
+        let _ = MessageBoxW(
+            None,
+            &description,
+            &title,
+            MESSAGEBOX_STYLE(MB_OK.0 | MB_ICONINFORMATION.0),
+        );
+    }
+
+    Ok(())
+}
+
 fn ensure_main_menu_window_class_registered() -> Result<()> {
     if MAIN_MENU_WINDOW_CLASS_REGISTERED.get().is_some() {
         return Ok(());
@@ -174,26 +195,47 @@ fn handle_left_button_up(hwnd: HWND, lparam: LPARAM) -> Result<()> {
     );
 
     if let Some(action) = chrome_click_action(layout, point) {
+        info!(
+            ?action,
+            x = point.x,
+            y = point.y,
+            "main menu chrome clicked"
+        );
         perform_chrome_click(hwnd, action);
         return Ok(());
     }
 
     let card_layouts = layout_main_menu_button_cards(layout.body_rect, snapshot.buttons().len());
-    if let Some(button) = snapshot
-        .buttons()
-        .iter()
-        .zip(card_layouts.iter())
-        .find_map(|(button, layout)| {
-            rect_contains(layout.card_rect, point.x, point.y)
-                .then_some(button)
-                .filter(|button| button.validation_state == FeatureValidationState::Validated)
-        })
+    if let Some(button) =
+        snapshot
+            .buttons()
+            .iter()
+            .zip(card_layouts.iter())
+            .find_map(|(button, layout)| {
+                rect_contains(layout.card_rect, point.x, point.y)
+                    .then_some(button)
+                    .filter(|button| button.validation_state != FeatureValidationState::Failed)
+            })
     {
+        info!(
+            logical_button_id = ?button.logical_button_id,
+            title = button.title,
+            ?button.validation_state,
+            x = point.x,
+            y = point.y,
+            "main menu button clicked"
+        );
         CLICKED_BUTTON_IDS
             .get_or_init(|| Mutex::new(Vec::new()))
             .lock()
             .expect("main menu click queue should not be poisoned")
             .push(button.logical_button_id);
+    } else {
+        info!(
+            x = point.x,
+            y = point.y,
+            "main menu click did not hit an actionable button"
+        );
     }
 
     Ok(())
@@ -290,7 +332,13 @@ fn draw_sprite(hdc: HDC, sprite: &SpriteQuad) -> Result<()> {
         SpriteId::Terminal => draw_terminal_sprite(hdc, sprite.rect),
         SpriteId::Storage => draw_storage_sprite(hdc, sprite.rect),
         SpriteId::Audio => draw_audio_sprite(hdc, sprite.rect),
-        SpriteId::CursorArrow => draw_cursor_arrow_sprite(hdc, sprite.rect),
+        SpriteId::CursorArrow
+        | SpriteId::CursorHand
+        | SpriteId::CursorIBeam
+        | SpriteId::CursorCross
+        | SpriteId::CursorWait
+        | SpriteId::CursorSizeAll
+        | SpriteId::CursorHelp => draw_cursor_arrow_sprite(hdc, sprite.rect),
     }
 }
 
@@ -1001,6 +1049,10 @@ where
             std::mem::take(&mut *queued)
         };
         for logical_button_id in button_ids {
+            info!(
+                ?logical_button_id,
+                "dispatching main menu click to callback"
+            );
             on_click(logical_button_id)?;
         }
     }

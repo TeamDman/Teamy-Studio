@@ -9,9 +9,9 @@ use std::sync::{Arc, Mutex};
 #[cfg(feature = "tracy")]
 use tracing::Metadata;
 use tracing::level_filters::LevelFilter;
+use tracing_subscriber::EnvFilter;
 #[cfg(feature = "tracy")]
 use tracing_subscriber::filter::FilterFn;
-use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt::writer::BoxMakeWriter;
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -105,7 +105,6 @@ impl BootstrapCliParseError {
                 | Self::CompletionsRequested { .. }
         )
     }
-
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -286,9 +285,7 @@ fn exclude_tracy_frame_mark(meta: &Metadata<'_>) -> bool {
 }
 
 fn startup_help_text() -> String {
-    format!(
-        "Teamy Studio\n\nUsage:\n  teamy-studio [OPTIONS]\n\nOptions:\n  --debug                    Enable debug logging\n  --log-filter <FILTER>      Override the tracing filter directive\n  --log-file <PATH>          Write NDJSON logs to a file or directory\n  -h, --help                 Print help and exit\n  -V, --version              Print version and exit\n  --completions <SHELL>      Print shell completions for bash, zsh, or fish\n"
-    )
+    "Teamy Studio\n\nUsage:\n  teamy-studio [OPTIONS]\n\nOptions:\n  --debug                    Enable debug logging\n  --log-filter <FILTER>      Override the tracing filter directive\n  --log-file <PATH>          Write NDJSON logs to a file or directory\n  -h, --help                 Print help and exit\n  -V, --version              Print version and exit\n  --completions <SHELL>      Print shell completions for bash, zsh, or fish\n".to_owned()
 }
 
 fn startup_version_text() -> String {
@@ -421,9 +418,7 @@ pub fn parse_bootstrap_cli_args(
             "--log-file" => {
                 let value = args
                     .get(index + 1)
-                    .ok_or(BootstrapCliParseError::MissingValue {
-                        flag: "--log-file",
-                    })?;
+                    .ok_or(BootstrapCliParseError::MissingValue { flag: "--log-file" })?;
                 global_args.log_file = Some((*value).to_owned());
                 index += 2;
             }
@@ -509,22 +504,24 @@ pub fn initialize_tracing_from_bootstrap_plan(
             .with_line_number(true)
             .with_target(false)
             .with_writer(json_writer)
-            .with_filter(EnvFilter::builder().parse(bootstrap_plan.logging.effective_filter_directive())?);
+            .with_filter(
+                EnvFilter::builder().parse(bootstrap_plan.logging.effective_filter_directive())?,
+            );
         #[cfg(feature = "tracy")]
         let json_layer = json_layer.with_filter(FilterFn::new(exclude_tracy_frame_mark));
 
         let subscriber_was_already_initialized =
             try_init_with_already_initialized(subscriber.with(json_layer).try_init())?;
-        return Ok(bootstrap_plan.logging.to_tracing_initialized_event(
-            subscriber_was_already_initialized,
-        ));
+        return Ok(bootstrap_plan
+            .logging
+            .to_tracing_initialized_event(subscriber_was_already_initialized));
     }
 
     let subscriber_was_already_initialized =
         try_init_with_already_initialized(subscriber.try_init())?;
-    Ok(bootstrap_plan.logging.to_tracing_initialized_event(
-        subscriber_was_already_initialized,
-    ))
+    Ok(bootstrap_plan
+        .logging
+        .to_tracing_initialized_event(subscriber_was_already_initialized))
 }
 
 fn try_init_with_already_initialized(
@@ -537,7 +534,10 @@ fn try_init_with_already_initialized(
 }
 
 fn ignore_already_initialized(error: tracing_subscriber::util::TryInitError) -> Result<bool> {
-    if error.to_string().contains("a global default trace dispatcher has already been set") {
+    if error
+        .to_string()
+        .contains("a global default trace dispatcher has already been set")
+    {
         return Ok(true);
     }
 
@@ -579,16 +579,15 @@ fn resolve_json_log_path(log_file: Option<&str>, now: DateTime<Local>) -> Option
 mod tests {
     use super::{
         BootstrapCliParseError, BootstrapPlanError, GlobalArgs, LogFilterSelection,
-        RawProcessStartupInputs, StartupGlobalArgsParsedEvent, StartupLoggingPlan,
-        StartupLoggingPlanError, StartupBootstrapPlan, TracingInitializedEvent,
+        RawProcessStartupInputs, StartupBootstrapPlan, StartupGlobalArgsParsedEvent,
+        StartupLoggingPlan, StartupLoggingPlanError, TracingInitializedEvent,
         derive_bootstrap_plan, parse_bootstrap_cli_args, try_handle_builtin_bootstrap_cli_request,
     };
     use chrono::{Local, TimeZone};
 
     #[test]
     fn bootstrap_cli_parses_debug_flag() {
-        let parsed = parse_bootstrap_cli_args(&["--debug"])
-            .expect("debug flag should parse");
+        let parsed = parse_bootstrap_cli_args(&["--debug"]).expect("debug flag should parse");
 
         assert!(parsed.global_args.debug);
         assert_eq!(parsed.global_args.log_filter, None);
@@ -597,13 +596,9 @@ mod tests {
 
     #[test]
     fn bootstrap_cli_parses_log_filter_and_log_file() {
-        let parsed = parse_bootstrap_cli_args(&[
-            "--log-filter",
-            "trace",
-            "--log-file",
-            "logs/teamy.ndjson",
-        ])
-        .expect("log flags should parse");
+        let parsed =
+            parse_bootstrap_cli_args(&["--log-filter", "trace", "--log-file", "logs/teamy.ndjson"])
+                .expect("log flags should parse");
 
         assert_eq!(parsed.global_args.log_filter.as_deref(), Some("trace"));
         assert_eq!(
@@ -616,16 +611,22 @@ mod tests {
     fn bootstrap_cli_surfaces_help_requests() {
         let error = parse_bootstrap_cli_args(&["--help"]).expect_err("help should short-circuit");
 
-        assert!(matches!(error, BootstrapCliParseError::HelpRequested { .. }));
+        assert!(matches!(
+            error,
+            BootstrapCliParseError::HelpRequested { .. }
+        ));
         assert!(error.to_string().contains("--help"));
     }
 
     #[test]
     fn bootstrap_cli_surfaces_version_requests() {
-        let error = parse_bootstrap_cli_args(&["--version"])
-            .expect_err("version should short-circuit");
+        let error =
+            parse_bootstrap_cli_args(&["--version"]).expect_err("version should short-circuit");
 
-        assert!(matches!(error, BootstrapCliParseError::VersionRequested { .. }));
+        assert!(matches!(
+            error,
+            BootstrapCliParseError::VersionRequested { .. }
+        ));
         assert!(error.to_string().contains(env!("CARGO_PKG_VERSION")));
     }
 
@@ -642,7 +643,10 @@ mod tests {
         let error = parse_bootstrap_cli_args(&["--completions", "bash"])
             .expect_err("completions should short-circuit");
 
-        assert!(matches!(error, BootstrapCliParseError::CompletionsRequested { .. }));
+        assert!(matches!(
+            error,
+            BootstrapCliParseError::CompletionsRequested { .. }
+        ));
         assert!(error.to_string().contains("teamy-studio"));
     }
 
@@ -671,12 +675,9 @@ mod tests {
     // tool[verify logging.filter.from-env]
     #[test]
     fn rust_log_is_used_when_explicit_filter_is_omitted() {
-        let logging = StartupLoggingPlan::from_global_args(
-            &GlobalArgs::default(),
-            Some("warn"),
-            fixed_now(),
-        )
-        .expect("RUST_LOG should be accepted when --log-filter is omitted");
+        let logging =
+            StartupLoggingPlan::from_global_args(&GlobalArgs::default(), Some("warn"), fixed_now())
+                .expect("RUST_LOG should be accepted when --log-filter is omitted");
 
         assert_eq!(
             logging.filter_selection,
@@ -708,12 +709,9 @@ mod tests {
     // tool[verify logging.filter.defaults]
     #[test]
     fn non_debug_defaults_to_info_filter_when_no_filter_is_provided() {
-        let logging = StartupLoggingPlan::from_global_args(
-            &GlobalArgs::default(),
-            None,
-            fixed_now(),
-        )
-        .expect("non-debug default filter should resolve");
+        let logging =
+            StartupLoggingPlan::from_global_args(&GlobalArgs::default(), None, fixed_now())
+                .expect("non-debug default filter should resolve");
 
         assert_eq!(
             logging.filter_selection,
@@ -777,7 +775,10 @@ mod tests {
         )
         .expect("bootstrap plan should derive from raw inputs");
 
-        assert_eq!(plan.global_args.log_file.as_deref(), Some("logs/teamy.ndjson"));
+        assert_eq!(
+            plan.global_args.log_file.as_deref(),
+            Some("logs/teamy.ndjson")
+        );
         assert_eq!(
             plan.logging.filter_selection,
             LogFilterSelection::FromEnv("trace".to_owned())

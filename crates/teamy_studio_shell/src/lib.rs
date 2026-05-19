@@ -15,20 +15,32 @@ mod scene_upload_batch;
 mod scene_vertices;
 mod text_atlas;
 
-use std::sync::OnceLock;
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
 
 use eyre::{Result, WrapErr};
 use linkme::distributed_slice;
 use teamy_studio_event_core::{EventDefinition, EventDefinitionId, PublishedEvent, WritableArena};
 use teamy_studio_registration_core::{EVENT_DEFINITION_REGISTRATIONS, EventDefinitionRegistration};
 use teamy_studio_timeline_core::{CanonicalTimeKey, ConstructedTimeline, TriggerRuntime};
+use tracing::warn;
 use windows::Win32::Foundation::HINSTANCE;
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::Graphics::Dwm::{
+    DWMWA_BORDER_COLOR, DWMWA_COLOR_NONE, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND,
+    DwmSetWindowAttribute,
+};
+use windows::Win32::Graphics::Gdi::{BeginPaint, EndPaint, PAINTSTRUCT};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
-    BringWindowToTop, CS_DBLCLKS, CreateWindowExW, DefWindowProcW, DestroyWindow, GetSystemMetrics,
-    IDC_ARROW, LoadCursorW, RegisterClassExW, SM_CXSCREEN, SM_CYSCREEN, SW_SHOW, SW_SHOWNA,
-    ShowWindow, WINDOW_EX_STYLE, WINDOW_STYLE, WNDCLASSEXW, WS_EX_APPWINDOW, WS_EX_NOACTIVATE,
+    BringWindowToTop, CS_DBLCLKS, CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect,
+    GetSystemMetrics, GetWindowRect, HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTCAPTION, HTCLIENT,
+    HTLEFT, HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT, IDC_ARROW, KillTimer, LoadCursorW,
+    RegisterClassExW, SM_CXSCREEN, SM_CYSCREEN, SW_MAXIMIZE, SW_MINIMIZE, SW_SHOW, SW_SHOWNA,
+    SetCursor, SetTimer, SetWindowPos, ShowWindow, WINDOW_EX_STYLE, WINDOW_STYLE, WM_DESTROY,
+    WM_DPICHANGED, WM_ERASEBKGND, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCACTIVATE, WM_NCCALCSIZE,
+    WM_NCHITTEST, WM_NCPAINT, WM_PAINT, WM_TIMER, WNDCLASSEXW, WS_EX_APPWINDOW, WS_EX_NOACTIVATE,
     WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP,
     WS_THICKFRAME, WS_VISIBLE,
 };
@@ -74,10 +86,45 @@ const INITIAL_WINDOW_WIDTH: i32 = 1280;
 const INITIAL_WINDOW_HEIGHT: i32 = 820;
 const STANDARD_WINDOW_CLASS_NAME: PCWSTR = w!("TeamyStudioShellWindow");
 const TOOL_WINDOW_CLASS_NAME: PCWSTR = w!("TeamyStudioShellToolWindow");
+const SHELL_RENDER_TIMER_ID: usize = 1;
+const SHELL_RENDER_INTERVAL_MS: u32 = 16;
 
 static STANDARD_WINDOW_CLASS_REGISTERED: OnceLock<()> = OnceLock::new();
 static TOOL_WINDOW_CLASS_REGISTERED: OnceLock<()> = OnceLock::new();
 static DPI_AWARENESS_INITIALIZED: OnceLock<()> = OnceLock::new();
+static SHELL_WINDOW_STATES: OnceLock<Mutex<HashMap<isize, NativeShellWindowState>>> =
+    OnceLock::new();
+
+thread_local! {
+    static SHELL_TEXT_RENDERER_HOSTS: RefCell<HashMap<isize, TextRendererHost>> = RefCell::new(HashMap::new());
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct FeatureWindowSceneContext {
+    pub title: &'static str,
+    pub layout: ShellSceneLayout,
+    pub dpi: u32,
+    pub chrome: WindowChromeButtonsState,
+    pub cursor_client_point: Option<POINT>,
+}
+
+#[derive(Clone, Copy)]
+pub struct FeatureWindowSceneRegistration {
+    pub title: &'static str,
+    pub build_scene: fn(FeatureWindowSceneContext) -> RenderScene,
+    pub cursor_for_point: Option<fn(FeatureWindowSceneContext, POINT) -> Option<PCWSTR>>,
+}
+
+#[distributed_slice]
+pub static FEATURE_WINDOW_SCENE_REGISTRATIONS: [FeatureWindowSceneRegistration];
+
+#[derive(Clone, Copy, Debug)]
+struct NativeShellWindowState {
+    title: &'static str,
+    dpi: u32,
+    chrome: WindowChromeButtonsState,
+    cursor_client_point: Option<POINT>,
+}
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct LogicalWindowId(u64);
@@ -219,9 +266,415 @@ unsafe extern "system" fn shell_window_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
-    // Safety: this host scaffold currently delegates all behavior to the default
-    // window procedure until the shell crate owns a real message loop.
-    unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
+    match message {
+        WM_NCCALCSIZE => LRESULT(0),
+        WM_NCACTIVATE => LRESULT(1),
+        WM_NCPAINT => LRESULT(0),
+        WM_NCHITTEST => shell_non_client_hit_test(hwnd, lparam),
+        WM_ERASEBKGND => LRESULT(1),
+        WM_DPICHANGED => handle_shell_dpi_changed(hwnd, wparam, lparam),
+        WM_MOUSEMOVE => {
+            let _ = handle_shell_mouse_move(hwnd, lparam);
+            LRESULT(0)
+        }
+        WM_TIMER if wparam.0 == SHELL_RENDER_TIMER_ID => {
+            let _ = drive_shell_render_path(hwnd);
+            LRESULT(0)
+        }
+        WM_LBUTTONUP => {
+            let _ = handle_shell_left_button_up(hwnd, lparam);
+            LRESULT(0)
+        }
+        WM_PAINT => paint_shell_window(hwnd),
+        WM_DESTROY => {
+            destroy_shell_window_render_state(hwnd);
+            LRESULT(0)
+        }
+        _ => unsafe { DefWindowProcW(hwnd, message, wparam, lparam) },
+    }
+}
+
+fn shell_window_states() -> &'static Mutex<HashMap<isize, NativeShellWindowState>> {
+    SHELL_WINDOW_STATES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn feature_window_scene_registration(
+    title: &'static str,
+) -> Option<&'static FeatureWindowSceneRegistration> {
+    FEATURE_WINDOW_SCENE_REGISTRATIONS
+        .iter()
+        .find(|registration| registration.title == title)
+}
+
+fn shell_window_layout(hwnd: HWND, dpi: u32) -> Result<ShellSceneLayout> {
+    let mut client_rect = RECT::default();
+    unsafe { GetClientRect(hwnd, &mut client_rect) }
+        .wrap_err("failed to get shell window client rect")?;
+    Ok(ShellSceneLayout::for_main_menu_with_dpi(
+        client_rect.right - client_rect.left,
+        client_rect.bottom - client_rect.top,
+        dpi,
+    ))
+}
+
+fn rect_contains(rect: RECT, x: i32, y: i32) -> bool {
+    x >= rect.left && x < rect.right && y >= rect.top && y < rect.bottom
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ShellChromeClickAction {
+    Pin,
+    Diagnostics,
+    Latency,
+    Minimize,
+    MaximizeRestore,
+    Close,
+}
+
+fn shell_chrome_click_action(
+    layout: ShellSceneLayout,
+    point: POINT,
+) -> Option<ShellChromeClickAction> {
+    [
+        (layout.pin_button_rect, ShellChromeClickAction::Pin),
+        (
+            layout.diagnostics_button_rect,
+            ShellChromeClickAction::Diagnostics,
+        ),
+        (layout.latency_button_rect, ShellChromeClickAction::Latency),
+        (
+            layout.minimize_button_rect,
+            ShellChromeClickAction::Minimize,
+        ),
+        (
+            layout.maximize_restore_button_rect,
+            ShellChromeClickAction::MaximizeRestore,
+        ),
+        (layout.close_button_rect, ShellChromeClickAction::Close),
+    ]
+    .into_iter()
+    .find_map(|(rect, action)| rect_contains(rect, point.x, point.y).then_some(action))
+}
+
+fn button_visual_state_for_rect(
+    rect: RECT,
+    cursor_client_point: Option<POINT>,
+) -> ButtonVisualState {
+    let hovered = cursor_client_point.is_some_and(|point| rect_contains(rect, point.x, point.y));
+    ButtonVisualState {
+        hover_near: if hovered { 1.0 } else { 0.0 },
+        hovered,
+        active: hovered,
+        ..Default::default()
+    }
+}
+
+fn chrome_state_with_pointer(
+    mut chrome: WindowChromeButtonsState,
+    layout: ShellSceneLayout,
+    cursor_client_point: Option<POINT>,
+) -> WindowChromeButtonsState {
+    chrome.pin = button_visual_state_for_rect(layout.pin_button_rect, cursor_client_point);
+    chrome.diagnostics =
+        button_visual_state_for_rect(layout.diagnostics_button_rect, cursor_client_point);
+    chrome.latency = button_visual_state_for_rect(layout.latency_button_rect, cursor_client_point);
+    chrome.minimize =
+        button_visual_state_for_rect(layout.minimize_button_rect, cursor_client_point);
+    chrome.maximize_restore =
+        button_visual_state_for_rect(layout.maximize_restore_button_rect, cursor_client_point);
+    chrome.close = button_visual_state_for_rect(layout.close_button_rect, cursor_client_point);
+    chrome
+}
+
+fn build_live_shell_window_scene(hwnd: HWND) -> Result<Option<RenderScene>> {
+    let state = shell_window_states()
+        .lock()
+        .expect("shell window state should not be poisoned")
+        .get(&(hwnd.0 as isize))
+        .copied();
+    let Some(state) = state else {
+        return Ok(None);
+    };
+    let Some(registration) = feature_window_scene_registration(state.title) else {
+        return Ok(None);
+    };
+    let layout = shell_window_layout(hwnd, state.dpi)?;
+    Ok(Some((registration.build_scene)(
+        FeatureWindowSceneContext {
+            title: state.title,
+            layout,
+            dpi: state.dpi,
+            chrome: chrome_state_with_pointer(state.chrome, layout, state.cursor_client_point),
+            cursor_client_point: state.cursor_client_point,
+        },
+    )))
+}
+
+fn shell_window_scene_context(hwnd: HWND) -> Result<Option<FeatureWindowSceneContext>> {
+    let state = shell_window_states()
+        .lock()
+        .expect("shell window state should not be poisoned")
+        .get(&(hwnd.0 as isize))
+        .copied();
+    let Some(state) = state else {
+        return Ok(None);
+    };
+    let layout = shell_window_layout(hwnd, state.dpi)?;
+    Ok(Some(FeatureWindowSceneContext {
+        title: state.title,
+        layout,
+        dpi: state.dpi,
+        chrome: chrome_state_with_pointer(state.chrome, layout, state.cursor_client_point),
+        cursor_client_point: state.cursor_client_point,
+    }))
+}
+
+fn update_shell_window_cursor(hwnd: HWND, point: POINT) -> Result<()> {
+    let Some(context) = shell_window_scene_context(hwnd)? else {
+        return Ok(());
+    };
+    let Some(registration) = feature_window_scene_registration(context.title) else {
+        return Ok(());
+    };
+    let cursor = registration
+        .cursor_for_point
+        .and_then(|resolver| resolver(context, point))
+        .unwrap_or(IDC_ARROW);
+    if let Ok(cursor_handle) = unsafe { LoadCursorW(Some(HINSTANCE::default()), cursor) } {
+        unsafe { SetCursor(Some(cursor_handle)) };
+    }
+    Ok(())
+}
+
+fn initialize_shell_window_render_state(hwnd: HWND) -> Result<()> {
+    let scene = build_live_shell_window_scene(hwnd)?;
+    let Some(scene) = scene else {
+        return Ok(());
+    };
+    SHELL_TEXT_RENDERER_HOSTS.with(|text_renderer_hosts| {
+        text_renderer_hosts.borrow_mut().insert(
+            hwnd.0 as isize,
+            create_text_renderer_host_for_scene(hwnd, &scene)?,
+        );
+        Ok::<(), eyre::Report>(())
+    })?;
+    unsafe {
+        let _ = SetTimer(
+            Some(hwnd),
+            SHELL_RENDER_TIMER_ID,
+            SHELL_RENDER_INTERVAL_MS,
+            None,
+        );
+    }
+    configure_shell_window_chrome(hwnd)?;
+    Ok(())
+}
+
+fn destroy_shell_window_render_state(hwnd: HWND) {
+    unsafe {
+        let _ = KillTimer(Some(hwnd), SHELL_RENDER_TIMER_ID);
+    }
+    shell_window_states()
+        .lock()
+        .expect("shell window state should not be poisoned")
+        .remove(&(hwnd.0 as isize));
+    SHELL_TEXT_RENDERER_HOSTS.with(|text_renderer_hosts| {
+        text_renderer_hosts.borrow_mut().remove(&(hwnd.0 as isize));
+    });
+}
+
+fn configure_shell_window_chrome(hwnd: HWND) -> Result<()> {
+    let border_color = DWMWA_COLOR_NONE;
+    if let Err(error) = unsafe {
+        DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_BORDER_COLOR,
+            (&raw const border_color).cast(),
+            u32::try_from(std::mem::size_of_val(&border_color)).unwrap_or(u32::MAX),
+        )
+    } {
+        warn!(error = %error, "shell window DWM border-color override unavailable");
+    }
+
+    let corner_preference = DWMWCP_DONOTROUND;
+    if let Err(error) = unsafe {
+        DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_WINDOW_CORNER_PREFERENCE,
+            (&raw const corner_preference).cast(),
+            u32::try_from(std::mem::size_of_val(&corner_preference)).unwrap_or(u32::MAX),
+        )
+    } {
+        warn!(error = %error, "shell window DWM corner override unavailable");
+    }
+
+    Ok(())
+}
+
+fn paint_shell_window(hwnd: HWND) -> LRESULT {
+    let mut paint = PAINTSTRUCT::default();
+    let hdc = unsafe { BeginPaint(hwnd, &mut paint) };
+    if !hdc.0.is_null() {
+        unsafe {
+            let _ = EndPaint(hwnd, &paint);
+        };
+    }
+    LRESULT(0)
+}
+
+fn drive_shell_render_path(hwnd: HWND) -> Result<()> {
+    let scene = build_live_shell_window_scene(hwnd)?;
+    let Some(scene) = scene else {
+        return Ok(());
+    };
+    let mut client_rect = RECT::default();
+    unsafe { GetClientRect(hwnd, &mut client_rect) }
+        .wrap_err("failed to get shell window client rect for render")?;
+    let width = (client_rect.right - client_rect.left).max(0) as u32;
+    let height = (client_rect.bottom - client_rect.top).max(0) as u32;
+    SHELL_TEXT_RENDERER_HOSTS.with(|text_renderer_hosts| {
+        let mut hosts = text_renderer_hosts.borrow_mut();
+        let Some(host) = hosts.get_mut(&(hwnd.0 as isize)) else {
+            return Ok::<(), eyre::Report>(());
+        };
+        if host.width != width || host.height != height {
+            host.resize_swap_chain(width.max(1), height.max(1))?;
+        }
+        host.upload_scene(&scene)?;
+        host.present_scene_frame([0.0, 0.0, 0.0, 0.0])
+    })
+}
+
+fn handle_shell_mouse_move(hwnd: HWND, lparam: LPARAM) -> Result<()> {
+    let point = POINT {
+        x: (lparam.0 & 0xFFFF) as i16 as i32,
+        y: ((lparam.0 >> 16) & 0xFFFF) as i16 as i32,
+    };
+    if let Some(state) = shell_window_states()
+        .lock()
+        .expect("shell window state should not be poisoned")
+        .get_mut(&(hwnd.0 as isize))
+    {
+        state.cursor_client_point = Some(point);
+    }
+    update_shell_window_cursor(hwnd, point)?;
+    drive_shell_render_path(hwnd)
+}
+
+fn handle_shell_left_button_up(hwnd: HWND, lparam: LPARAM) -> Result<()> {
+    let point = POINT {
+        x: (lparam.0 & 0xFFFF) as i16 as i32,
+        y: ((lparam.0 >> 16) & 0xFFFF) as i16 as i32,
+    };
+    let dpi = shell_window_states()
+        .lock()
+        .expect("shell window state should not be poisoned")
+        .get(&(hwnd.0 as isize))
+        .map_or_else(system_dpi, |state| state.dpi);
+    let layout = shell_window_layout(hwnd, dpi)?;
+    if let Some(action) = shell_chrome_click_action(layout, point) {
+        match action {
+            ShellChromeClickAction::Close => unsafe {
+                let _ = DestroyWindow(hwnd);
+            },
+            ShellChromeClickAction::Minimize => unsafe {
+                let _ = ShowWindow(hwnd, SW_MINIMIZE);
+            },
+            ShellChromeClickAction::MaximizeRestore => unsafe {
+                let _ = ShowWindow(hwnd, SW_MAXIMIZE);
+            },
+            ShellChromeClickAction::Pin
+            | ShellChromeClickAction::Diagnostics
+            | ShellChromeClickAction::Latency => {}
+        }
+    }
+    Ok(())
+}
+
+fn shell_non_client_hit_test(hwnd: HWND, lparam: LPARAM) -> LRESULT {
+    let x = (lparam.0 & 0xFFFF) as i16 as i32;
+    let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
+    let mut window_rect = RECT::default();
+    if unsafe { GetWindowRect(hwnd, &mut window_rect) }.is_err() {
+        return LRESULT(HTCLIENT as isize);
+    }
+    let width = window_rect.right - window_rect.left;
+    let height = window_rect.bottom - window_rect.top;
+    let layout = ShellSceneLayout::for_main_menu_with_dpi(width, height, window_dpi(hwnd));
+    let border = scale_for_dpi(8, window_dpi(hwnd));
+    let local_x = x - window_rect.left;
+    let local_y = y - window_rect.top;
+
+    let left = local_x < border;
+    let right = local_x >= width - border;
+    let top = local_y < border;
+    let bottom = local_y >= height - border;
+
+    if top && left {
+        return LRESULT(HTTOPLEFT as isize);
+    }
+    if top && right {
+        return LRESULT(HTTOPRIGHT as isize);
+    }
+    if bottom && left {
+        return LRESULT(HTBOTTOMLEFT as isize);
+    }
+    if bottom && right {
+        return LRESULT(HTBOTTOMRIGHT as isize);
+    }
+    if left {
+        return LRESULT(HTLEFT as isize);
+    }
+    if right {
+        return LRESULT(HTRIGHT as isize);
+    }
+    if top {
+        return LRESULT(HTTOP as isize);
+    }
+    if bottom {
+        return LRESULT(HTBOTTOM as isize);
+    }
+
+    if local_y >= layout.title_bar_rect.top
+        && local_y < layout.title_bar_rect.bottom
+        && shell_chrome_click_action(
+            layout,
+            POINT {
+                x: local_x,
+                y: local_y,
+            },
+        )
+        .is_none()
+    {
+        return LRESULT(HTCAPTION as isize);
+    }
+
+    LRESULT(HTCLIENT as isize)
+}
+
+fn handle_shell_dpi_changed(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    let dpi = u32::try_from(wparam.0 & 0xFFFF).unwrap_or_else(|_| window_dpi(hwnd));
+    if let Some(state) = shell_window_states()
+        .lock()
+        .expect("shell window state should not be poisoned")
+        .get_mut(&(hwnd.0 as isize))
+    {
+        state.dpi = dpi;
+    }
+    let suggested_rect = unsafe { &*(lparam.0 as *const RECT) };
+    unsafe {
+        let _ = SetWindowPos(
+            hwnd,
+            None,
+            suggested_rect.left,
+            suggested_rect.top,
+            suggested_rect.right - suggested_rect.left,
+            suggested_rect.bottom - suggested_rect.top,
+            Default::default(),
+        );
+    }
+    let _ = drive_shell_render_path(hwnd);
+    LRESULT(0)
 }
 
 fn shell_window_class_name(chrome_kind: WindowChromeKind) -> PCWSTR {
@@ -329,6 +782,28 @@ pub fn create_native_window(request: &WindowCreateRequest) -> Result<NativeWindo
         )
     }
     .wrap_err("failed to create shell window")?;
+
+    shell_window_states()
+        .lock()
+        .expect("shell window state should not be poisoned")
+        .insert(
+            hwnd.0 as isize,
+            NativeShellWindowState {
+                title: request.title,
+                dpi: window_dpi(hwnd),
+                chrome: WindowChromeButtonsState {
+                    focused: true,
+                    ..Default::default()
+                },
+                cursor_client_point: None,
+            },
+        );
+
+    if matches!(request.present_policy, PresentPolicy::Composed)
+        && feature_window_scene_registration(request.title).is_some()
+    {
+        initialize_shell_window_render_state(hwnd)?;
+    }
 
     match native_host_plan.initial_command {
         InitialWindowCommand::Show => {

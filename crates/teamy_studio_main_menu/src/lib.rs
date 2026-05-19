@@ -7,6 +7,7 @@ use teamy_studio_registration_core::{EVENT_DEFINITION_REGISTRATIONS, EventDefini
 
 pub use native_window::{
     run_native_main_menu_window, run_native_main_menu_window_with_click_handler,
+    show_main_menu_info_dialog,
 };
 pub use scene::{
     MainMenuButtonCardLayout, MainMenuSceneButtonState, build_main_menu_scene,
@@ -145,7 +146,7 @@ impl MainMenuSnapshot {
             .iter()
             .find(|button| {
                 button.logical_button_id == logical_button_id
-                    && button.validation_state == FeatureValidationState::Validated
+                    && button.validation_state != FeatureValidationState::Failed
             })
             .map(|button| MainMenuClickEvent {
                 logical_button_id: button.logical_button_id,
@@ -246,8 +247,28 @@ mod tests {
     }
 
     #[test]
-    fn pending_button_cannot_publish_or_create_click_event() {
+    fn pending_button_can_publish_and_create_click_event() {
         let snapshot = MainMenuSnapshot::from_registrations(&[&CLICK_TEST_REGISTRATION]);
+
+        assert!(
+            snapshot
+                .click_button(snapshot.buttons()[0].logical_button_id, 10, 20, 3)
+                .is_some()
+        );
+        assert!(
+            snapshot
+                .publish_click(snapshot.buttons()[0].logical_button_id, 10, 20, 3)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn failed_button_cannot_publish_or_create_click_event() {
+        let mut snapshot = MainMenuSnapshot::from_registrations(&[&CLICK_TEST_REGISTRATION]);
+        snapshot.set_validation_state_for_class_id(
+            CLICK_TEST_REGISTRATION.class_id,
+            FeatureValidationState::Failed,
+        );
 
         assert!(
             snapshot

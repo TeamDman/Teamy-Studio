@@ -3,6 +3,8 @@
 See also:
 - startup-bootstrap-record-of-decision.md
 - event-cutover-record-of-decision.md
+- timeline-authoritative-logging-record-of-decision.md
+- development-workflow-record-of-decision.md
 
 ## Overview
 
@@ -79,16 +81,22 @@ Completed in the repository now:
 - the real startup entry path now restores builtin startup CLI short-circuits for `--help`, `--version`, and `--completions` before session construction, so `cargo run -- --help` no longer falls through into bootstrap parse failure or window startup
 - startup tracing initialization now mirrors the legacy stderr/file split more closely: stderr uses pretty formatting with debug-sensitive timing, optional NDJSON file output clones a stable writer handle, and the root `tracy` feature now forwards into `teamy_studio_startup` so Tracy-backed startup subscriber installation lives in the active bootstrap surface again
 - the live cursor-gallery launch path now uses the existing native-shell startup session instead of the extra cursor-gallery thread spawn, so the real entrypoint follows the same event-to-window-create path that the startup/session tests already exercise
+- the shell host now owns a feature-window scene registration surface for composed native hosted windows, and the cursor gallery uses that path to render custom chrome, transparency-compatible D3D12 content, adaptive wrapped cursor cards, and stock system-cursor hover overrides instead of the previous blank placeholder host
+- startup timeline publication now emits trace-level tracing records from the central publish seam, so `--log-filter trace` can show authoritative event emission without relying only on ad hoc caller-local logging
+- Tracey-with-an-E has been demoted from the active validation gate to historical reference documentation under `docs/reference/tracey`, and `check-all.ps1` no longer runs `tracey query status`
 
 Still pending:
 
+- keeping `check-all.ps1` green during the cutover; the current observed blocker is strict clippy debt in `teamy_studio_fonts`
 - replacing the current startup-owned builtin CLI compatibility shim with direct Figue-backed parsing once the active Facet dependency stack is unified enough to admit that dependency without splitting the `facet_core` graph
+- preserving the legacy `teamy-figue`/Facet compatibility constraint when Figue parsing is restored, rather than blindly upgrading into an incompatible Facet graph
 - restoring richer structured log collection policies on the active startup path beyond stderr plus optional NDJSON output
 - representing startup bootstrap as a timeline-driven chain beginning from raw process startup inputs and deriving parsed CLI, logging configuration, tracing initialization, validation state, and startup composition requests
 - real startup validation UX and gating using explicit per-feature validation events instead of the current synchronous validation call
 - actual Win32/D3D12-backed window creation behind the shell host scaffold
 - async timeline ingestion, trigger cursors, and runtime pumping
 - feature-owned render/input loops and the real cursor-gallery window implementation
+- feature-owned event definitions that carry explicit log intent/level metadata plus the authoritative timeline-to-tracing re-emission bridge and tracing-observation loop-prevention markers needed to make timeline publication, rather than direct tracing macros, the long-term source of truth for product logs
 - extracting the legacy D3D12 render thread and shader-backed scene renderer into shell-owned helpers so the main menu and feature crates can render the shared scene model through the real backend instead of the current custom-painted stopgap
 - richer event definitions with Facet-shaped public canonical event forms
 - richer startup failure reporting with thin failure events that point back to concrete prior failure references

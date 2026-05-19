@@ -11,7 +11,9 @@ pub(crate) struct TimeLikeFacetProxy {
     pub femtoseconds: i128,
 }
 
-fn offset_to_femtoseconds<Repr, Unit>(value: TimelineOffset<Repr, Unit>) -> Result<i128, &'static str>
+fn offset_to_femtoseconds<Repr, Unit>(
+    value: TimelineOffset<Repr, Unit>,
+) -> Result<i128, &'static str>
 where
     Repr: TimelineRepr,
     Unit: TimeUnit,
@@ -56,7 +58,9 @@ where
 
         let raw_value = proxy.femtoseconds / Unit::FEMTOSECONDS_PER_UNIT;
         let Some(raw_value) = Repr::try_from_i128(raw_value) else {
-            return Err("time-like facet proxy offset conversion overflowed the destination representation");
+            return Err(
+                "time-like facet proxy offset conversion overflowed the destination representation",
+            );
         };
 
         Ok(Self::from_raw(raw_value))
@@ -83,6 +87,7 @@ where
     type Error = &'static str;
 
     fn try_from(proxy: TimeLikeFacetProxy) -> Result<Self, Self::Error> {
-        TimelineOffset::<Repr, Unit>::try_from(proxy).map(|offset| Self::from_raw(offset.raw_value()))
+        TimelineOffset::<Repr, Unit>::try_from(proxy)
+            .map(|offset| Self::from_raw(offset.raw_value()))
     }
 }

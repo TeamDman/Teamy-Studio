@@ -1,5 +1,7 @@
 use facet::Facet;
-use teamy_studio_event_core::{CanonicalEvent, EventId as CoreEventId, PublishedEvent, SealedArenaEpoch};
+use teamy_studio_event_core::{
+    CanonicalEvent, EventId as CoreEventId, PublishedEvent, SealedArenaEpoch,
+};
 
 pub mod timeline;
 
@@ -238,7 +240,8 @@ where
             .iter()
             .filter(|(cursor, _)| last_seen.is_none_or(|seen| *cursor > seen))
             .flat_map(|(cursor, epoch)| {
-                epoch.event_records()
+                epoch
+                    .event_records()
                     .map(move |(event_id, event)| (*cursor, event_id, event))
             })
             .collect()
@@ -261,7 +264,8 @@ impl ConstructedTimeline<PublishedEvent> {
         self.published_epochs
             .last()
             .map_or_else(Vec::new, |(cursor, epoch)| {
-                epoch.event_records()
+                epoch
+                    .event_records()
                     .map(|(event_id, event)| {
                         EventReference::from_arena_position(
                             event_id,
@@ -276,10 +280,7 @@ impl ConstructedTimeline<PublishedEvent> {
     }
 
     #[must_use]
-    pub fn event_references_since(
-        &self,
-        last_seen: Option<TriggerCursor>,
-    ) -> Vec<EventReference> {
+    pub fn event_references_since(&self, last_seen: Option<TriggerCursor>) -> Vec<EventReference> {
         self.unseen_event_records_since(last_seen)
             .into_iter()
             .map(|(cursor, event_id, event)| {
@@ -300,11 +301,13 @@ mod tests {
     use facet::Facet;
 
     use super::{
-        CanonicalTimeKey, ConstructedTimeline, EventReference, PublicationOrdinal,
-        TriggerCursor, TriggerRuntime,
+        CanonicalTimeKey, ConstructedTimeline, EventReference, PublicationOrdinal, TriggerCursor,
+        TriggerRuntime,
     };
     use crate::timeline::{TIME_LIKE_CATEGORY_INSTANT, TimeLikeFacetProxy};
-    use teamy_studio_event_core::{EventDefinition, EventDefinitionId, EventId, PublishedEvent, WritableArena};
+    use teamy_studio_event_core::{
+        EventDefinition, EventDefinitionId, EventId, PublishedEvent, WritableArena,
+    };
 
     #[derive(Clone, Debug, Eq, PartialEq)]
     struct TestEvent {
@@ -407,7 +410,8 @@ mod tests {
         let mut timeline = ConstructedTimeline::new();
         let mut first_arena = WritableArena::new("timeline.test");
         first_arena.push(TestEvent { value: 1 });
-        let first_cursor = timeline.ingest(CanonicalTimeKey::from_femtoseconds(10), first_arena.seal());
+        let first_cursor =
+            timeline.ingest(CanonicalTimeKey::from_femtoseconds(10), first_arena.seal());
 
         let mut runtime = TriggerRuntime::default();
         let result = runtime.pump_unseen(&timeline, |_, _| Err::<(), _>("boom"));
@@ -480,7 +484,8 @@ mod tests {
             EventId::from_bytes([10; 16]),
             PublishedEvent::new(&TEST_PUBLISHED_DEFINITION, TestEvent { value: 1 }),
         );
-        let first_cursor = timeline.ingest(CanonicalTimeKey::from_femtoseconds(30), first_arena.seal());
+        let first_cursor =
+            timeline.ingest(CanonicalTimeKey::from_femtoseconds(30), first_arena.seal());
 
         let mut second_arena = WritableArena::new("timeline.test.published");
         second_arena.push_with_id(
