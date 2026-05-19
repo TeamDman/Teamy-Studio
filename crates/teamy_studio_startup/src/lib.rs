@@ -5,8 +5,8 @@ pub use bootstrap::{
     ProcessStartupObservedEvent, RawProcessStartupInputs, StartupBootstrapCli,
     StartupBootstrapPlan, StartupGlobalArgsParsedEvent, StartupLoggingConfiguredEvent,
     StartupLoggingPlan, StartupLoggingPlanError, TracingInitialization, TracingInitializedEvent,
-    TracingObservationLayer, TracingRecordObservedEvent, derive_bootstrap_plan,
-    initialize_tracing_from_bootstrap_plan,
+    TracingObservationLayer, TracingObservedField, TracingRecordObservedEvent,
+    derive_bootstrap_plan, initialize_tracing_from_bootstrap_plan,
     initialize_tracing_with_observation_from_bootstrap_plan, parse_bootstrap_cli_args,
     try_handle_builtin_bootstrap_cli_request,
 };
@@ -14,6 +14,7 @@ pub use bootstrap::{
 use eyre::{Result, eyre};
 use facet::Facet;
 use linkme::distributed_slice;
+use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use teamy_studio_cursor_gallery::CursorGalleryState;
@@ -416,6 +417,13 @@ pub struct AppComposition {
     pub timeline: ConstructedTimeline<PublishedEvent>,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct TracingObservationSummary {
+    pub total_observed_records: usize,
+    pub counts_by_level: BTreeMap<String, usize>,
+    pub contains_timeline_reemit_marker: bool,
+}
+
 impl AppComposition {
     #[must_use]
     pub fn bootstrap_plan(&self) -> &StartupBootstrapPlan {
@@ -435,6 +443,32 @@ impl AppComposition {
     #[must_use]
     pub fn latest_event_references(&self) -> Vec<EventReference> {
         self.timeline.latest_event_references()
+    }
+
+    #[must_use]
+    pub fn tracing_observation_summary(&self) -> TracingObservationSummary {
+        let mut summary = TracingObservationSummary::default();
+        for (_, epoch) in self.timeline.published_epochs() {
+            for event in epoch.events() {
+                let Some(observed_record) = event.downcast_ref::<TracingRecordObservedEvent>()
+                else {
+                    continue;
+                };
+                summary.total_observed_records += 1;
+                *summary
+                    .counts_by_level
+                    .entry(observed_record.level.clone())
+                    .or_default() += 1;
+                if observed_record
+                    .fields
+                    .iter()
+                    .any(|field| field.name == "teamy.timeline_reemit")
+                {
+                    summary.contains_timeline_reemit_marker = true;
+                }
+            }
+        }
+        summary
     }
 }
 
@@ -1865,11 +1899,12 @@ mod tests {
         RegistrationValidationStartedEvent, STARTUP_FAILED_EVENT_DEFINITION,
         STARTUP_GLOBAL_ARGS_PARSED_EVENT_DEFINITION, STARTUP_LOGGING_CONFIGURED_EVENT_DEFINITION,
         STARTUP_LOGGING_PLAN_FAILED_EVENT_DEFINITION, STARTUP_SUCCEEDED_EVENT_DEFINITION,
-        StartupFailedEvent, StartupGlobalArgsParsedEvent, StartupLoggingConfiguredEvent,
-        StartupLoggingPlanFailedEvent, StartupRuntime, StartupSucceededEvent,
-        TRACING_INITIALIZATION_FAILED_EVENT_DEFINITION, TRACING_INITIALIZED_EVENT_DEFINITION,
-        TRACING_OBSERVATION_DRAIN_LIMIT, TRACING_RECORD_OBSERVED_EVENT_DEFINITION,
-        TracingInitializationFailedEvent, TracingInitializedEvent, TracingObservationLayer,
+        StartupBootstrapPlan, StartupFailedEvent, StartupGlobalArgsParsedEvent,
+        StartupLoggingConfiguredEvent, StartupLoggingPlanFailedEvent, StartupRuntime,
+        StartupSession, StartupSucceededEvent, TRACING_INITIALIZATION_FAILED_EVENT_DEFINITION,
+        TRACING_INITIALIZED_EVENT_DEFINITION, TRACING_OBSERVATION_DRAIN_LIMIT,
+        TRACING_RECORD_OBSERVED_EVENT_DEFINITION, TracingInitializationFailedEvent,
+        TracingInitializedEvent, TracingObservationLayer, TracingObservedField,
         TracingRecordObservedEvent, build_mvp_composition, build_mvp_composition_from_raw_inputs,
         build_mvp_session, build_mvp_session_from_bootstrap_plan,
         build_mvp_session_from_raw_inputs, build_mvp_session_with_native_shell,
@@ -1884,10 +1919,12 @@ mod tests {
     use teamy_studio_launcher_catalog::{
         ENVIRONMENT_VARIABLES_BUTTON_CLASS_ID, TERMINAL_BUTTON_CLASS_ID,
     };
-    use teamy_studio_main_menu::{FeatureValidationState, MAIN_MENU_CLICKED_EVENT_DEFINITION};
+    use teamy_studio_main_menu::{
+        FeatureValidationState, MAIN_MENU_CLICKED_EVENT_DEFINITION, MainMenuSnapshot,
+    };
     use teamy_studio_registration_core::{
-        FeatureId, RegistrationValidationError, TriggerDefinitionId, TriggerRegistrationId,
-        registration_provenance,
+        FeatureId, RegistrationSnapshot, RegistrationValidationError, TriggerDefinitionId,
+        TriggerRegistrationId, registration_provenance,
     };
     use teamy_studio_shell::{
         InitialWindowCommand, RendererHostMode, WINDOW_CREATE_REQUEST_EVENT_DEFINITION,
@@ -2746,6 +2783,71 @@ mod tests {
             TRACING_RECORD_OBSERVED_EVENT_DEFINITION.id
         );
         assert_eq!(observed.level, "INFO");
+    }
+
+    #[test]
+    fn app_composition_summarizes_tracing_observations() {
+        let mut runtime = StartupRuntime::new();
+        runtime.publish_tracing_observed_records(vec![
+            TracingRecordObservedEvent {
+                target: "teamy_studio_startup::tests".to_owned(),
+                name: "info record".to_owned(),
+                level: "INFO".to_owned(),
+                fields: Vec::new(),
+            },
+            TracingRecordObservedEvent {
+                target: "teamy_studio_startup::tests".to_owned(),
+                name: "warn record".to_owned(),
+                level: "WARN".to_owned(),
+                fields: Vec::new(),
+            },
+            TracingRecordObservedEvent {
+                target: "teamy_studio_startup::tests".to_owned(),
+                name: "second info record".to_owned(),
+                level: "INFO".to_owned(),
+                fields: Vec::new(),
+            },
+        ]);
+        let session = StartupSession {
+            bootstrap_plan: StartupBootstrapPlan::empty(),
+            registration_snapshot: RegistrationSnapshot::default(),
+            menu_snapshot: MainMenuSnapshot::from_registrations(&[]),
+            runtime,
+            tracing_observation_layer: None,
+        };
+
+        let summary = session.into_composition().tracing_observation_summary();
+
+        assert_eq!(summary.total_observed_records, 3);
+        assert_eq!(summary.counts_by_level.get("INFO"), Some(&2));
+        assert_eq!(summary.counts_by_level.get("WARN"), Some(&1));
+        assert!(!summary.contains_timeline_reemit_marker);
+    }
+
+    #[test]
+    fn tracing_observation_summary_flags_reemit_marker_if_present() {
+        let mut runtime = StartupRuntime::new();
+        runtime.publish_tracing_observed_records(vec![TracingRecordObservedEvent {
+            target: "teamy_studio_startup::tests".to_owned(),
+            name: "badly observed timeline reemit".to_owned(),
+            level: "INFO".to_owned(),
+            fields: vec![TracingObservedField {
+                name: "teamy.timeline_reemit".to_owned(),
+                value: "true".to_owned(),
+            }],
+        }]);
+        let session = StartupSession {
+            bootstrap_plan: StartupBootstrapPlan::empty(),
+            registration_snapshot: RegistrationSnapshot::default(),
+            menu_snapshot: MainMenuSnapshot::from_registrations(&[]),
+            runtime,
+            tracing_observation_layer: None,
+        };
+
+        let summary = session.into_composition().tracing_observation_summary();
+
+        assert_eq!(summary.total_observed_records, 1);
+        assert!(summary.contains_timeline_reemit_marker);
     }
 
     #[test]
