@@ -8,14 +8,20 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 #[cfg(feature = "tracy")]
 use tracing::Metadata;
+use tracing::field::{Field, Visit};
 use tracing::level_filters::LevelFilter;
+use tracing::{Event, Subscriber};
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::Layer;
 #[cfg(feature = "tracy")]
 use tracing_subscriber::filter::FilterFn;
 use tracing_subscriber::fmt::writer::BoxMakeWriter;
+use tracing_subscriber::layer::Context;
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{Registry, fmt};
+
+const TIMELINE_REEMIT_FIELD_NAME: &str = "teamy.timeline_reemit";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RawProcessStartupInputs {
@@ -192,6 +198,106 @@ pub struct TracingInitializedEvent {
     pub effective_filter_directive: String,
     pub json_log_path: Option<String>,
     pub subscriber_was_already_initialized: bool,
+}
+
+#[derive(Clone, Debug, Eq, Facet, PartialEq)]
+pub struct TracingObservedField {
+    pub name: String,
+    pub value: String,
+}
+
+#[derive(Clone, Debug, Eq, Facet, PartialEq)]
+pub struct TracingRecordObservedEvent {
+    pub target: String,
+    pub name: String,
+    pub level: String,
+    pub fields: Vec<TracingObservedField>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct TracingObservationLayer {
+    observed_records: Arc<Mutex<Vec<TracingRecordObservedEvent>>>,
+}
+
+impl TracingObservationLayer {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    #[must_use]
+    pub fn observed_records(&self) -> Vec<TracingRecordObservedEvent> {
+        self.observed_records
+            .lock()
+            .expect("tracing observation records mutex should not be poisoned")
+            .clone()
+    }
+}
+
+impl<S> Layer<S> for TracingObservationLayer
+where
+    S: Subscriber,
+{
+    fn on_event(&self, event: &Event<'_>, _context: Context<'_, S>) {
+        let mut visitor = TracingObservationVisitor::default();
+        event.record(&mut visitor);
+
+        if visitor.is_timeline_reemit {
+            return;
+        }
+
+        let metadata = event.metadata();
+        self.observed_records
+            .lock()
+            .expect("tracing observation records mutex should not be poisoned")
+            .push(TracingRecordObservedEvent {
+                target: metadata.target().to_owned(),
+                name: metadata.name().to_owned(),
+                level: metadata.level().to_string(),
+                fields: visitor.fields,
+            });
+    }
+}
+
+#[derive(Debug, Default)]
+struct TracingObservationVisitor {
+    is_timeline_reemit: bool,
+    fields: Vec<TracingObservedField>,
+}
+
+impl TracingObservationVisitor {
+    fn push_field(&mut self, field: &Field, value: String) {
+        if field.name() == TIMELINE_REEMIT_FIELD_NAME && value == "true" {
+            self.is_timeline_reemit = true;
+        }
+
+        self.fields.push(TracingObservedField {
+            name: field.name().to_owned(),
+            value,
+        });
+    }
+}
+
+impl Visit for TracingObservationVisitor {
+    fn record_bool(&mut self, field: &Field, value: bool) {
+        self.push_field(field, value.to_string());
+    }
+
+    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+        self.push_field(field, format!("{value:?}"));
+    }
+
+    fn record_i64(&mut self, field: &Field, value: i64) {
+        self.push_field(field, value.to_string());
+    }
+
+    fn record_u64(&mut self, field: &Field, value: u64) {
+        self.push_field(field, value.to_string());
+    }
+
+    fn record_str(&mut self, field: &Field, value: &str) {
+        self.push_field(field, value.to_owned());
+    }
 }
 
 impl StartupLoggingPlan {
@@ -581,9 +687,12 @@ mod tests {
         BootstrapCliParseError, BootstrapPlanError, GlobalArgs, LogFilterSelection,
         RawProcessStartupInputs, StartupBootstrapPlan, StartupGlobalArgsParsedEvent,
         StartupLoggingPlan, StartupLoggingPlanError, TracingInitializedEvent,
-        derive_bootstrap_plan, parse_bootstrap_cli_args, try_handle_builtin_bootstrap_cli_request,
+        TracingObservationLayer, derive_bootstrap_plan, parse_bootstrap_cli_args,
+        try_handle_builtin_bootstrap_cli_request,
     };
     use chrono::{Local, TimeZone};
+    use tracing_subscriber::Registry;
+    use tracing_subscriber::prelude::*;
 
     #[test]
     fn bootstrap_cli_parses_debug_flag() {
@@ -811,6 +920,54 @@ mod tests {
         assert_eq!(event.effective_filter_directive, "trace");
         assert_eq!(event.json_log_path.as_deref(), Some("logs/teamy.ndjson"));
         assert!(event.subscriber_was_already_initialized);
+    }
+
+    #[test]
+    fn tracing_observation_layer_captures_unmarked_records() {
+        let layer = TracingObservationLayer::new();
+        let handle = layer.clone();
+        let subscriber = Registry::default().with(layer);
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(
+                custom_field = "alpha",
+                numeric_field = 42_u64,
+                "ordinary tracing record"
+            );
+        });
+
+        let records = handle.observed_records();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].level, "INFO");
+        assert!(
+            records[0]
+                .fields
+                .iter()
+                .any(|field| { field.name == "custom_field" && field.value == "alpha" })
+        );
+        assert!(
+            records[0]
+                .fields
+                .iter()
+                .any(|field| { field.name == "numeric_field" && field.value == "42" })
+        );
+    }
+
+    #[test]
+    fn tracing_observation_layer_ignores_timeline_reemissions() {
+        let layer = TracingObservationLayer::new();
+        let handle = layer.clone();
+        let subscriber = Registry::default().with(layer);
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(
+                teamy.timeline_reemit = true,
+                event_schema_name = "teamy_studio.startup.succeeded",
+                "timeline event re-emitted to tracing"
+            );
+        });
+
+        assert!(handle.observed_records().is_empty());
     }
 
     #[test]
