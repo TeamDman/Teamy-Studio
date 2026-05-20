@@ -84,6 +84,8 @@ For Tracy profiling, run:
 ./run-profiler.ps1 window show
 ```
 
+That wrapper builds with the dedicated Cargo `profiling` profile. If you want to prewarm the same artifacts before a capture, run `cargo build --profile profiling`.
+
 <!-- repo[impl implementation.present] -->
 ## Repository Layout
 

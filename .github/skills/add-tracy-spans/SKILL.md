@@ -25,6 +25,7 @@ Produce instrumentation that:
 - Teamy-Studio already has an `extended_observability` cargo feature in `Cargo.toml`.
 - Teamy-Studio wires Tracy through the tracing subscriber only when `TEAMY_STUDIO_ENABLE_TRACY_LAYER=1` is present at runtime.
 - Teamy-Studio already has `run-profiler.ps1` for capturing and opening a Tracy profile.
+- That wrapper uses Cargo's dedicated `profiling` profile rather than `--release` so repeated local captures can reuse incremental profiling artifacts.
 - teamy-mft is the reference repository for existing span style and gating decisions.
 
 ## Procedure
