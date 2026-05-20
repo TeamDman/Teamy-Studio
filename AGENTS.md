@@ -27,12 +27,7 @@ Because of that:
 
 ## Extraction Strategy
 
-- Extract one subsystem at a time into `crates/`.
-- Keep the root package working after every slice.
-- During active refactor iteration, prefer `cargo clippy -- -D warnings` for fast feedback.
-- Run [.\check-all.ps1](check-all.ps1) at broader checkpoints before calling a larger chunk done.
-- If a build fails because a binary is locked, run [.\stop.ps1](stop.ps1) and continue.
-- Do not use alternate `$env:CARGO_TARGET_DIR` values.
+- When preparing a profiling workflow or handing off to [run-profiler.ps1](run-profiler.ps1), warm the same artifacts with `cargo build --profile profiling` so the profiler wrapper does not pay a fresh build after test-only validation.
 
 ## First-Class Priorities
 
