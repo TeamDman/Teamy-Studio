@@ -996,7 +996,7 @@ pub(crate) fn build_reference_text_layout_with_config(
     pitch_radians: f32,
 ) -> ReferenceTextLayout {
     let (_, plane_basis, glyphs) =
-        super::windows_app::build_text_rendering_plane_verification_geometry(
+        windows_d3d12_renderer::build_text_rendering_plane_verification_geometry(
             layout,
             text,
             font_size_px / 28.0,

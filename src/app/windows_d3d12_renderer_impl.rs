@@ -73,6 +73,7 @@ use super::windows_terminal::{
     SharedTerminalDisplayState, TerminalDisplayCursor, TerminalDisplayCursorStyle,
     TerminalDisplayRow, TerminalDisplayScrollbar, TerminalLayout, TerminalSelection,
 };
+use super::windows_terminal;
 
 const FRAME_COUNT: usize = 2;
 const MAX_PANEL_COUNT: usize = 8_192;
@@ -3320,6 +3321,332 @@ pub fn terminal_font_layout_snapshot() -> eyre::Result<Arc<TerminalFontLayoutSna
         .as_ref()
         .map(Arc::clone)
         .map_err(|error| eyre::eyre!(error.clone()))
+}
+
+const TEXT_RENDERING_VERIFICATION_CAMERA_DISTANCE: f32 = 1400.0;
+const TEXT_RENDERING_VERIFICATION_NEAR_PLANE_DISTANCE: f32 = 80.0;
+const TEXT_RENDERING_VERIFICATION_VIRTUALIZATION_PADDING_PX: f32 = 48.0;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct TextRenderingVerificationViewportState {
+    zoom: f32,
+    yaw_radians: f32,
+    pitch_radians: f32,
+    camera_offset: [f32; 2],
+    plane_offset: [f32; 2],
+}
+
+pub fn build_text_rendering_plane_verification_geometry(
+    layout: windows_terminal::TerminalLayout,
+    text: &str,
+    zoom: f32,
+    yaw_radians: f32,
+    pitch_radians: f32,
+    camera_offset: [f32; 2],
+    plane_offset: [f32; 2],
+    color: [f32; 4],
+) -> (
+    windows_scene::TextRenderingPlaneViewState,
+    Option<TransformedTextPlaneBasis>,
+    Vec<windows_scene::TextRenderingGlyphInstance>,
+) {
+    let viewport = TextRenderingVerificationViewportState {
+        zoom,
+        yaw_radians,
+        pitch_radians,
+        camera_offset,
+        plane_offset,
+    };
+    let interaction_rect = windows_scene::text_rendering_plane_interaction_rect(layout);
+    let plane_basis =
+        text_rendering_verification_projection_basis(interaction_rect, text, viewport);
+    let glyphs = build_text_rendering_verification_glyph_instances(
+        interaction_rect,
+        text,
+        viewport,
+        color,
+    );
+    let view_state = windows_scene::TextRenderingPlaneViewState {
+        glyph_count: text.chars().filter(|character| *character != '\n').count(),
+        line_count: text.lines().count().max(1),
+        zoom,
+        yaw_degrees: yaw_radians.to_degrees(),
+        pitch_degrees: pitch_radians.to_degrees(),
+        camera_offset,
+        plane_offset,
+    };
+    (view_state, plane_basis, glyphs)
+}
+
+fn rotate_text_rendering_verification_vector_3d(
+    vector: [f32; 3],
+    yaw_radians: f32,
+    pitch_radians: f32,
+) -> [f32; 3] {
+    let (yaw_sin, yaw_cos) = yaw_radians.sin_cos();
+    let yaw_rotated = [
+        (vector[0] * yaw_cos) + (vector[2] * yaw_sin),
+        vector[1],
+        (-vector[0] * yaw_sin) + (vector[2] * yaw_cos),
+    ];
+    let (pitch_sin, pitch_cos) = pitch_radians.sin_cos();
+    [
+        yaw_rotated[0],
+        (yaw_rotated[1] * pitch_cos) - (yaw_rotated[2] * pitch_sin),
+        (yaw_rotated[1] * pitch_sin) + (yaw_rotated[2] * pitch_cos),
+    ]
+}
+
+fn project_text_rendering_verification_point(
+    point: [f32; 3],
+    center: [f32; 2],
+) -> [f32; 2] {
+    project_text_rendering_verification_point_with_weight(point, center).0
+}
+
+fn project_text_rendering_verification_point_with_weight(
+    point: [f32; 3],
+    center: [f32; 2],
+) -> ([f32; 2], f32) {
+    let perspective = TEXT_RENDERING_VERIFICATION_CAMERA_DISTANCE
+        / (TEXT_RENDERING_VERIFICATION_CAMERA_DISTANCE - point[2]).max(80.0);
+    (
+        [
+            center[0] + (point[0] * perspective),
+            center[1] + (point[1] * perspective),
+        ],
+        1.0 / perspective.max(0.0001),
+    )
+}
+
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "text rendering projection works in UI-sized pixel coordinates"
+)]
+fn text_rendering_verification_projection_basis(
+    rect: ClientRect,
+    text: &str,
+    viewport: TextRenderingVerificationViewportState,
+) -> Option<TransformedTextPlaneBasis> {
+    let Ok(font) = terminal_font_layout_snapshot() else {
+        return None;
+    };
+    let font_size = 28.0 * viewport.zoom.max(0.1);
+    let units_per_em = font.units_per_em.max(1.0);
+    let scale = font_size / units_per_em;
+    let line_height_units = (font.ascender - font.descender).max(1.0);
+    let line_height = line_height_units * scale;
+    let lines = text.lines().collect::<Vec<_>>();
+    let line_count = lines.len().max(1) as f32;
+    let line_advances = lines
+        .iter()
+        .map(|line| {
+            let mut advance = 0.0;
+            for character in line.chars() {
+                let glyph = font.glyphs.get(&character).copied();
+                advance += glyph.map_or(font.cell_advance, |glyph| glyph.advance.max(0.0));
+            }
+            advance.max(0.0)
+        })
+        .collect::<Vec<_>>();
+    let plane_width = line_advances
+        .iter()
+        .copied()
+        .fold(0.0_f32, f32::max)
+        .max(font.cell_advance)
+        * scale;
+    let plane_height = (line_count * line_height).max(line_height);
+    let plane_origin = [
+        (rect.left() + rect.width() / 2) as f32
+            + viewport.camera_offset[0]
+            + viewport.plane_offset[0]
+            - (plane_width / 2.0),
+        (rect.top() + rect.height() / 2) as f32
+            + viewport.camera_offset[1]
+            + viewport.plane_offset[1]
+            - (plane_height / 2.0),
+    ];
+    let center = [
+        plane_origin[0] + (plane_width / 2.0),
+        plane_origin[1] + (plane_height / 2.0),
+    ];
+    let local_corners = [
+        [-plane_width / 2.0, -plane_height / 2.0],
+        [plane_width / 2.0, -plane_height / 2.0],
+        [plane_width / 2.0, plane_height / 2.0],
+        [-plane_width / 2.0, plane_height / 2.0],
+    ];
+    let screen_corners = local_corners.map(|local_corner| {
+        let rotated = rotate_text_rendering_verification_vector_3d(
+            [local_corner[0], local_corner[1], 0.0],
+            viewport.yaw_radians,
+            viewport.pitch_radians,
+        );
+        project_text_rendering_verification_point(rotated, center)
+    });
+    Some(TransformedTextPlaneBasis {
+        screen_corners,
+        local_corners,
+        screen_center: center,
+        yaw_radians: viewport.yaw_radians,
+        pitch_radians: viewport.pitch_radians,
+        camera_distance: TEXT_RENDERING_VERIFICATION_CAMERA_DISTANCE,
+        near_plane_distance: TEXT_RENDERING_VERIFICATION_NEAR_PLANE_DISTANCE,
+    })
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "glyph instance generation keeps projection, culling, and glyph metrics in one local pipeline"
+)]
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "glyph placement converts bounded pixel and index values into render-space floats"
+)]
+fn build_text_rendering_verification_glyph_instances(
+    rect: ClientRect,
+    text: &str,
+    viewport: TextRenderingVerificationViewportState,
+    color: [f32; 4],
+) -> Vec<windows_scene::TextRenderingGlyphInstance> {
+    let Ok(font) = terminal_font_layout_snapshot() else {
+        return Vec::new();
+    };
+    let font_size = 28.0 * viewport.zoom.max(0.1);
+    let units_per_em = font.units_per_em.max(1.0);
+    let scale = font_size / units_per_em;
+    let line_height_units = (font.ascender - font.descender).max(1.0);
+    let line_height = line_height_units * scale;
+    let lines = text.lines().collect::<Vec<_>>();
+    let line_count = lines.len().max(1) as f32;
+    let line_advances = lines
+        .iter()
+        .map(|line| {
+            let mut advance = 0.0;
+            for character in line.chars() {
+                let glyph = font.glyphs.get(&character).copied();
+                advance += glyph.map_or(font.cell_advance, |glyph| glyph.advance.max(0.0));
+            }
+            advance.max(0.0)
+        })
+        .collect::<Vec<_>>();
+    let max_line_advance = line_advances
+        .iter()
+        .copied()
+        .fold(0.0_f32, f32::max)
+        .max(font.cell_advance);
+    let plane_origin = [
+        (rect.left() + rect.width() / 2) as f32
+            + viewport.camera_offset[0]
+            + viewport.plane_offset[0]
+            - ((max_line_advance * scale) / 2.0),
+        (rect.top() + rect.height() / 2) as f32
+            + viewport.camera_offset[1]
+            + viewport.plane_offset[1]
+            - ((line_count * line_height) / 2.0),
+    ];
+    let center = [
+        plane_origin[0] + ((max_line_advance * scale) / 2.0),
+        plane_origin[1] + ((line_count * line_height) / 2.0),
+    ];
+    let cull_left = rect.left() as f32 - TEXT_RENDERING_VERIFICATION_VIRTUALIZATION_PADDING_PX;
+    let cull_right =
+        rect.right() as f32 + TEXT_RENDERING_VERIFICATION_VIRTUALIZATION_PADDING_PX;
+    let cull_top = rect.top() as f32 - TEXT_RENDERING_VERIFICATION_VIRTUALIZATION_PADDING_PX;
+    let cull_bottom =
+        rect.bottom() as f32 + TEXT_RENDERING_VERIFICATION_VIRTUALIZATION_PADDING_PX;
+
+    let mut glyphs = Vec::new();
+    for (row_index, line) in lines.iter().enumerate() {
+        let line_left =
+            plane_origin[0] + ((max_line_advance - line_advances[row_index]) * scale * 0.5);
+        let line_top = plane_origin[1] + (row_index as f32 * line_height);
+        let mut pen_x_units = 0.0;
+        for character in line.chars() {
+            let advance = font
+                .glyphs
+                .get(&character)
+                .map_or(font.cell_advance, |glyph| glyph.advance.max(0.0));
+            if character.is_control() || character == ' ' {
+                pen_x_units += advance;
+                continue;
+            }
+            let glyph = font.glyphs.get(&character).copied().unwrap_or_else(|| {
+                TerminalFontGlyphMetrics {
+                    x_min: 0.0,
+                    y_min: font.descender,
+                    x_max: advance,
+                    y_max: font.ascender,
+                    advance,
+                }
+            });
+            let left = line_left + (pen_x_units + glyph.x_min) * scale;
+            let right = line_left + (pen_x_units + glyph.x_max) * scale;
+            let top = line_top + (font.ascender - glyph.y_max) * scale;
+            let bottom = line_top + (font.ascender - glyph.y_min) * scale;
+            let transformed_corners = [[left, top], [right, top], [right, bottom], [left, bottom]]
+                .map(|corner| {
+                    let translated = [corner[0] - center[0], corner[1] - center[1], 0.0];
+                    let rotated = rotate_text_rendering_verification_vector_3d(
+                        translated,
+                        viewport.yaw_radians,
+                        viewport.pitch_radians,
+                    );
+                    project_text_rendering_verification_point_with_weight(rotated, center)
+                });
+            let corners = transformed_corners.map(|(corner, _)| corner);
+            let corner_w = transformed_corners.map(|(_, clip_w)| clip_w);
+            let projection_is_valid = corners
+                .iter()
+                .all(|corner| corner.iter().all(|value| value.is_finite()))
+                && corner_w
+                    .iter()
+                    .all(|clip_w| clip_w.is_finite() && *clip_w > 0.0);
+            if !projection_is_valid {
+                pen_x_units += advance;
+                continue;
+            }
+            let min_x = corners
+                .iter()
+                .map(|corner| corner[0])
+                .fold(f32::INFINITY, f32::min);
+            let max_x = corners
+                .iter()
+                .map(|corner| corner[0])
+                .fold(f32::NEG_INFINITY, f32::max);
+            let min_y = corners
+                .iter()
+                .map(|corner| corner[1])
+                .fold(f32::INFINITY, f32::min);
+            let max_y = corners
+                .iter()
+                .map(|corner| corner[1])
+                .fold(f32::NEG_INFINITY, f32::max);
+            if max_x >= cull_left
+                && min_x <= cull_right
+                && max_y >= cull_top
+                && min_y <= cull_bottom
+            {
+                glyphs.push(windows_scene::TextRenderingGlyphInstance {
+                    character,
+                    color,
+                    corners,
+                    corner_w,
+                    local_bounds: [
+                        left - center[0],
+                        right - center[0],
+                        top - center[1],
+                        bottom - center[1],
+                    ],
+                    glyph_uv_bounds: [glyph.x_min, glyph.x_max, glyph.y_max, glyph.y_min],
+                    debug_id: glyphs.len() as f32 + 1.0,
+                });
+            }
+            pen_x_units += advance;
+        }
+    }
+
+    glyphs
 }
 
 fn build_slug_curve_buffer(

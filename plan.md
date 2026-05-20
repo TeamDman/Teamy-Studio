@@ -67,9 +67,9 @@ This order is intentionally low-risk:
 
 Current goal:
 
-1. finish the remaining `render_verification` / `windows_app` seam
-2. extract `windows_app.rs` into a dedicated app-host crate
-3. keep the root facade stable while finishing the transition
+1. keep the new app-host boundary stable
+2. optionally extract `logging_init.rs` into an observability crate
+3. decide how much additional CLI/root thinning we want beyond the compile-time win target
 
 Current status:
 
@@ -98,9 +98,11 @@ Current status:
 - `teamy_studio_terminal_core` now owns the compiled `windows_terminal` and `windows_terminal_self_test` implementations, plus the shared `VtEngineChoice` contract, with the root crate preserving `crate::app::windows_terminal`, `crate::app::windows_terminal_self_test`, and `crate::app::VtEngineChoice`
 - `teamy_studio_shell` now owns the compiled `cell_grid`, `windows_scene`, and `windows_d3d12_renderer` implementations, with the root crate preserving those module paths through thin shims
 - `teamy_studio_cursor_info` now owns the compiled `windows_cursor_info` implementation, including `CursorInfoVirtualSession`, with the root crate preserving `crate::app::windows_cursor_info`
-- `render_verification` intentionally remains root-local for now because it still depends on text-rendering verification helpers that live in `windows_app`
+- `render_verification` now lives in `teamy_studio_shell`
+- `teamy_studio_app_host` now owns the compiled `windows_app` implementation, with the root crate preserving `crate::app::windows_app` through a thin shim and re-exporting `TerminalThroughputBenchmarkMode` / `TerminalWindowSummary`
 - fast iteration validation is currently green with `cargo clippy -- -D warnings`
 - the root workspace currently includes:
+  - `crates/teamy_studio_app_host`
   - `crates/teamy_studio_audio_transcription`
   - `crates/teamy_studio_cursor_info`
   - `crates/teamy_studio_demo_mode`
@@ -128,9 +130,9 @@ Current status:
 
 Next slice:
 
-1. move the text-rendering verification helper cluster out of `windows_app.rs`
-2. finish moving `render_verification` into `teamy_studio_shell`
-3. extract `windows_app.rs` into `teamy_studio_app_host`
+1. if desired, extract `logging_init.rs` into `teamy_studio_observability`
+2. if desired, keep thinning `src/cli` and the root facade
+3. otherwise treat the crate-split objective as largely complete and do a final `.\check-all.ps1` checkpoint once ready
 
 See:
 
@@ -154,6 +156,7 @@ If context compacts, assume the following is the current ground truth unless the
 - `src/transcription.rs` is now a thin shim: `pub use teamy_studio_whisper_stack::transcription::*;`
 - `src/whisper.rs` is now a thin shim: `pub use teamy_studio_whisper_stack::whisper::*;`
 - `src/app/audio_transcription.rs` is now a thin shim: `pub use teamy_studio_audio_transcription::*;`
+- `src/app/windows_app.rs` is now a thin shim: `pub use teamy_studio_app_host::windows_app::*;`
 - `src/app/windows_terminal.rs` is now a thin shim: `pub use teamy_studio_terminal_core::*;`
 - `src/app/windows_terminal_self_test.rs` now forwards to `teamy_studio_terminal_core::run_keyboard_input_self_test`
 - `src/app/cell_grid.rs` is now a thin shim: `pub use teamy_studio_shell::cell_grid::*;`
@@ -173,6 +176,7 @@ If context compacts, assume the following is the current ground truth unless the
 - `src/lib.rs` now re-exports `teamy_studio_timeline_core` as `crate::timeline`
 - the moved code lives in:
   - `src/app/audio_transcription_impl.rs`, compiled through `crates/teamy_studio_audio_transcription/src/lib.rs`
+  - `src/app/windows_app_impl.rs`, compiled through `crates/teamy_studio_app_host/src/lib.rs`
   - `src/app/cell_grid_impl.rs`, `src/app/windows_scene_impl.rs`, and `src/app/windows_d3d12_renderer_impl.rs`, compiled through `crates/teamy_studio_shell/src/lib.rs`
   - `src/app/windows_cursor_info_impl.rs`, compiled through `crates/teamy_studio_cursor_info/src/lib.rs`
   - `src/app/windows_audio_input_impl.rs`, compiled through `crates/teamy_studio_audio_input/src/lib.rs`
@@ -186,7 +190,7 @@ If context compacts, assume the following is the current ground truth unless the
   - `src/app/windows_terminal_impl.rs` and `src/app/windows_terminal_self_test_impl.rs`, compiled through `crates/teamy_studio_terminal_core/src/lib.rs`
   - `src/app/windows_terminal_engine_impl.rs`, compiled through `crates/teamy_studio_windows_terminal_engine/src/lib.rs`
   - `src/app/windows_terminal_replay_impl.rs`, compiled through `crates/teamy_studio_windows_terminal_replay/src/lib.rs`
-  - `src/app/render_verification_impl.rs`, still compiled from the root `src/app/render_verification.rs` module because it currently depends on `windows_app`
+  - `src/app/render_verification_impl.rs`, compiled through `crates/teamy_studio_shell/src/lib.rs`
   - `src/timeline/*`, compiled through `crates/teamy_studio_timeline_core/src/lib.rs`
   - `crates/teamy_studio_paths/src/*`
   - `crates/teamy_studio_win32_support/src/*`
@@ -207,7 +211,7 @@ If context compacts, assume the following is the current ground truth unless the
 ### Validation state
 
 - current fast iteration gate: `cargo clippy -- -D warnings`
-- current status of that fast gate: green after the twenty-four landed extractions above
+- current status of that fast gate: green after the twenty-six landed extractions above
 - last known `.\check-all.ps1` success was earlier in the refactor, before the later `win32_support` and `audio_core` slices, when the user switched us to clippy-only iteration
 
 ### Extraction recipe
@@ -236,23 +240,22 @@ For the next crate split, follow this exact pattern unless a concrete seam force
 These are the best current candidates, in rough order of safety:
 
 1. `logging_init`, if we want to finish peeling the root logging surface after `teamy_studio_logs`
-2. the remaining `render_verification` / text-rendering verification helper seam between `windows_app` and `render_verification`
-3. `windows_app`, now that the terminal core, cursor-info, scene, and renderer layers are thinner and more explicitly owned
+2. CLI/root thinning, if we want to go beyond the compile-time-focused crate split
+3. final whole-repo verification with `.\check-all.ps1` when we are ready for a slower checkpoint
 
-Avoid starting with highly entangled orchestration files like:
+Avoid unnecessary churn in the already-extracted host/shell layers unless there is a concrete reason:
 
-- `src/app/windows_app.rs`
-- `src/app/windows_scene.rs`
-- `src/app/windows_terminal.rs`
-
-Those should come later, after more shared foundations have been pulled outward.
+- `src/app/windows_app_impl.rs`
+- `src/app/windows_scene_impl.rs`
+- `src/app/windows_terminal_impl.rs`
 
 Current remaining high-entanglement tier worth treating as one connected problem:
 
-- `src/app/render_verification.rs`
-- `src/app/windows_app.rs`
+- `src/logging_init.rs`
+- `src/cli/*`
+- `src/app/mod.rs`
 
-The main remaining blocker is the text-rendering verification helper path that still lives inside `windows_app` and is called from `render_verification`.
+The main crate-split blocker tier has been cleared; the remaining work is mostly optional cleanup and final verification.
 
 ## Rules For Future Slices
 

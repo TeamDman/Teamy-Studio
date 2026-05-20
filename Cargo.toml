@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "crates/teamy_studio_audio_core",
+    "crates/teamy_studio_app_host",
     "crates/teamy_studio_audio_input",
     "crates/teamy_studio_audio_transcription",
     "crates/teamy_studio_cursor_info",
@@ -57,6 +58,7 @@ burn-store = "0.19.1"
 chrono = "0.4"
 color-eyre = "0.6.5"
 teamy_studio_audio_core = { path = "crates/teamy_studio_audio_core" }
+teamy_studio_app_host = { path = "crates/teamy_studio_app_host" }
 teamy_studio_audio_input = { path = "crates/teamy_studio_audio_input" }
 teamy_studio_audio_transcription = { path = "crates/teamy_studio_audio_transcription" }
 teamy_studio_cursor_info = { path = "crates/teamy_studio_cursor_info" }
@@ -158,7 +160,7 @@ tempfile = "3.20.0"
 default = []
 font-snapshot-tests = []
 ghostty = ["dep:libghostty-vt", "teamy_studio_terminal_core/ghostty", "teamy_studio_vt_types/ghostty", "teamy_studio_windows_terminal_engine/ghostty", "teamy_studio_windows_terminal_replay/ghostty"]
-tracy = ["dep:tracing-tracy", "teamy_studio_audio_input/tracy", "teamy_studio_audio_transcription/tracy", "teamy_studio_frontend/tracy", "teamy_studio_shell/tracy", "teamy_studio_teamy_terminal_engine/tracy", "teamy_studio_terminal_core/tracy"]
+tracy = ["dep:tracing-tracy", "teamy_studio_app_host/tracy", "teamy_studio_audio_input/tracy", "teamy_studio_audio_transcription/tracy", "teamy_studio_frontend/tracy", "teamy_studio_shell/tracy", "teamy_studio_teamy_terminal_engine/tracy", "teamy_studio_terminal_core/tracy"]
 
 [build-dependencies]
 embed-resource = "3.0.6"

@@ -43,5 +43,10 @@ pub mod windows_scene;
 
 #[path = "../../../src/app/windows_d3d12_renderer_impl.rs"]
 pub mod windows_d3d12_renderer;
+
+#[path = "../../../src/app/render_verification_impl.rs"]
+pub mod render_verification;
+
+pub use render_verification::*;
 pub use windows_d3d12_renderer::*;
 pub use windows_scene::*;

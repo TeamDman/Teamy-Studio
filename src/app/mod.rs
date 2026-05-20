@@ -23,7 +23,6 @@ use std::path::Path;
 
 use crate::paths::{AppHome, CacheHome};
 use eyre::Context;
-use facet::Facet;
 
 pub use audio_transcription::{
     AudioTranscriptionControlRequest, AudioTranscriptionControlResult,
@@ -46,6 +45,7 @@ pub use audio_transcription::{
 };
 pub use jobs::{JobSnapshot, JobStatus, has_job_snapshots, job_snapshots, running_job_count};
 pub use render_verification::{RenderOffscreenFixtureListReport, RenderOffscreenSelfTestReport};
+pub use teamy_studio_app_host::{TerminalThroughputBenchmarkMode, TerminalWindowSummary};
 pub use windows_app::TerminalThroughputBenchmarkResultsReport;
 pub use windows_audio_input::{
     AudioInputDeviceListReport, AudioInputDeviceSummary, list_active_audio_input_devices,
@@ -54,23 +54,6 @@ pub use windows_cursor_info::{CursorInfoConfig, CursorInfoPixelSize, CursorInfoR
 pub use windows_terminal_replay::TerminalReplayReport;
 pub use windows_terminal_self_test::KeyboardInputSelfTestReport;
 pub use teamy_studio_terminal_core::VtEngineChoice;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TerminalThroughputBenchmarkMode {
-    MeasureCommandOutHost,
-    StreamSmallBatches,
-    WideLines,
-    ScrollFlood,
-    PromptBursts,
-    ResizeDuringOutput,
-}
-
-#[derive(Clone, Debug, Facet, PartialEq, Eq)]
-pub struct TerminalWindowSummary {
-    pub hwnd: usize,
-    pub pid: u32,
-    pub title: String,
-}
 
 /// Run the Teamy Studio application shell.
 // cli[impl command.surface.core]
