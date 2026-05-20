@@ -215,9 +215,9 @@ For the next crate split, follow this exact pattern unless a concrete seam force
 
 These are the best current candidates, in rough order of safety:
 
-1. another low-coupling utility seam
-2. `timeline`, if extracted carefully and only after checking its current inward dependencies
-3. a pure compute/model seam such as transcription- or image-model-adjacent code
+1. `logging_init`, if we want to finish peeling the root logging surface after `teamy_studio_logs`
+2. terminal-adjacent support that does not force a `VtEngineChoice` split by itself
+3. a deliberate terminal host extraction only after deciding where shared app types such as `VtEngineChoice`, `TerminalLayout`, and `TerminalSession` should live
 
 Avoid starting with highly entangled orchestration files like:
 
@@ -226,6 +226,19 @@ Avoid starting with highly entangled orchestration files like:
 - `src/app/windows_terminal.rs`
 
 Those should come later, after more shared foundations have been pulled outward.
+
+Current remaining high-entanglement tier worth treating as one connected problem:
+
+- `src/app/windows_terminal.rs`
+- `src/app/windows_terminal_self_test.rs`
+- `src/app/windows_cursor_info.rs`
+- `src/app/render_verification.rs`
+- `src/app/cell_grid.rs`
+- `src/app/windows_d3d12_renderer.rs`
+- `src/app/windows_scene.rs`
+- `src/app/windows_app.rs`
+
+The main enabling blocker for that tier is shared app-local terminal types still rooted in `src/app/mod.rs` and `src/app/windows_terminal.rs`.
 
 ## Rules For Future Slices
 
