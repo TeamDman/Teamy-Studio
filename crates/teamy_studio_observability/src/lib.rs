@@ -5,7 +5,6 @@ pub struct LoggingConfig {
     pub log_file: Option<String>,
 }
 
-#[path = "../../../src/logging_init_impl.rs"]
 mod logging_init_impl;
 
 pub use logging_init_impl::*;

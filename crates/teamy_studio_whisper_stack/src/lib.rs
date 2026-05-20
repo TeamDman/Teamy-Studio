@@ -10,13 +10,10 @@ pub mod paths {
     pub use teamy_studio_paths::*;
 }
 
-#[path = "../../../src/model_impl.rs"]
 pub mod model;
 
-#[path = "../../../src/transcription_impl.rs"]
 pub mod transcription;
 
-#[path = "../../../src/whisper_impl.rs"]
 pub mod whisper;
 
 pub use model::*;

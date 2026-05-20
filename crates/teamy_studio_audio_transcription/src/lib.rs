@@ -17,7 +17,6 @@ pub fn repo_root_dir() -> PathBuf {
         .join("..")
 }
 
-#[path = "../../../src/app/audio_transcription_impl.rs"]
 mod audio_transcription_impl;
 
 pub use audio_transcription_impl::*;

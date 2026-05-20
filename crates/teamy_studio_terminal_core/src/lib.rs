@@ -46,14 +46,12 @@ impl VtEngineChoice {
     }
 }
 
-#[path = "../../../src/app/windows_terminal_impl.rs"]
 mod windows_terminal_impl;
 
 pub mod windows_terminal {
     pub use super::windows_terminal_impl::*;
 }
 
-#[path = "../../../src/app/windows_terminal_self_test_impl.rs"]
 mod windows_terminal_self_test_impl;
 
 pub use windows_terminal_impl::*;

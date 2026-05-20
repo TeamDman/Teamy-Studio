@@ -14,8 +14,6 @@ mod windows_demo_mode;
 mod windows_dialogs;
 mod windows_scene;
 mod windows_terminal;
-#[cfg(feature = "ghostty")]
-mod windows_terminal_engine;
 mod windows_terminal_replay;
 mod windows_terminal_self_test;
 
@@ -46,6 +44,7 @@ pub use audio_transcription::{
 pub use jobs::{JobSnapshot, JobStatus, has_job_snapshots, job_snapshots, running_job_count};
 pub use render_verification::{RenderOffscreenFixtureListReport, RenderOffscreenSelfTestReport};
 pub use teamy_studio_app_host::{TerminalThroughputBenchmarkMode, TerminalWindowSummary};
+pub use teamy_studio_terminal_core::VtEngineChoice;
 pub use windows_app::TerminalThroughputBenchmarkResultsReport;
 pub use windows_audio_input::{
     AudioInputDeviceListReport, AudioInputDeviceSummary, list_active_audio_input_devices,
@@ -53,7 +52,6 @@ pub use windows_audio_input::{
 pub use windows_cursor_info::{CursorInfoConfig, CursorInfoPixelSize, CursorInfoRenderMode};
 pub use windows_terminal_replay::TerminalReplayReport;
 pub use windows_terminal_self_test::KeyboardInputSelfTestReport;
-pub use teamy_studio_terminal_core::VtEngineChoice;
 
 /// Run the Teamy Studio application shell.
 // cli[impl command.surface.core]

@@ -416,9 +416,12 @@ impl RuntimeTerminalEngine {
         }
     }
 
-    #[expect(
-        clippy::unnecessary_wraps,
-        reason = "the Teamy branch is intentionally kept signature-compatible with the ghostty branch during terminal-engine preservation work"
+    #[cfg_attr(
+        not(feature = "ghostty"),
+        expect(
+            clippy::unnecessary_wraps,
+            reason = "the Teamy branch is intentionally kept signature-compatible with the ghostty branch during terminal-engine preservation work"
+        )
     )]
     fn resize(
         &mut self,
@@ -447,9 +450,12 @@ impl RuntimeTerminalEngine {
         }
     }
 
-    #[expect(
-        clippy::unnecessary_wraps,
-        reason = "the Teamy branch is intentionally kept signature-compatible with the ghostty branch during terminal-engine preservation work"
+    #[cfg_attr(
+        not(feature = "ghostty"),
+        expect(
+            clippy::unnecessary_wraps,
+            reason = "the Teamy branch is intentionally kept signature-compatible with the ghostty branch during terminal-engine preservation work"
+        )
     )]
     fn scroll_active_cursor_into_view(&mut self) -> eyre::Result<()> {
         match self {
@@ -471,9 +477,12 @@ impl RuntimeTerminalEngine {
         }
     }
 
-    #[expect(
-        clippy::unnecessary_wraps,
-        reason = "the Teamy branch is intentionally kept signature-compatible with the ghostty branch during terminal-engine preservation work"
+    #[cfg_attr(
+        not(feature = "ghostty"),
+        expect(
+            clippy::unnecessary_wraps,
+            reason = "the Teamy branch is intentionally kept signature-compatible with the ghostty branch during terminal-engine preservation work"
+        )
     )]
     fn kitty_keyboard_flags(&self) -> eyre::Result<key::KittyKeyFlags> {
         match self {
@@ -491,9 +500,12 @@ impl RuntimeTerminalEngine {
         }
     }
 
-    #[expect(
-        clippy::unnecessary_wraps,
-        reason = "the Teamy branch is intentionally kept signature-compatible with the ghostty branch during terminal-engine preservation work"
+    #[cfg_attr(
+        not(feature = "ghostty"),
+        expect(
+            clippy::unnecessary_wraps,
+            reason = "the Teamy branch is intentionally kept signature-compatible with the ghostty branch during terminal-engine preservation work"
+        )
     )]
     fn viewport_metrics(&self) -> eyre::Result<TerminalViewportMetrics> {
         match self {
@@ -524,9 +536,12 @@ impl RuntimeTerminalEngine {
         }
     }
 
-    #[expect(
-        clippy::unnecessary_wraps,
-        reason = "the Teamy branch is intentionally kept signature-compatible with the ghostty branch during terminal-engine preservation work"
+    #[cfg_attr(
+        not(feature = "ghostty"),
+        expect(
+            clippy::unnecessary_wraps,
+            reason = "the Teamy branch is intentionally kept signature-compatible with the ghostty branch during terminal-engine preservation work"
+        )
     )]
     fn total_rows(&self) -> eyre::Result<usize> {
         match self {
@@ -536,9 +551,12 @@ impl RuntimeTerminalEngine {
         }
     }
 
-    #[expect(
-        clippy::unnecessary_wraps,
-        reason = "the Teamy branch is intentionally kept signature-compatible with the ghostty branch during terminal-engine preservation work"
+    #[cfg_attr(
+        not(feature = "ghostty"),
+        expect(
+            clippy::unnecessary_wraps,
+            reason = "the Teamy branch is intentionally kept signature-compatible with the ghostty branch during terminal-engine preservation work"
+        )
     )]
     fn screen_row_cells(&self, row: u32, cols: u16) -> eyre::Result<Vec<String>> {
         #[cfg(not(feature = "ghostty"))]
@@ -550,9 +568,12 @@ impl RuntimeTerminalEngine {
         }
     }
 
-    #[expect(
-        clippy::unnecessary_wraps,
-        reason = "the Teamy branch is intentionally kept signature-compatible with the ghostty branch during terminal-engine preservation work"
+    #[cfg_attr(
+        not(feature = "ghostty"),
+        expect(
+            clippy::unnecessary_wraps,
+            reason = "the Teamy branch is intentionally kept signature-compatible with the ghostty branch during terminal-engine preservation work"
+        )
     )]
     fn encode_key_event(
         &mut self,
@@ -2767,9 +2788,12 @@ impl TerminalCore {
         Cow::Owned(output)
     }
 
-    #[expect(
-        clippy::unnecessary_wraps,
-        reason = "the ghostty branch can fail and the shared preserved call path keeps one signature"
+    #[cfg_attr(
+        not(feature = "ghostty"),
+        expect(
+            clippy::unnecessary_wraps,
+            reason = "the ghostty branch can fail and the shared preserved call path keeps one signature"
+        )
     )]
     fn refresh_semantic_prompt_tracking(&mut self) -> eyre::Result<()> {
         let next = match &mut self.engine {
@@ -4125,9 +4149,12 @@ fn normalize_cursor_visibility_mode_sequence(data: &[u8]) -> Cow<'_, [u8]> {
     }
 }
 
-#[expect(
-    clippy::needless_return,
-    reason = "the cfg-split early return keeps the non-ghostty branch visually aligned with the ghostty branch"
+#[cfg_attr(
+    not(feature = "ghostty"),
+    expect(
+        clippy::needless_return,
+        reason = "the cfg-split early return keeps the non-ghostty branch visually aligned with the ghostty branch"
+    )
 )]
 fn legacy_special_key_bytes(mapped_key: key::Key, mods: key::Mods) -> Option<Vec<u8>> {
     #[cfg(not(feature = "ghostty"))]

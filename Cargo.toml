@@ -5,6 +5,7 @@ members = [
     "crates/teamy_studio_app_host",
     "crates/teamy_studio_audio_input",
     "crates/teamy_studio_audio_transcription",
+	"crates/teamy_studio_cli",
     "crates/teamy_studio_cursor_info",
     "crates/teamy_studio_demo_mode",
     "crates/teamy_studio_frontend",
@@ -62,6 +63,7 @@ teamy_studio_audio_core = { path = "crates/teamy_studio_audio_core" }
 teamy_studio_app_host = { path = "crates/teamy_studio_app_host" }
 teamy_studio_audio_input = { path = "crates/teamy_studio_audio_input" }
 teamy_studio_audio_transcription = { path = "crates/teamy_studio_audio_transcription" }
+teamy_studio_cli = { path = "crates/teamy_studio_cli" }
 teamy_studio_cursor_info = { path = "crates/teamy_studio_cursor_info" }
 teamy_studio_demo_mode = { path = "crates/teamy_studio_demo_mode" }
 teamy_studio_frontend = { path = "crates/teamy_studio_frontend" }
@@ -161,8 +163,8 @@ tempfile = "3.20.0"
 [features]
 default = []
 font-snapshot-tests = []
-ghostty = ["dep:libghostty-vt", "teamy_studio_terminal_core/ghostty", "teamy_studio_vt_types/ghostty", "teamy_studio_windows_terminal_engine/ghostty", "teamy_studio_windows_terminal_replay/ghostty"]
-tracy = ["dep:tracing-tracy", "teamy_studio_app_host/tracy", "teamy_studio_audio_input/tracy", "teamy_studio_audio_transcription/tracy", "teamy_studio_frontend/tracy", "teamy_studio_observability/tracy", "teamy_studio_shell/tracy", "teamy_studio_teamy_terminal_engine/tracy", "teamy_studio_terminal_core/tracy"]
+ghostty = ["dep:libghostty-vt", "teamy_studio_cli/ghostty", "teamy_studio_terminal_core/ghostty", "teamy_studio_vt_types/ghostty", "teamy_studio_windows_terminal_engine/ghostty", "teamy_studio_windows_terminal_replay/ghostty"]
+tracy = ["dep:tracing-tracy", "teamy_studio_app_host/tracy", "teamy_studio_audio_input/tracy", "teamy_studio_audio_transcription/tracy", "teamy_studio_cli/tracy", "teamy_studio_frontend/tracy", "teamy_studio_observability/tracy", "teamy_studio_shell/tracy", "teamy_studio_teamy_terminal_engine/tracy", "teamy_studio_terminal_core/tracy"]
 
 [build-dependencies]
 embed-resource = "3.0.6"

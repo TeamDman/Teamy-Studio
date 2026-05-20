@@ -140,7 +140,6 @@ pub fn open_terminal_window(
     })
 }
 
-#[path = "../../../src/app/windows_app_impl.rs"]
 mod windows_app_impl;
 
 pub mod windows_app {

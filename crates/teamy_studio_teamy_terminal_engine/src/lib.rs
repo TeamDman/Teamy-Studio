@@ -8,7 +8,6 @@ pub mod app {
     }
 }
 
-#[path = "../../../src/app/teamy_terminal_engine_impl.rs"]
 mod teamy_terminal_engine_impl;
 
 pub use teamy_terminal_engine_impl::*;

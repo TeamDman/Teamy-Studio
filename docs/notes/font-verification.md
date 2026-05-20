@@ -8,7 +8,7 @@ Build a single production-path text correctness harness for Teamy-Studio that va
 
 - Done so far:
   - Shared render verification harness added and wired to both `cargo test` and `self-test render-offscreen`.
-  - Built-in fixture `basic-terminal-frame` added with a checked-in expected image at `tests/fixtures/render-offscreen/basic-terminal-frame.png`.
+  - Built-in fixture `basic-terminal-frame` added with a checked-in expected image at `crates/teamy_studio_shell/tests/fixtures/render-offscreen/basic-terminal-frame.png`.
   - The shared harness now also records and compares a renderer-generated scene snapshot alongside the PNG golden so structural regressions are caught before pixel-only diffs.
   - `SelfTestRenderOffscreenArgs` extended with fixture selection, fixture listing, and expected-image update support.
   - `render_frame_model_offscreen_image` now renders through the real D3D12 pipeline into an offscreen texture and reads pixels back for comparison.
@@ -29,7 +29,7 @@ Build a single production-path text correctness harness for Teamy-Studio that va
 
 ## Constraints And Assumptions
 
-- `src/cli/self_test/self_test_cli.rs` already exposes:
+- `crates/teamy_studio_cli/src/cli/self_test/self_test_cli.rs` already exposes:
   - `RenderOffscreen(SelfTestRenderOffscreenArgs)`
   - `TerminalReplay(SelfTestTerminalReplayArgs)`
 - The harness should extend that existing diagnostics surface instead of creating a parallel path.
@@ -109,7 +109,7 @@ Build a single production-path text correctness harness for Teamy-Studio that va
   - `tracey query status`
   - `tracey query uncovered`
   - `tracey query unmapped`
-  - `tracey query unmapped --path src/cli/self_test`
+  - `tracey query unmapped --path crates/teamy_studio_cli/src/cli/self_test`
   - `tracey query validate --deny warnings`
 - Follow-up after implementation lands:
   - `tracey query untested`
@@ -130,8 +130,8 @@ Build a single production-path text correctness harness for Teamy-Studio that va
 - Complete.
 
 **Tasks**
-- Read `src/cli/self_test/render_offscreen.rs`.
-- Confirm how `src/cli/self_test/self_test_cli.rs` dispatches into the current offscreen path and whether new flags can be added without breaking the current surface.
+- Read `crates/teamy_studio_cli/src/cli/self_test/render_offscreen/self_test_render_offscreen_cli.rs`.
+- Confirm how `crates/teamy_studio_cli/src/cli/self_test/self_test_cli.rs` dispatches into the current offscreen path and whether new flags can be added without breaking the current surface.
 - Identify:
   - current shaping entrypoint
   - slug draw-data construction entrypoint
@@ -220,14 +220,14 @@ Build a single production-path text correctness harness for Teamy-Studio that va
 - Complete for fixture selection, listing, and expected-image update flows.
 
 **Tasks**
-- Extend `SelfTestRenderOffscreenArgs` and `src/cli/self_test/render_offscreen.rs` to call the shared runner.
+- Extend `SelfTestRenderOffscreenArgs` and `crates/teamy_studio_cli/src/cli/self_test/render_offscreen/self_test_render_offscreen_cli.rs` to call the shared runner.
 - Add CLI options for:
   - running all fixtures or selected fixtures
   - listing fixtures
   - output directory for artifacts
   - update mode for expected outputs, if allowed
   - machine-readable summary output
-- Keep `src/cli/self_test/self_test_cli.rs` unchanged unless the current subcommand surface proves insufficient.
+- Keep `crates/teamy_studio_cli/src/cli/self_test/self_test_cli.rs` unchanged unless the current subcommand surface proves insufficient.
 - Ensure runtime self-test and cargo-test adapters share the same fixture files and comparison code.
 
 **Definition of done**
@@ -310,7 +310,7 @@ Build a single production-path text correctness harness for Teamy-Studio that va
 
 ## First Concrete Slice (Completed)
 
-1. Inspect `src/cli/self_test/render_offscreen.rs` and document its current inputs and outputs.
+1. Inspect `crates/teamy_studio_cli/src/cli/self_test/render_offscreen/self_test_render_offscreen_cli.rs` and document its current inputs and outputs.
 2. Locate the production text shaping entrypoint and the production offscreen render entrypoint.
 3. Add a shared harness module with the smallest possible surface:
    - `Fixture`

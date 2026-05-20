@@ -31,5 +31,10 @@ features = [
 
 [features]
 default = []
-ghostty = ["dep:libghostty-vt", "dep:teamy_studio_windows_terminal_engine"]
+ghostty = [
+    "dep:libghostty-vt",
+    "dep:teamy_studio_windows_terminal_engine",
+    "teamy_studio_vt_types/ghostty",
+    "teamy_studio_windows_terminal_engine/ghostty",
+]
 tracy = []

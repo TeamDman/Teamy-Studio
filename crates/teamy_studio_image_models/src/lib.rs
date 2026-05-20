@@ -15,7 +15,6 @@ pub mod model {
     }
 }
 
-#[path = "../../../src/image_model_impl.rs"]
 mod image_model_impl;
 
 pub use image_model_impl::*;

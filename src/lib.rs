@@ -1,21 +1,90 @@
 #![deny(clippy::disallowed_methods)]
 #![deny(clippy::disallowed_macros)]
 
-pub mod app;
-pub mod audio;
-pub mod cli;
-pub mod frontend;
-pub mod image_model;
-pub mod logging_init;
-pub mod logs;
-pub mod model;
-pub mod paths;
-pub mod shell_default;
+pub mod app {
+    pub use teamy_studio_cli::app::*;
+}
+
+pub mod audio {
+    pub use teamy_studio_audio_core::*;
+}
+
+pub mod cli {
+    pub use teamy_studio_cli::*;
+}
+
+pub mod frontend {
+    pub use teamy_studio_frontend::*;
+}
+
+pub mod image_model {
+    pub use teamy_studio_image_models::*;
+}
+
+pub mod logging_init {
+    use crate::cli::global_args::GlobalArgs;
+    use teamy_studio_observability::LoggingConfig;
+
+    /// Initialize logging based on the provided configuration.
+    /// tool[impl logging.stderr-output]
+    /// tool[impl logging.file-path-option]
+    /// tool[impl logging.file-structured-ndjson]
+    /// tool[impl logging.filter.from-env]
+    /// tool[impl logging.filter.defaults]
+    /// tool[impl logging.filter.debug-conflicts-with-log-filter]
+    ///
+    /// # Errors
+    ///
+    /// This function will return an error if creating the log file or directories fails.
+    ///
+    /// # Panics
+    ///
+    /// This function may panic if locking or cloning the log file handle fails.
+    pub fn init_logging(global_args: &GlobalArgs) -> eyre::Result<()> {
+        let config = LoggingConfig {
+            debug: global_args.debug,
+            log_filter: global_args.log_filter.clone(),
+            log_file: global_args.log_file.clone(),
+        };
+
+        teamy_studio_observability::init_logging(&config)
+    }
+}
+
+pub mod logs {
+    pub use teamy_studio_logs::*;
+}
+
+pub mod model {
+    pub use teamy_studio_whisper_stack::model::*;
+}
+
+pub mod paths {
+    pub use teamy_studio_paths::*;
+}
+
+pub mod shell_default {
+    pub use teamy_studio_shell_default::*;
+}
+
 pub use teamy_studio_timeline_core as timeline;
-pub mod transcription;
-pub mod waifu2x_reference;
-pub mod whisper;
-pub mod win32_support;
+
+pub mod transcription {
+    pub use teamy_studio_whisper_stack::transcription::*;
+}
+
+pub mod waifu2x_reference {
+    pub use teamy_studio_waifu2x_reference::*;
+}
+
+pub mod whisper {
+    pub use teamy_studio_whisper_stack::whisper::*;
+}
+
+pub mod win32_support {
+    pub use teamy_studio_win32_support::*;
+}
+
 use crate::cli::Cli;
 use crate::cli::output::CliOutput;
 

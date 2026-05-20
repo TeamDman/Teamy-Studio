@@ -69,11 +69,11 @@ use windows::core::{Error, Interface, Owned, PCSTR, PCWSTR, s};
 use super::cell_grid;
 use super::spatial::{ClientPoint, ClientRect, TerminalCellPoint};
 use super::windows_scene::{self, CursorLatencyPlaygroundViewState, SceneAction};
+use super::windows_terminal;
 use super::windows_terminal::{
     SharedTerminalDisplayState, TerminalDisplayCursor, TerminalDisplayCursorStyle,
     TerminalDisplayRow, TerminalDisplayScrollbar, TerminalLayout, TerminalSelection,
 };
-use super::windows_terminal;
 
 const FRAME_COUNT: usize = 2;
 const MAX_PANEL_COUNT: usize = 8_192;
@@ -93,8 +93,9 @@ const SLUG_HORIZONTAL_COVERAGE_EPSILON: f32 = 1.0 / 65536.0;
 const TEAMY_D3D12_GPU_VALIDATION_ENV: &str = "TEAMY_D3D12_GPU_VALIDATION";
 const TEAMY_D3D12_OFFSCREEN_ADAPTER_ENV: &str = "TEAMY_D3D12_OFFSCREEN_ADAPTER";
 const OFFSCREEN_RENDER_FENCE_TIMEOUT_MS: u32 = 10_000;
-const WINDOWS_PANEL_SHADERS_PATH: &str = "src/app/windows_panel_shaders.hlsl";
-const WINDOWS_CHROME_SHADERS_PATH: &str = "src/app/windows_chrome_shaders.hlsl";
+const WINDOWS_PANEL_SHADERS_PATH: &str = "crates/teamy_studio_shell/src/windows_panel_shaders.hlsl";
+const WINDOWS_CHROME_SHADERS_PATH: &str =
+    "crates/teamy_studio_shell/src/windows_chrome_shaders.hlsl";
 const WINDOWS_PANEL_SHADERS_SOURCE: &str = include_str!("windows_panel_shaders.hlsl");
 const WINDOWS_CHROME_SHADERS_SOURCE: &str = include_str!("windows_chrome_shaders.hlsl");
 const SPRITE_SLOT_SIZE: u32 = 320;
@@ -3360,12 +3361,8 @@ pub fn build_text_rendering_plane_verification_geometry(
     let interaction_rect = windows_scene::text_rendering_plane_interaction_rect(layout);
     let plane_basis =
         text_rendering_verification_projection_basis(interaction_rect, text, viewport);
-    let glyphs = build_text_rendering_verification_glyph_instances(
-        interaction_rect,
-        text,
-        viewport,
-        color,
-    );
+    let glyphs =
+        build_text_rendering_verification_glyph_instances(interaction_rect, text, viewport, color);
     let view_state = windows_scene::TextRenderingPlaneViewState {
         glyph_count: text.chars().filter(|character| *character != '\n').count(),
         line_count: text.lines().count().max(1),
@@ -3397,10 +3394,7 @@ fn rotate_text_rendering_verification_vector_3d(
     ]
 }
 
-fn project_text_rendering_verification_point(
-    point: [f32; 3],
-    center: [f32; 2],
-) -> [f32; 2] {
+fn project_text_rendering_verification_point(point: [f32; 3], center: [f32; 2]) -> [f32; 2] {
     project_text_rendering_verification_point_with_weight(point, center).0
 }
 
@@ -3550,11 +3544,9 @@ fn build_text_rendering_verification_glyph_instances(
         plane_origin[1] + ((line_count * line_height) / 2.0),
     ];
     let cull_left = rect.left() as f32 - TEXT_RENDERING_VERIFICATION_VIRTUALIZATION_PADDING_PX;
-    let cull_right =
-        rect.right() as f32 + TEXT_RENDERING_VERIFICATION_VIRTUALIZATION_PADDING_PX;
+    let cull_right = rect.right() as f32 + TEXT_RENDERING_VERIFICATION_VIRTUALIZATION_PADDING_PX;
     let cull_top = rect.top() as f32 - TEXT_RENDERING_VERIFICATION_VIRTUALIZATION_PADDING_PX;
-    let cull_bottom =
-        rect.bottom() as f32 + TEXT_RENDERING_VERIFICATION_VIRTUALIZATION_PADDING_PX;
+    let cull_bottom = rect.bottom() as f32 + TEXT_RENDERING_VERIFICATION_VIRTUALIZATION_PADDING_PX;
 
     let mut glyphs = Vec::new();
     for (row_index, line) in lines.iter().enumerate() {
@@ -3571,15 +3563,17 @@ fn build_text_rendering_verification_glyph_instances(
                 pen_x_units += advance;
                 continue;
             }
-            let glyph = font.glyphs.get(&character).copied().unwrap_or_else(|| {
-                TerminalFontGlyphMetrics {
-                    x_min: 0.0,
-                    y_min: font.descender,
-                    x_max: advance,
-                    y_max: font.ascender,
-                    advance,
-                }
-            });
+            let glyph =
+                font.glyphs
+                    .get(&character)
+                    .copied()
+                    .unwrap_or_else(|| TerminalFontGlyphMetrics {
+                        x_min: 0.0,
+                        y_min: font.descender,
+                        x_max: advance,
+                        y_max: font.ascender,
+                        advance,
+                    });
             let left = line_left + (pen_x_units + glyph.x_min) * scale;
             let right = line_left + (pen_x_units + glyph.x_max) * scale;
             let top = line_top + (font.ascender - glyph.y_max) * scale;

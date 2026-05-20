@@ -5769,6 +5769,7 @@ dependencies = [
  "teamy_studio_audio_core",
  "teamy_studio_audio_input",
  "teamy_studio_audio_transcription",
+ "teamy_studio_cli",
  "teamy_studio_cursor_info",
  "teamy_studio_demo_mode",
  "teamy_studio_frontend",
@@ -5880,6 +5881,47 @@ dependencies = [
  "tokio",
  "tracing",
  "windows 0.62.2",
+]
+
+[[package]]
+name = "teamy_studio_cli"
+version = "0.1.0"
+dependencies = [
+ "arbitrary",
+ "chrono",
+ "eyre",
+ "facet",
+ "facet-csv",
+ "facet-json",
+ "facet-pretty",
+ "image",
+ "open",
+ "serde",
+ "serde_json",
+ "teamy-figue",
+ "teamy_studio_app_host",
+ "teamy_studio_audio_core",
+ "teamy_studio_audio_input",
+ "teamy_studio_audio_transcription",
+ "teamy_studio_cursor_info",
+ "teamy_studio_demo_mode",
+ "teamy_studio_frontend",
+ "teamy_studio_image_models",
+ "teamy_studio_jobs",
+ "teamy_studio_paths",
+ "teamy_studio_shell",
+ "teamy_studio_shell_default",
+ "teamy_studio_spatial",
+ "teamy_studio_teamy_terminal_engine",
+ "teamy_studio_terminal_core",
+ "teamy_studio_vt_types",
+ "teamy_studio_waifu2x_reference",
+ "teamy_studio_whisper_stack",
+ "teamy_studio_windows_audio",
+ "teamy_studio_windows_dialogs",
+ "teamy_studio_windows_terminal_engine",
+ "teamy_studio_windows_terminal_replay",
+ "tracing",
 ]
 
 [[package]]

@@ -8,7 +8,6 @@ pub mod win32_support {
     }
 }
 
-#[path = "../../../src/app/windows_audio_impl.rs"]
 mod windows_audio_impl;
 
 pub use windows_audio_impl::*;

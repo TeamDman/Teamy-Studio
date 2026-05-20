@@ -4,7 +4,6 @@ pub mod win32_support {
     }
 }
 
-#[path = "../../../src/app/windows_dialogs_impl.rs"]
 mod windows_dialogs_impl;
 
 pub use windows_dialogs_impl::*;

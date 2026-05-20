@@ -67,8 +67,8 @@ This order is intentionally low-risk:
 
 Current goal:
 
-1. keep the new app-host boundary stable
-2. decide how much additional CLI/root thinning we want beyond the compile-time win target
+1. keep the new app-host and CLI boundaries stable
+2. decide how much additional root shim collapse we want beyond the compile-time win target
 3. run a slower final verification checkpoint when we want to call the refactor complete
 
 Current status:
@@ -101,10 +101,14 @@ Current status:
 - `teamy_studio_cursor_info` now owns the compiled `windows_cursor_info` implementation, including `CursorInfoVirtualSession`, with the root crate preserving `crate::app::windows_cursor_info`
 - `render_verification` now lives in `teamy_studio_shell`
 - `teamy_studio_app_host` now owns the compiled `windows_app` implementation, with the root crate preserving `crate::app::windows_app` through a thin shim and re-exporting `TerminalThroughputBenchmarkMode` / `TerminalWindowSummary`
+- `teamy_studio_cli` now owns the compiled `app` and `cli` surface trees, with the root crate preserving `crate::app` and `crate::cli` through thin shims
+- there are no remaining crate `#[path = "../../../src/..." ]` includes into root `src/`
+- dead root copies of `paths` and `win32_support` implementation files have been removed now that those crates own their source locally
 - fast iteration validation is currently green with `cargo clippy -- -D warnings`
 - the root workspace currently includes:
   - `crates/teamy_studio_app_host`
   - `crates/teamy_studio_audio_transcription`
+  - `crates/teamy_studio_cli`
   - `crates/teamy_studio_cursor_info`
   - `crates/teamy_studio_demo_mode`
   - `crates/teamy_studio_jobs`
@@ -132,7 +136,7 @@ Current status:
 
 Next slice:
 
-1. if desired, keep thinning `src/cli` and the root facade
+1. if desired, clean up stale historical notes that still mention the pre-flattened root shim files
 2. otherwise treat the crate-split objective as largely complete and do a final `\.\check-all.ps1` checkpoint once ready
 
 See:
@@ -145,76 +149,50 @@ If context compacts, assume the following is the current ground truth unless the
 
 ### Landed extractions
 
-- `src/paths/mod.rs` is now a thin shim: `pub use teamy_studio_paths::*;`
-- `src/win32_support/mod.rs` is now a thin shim: `pub use teamy_studio_win32_support::*;`
-- `src/audio.rs` is now a thin shim: `pub use teamy_studio_audio_core::*;`
-- `src/frontend.rs` is now a thin shim: `pub use teamy_studio_frontend::*;`
-- `src/shell_default.rs` is now a thin shim: `pub use teamy_studio_shell_default::*;`
-- `src/image_model.rs` is now a thin shim: `pub use teamy_studio_image_models::*;`
-- `src/logs.rs` is now a thin shim: `pub use teamy_studio_logs::*;`
-- `src/logging_init.rs` is now a thin adapter that converts `GlobalArgs` into `teamy_studio_observability::LoggingConfig`
-- `src/model.rs` is now a thin shim: `pub use teamy_studio_whisper_stack::model::*;`
-- `src/waifu2x_reference.rs` is now a thin shim: `pub use teamy_studio_waifu2x_reference::*;`
-- `src/transcription.rs` is now a thin shim: `pub use teamy_studio_whisper_stack::transcription::*;`
-- `src/whisper.rs` is now a thin shim: `pub use teamy_studio_whisper_stack::whisper::*;`
-- `src/app/audio_transcription.rs` is now a thin shim: `pub use teamy_studio_audio_transcription::*;`
-- `src/app/windows_app.rs` is now a thin shim: `pub use teamy_studio_app_host::windows_app::*;`
-- `src/app/windows_terminal.rs` is now a thin shim: `pub use teamy_studio_terminal_core::*;`
-- `src/app/windows_terminal_self_test.rs` now forwards to `teamy_studio_terminal_core::run_keyboard_input_self_test`
-- `src/app/cell_grid.rs` is now a thin shim: `pub use teamy_studio_shell::cell_grid::*;`
-- `src/app/windows_scene.rs` is now a thin shim: `pub use teamy_studio_shell::windows_scene::*;`
-- `src/app/windows_d3d12_renderer.rs` is now a thin shim: `pub use teamy_studio_shell::windows_d3d12_renderer::*;`
-- `src/app/windows_cursor_info.rs` is now a thin shim: `pub use teamy_studio_cursor_info::*;`
-- `src/app/windows_audio_input.rs` is now a thin shim: `pub use teamy_studio_audio_input::*;`
-- `src/app/spatial.rs` is now a thin shim: `pub use teamy_studio_spatial::*;`
-- `src/app/jobs.rs` is now a thin shim: `pub use teamy_studio_jobs::*;`
-- `src/app/vt_types.rs` is now a thin shim: `pub use teamy_studio_vt_types::*;`
-- `src/app/windows_audio.rs` is now a thin shim: `pub use teamy_studio_windows_audio::*;`
-- `src/app/windows_demo_mode.rs` is now a thin shim: `pub use teamy_studio_demo_mode::*;`
-- `src/app/windows_dialogs.rs` is now a thin shim: `pub use teamy_studio_windows_dialogs::*;`
-- `src/app/teamy_terminal_engine.rs` is now a thin shim: `pub use teamy_studio_teamy_terminal_engine::*;`
-- `src/app/windows_terminal_engine.rs` is now a thin shim: `pub use teamy_studio_windows_terminal_engine::*;`
-- `src/app/windows_terminal_replay.rs` is now a thin shim: `pub use teamy_studio_windows_terminal_replay::*;`
+- `src/lib.rs` now inlines the root compatibility modules for `app`, `audio`, `cli`, `frontend`, `image_model`, `logging_init`, `logs`, `model`, `paths`, `shell_default`, `transcription`, `waifu2x_reference`, `whisper`, and `win32_support`
+- `teamy_studio_cli` now owns the shim-heavy `app` surface that used to live under `src/app/*`, with the root crate preserving `crate::app` through the inline compatibility module in `src/lib.rs`
 - `src/lib.rs` now re-exports `teamy_studio_timeline_core` as `crate::timeline`
 - the moved code lives in:
-  - `src/app/audio_transcription_impl.rs`, compiled through `crates/teamy_studio_audio_transcription/src/lib.rs`
-  - `src/app/windows_app_impl.rs`, compiled through `crates/teamy_studio_app_host/src/lib.rs`
-  - `src/app/cell_grid_impl.rs`, `src/app/windows_scene_impl.rs`, and `src/app/windows_d3d12_renderer_impl.rs`, compiled through `crates/teamy_studio_shell/src/lib.rs`
-  - `src/app/windows_cursor_info_impl.rs`, compiled through `crates/teamy_studio_cursor_info/src/lib.rs`
-  - `src/app/windows_audio_input_impl.rs`, compiled through `crates/teamy_studio_audio_input/src/lib.rs`
-  - `src/app/jobs_impl.rs`, compiled through `crates/teamy_studio_jobs/src/lib.rs`
-  - `src/app/spatial_impl.rs`, compiled through `crates/teamy_studio_spatial/src/lib.rs`
-  - `src/app/vt_types_impl.rs`, compiled through `crates/teamy_studio_vt_types/src/lib.rs`
-  - `src/app/windows_audio_impl.rs`, compiled through `crates/teamy_studio_windows_audio/src/lib.rs`
-  - `src/app/windows_demo_mode_impl.rs`, compiled through `crates/teamy_studio_demo_mode/src/lib.rs`
-  - `src/app/windows_dialogs_impl.rs`, compiled through `crates/teamy_studio_windows_dialogs/src/lib.rs`
-  - `src/app/teamy_terminal_engine_impl.rs`, compiled through `crates/teamy_studio_teamy_terminal_engine/src/lib.rs`
-  - `src/app/windows_terminal_impl.rs` and `src/app/windows_terminal_self_test_impl.rs`, compiled through `crates/teamy_studio_terminal_core/src/lib.rs`
-  - `src/app/windows_terminal_engine_impl.rs`, compiled through `crates/teamy_studio_windows_terminal_engine/src/lib.rs`
-  - `src/app/windows_terminal_replay_impl.rs`, compiled through `crates/teamy_studio_windows_terminal_replay/src/lib.rs`
-  - `src/app/render_verification_impl.rs`, compiled through `crates/teamy_studio_shell/src/lib.rs`
-  - `src/timeline/*`, compiled through `crates/teamy_studio_timeline_core/src/lib.rs`
+  - `crates/teamy_studio_cli/src/app/*`, compiled through `crates/teamy_studio_cli/src/lib.rs`
+  - `crates/teamy_studio_cli/src/cli/*`, compiled through `crates/teamy_studio_cli/src/lib.rs`
+  - `crates/teamy_studio_audio_transcription/src/audio_transcription_impl.rs`, compiled through `crates/teamy_studio_audio_transcription/src/lib.rs`
+  - `crates/teamy_studio_app_host/src/windows_app_impl.rs`, compiled through `crates/teamy_studio_app_host/src/lib.rs`
+  - `crates/teamy_studio_shell/src/cell_grid.rs`, `crates/teamy_studio_shell/src/windows_scene.rs`, and `crates/teamy_studio_shell/src/windows_d3d12_renderer.rs`, compiled through `crates/teamy_studio_shell/src/lib.rs`
+  - `crates/teamy_studio_cursor_info/src/windows_cursor_info_impl.rs`, compiled through `crates/teamy_studio_cursor_info/src/lib.rs`
+  - `crates/teamy_studio_audio_input/src/windows_audio_input_impl.rs`, compiled through `crates/teamy_studio_audio_input/src/lib.rs`
+  - `crates/teamy_studio_jobs/src/jobs_impl.rs`, compiled through `crates/teamy_studio_jobs/src/lib.rs`
+  - `crates/teamy_studio_spatial/src/spatial_impl.rs`, compiled through `crates/teamy_studio_spatial/src/lib.rs`
+  - `crates/teamy_studio_vt_types/src/vt_types_impl.rs`, compiled through `crates/teamy_studio_vt_types/src/lib.rs`
+  - `crates/teamy_studio_windows_audio/src/windows_audio_impl.rs`, compiled through `crates/teamy_studio_windows_audio/src/lib.rs`
+  - `crates/teamy_studio_demo_mode/src/windows_demo_mode_impl.rs`, compiled through `crates/teamy_studio_demo_mode/src/lib.rs`
+  - `crates/teamy_studio_windows_dialogs/src/windows_dialogs_impl.rs`, compiled through `crates/teamy_studio_windows_dialogs/src/lib.rs`
+  - `crates/teamy_studio_teamy_terminal_engine/src/teamy_terminal_engine_impl.rs`, compiled through `crates/teamy_studio_teamy_terminal_engine/src/lib.rs`
+  - `crates/teamy_studio_terminal_core/src/windows_terminal_impl.rs` and `crates/teamy_studio_terminal_core/src/windows_terminal_self_test_impl.rs`, compiled through `crates/teamy_studio_terminal_core/src/lib.rs`
+  - `crates/teamy_studio_windows_terminal_engine/src/windows_terminal_engine_impl.rs`, compiled through `crates/teamy_studio_windows_terminal_engine/src/lib.rs`
+  - `crates/teamy_studio_windows_terminal_replay/src/windows_terminal_replay_impl.rs`, compiled through `crates/teamy_studio_windows_terminal_replay/src/lib.rs`
+  - `crates/teamy_studio_shell/src/render_verification.rs`, compiled through `crates/teamy_studio_shell/src/lib.rs`
+  - `crates/teamy_studio_timeline_core/src/timeline_impl/*`, compiled through `crates/teamy_studio_timeline_core/src/lib.rs`
   - `crates/teamy_studio_paths/src/*`
   - `crates/teamy_studio_win32_support/src/*`
   - `crates/teamy_studio_audio_core/src/lib.rs`
   - `crates/teamy_studio_frontend/src/lib.rs`
-  - `src/logs_impl.rs`, compiled through `crates/teamy_studio_logs/src/lib.rs`
-  - `src/logging_init_impl.rs`, compiled through `crates/teamy_studio_observability/src/lib.rs`
+  - `crates/teamy_studio_logs/src/logs_impl.rs`, compiled through `crates/teamy_studio_logs/src/lib.rs`
+  - `crates/teamy_studio_observability/src/logging_init_impl.rs`, compiled through `crates/teamy_studio_observability/src/lib.rs`
   - `crates/teamy_studio_shell_default/src/lib.rs`
-  - `src/image_model_impl.rs`, compiled through `crates/teamy_studio_image_models/src/lib.rs`
-  - `src/model_impl.rs`, `src/transcription_impl.rs`, and `src/whisper_impl.rs`, compiled through `crates/teamy_studio_whisper_stack/src/lib.rs`
-  - `src/waifu2x_reference_impl.rs`, compiled through `crates/teamy_studio_waifu2x_reference/src/lib.rs`
+  - `crates/teamy_studio_image_models/src/image_model_impl.rs`, compiled through `crates/teamy_studio_image_models/src/lib.rs`
+  - `crates/teamy_studio_whisper_stack/src/model.rs`, `crates/teamy_studio_whisper_stack/src/transcription.rs`, and `crates/teamy_studio_whisper_stack/src/whisper.rs`, compiled through `crates/teamy_studio_whisper_stack/src/lib.rs`
+  - `crates/teamy_studio_waifu2x_reference/src/waifu2x_reference_impl.rs`, compiled through `crates/teamy_studio_waifu2x_reference/src/lib.rs`
 
 ### Intentional non-extraction change
 
-- `src/app/windows_terminal.rs` contains targeted `#[expect(...)]` annotations added only to satisfy the current fast clippy gate.
+- `crates/teamy_studio_terminal_core/src/windows_terminal_impl.rs` contains targeted `#[expect(...)]` annotations added only to satisfy the current fast clippy gate.
 - Those annotations were preferred over signature rewrites specifically to preserve behavior and code shape.
 - Do not "clean up" those signatures during the refactor unless there is a separate deliberate reason.
 
 ### Validation state
 
 - current fast iteration gate: `cargo clippy -- -D warnings`
-- current status of that fast gate: green after the twenty-six landed extractions above
+- current status of that fast gate: green after the landed extractions and the follow-up physical relocation pass into `crates/`
 - last known `.\check-all.ps1` success was earlier in the refactor, before the later `win32_support` and `audio_core` slices, when the user switched us to clippy-only iteration
 
 ### Extraction recipe
@@ -242,23 +220,23 @@ For the next crate split, follow this exact pattern unless a concrete seam force
 
 These are the best current candidates, in rough order of safety:
 
-1. `logging_init`, if we want to finish peeling the root logging surface after `teamy_studio_logs`
-2. CLI/root thinning, if we want to go beyond the compile-time-focused crate split
+1. documentation cleanup for stale historical path references outside the active handoff docs, if we care about those notes staying navigable
+2. any final polish inside `src/lib.rs` if we want the root bootstrap to be even smaller or more explicit
 3. final whole-repo verification with `\.\check-all.ps1` when we are ready for a slower checkpoint
 
 Avoid unnecessary churn in the already-extracted host/shell layers unless there is a concrete reason:
 
-- `src/app/windows_app_impl.rs`
-- `src/app/windows_scene_impl.rs`
-- `src/app/windows_terminal_impl.rs`
+- `crates/teamy_studio_app_host/src/windows_app_impl.rs`
+- `crates/teamy_studio_shell/src/windows_scene.rs`
+- `crates/teamy_studio_terminal_core/src/windows_terminal_impl.rs`
+- `crates/teamy_studio_cli/src/cli/audio/transcribe/audio_transcribe_cli.rs`
 
 Current remaining high-entanglement tier worth treating as one connected problem:
 
-- `src/logging_init.rs`
-- `src/cli/*`
-- `src/app/mod.rs`
+- `src/lib.rs`
+- `crates/teamy_studio_cli/src/lib.rs`
 
-After the observability extraction, `logging_init.rs` is now in the low-risk adapter tier rather than the high-entanglement tier.
+After the physical relocation pass, the CLI extraction, and the root shim collapse, the remaining root work is primarily bootstrap polish and final verification rather than moving crate-owned implementation bodies.
 
 The main crate-split blocker tier has been cleared; the remaining work is mostly optional cleanup and final verification.
 

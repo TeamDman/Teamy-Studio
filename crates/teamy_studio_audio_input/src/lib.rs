@@ -32,7 +32,6 @@ pub mod win32_support {
     }
 }
 
-#[path = "../../../src/app/windows_audio_input_impl.rs"]
 mod windows_audio_input_impl;
 
 pub use windows_audio_input_impl::*;

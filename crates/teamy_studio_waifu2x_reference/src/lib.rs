@@ -7,7 +7,6 @@ pub fn repo_root_dir() -> PathBuf {
         .join("..")
 }
 
-#[path = "../../../src/waifu2x_reference_impl.rs"]
 mod waifu2x_reference_impl;
 
 pub use waifu2x_reference_impl::*;
