@@ -5766,11 +5766,13 @@ dependencies = [
  "sguaba",
  "teamy-figue",
  "teamy_studio_audio_core",
+ "teamy_studio_audio_input",
  "teamy_studio_audio_transcription",
  "teamy_studio_demo_mode",
  "teamy_studio_frontend",
  "teamy_studio_image_models",
  "teamy_studio_jobs",
+ "teamy_studio_logs",
  "teamy_studio_paths",
  "teamy_studio_shell_default",
  "teamy_studio_spatial",
@@ -5778,6 +5780,7 @@ dependencies = [
  "teamy_studio_timeline_core",
  "teamy_studio_vt_types",
  "teamy_studio_waifu2x_reference",
+ "teamy_studio_whisper_stack",
  "teamy_studio_win32_support",
  "teamy_studio_windows_audio",
  "teamy_studio_windows_dialogs",
@@ -5805,6 +5808,25 @@ dependencies = [
  "facet",
  "facet-json",
  "hound",
+]
+
+[[package]]
+name = "teamy_studio_audio_input"
+version = "0.1.0"
+dependencies = [
+ "arbitrary",
+ "eyre",
+ "facet",
+ "teamy_studio_audio_core",
+ "teamy_studio_audio_transcription",
+ "teamy_studio_jobs",
+ "teamy_studio_logs",
+ "teamy_studio_paths",
+ "teamy_studio_whisper_stack",
+ "teamy_studio_win32_support",
+ "tracing",
+ "uom",
+ "windows 0.62.2",
 ]
 
 [[package]]
@@ -5861,6 +5883,16 @@ dependencies = [
 [[package]]
 name = "teamy_studio_jobs"
 version = "0.1.0"
+
+[[package]]
+name = "teamy_studio_logs"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "teamy_studio_timeline_core",
+ "tracing",
+ "tracing-subscriber",
+]
 
 [[package]]
 name = "teamy_studio_paths"
@@ -5925,6 +5957,28 @@ dependencies = [
  "eyre",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "teamy_studio_whisper_stack"
+version = "0.1.0"
+dependencies = [
+ "burn",
+ "burn-store",
+ "dunce",
+ "eyre",
+ "hound",
+ "npy",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "teamy_studio_audio_core",
+ "teamy_studio_frontend",
+ "teamy_studio_paths",
+ "tokenizers",
+ "tracing",
+ "walkdir",
+ "zip 2.4.2",
 ]
 
 [[package]]

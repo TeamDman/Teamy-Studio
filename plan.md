@@ -93,6 +93,9 @@ Current status:
 - `teamy_studio_windows_terminal_engine` has been extracted behind a compatibility re-export
 - `teamy_studio_windows_terminal_replay` has been extracted behind a compatibility re-export
 - `teamy_studio_timeline_core` now owns the compiled `timeline` implementation, with the root crate re-exporting it as `crate::timeline`
+- `teamy_studio_whisper_stack` now owns the compiled `model`, `transcription`, and `whisper` implementations, with the root crate preserving `crate::model`, `crate::transcription`, and `crate::whisper` through thin shims
+- `teamy_studio_logs` now owns the compiled `logs` implementation, with the root crate preserving `crate::logs` through a thin shim
+- `teamy_studio_audio_input` now owns the compiled `windows_audio_input` implementation, with the root crate preserving `crate::app::windows_audio_input` through a thin shim
 - fast iteration validation is currently green with `cargo clippy -- -D warnings`
 - the root workspace currently includes:
   - `crates/teamy_studio_audio_transcription`
@@ -101,6 +104,7 @@ Current status:
   - `crates/teamy_studio_paths`
   - `crates/teamy_studio_win32_support`
   - `crates/teamy_studio_audio_core`
+  - `crates/teamy_studio_audio_input`
   - `crates/teamy_studio_frontend`
   - `crates/teamy_studio_shell_default`
   - `crates/teamy_studio_image_models`
@@ -109,6 +113,8 @@ Current status:
   - `crates/teamy_studio_timeline_core`
   - `crates/teamy_studio_vt_types`
   - `crates/teamy_studio_waifu2x_reference`
+  - `crates/teamy_studio_whisper_stack`
+  - `crates/teamy_studio_logs`
   - `crates/teamy_studio_windows_audio`
   - `crates/teamy_studio_windows_dialogs`
   - `crates/teamy_studio_windows_terminal_replay`
@@ -132,8 +138,13 @@ If context compacts, assume the following is the current ground truth unless the
 - `src/frontend.rs` is now a thin shim: `pub use teamy_studio_frontend::*;`
 - `src/shell_default.rs` is now a thin shim: `pub use teamy_studio_shell_default::*;`
 - `src/image_model.rs` is now a thin shim: `pub use teamy_studio_image_models::*;`
+- `src/logs.rs` is now a thin shim: `pub use teamy_studio_logs::*;`
+- `src/model.rs` is now a thin shim: `pub use teamy_studio_whisper_stack::model::*;`
 - `src/waifu2x_reference.rs` is now a thin shim: `pub use teamy_studio_waifu2x_reference::*;`
+- `src/transcription.rs` is now a thin shim: `pub use teamy_studio_whisper_stack::transcription::*;`
+- `src/whisper.rs` is now a thin shim: `pub use teamy_studio_whisper_stack::whisper::*;`
 - `src/app/audio_transcription.rs` is now a thin shim: `pub use teamy_studio_audio_transcription::*;`
+- `src/app/windows_audio_input.rs` is now a thin shim: `pub use teamy_studio_audio_input::*;`
 - `src/app/spatial.rs` is now a thin shim: `pub use teamy_studio_spatial::*;`
 - `src/app/jobs.rs` is now a thin shim: `pub use teamy_studio_jobs::*;`
 - `src/app/vt_types.rs` is now a thin shim: `pub use teamy_studio_vt_types::*;`
@@ -146,6 +157,7 @@ If context compacts, assume the following is the current ground truth unless the
 - `src/lib.rs` now re-exports `teamy_studio_timeline_core` as `crate::timeline`
 - the moved code lives in:
   - `src/app/audio_transcription_impl.rs`, compiled through `crates/teamy_studio_audio_transcription/src/lib.rs`
+  - `src/app/windows_audio_input_impl.rs`, compiled through `crates/teamy_studio_audio_input/src/lib.rs`
   - `src/app/jobs_impl.rs`, compiled through `crates/teamy_studio_jobs/src/lib.rs`
   - `src/app/spatial_impl.rs`, compiled through `crates/teamy_studio_spatial/src/lib.rs`
   - `src/app/vt_types_impl.rs`, compiled through `crates/teamy_studio_vt_types/src/lib.rs`
@@ -160,8 +172,10 @@ If context compacts, assume the following is the current ground truth unless the
   - `crates/teamy_studio_win32_support/src/*`
   - `crates/teamy_studio_audio_core/src/lib.rs`
   - `crates/teamy_studio_frontend/src/lib.rs`
+  - `src/logs_impl.rs`, compiled through `crates/teamy_studio_logs/src/lib.rs`
   - `crates/teamy_studio_shell_default/src/lib.rs`
   - `src/image_model_impl.rs`, compiled through `crates/teamy_studio_image_models/src/lib.rs`
+  - `src/model_impl.rs`, `src/transcription_impl.rs`, and `src/whisper_impl.rs`, compiled through `crates/teamy_studio_whisper_stack/src/lib.rs`
   - `src/waifu2x_reference_impl.rs`, compiled through `crates/teamy_studio_waifu2x_reference/src/lib.rs`
 
 ### Intentional non-extraction change
@@ -173,7 +187,7 @@ If context compacts, assume the following is the current ground truth unless the
 ### Validation state
 
 - current fast iteration gate: `cargo clippy -- -D warnings`
-- current status of that fast gate: green after the eighteen landed extractions above
+- current status of that fast gate: green after the twenty-one landed extractions above
 - last known `.\check-all.ps1` success was earlier in the refactor, before the later `win32_support` and `audio_core` slices, when the user switched us to clippy-only iteration
 
 ### Extraction recipe

@@ -1,0 +1,11 @@
+[package]
+name = "teamy_studio_logs"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+chrono = "0.4"
+teamy_studio_timeline_core = { path = "../teamy_studio_timeline_core" }
+tracing = "0.1.41"
+tracing-subscriber = "0.3.19"
