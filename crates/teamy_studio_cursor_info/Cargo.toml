@@ -1,0 +1,24 @@
+[package]
+name = "teamy_studio_cursor_info"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+crossterm = "0.29"
+eyre = "0.6.12"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+ratatui = { version = "0.30.0", default-features = false, features = ["crossterm"] }
+teamy_studio_spatial = { path = "../teamy_studio_spatial" }
+teamy_studio_terminal_core = { path = "../teamy_studio_terminal_core" }
+
+[dependencies.windows]
+version = "0.62.2"
+default-features = false
+features = [
+    "std",
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+]

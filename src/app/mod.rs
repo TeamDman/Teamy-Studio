@@ -53,6 +53,7 @@ pub use windows_audio_input::{
 pub use windows_cursor_info::{CursorInfoConfig, CursorInfoPixelSize, CursorInfoRenderMode};
 pub use windows_terminal_replay::TerminalReplayReport;
 pub use windows_terminal_self_test::KeyboardInputSelfTestReport;
+pub use teamy_studio_terminal_core::VtEngineChoice;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TerminalThroughputBenchmarkMode {
@@ -62,25 +63,6 @@ pub enum TerminalThroughputBenchmarkMode {
     ScrollFlood,
     PromptBursts,
     ResizeDuringOutput,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum VtEngineChoice {
-    Ghostty,
-    #[default]
-    Teamy,
-}
-
-impl VtEngineChoice {
-    pub const CURRENT_TERMINAL_VT_ENGINE_ENV_VAR: &str = "TEAMY_STUDIO_CURRENT_TERMINAL_VT_ENGINE";
-
-    #[must_use]
-    pub const fn current_terminal_vt_engine_env_value(self) -> &'static str {
-        match self {
-            Self::Ghostty => "ghostty",
-            Self::Teamy => "teamy",
-        }
-    }
 }
 
 #[derive(Clone, Debug, Facet, PartialEq, Eq)]

@@ -1,0 +1,50 @@
+[package]
+name = "teamy_studio_shell"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+arbitrary = { version = "1.4.1", features = ["derive"] }
+eyre = "0.6.12"
+facet = "0.44.1"
+fontdb = "0.23"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+ratatui = { version = "0.30.0", default-features = false, features = ["crossterm"] }
+teamy_studio_audio_input = { path = "../teamy_studio_audio_input" }
+teamy_studio_audio_transcription = { path = "../teamy_studio_audio_transcription" }
+teamy_studio_jobs = { path = "../teamy_studio_jobs" }
+teamy_studio_logs = { path = "../teamy_studio_logs" }
+teamy_studio_spatial = { path = "../teamy_studio_spatial" }
+teamy_studio_teamy_terminal_engine = { path = "../teamy_studio_teamy_terminal_engine" }
+teamy_studio_terminal_core = { path = "../teamy_studio_terminal_core" }
+teamy_studio_timeline_core = { path = "../teamy_studio_timeline_core" }
+teamy_studio_whisper_stack = { path = "../teamy_studio_whisper_stack" }
+teamy_studio_win32_support = { path = "../teamy_studio_win32_support" }
+tracing = "0.1.41"
+ttf-parser = "0.25"
+uom = { version = "0.38.0", default-features = false, features = ["autoconvert", "f64", "si", "std"] }
+
+[dependencies.windows]
+version = "0.62.2"
+default-features = false
+features = [
+    "std",
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D_Fxc",
+    "Win32_Graphics_Direct3D12",
+    "Win32_Graphics_DirectComposition",
+    "Win32_Graphics_Dwm",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Gdi",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Threading",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+]
+
+[features]
+default = []
+tracy = []

@@ -5768,15 +5768,18 @@ dependencies = [
  "teamy_studio_audio_core",
  "teamy_studio_audio_input",
  "teamy_studio_audio_transcription",
+ "teamy_studio_cursor_info",
  "teamy_studio_demo_mode",
  "teamy_studio_frontend",
  "teamy_studio_image_models",
  "teamy_studio_jobs",
  "teamy_studio_logs",
  "teamy_studio_paths",
+ "teamy_studio_shell",
  "teamy_studio_shell_default",
  "teamy_studio_spatial",
  "teamy_studio_teamy_terminal_engine",
+ "teamy_studio_terminal_core",
  "teamy_studio_timeline_core",
  "teamy_studio_vt_types",
  "teamy_studio_waifu2x_reference",
@@ -5844,6 +5847,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "teamy_studio_cursor_info"
+version = "0.1.0"
+dependencies = [
+ "crossterm",
+ "eyre",
+ "image",
+ "ratatui",
+ "teamy_studio_spatial",
+ "teamy_studio_terminal_core",
+ "windows 0.62.2",
+]
+
+[[package]]
 name = "teamy_studio_demo_mode"
 version = "0.1.0"
 dependencies = [
@@ -5904,6 +5920,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "teamy_studio_shell"
+version = "0.1.0"
+dependencies = [
+ "arbitrary",
+ "eyre",
+ "facet",
+ "fontdb",
+ "image",
+ "ratatui",
+ "teamy_studio_audio_input",
+ "teamy_studio_audio_transcription",
+ "teamy_studio_jobs",
+ "teamy_studio_logs",
+ "teamy_studio_spatial",
+ "teamy_studio_teamy_terminal_engine",
+ "teamy_studio_terminal_core",
+ "teamy_studio_timeline_core",
+ "teamy_studio_whisper_stack",
+ "teamy_studio_win32_support",
+ "tracing",
+ "ttf-parser 0.25.1",
+ "uom",
+ "windows 0.62.2",
+]
+
+[[package]]
 name = "teamy_studio_shell_default"
 version = "0.1.0"
 dependencies = [
@@ -5929,6 +5971,25 @@ dependencies = [
  "facet",
  "teamy_studio_vt_types",
  "tracing",
+]
+
+[[package]]
+name = "teamy_studio_terminal_core"
+version = "0.1.0"
+dependencies = [
+ "eyre",
+ "facet",
+ "libghostty-vt",
+ "portable-pty",
+ "teamy_studio_paths",
+ "teamy_studio_shell_default",
+ "teamy_studio_spatial",
+ "teamy_studio_teamy_terminal_engine",
+ "teamy_studio_vt_types",
+ "teamy_studio_windows_audio",
+ "teamy_studio_windows_terminal_engine",
+ "tracing",
+ "windows 0.62.2",
 ]
 
 [[package]]
