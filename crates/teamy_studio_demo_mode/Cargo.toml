@@ -5,5 +5,5 @@ edition = "2024"
 publish = false
 
 [dependencies]
-eyre = "0.6.12"
-teamy_studio_paths = { path = "../teamy_studio_paths" }
+eyre.workspace = true
+teamy_studio_paths.workspace = true

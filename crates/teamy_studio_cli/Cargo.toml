@@ -5,41 +5,41 @@ edition = "2024"
 publish = false
 
 [dependencies]
-arbitrary = { version = "1.4.1", features = ["derive"] }
-chrono = "0.4"
-eyre = "0.6.12"
-facet = "0.44.1"
-facet-csv = "0.44.1"
-facet-json = "0.44.1"
-facet-pretty = "0.44.1"
-figue = { package = "teamy-figue", version = "2.0.1", features = ["arbitrary"] }
-image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
-open = "5"
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-teamy_studio_audio_core = { path = "../teamy_studio_audio_core" }
-teamy_studio_app_host = { path = "../teamy_studio_app_host" }
-teamy_studio_audio_input = { path = "../teamy_studio_audio_input" }
-teamy_studio_audio_transcription = { path = "../teamy_studio_audio_transcription" }
-teamy_studio_cursor_info = { path = "../teamy_studio_cursor_info" }
-teamy_studio_demo_mode = { path = "../teamy_studio_demo_mode" }
-teamy_studio_frontend = { path = "../teamy_studio_frontend" }
-teamy_studio_image_models = { path = "../teamy_studio_image_models" }
-teamy_studio_jobs = { path = "../teamy_studio_jobs" }
-teamy_studio_paths = { path = "../teamy_studio_paths" }
-teamy_studio_shell = { path = "../teamy_studio_shell" }
-teamy_studio_shell_default = { path = "../teamy_studio_shell_default" }
-teamy_studio_spatial = { path = "../teamy_studio_spatial" }
-teamy_studio_teamy_terminal_engine = { path = "../teamy_studio_teamy_terminal_engine" }
-teamy_studio_terminal_core = { path = "../teamy_studio_terminal_core" }
-teamy_studio_vt_types = { path = "../teamy_studio_vt_types" }
-teamy_studio_waifu2x_reference = { path = "../teamy_studio_waifu2x_reference" }
-teamy_studio_whisper_stack = { path = "../teamy_studio_whisper_stack" }
-teamy_studio_windows_audio = { path = "../teamy_studio_windows_audio" }
-teamy_studio_windows_dialogs = { path = "../teamy_studio_windows_dialogs" }
-teamy_studio_windows_terminal_engine = { path = "../teamy_studio_windows_terminal_engine", optional = true }
-teamy_studio_windows_terminal_replay = { path = "../teamy_studio_windows_terminal_replay" }
-tracing = "0.1.41"
+arbitrary.workspace = true
+chrono.workspace = true
+eyre.workspace = true
+facet.workspace = true
+facet-csv.workspace = true
+facet-json.workspace = true
+facet-pretty.workspace = true
+figue.workspace = true
+image.workspace = true
+open.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+teamy_studio_audio_core.workspace = true
+teamy_studio_app_host.workspace = true
+teamy_studio_audio_input.workspace = true
+teamy_studio_audio_transcription.workspace = true
+teamy_studio_cursor_info.workspace = true
+teamy_studio_demo_mode.workspace = true
+teamy_studio_frontend.workspace = true
+teamy_studio_image_models.workspace = true
+teamy_studio_jobs.workspace = true
+teamy_studio_paths.workspace = true
+teamy_studio_shell.workspace = true
+teamy_studio_shell_default.workspace = true
+teamy_studio_spatial.workspace = true
+teamy_studio_teamy_terminal_engine.workspace = true
+teamy_studio_terminal_core.workspace = true
+teamy_studio_vt_types.workspace = true
+teamy_studio_waifu2x_reference.workspace = true
+teamy_studio_whisper_stack.workspace = true
+teamy_studio_windows_audio.workspace = true
+teamy_studio_windows_dialogs.workspace = true
+teamy_studio_windows_terminal_engine = { workspace = true, optional = true }
+teamy_studio_windows_terminal_replay.workspace = true
+tracing.workspace = true
 
 [features]
 default = []

@@ -5,11 +5,12 @@ edition = "2024"
 publish = false
 
 [dependencies]
-arbitrary = { version = "1.4.1", features = ["derive"] }
-eyre = "0.6.12"
-facet = "0.44.1"
-sguaba = { version = "0.10.3", default-features = false, features = ["std"] }
-uom = { version = "0.38.0", default-features = false, features = ["autoconvert", "f64", "si", "std"] }
+arbitrary.workspace = true
+eyre.workspace = true
+facet.workspace = true
+sguaba.workspace = true
+uom.workspace = true
 
 [dev-dependencies]
-tempfile = "3.20.0"
+facet-pretty.workspace = true
+tempfile.workspace = true

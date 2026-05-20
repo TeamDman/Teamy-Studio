@@ -5,6 +5,6 @@ edition = "2024"
 publish = false
 
 [dependencies]
-directories-next = "2"
-eyre = "0.6.12"
-tracing = "0.1.41"
+directories-next.workspace = true
+eyre.workspace = true
+tracing.workspace = true

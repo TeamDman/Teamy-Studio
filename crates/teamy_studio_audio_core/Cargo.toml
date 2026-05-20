@@ -5,7 +5,7 @@ edition = "2024"
 publish = false
 
 [dependencies]
-eyre = "0.6.12"
-facet = "0.44.1"
-facet-json = "0.44.1"
-hound = "3.5.1"
+eyre.workspace = true
+facet.workspace = true
+facet-json.workspace = true
+hound.workspace = true

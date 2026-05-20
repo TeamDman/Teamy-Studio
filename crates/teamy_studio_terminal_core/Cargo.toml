@@ -5,29 +5,25 @@ edition = "2024"
 publish = false
 
 [dependencies]
-eyre = "0.6.12"
-facet = "0.44.1"
-portable-pty = "0.9"
-teamy_studio_paths = { path = "../teamy_studio_paths" }
-teamy_studio_shell_default = { path = "../teamy_studio_shell_default" }
-teamy_studio_spatial = { path = "../teamy_studio_spatial" }
-teamy_studio_teamy_terminal_engine = { path = "../teamy_studio_teamy_terminal_engine" }
-teamy_studio_vt_types = { path = "../teamy_studio_vt_types" }
-teamy_studio_windows_audio = { path = "../teamy_studio_windows_audio" }
-teamy_studio_windows_terminal_engine = { path = "../teamy_studio_windows_terminal_engine", optional = true }
-tracing = "0.1.41"
-libghostty-vt = { git = "https://github.com/TeamDman/libghostty-rs.git", rev = "5e5351c9dc4b800202721ce15017c929958f685d", optional = true }
-
-[dependencies.windows]
-version = "0.62.2"
-default-features = false
-features = [
+eyre.workspace = true
+facet.workspace = true
+portable-pty.workspace = true
+teamy_studio_paths.workspace = true
+teamy_studio_shell_default.workspace = true
+teamy_studio_spatial.workspace = true
+teamy_studio_teamy_terminal_engine.workspace = true
+teamy_studio_vt_types.workspace = true
+teamy_studio_windows_audio.workspace = true
+teamy_studio_windows_terminal_engine = { workspace = true, optional = true }
+tracing.workspace = true
+libghostty-vt = { workspace = true, optional = true }
+windows = { workspace = true, features = [
     "std",
     "Win32_Foundation",
     "Win32_System_Console",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
-]
+] }
 
 [features]
 default = []

@@ -5,15 +5,11 @@ edition = "2024"
 publish = false
 
 [dependencies]
-eyre = "0.6.12"
-sguaba = { version = "0.10.3", default-features = false, features = ["std"] }
-uom = { version = "0.38.0", default-features = false, features = ["autoconvert", "f64", "si", "std"] }
-
-[dependencies.windows]
-version = "0.62.2"
-default-features = false
-features = [
+eyre.workspace = true
+sguaba.workspace = true
+uom.workspace = true
+windows = { workspace = true, features = [
     "std",
     "Win32_Foundation",
     "Win32_UI_WindowsAndMessaging",
-]
+] }

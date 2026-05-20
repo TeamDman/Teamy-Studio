@@ -5,14 +5,10 @@ edition = "2024"
 publish = false
 
 [dependencies]
-eyre = "0.6.12"
-tracing = "0.1.41"
-widestring = "1.2"
-
-[dependencies.windows]
-version = "0.62.2"
-default-features = false
-features = [
+eyre.workspace = true
+tracing.workspace = true
+widestring.workspace = true
+windows = { workspace = true, features = [
 	"std",
 	"Win32_Foundation",
 	"Win32_Globalization",
@@ -21,4 +17,4 @@ features = [
 	"Win32_System_LibraryLoader",
 	"Win32_System_Memory",
 	"Win32_System_Ole",
-]
+] }

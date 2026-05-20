@@ -5,7 +5,7 @@ edition = "2024"
 publish = false
 
 [dependencies]
-libghostty-vt = { git = "https://github.com/TeamDman/libghostty-rs.git", rev = "5e5351c9dc4b800202721ce15017c929958f685d", optional = true }
+libghostty-vt = { workspace = true, optional = true }
 
 [features]
 default = []

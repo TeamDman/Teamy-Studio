@@ -5,23 +5,19 @@ edition = "2024"
 publish = false
 
 [dependencies]
-arbitrary = { version = "1.4.1", features = ["derive"] }
-eyre = "0.6.12"
-facet = "0.44.1"
-teamy_studio_audio_core = { path = "../teamy_studio_audio_core" }
-teamy_studio_audio_transcription = { path = "../teamy_studio_audio_transcription" }
-teamy_studio_jobs = { path = "../teamy_studio_jobs" }
-teamy_studio_logs = { path = "../teamy_studio_logs" }
-teamy_studio_paths = { path = "../teamy_studio_paths" }
-teamy_studio_whisper_stack = { path = "../teamy_studio_whisper_stack" }
-teamy_studio_win32_support = { path = "../teamy_studio_win32_support" }
-tracing = "0.1.41"
-uom = { version = "0.38.0", default-features = false, features = ["autoconvert", "f64", "si", "std"] }
-
-[dependencies.windows]
-version = "0.62.2"
-default-features = false
-features = [
+arbitrary.workspace = true
+eyre.workspace = true
+facet.workspace = true
+teamy_studio_audio_core.workspace = true
+teamy_studio_audio_transcription.workspace = true
+teamy_studio_jobs.workspace = true
+teamy_studio_logs.workspace = true
+teamy_studio_paths.workspace = true
+teamy_studio_whisper_stack.workspace = true
+teamy_studio_win32_support.workspace = true
+tracing.workspace = true
+uom.workspace = true
+windows = { workspace = true, features = [
     "std",
     "Win32_Devices_Properties",
     "Win32_Foundation",
@@ -31,7 +27,7 @@ features = [
     "Win32_System_Variant",
     "Win32_UI_Shell_PropertiesSystem",
     "Win32_UI_WindowsAndMessaging",
-]
+] }
 
 [features]
 default = []

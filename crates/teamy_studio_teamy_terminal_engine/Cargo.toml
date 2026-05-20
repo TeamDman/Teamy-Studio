@@ -5,9 +5,9 @@ edition = "2024"
 publish = false
 
 [dependencies]
-facet = "0.44.1"
-tracing = "0.1.41"
-teamy_studio_vt_types = { path = "../teamy_studio_vt_types" }
+facet.workspace = true
+tracing.workspace = true
+teamy_studio_vt_types.workspace = true
 
 [features]
 default = []

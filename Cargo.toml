@@ -30,35 +30,7 @@ members = [
     "crates/teamy_studio_win32_support",
 ]
 
-[package]
-name = "teamy-studio"
-version = "0.1.0"
-edition = "2024"
-authors = ["TeamDman"]
-default-run = "teamy-studio"
-# repo[impl description.meaningful]
-description = "Teamy Studio desktop shell with a low-latency Win32 startup path"
-# repo[impl license.present]
-license = "MPL-2.0"
-readme = "README.md"
-repository = "https://github.com/TeamDman/Teamy-Studio"
-keywords = ["windows", "desktop", "studio"]
-categories = ["command-line-utilities"]
-documentation = "https://github.com/TeamDman/Teamy-Studio"
-
-[profile.dev]
-debug = "full"
-
-[[bin]]
-name = "teamy-studio"
-path = "src/main.rs"
-
-[dependencies]
-arbitrary = { version = "1.4.1", features = ["derive"] }
-burn = { version = "0.19.0", default-features = false, features = ["cuda", "ndarray", "std", "store", "record-item-custom-serde"] }
-burn-store = "0.19.1"
-chrono = "0.4"
-color-eyre = "0.6.5"
+[workspace.dependencies]
 teamy_studio_audio_core = { path = "crates/teamy_studio_audio_core" }
 teamy_studio_app_host = { path = "crates/teamy_studio_app_host" }
 teamy_studio_audio_input = { path = "crates/teamy_studio_audio_input" }
@@ -86,43 +58,146 @@ teamy_studio_windows_dialogs = { path = "crates/teamy_studio_windows_dialogs" }
 teamy_studio_windows_terminal_replay = { path = "crates/teamy_studio_windows_terminal_replay" }
 teamy_studio_windows_terminal_engine = { path = "crates/teamy_studio_windows_terminal_engine" }
 teamy_studio_win32_support = { path = "crates/teamy_studio_win32_support" }
+
+arbitrary = { version = "1.4.1", features = ["derive"] }
+burn = { version = "0.19.0", default-features = false, features = ["cuda", "ndarray", "std", "store", "record-item-custom-serde"] }
+burn-store = "0.19.1"
+chrono = "0.4"
+color-eyre = "0.6.5"
+crossterm = "0.29"
+directories-next = "2"
 dunce = "1.0.5"
 eyre = "0.6.12"
-tracing = "0.1.41"
-tracing-subscriber = { version = "0.3.19", features = ["env-filter", "json"] }
-image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
-directories-next = "2"
-hound = "3.5.1"
-npy = "0.4.0"
-tokio = { version = "1.49.0", features = ["full"] }
 facet = "0.44.1"
 facet-csv = "0.44.1"
 facet-json = "0.44.1"
 facet-pretty = "0.44.1"
 figue = { package = "teamy-figue", version = "2.0.1", features = ["arbitrary"] }
-open = "5"
-reqwest = { version = "0.12.23", default-features = false, features = ["blocking", "rustls-tls"] }
-rfd = "0.15"
-crossterm = "0.29"
 fontdb = "0.23"
-libghostty-vt = { git = "https://github.com/TeamDman/libghostty-rs.git", rev = "5e5351c9dc4b800202721ce15017c929958f685d", optional = true }
+fontdue = "0.9.3"
+hound = "3.5.1"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+libghostty-vt = { git = "https://github.com/TeamDman/libghostty-rs.git", rev = "5e5351c9dc4b800202721ce15017c929958f685d" }
+npy = "0.4.0"
+open = "5"
 portable-pty = "0.9"
 ratatui = { version = "0.30.0", default-features = false, features = ["crossterm"] }
+reqwest = { version = "0.12.23", default-features = false, features = ["blocking", "rustls-tls"] }
+rfd = "0.15"
 rustfft = "6.4.1"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sguaba = { version = "0.10.3", default-features = false, features = ["std"] }
+tempfile = "3.20.0"
+tokio = { version = "1.49.0", features = ["full"] }
 tokenizers = { version = "0.22.0", default-features = false, features = ["onig"] }
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.19", features = ["env-filter", "json"] }
+tracing-tracy = "0.11"
 ttf-parser = "0.25"
 uom = { version = "0.38.0", default-features = false, features = ["autoconvert", "f64", "si", "std"] }
 widestring = "1.2"
 walkdir = "2.5.0"
+windows = { version = "0.62.2", default-features = false }
 zip = { version = "2.4.1", default-features = false, features = ["deflate"] }
 
-[dependencies.windows]
-version = "0.62.2"
-default-features = false
-features = [
+[package]
+name = "teamy-studio"
+version = "0.1.0"
+edition = "2024"
+authors = ["TeamDman"]
+default-run = "teamy-studio"
+# repo[impl description.meaningful]
+description = "Teamy Studio desktop shell with a low-latency Win32 startup path"
+# repo[impl license.present]
+license = "MPL-2.0"
+readme = "README.md"
+repository = "https://github.com/TeamDman/Teamy-Studio"
+keywords = ["windows", "desktop", "studio"]
+categories = ["command-line-utilities"]
+documentation = "https://github.com/TeamDman/Teamy-Studio"
+
+[profile.dev]
+debug = "full"
+
+[profile.profiling]
+inherits = "release"
+incremental = true
+
+[profile.profiling.package.teamy_studio_cli]
+opt-level = 1
+codegen-units = 256
+
+[[bin]]
+name = "teamy-studio"
+path = "src/main.rs"
+
+[dependencies]
+arbitrary.workspace = true
+burn.workspace = true
+burn-store.workspace = true
+chrono.workspace = true
+color-eyre.workspace = true
+teamy_studio_audio_core.workspace = true
+teamy_studio_app_host.workspace = true
+teamy_studio_audio_input.workspace = true
+teamy_studio_audio_transcription.workspace = true
+teamy_studio_cli.workspace = true
+teamy_studio_cursor_info.workspace = true
+teamy_studio_demo_mode.workspace = true
+teamy_studio_frontend.workspace = true
+teamy_studio_image_models.workspace = true
+teamy_studio_jobs.workspace = true
+teamy_studio_logs.workspace = true
+teamy_studio_observability.workspace = true
+teamy_studio_paths.workspace = true
+teamy_studio_shell.workspace = true
+teamy_studio_shell_default.workspace = true
+teamy_studio_spatial.workspace = true
+teamy_studio_teamy_terminal_engine.workspace = true
+teamy_studio_terminal_core.workspace = true
+teamy_studio_timeline_core.workspace = true
+teamy_studio_vt_types.workspace = true
+teamy_studio_waifu2x_reference.workspace = true
+teamy_studio_whisper_stack.workspace = true
+teamy_studio_windows_audio.workspace = true
+teamy_studio_windows_dialogs.workspace = true
+teamy_studio_windows_terminal_replay.workspace = true
+teamy_studio_windows_terminal_engine.workspace = true
+teamy_studio_win32_support.workspace = true
+dunce.workspace = true
+eyre.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+image.workspace = true
+directories-next.workspace = true
+hound.workspace = true
+npy.workspace = true
+tokio.workspace = true
+facet.workspace = true
+facet-csv.workspace = true
+facet-json.workspace = true
+facet-pretty.workspace = true
+figue.workspace = true
+open.workspace = true
+reqwest.workspace = true
+rfd.workspace = true
+crossterm.workspace = true
+fontdb.workspace = true
+libghostty-vt = { workspace = true, optional = true }
+portable-pty.workspace = true
+ratatui.workspace = true
+rustfft.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sguaba.workspace = true
+tokenizers.workspace = true
+ttf-parser.workspace = true
+uom.workspace = true
+widestring.workspace = true
+walkdir.workspace = true
+zip.workspace = true
+windows = { workspace = true, features = [
 	"std",
 	"Win32_Foundation",
 	"Win32_Devices_Properties",
@@ -153,11 +228,11 @@ features = [
 	"Win32_UI_Shell",
 	"Win32_UI_Shell_PropertiesSystem",
 	"Win32_UI_WindowsAndMessaging",
-]
+] }
 
 [dev-dependencies]
-fontdue = "0.9.3"
-tempfile = "3.20.0"
+fontdue.workspace = true
+tempfile.workspace = true
 
 [features]
 default = ["extended_observability"]

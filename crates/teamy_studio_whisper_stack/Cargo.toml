@@ -5,22 +5,22 @@ edition = "2024"
 publish = false
 
 [dependencies]
-burn = { version = "0.19.0", default-features = false, features = ["cuda", "ndarray", "std", "store", "record-item-custom-serde"] }
-burn-store = "0.19.1"
-dunce = "1.0.5"
-eyre = "0.6.12"
-hound = "3.5.1"
-npy = "0.4.0"
-reqwest = { version = "0.12.23", default-features = false, features = ["blocking", "rustls-tls"] }
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-teamy_studio_audio_core = { path = "../teamy_studio_audio_core" }
-teamy_studio_frontend = { path = "../teamy_studio_frontend" }
-teamy_studio_paths = { path = "../teamy_studio_paths" }
-tokenizers = { version = "0.22.0", default-features = false, features = ["onig"] }
-tracing = "0.1.41"
-walkdir = "2.5.0"
-zip = { version = "2.4.1", default-features = false, features = ["deflate"] }
+burn.workspace = true
+burn-store.workspace = true
+dunce.workspace = true
+eyre.workspace = true
+hound.workspace = true
+npy.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+teamy_studio_audio_core.workspace = true
+teamy_studio_frontend.workspace = true
+teamy_studio_paths.workspace = true
+tokenizers.workspace = true
+tracing.workspace = true
+walkdir.workspace = true
+zip.workspace = true
 
 [features]
 default = []

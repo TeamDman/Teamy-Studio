@@ -5,23 +5,19 @@ edition = "2024"
 publish = false
 
 [dependencies]
-eyre = "0.6.12"
-facet = "0.44.1"
-facet-json = "0.44.1"
-teamy_studio_paths = { path = "../teamy_studio_paths" }
-teamy_studio_win32_support = { path = "../teamy_studio_win32_support" }
-tokio = { version = "1.49.0", features = ["full"] }
-tracing = { version = "0.1.41", optional = true }
-
-[dependencies.windows]
-version = "0.62.2"
-default-features = false
-features = [
+eyre.workspace = true
+facet.workspace = true
+facet-json.workspace = true
+teamy_studio_paths.workspace = true
+teamy_studio_win32_support.workspace = true
+tokio.workspace = true
+tracing = { workspace = true, optional = true }
+windows = { workspace = true, features = [
     "std",
     "Win32_Foundation",
     "Win32_System_Memory",
     "Win32_Security",
-]
+] }
 
 [features]
 default = []

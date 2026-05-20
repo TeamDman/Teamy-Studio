@@ -5,9 +5,9 @@ edition = "2024"
 publish = false
 
 [dependencies]
-rustfft = "6.4.1"
-teamy_studio_audio_core = { path = "../teamy_studio_audio_core" }
-tracing = { version = "0.1.41", optional = true }
+rustfft.workspace = true
+teamy_studio_audio_core.workspace = true
+tracing = { workspace = true, optional = true }
 
 [features]
 default = []

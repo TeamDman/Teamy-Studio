@@ -5,38 +5,34 @@ edition = "2024"
 publish = false
 
 [dependencies]
-chrono = "0.4"
-eyre = "0.6.12"
-facet = "0.44.1"
-facet-json = "0.44.1"
-facet-pretty = "0.44.1"
-portable-pty = "0.9"
-rfd = "0.15"
-teamy_studio_audio_input = { path = "../teamy_studio_audio_input" }
-teamy_studio_audio_transcription = { path = "../teamy_studio_audio_transcription" }
-teamy_studio_cursor_info = { path = "../teamy_studio_cursor_info" }
-teamy_studio_demo_mode = { path = "../teamy_studio_demo_mode" }
-teamy_studio_jobs = { path = "../teamy_studio_jobs" }
-teamy_studio_logs = { path = "../teamy_studio_logs" }
-teamy_studio_paths = { path = "../teamy_studio_paths" }
-teamy_studio_shell = { path = "../teamy_studio_shell" }
-teamy_studio_shell_default = { path = "../teamy_studio_shell_default" }
-teamy_studio_spatial = { path = "../teamy_studio_spatial" }
-teamy_studio_terminal_core = { path = "../teamy_studio_terminal_core" }
-teamy_studio_timeline_core = { path = "../teamy_studio_timeline_core" }
-teamy_studio_vt_types = { path = "../teamy_studio_vt_types" }
-teamy_studio_whisper_stack = { path = "../teamy_studio_whisper_stack" }
-teamy_studio_windows_audio = { path = "../teamy_studio_windows_audio" }
-teamy_studio_windows_dialogs = { path = "../teamy_studio_windows_dialogs" }
-teamy_studio_win32_support = { path = "../teamy_studio_win32_support" }
-tracing = "0.1.41"
-uom = { version = "0.38.0", default-features = false, features = ["autoconvert", "f64", "si", "std"] }
-widestring = "1.2"
-
-[dependencies.windows]
-version = "0.62.2"
-default-features = false
-features = [
+chrono.workspace = true
+eyre.workspace = true
+facet.workspace = true
+facet-json.workspace = true
+facet-pretty.workspace = true
+portable-pty.workspace = true
+rfd.workspace = true
+teamy_studio_audio_input.workspace = true
+teamy_studio_audio_transcription.workspace = true
+teamy_studio_cursor_info.workspace = true
+teamy_studio_demo_mode.workspace = true
+teamy_studio_jobs.workspace = true
+teamy_studio_logs.workspace = true
+teamy_studio_paths.workspace = true
+teamy_studio_shell.workspace = true
+teamy_studio_shell_default.workspace = true
+teamy_studio_spatial.workspace = true
+teamy_studio_terminal_core.workspace = true
+teamy_studio_timeline_core.workspace = true
+teamy_studio_vt_types.workspace = true
+teamy_studio_whisper_stack.workspace = true
+teamy_studio_windows_audio.workspace = true
+teamy_studio_windows_dialogs.workspace = true
+teamy_studio_win32_support.workspace = true
+tracing.workspace = true
+uom.workspace = true
+widestring.workspace = true
+windows = { workspace = true, features = [
     "std",
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
@@ -46,8 +42,11 @@ features = [
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
-]
+] }
 
 [features]
 default = []
 extended_observability = []
+
+[dev-dependencies]
+tracing-subscriber.workspace = true

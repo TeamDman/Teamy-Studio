@@ -5,9 +5,9 @@ edition = "2024"
 publish = false
 
 [dependencies]
-eyre = "0.6.12"
-libghostty-vt = { git = "https://github.com/TeamDman/libghostty-rs.git", rev = "5e5351c9dc4b800202721ce15017c929958f685d", optional = true }
-teamy_studio_vt_types = { path = "../teamy_studio_vt_types" }
+eyre.workspace = true
+libghostty-vt = { workspace = true, optional = true }
+teamy_studio_vt_types.workspace = true
 
 [features]
 default = []
