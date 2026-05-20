@@ -1,6 +1,6 @@
 ---
 name: add-tracy-spans
-description: 'Add tracing spans for Tracy profiling in Teamy-Studio. Use when instrumenting startup, windowing, rendering, terminal, async work, or other performance-sensitive code paths and deciding which spans should be always-on versus gated behind the tracy feature.'
+description: 'Add tracing spans for Tracy profiling in Teamy-Studio. Use when instrumenting startup, windowing, rendering, terminal, async work, or other performance-sensitive code paths and deciding which spans should be always-on versus gated behind the extended_observability feature.'
 argument-hint: 'Describe the code path, suspected hot spot, and user flow you want to profile'
 ---
 
@@ -8,7 +8,7 @@ argument-hint: 'Describe the code path, suspected hot spot, and user flow you wa
 
 Use this skill when adding or refining tracing spans in Teamy-Studio so Tracy captures are useful for performance analysis without paying unnecessary overhead in normal runs.
 
-This is not a rule to guard every span behind `feature = "tracy"`.
+This is not a rule to guard every span behind `feature = "extended_observability"`.
 The job is to place spans where they explain time spent, then gate only the spans whose creation cost or volume would distort hot paths.
 
 ## Outcome
@@ -22,9 +22,9 @@ Produce instrumentation that:
 
 ## Teamy-Specific Context
 
-- Teamy-Studio already has a `tracy` cargo feature in `Cargo.toml`.
-- Teamy-Studio already wires Tracy through the tracing subscriber.
-- Teamy-Studio already has `run-tracing.ps1` for capturing and opening a Tracy profile.
+- Teamy-Studio already has an `extended_observability` cargo feature in `Cargo.toml`.
+- Teamy-Studio wires Tracy through the tracing subscriber only when `TEAMY_STUDIO_ENABLE_TRACY_LAYER=1` is present at runtime.
+- Teamy-Studio already has `run-profiler.ps1` for capturing and opening a Tracy profile.
 - teamy-mft is the reference repository for existing span style and gating decisions.
 
 ## Procedure
@@ -70,7 +70,7 @@ Good names:
 
 Avoid dynamic span names.
 
-### 3. Choose always-on versus `tracy`-gated spans
+### 3. Choose always-on versus `extended_observability`-gated spans
 
 Use this decision rule for every new span.
 
@@ -82,7 +82,7 @@ Leave the span always-on when the span is:
 - useful for normal structured logging even without Tracy
 - low-frequency enough that overhead is negligible
 
-Guard the span behind `feature = "tracy"` when the span is:
+Guard the span behind `feature = "extended_observability"` when the span is:
 
 - inside a tight loop
 - created once per item, cell, glyph, line, packet, event, or record
@@ -108,10 +108,10 @@ fn invoke_and_render(...) -> eyre::Result<()> {
 }
 ```
 
-When the function is hot and the entry span should only exist for Tracy builds, use `cfg_attr`:
+When the function is hot and the entry span should only exist for extended observability builds, use `cfg_attr`:
 
 ```rust
-#[cfg_attr(feature = "tracy", instrument(level = "debug", skip_all))]
+#[cfg_attr(feature = "extended_observability", instrument(level = "debug", skip_all))]
 fn hot_inner_step(...) {
     ...
 }
@@ -125,10 +125,10 @@ Prefer always-on block spans for coarse steps:
 let _span = tracing::info_span!("load_terminal_config").entered();
 ```
 
-Prefer `tracy`-gated block spans for tight inner work:
+Prefer `extended_observability`-gated block spans for tight inner work:
 
 ```rust
-#[cfg(feature = "tracy")]
+#[cfg(feature = "extended_observability")]
 let _span = tracing::debug_span!("rasterize_visible_glyph_run").entered();
 ```
 
@@ -202,11 +202,11 @@ In Teamy-Studio, assume these areas may be hot until proven otherwise:
 Default approach in those areas:
 
 - add one coarse always-on parent span around the full phase
-- add inner diagnostic spans only behind `feature = "tracy"`
+- add inner diagnostic spans only behind `feature = "extended_observability"`
 
 Exception:
 
-- if the coarse parent itself runs every frame, every poll tick, or at similarly high frequency, it is acceptable to gate that parent span behind `feature = "tracy"`
+- if the coarse parent itself runs every frame, every poll tick, or at similarly high frequency, it is acceptable to gate that parent span behind `feature = "extended_observability"`
 - in that case, keep the surrounding one-time or per-user-action spans always-on so normal builds still expose the major lifecycle phases
 
 ### 8. Preserve normal logs separately from performance spans
@@ -221,8 +221,8 @@ Add the span around the work and keep the log if it explains behavior.
 
 Mirror the style already established in teamy-mft:
 
-- `#[cfg_attr(feature = "tracy", instrument(...))]` for hot function entry spans
-- `#[cfg(feature = "tracy")] let _span = debug_span!(...).entered();` in tight loops
+- `#[cfg_attr(feature = "extended_observability", instrument(...))]` for hot function entry spans
+- `#[cfg(feature = "extended_observability")] let _span = debug_span!(...).entered();` in tight loops
 - always-on `info_span!` around important higher-level phases
 - `skip_all` on functions whose arguments are large or noisy
 - omit fields on popular short-lived Tracy spans so statistics aggregate cleanly
@@ -232,7 +232,7 @@ When a scoped span block triggers both lints, prefer this shape:
 
 ```rust
 let () = {
-    #[cfg(feature = "tracy")]
+    #[cfg(feature = "extended_observability")]
     let _span = tracing::debug_span!("populate_render_scene").entered();
     do_work();
 };
@@ -260,7 +260,7 @@ After adding spans:
 For Teamy-Studio, use the existing wrapper:
 
 ```powershell
-.\run-tracing.ps1 window show
+.\run-profiler.ps1 window show
 ```
 
 Or pass the specific subcommand flow you are investigating.
@@ -274,9 +274,9 @@ Use this quick table when deciding what to add.
 | App or command entrypoint | Always-on `#[instrument]` or `info_span!` |
 | One-time startup phase | Always-on `info_span!` |
 | File open, device open, OS call, resource load | Usually always-on `info_span!` |
-| Tight per-item loop | `#[cfg(feature = "tracy")]` block span |
-| Render inner loop | `#[cfg(feature = "tracy")]` block span |
-| Parallel worker closure | Usually `#[cfg(feature = "tracy")]` block span |
+| Tight per-item loop | `#[cfg(feature = "extended_observability")]` block span |
+| Render inner loop | `#[cfg(feature = "extended_observability")]` block span |
+| Parallel worker closure | Usually `#[cfg(feature = "extended_observability")]` block span |
 | Moderate-cost helper called occasionally | Always-on `#[instrument(skip_all)]` can be fine |
 | Tiny helper called extremely often | Avoid or gate the span |
 
@@ -286,7 +286,7 @@ Before finishing, verify all of these:
 
 - The span names describe user-visible work or a meaningful internal phase.
 - The trace has a clear parent-child structure.
-- Hot-loop spans are gated behind `feature = "tracy"`.
+- Hot-loop spans are gated behind `feature = "extended_observability"`.
 - Coarse phase spans remain available without Tracy.
 - Span fields are bounded and useful.
 - Hot short-lived spans that matter in Tracy statistics are not parameterized.
@@ -298,7 +298,7 @@ Before finishing, verify all of these:
 Avoid these mistakes:
 
 - adding spans to every function in a file
-- guarding every span behind `feature = "tracy"`
+- guarding every span behind `feature = "extended_observability"`
 - leaving high-volume inner spans always-on in render or parsing loops
 - parameterizing hot short-lived spans and fragmenting Tracy statistics
 - putting huge payloads in span fields
@@ -313,7 +313,7 @@ When asked to instrument a Teamy-Studio code path:
 1. Identify the target user flow and the performance question.
 2. Find the entrypoint and add one or two coarse spans.
 3. Run `./check-all.ps1`.
-4. Capture with `./run-tracing.ps1 ...`.
+4. Capture with `./run-profiler.ps1 ...`.
 5. Inspect the hottest child region in Tracy.
 6. Add one more layer of detail only there.
 7. Gate fine-grained spans if they are on a hot path.

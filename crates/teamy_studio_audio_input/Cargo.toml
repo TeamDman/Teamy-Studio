@@ -35,4 +35,4 @@ features = [
 
 [features]
 default = []
-tracy = []
+extended_observability = []

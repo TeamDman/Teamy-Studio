@@ -3,6 +3,8 @@ param(
 	[string[]]$QueryArgs
 )
 
+$tracyLayerEnvVar = 'TEAMY_STUDIO_ENABLE_TRACY_LAYER'
+
 function Format-Elapsed {
 	param(
 		[Parameter(Mandatory = $true)]
@@ -167,9 +169,11 @@ Write-Host "Waiting 00:01.000 for tracy-capture to get ready"
 Start-Sleep -Seconds 1
 
 try {
-	Write-Host "Running: cargo run --release --features tracy -- $($QueryArgs -join ' ')"
+	$previousTracyLayerSetting = [Environment]::GetEnvironmentVariable($tracyLayerEnvVar)
+	Set-Item -Path "Env:$tracyLayerEnvVar" -Value '1'
+	Write-Host "Running with $tracyLayerEnvVar=1: cargo run --release -- $($QueryArgs -join ' ')"
 	$commandStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
-	cargo run --release --features tracy -- @QueryArgs --log-filter trace
+	cargo run --release -- @QueryArgs --log-filter trace
 	$commandStopwatch.Stop()
 	$commandElapsed = $commandStopwatch.Elapsed
 	Write-Host "Traced command time: $(Format-Elapsed $commandElapsed)"
@@ -178,6 +182,11 @@ try {
 	}
 }
 finally {
+	if ($null -eq $previousTracyLayerSetting) {
+		Remove-Item "Env:$tracyLayerEnvVar" -ErrorAction SilentlyContinue
+	} else {
+		Set-Item -Path "Env:$tracyLayerEnvVar" -Value $previousTracyLayerSetting
+	}
 	$cleanupStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
 	Write-Host "Waiting $(Format-Elapsed $captureFlushDelay) before closing tracy-capture"
 	Start-Sleep -Milliseconds ([int]$captureFlushDelay.TotalMilliseconds)

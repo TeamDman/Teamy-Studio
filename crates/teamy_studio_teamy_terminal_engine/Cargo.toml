@@ -11,4 +11,4 @@ teamy_studio_vt_types = { path = "../teamy_studio_vt_types" }
 
 [features]
 default = []
-tracy = []
+extended_observability = []

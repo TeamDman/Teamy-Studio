@@ -882,7 +882,7 @@ impl AudioInputTranscriptionState {
 impl AudioInputRuntimeState {
     // audio[impl transcription.cached-preview]
     pub fn refresh_transcription_preview_cache(&mut self) {
-        #[cfg(feature = "tracy")]
+        #[cfg(feature = "extended_observability")]
         let _span = tracing::debug_span!("refresh_transcription_preview_cache").entered();
         if !self.transcription.enabled {
             return;

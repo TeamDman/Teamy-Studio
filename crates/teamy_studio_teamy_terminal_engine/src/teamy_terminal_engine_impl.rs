@@ -1,6 +1,6 @@
 use facet::Facet;
 use std::borrow::Cow;
-#[cfg(feature = "tracy")]
+#[cfg(feature = "extended_observability")]
 use tracing::debug_span;
 use tracing::warn;
 
@@ -251,7 +251,7 @@ impl TeamyTerminalEngine {
         }
 
         let () = {
-            #[cfg(feature = "tracy")]
+            #[cfg(feature = "extended_observability")]
             let _span = debug_span!("teamy_terminal_vt_write").entered();
 
             self.pending_utf8.extend_from_slice(bytes);
@@ -485,7 +485,7 @@ impl TeamyTerminalEngine {
     #[must_use]
     pub fn display_state(&self) -> TeamyDisplayState {
         {
-            #[cfg(feature = "tracy")]
+            #[cfg(feature = "extended_observability")]
             let _span = debug_span!("teamy_terminal_display_state").entered();
 
             let viewport = self.viewport_metrics();
@@ -536,7 +536,7 @@ impl TeamyTerminalEngine {
     )]
     fn process_text(&mut self, text: &str) {
         let () = {
-            #[cfg(feature = "tracy")]
+            #[cfg(feature = "extended_observability")]
             let _span = debug_span!("teamy_terminal_process_text").entered();
 
             for character in text.chars() {
@@ -652,7 +652,7 @@ impl TeamyTerminalEngine {
 
     fn apply_csi(&mut self, parameters: &str, intermediates: &str, final_byte: char) {
         let () = {
-            #[cfg(feature = "tracy")]
+            #[cfg(feature = "extended_observability")]
             let _span = debug_span!("teamy_terminal_apply_csi").entered();
 
             self.record_event(

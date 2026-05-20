@@ -6,21 +6,45 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::Mutex;
-#[cfg(feature = "tracy")]
+#[cfg(feature = "extended_observability")]
 use tracing::Metadata;
 use tracing::debug;
 use tracing::level_filters::LevelFilter;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::Registry;
-#[cfg(feature = "tracy")]
+#[cfg(feature = "extended_observability")]
 use tracing_subscriber::filter::FilterFn;
 use tracing_subscriber::fmt::writer::BoxMakeWriter;
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::util::SubscriberInitExt;
 
-#[cfg(feature = "tracy")]
+#[cfg(feature = "extended_observability")]
 fn exclude_tracy_frame_mark(meta: &Metadata<'_>) -> bool {
     meta.fields().field("tracy.frame_mark").is_none()
+}
+
+#[cfg(feature = "extended_observability")]
+const TEAMY_STUDIO_ENABLE_TRACY_LAYER_ENV: &str = "TEAMY_STUDIO_ENABLE_TRACY_LAYER";
+
+#[cfg(feature = "extended_observability")]
+fn env_flag_enabled(value: Option<&str>) -> bool {
+    let Some(value) = value else {
+        return false;
+    };
+
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+#[cfg(feature = "extended_observability")]
+fn tracy_layer_requested() -> bool {
+    env_flag_enabled(
+        std::env::var(TEAMY_STUDIO_ENABLE_TRACY_LAYER_ENV)
+            .ok()
+            .as_deref(),
+    )
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -118,7 +142,7 @@ pub fn init_logging(config: &LoggingConfig) -> eyre::Result<()> {
             .boxed()
     };
     let stderr_layer = stderr_layer.with_filter(stderr_env_filter_layer);
-    #[cfg(feature = "tracy")]
+    #[cfg(feature = "extended_observability")]
     let stderr_layer = stderr_layer.with_filter(FilterFn::new(exclude_tracy_frame_mark));
     let subscriber = subscriber.with(stderr_layer);
 
@@ -143,7 +167,7 @@ pub fn init_logging(config: &LoggingConfig) -> eyre::Result<()> {
             .with_line_number(true)
             .with_writer(json_writer);
         let json_layer = json_layer.with_filter(build_env_filter(config, rust_log.as_deref())?);
-        #[cfg(feature = "tracy")]
+        #[cfg(feature = "extended_observability")]
         let json_layer = json_layer.with_filter(FilterFn::new(exclude_tracy_frame_mark));
         Some(json_layer)
     } else {
@@ -154,8 +178,11 @@ pub fn init_logging(config: &LoggingConfig) -> eyre::Result<()> {
     // timeline[impl playground.live-tracing-unfiltered]
     let subscriber = subscriber.with(teamy_studio_logs::LogCollectorLayer);
 
-    #[cfg(all(feature = "tracy", not(test)))]
-    let subscriber = subscriber.with(tracing_tracy::TracyLayer::default());
+    #[cfg(all(feature = "extended_observability", not(test)))]
+    let tracy_layer_requested = tracy_layer_requested();
+    #[cfg(all(feature = "extended_observability", not(test)))]
+    let subscriber =
+        subscriber.with(tracy_layer_requested.then(tracing_tracy::TracyLayer::default));
 
     if let Err(error) = subscriber.try_init() {
         eprintln!(
@@ -164,10 +191,13 @@ pub fn init_logging(config: &LoggingConfig) -> eyre::Result<()> {
         return Ok(());
     }
 
-    #[cfg(all(feature = "tracy", not(test)))]
-    tracing::info!(
-        "Tracy profiling layer added, memory usage will increase until a client is connected"
-    );
+    #[cfg(all(feature = "extended_observability", not(test)))]
+    if tracy_layer_requested {
+        tracing::info!(
+            env_var = TEAMY_STUDIO_ENABLE_TRACY_LAYER_ENV,
+            "Tracy profiling layer enabled, memory usage will increase until a client is connected"
+        );
+    }
 
     debug!(?json_log_path, debug = config.debug, "Tracing initialized");
     Ok(())
@@ -175,6 +205,8 @@ pub fn init_logging(config: &LoggingConfig) -> eyre::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "extended_observability")]
+    use super::env_flag_enabled;
     use super::{LogFilterSelection, resolve_json_log_path, select_log_filter};
     use crate::LoggingConfig;
 
@@ -264,5 +296,21 @@ mod tests {
                 .and_then(|name| name.to_str())
                 .is_some_and(|name| name.starts_with("log_") && name.ends_with(".ndjson"))
         );
+    }
+
+    #[cfg(feature = "extended_observability")]
+    #[test]
+    fn tracy_layer_flag_defaults_to_disabled() {
+        assert!(!env_flag_enabled(None));
+        assert!(!env_flag_enabled(Some("0")));
+        assert!(!env_flag_enabled(Some("false")));
+    }
+
+    #[cfg(feature = "extended_observability")]
+    #[test]
+    fn tracy_layer_flag_accepts_truthy_values() {
+        assert!(env_flag_enabled(Some("1")));
+        assert!(env_flag_enabled(Some("true")));
+        assert!(env_flag_enabled(Some("ON")));
     }
 }

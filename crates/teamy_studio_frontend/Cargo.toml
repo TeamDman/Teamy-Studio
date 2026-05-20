@@ -11,4 +11,4 @@ tracing = { version = "0.1.41", optional = true }
 
 [features]
 default = []
-tracy = ["dep:tracing"]
+extended_observability = ["dep:tracing"]

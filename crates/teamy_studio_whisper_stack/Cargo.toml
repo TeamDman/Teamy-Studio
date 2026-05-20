@@ -21,3 +21,7 @@ tokenizers = { version = "0.22.0", default-features = false, features = ["onig"]
 tracing = "0.1.41"
 walkdir = "2.5.0"
 zip = { version = "2.4.1", default-features = false, features = ["deflate"] }
+
+[features]
+default = []
+extended_observability = []

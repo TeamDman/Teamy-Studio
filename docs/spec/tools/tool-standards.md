@@ -77,11 +77,11 @@ The program must reject using `--debug` together with `--log-filter`.
 
 ## Quality Gate
 
-tool[tests.exclude-tracy-feature]
-The repository quality gate must run tests without enabling the `tracy` feature.
+tool[tests.disable-tracy-layer-during-quality-gate]
+The repository quality gate must disable the Tracy subscriber layer during tests and routine validation runs, even when extended observability spans are compiled in by default.
 
 tool[tests.avoid-tracy-firewall-prompt]
-The repository quality gate must avoid enabling `tracy` during tests because Tracy can trigger a Windows firewall prompt that is inappropriate for routine automated validation.
+The repository quality gate must avoid enabling the Tracy subscriber layer during tests because Tracy can trigger a Windows firewall prompt that is inappropriate for routine automated validation.
 
 tool[tests.headless.required-for-terminal-engine]
 Terminal-engine and terminal-rendering changes should prefer headless automated verification over visible-window-only manual testing.

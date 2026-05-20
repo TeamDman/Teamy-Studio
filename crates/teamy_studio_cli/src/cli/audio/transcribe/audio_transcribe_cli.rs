@@ -720,7 +720,7 @@ fn transcribe_one_input(
     } else {
         let mut chunk_results = Vec::with_capacity(chunks.len());
         for chunk in &chunks {
-            #[cfg(feature = "tracy")]
+            #[cfg(feature = "extended_observability")]
             let _span = tracing::debug_span!("transcribe_audio_chunk").entered();
             let chunk_result = transcribe_audio_chunk(
                 &effective_audio,
@@ -873,7 +873,7 @@ fn transcribe_audio_chunks_batched(
     let mut results = Vec::with_capacity(chunks.len());
     let batch_total = chunks.len().div_ceil(batch_size);
     for (batch_index, batch) in chunks.chunks(batch_size).enumerate() {
-        #[cfg(feature = "tracy")]
+        #[cfg(feature = "extended_observability")]
         let _span = tracing::debug_span!("transcribe_audio_chunk_batch").entered();
         let batch_number = batch_index + 1;
         log_overall_progress(
@@ -887,7 +887,7 @@ fn transcribe_audio_chunks_batched(
             &[batch_progress_line(batch, batch_number, batch_total)],
         );
         let prepared_features = {
-            #[cfg(feature = "tracy")]
+            #[cfg(feature = "extended_observability")]
             let _span = tracing::debug_span!("prepare_whisper_batch_features").entered();
             prepare_whisper_batch_features(batch.iter().map(|chunk| chunk.samples))?
         };
@@ -898,7 +898,7 @@ fn transcribe_audio_chunks_batched(
 
         let decode_started_at = Instant::now();
         let summaries = {
-            #[cfg(feature = "tracy")]
+            #[cfg(feature = "extended_observability")]
             let _span = tracing::debug_span!("decode_whisper_chunk_batch").entered();
             decoder.decode_batch_with_progress(&features, |decode_progress| {
                 if should_log_batch_token_progress(decode_progress) {

@@ -4,7 +4,7 @@ use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
-#[cfg(feature = "tracy")]
+#[cfg(feature = "extended_observability")]
 use tracing::debug_span;
 use tracing::trace;
 
@@ -1018,7 +1018,7 @@ impl TerminalSession {
             .spawn(move || {
                 loop {
                     let update = {
-                        #[cfg(feature = "tracy")]
+                        #[cfg(feature = "extended_observability")]
                         let _span = debug_span!("wait_for_terminal_worker_update").entered();
                         update_rx.recv()
                     };
@@ -1041,7 +1041,7 @@ impl TerminalSession {
                         .and_then(|wake_window| *wake_window);
                     if let Some(raw_hwnd) = wake_target {
                         let () = {
-                            #[cfg(feature = "tracy")]
+                            #[cfg(feature = "extended_observability")]
                             let _span = debug_span!("post_terminal_worker_wake").entered();
                             // Safety: this reconstructs the live window handle value previously stored by the UI thread and posts a message without dereferencing it.
                             let _ = unsafe {
@@ -1189,7 +1189,10 @@ impl TerminalSession {
         })
     }
 
-    #[cfg_attr(feature = "tracy", instrument(level = "debug", skip_all))]
+    #[cfg_attr(
+        feature = "extended_observability",
+        instrument(level = "debug", skip_all)
+    )]
     pub fn handle_char(&mut self, code_unit: u32, lparam: isize) -> eyre::Result<bool> {
         let response = self.request(TerminalWorkerCommand::HandleChar { code_unit, lparam })?;
         match response.payload {
@@ -1203,7 +1206,10 @@ impl TerminalSession {
         }
     }
 
-    #[cfg_attr(feature = "tracy", instrument(level = "debug", skip_all))]
+    #[cfg_attr(
+        feature = "extended_observability",
+        instrument(level = "debug", skip_all)
+    )]
     pub fn handle_key_event(
         &mut self,
         vkey: u32,
@@ -1392,7 +1398,10 @@ impl TerminalSession {
         }
     }
 
-    #[cfg_attr(feature = "tracy", instrument(level = "debug", skip_all))]
+    #[cfg_attr(
+        feature = "extended_observability",
+        instrument(level = "debug", skip_all)
+    )]
     fn request(&mut self, command: TerminalWorkerCommand) -> eyre::Result<TerminalWorkerResponse> {
         self.drain_worker_updates();
         let (reply_tx, reply_rx) = mpsc::sync_channel(1);
@@ -1400,7 +1409,7 @@ impl TerminalSession {
             .send(TerminalWorkerRequest { command, reply_tx })
             .map_err(|error| eyre::eyre!("failed to send terminal worker request: {error}"))?;
         let response = {
-            #[cfg(feature = "tracy")]
+            #[cfg(feature = "extended_observability")]
             let _span = debug_span!("wait_for_terminal_worker_response").entered();
             reply_rx.recv()
         }
@@ -1410,7 +1419,10 @@ impl TerminalSession {
         Ok(response)
     }
 
-    #[cfg_attr(feature = "tracy", instrument(level = "debug", skip_all))]
+    #[cfg_attr(
+        feature = "extended_observability",
+        instrument(level = "debug", skip_all)
+    )]
     fn request_read_only(
         &self,
         command: TerminalWorkerCommand,
@@ -1420,7 +1432,7 @@ impl TerminalSession {
             .send(TerminalWorkerRequest { command, reply_tx })
             .map_err(|error| eyre::eyre!("failed to send terminal worker request: {error}"))?;
         {
-            #[cfg(feature = "tracy")]
+            #[cfg(feature = "extended_observability")]
             let _span = debug_span!("wait_for_terminal_worker_response").entered();
             reply_rx.recv()
         }
@@ -1428,7 +1440,7 @@ impl TerminalSession {
     }
 
     fn drain_worker_updates(&mut self) {
-        #[cfg(feature = "tracy")]
+        #[cfg(feature = "extended_observability")]
         let _span = debug_span!("drain_terminal_worker_updates").entered();
 
         let Ok(mut pending_updates) = self.pending_updates.lock() else {
@@ -1518,7 +1530,7 @@ impl TerminalWorkerRunner {
         }
         loop {
             let request = {
-                #[cfg(feature = "tracy")]
+                #[cfg(feature = "extended_observability")]
                 let _span = debug_span!("wait_for_terminal_worker_request").entered();
                 self.request_rx.recv_timeout(TERMINAL_WORKER_IDLE_TIMEOUT)
             };
@@ -1542,7 +1554,10 @@ impl TerminalWorkerRunner {
         }
     }
 
-    #[cfg_attr(feature = "tracy", instrument(level = "debug", skip_all))]
+    #[cfg_attr(
+        feature = "extended_observability",
+        instrument(level = "debug", skip_all)
+    )]
     fn handle_request(&mut self, request: TerminalWorkerRequest) -> eyre::Result<()> {
         let payload = match request.command {
             TerminalWorkerCommand::Resize(layout) => {
@@ -1644,7 +1659,10 @@ impl TerminalWorkerRunner {
         Ok(())
     }
 
-    #[cfg_attr(feature = "tracy", instrument(level = "debug", skip_all))]
+    #[cfg_attr(
+        feature = "extended_observability",
+        instrument(level = "debug", skip_all)
+    )]
     fn service_background_output(&mut self) -> eyre::Result<()> {
         let poll_result = self.core.poll_pty_output()?;
         if poll_result.queued_output {
@@ -1702,14 +1720,17 @@ impl TerminalWorkerRunner {
         Ok(())
     }
 
-    #[cfg_attr(feature = "tracy", instrument(level = "debug", skip_all))]
+    #[cfg_attr(
+        feature = "extended_observability",
+        instrument(level = "debug", skip_all)
+    )]
     fn publish_display_state_if_due(&mut self) -> eyre::Result<()> {
         if !self.should_publish_display_state() {
             return Ok(());
         }
 
         let display = {
-            #[cfg(feature = "tracy")]
+            #[cfg(feature = "extended_observability")]
             let _span = debug_span!("publish_cached_terminal_display_state").entered();
             self.core.cached_display_state()?
         };
@@ -1871,7 +1892,7 @@ impl TerminalCore {
                 let mut buffer = vec![0_u8; PTY_READ_BUFFER_BYTES];
                 loop {
                     let read_result = {
-                        #[cfg(feature = "tracy")]
+                        #[cfg(feature = "extended_observability")]
                         let _span = debug_span!("wait_for_pty_output_read").entered();
                         cloned_reader.read(&mut buffer)
                     };
@@ -2010,19 +2031,22 @@ impl TerminalCore {
         Ok(())
     }
 
-    #[cfg_attr(feature = "tracy", instrument(level = "debug", skip_all))]
+    #[cfg_attr(
+        feature = "extended_observability",
+        instrument(level = "debug", skip_all)
+    )]
     pub fn poll_pty_output(&mut self) -> eyre::Result<PollPtyOutputResult> {
         let mut queued_output = false;
 
         let () = {
-            #[cfg(feature = "tracy")]
+            #[cfg(feature = "extended_observability")]
             let _span = debug_span!("drain_pty_reader_messages").entered();
 
             while let Ok(message) = self.reader.try_recv() {
                 match message {
                     PtyReaderMessage::Output { bytes, read_at } => {
                         let normalized_bytes = {
-                            #[cfg(feature = "tracy")]
+                            #[cfg(feature = "extended_observability")]
                             let _span = debug_span!("normalize_terminal_output_bytes").entered();
                             normalize_cursor_visibility_mode_sequence(&bytes)
                         };
@@ -2030,7 +2054,7 @@ impl TerminalCore {
                         let semantic_prompt_before_output = self.semantic_prompt;
 
                         let () = {
-                            #[cfg(feature = "tracy")]
+                            #[cfg(feature = "extended_observability")]
                             let _span = debug_span!("queue_pty_output_message").entered();
 
                             if should_close_from_echoed_ctrl_d(
@@ -2061,7 +2085,7 @@ impl TerminalCore {
                     PtyReaderMessage::Error(error) => {
                         let message = format!("\r\n[pty read error: {error}]\r\n");
                         let () = {
-                            #[cfg(feature = "tracy")]
+                            #[cfg(feature = "extended_observability")]
                             let _span = debug_span!("queue_pty_read_error_message").entered();
                             self.queue_terminal_output(message.as_bytes(), Instant::now());
                             queued_output = true;
@@ -2080,7 +2104,10 @@ impl TerminalCore {
         })
     }
 
-    #[cfg_attr(feature = "tracy", instrument(level = "debug", skip_all))]
+    #[cfg_attr(
+        feature = "extended_observability",
+        instrument(level = "debug", skip_all)
+    )]
     #[expect(
         dead_code,
         reason = "keeps the pre-worker TerminalCore API available while the worker now drives output slices directly"
@@ -2089,7 +2116,7 @@ impl TerminalCore {
         let output_processed = self.pump_pending_output_slice() > 0;
 
         if output_processed {
-            #[cfg(feature = "tracy")]
+            #[cfg(feature = "extended_observability")]
             let _span = debug_span!("refresh_semantic_prompt_tracking").entered();
             self.refresh_semantic_prompt_tracking()?;
         }
@@ -2112,7 +2139,7 @@ impl TerminalCore {
     }
 
     fn refresh_child_exit_state(&mut self) -> eyre::Result<()> {
-        #[cfg(feature = "tracy")]
+        #[cfg(feature = "extended_observability")]
         let _span = debug_span!("query_terminal_child_exit").entered();
         if self
             .child
@@ -2157,7 +2184,10 @@ impl TerminalCore {
         self.observe_pending_output_depth();
     }
 
-    #[cfg_attr(feature = "tracy", instrument(level = "debug", skip_all))]
+    #[cfg_attr(
+        feature = "extended_observability",
+        instrument(level = "debug", skip_all)
+    )]
     fn flush_pending_output(&mut self) -> usize {
         if self.pending_output.is_empty() {
             return 0;
@@ -2185,15 +2215,15 @@ impl TerminalCore {
         }
 
         let () = {
-            #[cfg(feature = "tracy")]
+            #[cfg(feature = "extended_observability")]
             let _span = debug_span!("process_terminal_output_chunk").entered();
             let () = {
-                #[cfg(feature = "tracy")]
+                #[cfg(feature = "extended_observability")]
                 let _span = debug_span!("observe_terminal_osc_sequences").entered();
                 self.observe_terminal_osc_sequences(&slice);
             };
             let () = {
-                #[cfg(feature = "tracy")]
+                #[cfg(feature = "extended_observability")]
                 let _span = debug_span!("vt_write_terminal_output_slice").entered();
                 self.engine.vt_write(&slice);
             };
@@ -2238,7 +2268,10 @@ impl TerminalCore {
             .max(dirty_row_count);
     }
 
-    #[cfg_attr(feature = "tracy", instrument(level = "debug", skip_all))]
+    #[cfg_attr(
+        feature = "extended_observability",
+        instrument(level = "debug", skip_all)
+    )]
     pub fn handle_char(&mut self, code_unit: u32, lparam: isize) -> eyre::Result<bool> {
         trace!(
             code_unit,
@@ -2310,7 +2343,10 @@ impl TerminalCore {
         Ok(true)
     }
 
-    #[cfg_attr(feature = "tracy", instrument(level = "debug", skip_all))]
+    #[cfg_attr(
+        feature = "extended_observability",
+        instrument(level = "debug", skip_all)
+    )]
     pub fn handle_key_event(
         &mut self,
         vkey: u32,
@@ -2603,7 +2639,10 @@ impl TerminalCore {
         Ok(())
     }
 
-    #[cfg_attr(feature = "tracy", instrument(level = "debug", skip_all))]
+    #[cfg_attr(
+        feature = "extended_observability",
+        instrument(level = "debug", skip_all)
+    )]
     pub fn visible_display_state_with_selection(
         &mut self,
         selection: Option<TerminalSelection>,
@@ -2629,7 +2668,10 @@ impl TerminalCore {
         Ok(Arc::clone(&self.cached_display))
     }
 
-    #[cfg_attr(feature = "tracy", instrument(level = "debug", skip_all))]
+    #[cfg_attr(
+        feature = "extended_observability",
+        instrument(level = "debug", skip_all)
+    )]
     fn build_display_state(
         &mut self,
         selection: Option<TerminalSelection>,
@@ -2673,7 +2715,10 @@ impl TerminalCore {
         )
     }
 
-    #[cfg_attr(feature = "tracy", instrument(level = "debug", skip_all))]
+    #[cfg_attr(
+        feature = "extended_observability",
+        instrument(level = "debug", skip_all)
+    )]
     fn write_input(&mut self, data: &[u8]) -> eyre::Result<()> {
         let mut writer = self
             .writer
@@ -2916,7 +2961,7 @@ fn build_ghostty_display_state(
     viewport: TerminalViewportMetrics,
 ) -> eyre::Result<TerminalDisplayState> {
     engine.with_snapshot(|snapshot| {
-        #[cfg(feature = "tracy")]
+        #[cfg(feature = "extended_observability")]
         let _span = debug_span!("update_terminal_render_state").entered();
 
         let colors = snapshot
@@ -2944,7 +2989,7 @@ fn build_ghostty_display_state(
             Dirty::Full
         });
 
-        #[cfg(feature = "tracy")]
+        #[cfg(feature = "extended_observability")]
         let _span = debug_span!("collect_visible_terminal_cells").entered();
         let mut row_index = 0_i32;
         let mut row_iter = rows
@@ -3072,7 +3117,7 @@ fn build_teamy_display_state(
     const TEAMY_SELECTION_BACKGROUND: [f32; 4] = [0.42, 0.67, 0.98, 1.0];
 
     {
-        #[cfg(feature = "tracy")]
+        #[cfg(feature = "extended_observability")]
         let _span = debug_span!("build_teamy_terminal_display_state").entered();
 
         let teamy_display = engine.display_state();

@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
-#[cfg(feature = "tracy")]
+#[cfg(feature = "extended_observability")]
 use tracing::debug_span;
 use tracing::trace;
 
@@ -4223,7 +4223,7 @@ fn message_loop() -> eyre::Result<()> {
     loop {
         let mut message = MSG::default();
         let status = {
-            #[cfg(feature = "tracy")]
+            #[cfg(feature = "extended_observability")]
             let _span = debug_span!("wait_for_window_message").entered();
             // Safety: `message` is a valid out-pointer for GetMessageW on this UI thread.
             unsafe { GetMessageW(&raw mut message, None, 0, 0) }
@@ -7424,7 +7424,7 @@ fn handle_focused_render_timer(hwnd: WindowHandle) -> LRESULT {
         }
 
         let () = {
-            #[cfg(feature = "tracy")]
+            #[cfg(feature = "extended_observability")]
             let _span = debug_span!("render_focused_animation_frame").entered();
             render_current_frame_with_options(state, hwnd, None, true)?;
         };
@@ -7730,7 +7730,10 @@ fn acknowledge_paint(hwnd: WindowHandle) -> eyre::Result<()> {
 /// behavior[impl window.interaction.resize.live]
 /// behavior[impl window.interaction.resize.terminal-live-output]
 /// behavior[impl window.interaction.resize.low-latency]
-#[cfg_attr(feature = "tracy", instrument(level = "debug", skip_all))]
+#[cfg_attr(
+    feature = "extended_observability",
+    instrument(level = "debug", skip_all)
+)]
 fn handle_poll_timer(hwnd: WindowHandle) -> eyre::Result<bool> {
     with_app_state(|state| {
         let poll_result = state.terminal.poll_pty_output()?;
@@ -7752,7 +7755,10 @@ fn handle_poll_timer(hwnd: WindowHandle) -> eyre::Result<bool> {
     })
 }
 
-#[cfg_attr(feature = "tracy", instrument(level = "debug", skip_all))]
+#[cfg_attr(
+    feature = "extended_observability",
+    instrument(level = "debug", skip_all)
+)]
 fn render_current_frame(
     state: &mut AppState,
     hwnd: WindowHandle,
@@ -7776,18 +7782,18 @@ fn render_current_frame_with_options(
     }
 
     let layout = {
-        #[cfg(feature = "tracy")]
+        #[cfg(feature = "extended_observability")]
         let _span = debug_span!("compute_client_layout").entered();
         terminal_client_layout(hwnd, state)?
     };
     let window_chrome_buttons_state = terminal_window_chrome_buttons_state(state, hwnd, layout);
     let diagnostic_text = {
-        #[cfg(feature = "tracy")]
+        #[cfg(feature = "extended_observability")]
         let _span = debug_span!("build_diagnostic_panel_text").entered();
         build_diagnostic_panel_text(state, layout)?
     };
     let terminal_display = {
-        #[cfg(feature = "tracy")]
+        #[cfg(feature = "extended_observability")]
         let _span = debug_span!("build_terminal_display_state").entered();
         let display = if let Some(selection) = state.terminal_selection {
             Arc::new(
@@ -7811,7 +7817,7 @@ fn render_current_frame_with_options(
         return Ok(());
     };
     let () = {
-        #[cfg(feature = "tracy")]
+        #[cfg(feature = "extended_observability")]
         let _span = debug_span!("submit_render_frame_model").entered();
         let frame = RenderFrameModel {
             layout,

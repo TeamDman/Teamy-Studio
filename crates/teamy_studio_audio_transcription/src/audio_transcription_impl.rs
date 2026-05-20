@@ -87,7 +87,7 @@ pub fn audio_transcription_prepare_handoff_tensor_from_samples(
     samples: &[f32],
     sample_rate_hz: u32,
 ) -> WhisperLogMel80x3000 {
-    #[cfg(feature = "tracy")]
+    #[cfg(feature = "extended_observability")]
     let _span = tracing::debug_span!("prepare_transcription_handoff_tensor_from_samples").entered();
     if samples.is_empty() || sample_rate_hz == 0 {
         return WhisperLogMel80x3000::zeros();

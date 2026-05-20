@@ -310,7 +310,7 @@ impl<B: Backend> WhisperTextDecoder<B> {
             None
         };
         for (layer_index, block) in self.blocks.iter().enumerate() {
-            #[cfg(feature = "tracy")]
+            #[cfg(feature = "extended_observability")]
             let _span = tracing::debug_span!("whisper_decoder_layer").entered();
             let previous_cache = if caches.is_empty() {
                 None
@@ -463,14 +463,14 @@ impl<B: Backend> ResidualDecoderAttentionBlock<B> {
             (Some(cache.self_attn), Some(cache.cross_attn))
         });
         let (attn_output, self_attn_cache) = {
-            #[cfg(feature = "tracy")]
+            #[cfg(feature = "extended_observability")]
             let _span = tracing::debug_span!("whisper_decoder_self_attention").entered();
             self.attn
                 .forward_with_cache(self.attn_ln.forward(input.clone()), mask, self_attn_cache)
         };
         let input = input + attn_output;
         let (input, cross_attn_cache) = {
-            #[cfg(feature = "tracy")]
+            #[cfg(feature = "extended_observability")]
             let _span = tracing::debug_span!("whisper_decoder_cross_attention").entered();
             let cross_attn_cache =
                 cross_attn_cache.unwrap_or_else(|| self.cross_attn.key_value_cache(encoder_output));
@@ -482,7 +482,7 @@ impl<B: Backend> ResidualDecoderAttentionBlock<B> {
             (input, cross_attn_cache)
         };
         let input = {
-            #[cfg(feature = "tracy")]
+            #[cfg(feature = "extended_observability")]
             let _span = tracing::debug_span!("whisper_decoder_mlp").entered();
             input.clone() + self.mlp.forward(self.mlp_ln.forward(input))
         };
@@ -1261,7 +1261,7 @@ impl LoadedWhisperGreedyDecoder {
             });
         tracing::info_span!("whisper_batch_decoder_loop").in_scope(|| -> eyre::Result<()> {
             for token_index in 0..decode_limit {
-                #[cfg(feature = "tracy")]
+                #[cfg(feature = "extended_observability")]
                 let _span = tracing::debug_span!("whisper_batch_decoder_token_step").entered();
                 if active_count == 0 {
                     break;
@@ -1269,7 +1269,7 @@ impl LoadedWhisperGreedyDecoder {
                 let token_started_at = Instant::now();
                 last_decoder_logits_dims = decoder_logits.dims();
                 let next_token_ids = {
-                    #[cfg(feature = "tracy")]
+                    #[cfg(feature = "extended_observability")]
                     let _span = tracing::debug_span!("whisper_greedy_select_next_tokens").entered();
                     greedy_next_token_ids(&decoder_logits, &self.suppressed_token_ids)?
                 };
@@ -1321,7 +1321,7 @@ impl LoadedWhisperGreedyDecoder {
                 let next_token_index = token_index + 2;
                 let next_token_rows = token_id_rows_to_tensor(&next_token_rows, &self.device)?;
                 (decoder_logits, caches) = {
-                    #[cfg(feature = "tracy")]
+                    #[cfg(feature = "extended_observability")]
                     let _span =
                         tracing::debug_span!("whisper_batch_decoder_incremental_forward").entered();
                     self.model.decoder.forward_incremental_with_layer_progress(
@@ -1359,7 +1359,7 @@ impl LoadedWhisperGreedyDecoder {
                 .map(
                     |((generated_token_ids, terminated_on_end_of_text), stop_reason)| {
                         let text = {
-                            #[cfg(feature = "tracy")]
+                            #[cfg(feature = "extended_observability")]
                             let _span =
                                 tracing::debug_span!("decode_whisper_generated_tokens").entered();
                             decode_token_ids_with_tokenizer(&tokenizer, &generated_token_ids, true)?

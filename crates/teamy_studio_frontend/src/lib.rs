@@ -55,23 +55,23 @@ pub fn pad_or_trim(samples: &[f32], target_len: usize) -> Vec<f32> {
 
 #[must_use]
 pub fn whisper_log_mel_spectrogram(samples: &[f32]) -> WhisperLogMelSpectrogram {
-    #[cfg(feature = "tracy")]
+    #[cfg(feature = "extended_observability")]
     let _span = tracing::debug_span!("whisper_log_mel_spectrogram").entered();
     let padded = {
-        #[cfg(feature = "tracy")]
+        #[cfg(feature = "extended_observability")]
         let _span = tracing::debug_span!("whisper_pad_or_trim_audio").entered();
         pad_or_trim(samples, N_SAMPLES)
     };
     let power = stft_power_spectrogram(&padded);
     let filters = {
-        #[cfg(feature = "tracy")]
+        #[cfg(feature = "extended_observability")]
         let _span = tracing::debug_span!("whisper_mel_filter_bank").entered();
         mel_filter_bank()
     };
     let mut mel_spec = vec![0.0_f32; N_MELS * N_FRAMES];
 
     let () = {
-        #[cfg(feature = "tracy")]
+        #[cfg(feature = "extended_observability")]
         let _span = tracing::debug_span!("whisper_mel_projection").entered();
         for mel_bin in 0..N_MELS {
             for frame in 0..N_FRAMES {
@@ -87,7 +87,7 @@ pub fn whisper_log_mel_spectrogram(samples: &[f32]) -> WhisperLogMelSpectrogram 
     };
 
     let mut log_spec = {
-        #[cfg(feature = "tracy")]
+        #[cfg(feature = "extended_observability")]
         let _span = tracing::debug_span!("whisper_log_normalize_mel").entered();
         let mut log_spec = mel_spec
             .into_iter()
@@ -111,7 +111,7 @@ pub fn whisper_log_mel_spectrogram(samples: &[f32]) -> WhisperLogMelSpectrogram 
 }
 
 fn stft_power_spectrogram(samples: &[f32]) -> Vec<f32> {
-    #[cfg(feature = "tracy")]
+    #[cfg(feature = "extended_observability")]
     let _span = tracing::debug_span!("whisper_stft_power_spectrogram").entered();
     let window = hann_window(N_FFT);
     let mut planner = FftPlanner::<f32>::new();

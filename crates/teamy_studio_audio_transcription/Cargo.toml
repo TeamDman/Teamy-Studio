@@ -25,4 +25,4 @@ features = [
 
 [features]
 default = []
-tracy = ["dep:tracing"]
+extended_observability = ["dep:tracing"]

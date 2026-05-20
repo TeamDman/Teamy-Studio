@@ -81,7 +81,7 @@ That script runs formatting, clippy, build, tests, and local tracey validation.
 For Tracy profiling, run:
 
 ```powershell
-./run-tracing.ps1 window show
+./run-profiler.ps1 window show
 ```
 
 <!-- repo[impl implementation.present] -->

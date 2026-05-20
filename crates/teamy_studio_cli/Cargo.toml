@@ -49,4 +49,4 @@ ghostty = [
 	"teamy_studio_windows_terminal_engine/ghostty",
 	"teamy_studio_windows_terminal_replay/ghostty",
 ]
-tracy = []
+extended_observability = []

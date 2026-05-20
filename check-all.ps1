@@ -3,6 +3,8 @@ param(
 	[switch]$VerboseBuild
 )
 
+$tracyLayerEnvVar = 'TEAMY_STUDIO_ENABLE_TRACY_LAYER'
+
 function Invoke-CargoWithOptionalVerbosity {
 	param(
 		[Parameter(Mandatory = $true)]
@@ -91,14 +93,14 @@ function Invoke-Step {
 	}
 }
 
-function Get-NonTracyTestFeatureArgs {
+function Get-TestFeatureArgs {
 	param(
 		[switch]$Full
 	)
 
-	# tool[impl tests.exclude-tracy-feature]
+	# tool[impl tests.disable-tracy-layer-during-quality-gate]
 	# tool[impl tests.avoid-tracy-firewall-prompt]
-	$defaultExcludedFeatures = @("default", "tracy")
+	$defaultExcludedFeatures = @("default", "extended_observability")
 	if (-not $Full) {
 		$defaultExcludedFeatures += "font-snapshot-tests"
 	}
@@ -136,58 +138,68 @@ function Stop-TeamyStudioProcessIfRunning {
 	taskkill /F /IM teamy-studio.exe | Out-Null
 }
 
-Invoke-Step -Label "format check" -Action {
-	Invoke-CargoWithOptionalVerbosity -Arguments @("fmt", "--all")
-}
-
-Invoke-Step -Label "clippy lint check" -Action {
-	# cargo clippy --all-targets --all-features -- -D warnings
-	Invoke-CargoWithOptionalVerbosity -Arguments @("clippy", "--all-features", "--", "-D", "warnings")
-}
-
-Invoke-Step -Label "build (all features)" -Action {
-	Stop-TeamyStudioProcessIfRunning
-	if ($VerboseBuild) {
-		Write-BuildNetworkDiagnostics
-		Write-CargoSourceDiagnostics
-		Invoke-CargoWithOptionalVerbosity -Arguments @("build", "--all-features", "--locked")
-	} else {
-		cargo build --all-features --quiet
+$previousTracyLayerSetting = [Environment]::GetEnvironmentVariable($tracyLayerEnvVar)
+Set-Item -Path "Env:$tracyLayerEnvVar" -Value '0'
+try {
+	Invoke-Step -Label "format check" -Action {
+		Invoke-CargoWithOptionalVerbosity -Arguments @("fmt", "--all")
 	}
-}
 
-Invoke-Step -Label "tests" -Action {
-	Stop-TeamyStudioProcessIfRunning
-	$featuresArg = Get-NonTracyTestFeatureArgs -Full:$Full
-	$previousFullCheck = $env:TEAMY_STUDIO_FULL_CHECK
-	$env:TEAMY_STUDIO_FULL_CHECK = if ($Full) { '1' } else { '0' }
-	try {
-	if ($VerboseBuild) {
-		$testArguments = @("test") + $featuresArg + @("--locked")
-		Invoke-CargoWithOptionalVerbosity -Arguments $testArguments
-	} else {
-		cargo test @featuresArg --quiet
+	Invoke-Step -Label "clippy lint check" -Action {
+		# cargo clippy --all-targets --all-features -- -D warnings
+		Invoke-CargoWithOptionalVerbosity -Arguments @("clippy", "--all-features", "--", "-D", "warnings")
 	}
-	} finally {
-		if ($null -eq $previousFullCheck) {
-			Remove-Item Env:TEAMY_STUDIO_FULL_CHECK -ErrorAction SilentlyContinue
+
+	Invoke-Step -Label "build (all features)" -Action {
+		Stop-TeamyStudioProcessIfRunning
+		if ($VerboseBuild) {
+			Write-BuildNetworkDiagnostics
+			Write-CargoSourceDiagnostics
+			Invoke-CargoWithOptionalVerbosity -Arguments @("build", "--all-features", "--locked")
 		} else {
-			$env:TEAMY_STUDIO_FULL_CHECK = $previousFullCheck
+			cargo build --all-features --quiet
 		}
 	}
-}
 
-Invoke-Step -Label "tracey status" -Action {
-	tracey query status
-}
+	Invoke-Step -Label "tests" -Action {
+		Stop-TeamyStudioProcessIfRunning
+		$featuresArg = Get-TestFeatureArgs -Full:$Full
+		$previousFullCheck = $env:TEAMY_STUDIO_FULL_CHECK
+		$env:TEAMY_STUDIO_FULL_CHECK = if ($Full) { '1' } else { '0' }
+		try {
+		if ($VerboseBuild) {
+			$testArguments = @("test") + $featuresArg + @("--locked")
+			Invoke-CargoWithOptionalVerbosity -Arguments $testArguments
+		} else {
+			cargo test @featuresArg --quiet
+		}
+		} finally {
+			if ($null -eq $previousFullCheck) {
+				Remove-Item Env:TEAMY_STUDIO_FULL_CHECK -ErrorAction SilentlyContinue
+			} else {
+				$env:TEAMY_STUDIO_FULL_CHECK = $previousFullCheck
+			}
+		}
+	}
 
-Invoke-Step -Label "build (default features)" -Action {
-	Stop-TeamyStudioProcessIfRunning
-	if ($VerboseBuild) {
-		Write-BuildNetworkDiagnostics
-		Write-CargoSourceDiagnostics
-		Invoke-CargoWithOptionalVerbosity -Arguments @("build", "--locked")
+	Invoke-Step -Label "tracey status" -Action {
+		tracey query status
+	}
+
+	Invoke-Step -Label "build (default features)" -Action {
+		Stop-TeamyStudioProcessIfRunning
+		if ($VerboseBuild) {
+			Write-BuildNetworkDiagnostics
+			Write-CargoSourceDiagnostics
+			Invoke-CargoWithOptionalVerbosity -Arguments @("build", "--locked")
+		} else {
+			cargo build --quiet
+		}
+	}
+} finally {
+	if ($null -eq $previousTracyLayerSetting) {
+		Remove-Item "Env:$tracyLayerEnvVar" -ErrorAction SilentlyContinue
 	} else {
-		cargo build --quiet
+		Set-Item -Path "Env:$tracyLayerEnvVar" -Value $previousTracyLayerSetting
 	}
 }

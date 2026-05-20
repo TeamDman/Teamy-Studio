@@ -35,7 +35,7 @@ use eyre::Context;
 use fontdb::{Database, Family, Query, Source};
 use image::imageops::{FilterType, resize};
 use image::{ImageBuffer, Rgba, RgbaImage};
-#[cfg(feature = "tracy")]
+#[cfg(feature = "extended_observability")]
 use tracing::debug_span;
 use tracing::{info, info_span, instrument, warn};
 use ttf_parser::{Face, GlyphId, OutlineBuilder};
@@ -854,19 +854,19 @@ fn render_thread_main_loop(
 
         let result = (|| -> eyre::Result<()> {
             if let Some((width, height)) = pending_resize {
-                #[cfg(feature = "tracy")]
+                #[cfg(feature = "extended_observability")]
                 let _span = debug_span!("render_thread_resize_swap_chain").entered();
                 renderer.resize(width, height)?;
             }
 
             if pending_reactivate_low_latency_mode {
-                #[cfg(feature = "tracy")]
+                #[cfg(feature = "extended_observability")]
                 let _span = debug_span!("render_thread_reactivate_low_latency_mode").entered();
                 renderer.reactivate_low_latency_mode()?;
             }
 
             if let Some(queued_frame) = pending_frame.as_ref() {
-                #[cfg(feature = "tracy")]
+                #[cfg(feature = "extended_observability")]
                 let _span = debug_span!("render_thread_render_frame").entered();
                 renderer.render_frame_model(
                     &queued_frame.frame,
@@ -1277,12 +1277,18 @@ impl D3d12PanelRenderer {
         Ok(())
     }
 
-    #[cfg_attr(feature = "tracy", instrument(level = "debug", skip_all))]
+    #[cfg_attr(
+        feature = "extended_observability",
+        instrument(level = "debug", skip_all)
+    )]
     pub fn render(&mut self, scene: &RenderScene) -> eyre::Result<()> {
         self.render_fragments(&[scene])
     }
 
-    #[cfg_attr(feature = "tracy", instrument(level = "debug", skip_all))]
+    #[cfg_attr(
+        feature = "extended_observability",
+        instrument(level = "debug", skip_all)
+    )]
     pub fn render_fragments(&mut self, scenes: &[&RenderScene]) -> eyre::Result<()> {
         // Curve, band, inverse, and vertex uploads all reuse shared upload buffers, so the
         // previous frame must be finished before we overwrite them for a new live frame.
@@ -1313,12 +1319,12 @@ impl D3d12PanelRenderer {
             .find_map(|scene| transformed_text_inverse_homography_for_scene(scene))
             .unwrap_or([[0.0; 4]; 2]);
         {
-            #[cfg(feature = "tracy")]
+            #[cfg(feature = "extended_observability")]
             let _span = debug_span!("update_slug_curves").entered();
             let _ = self.update_slug_curves_for_fragments(scenes)?;
         }
         let vertex_count = {
-            #[cfg(feature = "tracy")]
+            #[cfg(feature = "extended_observability")]
             let _span = debug_span!("update_scene_vertices").entered();
             self.update_scene_vertices_for_fragments(scenes)?
         };
@@ -1362,12 +1368,12 @@ impl D3d12PanelRenderer {
             self.transformed_text_inverse_homography =
                 transformed_text_inverse_homography_for_scene(scene).unwrap_or([[0.0; 4]; 2]);
             let _glyph_cache_changed = {
-                #[cfg(feature = "tracy")]
+                #[cfg(feature = "extended_observability")]
                 let _span = debug_span!("update_slug_curves").entered();
                 self.update_slug_curves_for_fragments(&[scene])?
             };
             let scene_vertices = {
-                #[cfg(feature = "tracy")]
+                #[cfg(feature = "extended_observability")]
                 let _span = debug_span!("update_scene_vertices").entered();
                 self.cached_fragment_vertices(scene, false, &mut scene_cache.scene_vertices)
             };
@@ -1409,7 +1415,7 @@ impl D3d12PanelRenderer {
         );
 
         let glyph_cache_changed = {
-            #[cfg(feature = "tracy")]
+            #[cfg(feature = "extended_observability")]
             let _span = debug_span!("update_slug_curves").entered();
             let mut scenes = Vec::with_capacity(terminal_scenes.len() + 2);
             scenes.push(chrome_scene.as_ref());
@@ -1419,7 +1425,7 @@ impl D3d12PanelRenderer {
         };
 
         let chrome_vertices = {
-            #[cfg(feature = "tracy")]
+            #[cfg(feature = "extended_observability")]
             let _span = debug_span!("update_chrome_vertices").entered();
             self.cached_fragment_vertices(
                 chrome_scene.as_ref(),
@@ -1428,7 +1434,7 @@ impl D3d12PanelRenderer {
             )
         };
         let terminal_vertices = {
-            #[cfg(feature = "tracy")]
+            #[cfg(feature = "extended_observability")]
             let _span = debug_span!("update_terminal_vertices").entered();
             scene_cache
                 .terminal_vertices
@@ -1447,7 +1453,7 @@ impl D3d12PanelRenderer {
             vertices
         };
         let diagnostic_vertices = {
-            #[cfg(feature = "tracy")]
+            #[cfg(feature = "extended_observability")]
             let _span = debug_span!("update_diagnostic_vertices").entered();
             self.cached_fragment_vertices(
                 diagnostic_scene.as_ref(),
@@ -1457,7 +1463,7 @@ impl D3d12PanelRenderer {
         };
 
         let vertex_count = {
-            #[cfg(feature = "tracy")]
+            #[cfg(feature = "extended_observability")]
             let _span = debug_span!("update_scene_vertices").entered();
             let mut fragments = Vec::with_capacity(terminal_vertices.len() + 2);
             let mut fragment_reused = Vec::with_capacity(terminal_vertices.len() + 2);
@@ -1755,13 +1761,13 @@ impl D3d12PanelRenderer {
 
     fn execute_prepared_frame(&mut self, vertex_count: usize) -> eyre::Result<()> {
         {
-            #[cfg(feature = "tracy")]
+            #[cfg(feature = "extended_observability")]
             let _span = debug_span!("wait_for_frame_sync").entered();
             self.wait_for_frame_latency()?;
         }
         let frame_index = unsafe { self.swap_chain.GetCurrentBackBufferIndex() as usize };
         {
-            #[cfg(feature = "tracy")]
+            #[cfg(feature = "extended_observability")]
             let _span = debug_span!("wait_for_frame_fence").entered();
             self.wait_for_frame(frame_index)?;
         }
@@ -1780,7 +1786,7 @@ impl D3d12PanelRenderer {
         let command_allocator = &self.command_allocators[frame_index];
 
         {
-            #[cfg(feature = "tracy")]
+            #[cfg(feature = "extended_observability")]
             let _span = debug_span!("record_render_commands").entered();
             unsafe {
                 command_allocator.Reset()?;
@@ -1840,7 +1846,7 @@ impl D3d12PanelRenderer {
 
         let command_lists = [Some(self.command_list.cast::<ID3D12CommandList>()?)];
         {
-            #[cfg(feature = "tracy")]
+            #[cfg(feature = "extended_observability")]
             let _span = debug_span!("submit_and_present_frame").entered();
             unsafe {
                 self.command_queue.ExecuteCommandLists(&command_lists);
@@ -1860,7 +1866,7 @@ impl D3d12PanelRenderer {
         }
 
         self.signal_frame(frame_index)?;
-        #[cfg(feature = "tracy")]
+        #[cfg(feature = "extended_observability")]
         info!(message = "finished frame", tracy.frame_mark = true,);
         Ok(())
     }
