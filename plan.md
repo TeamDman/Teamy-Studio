@@ -91,6 +91,8 @@ Current status:
 - `teamy_studio_windows_dialogs` has been extracted behind a compatibility re-export
 - `teamy_studio_teamy_terminal_engine` has been extracted behind a compatibility re-export
 - `teamy_studio_windows_terminal_engine` has been extracted behind a compatibility re-export
+- `teamy_studio_windows_terminal_replay` has been extracted behind a compatibility re-export
+- `teamy_studio_timeline_core` now owns the compiled `timeline` implementation, with the root crate re-exporting it as `crate::timeline`
 - fast iteration validation is currently green with `cargo clippy -- -D warnings`
 - the root workspace currently includes:
   - `crates/teamy_studio_audio_transcription`
@@ -104,10 +106,12 @@ Current status:
   - `crates/teamy_studio_image_models`
   - `crates/teamy_studio_spatial`
   - `crates/teamy_studio_teamy_terminal_engine`
+  - `crates/teamy_studio_timeline_core`
   - `crates/teamy_studio_vt_types`
   - `crates/teamy_studio_waifu2x_reference`
   - `crates/teamy_studio_windows_audio`
   - `crates/teamy_studio_windows_dialogs`
+  - `crates/teamy_studio_windows_terminal_replay`
   - `crates/teamy_studio_windows_terminal_engine`
 
 Next slice:
@@ -138,6 +142,8 @@ If context compacts, assume the following is the current ground truth unless the
 - `src/app/windows_dialogs.rs` is now a thin shim: `pub use teamy_studio_windows_dialogs::*;`
 - `src/app/teamy_terminal_engine.rs` is now a thin shim: `pub use teamy_studio_teamy_terminal_engine::*;`
 - `src/app/windows_terminal_engine.rs` is now a thin shim: `pub use teamy_studio_windows_terminal_engine::*;`
+- `src/app/windows_terminal_replay.rs` is now a thin shim: `pub use teamy_studio_windows_terminal_replay::*;`
+- `src/lib.rs` now re-exports `teamy_studio_timeline_core` as `crate::timeline`
 - the moved code lives in:
   - `src/app/audio_transcription_impl.rs`, compiled through `crates/teamy_studio_audio_transcription/src/lib.rs`
   - `src/app/jobs_impl.rs`, compiled through `crates/teamy_studio_jobs/src/lib.rs`
@@ -148,6 +154,8 @@ If context compacts, assume the following is the current ground truth unless the
   - `src/app/windows_dialogs_impl.rs`, compiled through `crates/teamy_studio_windows_dialogs/src/lib.rs`
   - `src/app/teamy_terminal_engine_impl.rs`, compiled through `crates/teamy_studio_teamy_terminal_engine/src/lib.rs`
   - `src/app/windows_terminal_engine_impl.rs`, compiled through `crates/teamy_studio_windows_terminal_engine/src/lib.rs`
+  - `src/app/windows_terminal_replay_impl.rs`, compiled through `crates/teamy_studio_windows_terminal_replay/src/lib.rs`
+  - `src/timeline/*`, compiled through `crates/teamy_studio_timeline_core/src/lib.rs`
   - `crates/teamy_studio_paths/src/*`
   - `crates/teamy_studio_win32_support/src/*`
   - `crates/teamy_studio_audio_core/src/lib.rs`
@@ -165,7 +173,7 @@ If context compacts, assume the following is the current ground truth unless the
 ### Validation state
 
 - current fast iteration gate: `cargo clippy -- -D warnings`
-- current status of that fast gate: green after the sixteen landed extractions above
+- current status of that fast gate: green after the eighteen landed extractions above
 - last known `.\check-all.ps1` success was earlier in the refactor, before the later `win32_support` and `audio_core` slices, when the user switched us to clippy-only iteration
 
 ### Extraction recipe

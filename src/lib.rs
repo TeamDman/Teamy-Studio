@@ -11,7 +11,7 @@ pub mod logs;
 pub mod model;
 pub mod paths;
 pub mod shell_default;
-pub mod timeline;
+pub use teamy_studio_timeline_core as timeline;
 pub mod transcription;
 pub mod waifu2x_reference;
 pub mod whisper;

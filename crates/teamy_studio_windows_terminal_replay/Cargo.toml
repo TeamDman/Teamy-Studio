@@ -1,0 +1,17 @@
+[package]
+name = "teamy_studio_windows_terminal_replay"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+eyre = "0.6.12"
+facet = "0.44.1"
+facet-json = "0.44.1"
+libghostty-vt = { git = "https://github.com/TeamDman/libghostty-rs.git", rev = "5e5351c9dc4b800202721ce15017c929958f685d", optional = true }
+teamy_studio_teamy_terminal_engine = { path = "../teamy_studio_teamy_terminal_engine" }
+teamy_studio_windows_terminal_engine = { path = "../teamy_studio_windows_terminal_engine", optional = true }
+
+[features]
+default = []
+ghostty = ["dep:libghostty-vt", "dep:teamy_studio_windows_terminal_engine"]

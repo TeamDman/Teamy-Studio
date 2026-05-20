@@ -11,10 +11,12 @@ members = [
     "crates/teamy_studio_shell_default",
     "crates/teamy_studio_spatial",
     "crates/teamy_studio_teamy_terminal_engine",
+    "crates/teamy_studio_timeline_core",
     "crates/teamy_studio_vt_types",
     "crates/teamy_studio_waifu2x_reference",
     "crates/teamy_studio_windows_audio",
     "crates/teamy_studio_windows_dialogs",
+    "crates/teamy_studio_windows_terminal_replay",
     "crates/teamy_studio_windows_terminal_engine",
     "crates/teamy_studio_win32_support",
 ]
@@ -58,10 +60,12 @@ teamy_studio_paths = { path = "crates/teamy_studio_paths" }
 teamy_studio_shell_default = { path = "crates/teamy_studio_shell_default" }
 teamy_studio_spatial = { path = "crates/teamy_studio_spatial" }
 teamy_studio_teamy_terminal_engine = { path = "crates/teamy_studio_teamy_terminal_engine" }
+teamy_studio_timeline_core = { path = "crates/teamy_studio_timeline_core" }
 teamy_studio_vt_types = { path = "crates/teamy_studio_vt_types" }
 teamy_studio_waifu2x_reference = { path = "crates/teamy_studio_waifu2x_reference" }
 teamy_studio_windows_audio = { path = "crates/teamy_studio_windows_audio" }
 teamy_studio_windows_dialogs = { path = "crates/teamy_studio_windows_dialogs" }
+teamy_studio_windows_terminal_replay = { path = "crates/teamy_studio_windows_terminal_replay" }
 teamy_studio_windows_terminal_engine = { path = "crates/teamy_studio_windows_terminal_engine" }
 teamy_studio_win32_support = { path = "crates/teamy_studio_win32_support" }
 dunce = "1.0.5"
@@ -141,7 +145,7 @@ tempfile = "3.20.0"
 [features]
 default = []
 font-snapshot-tests = []
-ghostty = ["dep:libghostty-vt", "teamy_studio_vt_types/ghostty", "teamy_studio_windows_terminal_engine/ghostty"]
+ghostty = ["dep:libghostty-vt", "teamy_studio_vt_types/ghostty", "teamy_studio_windows_terminal_engine/ghostty", "teamy_studio_windows_terminal_replay/ghostty"]
 tracy = ["dep:tracing-tracy", "teamy_studio_audio_transcription/tracy", "teamy_studio_frontend/tracy", "teamy_studio_teamy_terminal_engine/tracy"]
 
 [build-dependencies]

@@ -5775,12 +5775,14 @@ dependencies = [
  "teamy_studio_shell_default",
  "teamy_studio_spatial",
  "teamy_studio_teamy_terminal_engine",
+ "teamy_studio_timeline_core",
  "teamy_studio_vt_types",
  "teamy_studio_waifu2x_reference",
  "teamy_studio_win32_support",
  "teamy_studio_windows_audio",
  "teamy_studio_windows_dialogs",
  "teamy_studio_windows_terminal_engine",
+ "teamy_studio_windows_terminal_replay",
  "tempfile",
  "tokenizers",
  "tokio",
@@ -5898,6 +5900,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "teamy_studio_timeline_core"
+version = "0.1.0"
+dependencies = [
+ "arbitrary",
+ "eyre",
+ "facet",
+ "sguaba",
+ "tempfile",
+ "uom",
+]
+
+[[package]]
 name = "teamy_studio_vt_types"
 version = "0.1.0"
 dependencies = [
@@ -5949,6 +5963,18 @@ dependencies = [
  "eyre",
  "libghostty-vt",
  "teamy_studio_vt_types",
+]
+
+[[package]]
+name = "teamy_studio_windows_terminal_replay"
+version = "0.1.0"
+dependencies = [
+ "eyre",
+ "facet",
+ "facet-json",
+ "libghostty-vt",
+ "teamy_studio_teamy_terminal_engine",
+ "teamy_studio_windows_terminal_engine",
 ]
 
 [[package]]

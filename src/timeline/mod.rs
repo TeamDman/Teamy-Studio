@@ -76,10 +76,6 @@ pub struct TimelineViewportPoint {
     coordinate: Coordinate<TimelineViewportSpace>,
 }
 
-#[expect(
-    clippy::expl_impl_clone_on_copy,
-    reason = "this coordinate wrapper mirrors the existing spatial point pattern in the repo"
-)]
 impl Clone for TimelineViewportPoint {
     fn clone(&self) -> Self {
         *self
