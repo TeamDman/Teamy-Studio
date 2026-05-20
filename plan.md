@@ -67,10 +67,9 @@ This order is intentionally low-risk:
 
 Current goal:
 
-1. establish the Cargo workspace shape
-2. extract `src/paths` into `crates/teamy_studio_paths`
-3. keep `crate::paths` stable through a thin re-export shim
-4. prove that the first crate split can happen without changing behavior
+1. finish the remaining `render_verification` / `windows_app` seam
+2. extract `windows_app.rs` into a dedicated app-host crate
+3. keep the root facade stable while finishing the transition
 
 Current status:
 
@@ -129,9 +128,13 @@ Current status:
 
 Next slice:
 
-1. extract the next pure or low-coupling subsystem, likely `timeline` or another utility seam that does not force a redesign
-2. preserve the root module path through the same thin re-export pattern
-3. keep the extraction as close to an exact move as possible
+1. move the text-rendering verification helper cluster out of `windows_app.rs`
+2. finish moving `render_verification` into `teamy_studio_shell`
+3. extract `windows_app.rs` into `teamy_studio_app_host`
+
+See:
+
+- `docs/notes/crate-refactor-handoff.md`
 
 ## Compaction Handoff
 
