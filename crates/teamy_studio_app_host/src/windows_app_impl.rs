@@ -542,7 +542,7 @@ enum TimelinePlaygroundSourceMode {
 #[derive(Debug)]
 struct TimelinePlaygroundState {
     seed: u64,
-    dataset: TimelineDataset,
+    dataset: Arc<TimelineDataset>,
     grouping_mode: TimelineGroupingMode,
     minimum_visible_pixels: u32,
     visible_start_ns: i64,
@@ -852,9 +852,9 @@ struct TimelinePlaygroundRowPositionAnimation {
 impl TimelinePlaygroundState {
     fn new() -> eyre::Result<Self> {
         let seed = TimelineSyntheticConfig::default().seed();
-        let dataset = generate_synthetic_timeline_dataset(
+        let dataset = Arc::new(generate_synthetic_timeline_dataset(
             &TimelineSyntheticConfig::default().with_seed(seed),
-        )?;
+        )?);
         Ok(Self {
             seed,
             dataset,
@@ -881,9 +881,9 @@ impl TimelinePlaygroundState {
         self.live_tracing_snapshot_revision = None;
         self.last_live_tracing_sync_at = None;
         self.seed = self.seed.wrapping_add(0x9e37_79b9_7f4a_7c15);
-        self.dataset = generate_synthetic_timeline_dataset(
+        self.dataset = Arc::new(generate_synthetic_timeline_dataset(
             &TimelineSyntheticConfig::default().with_seed(self.seed),
-        )?;
+        )?);
         self.zoom_animation = None;
         self.row_position_animation = None;
         self.last_row_positions.clear();
@@ -16804,7 +16804,7 @@ mod tests {
         );
         dataset.compact();
         let mut playground = TimelinePlaygroundState::new().expect("playground");
-        playground.dataset = dataset;
+        playground.dataset = Arc::new(dataset);
 
         playground.visible_start_ns = 900;
         playground.visible_end_ns = 1_100;
@@ -16872,7 +16872,7 @@ mod tests {
         let mut dataset = TimelineDataset::new();
         dataset.push_event(TimelineItemInput::new("origin"), TimelineInstantNs::new(0));
         let mut playground = TimelinePlaygroundState::new().expect("playground");
-        playground.dataset = dataset;
+        playground.dataset = Arc::new(dataset);
         playground.visible_start_ns = 500;
         playground.visible_end_ns = 1_500;
 
@@ -16888,7 +16888,7 @@ mod tests {
         let mut dataset = TimelineDataset::new();
         dataset.push_event(TimelineItemInput::new("earlier"), TimelineInstantNs::new(0));
         let mut playground = TimelinePlaygroundState::new().expect("playground");
-        playground.dataset = dataset;
+        playground.dataset = Arc::new(dataset);
         playground.visible_start_ns = 10_000;
         playground.visible_end_ns = 11_000;
 
