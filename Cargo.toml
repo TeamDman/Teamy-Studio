@@ -3,13 +3,19 @@ resolver = "3"
 members = [
     "crates/teamy_studio_audio_core",
     "crates/teamy_studio_audio_transcription",
+    "crates/teamy_studio_demo_mode",
     "crates/teamy_studio_frontend",
     "crates/teamy_studio_image_models",
     "crates/teamy_studio_jobs",
     "crates/teamy_studio_paths",
     "crates/teamy_studio_shell_default",
     "crates/teamy_studio_spatial",
+    "crates/teamy_studio_teamy_terminal_engine",
+    "crates/teamy_studio_vt_types",
     "crates/teamy_studio_waifu2x_reference",
+    "crates/teamy_studio_windows_audio",
+    "crates/teamy_studio_windows_dialogs",
+    "crates/teamy_studio_windows_terminal_engine",
     "crates/teamy_studio_win32_support",
 ]
 
@@ -44,13 +50,19 @@ chrono = "0.4"
 color-eyre = "0.6.5"
 teamy_studio_audio_core = { path = "crates/teamy_studio_audio_core" }
 teamy_studio_audio_transcription = { path = "crates/teamy_studio_audio_transcription" }
+teamy_studio_demo_mode = { path = "crates/teamy_studio_demo_mode" }
 teamy_studio_frontend = { path = "crates/teamy_studio_frontend" }
 teamy_studio_image_models = { path = "crates/teamy_studio_image_models" }
 teamy_studio_jobs = { path = "crates/teamy_studio_jobs" }
 teamy_studio_paths = { path = "crates/teamy_studio_paths" }
 teamy_studio_shell_default = { path = "crates/teamy_studio_shell_default" }
 teamy_studio_spatial = { path = "crates/teamy_studio_spatial" }
+teamy_studio_teamy_terminal_engine = { path = "crates/teamy_studio_teamy_terminal_engine" }
+teamy_studio_vt_types = { path = "crates/teamy_studio_vt_types" }
 teamy_studio_waifu2x_reference = { path = "crates/teamy_studio_waifu2x_reference" }
+teamy_studio_windows_audio = { path = "crates/teamy_studio_windows_audio" }
+teamy_studio_windows_dialogs = { path = "crates/teamy_studio_windows_dialogs" }
+teamy_studio_windows_terminal_engine = { path = "crates/teamy_studio_windows_terminal_engine" }
 teamy_studio_win32_support = { path = "crates/teamy_studio_win32_support" }
 dunce = "1.0.5"
 eyre = "0.6.12"
@@ -129,8 +141,8 @@ tempfile = "3.20.0"
 [features]
 default = []
 font-snapshot-tests = []
-ghostty = ["dep:libghostty-vt"]
-tracy = ["dep:tracing-tracy", "teamy_studio_audio_transcription/tracy", "teamy_studio_frontend/tracy"]
+ghostty = ["dep:libghostty-vt", "teamy_studio_vt_types/ghostty", "teamy_studio_windows_terminal_engine/ghostty"]
+tracy = ["dep:tracing-tracy", "teamy_studio_audio_transcription/tracy", "teamy_studio_frontend/tracy", "teamy_studio_teamy_terminal_engine/tracy"]
 
 [build-dependencies]
 embed-resource = "3.0.6"

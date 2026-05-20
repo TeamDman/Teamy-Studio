@@ -5767,14 +5767,20 @@ dependencies = [
  "teamy-figue",
  "teamy_studio_audio_core",
  "teamy_studio_audio_transcription",
+ "teamy_studio_demo_mode",
  "teamy_studio_frontend",
  "teamy_studio_image_models",
  "teamy_studio_jobs",
  "teamy_studio_paths",
  "teamy_studio_shell_default",
  "teamy_studio_spatial",
+ "teamy_studio_teamy_terminal_engine",
+ "teamy_studio_vt_types",
  "teamy_studio_waifu2x_reference",
  "teamy_studio_win32_support",
+ "teamy_studio_windows_audio",
+ "teamy_studio_windows_dialogs",
+ "teamy_studio_windows_terminal_engine",
  "tempfile",
  "tokenizers",
  "tokio",
@@ -5811,6 +5817,14 @@ dependencies = [
  "tokio",
  "tracing",
  "windows 0.62.2",
+]
+
+[[package]]
+name = "teamy_studio_demo_mode"
+version = "0.1.0"
+dependencies = [
+ "eyre",
+ "teamy_studio_paths",
 ]
 
 [[package]]
@@ -5875,6 +5889,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "teamy_studio_teamy_terminal_engine"
+version = "0.1.0"
+dependencies = [
+ "facet",
+ "teamy_studio_vt_types",
+ "tracing",
+]
+
+[[package]]
+name = "teamy_studio_vt_types"
+version = "0.1.0"
+dependencies = [
+ "libghostty-vt",
+]
+
+[[package]]
 name = "teamy_studio_waifu2x_reference"
 version = "0.1.0"
 dependencies = [
@@ -5891,6 +5921,34 @@ dependencies = [
  "tracing",
  "widestring",
  "windows 0.62.2",
+]
+
+[[package]]
+name = "teamy_studio_windows_audio"
+version = "0.1.0"
+dependencies = [
+ "eyre",
+ "teamy_studio_paths",
+ "teamy_studio_win32_support",
+ "windows 0.62.2",
+]
+
+[[package]]
+name = "teamy_studio_windows_dialogs"
+version = "0.1.0"
+dependencies = [
+ "eyre",
+ "teamy_studio_win32_support",
+ "windows 0.62.2",
+]
+
+[[package]]
+name = "teamy_studio_windows_terminal_engine"
+version = "0.1.0"
+dependencies = [
+ "eyre",
+ "libghostty-vt",
+ "teamy_studio_vt_types",
 ]
 
 [[package]]

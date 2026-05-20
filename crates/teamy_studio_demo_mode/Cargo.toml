@@ -1,0 +1,9 @@
+[package]
+name = "teamy_studio_demo_mode"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+eyre = "0.6.12"
+teamy_studio_paths = { path = "../teamy_studio_paths" }

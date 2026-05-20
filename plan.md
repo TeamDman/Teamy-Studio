@@ -85,9 +85,16 @@ Current status:
 - `teamy_studio_audio_transcription` has been extracted behind a compatibility re-export
 - `teamy_studio_spatial` has been extracted behind a compatibility re-export
 - `teamy_studio_jobs` has been extracted behind a compatibility re-export
+- `teamy_studio_vt_types` has been extracted behind a compatibility re-export
+- `teamy_studio_demo_mode` has been extracted behind a compatibility re-export
+- `teamy_studio_windows_audio` has been extracted behind a compatibility re-export
+- `teamy_studio_windows_dialogs` has been extracted behind a compatibility re-export
+- `teamy_studio_teamy_terminal_engine` has been extracted behind a compatibility re-export
+- `teamy_studio_windows_terminal_engine` has been extracted behind a compatibility re-export
 - fast iteration validation is currently green with `cargo clippy -- -D warnings`
 - the root workspace currently includes:
   - `crates/teamy_studio_audio_transcription`
+  - `crates/teamy_studio_demo_mode`
   - `crates/teamy_studio_jobs`
   - `crates/teamy_studio_paths`
   - `crates/teamy_studio_win32_support`
@@ -96,7 +103,12 @@ Current status:
   - `crates/teamy_studio_shell_default`
   - `crates/teamy_studio_image_models`
   - `crates/teamy_studio_spatial`
+  - `crates/teamy_studio_teamy_terminal_engine`
+  - `crates/teamy_studio_vt_types`
   - `crates/teamy_studio_waifu2x_reference`
+  - `crates/teamy_studio_windows_audio`
+  - `crates/teamy_studio_windows_dialogs`
+  - `crates/teamy_studio_windows_terminal_engine`
 
 Next slice:
 
@@ -120,10 +132,22 @@ If context compacts, assume the following is the current ground truth unless the
 - `src/app/audio_transcription.rs` is now a thin shim: `pub use teamy_studio_audio_transcription::*;`
 - `src/app/spatial.rs` is now a thin shim: `pub use teamy_studio_spatial::*;`
 - `src/app/jobs.rs` is now a thin shim: `pub use teamy_studio_jobs::*;`
+- `src/app/vt_types.rs` is now a thin shim: `pub use teamy_studio_vt_types::*;`
+- `src/app/windows_audio.rs` is now a thin shim: `pub use teamy_studio_windows_audio::*;`
+- `src/app/windows_demo_mode.rs` is now a thin shim: `pub use teamy_studio_demo_mode::*;`
+- `src/app/windows_dialogs.rs` is now a thin shim: `pub use teamy_studio_windows_dialogs::*;`
+- `src/app/teamy_terminal_engine.rs` is now a thin shim: `pub use teamy_studio_teamy_terminal_engine::*;`
+- `src/app/windows_terminal_engine.rs` is now a thin shim: `pub use teamy_studio_windows_terminal_engine::*;`
 - the moved code lives in:
   - `src/app/audio_transcription_impl.rs`, compiled through `crates/teamy_studio_audio_transcription/src/lib.rs`
   - `src/app/jobs_impl.rs`, compiled through `crates/teamy_studio_jobs/src/lib.rs`
   - `src/app/spatial_impl.rs`, compiled through `crates/teamy_studio_spatial/src/lib.rs`
+  - `src/app/vt_types_impl.rs`, compiled through `crates/teamy_studio_vt_types/src/lib.rs`
+  - `src/app/windows_audio_impl.rs`, compiled through `crates/teamy_studio_windows_audio/src/lib.rs`
+  - `src/app/windows_demo_mode_impl.rs`, compiled through `crates/teamy_studio_demo_mode/src/lib.rs`
+  - `src/app/windows_dialogs_impl.rs`, compiled through `crates/teamy_studio_windows_dialogs/src/lib.rs`
+  - `src/app/teamy_terminal_engine_impl.rs`, compiled through `crates/teamy_studio_teamy_terminal_engine/src/lib.rs`
+  - `src/app/windows_terminal_engine_impl.rs`, compiled through `crates/teamy_studio_windows_terminal_engine/src/lib.rs`
   - `crates/teamy_studio_paths/src/*`
   - `crates/teamy_studio_win32_support/src/*`
   - `crates/teamy_studio_audio_core/src/lib.rs`
@@ -141,7 +165,7 @@ If context compacts, assume the following is the current ground truth unless the
 ### Validation state
 
 - current fast iteration gate: `cargo clippy -- -D warnings`
-- current status of that fast gate: green after the ten landed extractions above
+- current status of that fast gate: green after the sixteen landed extractions above
 - last known `.\check-all.ps1` success was earlier in the refactor, before the later `win32_support` and `audio_core` slices, when the user switched us to clippy-only iteration
 
 ### Extraction recipe
