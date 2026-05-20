@@ -1,0 +1,14 @@
+[package]
+name = "teamy_studio_frontend"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+rustfft = "6.4.1"
+teamy_studio_audio_core = { path = "../teamy_studio_audio_core" }
+tracing = { version = "0.1.41", optional = true }
+
+[features]
+default = []
+tracy = ["dep:tracing"]

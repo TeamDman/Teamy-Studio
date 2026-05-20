@@ -1,0 +1,23 @@
+[package]
+name = "teamy_studio_image_models"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+burn = { version = "0.19.0", default-features = false, features = ["cuda", "ndarray", "std", "store", "record-item-custom-serde"] }
+burn-store = "0.19.1"
+dunce = "1.0.5"
+eyre = "0.6.12"
+facet = "0.44.1"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+reqwest = { version = "0.12.23", default-features = false, features = ["blocking", "rustls-tls"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+teamy_studio_paths = { path = "../teamy_studio_paths" }
+tracing = "0.1.41"
+walkdir = "2.5.0"
+zip = { version = "2.4.1", default-features = false, features = ["deflate"] }
+
+[dev-dependencies]
+tempfile = "3.20.0"

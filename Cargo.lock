@@ -5765,6 +5765,16 @@ dependencies = [
  "serde_json",
  "sguaba",
  "teamy-figue",
+ "teamy_studio_audio_core",
+ "teamy_studio_audio_transcription",
+ "teamy_studio_frontend",
+ "teamy_studio_image_models",
+ "teamy_studio_jobs",
+ "teamy_studio_paths",
+ "teamy_studio_shell_default",
+ "teamy_studio_spatial",
+ "teamy_studio_waifu2x_reference",
+ "teamy_studio_win32_support",
  "tempfile",
  "tokenizers",
  "tokio",
@@ -5777,6 +5787,110 @@ dependencies = [
  "widestring",
  "windows 0.62.2",
  "zip 2.4.2",
+]
+
+[[package]]
+name = "teamy_studio_audio_core"
+version = "0.1.0"
+dependencies = [
+ "eyre",
+ "facet",
+ "facet-json",
+ "hound",
+]
+
+[[package]]
+name = "teamy_studio_audio_transcription"
+version = "0.1.0"
+dependencies = [
+ "eyre",
+ "facet",
+ "facet-json",
+ "teamy_studio_paths",
+ "teamy_studio_win32_support",
+ "tokio",
+ "tracing",
+ "windows 0.62.2",
+]
+
+[[package]]
+name = "teamy_studio_frontend"
+version = "0.1.0"
+dependencies = [
+ "rustfft",
+ "teamy_studio_audio_core",
+ "tracing",
+]
+
+[[package]]
+name = "teamy_studio_image_models"
+version = "0.1.0"
+dependencies = [
+ "burn",
+ "burn-store",
+ "dunce",
+ "eyre",
+ "facet",
+ "image",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "teamy_studio_paths",
+ "tempfile",
+ "tracing",
+ "walkdir",
+ "zip 2.4.2",
+]
+
+[[package]]
+name = "teamy_studio_jobs"
+version = "0.1.0"
+
+[[package]]
+name = "teamy_studio_paths"
+version = "0.1.0"
+dependencies = [
+ "directories-next",
+ "eyre",
+ "tracing",
+]
+
+[[package]]
+name = "teamy_studio_shell_default"
+version = "0.1.0"
+dependencies = [
+ "eyre",
+ "portable-pty",
+ "teamy_studio_paths",
+]
+
+[[package]]
+name = "teamy_studio_spatial"
+version = "0.1.0"
+dependencies = [
+ "eyre",
+ "sguaba",
+ "uom",
+ "windows 0.62.2",
+]
+
+[[package]]
+name = "teamy_studio_waifu2x_reference"
+version = "0.1.0"
+dependencies = [
+ "eyre",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "teamy_studio_win32_support"
+version = "0.1.0"
+dependencies = [
+ "eyre",
+ "tracing",
+ "widestring",
+ "windows 0.62.2",
 ]
 
 [[package]]

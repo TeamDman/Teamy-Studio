@@ -1,0 +1,10 @@
+[package]
+name = "teamy_studio_shell_default"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+eyre = "0.6.12"
+portable-pty = "0.9"
+teamy_studio_paths = { path = "../teamy_studio_paths" }

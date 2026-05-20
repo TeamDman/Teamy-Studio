@@ -1,0 +1,527 @@
+use std::ffi::OsString;
+use std::fs;
+use std::io::ErrorKind;
+use std::path::Path;
+use std::path::PathBuf;
+
+use eyre::{Context, ensure};
+use portable_pty::CommandBuilder;
+use teamy_studio_paths::AppHome;
+
+const DEFAULT_SHELL_FILENAME: &str = "default-shell.txt";
+
+const TEAMY_PWSH_OSC133_BOOTSTRAP: &str = r#"$global:__teamy_prompt_seen = $false; if (Test-Path Function:\prompt) { $function:__teamy_original_prompt = $function:prompt }; function global:prompt { $status = if ($?) { 0 } elseif ($null -ne $LASTEXITCODE) { [int]$LASTEXITCODE } else { 1 }; if ($global:__teamy_prompt_seen) { [Console]::Out.Write("`e]133;D;$status`a") } else { $global:__teamy_prompt_seen = $true }; [Console]::Out.Write("`e]133;A`a"); $promptText = if (Test-Path Function:\__teamy_original_prompt) { & $function:__teamy_original_prompt } else { "PS $($executionContext.SessionState.Path.CurrentLocation)$('>' * ($nestedPromptLevel + 1)) " }; [Console]::Out.Write("`e]133;B`a"); $promptText }"#;
+
+#[must_use]
+// cli[impl shell.default.persisted-in-app-home]
+pub fn default_shell_path(app_home: &AppHome) -> PathBuf {
+    app_home.file_path(DEFAULT_SHELL_FILENAME)
+}
+
+// cli[impl shell.default.fallback.builtin]
+/// os[impl shell.default.fallback.windows-comspec]
+///
+/// # Errors
+///
+/// This function will return an error if the configured shell cannot be read.
+pub fn load_effective_argv(app_home: &AppHome) -> eyre::Result<Vec<String>> {
+    Ok(load_configured_argv(app_home)?.unwrap_or_else(builtin_default_argv))
+}
+
+// cli[impl shell.default.persisted-in-app-home]
+///
+/// # Errors
+///
+/// This function will return an error if the configured shell file cannot be read.
+pub fn load_configured_argv(app_home: &AppHome) -> eyre::Result<Option<Vec<String>>> {
+    let path = default_shell_path(app_home);
+    match fs::read_to_string(&path) {
+        Ok(contents) => {
+            let argv = parse_shell_file(&contents);
+            if argv.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(argv))
+            }
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).wrap_err_with(|| {
+            format!(
+                "failed to read default shell config from {}",
+                path.display()
+            )
+        }),
+    }
+}
+
+// cli[impl shell.default.persisted-in-app-home]
+///
+/// # Errors
+///
+/// This function will return an error if the shell arguments are invalid or the configuration file cannot be written.
+pub fn save_configured_argv(
+    app_home: &AppHome,
+    program: String,
+    args: Vec<String>,
+) -> eyre::Result<()> {
+    ensure!(
+        !program.contains(['\r', '\n']),
+        "shell program cannot contain newlines"
+    );
+    ensure!(!program.is_empty(), "shell program cannot be empty");
+
+    for argument in &args {
+        ensure!(
+            !argument.contains(['\r', '\n']),
+            "shell arguments cannot contain newlines"
+        );
+    }
+
+    let mut command_argv = Vec::with_capacity(args.len() + 1);
+    command_argv.push(program);
+    command_argv.extend(args);
+
+    app_home.ensure_dir()?;
+    let path = default_shell_path(app_home);
+    fs::write(&path, serialize_shell_file(&command_argv))
+        .wrap_err_with(|| format!("failed to write default shell config to {}", path.display()))?;
+    Ok(())
+}
+
+/// Build a Windows PTY command for the configured default shell.
+///
+/// # Errors
+///
+/// This function will return an error if the effective shell argv cannot be resolved.
+pub fn load_effective_command_builder(app_home: &AppHome) -> eyre::Result<CommandBuilder> {
+    command_builder_from_argv(&load_effective_argv(app_home)?)
+}
+
+/// Build a Windows PTY command from a pre-resolved argv list.
+///
+/// # Errors
+///
+/// This function will return an error if the argv list is empty.
+pub fn command_builder_from_argv(command_argv: &[String]) -> eyre::Result<CommandBuilder> {
+    let (program, args) = command_argv
+        .split_first()
+        .ok_or_else(|| eyre::eyre!("default shell command cannot be empty"))?;
+    let resolved_program = resolve_windows_program(program);
+    let mut command = CommandBuilder::new(resolved_program);
+    for argument in args {
+        command.arg(argument);
+    }
+    maybe_enable_pwsh_osc133(&mut command, program, args);
+    Ok(command)
+}
+
+/// behavior[impl window.interaction.input.semantic-prompt-aware-shell-integration]
+fn maybe_enable_pwsh_osc133(command: &mut CommandBuilder, program: &str, args: &[String]) {
+    if !is_pwsh_program(program) || !is_interactive_pwsh_launch(args) {
+        return;
+    }
+
+    command.env("TEAMY_SHELL_INTEGRATION", "osc133-pwsh-prompt");
+    command.arg("-NoExit");
+    command.arg("-Command");
+    command.arg(TEAMY_PWSH_OSC133_BOOTSTRAP);
+}
+
+fn is_pwsh_program(program: &str) -> bool {
+    Path::new(program)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            let name = name.to_ascii_lowercase();
+            matches!(
+                name.as_str(),
+                "pwsh" | "pwsh.exe" | "powershell" | "powershell.exe"
+            )
+        })
+}
+
+fn is_cmd_program(program: &str) -> bool {
+    Path::new(program)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            name.eq_ignore_ascii_case("cmd") || name.eq_ignore_ascii_case("cmd.exe")
+        })
+}
+
+fn is_interactive_pwsh_launch(args: &[String]) -> bool {
+    !args.iter().any(|argument| {
+        matches!(
+            argument.to_ascii_lowercase().as_str(),
+            "-command"
+                | "-c"
+                | "-encodedcommand"
+                | "-ec"
+                | "-file"
+                | "-f"
+                | "-commandwithargs"
+                | "-noninteractive"
+        )
+    })
+}
+
+/// os[impl shell.default.windows-launch-resolves-program-on-path]
+fn resolve_windows_program(program: &str) -> PathBuf {
+    resolve_windows_program_on_path(program).unwrap_or_else(|| PathBuf::from(program))
+}
+
+fn resolve_windows_program_on_path(program: &str) -> Option<PathBuf> {
+    let candidate = Path::new(program);
+    let has_path_separator = program.contains(['\\', '/']);
+    let has_extension = candidate.extension().is_some();
+
+    if candidate.is_absolute() || has_path_separator {
+        return resolve_windows_program_candidate(candidate, has_extension);
+    }
+
+    let path = std::env::var_os("PATH")?;
+    for directory in std::env::split_paths(&path) {
+        let joined = directory.join(candidate);
+        if let Some(resolved) = resolve_windows_program_candidate(&joined, has_extension) {
+            return Some(resolved);
+        }
+    }
+
+    None
+}
+
+fn resolve_windows_program_candidate(candidate: &Path, has_extension: bool) -> Option<PathBuf> {
+    if has_extension {
+        return candidate.is_file().then(|| candidate.to_path_buf());
+    }
+
+    if candidate.is_file() {
+        return Some(candidate.to_path_buf());
+    }
+
+    for extension in windows_program_extensions() {
+        let mut program = candidate.as_os_str().to_os_string();
+        program.push(extension);
+        let resolved = PathBuf::from(program);
+        if resolved.is_file() {
+            return Some(resolved);
+        }
+    }
+
+    None
+}
+
+fn windows_program_extensions() -> Vec<OsString> {
+    std::env::var_os("PATHEXT")
+        .map(|value| {
+            value
+                .to_string_lossy()
+                .split(';')
+                .filter(|part| !part.is_empty())
+                .map(OsString::from)
+                .collect::<Vec<_>>()
+        })
+        .filter(|extensions| !extensions.is_empty())
+        .unwrap_or_else(|| {
+            vec![
+                OsString::from(".COM"),
+                OsString::from(".EXE"),
+                OsString::from(".BAT"),
+                OsString::from(".CMD"),
+            ]
+        })
+}
+
+#[must_use]
+// cli[impl shell.default.show-effective]
+pub fn format_command_line(argv: &[String]) -> String {
+    argv.iter()
+        .map(|argument| quote_windows_command_argument(argument))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn builtin_default_argv() -> Vec<String> {
+    let program = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_owned());
+    if is_cmd_program(&program) {
+        vec![program, "/D".to_owned()]
+    } else {
+        vec![program]
+    }
+}
+
+fn parse_shell_file(contents: &str) -> Vec<String> {
+    contents.lines().map(ToOwned::to_owned).collect()
+}
+
+fn serialize_shell_file(argv: &[String]) -> String {
+    let mut contents = argv.join("\n");
+    contents.push('\n');
+    contents
+}
+
+fn quote_windows_command_argument(argument: &str) -> String {
+    if argument.is_empty() {
+        return "\"\"".to_owned();
+    }
+
+    if !argument.contains([' ', '\t', '"']) {
+        return argument.to_owned();
+    }
+
+    let mut quoted = String::from('"');
+    let mut backslashes = 0_usize;
+
+    for character in argument.chars() {
+        match character {
+            '\\' => backslashes += 1,
+            '"' => {
+                quoted.push_str(&"\\".repeat((backslashes * 2) + 1));
+                quoted.push('"');
+                backslashes = 0;
+            }
+            _ => {
+                if backslashes > 0 {
+                    quoted.push_str(&"\\".repeat(backslashes));
+                    backslashes = 0;
+                }
+                quoted.push(character);
+            }
+        }
+    }
+
+    if backslashes > 0 {
+        quoted.push_str(&"\\".repeat(backslashes * 2));
+    }
+
+    quoted.push('"');
+    quoted
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::OsString;
+    use std::path::PathBuf;
+    use std::sync::{Mutex, OnceLock};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::{
+        TEAMY_PWSH_OSC133_BOOTSTRAP, builtin_default_argv, command_builder_from_argv,
+        default_shell_path, format_command_line, load_configured_argv, load_effective_argv,
+        parse_shell_file, save_configured_argv, serialize_shell_file,
+    };
+    use teamy_studio_paths::AppHome;
+
+    struct TestHome {
+        path: PathBuf,
+    }
+
+    impl TestHome {
+        fn new() -> Self {
+            let unique = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos();
+            let path =
+                std::env::temp_dir().join(format!("teamy-studio-shell-default-test-{unique}"));
+            Self { path }
+        }
+
+        fn app_home(&self) -> AppHome {
+            AppHome(self.path.clone())
+        }
+    }
+
+    impl Drop for TestHome {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn comspec_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    struct EnvVarGuard {
+        key: &'static str,
+        original: Option<OsString>,
+    }
+
+    impl EnvVarGuard {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "these tests serialize COMSPEC mutation with a process-wide mutex"
+        )]
+        #[expect(
+            clippy::semicolon_outside_block,
+            reason = "the unsafe environment mutation stays scoped inside a small helper"
+        )]
+        fn set(key: &'static str, value: &str) -> Self {
+            let original = std::env::var_os(key);
+            // Safety: these tests serialize COMSPEC mutation with a process-wide mutex.
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, original }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "these tests restore COMSPEC after serialized mutation"
+        )]
+        fn drop(&mut self) {
+            match self.original.as_ref() {
+                Some(value) => {
+                    // Safety: these tests serialize COMSPEC mutation with a process-wide mutex.
+                    unsafe {
+                        std::env::set_var(self.key, value);
+                    }
+                }
+                None => {
+                    // Safety: these tests serialize COMSPEC mutation with a process-wide mutex.
+                    unsafe {
+                        std::env::remove_var(self.key);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn shell_file_roundtrip_preserves_arguments() {
+        let argv = vec![
+            "pwsh.exe".to_owned(),
+            "-NoLogo".to_owned(),
+            "C:\\Program Files\\PowerShell\\7\\pwsh.exe".to_owned(),
+        ];
+
+        assert_eq!(parse_shell_file(&serialize_shell_file(&argv)), argv);
+    }
+
+    #[test]
+    fn format_command_line_quotes_whitespace() {
+        let argv = vec![
+            "C:\\Program Files\\PowerShell\\7\\pwsh.exe".to_owned(),
+            "-Command".to_owned(),
+            "Write-Host hi".to_owned(),
+        ];
+
+        assert_eq!(
+            format_command_line(&argv),
+            "\"C:\\Program Files\\PowerShell\\7\\pwsh.exe\" -Command \"Write-Host hi\""
+        );
+    }
+
+    #[test]
+    fn save_and_load_configured_argv_uses_supplied_app_home() {
+        let test_home = TestHome::new();
+        let app_home = test_home.app_home();
+        let expected = vec!["pwsh.exe".to_owned(), "-NoLogo".to_owned()];
+
+        save_configured_argv(&app_home, expected[0].clone(), expected[1..].to_vec())
+            .expect("shell config should save successfully");
+
+        assert_eq!(
+            load_configured_argv(&app_home).expect("shell config should load successfully"),
+            Some(expected)
+        );
+        assert!(default_shell_path(&app_home).exists());
+    }
+
+    #[test]
+    fn builtin_default_argv_keeps_cmd_switches_only_for_cmd_comspec() {
+        let _lock = comspec_lock()
+            .lock()
+            .expect("COMSPEC test lock should not be poisoned");
+        let _guard = EnvVarGuard::set("COMSPEC", r"C:\Windows\System32\cmd.exe");
+
+        assert_eq!(
+            builtin_default_argv(),
+            vec![r"C:\Windows\System32\cmd.exe".to_owned(), "/D".to_owned()]
+        );
+    }
+
+    #[test]
+    fn builtin_default_argv_omits_cmd_switches_for_pwsh_comspec() {
+        let _lock = comspec_lock()
+            .lock()
+            .expect("COMSPEC test lock should not be poisoned");
+        let _guard = EnvVarGuard::set("COMSPEC", "pwsh.exe");
+        let test_home = TestHome::new();
+
+        assert_eq!(builtin_default_argv(), vec!["pwsh.exe".to_owned()]);
+        assert_eq!(
+            load_effective_argv(&test_home.app_home()).expect("fallback shell should load"),
+            vec!["pwsh.exe".to_owned()]
+        );
+    }
+
+    #[test]
+    // os[verify shell.default.windows-launch-resolves-program-on-path]
+    fn command_builder_resolves_bare_windows_program_names() {
+        let command = command_builder_from_argv(&["cmd".to_owned(), "/D".to_owned()])
+            .expect("command builder should resolve cmd through PATH");
+        let argv = command.get_argv();
+        let program = argv
+            .first()
+            .expect("resolved command should include a program")
+            .to_string_lossy()
+            .to_string();
+
+        assert!(program.to_ascii_lowercase().ends_with("cmd.exe"));
+    }
+
+    #[test]
+    fn interactive_pwsh_launch_adds_teamy_osc133_bootstrap() {
+        let command = command_builder_from_argv(&["pwsh.exe".to_owned(), "-NoLogo".to_owned()])
+            .expect("command builder should accept interactive pwsh argv");
+
+        let argv = command
+            .get_argv()
+            .iter()
+            .map(|value| value.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        assert_eq!(argv[1], "-NoLogo");
+        assert_eq!(argv[2], "-NoExit");
+        assert_eq!(argv[3], "-Command");
+        assert_eq!(argv[4], TEAMY_PWSH_OSC133_BOOTSTRAP);
+        assert_eq!(
+            command
+                .get_env("TEAMY_SHELL_INTEGRATION")
+                .expect("pwsh bootstrap should set integration env var"),
+            "osc133-pwsh-prompt"
+        );
+    }
+
+    #[test]
+    fn noninteractive_pwsh_command_does_not_add_teamy_osc133_bootstrap() {
+        let command = command_builder_from_argv(&[
+            "pwsh.exe".to_owned(),
+            "-NoLogo".to_owned(),
+            "-Command".to_owned(),
+            "Write-Host hi".to_owned(),
+        ])
+        .expect("command builder should accept noninteractive pwsh argv");
+
+        let argv = command
+            .get_argv()
+            .iter()
+            .map(|value| value.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            argv,
+            vec![
+                argv[0].clone(),
+                "-NoLogo".to_owned(),
+                "-Command".to_owned(),
+                "Write-Host hi".to_owned(),
+            ]
+        );
+        assert!(command.get_env("TEAMY_SHELL_INTEGRATION").is_none());
+    }
+}

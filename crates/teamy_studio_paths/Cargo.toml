@@ -1,0 +1,10 @@
+[package]
+name = "teamy_studio_paths"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+directories-next = "2"
+eyre = "0.6.12"
+tracing = "0.1.41"

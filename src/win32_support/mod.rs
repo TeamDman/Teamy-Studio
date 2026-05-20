@@ -1,4 +1,1 @@
-pub mod clipboard;
-pub mod console;
-pub mod module;
-pub mod string;
+pub use teamy_studio_win32_support::*;
