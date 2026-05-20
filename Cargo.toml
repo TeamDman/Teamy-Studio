@@ -11,6 +11,7 @@ members = [
     "crates/teamy_studio_image_models",
     "crates/teamy_studio_jobs",
     "crates/teamy_studio_logs",
+	"crates/teamy_studio_observability",
     "crates/teamy_studio_paths",
     "crates/teamy_studio_shell",
     "crates/teamy_studio_shell_default",
@@ -67,6 +68,7 @@ teamy_studio_frontend = { path = "crates/teamy_studio_frontend" }
 teamy_studio_image_models = { path = "crates/teamy_studio_image_models" }
 teamy_studio_jobs = { path = "crates/teamy_studio_jobs" }
 teamy_studio_logs = { path = "crates/teamy_studio_logs" }
+teamy_studio_observability = { path = "crates/teamy_studio_observability" }
 teamy_studio_paths = { path = "crates/teamy_studio_paths" }
 teamy_studio_shell = { path = "crates/teamy_studio_shell" }
 teamy_studio_shell_default = { path = "crates/teamy_studio_shell_default" }
@@ -160,7 +162,7 @@ tempfile = "3.20.0"
 default = []
 font-snapshot-tests = []
 ghostty = ["dep:libghostty-vt", "teamy_studio_terminal_core/ghostty", "teamy_studio_vt_types/ghostty", "teamy_studio_windows_terminal_engine/ghostty", "teamy_studio_windows_terminal_replay/ghostty"]
-tracy = ["dep:tracing-tracy", "teamy_studio_app_host/tracy", "teamy_studio_audio_input/tracy", "teamy_studio_audio_transcription/tracy", "teamy_studio_frontend/tracy", "teamy_studio_shell/tracy", "teamy_studio_teamy_terminal_engine/tracy", "teamy_studio_terminal_core/tracy"]
+tracy = ["dep:tracing-tracy", "teamy_studio_app_host/tracy", "teamy_studio_audio_input/tracy", "teamy_studio_audio_transcription/tracy", "teamy_studio_frontend/tracy", "teamy_studio_observability/tracy", "teamy_studio_shell/tracy", "teamy_studio_teamy_terminal_engine/tracy", "teamy_studio_terminal_core/tracy"]
 
 [build-dependencies]
 embed-resource = "3.0.6"

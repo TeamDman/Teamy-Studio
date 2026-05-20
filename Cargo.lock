@@ -5775,6 +5775,7 @@ dependencies = [
  "teamy_studio_image_models",
  "teamy_studio_jobs",
  "teamy_studio_logs",
+ "teamy_studio_observability",
  "teamy_studio_paths",
  "teamy_studio_shell",
  "teamy_studio_shell_default",
@@ -5943,6 +5944,19 @@ dependencies = [
  "teamy_studio_timeline_core",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "teamy_studio_observability"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "eyre",
+ "teamy_studio_logs",
+ "tempfile",
+ "tracing",
+ "tracing-subscriber",
+ "tracing-tracy",
 ]
 
 [[package]]

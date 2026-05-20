@@ -68,8 +68,8 @@ This order is intentionally low-risk:
 Current goal:
 
 1. keep the new app-host boundary stable
-2. optionally extract `logging_init.rs` into an observability crate
-3. decide how much additional CLI/root thinning we want beyond the compile-time win target
+2. decide how much additional CLI/root thinning we want beyond the compile-time win target
+3. run a slower final verification checkpoint when we want to call the refactor complete
 
 Current status:
 
@@ -94,6 +94,7 @@ Current status:
 - `teamy_studio_timeline_core` now owns the compiled `timeline` implementation, with the root crate re-exporting it as `crate::timeline`
 - `teamy_studio_whisper_stack` now owns the compiled `model`, `transcription`, and `whisper` implementations, with the root crate preserving `crate::model`, `crate::transcription`, and `crate::whisper` through thin shims
 - `teamy_studio_logs` now owns the compiled `logs` implementation, with the root crate preserving `crate::logs` through a thin shim
+- `teamy_studio_observability` now owns the compiled `logging_init` implementation, with the root crate preserving `crate::logging_init` through a thin adapter over `GlobalArgs`
 - `teamy_studio_audio_input` now owns the compiled `windows_audio_input` implementation, with the root crate preserving `crate::app::windows_audio_input` through a thin shim
 - `teamy_studio_terminal_core` now owns the compiled `windows_terminal` and `windows_terminal_self_test` implementations, plus the shared `VtEngineChoice` contract, with the root crate preserving `crate::app::windows_terminal`, `crate::app::windows_terminal_self_test`, and `crate::app::VtEngineChoice`
 - `teamy_studio_shell` now owns the compiled `cell_grid`, `windows_scene`, and `windows_d3d12_renderer` implementations, with the root crate preserving those module paths through thin shims
@@ -108,6 +109,7 @@ Current status:
   - `crates/teamy_studio_demo_mode`
   - `crates/teamy_studio_jobs`
   - `crates/teamy_studio_logs`
+  - `crates/teamy_studio_observability`
   - `crates/teamy_studio_paths`
   - `crates/teamy_studio_shell`
   - `crates/teamy_studio_win32_support`
@@ -130,9 +132,8 @@ Current status:
 
 Next slice:
 
-1. if desired, extract `logging_init.rs` into `teamy_studio_observability`
-2. if desired, keep thinning `src/cli` and the root facade
-3. otherwise treat the crate-split objective as largely complete and do a final `.\check-all.ps1` checkpoint once ready
+1. if desired, keep thinning `src/cli` and the root facade
+2. otherwise treat the crate-split objective as largely complete and do a final `\.\check-all.ps1` checkpoint once ready
 
 See:
 
@@ -151,6 +152,7 @@ If context compacts, assume the following is the current ground truth unless the
 - `src/shell_default.rs` is now a thin shim: `pub use teamy_studio_shell_default::*;`
 - `src/image_model.rs` is now a thin shim: `pub use teamy_studio_image_models::*;`
 - `src/logs.rs` is now a thin shim: `pub use teamy_studio_logs::*;`
+- `src/logging_init.rs` is now a thin adapter that converts `GlobalArgs` into `teamy_studio_observability::LoggingConfig`
 - `src/model.rs` is now a thin shim: `pub use teamy_studio_whisper_stack::model::*;`
 - `src/waifu2x_reference.rs` is now a thin shim: `pub use teamy_studio_waifu2x_reference::*;`
 - `src/transcription.rs` is now a thin shim: `pub use teamy_studio_whisper_stack::transcription::*;`
@@ -197,6 +199,7 @@ If context compacts, assume the following is the current ground truth unless the
   - `crates/teamy_studio_audio_core/src/lib.rs`
   - `crates/teamy_studio_frontend/src/lib.rs`
   - `src/logs_impl.rs`, compiled through `crates/teamy_studio_logs/src/lib.rs`
+  - `src/logging_init_impl.rs`, compiled through `crates/teamy_studio_observability/src/lib.rs`
   - `crates/teamy_studio_shell_default/src/lib.rs`
   - `src/image_model_impl.rs`, compiled through `crates/teamy_studio_image_models/src/lib.rs`
   - `src/model_impl.rs`, `src/transcription_impl.rs`, and `src/whisper_impl.rs`, compiled through `crates/teamy_studio_whisper_stack/src/lib.rs`
@@ -241,7 +244,7 @@ These are the best current candidates, in rough order of safety:
 
 1. `logging_init`, if we want to finish peeling the root logging surface after `teamy_studio_logs`
 2. CLI/root thinning, if we want to go beyond the compile-time-focused crate split
-3. final whole-repo verification with `.\check-all.ps1` when we are ready for a slower checkpoint
+3. final whole-repo verification with `\.\check-all.ps1` when we are ready for a slower checkpoint
 
 Avoid unnecessary churn in the already-extracted host/shell layers unless there is a concrete reason:
 
@@ -254,6 +257,8 @@ Current remaining high-entanglement tier worth treating as one connected problem
 - `src/logging_init.rs`
 - `src/cli/*`
 - `src/app/mod.rs`
+
+After the observability extraction, `logging_init.rs` is now in the low-risk adapter tier rather than the high-entanglement tier.
 
 The main crate-split blocker tier has been cleared; the remaining work is mostly optional cleanup and final verification.
 

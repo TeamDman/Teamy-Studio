@@ -69,6 +69,7 @@ These crates already exist and compile:
 - `teamy_studio_timeline_core`
 - `teamy_studio_whisper_stack`
 - `teamy_studio_logs`
+- `teamy_studio_observability`
 - `teamy_studio_audio_input`
 - `teamy_studio_terminal_core`
 - `teamy_studio_shell`
@@ -82,6 +83,8 @@ High-signal ownership map:
   - owns [src/model_impl.rs](/G:/Programming/Repos/Teamy-Studio/src/model_impl.rs), [src/transcription_impl.rs](/G:/Programming/Repos/Teamy-Studio/src/transcription_impl.rs), and [src/whisper_impl.rs](/G:/Programming/Repos/Teamy-Studio/src/whisper_impl.rs)
 - `teamy_studio_logs`
   - owns [src/logs_impl.rs](/G:/Programming/Repos/Teamy-Studio/src/logs_impl.rs)
+- `teamy_studio_observability`
+  - owns [src/logging_init_impl.rs](/G:/Programming/Repos/Teamy-Studio/src/logging_init_impl.rs)
 - `teamy_studio_audio_input`
   - owns [src/app/windows_audio_input_impl.rs](/G:/Programming/Repos/Teamy-Studio/src/app/windows_audio_input_impl.rs)
 - `teamy_studio_terminal_core`
@@ -107,11 +110,10 @@ The old module paths remain alive through thin shims in `src/` and `src/app/`.
 The root crate still directly owns the last major orchestration layer:
 
 - [src/app/mod.rs](/G:/Programming/Repos/Teamy-Studio/src/app/mod.rs)
-- [src/logging_init.rs](/G:/Programming/Repos/Teamy-Studio/src/logging_init.rs)
 - [src/cli](/G:/Programming/Repos/Teamy-Studio/src/cli)
 - [src/lib.rs](/G:/Programming/Repos/Teamy-Studio/src/lib.rs)
 
-Of these, the main remaining non-crate-split work is `logging_init.rs`, the CLI surface, and any optional additional root thinning.
+Of these, the main remaining non-crate-split work is the CLI surface and any optional additional root thinning.
 
 ## Main Result
 
@@ -152,19 +154,7 @@ Important:
 - do not rush to redesign `app/mod.rs`
 - treat the current app-host move as successful unless a concrete reason appears to thin it further
 
-### 2. Optional observability cleanup
-
-After `windows_app` is out, consider extracting:
-
-- [src/logging_init.rs](/G:/Programming/Repos/Teamy-Studio/src/logging_init.rs)
-
-Likely crate:
-
-- `teamy_studio_observability`
-
-This is lower-risk and lower-priority than finishing the app host.
-
-### 3. Optional CLI/root thinning
+### 2. Optional CLI/root thinning
 
 If we want to complete the original workspace shape beyond compile-time wins:
 
@@ -173,15 +163,21 @@ If we want to complete the original workspace shape beyond compile-time wins:
 
 This is not required to finish the core compile-time-oriented transition.
 
+### 3. Final slower verification
+
+When the optional cleanup churn is done:
+
+- run [check-all.ps1](/G:/Programming/Repos/Teamy-Studio/check-all.ps1)
+
 ## Recommended Order For Another Agent
 
 If another agent is continuing from here, the safest order is:
 
 1. keep the current app-host and shell boundaries intact
-2. decide whether `logging_init.rs` is worth extracting now
-3. decide whether CLI/root thinning is worth the churn
+2. decide whether CLI/root thinning is worth the churn
+3. run the slower final verification checkpoint when ready
 4. run `cargo clippy -- -D warnings`
-5. run `.\check-all.ps1` at the final slower checkpoint
+5. run `\.\check-all.ps1` at the final slower checkpoint
 
 ## Files To Treat Carefully
 
@@ -229,6 +225,7 @@ If build output is blocked by a running executable:
 - Some old `#[expect(...)]` annotations had to be removed when they became unfulfilled after extraction.
 - `windows_app.rs` now re-exports `teamy_studio_app_host::windows_app::*;`
 - `render_verification.rs` now re-exports `teamy_studio_shell::render_verification::*;`
+- `logging_init.rs` now converts `GlobalArgs` into `teamy_studio_observability::LoggingConfig` and forwards to the extracted implementation.
 - several shim modules use narrow `#[expect(unused_imports, reason = ...)]` annotations because they now exist only to preserve old module paths
 
 These are all preservation-first tactics, not architectural mistakes.
@@ -247,6 +244,6 @@ The transition is "finished enough" when:
 The next agent should:
 
 1. treat the crate split as largely complete
-2. optionally extract `logging_init.rs`
-3. optionally thin the CLI/root facade
+2. optionally thin the CLI/root facade
+3. run `\.\check-all.ps1` when ready for the slower final checkpoint
 4. avoid rewrites the entire time
