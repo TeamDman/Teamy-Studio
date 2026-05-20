@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::thread::{Builder, JoinHandle};
 use tracing::field::{Field, Visit};
-use tracing::{Event, Id, Level, Subscriber, span};
+use tracing::{Event, Id, Level, Metadata, Subscriber, span};
 use tracing_subscriber::Layer;
 use tracing_subscriber::layer::Context;
 use tracing_subscriber::registry::LookupSpan;
@@ -64,6 +64,7 @@ pub struct LogRecordSnapshot {
     pub target: String,
     pub message: String,
     pub source_hwnd: Option<isize>,
+    pub is_tracy_frame_mark: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -123,6 +124,13 @@ pub struct LiveTracingSnapshotRevision {
     latest_span_id: u64,
     record_count: usize,
     span_count: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LiveTracingSnapshotDelta {
+    None,
+    FrameMarksOnly,
+    Other,
 }
 
 static LOGS_STATE: OnceLock<LogsState> = OnceLock::new();
@@ -254,7 +262,7 @@ where
     // observability[impl logs.capture]
     // observability[impl logs.span-context]
     fn on_event(&self, event: &Event<'_>, ctx: Context<'_, S>) {
-        if !live_timeline_should_collect_event(event.metadata().target()) {
+        if !live_timeline_should_collect_event(event.metadata()) {
             return;
         }
         let mut visitor = LogFieldVisitor::default();
@@ -272,15 +280,20 @@ where
             &target,
             visitor.message_text(),
             source_hwnd,
+            event_is_tracy_frame_mark(metadata),
         );
     }
 }
 
-fn live_timeline_should_collect_event(target: &str) -> bool {
+fn live_timeline_should_collect_event(metadata: &Metadata<'_>) -> bool {
     !matches!(
-        target,
+        metadata.target(),
         "tracy_client" | "tracy_client::client" | "tracing_tracy" | "tracing_tracy::layer"
     )
+}
+
+fn event_is_tracy_frame_mark(metadata: &Metadata<'_>) -> bool {
+    metadata.fields().field("tracy.frame_mark").is_some()
 }
 
 fn live_timeline_should_collect_span(name: &str) -> bool {
@@ -382,6 +395,7 @@ fn push_log_record(
     target: &str,
     message: String,
     source_hwnd: Option<isize>,
+    is_tracy_frame_mark: bool,
 ) -> u64 {
     let state = logs_state();
     let id = state.next_id.fetch_add(1, Ordering::AcqRel);
@@ -401,6 +415,7 @@ fn push_log_record(
         target: target.to_owned(),
         message,
         source_hwnd,
+        is_tracy_frame_mark,
     });
     id
 }
@@ -483,6 +498,46 @@ pub fn live_tracing_snapshot_revision() -> LiveTracingSnapshotRevision {
         latest_span_id: span_records.back().map_or(0, |record| record.id),
         record_count,
         span_count: span_records.len(),
+    }
+}
+
+#[must_use]
+pub fn live_tracing_snapshot_delta_since(
+    previous: Option<LiveTracingSnapshotRevision>,
+) -> LiveTracingSnapshotDelta {
+    let Some(previous) = previous else {
+        return LiveTracingSnapshotDelta::Other;
+    };
+
+    let current = live_tracing_snapshot_revision();
+    if current == previous {
+        return LiveTracingSnapshotDelta::None;
+    }
+
+    if current.latest_span_id != previous.latest_span_id
+        || current.span_count != previous.span_count
+        || current.record_count < previous.record_count
+        || current.latest_log_id < previous.latest_log_id
+    {
+        return LiveTracingSnapshotDelta::Other;
+    }
+
+    let records = logs_state()
+        .records
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut saw_frame_mark = false;
+    for record in records.iter().filter(|record| record.id > previous.latest_log_id) {
+        if !record.is_tracy_frame_mark {
+            return LiveTracingSnapshotDelta::Other;
+        }
+        saw_frame_mark = true;
+    }
+
+    if saw_frame_mark {
+        LiveTracingSnapshotDelta::FrameMarksOnly
+    } else {
+        LiveTracingSnapshotDelta::Other
     }
 }
 
@@ -692,6 +747,7 @@ pub fn toast_log_snapshots_after(last_seen_id: u64) -> Vec<LogRecordSnapshot> {
         .iter()
         .filter(|record| {
             record.id > last_seen_id
+                && !record.is_tracy_frame_mark
                 && matches!(
                     record.level,
                     LogRecordLevel::Info | LogRecordLevel::Warn | LogRecordLevel::Error
@@ -720,12 +776,14 @@ mod tests {
             "teamy::test",
             "first".to_owned(),
             Some(42),
+            false,
         );
         let second = push_log_record(
             LogRecordLevel::Warn,
             "teamy::test",
             "second".to_owned(),
             None,
+            false,
         );
 
         let logs = log_snapshots();
@@ -751,19 +809,28 @@ mod tests {
             "teamy::test",
             "first".to_owned(),
             None,
+            false,
         );
         let _ = push_log_record(
             LogRecordLevel::Debug,
             "teamy::test",
             "debug".to_owned(),
             None,
+            false,
         );
-        let second = push_log_record(LogRecordLevel::Warn, "teamy::test", "warn".to_owned(), None);
+        let second = push_log_record(
+            LogRecordLevel::Warn,
+            "teamy::test",
+            "warn".to_owned(),
+            None,
+            false,
+        );
         let third = push_log_record(
             LogRecordLevel::Error,
             "teamy::test",
             "error".to_owned(),
             None,
+            false,
         );
 
         let logs = toast_log_snapshots_after(first);
@@ -786,6 +853,7 @@ mod tests {
             "teamy_studio::app::windows_app",
             "settings opened".to_owned(),
             None,
+            false,
         );
 
         let logs = toast_log_snapshots_after(id - 1);
@@ -796,6 +864,26 @@ mod tests {
     }
 
     #[test]
+    // observability[verify toasts.levels]
+    fn tracy_frame_mark_logs_are_not_toast_visible() {
+        let _guard = TEST_LOGS_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear_logs();
+        let id = push_log_record(
+            LogRecordLevel::Info,
+            "teamy_studio_shell::windows_d3d12_renderer",
+            "finished frame".to_owned(),
+            Some(42),
+            true,
+        );
+
+        let logs = toast_log_snapshots_after(id - 1);
+
+        assert!(logs.is_empty());
+    }
+
+    #[test]
     // observability[verify logs.capture]
     fn clear_removes_buffered_logs_without_reusing_ids() {
         let _guard = TEST_LOGS_LOCK
@@ -803,11 +891,11 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         clear_logs();
         let before_clear =
-            push_log_record(LogRecordLevel::Info, "teamy::test", "old".to_owned(), None);
+            push_log_record(LogRecordLevel::Info, "teamy::test", "old".to_owned(), None, false);
 
         clear_logs();
         let after_clear =
-            push_log_record(LogRecordLevel::Info, "teamy::test", "new".to_owned(), None);
+            push_log_record(LogRecordLevel::Info, "teamy::test", "new".to_owned(), None, false);
 
         assert!(after_clear > before_clear);
         assert_eq!(log_snapshots().len(), 1);
@@ -916,6 +1004,7 @@ mod tests {
             "teamy::test",
             "first".to_owned(),
             None,
+            false,
         );
 
         let (first_dataset, _) = tracing_event_timeline_dataset();
@@ -938,6 +1027,61 @@ mod tests {
         });
 
         assert!(log_span_snapshots().is_empty());
+    }
+
+    #[test]
+    fn collector_captures_tracy_frame_mark_events() {
+        let _guard = TEST_LOGS_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear_logs();
+        let subscriber = tracing_subscriber::Registry::default().with(LogCollectorLayer);
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(message = "finished frame", tracy.frame_mark = true);
+        });
+
+        let logs = log_snapshots();
+        assert_eq!(logs.len(), 1);
+        assert!(logs[0].is_tracy_frame_mark);
+    }
+
+    #[test]
+    fn snapshot_delta_classifies_frame_mark_only_updates() {
+        let _guard = TEST_LOGS_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear_logs();
+        let previous = live_tracing_snapshot_revision();
+        let subscriber = tracing_subscriber::Registry::default().with(LogCollectorLayer);
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(message = "finished frame", tracy.frame_mark = true);
+        });
+
+        assert_eq!(
+            live_tracing_snapshot_delta_since(Some(previous)),
+            LiveTracingSnapshotDelta::FrameMarksOnly
+        );
+    }
+
+    #[test]
+    fn snapshot_delta_classifies_regular_logs_as_other_updates() {
+        let _guard = TEST_LOGS_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear_logs();
+        let previous = live_tracing_snapshot_revision();
+        let subscriber = tracing_subscriber::Registry::default().with(LogCollectorLayer);
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!("new live record");
+        });
+
+        assert_eq!(
+            live_tracing_snapshot_delta_since(Some(previous)),
+            LiveTracingSnapshotDelta::Other
+        );
     }
 
     #[test]

@@ -4,8 +4,7 @@ use arbitrary::Arbitrary;
 use facet::Facet;
 
 use super::dataset::{
-    TimelineDataset, TimelineDatasetRevision, TimelineInternedStringId, TimelineItem,
-    TimelineItemId, TimelineItemKind,
+    TimelineDataset, TimelineDatasetRevision, TimelineItem, TimelineItemId, TimelineItemKind,
 };
 use super::time::{TimelineInstantNs, TimelineRangeNs};
 
@@ -29,10 +28,10 @@ impl TimelineRenderRowId {
     }
 }
 
-#[derive(Facet, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Facet, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(C)]
 pub enum TimelineRenderRowKey {
-    Interned(TimelineInternedStringId),
+    Key(String),
     All,
 }
 
@@ -49,8 +48,8 @@ impl TimelineRenderRow {
     }
 
     #[must_use]
-    pub const fn key(&self) -> TimelineRenderRowKey {
-        self.key
+    pub fn key(&self) -> &TimelineRenderRowKey {
+        &self.key
     }
 }
 
@@ -289,7 +288,7 @@ enum TimelineCandidateKind {
     },
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct TimelineRenderCandidate {
     item_id: TimelineItemId,
     row_key: TimelineRenderRowKey,
@@ -310,7 +309,7 @@ impl TimelineDataset {
         let rows = build_rows(&candidates);
         let row_ids = rows
             .iter()
-            .map(|row| (row.key, row.id))
+            .map(|row| (row.key.clone(), row.id))
             .collect::<BTreeMap<_, _>>();
         let items = build_render_items(query, candidates, &row_ids);
 
@@ -342,7 +341,7 @@ impl TimelineDataset {
             if ranges_intersect(range, query.visible_range()) {
                 candidates.push(TimelineRenderCandidate {
                     item_id: *item_id,
-                    row_key: row_key_for_item(item, query.grouping_mode()),
+                    row_key: row_key_for_item(self, item, query.grouping_mode()),
                     kind: TimelineCandidateKind::Span {
                         range,
                         is_open: span.is_open(),
@@ -367,7 +366,7 @@ impl TimelineDataset {
             if instant_in_range(event.at(), query.visible_range()) {
                 candidates.push(TimelineRenderCandidate {
                     item_id: *item_id,
-                    row_key: row_key_for_item(item, query.grouping_mode()),
+                    row_key: row_key_for_item(self, item, query.grouping_mode()),
                     kind: TimelineCandidateKind::Event { at: event.at() },
                 });
             }
@@ -378,7 +377,7 @@ impl TimelineDataset {
 fn build_rows(candidates: &[TimelineRenderCandidate]) -> Vec<TimelineRenderRow> {
     let mut row_keys = candidates
         .iter()
-        .map(|candidate| candidate.row_key)
+        .map(|candidate| candidate.row_key.clone())
         .collect::<Vec<_>>();
     row_keys.sort_unstable();
     row_keys.dedup();
@@ -397,7 +396,7 @@ fn build_render_items(
     mut candidates: Vec<TimelineRenderCandidate>,
     row_ids: &BTreeMap<TimelineRenderRowKey, TimelineRenderRowId>,
 ) -> Vec<TimelineRenderItem> {
-    candidates.sort_by_key(candidate_sort_key);
+    candidates.sort_by(|left, right| candidate_sort_key(left).cmp(&candidate_sort_key(right)));
     let mut render_items = Vec::new();
     let mut folded_spans: Vec<(TimelineItemId, TimelineRenderRowId, TimelineRangeNs)> = Vec::new();
     let mut folded_events = Vec::new();
@@ -436,11 +435,7 @@ fn build_render_items(
                 }
             }
             TimelineCandidateKind::Event { at } => {
-                if folded_events.last().is_some_and(|(_, row, previous_at)| {
-                    *row != row_id
-                        || projected_instant_distance_pixels(*previous_at, at, query)
-                            >= f64::from(query.minimum_visible_pixels())
-                }) {
+                if should_flush_event_cluster(&folded_events, row_id, at, query) {
                     flush_event_cluster(&mut folded_events, &mut render_items);
                 }
                 folded_events.push((candidate.item_id, row_id, at));
@@ -537,14 +532,44 @@ fn flush_event_cluster(
     folded_events.clear();
 }
 
+fn should_flush_event_cluster(
+    folded_events: &[(TimelineItemId, TimelineRenderRowId, TimelineInstantNs)],
+    row_id: TimelineRenderRowId,
+    at: TimelineInstantNs,
+    query: &TimelineViewportQuery,
+) -> bool {
+    let Some((_, previous_row, previous_at)) = folded_events.last() else {
+        return false;
+    };
+    if *previous_row != row_id
+        || projected_instant_distance_pixels(*previous_at, at, query)
+            >= f64::from(query.minimum_visible_pixels())
+    {
+        return true;
+    }
+    let Some((_, first_row, first_at)) = folded_events.first() else {
+        return false;
+    };
+    *first_row != row_id
+        || projected_instant_distance_pixels(*first_at, at, query)
+            > event_cluster_max_width_pixels(query)
+}
+
+fn event_cluster_max_width_pixels(query: &TimelineViewportQuery) -> f64 {
+    // timeline[impl playground.event-cluster-decomposition]
+    // Keep folded event markers local so one dense chain does not collapse into a single
+    // indicator across a broad visible band.
+    f64::from(query.minimum_visible_pixels().max(4).saturating_mul(4))
+}
+
 fn candidate_sort_key(
     candidate: &TimelineRenderCandidate,
-) -> (TimelineRenderRowKey, TimelineInstantNs, TimelineItemId) {
+) -> (&TimelineRenderRowKey, TimelineInstantNs, TimelineItemId) {
     let at = match candidate.kind {
         TimelineCandidateKind::Span { range, .. } => range.start(),
         TimelineCandidateKind::Event { at } => at,
     };
-    (candidate.row_key, at, candidate.item_id)
+    (&candidate.row_key, at, candidate.item_id)
 }
 
 fn span_lane_index(
@@ -565,13 +590,29 @@ fn span_lane_index(
 }
 
 fn row_key_for_item(
+    dataset: &TimelineDataset,
     item: &TimelineItem,
     grouping_mode: TimelineGroupingMode,
 ) -> TimelineRenderRowKey {
     match grouping_mode {
-        TimelineGroupingMode::GroupKey => TimelineRenderRowKey::Interned(item.group_key()),
-        TimelineGroupingMode::SourceKey => TimelineRenderRowKey::Interned(item.source_key()),
-        TimelineGroupingMode::Label => TimelineRenderRowKey::Interned(item.label()),
+        TimelineGroupingMode::GroupKey => TimelineRenderRowKey::Key(
+            dataset
+                .resolve_string(item.group_key())
+                .unwrap_or("<missing>")
+                .to_owned(),
+        ),
+        TimelineGroupingMode::SourceKey => TimelineRenderRowKey::Key(
+            dataset
+                .resolve_string(item.source_key())
+                .unwrap_or("<missing>")
+                .to_owned(),
+        ),
+        TimelineGroupingMode::Label => TimelineRenderRowKey::Key(
+            dataset
+                .resolve_string(item.label())
+                .unwrap_or("<missing>")
+                .to_owned(),
+        ),
         TimelineGroupingMode::All => TimelineRenderRowKey::All,
     }
 }
@@ -907,6 +948,134 @@ mod tests {
     }
 
     #[test]
+    // timeline[verify playground.row-stable-colors]
+    fn render_plan_row_keys_ignore_hidden_interning_noise() {
+        let mut baseline = TimelineDataset::new();
+        baseline
+            .push_span(
+                TimelineItemInput::new("row-a").with_group_key("row-a"),
+                TimelineInstantNs::new(10),
+                Some(TimelineInstantNs::new(20)),
+            )
+            .expect("span");
+        baseline.compact();
+
+        let mut rebuilt = TimelineDataset::new();
+        rebuilt
+            .push_span(
+                TimelineItemInput::new("noise").with_group_key("noise"),
+                TimelineInstantNs::new(1_000),
+                Some(TimelineInstantNs::new(1_010)),
+            )
+            .expect("span");
+        rebuilt
+            .push_span(
+                TimelineItemInput::new("row-a").with_group_key("row-a"),
+                TimelineInstantNs::new(10),
+                Some(TimelineInstantNs::new(20)),
+            )
+            .expect("span");
+        rebuilt.compact();
+
+        let query = TimelineViewportQuery::try_new(
+            TimelineInstantNs::new(0),
+            TimelineInstantNs::new(100),
+            TimelineInstantNs::new(100),
+            1_000,
+        )
+        .expect("query")
+        .with_grouping_mode(TimelineGroupingMode::GroupKey);
+
+        let baseline_keys = baseline
+            .render_plan(&query)
+            .rows()
+            .iter()
+            .map(|row| row.key().clone())
+            .collect::<Vec<_>>();
+        let rebuilt_keys = rebuilt
+            .render_plan(&query)
+            .rows()
+            .iter()
+            .map(|row| row.key().clone())
+            .collect::<Vec<_>>();
+
+        assert_eq!(baseline_keys, rebuilt_keys);
+        assert_eq!(
+            baseline_keys,
+            vec![TimelineRenderRowKey::Key("row-a".to_owned())]
+        );
+    }
+
+    #[test]
+    // timeline[verify playground.query-derived-rows]
+    fn render_plan_rows_sort_by_stable_row_key_value() {
+        let mut first = TimelineDataset::new();
+        first
+            .push_span(
+                TimelineItemInput::new("row-b").with_group_key("row-b"),
+                TimelineInstantNs::new(10),
+                Some(TimelineInstantNs::new(20)),
+            )
+            .expect("span");
+        first
+            .push_span(
+                TimelineItemInput::new("row-a").with_group_key("row-a"),
+                TimelineInstantNs::new(30),
+                Some(TimelineInstantNs::new(40)),
+            )
+            .expect("span");
+        first.compact();
+
+        let mut second = TimelineDataset::new();
+        second
+            .push_span(
+                TimelineItemInput::new("row-a").with_group_key("row-a"),
+                TimelineInstantNs::new(30),
+                Some(TimelineInstantNs::new(40)),
+            )
+            .expect("span");
+        second
+            .push_span(
+                TimelineItemInput::new("row-b").with_group_key("row-b"),
+                TimelineInstantNs::new(10),
+                Some(TimelineInstantNs::new(20)),
+            )
+            .expect("span");
+        second.compact();
+
+        let query = TimelineViewportQuery::try_new(
+            TimelineInstantNs::new(0),
+            TimelineInstantNs::new(100),
+            TimelineInstantNs::new(100),
+            1_000,
+        )
+        .expect("query")
+        .with_grouping_mode(TimelineGroupingMode::GroupKey);
+
+        let first_keys = first
+            .render_plan(&query)
+            .rows()
+            .iter()
+            .map(|row| row.key().clone())
+            .collect::<Vec<_>>();
+        let second_keys = second
+            .render_plan(&query)
+            .rows()
+            .iter()
+            .map(|row| row.key().clone())
+            .collect::<Vec<_>>();
+
+        assert_eq!(first_keys, second_keys);
+        assert_eq!(
+            first_keys,
+            vec![
+                TimelineRenderRowKey::Key("row-a".to_owned()),
+                TimelineRenderRowKey::Key("row-b".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
     // timeline[verify playground.span-cluster-decomposition]
     fn separated_tiny_spans_decompose_into_individual_markers() {
         let mut dataset = TimelineDataset::new();
@@ -972,6 +1141,44 @@ mod tests {
         assert_eq!(cluster.count(), 3);
         assert_eq!(cluster.range().start(), TimelineInstantNs::new(10));
         assert_eq!(cluster.range().end(), TimelineInstantNs::new(12));
+    }
+
+    #[test]
+    // timeline[verify playground.event-cluster-decomposition]
+    fn dense_event_chains_decompose_into_local_clusters() {
+        let mut dataset = TimelineDataset::new();
+        for at in 10..30 {
+            dataset.push_event(
+                TimelineItemInput::new(format!("event-{at}")).with_group_key("dense"),
+                TimelineInstantNs::new(at),
+            );
+        }
+        dataset.compact();
+        let query = TimelineViewportQuery::try_new(
+            TimelineInstantNs::new(0),
+            TimelineInstantNs::new(100),
+            TimelineInstantNs::new(100),
+            100,
+        )
+        .expect("query")
+        .with_minimum_visible_pixels(2);
+
+        let plan = dataset.render_plan(&query);
+
+        let clusters = plan
+            .items()
+            .iter()
+            .filter_map(|item| match item {
+                TimelineRenderItem::FoldedEventCluster(cluster) => Some(*cluster),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(clusters.len(), 2);
+        assert!(clusters.iter().all(|cluster| cluster.count() > 1));
+        assert!(clusters.iter().all(|cluster| {
+            projected_width_pixels(cluster.range(), &query) <= event_cluster_max_width_pixels(&query)
+        }));
     }
 
     #[test]

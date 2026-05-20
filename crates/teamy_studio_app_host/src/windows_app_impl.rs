@@ -1,10 +1,10 @@
 use std::cell::RefCell;
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashSet, VecDeque};
 use std::ffi::c_void;
 use std::marker::PhantomData;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -22,6 +22,10 @@ use uom::si::f64::Time;
 use uom::si::time::{nanosecond, second};
 use widestring::{U16CStr, U16CString};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
+use windows::Win32::Graphics::Dwm::{
+    DWMWA_BORDER_COLOR, DWMWA_COLOR_NONE, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND,
+    DwmSetWindowAttribute,
+};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, CLEARTYPE_QUALITY, CreateFontIndirectW, DEVMODEW, DeleteObject,
     ENUM_CURRENT_SETTINGS, EndPaint, EnumDisplaySettingsW, GetDC, GetDeviceCaps, GetMonitorInfoW,
@@ -49,12 +53,13 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetClassNameW, GetClientRect, GetCursorPos, GetMessageW, GetSystemMetrics, GetWindowRect,
     GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, HTCAPTION, HTCLIENT,
     HTTRANSPARENT, HWND_NOTOPMOST, HWND_TOPMOST, IDC_ARROW, IDC_CROSS, IDC_HAND, IDC_HELP,
-    IDC_IBEAM, IDC_SIZEALL, IDC_SIZEWE, IDC_WAIT, IsWindowVisible, IsZoomed, LoadCursorW, MSG,
-    MoveWindow, PostMessageW, PostQuitMessage, RegisterClassExW, SM_CXPADDEDBORDER, SM_CXSCREEN,
-    SM_CXSIZEFRAME, SM_CXVIRTUALSCREEN, SM_CYSCREEN, SM_CYSIZEFRAME, SM_CYVIRTUALSCREEN,
-    SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SW_HIDE, SW_MAXIMIZE, SW_MINIMIZE, SW_RESTORE, SW_SHOW,
-    SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SYSTEM_METRICS_INDEX,
-    SendMessageW, SetCursor, SetCursorPos, SetForegroundWindow, SetTimer, SetWindowPos,
+    IDC_IBEAM, IDC_SIZEALL, IDC_SIZEWE, IDC_WAIT, IsWindowVisible, IsZoomed, KillTimer,
+    LoadCursorW, MSG, MoveWindow, PostMessageW, PostQuitMessage, RegisterClassExW,
+    SM_CXPADDEDBORDER, SM_CXSCREEN, SM_CXSIZEFRAME, SM_CXVIRTUALSCREEN, SM_CYSCREEN,
+    SM_CYSIZEFRAME, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SW_HIDE,
+    SW_MAXIMIZE, SW_MINIMIZE, SW_RESTORE, SW_SHOW, SW_SHOWNOACTIVATE, SWP_NOACTIVATE,
+    SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SYSTEM_METRICS_INDEX, SendMessageW, SetCursor,
+    SetCursorPos, SetForegroundWindow, SetTimer, SetWindowPos,
     SetWindowTextW, ShowWindow, TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CHAR,
     WM_CLOSE, WM_DESTROY, WM_DPICHANGED, WM_ENTERSIZEMOVE, WM_ERASEBKGND, WM_EXITSIZEMOVE,
     WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
@@ -98,7 +103,7 @@ use super::windows_cursor_info::{CursorInfoConfig, CursorInfoVirtualSession};
 use super::windows_d3d12_renderer::{
     ButtonVisualState, CursorLatencyBrickFrameModel, CursorLatencyFrameModel,
     LateLatchedPointerVisual, RenderFrameModel, RenderScene, RenderThreadProxy,
-    RendererPresentationMode, RendererTerminalVisualState, WindowChromeButtonsState,
+    RendererTerminalVisualState, WindowChromeButtonsState,
     terminal_font_layout_snapshot, terminal_font_unicode_chars,
 };
 use super::windows_demo_mode::{
@@ -146,7 +151,9 @@ const TERMINAL_WHEEL_SCROLL_LINES: isize = 3;
 const SELECTION_AUTO_SCROLL_MAX_LINES: isize = 12;
 const HIGH_RESOLUTION_TIMER_PERIOD_MS: u32 = 1;
 const TOAST_RENDER_TIMER_ID: usize = 3;
+const FOCUSED_RENDER_TIMER_ID: usize = 4;
 const TOAST_RENDER_INTERVAL_MS: u32 = 16;
+const TIMELINE_PLAYGROUND_FOCUSED_RENDER_TICK_INTERVAL_MS: u32 = 16;
 const USER_DEFAULT_SCREEN_DPI: u32 = 96;
 const TERMINAL_THROUGHPUT_BENCHMARK_START_MARKER: &str = "__TEAMY_TERMINAL_THROUGHPUT_START__";
 const TERMINAL_THROUGHPUT_BENCHMARK_DONE_MARKER: &str = "__TEAMY_TERMINAL_THROUGHPUT_DONE__";
@@ -156,6 +163,7 @@ const TERMINAL_THROUGHPUT_BENCHMARK_TIMEOUT: Duration = Duration::from_mins(1);
 const TERMINAL_THROUGHPUT_BENCHMARK_POLL_INTERVAL: Duration = Duration::from_millis(1);
 const TIMELINE_ZOOM_ANIMATION_DURATION: Duration = Duration::from_millis(220);
 const TIMELINE_PLAYGROUND_ROW_ANIMATION_DURATION: Duration = Duration::from_millis(180);
+const TIMELINE_PLAYGROUND_FRAME_MARK_SYNC_INTERVAL: Duration = Duration::from_millis(100);
 const TIMELINE_PLAYGROUND_LIVE_INITIAL_DURATION_NS: i64 = 30_000_000_000;
 const MODEL_WARNING_PREPARE_HOLD_DURATION: Duration = Duration::from_millis(1400);
 const LOG_TOAST_DURATION: Duration = Duration::from_secs(5);
@@ -170,8 +178,7 @@ const TIMELINE_DOCUMENT_CHANGED_MESSAGE: u32 = WM_APP + 0x403;
 const TIMELINE_DOCUMENT_COMMAND_MESSAGE: u32 = WM_APP + 0x404;
 const TIMELINE_TRANSCRIPTION_WORKER_COMPLETED_MESSAGE: u32 = WM_APP + 0x405;
 const TIMELINE_PLAYGROUND_DETAIL_CHANGED_MESSAGE: u32 = WM_APP + 0x406;
-const FOCUSED_RENDER_TICK_MESSAGE: u32 = WM_APP + 0x407;
-const TEXT_RENDERING_PLAYGROUND_CHANGED_MESSAGE: u32 = WM_APP + 0x408;
+const TEXT_RENDERING_PLAYGROUND_CHANGED_MESSAGE: u32 = WM_APP + 0x407;
 const TEXT_RENDERING_TOOLTIP_COOLDOWN: Duration = Duration::from_millis(850);
 const TEXT_RENDERING_DOUBLE_RIGHT_CLICK_WINDOW: Duration = Duration::from_millis(350);
 const TEXT_RENDERING_DOUBLE_RIGHT_CLICK_MAX_MOVEMENT_PX: u32 = 1;
@@ -246,6 +253,179 @@ fn focus_launcher_scene_window(excluding: WindowHandle) {
         return;
     }
     WindowHandle::new(WindowThread::current(), hwnd).bring_to_front();
+}
+
+fn top_level_windows_for_class_name(class_name: &str) -> Vec<HWND> {
+    struct SearchState {
+        class_name: String,
+        pid: u32,
+        matches: Vec<isize>,
+    }
+
+    unsafe extern "system" fn enumerate_windows_by_class(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        // Safety: `lparam` points to `SearchState` for the duration of `EnumWindows`.
+        let state = unsafe { &mut *(lparam.0 as *mut SearchState) };
+        let mut pid = 0;
+        // Safety: `pid` is writable storage for the owning process id of the enumerated top-level window.
+        let _ = unsafe { GetWindowThreadProcessId(hwnd, Some(&raw mut pid)) };
+        if pid != state.pid {
+            return BOOL(1);
+        }
+        let mut class_name_buffer = [0_u16; 256];
+        // Safety: `class_name_buffer` is writable storage for the enumerated top-level class name.
+        let copied = unsafe { GetClassNameW(hwnd, &mut class_name_buffer) };
+        let copied = usize::try_from(copied.max(0)).unwrap_or_default();
+        if String::from_utf16_lossy(&class_name_buffer[..copied]) == state.class_name {
+            state.matches.push(hwnd.0 as isize);
+        }
+        BOOL(1)
+    }
+
+    let mut state = SearchState {
+        class_name: class_name.to_owned(),
+        pid: std::process::id(),
+        matches: Vec::new(),
+    };
+    let state_ptr = (&mut state) as *mut SearchState;
+    // Safety: `state_ptr` remains valid for the full synchronous enumeration.
+    let _ = unsafe {
+        EnumWindows(
+            Some(enumerate_windows_by_class),
+            LPARAM(state_ptr as isize),
+        )
+    };
+    state
+        .matches
+        .into_iter()
+        .map(|raw| HWND(raw as *mut c_void))
+        .collect()
+}
+
+fn current_process_terminal_windows() -> Vec<TerminalWindowSummary> {
+    let current_pid = std::process::id();
+    match list_terminal_windows() {
+        Ok(windows) => windows
+            .into_iter()
+            .filter(|window| window.pid == current_pid)
+            .collect(),
+        Err(error) => {
+            error!(?error, "failed to enumerate Teamy Studio terminal windows for shutdown");
+            Vec::new()
+        }
+    }
+}
+
+fn request_process_helper_shutdown() {
+    for hwnd in top_level_windows_for_class_name("TeamyStudioToastWindow")
+        .into_iter()
+        .chain(top_level_windows_for_class_name("TeamyStudioTerminalBenchmarkWindow"))
+    {
+        // Safety: the helper HWND values come from a fresh top-level window enumeration.
+        let _ = unsafe { PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0)) };
+    }
+}
+
+fn maybe_request_process_helper_shutdown(excluding: WindowHandle) {
+    let excluding_raw = excluding.raw().0 as isize;
+    let remaining_scene_windows = scene_window_registry()
+        .lock()
+        .ok()
+        .map(|windows| windows.iter().any(|window| window.raw != excluding_raw))
+        .unwrap_or(true);
+    if remaining_scene_windows {
+        return;
+    }
+
+    let remaining_terminal_windows = current_process_terminal_windows()
+        .into_iter()
+        .any(|window| window.hwnd != excluding.raw().0 as usize);
+    if remaining_terminal_windows {
+        return;
+    }
+
+    request_process_helper_shutdown();
+}
+
+fn remaining_application_window_descriptions() -> Vec<String> {
+    let mut descriptions = scene_window_registry()
+        .lock()
+        .ok()
+        .map(|windows| {
+            windows
+                .iter()
+                .map(|window| format!("Scene: {}", window.kind.title()))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    descriptions.extend(
+        current_process_terminal_windows()
+            .into_iter()
+            .map(|window| format!("Terminal: {}", window.title)),
+    );
+    if !top_level_windows_for_class_name("TeamyStudioToastWindow").is_empty() {
+        descriptions.push("Helper: Toast Host".to_owned());
+    }
+    if !top_level_windows_for_class_name("TeamyStudioTerminalBenchmarkWindow").is_empty() {
+        descriptions.push("Helper: Terminal Benchmark".to_owned());
+    }
+    descriptions
+}
+
+fn spawn_shutdown_watchdog() {
+    let _ = thread::Builder::new()
+        .name("teamy-studio-shutdown-watchdog".to_owned())
+        .spawn_with_current_span(|| {
+            thread::sleep(Duration::from_millis(1500));
+            let remaining = remaining_application_window_descriptions();
+            if remaining.is_empty() {
+                return;
+            }
+
+            let details = remaining.join("\n");
+            tracing::warn!(remaining = %details, "Teamy Studio shutdown left windows alive");
+            let _ = MessageDialog::new()
+                .set_level(MessageLevel::Warning)
+                .set_title("Shutdown Still In Progress")
+                .set_description(format!(
+                    "Teamy Studio asked every window to close, but some are still alive:\n\n{details}"
+                ))
+                .set_buttons(MessageButtons::Ok)
+                .show();
+        });
+}
+
+fn request_application_shutdown(source_hwnd: WindowHandle) {
+    let source_raw = source_hwnd.raw().0 as isize;
+    let scene_targets = scene_window_registry()
+        .lock()
+        .ok()
+        .map(|windows| {
+            windows
+                .iter()
+                .filter(|window| window.raw != source_raw)
+                .map(|window| HWND(window.raw as *mut c_void))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let terminal_targets = current_process_terminal_windows()
+        .into_iter()
+        .filter(|window| window.hwnd != source_hwnd.raw().0 as usize)
+        .map(|window| HWND(window.hwnd as *mut c_void))
+        .collect::<Vec<_>>();
+
+    info!(
+        scene_window_count = scene_targets.len(),
+        terminal_window_count = terminal_targets.len(),
+        "application shutdown requested"
+    );
+
+    for target in scene_targets.into_iter().chain(terminal_targets) {
+        // Safety: these HWND values are current snapshots and WM_CLOSE tolerates races.
+        let _ = unsafe { PostMessageW(Some(target), WM_CLOSE, WPARAM(0), LPARAM(0)) };
+    }
+    request_process_helper_shutdown();
+    source_hwnd.post_close();
+    spawn_shutdown_watchdog();
 }
 
 fn broadcast_demo_mode_state_changed() {
@@ -371,6 +551,7 @@ struct TimelinePlaygroundState {
     source_mode: TimelinePlaygroundSourceMode,
     live_tracing_follow_tail: bool,
     live_tracing_snapshot_revision: Option<logs::LiveTracingSnapshotRevision>,
+    last_live_tracing_sync_at: Option<Instant>,
     zoom_animation: Option<TimelinePlaygroundZoomAnimation>,
     row_position_animation: Option<TimelinePlaygroundRowPositionAnimation>,
     last_row_positions: Vec<(TimelineRenderRowKey, i32)>,
@@ -685,6 +866,7 @@ impl TimelinePlaygroundState {
             source_mode: TimelinePlaygroundSourceMode::Synthetic,
             live_tracing_follow_tail: false,
             live_tracing_snapshot_revision: None,
+            last_live_tracing_sync_at: None,
             zoom_animation: None,
             row_position_animation: None,
             last_row_positions: Vec::new(),
@@ -697,6 +879,7 @@ impl TimelinePlaygroundState {
         self.source_mode = TimelinePlaygroundSourceMode::Synthetic;
         self.live_tracing_follow_tail = false;
         self.live_tracing_snapshot_revision = None;
+        self.last_live_tracing_sync_at = None;
         self.seed = self.seed.wrapping_add(0x9e37_79b9_7f4a_7c15);
         self.dataset = generate_synthetic_timeline_dataset(
             &TimelineSyntheticConfig::default().with_seed(self.seed),
@@ -735,6 +918,7 @@ impl TimelinePlaygroundState {
                 self.source_mode = TimelinePlaygroundSourceMode::LiveTracingEvents;
                 self.live_tracing_follow_tail = true;
                 self.live_tracing_snapshot_revision = None;
+                self.last_live_tracing_sync_at = None;
                 self.visible_start_ns = 0;
                 self.visible_end_ns = TIMELINE_PLAYGROUND_LIVE_INITIAL_DURATION_NS;
                 self.sync_live_tracing_events();
@@ -743,6 +927,7 @@ impl TimelinePlaygroundState {
                 self.source_mode = TimelinePlaygroundSourceMode::Synthetic;
                 self.live_tracing_follow_tail = false;
                 self.live_tracing_snapshot_revision = None;
+                self.last_live_tracing_sync_at = None;
             }
         }
         self.hovered_item = None;
@@ -756,8 +941,13 @@ impl TimelinePlaygroundState {
         if self.source_mode != TimelinePlaygroundSourceMode::LiveTracingEvents {
             return;
         }
+        let revision = logs::live_tracing_snapshot_revision();
+        if self.live_tracing_snapshot_revision == Some(revision) {
+            return;
+        }
         let (dataset, latest_at_ns) = logs::tracing_event_timeline_dataset();
-        self.live_tracing_snapshot_revision = Some(logs::live_tracing_snapshot_revision());
+        self.live_tracing_snapshot_revision = Some(revision);
+        self.last_live_tracing_sync_at = Some(Instant::now());
         self.dataset = dataset;
         if self.live_tracing_follow_tail {
             let duration = (self.visible_end_ns - self.visible_start_ns).max(1);
@@ -778,6 +968,16 @@ impl TimelinePlaygroundState {
                 row_count,
                 self.vertical_scroll_offset,
             );
+    }
+
+    fn cached_row_count_hint(&self) -> usize {
+        self.row_position_animation.as_ref().map_or_else(
+            || self.last_row_positions.len(),
+            |animation| animation
+                .start_positions
+                .len()
+                .max(animation.target_positions.len()),
+        )
     }
 
     fn update_row_position_animation(&mut self, render_plan: &TimelineRenderPlan) {
@@ -829,9 +1029,9 @@ impl TimelinePlaygroundState {
                 let start_top = animation
                     .start_positions
                     .iter()
-                    .find_map(|(start_key, top)| (*start_key == *key).then_some(*top))
+                    .find_map(|(start_key, top)| (start_key == key).then_some(*top))
                     .unwrap_or(*target_top);
-                (*key, interpolate_i32(start_top, *target_top, progress))
+                (key.clone(), interpolate_i32(start_top, *target_top, progress))
             })
             .collect()
     }
@@ -1955,8 +2155,6 @@ struct WindowHandle {
 }
 
 static ACTIVE_HIGH_RESOLUTION_TIMER_WINDOWS: OnceLock<Mutex<HashSet<isize>>> = OnceLock::new();
-static ACTIVE_FOCUSED_RENDER_TICKERS: OnceLock<Mutex<HashMap<isize, FocusedRenderTicker>>> =
-    OnceLock::new();
 
 const TIMERR_NOERROR: u32 = 0;
 
@@ -1964,12 +2162,6 @@ const TIMERR_NOERROR: u32 = 0;
 unsafe extern "system" {
     fn timeBeginPeriod(uperiod: u32) -> u32;
     fn timeEndPeriod(uperiod: u32) -> u32;
-}
-
-struct FocusedRenderTicker {
-    stop: Arc<AtomicBool>,
-    pending_tick: Arc<AtomicBool>,
-    handle: Option<thread::JoinHandle<()>>,
 }
 
 impl WindowHandle {
@@ -2176,103 +2368,22 @@ fn high_resolution_timer_windows() -> &'static Mutex<HashSet<isize>> {
     ACTIVE_HIGH_RESOLUTION_TIMER_WINDOWS.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
-fn focused_render_tickers() -> &'static Mutex<HashMap<isize, FocusedRenderTicker>> {
-    ACTIVE_FOCUSED_RENDER_TICKERS.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
 fn restart_focused_render_ticker(hwnd: HWND, interval_ms: u32) -> eyre::Result<()> {
     stop_focused_render_ticker(hwnd);
     enable_high_resolution_timer_period_for_hwnd(hwnd)?;
-    let stop = Arc::new(AtomicBool::new(false));
-    let pending_tick = Arc::new(AtomicBool::new(false));
-    let thread_stop = Arc::clone(&stop);
-    let thread_pending_tick = Arc::clone(&pending_tick);
-    let interval = Duration::from_millis(u64::from(interval_ms.max(1)));
-    let hwnd_key = hwnd.0 as isize;
-    let handle = thread::Builder::new()
-        .name(format!("teamy-focused-render-ticker-{hwnd_key}"))
-        .spawn(move || {
-            run_focused_render_ticker(
-                hwnd_key,
-                interval,
-                thread_stop.as_ref(),
-                thread_pending_tick.as_ref(),
-            );
-        })
-        .map_err(|error| eyre::eyre!("failed to spawn focused render ticker: {error}"))?;
-    focused_render_tickers()
-        .lock()
-        .expect("focused render ticker tracking should not be poisoned")
-        .insert(
-            hwnd_key,
-            FocusedRenderTicker {
-                stop,
-                pending_tick,
-                handle: Some(handle),
-            },
-        );
+    // Safety: installing a low-priority WM_TIMER on a live HWND is valid and lets input messages win.
+    let timer = unsafe { SetTimer(Some(hwnd), FOCUSED_RENDER_TIMER_ID, interval_ms.max(1), None) };
+    if timer == 0 {
+        disable_high_resolution_timer_period_for_hwnd(hwnd);
+        eyre::bail!("failed to start focused render timer")
+    }
     Ok(())
 }
 
 fn stop_focused_render_ticker(hwnd: HWND) {
-    let ticker = focused_render_tickers()
-        .lock()
-        .expect("focused render ticker tracking should not be poisoned")
-        .remove(&(hwnd.0 as isize));
-    if let Some(mut ticker) = ticker {
-        ticker.stop.store(true, AtomicOrdering::Release);
-        if let Some(handle) = ticker.handle.take() {
-            let _ = handle.join();
-        }
-        disable_high_resolution_timer_period_for_hwnd(hwnd);
-    }
-}
-
-fn run_focused_render_ticker(
-    hwnd_raw: isize,
-    interval: Duration,
-    stop: &AtomicBool,
-    pending_tick: &AtomicBool,
-) {
-    let hwnd = HWND(hwnd_raw as *mut c_void);
-    let mut next_tick = Instant::now() + interval;
-    while !stop.load(AtomicOrdering::Acquire) {
-        let now = Instant::now();
-        if now < next_tick {
-            thread::sleep(next_tick - now);
-        }
-        if stop.load(AtomicOrdering::Acquire) {
-            break;
-        }
-        if !pending_tick.swap(true, AtomicOrdering::AcqRel) {
-            // Safety: the ticker only posts a private wake message to the HWND that created it; failure is handled by clearing the pending flag.
-            let posted = unsafe {
-                PostMessageW(
-                    Some(hwnd),
-                    FOCUSED_RENDER_TICK_MESSAGE,
-                    WPARAM(0),
-                    LPARAM(0),
-                )
-            }
-            .is_ok();
-            if !posted {
-                pending_tick.store(false, AtomicOrdering::Release);
-            }
-        }
-        next_tick += interval;
-        let now = Instant::now();
-        if next_tick < now {
-            next_tick = now + interval;
-        }
-    }
-}
-
-fn clear_focused_render_tick_pending(hwnd: HWND) {
-    if let Ok(tickers) = focused_render_tickers().lock()
-        && let Some(ticker) = tickers.get(&(hwnd.0 as isize))
-    {
-        ticker.pending_tick.store(false, AtomicOrdering::Release);
-    }
+    // Safety: clearing a timer on its owning live HWND is valid; stale state is ignored by the OS.
+    let _ = unsafe { KillTimer(Some(hwnd), FOCUSED_RENDER_TIMER_ID) };
+    disable_high_resolution_timer_period_for_hwnd(hwnd);
 }
 
 fn enable_high_resolution_timer_period_for_hwnd(hwnd: HWND) -> eyre::Result<()> {
@@ -2998,8 +3109,7 @@ fn run_scene_window(
 
     let hwnd = create_scene_window(window_thread, scene_kind)?;
     register_scene_window(hwnd, scene_kind);
-    let renderer =
-        RenderThreadProxy::new_with_mode(hwnd.raw(), RendererPresentationMode::LowLatencyHwnd)?;
+    let renderer = RenderThreadProxy::new(hwnd.raw())?;
     let chrome_tooltip = ChromeTooltipController::create(hwnd)?;
     with_scene_app_state(|state| {
         state.hwnd = Some(hwnd);
@@ -3807,7 +3917,35 @@ fn create_scene_window(
     }
     .wrap_err("failed to create scene window")?;
 
+    configure_scene_window_chrome(hwnd);
+
     Ok(WindowHandle::new(window_thread, hwnd))
+}
+
+fn configure_scene_window_chrome(hwnd: HWND) {
+    let border_color = DWMWA_COLOR_NONE;
+    if let Err(error) = unsafe {
+        DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_BORDER_COLOR,
+            (&raw const border_color).cast(),
+            u32::try_from(std::mem::size_of_val(&border_color)).unwrap_or(u32::MAX),
+        )
+    } {
+        tracing::warn!(error = %error, "scene window DWM border-color override unavailable");
+    }
+
+    let corner_preference = DWMWCP_DONOTROUND;
+    if let Err(error) = unsafe {
+        DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_WINDOW_CORNER_PREFERENCE,
+            (&raw const corner_preference).cast(),
+            u32::try_from(std::mem::size_of_val(&corner_preference)).unwrap_or(u32::MAX),
+        )
+    } {
+        tracing::warn!(error = %error, "scene window DWM corner override unavailable");
+    }
 }
 
 fn scene_window_ex_style(scene_kind: SceneWindowKind) -> WINDOW_EX_STYLE {
@@ -4272,7 +4410,7 @@ extern "system" fn window_proc(
         WM_SIZE => handle_size(hwnd),
         TERMINAL_WORKER_WAKE_MESSAGE => handle_terminal_worker_wake(hwnd),
         WM_TIMER if wparam.0 == POLL_TIMER_ID => handle_timer(hwnd),
-        FOCUSED_RENDER_TICK_MESSAGE => handle_focused_render_timer(hwnd),
+        WM_TIMER if wparam.0 == FOCUSED_RENDER_TIMER_ID => handle_focused_render_timer(hwnd),
         WM_CHAR => handle_char_message(hwnd, message, wparam, lparam),
         WM_KEYDOWN | WM_SYSKEYDOWN => handle_key_down_message(hwnd, message, wparam, lparam),
         WM_KEYUP | WM_SYSKEYUP => handle_key_up_message(hwnd, message, wparam, lparam),
@@ -4326,7 +4464,7 @@ extern "system" fn scene_window_proc(
         WM_DPICHANGED => handle_scene_dpi_changed(hwnd, lparam),
         WM_MOVE => handle_scene_move(hwnd),
         WM_SIZE => handle_scene_size(hwnd),
-        FOCUSED_RENDER_TICK_MESSAGE => handle_scene_focused_render_timer(hwnd),
+        WM_TIMER if wparam.0 == FOCUSED_RENDER_TIMER_ID => handle_scene_focused_render_timer(hwnd),
         DEMO_MODE_STATE_CHANGED_MESSAGE => handle_scene_demo_mode_state_changed(hwnd),
         TIMELINE_DOCUMENT_CHANGED_MESSAGE => handle_scene_timeline_document_changed(hwnd),
         TIMELINE_DOCUMENT_COMMAND_MESSAGE => handle_scene_timeline_document_command(hwnd),
@@ -4475,7 +4613,6 @@ fn handle_scene_move(hwnd: WindowHandle) -> LRESULT {
 }
 
 fn handle_scene_focused_render_timer(hwnd: WindowHandle) -> LRESULT {
-    clear_focused_render_tick_pending(hwnd.raw());
     match with_scene_app_state(|state| {
         if !state.window_focused {
             return Ok(());
@@ -4523,11 +4660,21 @@ fn scene_needs_focused_timer_render(state: &SceneAppState) -> bool {
     if state.scene_kind == SceneWindowKind::TimelinePlayground
         && let Some(playground) = state.timeline_playground.as_ref()
     {
+        let live_delta = logs::live_tracing_snapshot_delta_since(
+            playground.live_tracing_snapshot_revision,
+        );
         return playground.zoom_animation.is_some()
             || playground.row_position_animation.is_some()
             || (playground.live_tracing_follow_tail
-                && playground.live_tracing_snapshot_revision
-                    != Some(logs::live_tracing_snapshot_revision()));
+                && match live_delta {
+                    logs::LiveTracingSnapshotDelta::None => false,
+                    logs::LiveTracingSnapshotDelta::Other => true,
+                    logs::LiveTracingSnapshotDelta::FrameMarksOnly => playground
+                        .last_live_tracing_sync_at
+                        .is_none_or(|last| {
+                            last.elapsed() >= TIMELINE_PLAYGROUND_FRAME_MARK_SYNC_INTERVAL
+                        }),
+                });
     }
 
     state.scene_kind == SceneWindowKind::ModelWarning
@@ -4538,6 +4685,8 @@ fn scene_needs_focused_timer_render(state: &SceneAppState) -> bool {
 fn scene_focused_render_tick_interval_ms(state: &SceneAppState) -> u32 {
     if state.scene_kind == SceneWindowKind::CursorLatencyPlayground {
         CURSOR_LATENCY_FOCUSED_RENDER_TICK_INTERVAL_MS
+    } else if state.scene_kind == SceneWindowKind::TimelinePlayground {
+        TIMELINE_PLAYGROUND_FOCUSED_RENDER_TICK_INTERVAL_MS
     } else {
         state.focused_render_interval_ms
     }
@@ -5130,6 +5279,7 @@ fn handle_scene_destroy_message(hwnd: WindowHandle) -> LRESULT {
             matches!(
                 state.scene_kind,
                 SceneWindowKind::CursorLatencyPlayground
+                    | SceneWindowKind::TimelinePlayground
                     | SceneWindowKind::TextRenderingPlaygroundPlane
                     | SceneWindowKind::TextRenderingPlaygroundEditor
                     | SceneWindowKind::TextRenderingPlaygroundPresets
@@ -5149,6 +5299,7 @@ fn handle_scene_destroy_message(hwnd: WindowHandle) -> LRESULT {
     if should_focus_launcher {
         focus_launcher_scene_window(hwnd);
     }
+    maybe_request_process_helper_shutdown(hwnd);
     hwnd.post_quit_message();
     LRESULT(0)
 }
@@ -6522,10 +6673,6 @@ fn handle_scene_mouse_move(
             state.timeline_playground_pan_drag = None;
             return Ok(true);
         };
-        let render_plan =
-            playground.dataset.render_plan(&playground.query(
-                u32::try_from(playground_layout.content_rect.width().max(1)).unwrap_or(1),
-            )?);
         apply_timeline_playground_pan_drag(
             playground,
             pan_drag,
@@ -6533,7 +6680,7 @@ fn handle_scene_mouse_move(
             delta_y,
             playground_layout.content_rect.width(),
             playground_layout,
-            render_plan.rows().len(),
+            playground.cached_row_count_hint(),
         );
         Ok(true)
     })?;
@@ -7417,7 +7564,6 @@ fn handle_timer(hwnd: WindowHandle) -> LRESULT {
 }
 
 fn handle_focused_render_timer(hwnd: WindowHandle) -> LRESULT {
-    clear_focused_render_tick_pending(hwnd.raw());
     match with_app_state(|state| {
         if !state.window_focused {
             return Ok(());
@@ -7711,6 +7857,7 @@ fn handle_destroy_message(hwnd: WindowHandle) -> LRESULT {
         }
         let _ = state.take();
     });
+    maybe_request_process_helper_shutdown(hwnd);
     hwnd.post_quit_message();
     LRESULT(0)
 }
@@ -8344,7 +8491,6 @@ fn render_scene_window_frame(
             debug_overlay.as_ref(),
         )
     } else if state.scene_kind == SceneWindowKind::TimelinePlayground {
-        let pointer_position = state.pointer_position;
         let button_visual_states = scene_button_visual_states(state, layout);
         let playground = state
             .timeline_playground
@@ -8373,7 +8519,7 @@ fn render_scene_window_frame(
             window_chrome_buttons_state,
             &playground.dataset,
             &render_plan,
-            playground.view_state(pointer_position),
+            playground.view_state(None),
             &row_visual_positions,
             &button_visual_states,
         )
@@ -10818,7 +10964,7 @@ fn timeline_playground_row_positions(
         .iter()
         .map(|row| {
             (
-                row.key(),
+                row.key().clone(),
                 windows_scene::timeline_playground_row_world_top(row.id().as_u32()),
             )
         })
@@ -11921,6 +12067,11 @@ fn invoke_scene_action(
         });
     }
 
+    if action == SceneAction::QuitApplication {
+        request_application_shutdown(hwnd);
+        return Ok(SceneActionDisposition::KeepOpen);
+    }
+
     let (app_home, vt_engine) =
         with_scene_app_state(|state| Ok((state.app_home.clone(), state.vt_engine)))?;
     let disposition = perform_scene_action(&app_home, vt_engine, action)?;
@@ -12016,7 +12167,9 @@ fn perform_scene_action(
                 .wrap_err("failed to spawn Teamy Studio cursor latency playground thread")?;
             Ok(SceneActionDisposition::KeepOpen)
         }
-        SceneAction::ReactivateCursorLatencyMode | SceneAction::CreateBlankTimeline => {
+        SceneAction::QuitApplication
+        | SceneAction::ReactivateCursorLatencyMode
+        | SceneAction::CreateBlankTimeline => {
             Ok(SceneActionDisposition::KeepOpen)
         }
         SceneAction::OpenTextRenderingPlayground => {
@@ -16129,6 +16282,8 @@ mod tests {
 
     use super::*;
 
+    static TIMELINE_LOGS_TEST_LOCK: Mutex<()> = Mutex::new(());
+
     fn timeline_test_state(document: TimelineDocument) -> SceneAppState {
         SceneAppState {
             app_home: AppHome(std::path::PathBuf::from(".")),
@@ -16301,6 +16456,9 @@ mod tests {
 
     #[test]
     fn focused_timer_skips_live_playground_when_no_new_records_arrived() {
+        let _guard = TIMELINE_LOGS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         logs::clear_logs();
         let mut state = timeline_test_state(TimelineDocument::blank());
         state.scene_kind = SceneWindowKind::TimelinePlayground;
@@ -16316,6 +16474,9 @@ mod tests {
 
     #[test]
     fn focused_timer_renders_live_playground_after_new_records_arrive() {
+        let _guard = TIMELINE_LOGS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         logs::clear_logs();
         let mut state = timeline_test_state(TimelineDocument::blank());
         state.scene_kind = SceneWindowKind::TimelinePlayground;
@@ -16328,6 +16489,55 @@ mod tests {
 
         let subscriber = tracing_subscriber::Registry::default().with(logs::LogCollectorLayer);
         tracing::subscriber::with_default(subscriber, || tracing::info!("new live record"));
+
+        assert!(scene_needs_focused_timer_render(&state));
+    }
+
+    #[test]
+    fn focused_timer_skips_live_playground_for_recent_frame_mark_only_updates() {
+        let _guard = TIMELINE_LOGS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        logs::clear_logs();
+        let mut state = timeline_test_state(TimelineDocument::blank());
+        state.scene_kind = SceneWindowKind::TimelinePlayground;
+        state.window_focused = true;
+        let mut playground = TimelinePlaygroundState::new().expect("playground");
+        playground.source_mode = TimelinePlaygroundSourceMode::LiveTracingEvents;
+        playground.live_tracing_follow_tail = true;
+        playground.live_tracing_snapshot_revision = Some(logs::live_tracing_snapshot_revision());
+        playground.last_live_tracing_sync_at = Some(Instant::now());
+        state.timeline_playground = Some(playground);
+
+        let subscriber = tracing_subscriber::Registry::default().with(logs::LogCollectorLayer);
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(message = "finished frame", tracy.frame_mark = true)
+        });
+
+        assert!(!scene_needs_focused_timer_render(&state));
+    }
+
+    #[test]
+    fn focused_timer_renders_live_playground_for_stale_frame_mark_only_updates() {
+        let _guard = TIMELINE_LOGS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        logs::clear_logs();
+        let mut state = timeline_test_state(TimelineDocument::blank());
+        state.scene_kind = SceneWindowKind::TimelinePlayground;
+        state.window_focused = true;
+        let mut playground = TimelinePlaygroundState::new().expect("playground");
+        playground.source_mode = TimelinePlaygroundSourceMode::LiveTracingEvents;
+        playground.live_tracing_follow_tail = true;
+        playground.live_tracing_snapshot_revision = Some(logs::live_tracing_snapshot_revision());
+        playground.last_live_tracing_sync_at =
+            Instant::now().checked_sub(TIMELINE_PLAYGROUND_FRAME_MARK_SYNC_INTERVAL + Duration::from_millis(1));
+        state.timeline_playground = Some(playground);
+
+        let subscriber = tracing_subscriber::Registry::default().with(logs::LogCollectorLayer);
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(message = "finished frame", tracy.frame_mark = true)
+        });
 
         assert!(scene_needs_focused_timer_render(&state));
     }
@@ -16601,9 +16811,9 @@ mod tests {
         let filtered_plan = playground
             .dataset
             .render_plan(&playground.query(1_000).expect("query"));
-        let row_b_key = filtered_plan.rows()[0].key();
+        let row_b_key = filtered_plan.rows()[0].key().clone();
         playground.last_row_positions = vec![(
-            row_b_key,
+            row_b_key.clone(),
             windows_scene::timeline_playground_row_world_top(1),
         )];
         playground.update_row_position_animation(&filtered_plan);
@@ -16611,7 +16821,7 @@ mod tests {
         let visual_positions = playground.row_visual_positions(&filtered_plan);
         let row_b_visual_top = visual_positions
             .iter()
-            .find_map(|(key, top)| (*key == row_b_key).then_some(*top))
+            .find_map(|(key, top)| (key == &row_b_key).then_some(*top))
             .expect("row-b visual position");
         assert!(row_b_visual_top > 0);
         assert_eq!(timeline_playground_row_positions(&filtered_plan)[0].1, 0);
@@ -16862,6 +17072,19 @@ mod tests {
                 < focused_render_interval_ms_for_refresh_hz(60)
         );
         assert!(focused_render_interval_ms_for_refresh_hz(240) <= 4);
+    }
+
+    #[test]
+    fn timeline_playground_uses_fixed_focused_render_tick_interval() {
+        let mut state = timeline_test_state(TimelineDocument::blank());
+        state.scene_kind = SceneWindowKind::TimelinePlayground;
+        state.focused_render_interval_ms = 40;
+        state.timeline_playground = Some(TimelinePlaygroundState::new().expect("playground"));
+
+        assert_eq!(
+            scene_focused_render_tick_interval_ms(&state),
+            TIMELINE_PLAYGROUND_FOCUSED_RENDER_TICK_INTERVAL_MS
+        );
     }
 
     #[test]

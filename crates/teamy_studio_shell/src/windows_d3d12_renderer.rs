@@ -2739,7 +2739,7 @@ pub fn build_panel_scene(
     window_chrome_buttons_state: WindowChromeButtonsState,
 ) -> RenderScene {
     let blue = preferred_background_color();
-    let garden = [0.78, 0.88, 0.98, 1.0];
+    let garden = preferred_garden_frame_color(window_chrome_buttons_state.focused);
     let title_bar = preferred_title_bar_color(window_chrome_buttons_state.focused);
     let terminal_panel = [0.05, 0.06, 0.08, 1.0];
     let diagnostic_panel = [0.84, 0.44, 0.13, 1.0];
@@ -2803,6 +2803,11 @@ pub fn preferred_title_bar_color(focused: bool) -> [f32; 4] {
     }
 }
 
+#[must_use]
+pub fn preferred_garden_frame_color(focused: bool) -> [f32; 4] {
+    preferred_title_bar_color(focused)
+}
+
 fn preferred_background_color_from_dwm() -> Option<[f32; 4]> {
     preferred_background_color_with_alpha(0.5)
 }
@@ -2849,11 +2854,11 @@ pub fn window_garden_shader_data(layout: TerminalLayout) -> [f32; 4] {
 
 /// windowing[impl garden-band.outward]
 /// windowing[impl garden-band.feathered]
-pub fn push_window_garden_frame(scene: &mut RenderScene, layout: TerminalLayout) {
+pub fn push_window_garden_frame(scene: &mut RenderScene, layout: TerminalLayout, focused: bool) {
     push_panel_with_data(
         scene,
         layout.garden_rect().to_win32_rect(),
-        [0.78, 0.88, 0.98, 1.0],
+        preferred_garden_frame_color(focused),
         PanelEffect::GardenFrame,
         window_garden_shader_data(layout),
     );
@@ -7794,7 +7799,8 @@ mod tests {
         compile_embedded_shaders, composition_swap_chain_description, cpu_slug_coverage,
         cpu_slug_coverage_all_curves, cursor_latency_view_state_from_sample, dirty_fragment_ranges,
         extract_glyph_curves, fragment_ranges_match, fragment_vertex_ranges, load_snapshot_glyph,
-        load_terminal_font, preferred_title_bar_color, push_centered_text, push_glyph,
+        load_terminal_font, preferred_garden_frame_color, preferred_title_bar_color,
+        push_centered_text, push_glyph,
         push_overlay_panel, push_panel, push_text_block, push_title_text,
         render_frame_model_offscreen_image, render_snapshot_glyph_into_image, shader_compile_flags,
         solve_inverse_homography, terminal_scrollbar_geometry, window_garden_shader_data,
@@ -8809,6 +8815,38 @@ mod tests {
     }
 
     #[test]
+    fn build_panel_scene_matches_focused_garden_frame_to_title_bar_color() {
+        let layout = TerminalLayout {
+            client_width: 1040,
+            client_height: 680,
+            cell_width: 8,
+            cell_height: 16,
+            diagnostic_panel_visible: true,
+        };
+
+        let scene = build_panel_scene(
+            layout,
+            WindowChromeButtonsState {
+                focused: true,
+                ..WindowChromeButtonsState::default()
+            },
+        );
+        let garden_panel = scene
+            .panels
+            .iter()
+            .find(|panel| matches!(panel.effect, PanelEffect::GardenFrame))
+            .expect("garden frame panel should exist");
+        let title_panel = scene
+            .panels
+            .iter()
+            .find(|panel| matches!(panel.effect, PanelEffect::TitleBar))
+            .expect("title bar panel should exist");
+
+        assert_eq!(garden_panel.color, preferred_garden_frame_color(true));
+        assert_eq!(garden_panel.color, title_panel.color);
+    }
+
+    #[test]
     fn build_panel_scene_uses_unfocused_title_bar_color_when_inactive() {
         let layout = TerminalLayout {
             client_width: 1040,
@@ -8826,6 +8864,32 @@ mod tests {
             .expect("title bar panel should exist");
 
         assert_eq!(title_panel.color, preferred_title_bar_color(false));
+    }
+
+    #[test]
+    fn build_panel_scene_matches_inactive_garden_frame_to_title_bar_color() {
+        let layout = TerminalLayout {
+            client_width: 1040,
+            client_height: 680,
+            cell_width: 8,
+            cell_height: 16,
+            diagnostic_panel_visible: true,
+        };
+
+        let scene = build_panel_scene(layout, WindowChromeButtonsState::default());
+        let garden_panel = scene
+            .panels
+            .iter()
+            .find(|panel| matches!(panel.effect, PanelEffect::GardenFrame))
+            .expect("garden frame panel should exist");
+        let title_panel = scene
+            .panels
+            .iter()
+            .find(|panel| matches!(panel.effect, PanelEffect::TitleBar))
+            .expect("title bar panel should exist");
+
+        assert_eq!(garden_panel.color, preferred_garden_frame_color(false));
+        assert_eq!(garden_panel.color, title_panel.color);
     }
 
     #[test]

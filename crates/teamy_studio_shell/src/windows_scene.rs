@@ -187,6 +187,7 @@ pub enum SceneAction {
     OpenCursorInfo,
     OpenCursorGallery,
     OpenCursorLatencyPlayground,
+    QuitApplication,
     ReactivateCursorLatencyMode,
     OpenTextRenderingPlayground,
     OpenDemoMode,
@@ -1641,7 +1642,6 @@ pub fn build_timeline_playground_render_scene(
     push_timeline_playground_rows(
         &mut scene,
         playground_layout,
-        dataset,
         render_plan,
         row_visual_positions,
     );
@@ -2008,7 +2008,6 @@ fn push_timeline_playground_controls(
 fn push_timeline_playground_rows(
     scene: &mut RenderScene,
     layout: TimelinePlaygroundLayout,
-    dataset: &TimelineDataset,
     render_plan: &TimelineRenderPlan,
     row_visual_positions: &[(TimelineRenderRowKey, i32)],
 ) {
@@ -2054,7 +2053,7 @@ fn push_timeline_playground_rows(
             [0.11, 0.13, 0.16, 1.0],
             PanelEffect::TerminalFill,
         );
-        let label = timeline_playground_row_label(dataset, row.key());
+        let label = timeline_playground_row_label(row.key());
         let Some(label_rect) = client_rect_intersection(
             ClientRect::new(
                 layout.row_header_rect.left() + 8,
@@ -2414,12 +2413,18 @@ fn timeline_playground_render_item_color(
     timeline_playground_row_key_color(row_key)
 }
 
-fn timeline_playground_row_key_color(row_key: TimelineRenderRowKey) -> [f32; 4] {
+fn timeline_playground_row_key_color(row_key: &TimelineRenderRowKey) -> [f32; 4] {
     let palette_index = match row_key {
-        TimelineRenderRowKey::Interned(id) => id.as_u32(),
+        TimelineRenderRowKey::Key(value) => timeline_playground_row_palette_index(value),
         TimelineRenderRowKey::All => 0,
     };
     timeline_playground_row_color(palette_index)
+}
+
+fn timeline_playground_row_palette_index(value: &str) -> u32 {
+    value.bytes().fold(2_166_136_261_u32, |hash, byte| {
+        (hash ^ u32::from(byte)).wrapping_mul(16_777_619)
+    })
 }
 
 fn timeline_playground_row_color(row_id: u32) -> [f32; 4] {
@@ -2445,11 +2450,9 @@ fn timeline_render_item_row_id(render_item: TimelineRenderItem) -> u32 {
     }
 }
 
-fn timeline_playground_row_label(dataset: &TimelineDataset, key: TimelineRenderRowKey) -> String {
+fn timeline_playground_row_label(key: &TimelineRenderRowKey) -> String {
     match key {
-        TimelineRenderRowKey::Interned(id) => {
-            dataset.resolve_string(id).unwrap_or("<missing>").to_owned()
-        }
+        TimelineRenderRowKey::Key(value) => value.clone(),
         TimelineRenderRowKey::All => "all".to_owned(),
     }
 }
@@ -2583,13 +2586,13 @@ fn timeline_playground_row_unclipped_rect_for_top(
 }
 
 fn timeline_playground_visual_row_world_top(
-    row_key: TimelineRenderRowKey,
+    row_key: &TimelineRenderRowKey,
     row_id: u32,
     row_visual_positions: &[(TimelineRenderRowKey, i32)],
 ) -> i32 {
     row_visual_positions
         .iter()
-        .find_map(|(key, top)| (*key == row_key).then_some(*top))
+        .find_map(|(key, top)| (key == row_key).then_some(*top))
         .unwrap_or_else(|| timeline_playground_row_world_top(row_id))
 }
 
@@ -2873,6 +2876,14 @@ pub fn scene_button_specs(scene_kind: SceneWindowKind) -> &'static [SceneButtonS
                 tooltip: "Compare app-drawn cursor behavior against the OS cursor",
                 sprite: SpriteId::CursorArrow,
                 color: [0.28, 0.17, 0.18, 1.0],
+            },
+            SceneButtonSpec {
+                // windowing[impl launcher.buttons.quit]
+                action: SceneAction::QuitApplication,
+                label: "Quit Teamy Studio",
+                tooltip: "Close all Teamy Studio windows and warn if anything stays alive",
+                sprite: SpriteId::Terminal,
+                color: [0.36, 0.10, 0.10, 1.0],
             },
             SceneButtonSpec {
                 action: SceneAction::OpenTextRenderingPlayground,
@@ -10312,7 +10323,7 @@ fn build_scene_shell(
         preferred_background_color(),
         PanelEffect::BlueBackground,
     );
-    push_window_garden_frame(&mut scene, layout);
+    push_window_garden_frame(&mut scene, layout, window_chrome_buttons_state.focused);
     push_panel(
         &mut scene,
         layout.title_bar_rect().to_win32_rect(),
@@ -10576,6 +10587,11 @@ mod tests {
             specs
                 .iter()
                 .any(|spec| spec.action == SceneAction::OpenCursorLatencyPlayground)
+        );
+        assert!(
+            specs
+                .iter()
+                .any(|spec| spec.action == SceneAction::QuitApplication)
         );
         assert!(
             specs
