@@ -543,6 +543,7 @@ enum TimelinePlaygroundSourceMode {
 struct TimelinePlaygroundState {
     seed: u64,
     dataset: Arc<TimelineDataset>,
+    render_plan_cache: Option<TimelinePlaygroundRenderPlanCache>,
     grouping_mode: TimelineGroupingMode,
     minimum_visible_pixels: u32,
     visible_start_ns: i64,
@@ -849,6 +850,22 @@ struct TimelinePlaygroundRowPositionAnimation {
     started_at: Instant,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TimelinePlaygroundRenderPlanCacheKey {
+    dataset_ptr: usize,
+    visible_start_ns: i64,
+    visible_end_ns: i64,
+    grouping_mode: TimelineGroupingMode,
+    minimum_visible_pixels: u32,
+    viewport_width_pixels: u32,
+}
+
+#[derive(Clone, Debug)]
+struct TimelinePlaygroundRenderPlanCache {
+    key: TimelinePlaygroundRenderPlanCacheKey,
+    render_plan: Arc<TimelineRenderPlan>,
+}
+
 impl TimelinePlaygroundState {
     fn new() -> eyre::Result<Self> {
         let seed = TimelineSyntheticConfig::default().seed();
@@ -858,6 +875,7 @@ impl TimelinePlaygroundState {
         Ok(Self {
             seed,
             dataset,
+            render_plan_cache: None,
             grouping_mode: TimelineGroupingMode::GroupKey,
             minimum_visible_pixels: 4,
             visible_start_ns: 0,
@@ -884,6 +902,7 @@ impl TimelinePlaygroundState {
         self.dataset = Arc::new(generate_synthetic_timeline_dataset(
             &TimelineSyntheticConfig::default().with_seed(self.seed),
         )?);
+        self.render_plan_cache = None;
         self.zoom_animation = None;
         self.row_position_animation = None;
         self.last_row_positions.clear();
@@ -921,6 +940,7 @@ impl TimelinePlaygroundState {
                 self.last_live_tracing_sync_at = None;
                 self.visible_start_ns = 0;
                 self.visible_end_ns = TIMELINE_PLAYGROUND_LIVE_INITIAL_DURATION_NS;
+                self.render_plan_cache = None;
                 self.sync_live_tracing_events();
             }
             TimelinePlaygroundSourceMode::LiveTracingEvents => {
@@ -928,6 +948,7 @@ impl TimelinePlaygroundState {
                 self.live_tracing_follow_tail = false;
                 self.live_tracing_snapshot_revision = None;
                 self.last_live_tracing_sync_at = None;
+                self.render_plan_cache = None;
             }
         }
         self.hovered_item = None;
@@ -945,10 +966,15 @@ impl TimelinePlaygroundState {
         if self.live_tracing_snapshot_revision == Some(revision) {
             return;
         }
-        let (dataset, latest_at_ns) = logs::tracing_event_timeline_dataset();
+        let (dataset, latest_at_ns) = {
+            #[cfg(feature = "extended_observability")]
+            let _span = debug_span!("timeline_playground_live_dataset_sync").entered();
+            logs::tracing_event_timeline_dataset()
+        };
         self.live_tracing_snapshot_revision = Some(revision);
         self.last_live_tracing_sync_at = Some(Instant::now());
         self.dataset = dataset;
+        self.render_plan_cache = None;
         if self.live_tracing_follow_tail {
             let duration = (self.visible_end_ns - self.visible_start_ns).max(1);
             self.visible_end_ns = latest_at_ns.max(1);
@@ -1059,6 +1085,40 @@ impl TimelinePlaygroundState {
                 .with_grouping_mode(self.grouping_mode)
                 .with_minimum_visible_pixels(self.minimum_visible_pixels)
         })
+    }
+
+    fn render_plan_cache_key(
+        &self,
+        query: &TimelineViewportQuery,
+    ) -> TimelinePlaygroundRenderPlanCacheKey {
+        TimelinePlaygroundRenderPlanCacheKey {
+            dataset_ptr: Arc::as_ptr(&self.dataset) as usize,
+            visible_start_ns: query.visible_range().start().as_i64(),
+            visible_end_ns: query.visible_range().end().as_i64(),
+            grouping_mode: query.grouping_mode(),
+            minimum_visible_pixels: query.minimum_visible_pixels(),
+            viewport_width_pixels: query.viewport_width_pixels(),
+        }
+    }
+
+    fn render_plan_for_query(&mut self, query: &TimelineViewportQuery) -> Arc<TimelineRenderPlan> {
+        let key = self.render_plan_cache_key(query);
+        if let Some(cache) = &self.render_plan_cache
+            && cache.key == key
+        {
+            #[cfg(feature = "extended_observability")]
+            let _span = debug_span!("timeline_playground_render_plan_cache_hit").entered();
+            return cache.render_plan.clone();
+        }
+
+        #[cfg(feature = "extended_observability")]
+        let _span = debug_span!("timeline_playground_render_plan_cache_miss").entered();
+        let render_plan = Arc::new(self.dataset.render_plan(query));
+        self.render_plan_cache = Some(TimelinePlaygroundRenderPlanCache {
+            key,
+            render_plan: render_plan.clone(),
+        });
+        render_plan
     }
 
     fn pan(&mut self, direction: i64) {
@@ -3197,26 +3257,37 @@ fn timeline_document_snapshot(state: &SceneAppState) -> Option<TimelineDocument>
 }
 
 fn timeline_playground_target_at_point(
-    state: &SceneAppState,
+    state: &mut SceneAppState,
     layout: TerminalLayout,
     point: ClientPoint,
 ) -> eyre::Result<Option<windows_scene::TimelinePlaygroundHitTarget>> {
-    let Some(playground) = state.timeline_playground.as_ref() else {
+    let Some(playground) = state.timeline_playground.as_mut() else {
         return Ok(None);
     };
     let playground_layout = windows_scene::timeline_playground_layout(
         layout.terminal_panel_rect().inset(24),
         playground.vertical_scroll_offset,
     );
-    let query = playground
-        .query(u32::try_from(playground_layout.content_rect.width().max(1)).unwrap_or(1))?;
-    let render_plan = playground.dataset.render_plan(&query);
-    Ok(windows_scene::timeline_playground_hit_target_at_point(
-        layout,
-        &render_plan,
-        playground.view_state(None),
-        point,
-    ))
+    let query = {
+        #[cfg(feature = "extended_observability")]
+        let _span = debug_span!("timeline_playground_hit_test_query").entered();
+        playground.query(u32::try_from(playground_layout.content_rect.width().max(1)).unwrap_or(1))?
+    };
+    let render_plan = {
+        #[cfg(feature = "extended_observability")]
+        let _span = debug_span!("timeline_playground_hit_test_render_plan").entered();
+        playground.render_plan_for_query(&query)
+    };
+    Ok({
+        #[cfg(feature = "extended_observability")]
+        let _span = debug_span!("timeline_playground_hit_test_lookup").entered();
+        windows_scene::timeline_playground_hit_target_at_point(
+            layout,
+            &render_plan,
+            playground.view_state(None),
+            point,
+        )
+    })
 }
 
 fn update_timeline_playground_hover_detail_from_target(
@@ -3932,7 +4003,7 @@ fn configure_scene_window_chrome(hwnd: HWND) {
             u32::try_from(std::mem::size_of_val(&border_color)).unwrap_or(u32::MAX),
         )
     } {
-        tracing::warn!(error = %error, "scene window DWM border-color override unavailable");
+        log_scene_window_dwm_override_error("border-color", error);
     }
 
     let corner_preference = DWMWCP_DONOTROUND;
@@ -3944,7 +4015,17 @@ fn configure_scene_window_chrome(hwnd: HWND) {
             u32::try_from(std::mem::size_of_val(&corner_preference)).unwrap_or(u32::MAX),
         )
     } {
-        tracing::warn!(error = %error, "scene window DWM corner override unavailable");
+        log_scene_window_dwm_override_error("corner", error);
+    }
+}
+
+fn log_scene_window_dwm_override_error(attribute: &str, error: windows::core::Error) {
+    const INVALID_PARAMETER_HRESULT: windows::core::HRESULT =
+        windows::core::HRESULT(0x80070057_u32 as i32);
+    if error.code() == INVALID_PARAMETER_HRESULT {
+        tracing::debug!(error = %error, attribute, "scene window DWM override unsupported");
+    } else {
+        tracing::warn!(error = %error, attribute, "scene window DWM override unavailable");
     }
 }
 
@@ -8496,33 +8577,54 @@ fn render_scene_window_frame(
             .timeline_playground
             .as_mut()
             .expect("timeline playground scene has playground state");
-        playground.sync_live_tracing_events();
+        let () = {
+            #[cfg(feature = "extended_observability")]
+            let _span = debug_span!("timeline_playground_live_sync").entered();
+            playground.sync_live_tracing_events();
+        };
         let playground_layout = windows_scene::timeline_playground_layout(
             layout.terminal_panel_rect().inset(24),
             playground.vertical_scroll_offset,
         );
-        let query = playground
-            .query(u32::try_from(playground_layout.content_rect.width().max(1)).unwrap_or(1))
-            .expect("timeline playground query must be valid");
-        let render_plan = playground.dataset.render_plan(&query);
-        playground.clamp_vertical_scroll_offset(playground_layout, render_plan.rows().len());
-        playground.update_row_position_animation(&render_plan);
-        let row_visual_positions = playground.row_visual_positions(&render_plan);
-        playground.apply_row_position_animation();
+        let query = {
+            #[cfg(feature = "extended_observability")]
+            let _span = debug_span!("timeline_playground_build_query").entered();
+            playground
+                .query(u32::try_from(playground_layout.content_rect.width().max(1)).unwrap_or(1))
+                .expect("timeline playground query must be valid")
+        };
+        let render_plan = {
+            #[cfg(feature = "extended_observability")]
+            let _span = debug_span!("timeline_playground_render_plan").entered();
+            playground.render_plan_for_query(&query)
+        };
+        let row_visual_positions = {
+            #[cfg(feature = "extended_observability")]
+            let _span = debug_span!("timeline_playground_row_layout").entered();
+            playground.clamp_vertical_scroll_offset(playground_layout, render_plan.rows().len());
+            playground.update_row_position_animation(&render_plan);
+            let row_visual_positions = playground.row_visual_positions(&render_plan);
+            playground.apply_row_position_animation();
+            row_visual_positions
+        };
         late_latched_pointer_visual =
             Some(LateLatchedPointerVisual::TimelinePlaygroundCursorGuide {
                 ruler_rect: playground_layout.ruler_rect,
                 content_rect: playground_layout.content_rect,
             });
-        windows_scene::build_timeline_playground_render_scene(
-            layout,
-            window_chrome_buttons_state,
-            &playground.dataset,
-            &render_plan,
-            playground.view_state(None),
-            &row_visual_positions,
-            &button_visual_states,
-        )
+        {
+            #[cfg(feature = "extended_observability")]
+            let _span = debug_span!("timeline_playground_build_scene").entered();
+            windows_scene::build_timeline_playground_render_scene(
+                layout,
+                window_chrome_buttons_state,
+                &playground.dataset,
+                &render_plan,
+                playground.view_state(None),
+                &row_visual_positions,
+                &button_visual_states,
+            )
+        }
     } else if state.scene_kind == SceneWindowKind::TimelinePlaygroundDetail {
         let detail_state = timeline_playground_detail_window_state(state);
         let pretty_text = timeline_playground_detail_pretty_text(&detail_state);

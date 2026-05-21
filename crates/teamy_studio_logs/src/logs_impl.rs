@@ -93,6 +93,8 @@ struct LogsState {
     next_span_id: AtomicU64,
     records: Mutex<VecDeque<LogRecordSnapshot>>,
     span_records: Mutex<VecDeque<LogSpanSnapshot>>,
+    timeline_records: Mutex<Vec<LogRecordSnapshot>>,
+    timeline_span_records: Mutex<Vec<LogSpanSnapshot>>,
     timeline_cache: Mutex<LiveTracingTimelineCache>,
 }
 
@@ -103,9 +105,25 @@ impl Default for LogsState {
             next_span_id: AtomicU64::new(1),
             records: Mutex::new(VecDeque::with_capacity(MAX_LOG_RECORDS)),
             span_records: Mutex::new(VecDeque::with_capacity(MAX_LOG_SPAN_RECORDS)),
+            timeline_records: Mutex::new(Vec::with_capacity(MAX_LOG_RECORDS)),
+            timeline_span_records: Mutex::new(Vec::with_capacity(MAX_LOG_SPAN_RECORDS)),
             timeline_cache: Mutex::new(LiveTracingTimelineCache::default()),
         }
     }
+}
+
+#[derive(Clone, Debug)]
+struct LiveTracingHistoryMetadata {
+    revision: LiveTracingSnapshotRevision,
+    first_log_id: u64,
+    first_span_id: u64,
+}
+
+#[derive(Clone, Debug)]
+struct LiveTracingHistorySnapshot {
+    metadata: LiveTracingHistoryMetadata,
+    records: Vec<LogRecordSnapshot>,
+    span_records: Vec<LogSpanSnapshot>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -134,13 +152,11 @@ impl LiveTracingTimelineCache {
         revision: LiveTracingSnapshotRevision,
         first_log_id: u64,
         first_span_id: u64,
-        first_timestamp: Option<&DateTime<Local>>,
     ) -> bool {
         self.record_count <= revision.record_count
             && self.span_count <= revision.span_count
             && (self.record_count == 0 || self.first_log_id == first_log_id)
             && (self.span_count == 0 || self.first_span_id == first_span_id)
-            && self.first_timestamp.as_ref() == first_timestamp
     }
 
     fn store(
@@ -463,6 +479,17 @@ fn push_log_record(
         source_hwnd,
         is_tracy_frame_mark,
     });
+
+    let snapshot = records
+        .back()
+        .cloned()
+        .expect("newly pushed log record should exist");
+    drop(records);
+    state
+        .timeline_records
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(snapshot);
     id
 }
 
@@ -487,6 +514,17 @@ fn push_log_span_record(fields: LogSpanFields, end_timestamp: DateTime<Local>) -
         fields: fields.fields,
         source_hwnd: fields.source_hwnd,
     });
+
+    let snapshot = span_records
+        .back()
+        .cloned()
+        .expect("newly pushed span record should exist");
+    drop(span_records);
+    state
+        .timeline_span_records
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(snapshot);
     id
 }
 
@@ -525,26 +563,83 @@ pub fn log_span_snapshots() -> Vec<LogSpanSnapshot> {
         .collect()
 }
 
-#[must_use]
-pub fn live_tracing_snapshot_revision() -> LiveTracingSnapshotRevision {
+fn live_tracing_history_metadata() -> LiveTracingHistoryMetadata {
     let records = logs_state()
-        .records
+        .timeline_records
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let latest_log_id = records.back().map_or(0, |record| record.id);
+    let latest_log_id = records.last().map_or(0, |record| record.id);
     let record_count = records.len();
+    let first_log_id = records.first().map_or(0, |record| record.id);
     drop(records);
 
     let span_records = logs_state()
-        .span_records
+        .timeline_span_records
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    LiveTracingSnapshotRevision {
-        latest_log_id,
-        latest_span_id: span_records.back().map_or(0, |record| record.id),
-        record_count,
-        span_count: span_records.len(),
+    LiveTracingHistoryMetadata {
+        revision: LiveTracingSnapshotRevision {
+            latest_log_id,
+            latest_span_id: span_records.last().map_or(0, |record| record.id),
+            record_count,
+            span_count: span_records.len(),
+        },
+        first_log_id,
+        first_span_id: span_records.first().map_or(0, |record| record.id),
     }
+}
+
+fn live_tracing_history_snapshot(
+    record_start_index: usize,
+    span_start_index: usize,
+) -> LiveTracingHistorySnapshot {
+    let records = logs_state()
+        .timeline_records
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let first_log_id = records.first().map_or(0, |record| record.id);
+    let latest_log_id = records.last().map_or(0, |record| record.id);
+    let record_count = records.len();
+    let records = records.iter().skip(record_start_index).cloned().collect();
+
+    let span_records = logs_state()
+        .timeline_span_records
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    LiveTracingHistorySnapshot {
+        metadata: LiveTracingHistoryMetadata {
+            revision: LiveTracingSnapshotRevision {
+                latest_log_id,
+                latest_span_id: span_records.last().map_or(0, |record| record.id),
+                record_count,
+                span_count: span_records.len(),
+            },
+            first_log_id,
+            first_span_id: span_records.first().map_or(0, |record| record.id),
+        },
+        records,
+        span_records: span_records
+            .iter()
+            .skip(span_start_index)
+            .cloned()
+            .collect(),
+    }
+}
+
+fn live_tracing_tail_rewinds_first_timestamp(
+    cached_first_timestamp: Option<&DateTime<Local>>,
+    records: &[LogRecordSnapshot],
+    span_records: &[LogSpanSnapshot],
+) -> bool {
+    cached_first_timestamp.is_some_and(|cached_first_timestamp| {
+        live_tracing_first_timestamp(records, span_records)
+            .is_some_and(|first_timestamp| first_timestamp < *cached_first_timestamp)
+    })
+}
+
+#[must_use]
+pub fn live_tracing_snapshot_revision() -> LiveTracingSnapshotRevision {
+    live_tracing_history_metadata().revision
 }
 
 #[must_use]
@@ -569,11 +664,11 @@ pub fn live_tracing_snapshot_delta_since(
     }
 
     let records = logs_state()
-        .records
+        .timeline_records
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut saw_frame_mark = false;
-    for record in records.iter().filter(|record| record.id > previous.latest_log_id) {
+    for record in records.iter().skip(previous.record_count) {
         if !record.is_tracy_frame_mark {
             return LiveTracingSnapshotDelta::Other;
         }
@@ -590,108 +685,154 @@ pub fn live_tracing_snapshot_delta_since(
 #[must_use]
 // timeline[impl playground.live-tracing-events]
 pub fn tracing_event_timeline_dataset() -> (Arc<TimelineDataset>, i64) {
-    let records = log_snapshots();
-    let span_records = log_span_snapshots();
-    let revision = LiveTracingSnapshotRevision {
-        latest_log_id: records.last().map_or(0, |record| record.id),
-        latest_span_id: span_records.last().map_or(0, |record| record.id),
-        record_count: records.len(),
-        span_count: span_records.len(),
+    let _span = tracing::info_span!("tracing_event_timeline_dataset").entered();
+    let metadata = live_tracing_history_metadata();
+    let cache_snapshot = {
+        let cache = logs_state()
+            .timeline_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if cache.matches_revision(metadata.revision) {
+            let _span = tracing::debug_span!("timeline_dataset_cache_hit").entered();
+            return (cache.dataset.clone(), cache.latest_at_ns);
+        }
+        cache.clone()
     };
-    let first_log_id = records.first().map_or(0, |record| record.id);
-    let first_span_id = span_records.first().map_or(0, |record| record.id);
-    let first_timestamp = live_tracing_first_timestamp(&records, &span_records);
-    let mut cache = logs_state()
-        .timeline_cache
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if cache.matches_revision(revision) {
-        return (cache.dataset.clone(), cache.latest_at_ns);
-    }
-    if cache.can_append(
-        revision,
-        first_log_id,
-        first_span_id,
-        first_timestamp.as_ref(),
+
+    if cache_snapshot.can_append(
+        metadata.revision,
+        metadata.first_log_id,
+        metadata.first_span_id,
     ) {
-        let cached_record_count = cache.record_count;
-        let cached_span_count = cache.span_count;
-        let mut dataset = cache.dataset.as_ref().clone();
-        let mut latest_at_ns = cache.latest_at_ns.max(1);
-        let first_timestamp = first_timestamp
-            .clone()
-            .expect("append-only live tracing cache retains its first timestamp");
-
-        for record in span_records.iter().skip(cached_span_count).cloned() {
-            latest_at_ns = latest_at_ns.max(push_live_tracing_span_timeline_item(
-                &mut dataset,
-                record,
-                first_timestamp.clone(),
-                latest_at_ns,
-            ));
-        }
-
-        for record in records.iter().skip(cached_record_count).cloned() {
-            latest_at_ns = latest_at_ns.max(push_live_tracing_event_timeline_item(
-                &mut dataset,
-                record,
-                first_timestamp.clone(),
-                latest_at_ns,
-            ));
-        }
-
-        let _ = dataset.compact();
-        let latest_at_ns = latest_at_ns.max(1);
-        let dataset = Arc::new(dataset);
-        cache.store(
-            revision,
-            first_log_id,
-            first_span_id,
-            Some(first_timestamp),
-            dataset.clone(),
-            latest_at_ns,
+        let _span = tracing::debug_span!("timeline_dataset_cache_append").entered();
+        let history = {
+            let _span = tracing::debug_span!("timeline_dataset_snapshot_tail").entered();
+            live_tracing_history_snapshot(cache_snapshot.record_count, cache_snapshot.span_count)
+        };
+        let can_append = cache_snapshot.can_append(
+            history.metadata.revision,
+            history.metadata.first_log_id,
+            history.metadata.first_span_id,
+        ) && !live_tracing_tail_rewinds_first_timestamp(
+            cache_snapshot.first_timestamp.as_ref(),
+            &history.records,
+            &history.span_records,
         );
-        return (dataset, latest_at_ns);
+
+        if can_append {
+            let mut dataset = cache_snapshot.dataset.as_ref().clone();
+            let mut latest_at_ns = cache_snapshot.latest_at_ns.max(1);
+            let first_timestamp = cache_snapshot
+                .first_timestamp
+                .or_else(|| live_tracing_first_timestamp(&history.records, &history.span_records));
+
+            if let Some(first_timestamp) = first_timestamp {
+                let _span = tracing::debug_span!("timeline_dataset_append_replay").entered();
+                for record in history.span_records {
+                    latest_at_ns = latest_at_ns.max(push_live_tracing_span_timeline_item(
+                        &mut dataset,
+                        record,
+                        first_timestamp,
+                        latest_at_ns,
+                        true,
+                    ));
+                }
+
+                for record in history.records {
+                    latest_at_ns = latest_at_ns.max(push_live_tracing_event_timeline_item(
+                        &mut dataset,
+                        record,
+                        first_timestamp,
+                        latest_at_ns,
+                        true,
+                    ));
+                }
+            }
+            let latest_at_ns = latest_at_ns.max(1);
+            let dataset = Arc::new(dataset);
+            logs_state()
+                .timeline_cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .store(
+                    history.metadata.revision,
+                    history.metadata.first_log_id,
+                    history.metadata.first_span_id,
+                    first_timestamp,
+                    dataset.clone(),
+                    latest_at_ns,
+                );
+            return (dataset, latest_at_ns);
+        }
     }
 
+    let _span = tracing::debug_span!("timeline_dataset_cache_rebuild").entered();
+    let history = {
+        let _span = tracing::debug_span!("timeline_dataset_snapshot_full").entered();
+        live_tracing_history_snapshot(0, 0)
+    };
     let mut dataset = TimelineDataset::new();
+    let first_timestamp = live_tracing_first_timestamp(&history.records, &history.span_records);
     let Some(first_timestamp) = first_timestamp
     else {
         let dataset = Arc::new(dataset);
-        cache.store(revision, first_log_id, first_span_id, None, dataset.clone(), 1);
+        logs_state()
+            .timeline_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .store(
+                history.metadata.revision,
+                history.metadata.first_log_id,
+                history.metadata.first_span_id,
+                None,
+                dataset.clone(),
+                1,
+            );
         return (dataset, 1);
     };
     let mut latest_at_ns = 1_i64;
 
-    for record in span_records {
-        latest_at_ns = latest_at_ns.max(push_live_tracing_span_timeline_item(
-            &mut dataset,
-            record,
-            first_timestamp,
-            latest_at_ns,
-        ));
+    {
+        let _span = tracing::debug_span!("timeline_dataset_rebuild_replay").entered();
+        for record in history.span_records {
+            latest_at_ns = latest_at_ns.max(push_live_tracing_span_timeline_item(
+                &mut dataset,
+                record,
+                first_timestamp,
+                latest_at_ns,
+                false,
+            ));
+        }
+
+        for record in history.records {
+            latest_at_ns = latest_at_ns.max(push_live_tracing_event_timeline_item(
+                &mut dataset,
+                record,
+                first_timestamp,
+                latest_at_ns,
+                false,
+            ));
+        }
     }
 
-    for record in records {
-        latest_at_ns = latest_at_ns.max(push_live_tracing_event_timeline_item(
-            &mut dataset,
-            record,
-            first_timestamp,
-            latest_at_ns,
-        ));
+    {
+        let _span = tracing::debug_span!("timeline_dataset_compact").entered();
+        let _ = dataset.compact();
     }
-
-    let _ = dataset.compact();
     let latest_at_ns = latest_at_ns.max(1);
     let dataset = Arc::new(dataset);
-    cache.store(
-        revision,
-        first_log_id,
-        first_span_id,
-        Some(first_timestamp),
-        dataset.clone(),
-        latest_at_ns,
-    );
+    logs_state()
+        .timeline_cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .store(
+            history.metadata.revision,
+            history.metadata.first_log_id,
+            history.metadata.first_span_id,
+            Some(first_timestamp),
+            dataset.clone(),
+            latest_at_ns,
+        );
     (dataset, latest_at_ns)
 }
 
@@ -711,6 +852,7 @@ fn push_live_tracing_span_timeline_item(
     record: LogSpanSnapshot,
     first_timestamp: DateTime<Local>,
     fallback_at_ns: i64,
+    update_index: bool,
 ) -> i64 {
     let start_ns = record
         .start_timestamp
@@ -744,11 +886,19 @@ fn push_live_tracing_span_timeline_item(
             TimelineFieldInputValue::String(source_hwnd.to_string()),
         );
     }
-    let _ = dataset.push_span(
-        input,
-        TimelineInstantNs::new(start_ns),
-        Some(TimelineInstantNs::new(end_ns)),
-    );
+    if update_index {
+        let _ = dataset.push_span_indexed(
+            input,
+            TimelineInstantNs::new(start_ns),
+            Some(TimelineInstantNs::new(end_ns)),
+        );
+    } else {
+        let _ = dataset.push_span(
+            input,
+            TimelineInstantNs::new(start_ns),
+            Some(TimelineInstantNs::new(end_ns)),
+        );
+    }
     end_ns
 }
 
@@ -757,6 +907,7 @@ fn push_live_tracing_event_timeline_item(
     record: LogRecordSnapshot,
     first_timestamp: DateTime<Local>,
     fallback_at_ns: i64,
+    update_index: bool,
 ) -> i64 {
     let at_ns = record
         .timestamp
@@ -791,7 +942,11 @@ fn push_live_tracing_event_timeline_item(
                     .map_or_else(|| "none".to_owned(), |hwnd| hwnd.to_string()),
             ),
         );
-    dataset.push_event(input, TimelineInstantNs::new(at_ns));
+    if update_index {
+        let _ = dataset.push_event_indexed(input, TimelineInstantNs::new(at_ns));
+    } else {
+        let _ = dataset.push_event(input, TimelineInstantNs::new(at_ns));
+    }
     at_ns
 }
 
@@ -803,6 +958,16 @@ pub fn clear_logs() {
         .clear();
     logs_state()
         .span_records
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clear();
+    logs_state()
+        .timeline_records
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clear();
+    logs_state()
+        .timeline_span_records
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clear();
@@ -1131,12 +1296,11 @@ mod tests {
             },
             41,
             0,
-            Some(&base),
         ));
     }
 
     #[test]
-    fn live_timeline_cache_rejects_ring_buffer_rollover() {
+    fn live_timeline_cache_rejects_first_log_id_change() {
         let base = Local::now();
         let cache = LiveTracingTimelineCache {
             first_log_id: 41,
@@ -1155,32 +1319,29 @@ mod tests {
             },
             42,
             0,
-            Some(&base),
         ));
     }
 
     #[test]
-    fn live_timeline_cache_rejects_earlier_first_timestamp() {
+    fn live_timeline_tail_rewind_detects_earlier_first_timestamp() {
         let base = Local::now();
         let earlier = base - chrono::TimeDelta::milliseconds(1);
-        let cache = LiveTracingTimelineCache {
-            first_log_id: 41,
-            latest_log_id: 41,
-            record_count: 1,
-            first_timestamp: Some(base),
-            ..LiveTracingTimelineCache::default()
+        let earlier_span = LogSpanSnapshot {
+            id: 42,
+            start_timestamp: earlier,
+            end_timestamp: base,
+            thread_name: "timeline-thread".to_owned(),
+            thread_key: "timeline-thread ThreadId(1)".to_owned(),
+            target: "teamy::timeline".to_owned(),
+            name: "older-span".to_owned(),
+            fields: Vec::new(),
+            source_hwnd: None,
         };
 
-        assert!(!cache.can_append(
-            LiveTracingSnapshotRevision {
-                latest_log_id: 42,
-                latest_span_id: 0,
-                record_count: 2,
-                span_count: 0,
-            },
-            41,
-            0,
-            Some(&earlier),
+        assert!(live_tracing_tail_rewinds_first_timestamp(
+            Some(&base),
+            &[],
+            &[earlier_span],
         ));
     }
 
@@ -1277,5 +1438,44 @@ mod tests {
         assert!(dataset.items().iter().any(|item| {
             matches!(item.kind(), crate::timeline::TimelineItemKind::Span(span) if span.end().is_some())
         }));
+    }
+
+    #[test]
+    fn live_timeline_history_retains_spans_after_recent_buffer_rollover() {
+        let _guard = TEST_LOGS_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear_logs();
+        let base = Local::now();
+
+        for index in 0..=MAX_LOG_SPAN_RECORDS {
+            let start = base + chrono::TimeDelta::microseconds(i64::try_from(index).unwrap());
+            let end = start + chrono::TimeDelta::microseconds(1);
+            let _ = push_log_span_record(
+                LogSpanFields {
+                    start_timestamp: start,
+                    thread_name: "timeline-thread".to_owned(),
+                    thread_key: "timeline-thread ThreadId(1)".to_owned(),
+                    target: "teamy::timeline".to_owned(),
+                    name: format!("span-{index}"),
+                    fields: Vec::new(),
+                    source_hwnd: None,
+                    collect_timeline_span: true,
+                },
+                end,
+            );
+        }
+
+        assert_eq!(log_span_snapshots().len(), MAX_LOG_SPAN_RECORDS);
+        assert_eq!(live_tracing_snapshot_revision().span_count, MAX_LOG_SPAN_RECORDS + 1);
+
+        let (dataset, _) = tracing_event_timeline_dataset();
+        let span_count = dataset
+            .items()
+            .iter()
+            .filter(|item| matches!(item.kind(), crate::timeline::TimelineItemKind::Span(_)))
+            .count();
+
+        assert_eq!(span_count, MAX_LOG_SPAN_RECORDS + 1);
     }
 }

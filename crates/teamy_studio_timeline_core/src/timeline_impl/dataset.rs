@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::cmp::Ordering;
 
 use arbitrary::Arbitrary;
 use facet::Facet;
@@ -432,6 +433,30 @@ impl TimelineDataset {
         Ok(id)
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if a closed span has an end before its start.
+    pub fn push_span_indexed(
+        &mut self,
+        input: TimelineItemInput,
+        start: TimelineInstantNs,
+        end: Option<TimelineInstantNs>,
+    ) -> eyre::Result<TimelineItemId> {
+        if let Some(end) = end {
+            TimelineRangeNs::try_new(start, end)?;
+        }
+
+        let id = self.allocate_item_id();
+        let item = self.build_item(
+            id,
+            input,
+            TimelineItemKind::Span(TimelineSpanItem { start, end }),
+        );
+        self.items.push(item);
+        self.record_indexed_insert(id);
+        Ok(id)
+    }
+
     pub fn push_event(
         &mut self,
         input: TimelineItemInput,
@@ -444,13 +469,25 @@ impl TimelineDataset {
         id
     }
 
+    pub fn push_event_indexed(
+        &mut self,
+        input: TimelineItemInput,
+        at: TimelineInstantNs,
+    ) -> TimelineItemId {
+        let id = self.allocate_item_id();
+        let item = self.build_item(id, input, TimelineItemKind::Event(TimelineEventItem { at }));
+        self.items.push(item);
+        self.record_indexed_insert(id);
+        id
+    }
+
     /// # Errors
     ///
     /// Returns an error when the item does not exist, is not a span, is already closed,
     /// or `end` is earlier than the span start.
     // timeline[impl display.dataset-checked-mutation]
     pub fn finish_span(&mut self, id: TimelineItemId, end: TimelineInstantNs) -> eyre::Result<()> {
-        let Some(item) = self.items.iter_mut().find(|item| item.id == id) else {
+        let Some(item) = self.item_mut(id) else {
             eyre::bail!("timeline item {} does not exist", id.as_u64());
         };
 
@@ -470,7 +507,7 @@ impl TimelineDataset {
 
     #[must_use]
     pub fn item(&self, id: TimelineItemId) -> Option<&TimelineItem> {
-        self.items.iter().find(|item| item.id == id)
+        self.item_index(id).map(|index| &self.items[index])
     }
 
     // timeline[impl display.dataset-index-compaction]
@@ -499,6 +536,16 @@ impl TimelineDataset {
     fn allocate_sequence(&mut self) -> TimelineItemSequence {
         self.next_sequence = self.next_sequence.saturating_add(1);
         TimelineItemSequence(self.next_sequence)
+    }
+
+    fn item_index(&self, id: TimelineItemId) -> Option<usize> {
+        let index = usize::try_from(id.as_u64().checked_sub(1)?).ok()?;
+        self.items.get(index).and_then(|item| (item.id == id).then_some(index))
+    }
+
+    fn item_mut(&mut self, id: TimelineItemId) -> Option<&mut TimelineItem> {
+        let index = self.item_index(id)?;
+        self.items.get_mut(index)
     }
 
     fn build_item(
@@ -553,6 +600,63 @@ impl TimelineDataset {
     fn record_write(&mut self, entry: TimelineWriteLogEntry) {
         self.revision = TimelineDatasetRevision(self.revision.as_u64().saturating_add(1));
         self.write_log.push(entry);
+    }
+
+    fn record_indexed_insert(&mut self, id: TimelineItemId) {
+        self.revision = TimelineDatasetRevision(self.revision.as_u64().saturating_add(1));
+        self.insert_item_into_index(id);
+        self.index.revision = self.revision;
+    }
+
+    fn insert_item_into_index(&mut self, id: TimelineItemId) {
+        let Some(item) = self.item(id) else {
+            unreachable!("indexed insert item must exist");
+        };
+
+        match item.kind() {
+            TimelineItemKind::Span(span) => {
+                let key = (span.start(), item.sequence());
+                let position = self
+                    .index
+                    .spans_by_start
+                    .binary_search_by(|indexed_id| self.compare_span_index_key(*indexed_id, key))
+                    .unwrap_or_else(|position| position);
+                self.index.spans_by_start.insert(position, id);
+            }
+            TimelineItemKind::Event(event) => {
+                let key = (event.at(), item.sequence());
+                let position = self
+                    .index
+                    .events_by_time
+                    .binary_search_by(|indexed_id| self.compare_event_index_key(*indexed_id, key))
+                    .unwrap_or_else(|position| position);
+                self.index.events_by_time.insert(position, id);
+            }
+        }
+    }
+
+    fn compare_span_index_key(
+        &self,
+        id: TimelineItemId,
+        key: (TimelineInstantNs, TimelineItemSequence),
+    ) -> Ordering {
+        let item = self.item(id).expect("span index item must exist");
+        let TimelineItemKind::Span(span) = item.kind() else {
+            unreachable!("span index contains only span items");
+        };
+        (span.start(), item.sequence()).cmp(&key)
+    }
+
+    fn compare_event_index_key(
+        &self,
+        id: TimelineItemId,
+        key: (TimelineInstantNs, TimelineItemSequence),
+    ) -> Ordering {
+        let item = self.item(id).expect("event index item must exist");
+        let TimelineItemKind::Event(event) = item.kind() else {
+            unreachable!("event index contains only event items");
+        };
+        (event.at(), item.sequence()).cmp(&key)
     }
 
     fn rebuild_index_inner(&mut self) {
@@ -818,6 +922,34 @@ mod tests {
         assert_eq!(dataset.items().len(), 3);
         assert_eq!(dataset.span_index(), &[early_span_id, late_span_id]);
         assert_eq!(dataset.event_index(), &[event_id]);
+        assert_eq!(dataset.pending_write_count(), 0);
+        assert_eq!(dataset.index_revision(), dataset.revision());
+    }
+
+    #[test]
+    fn indexed_push_keeps_indexes_current_without_pending_writes() {
+        let mut dataset = TimelineDataset::new();
+        let later_event_id =
+            dataset.push_event_indexed(TimelineItemInput::new("later"), TimelineInstantNs::new(40));
+        let earlier_event_id =
+            dataset.push_event_indexed(TimelineItemInput::new("earlier"), TimelineInstantNs::new(10));
+        let later_span_id = dataset
+            .push_span_indexed(
+                TimelineItemInput::new("later-span"),
+                TimelineInstantNs::new(50),
+                Some(TimelineInstantNs::new(60)),
+            )
+            .expect("later span");
+        let earlier_span_id = dataset
+            .push_span_indexed(
+                TimelineItemInput::new("earlier-span"),
+                TimelineInstantNs::new(20),
+                Some(TimelineInstantNs::new(30)),
+            )
+            .expect("earlier span");
+
+        assert_eq!(dataset.event_index(), &[earlier_event_id, later_event_id]);
+        assert_eq!(dataset.span_index(), &[earlier_span_id, later_span_id]);
         assert_eq!(dataset.pending_write_count(), 0);
         assert_eq!(dataset.index_revision(), dataset.revision());
     }
