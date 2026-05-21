@@ -219,6 +219,7 @@ pub enum SceneAction {
     RegenerateTimelinePlayground,
     ToggleTimelinePlaygroundLiveEvents,
     FitTimelinePlaygroundToContent,
+    CopyTimelinePlaygroundContext,
     TimelinePlaygroundGroupingGroupKey,
     TimelinePlaygroundGroupingSourceKey,
     TimelinePlaygroundGroupingLabel,
@@ -2999,6 +3000,14 @@ pub fn scene_button_specs(scene_kind: SceneWindowKind) -> &'static [SceneButtonS
                 tooltip: "Fit the playground viewport to visible content",
                 sprite: SpriteId::Terminal,
                 color: [0.18, 0.28, 0.22, 1.0],
+            },
+            SceneButtonSpec {
+                // timeline[impl playground.copy-context]
+                action: SceneAction::CopyTimelinePlaygroundContext,
+                label: "Copy Context",
+                tooltip: "Copy playground viewport and hover context (Ctrl+Shift+C)",
+                sprite: SpriteId::Terminal,
+                color: [0.22, 0.24, 0.18, 1.0],
             },
             SceneButtonSpec {
                 // timeline[impl playground.query-controls]

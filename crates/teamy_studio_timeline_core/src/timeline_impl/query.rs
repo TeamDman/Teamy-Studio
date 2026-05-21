@@ -1177,7 +1177,8 @@ mod tests {
         assert_eq!(clusters.len(), 2);
         assert!(clusters.iter().all(|cluster| cluster.count() > 1));
         assert!(clusters.iter().all(|cluster| {
-            projected_width_pixels(cluster.range(), &query) <= event_cluster_max_width_pixels(&query)
+            projected_width_pixels(cluster.range(), &query)
+                <= event_cluster_max_width_pixels(&query)
         }));
     }
 

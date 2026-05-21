@@ -276,6 +276,9 @@ Timeline Playground detail windows must put the selected timeline item's title i
 timeline[playground.detail-selectable-text]
 Timeline Playground detail windows must expose reflected detail text through the shared terminal-cell selection and copy path.
 
+timeline[playground.copy-context]
+Timeline Playground must expose a copy-context command, including a keyboard path that does not disturb hover, that writes the current source, viewport, grouping, folding, render-plan counts, and hovered detail text to the clipboard for agent handoff.
+
 timeline[playground.detail-diagnostics-tui]
 Timeline Playground detail windows must provide a diagnostics view rendered as a Ratatui-style terminal UI, matching the existing scene diagnostics pattern.
 

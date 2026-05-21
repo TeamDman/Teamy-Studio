@@ -1,10 +1,10 @@
 param(
+	[switch]$Release,
 	[Parameter(ValueFromRemainingArguments = $true)]
 	[string[]]$QueryArgs
 )
 
 $tracyLayerEnvVar = 'TEAMY_STUDIO_ENABLE_TRACY_LAYER'
-$cargoProfile = 'profiling'
 
 function Format-Elapsed {
 	param(
@@ -172,9 +172,18 @@ Start-Sleep -Seconds 1
 try {
 	$previousTracyLayerSetting = [Environment]::GetEnvironmentVariable($tracyLayerEnvVar)
 	Set-Item -Path "Env:$tracyLayerEnvVar" -Value '1'
-	Write-Host "Running with $tracyLayerEnvVar=1: cargo run --profile $cargoProfile -- $($QueryArgs -join ' ')"
+	$cargoArgs = @("run")
+	if ($Release) {
+		$cargoArgs += @("--profile", "profiling")
+	}
+	$cargoArgs += "--"
+	$cargoArgs += $QueryArgs
+	$cargoArgs += "--log-filter"
+	$cargoArgs += "trace"
+	$profileLabel = if ($Release) { "profiling release" } else { "debug" }
+	Write-Host "Running $profileLabel with ${tracyLayerEnvVar}=1: cargo $($cargoArgs -join ' ')"
 	$commandStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
-	cargo run --profile $cargoProfile -- @QueryArgs --log-filter trace
+	& cargo @cargoArgs
 	$commandStopwatch.Stop()
 	$commandElapsed = $commandStopwatch.Elapsed
 	Write-Host "Traced command time: $(Format-Elapsed $commandElapsed)"

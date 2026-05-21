@@ -27,7 +27,7 @@ Because of that:
 
 ## Extraction Strategy
 
-- When preparing a profiling workflow or handing off to [run-profiler.ps1](run-profiler.ps1), warm the same artifacts with `cargo build --profile profiling` so the profiler wrapper does not pay a fresh build after test-only validation.
+- When preparing a release profiling workflow or handing off to [run-profiler.ps1](run-profiler.ps1) with `-Release`, warm the same artifacts with `cargo build --profile profiling` so the profiler wrapper does not pay a fresh build after test-only validation. The wrapper defaults to debug profiling when `-Release` is not passed.
 
 ## First-Class Priorities
 

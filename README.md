@@ -84,7 +84,13 @@ For Tracy profiling, run:
 ./run-profiler.ps1 window show
 ```
 
-That wrapper builds with the dedicated Cargo `profiling` profile. If you want to prewarm the same artifacts before a capture, run `cargo build --profile profiling`.
+That wrapper defaults to the debug profile so captures can show the same lag you see from `cargo run`. Pass `-Release` to use the dedicated Cargo `profiling` profile:
+
+```powershell
+./run-profiler.ps1 -Release window show
+```
+
+If you want to prewarm release profiling artifacts before a release capture, run `cargo build --profile profiling`.
 
 <!-- repo[impl implementation.present] -->
 ## Repository Layout

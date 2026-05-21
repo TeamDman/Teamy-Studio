@@ -573,7 +573,10 @@ pub fn live_tracing_snapshot_delta_since(
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut saw_frame_mark = false;
-    for record in records.iter().filter(|record| record.id > previous.latest_log_id) {
+    for record in records
+        .iter()
+        .filter(|record| record.id > previous.latest_log_id)
+    {
         if !record.is_tracy_frame_mark {
             return LiveTracingSnapshotDelta::Other;
         }
@@ -618,15 +621,14 @@ pub fn tracing_event_timeline_dataset() -> (Arc<TimelineDataset>, i64) {
         let cached_span_count = cache.span_count;
         let mut dataset = cache.dataset.as_ref().clone();
         let mut latest_at_ns = cache.latest_at_ns.max(1);
-        let first_timestamp = first_timestamp
-            .clone()
-            .expect("append-only live tracing cache retains its first timestamp");
+        let first_timestamp =
+            first_timestamp.expect("append-only live tracing cache retains its first timestamp");
 
         for record in span_records.iter().skip(cached_span_count).cloned() {
             latest_at_ns = latest_at_ns.max(push_live_tracing_span_timeline_item(
                 &mut dataset,
                 record,
-                first_timestamp.clone(),
+                first_timestamp,
                 latest_at_ns,
             ));
         }
@@ -635,7 +637,7 @@ pub fn tracing_event_timeline_dataset() -> (Arc<TimelineDataset>, i64) {
             latest_at_ns = latest_at_ns.max(push_live_tracing_event_timeline_item(
                 &mut dataset,
                 record,
-                first_timestamp.clone(),
+                first_timestamp,
                 latest_at_ns,
             ));
         }
@@ -655,10 +657,16 @@ pub fn tracing_event_timeline_dataset() -> (Arc<TimelineDataset>, i64) {
     }
 
     let mut dataset = TimelineDataset::new();
-    let Some(first_timestamp) = first_timestamp
-    else {
+    let Some(first_timestamp) = first_timestamp else {
         let dataset = Arc::new(dataset);
-        cache.store(revision, first_log_id, first_span_id, None, dataset.clone(), 1);
+        cache.store(
+            revision,
+            first_log_id,
+            first_span_id,
+            None,
+            dataset.clone(),
+            1,
+        );
         return (dataset, 1);
     };
     let mut latest_at_ns = 1_i64;
@@ -987,12 +995,22 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         clear_logs();
-        let before_clear =
-            push_log_record(LogRecordLevel::Info, "teamy::test", "old".to_owned(), None, false);
+        let before_clear = push_log_record(
+            LogRecordLevel::Info,
+            "teamy::test",
+            "old".to_owned(),
+            None,
+            false,
+        );
 
         clear_logs();
-        let after_clear =
-            push_log_record(LogRecordLevel::Info, "teamy::test", "new".to_owned(), None, false);
+        let after_clear = push_log_record(
+            LogRecordLevel::Info,
+            "teamy::test",
+            "new".to_owned(),
+            None,
+            false,
+        );
 
         assert!(after_clear > before_clear);
         assert_eq!(log_snapshots().len(), 1);

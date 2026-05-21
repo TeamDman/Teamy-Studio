@@ -21,7 +21,7 @@
 )]
 #![allow(clippy::wildcard_imports)]
 use std::collections::{BTreeSet, HashMap};
-use std::ffi::{CStr, CString, c_void};
+use std::ffi::c_void;
 use std::fmt::Write as _;
 use std::ops::Range;
 use std::path::Path;
@@ -40,12 +40,8 @@ use tracing::debug_span;
 use tracing::{info, info_span, instrument, warn};
 use ttf_parser::{Face, GlyphId, OutlineBuilder};
 use windows::Win32::Foundation::{E_FAIL, FreeLibrary, HANDLE, HWND, POINT, RECT, TRUE};
-use windows::Win32::Graphics::Direct3D::Fxc::{
-    D3DCOMPILE_DEBUG, D3DCOMPILE_SKIP_OPTIMIZATION, D3DCompile,
-};
 use windows::Win32::Graphics::Direct3D::{
-    D3D_FEATURE_LEVEL_11_0, D3D_INCLUDE_TYPE, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST, ID3DBlob,
-    ID3DInclude, ID3DInclude_Impl,
+    D3D_FEATURE_LEVEL_11_0, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST, ID3DBlob,
 };
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::DirectComposition::*;
@@ -64,7 +60,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     IMAGE_ICON, LoadCursorW, LoadImageW,
 };
 use windows::core::BOOL;
-use windows::core::{Error, Interface, Owned, PCSTR, PCWSTR, s};
+use windows::core::{Error, Interface, Owned, PCWSTR, s};
 
 use super::cell_grid;
 use super::spatial::{ClientPoint, ClientRect, TerminalCellPoint};
@@ -93,11 +89,10 @@ const SLUG_HORIZONTAL_COVERAGE_EPSILON: f32 = 1.0 / 65536.0;
 const TEAMY_D3D12_GPU_VALIDATION_ENV: &str = "TEAMY_D3D12_GPU_VALIDATION";
 const TEAMY_D3D12_OFFSCREEN_ADAPTER_ENV: &str = "TEAMY_D3D12_OFFSCREEN_ADAPTER";
 const OFFSCREEN_RENDER_FENCE_TIMEOUT_MS: u32 = 10_000;
-const WINDOWS_PANEL_SHADERS_PATH: &str = "crates/teamy_studio_shell/src/windows_panel_shaders.hlsl";
-const WINDOWS_CHROME_SHADERS_PATH: &str =
-    "crates/teamy_studio_shell/src/windows_chrome_shaders.hlsl";
-const WINDOWS_PANEL_SHADERS_SOURCE: &str = include_str!("windows_panel_shaders.hlsl");
-const WINDOWS_CHROME_SHADERS_SOURCE: &str = include_str!("windows_chrome_shaders.hlsl");
+const COMPILED_VERTEX_SHADER: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/windows_panel_vs.cso"));
+const COMPILED_PIXEL_SHADER: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/windows_panel_ps.cso"));
 const SPRITE_SLOT_SIZE: u32 = 320;
 const SPRITE_TARGET_SIZE: u32 = 256;
 const SPRITE_ATLAS_COLUMNS: u32 = 4;
@@ -6174,206 +6169,16 @@ fn cached_compiled_shaders() -> eyre::Result<&'static CompiledShaders> {
 }
 
 fn compile_shaders_for_cache() -> eyre::Result<CompiledShaders> {
-    compile_embedded_shaders(shader_compile_flags())
-}
-
-#[derive(Debug)]
-struct IncludedShaderSource {
-    _bytes: Box<[u8]>,
-    path: String,
-}
-
-#[derive(Debug)]
-struct ShaderIncludeHandler {
-    embedded_sources: HashMap<&'static str, &'static str>,
-    root_path: &'static str,
-    sources: Mutex<HashMap<usize, IncludedShaderSource>>,
+    Ok(CompiledShaders {
+        vertex: COMPILED_VERTEX_SHADER.to_vec(),
+        pixel: COMPILED_PIXEL_SHADER.to_vec(),
+    })
 }
 
 #[derive(Debug)]
 struct CompiledShaders {
     vertex: Vec<u8>,
     pixel: Vec<u8>,
-}
-
-impl ShaderIncludeHandler {
-    fn new(root_path: &'static str) -> Self {
-        Self {
-            embedded_sources: embedded_shader_sources(),
-            root_path,
-            sources: Mutex::new(HashMap::new()),
-        }
-    }
-
-    fn resolve_parent_path(&self, parent_data: *const c_void) -> String {
-        if parent_data.is_null() {
-            return self.root_path.to_owned();
-        }
-
-        self.sources
-            .lock()
-            .expect("shader include cache should not be poisoned")
-            .get(&(parent_data as usize))
-            .map_or_else(|| self.root_path.to_owned(), |source| source.path.clone())
-    }
-
-    fn resolve_include_path(&self, file_name: &str, parent_data: *const c_void) -> String {
-        let parent_path = self.resolve_parent_path(parent_data);
-        normalize_shader_virtual_path(
-            Path::new(&parent_path)
-                .parent()
-                .unwrap_or_else(|| Path::new(""))
-                .join(file_name),
-        )
-    }
-
-    fn load_embedded_source(&self, path: &str) -> windows::core::Result<&'static str> {
-        self.embedded_sources.get(path).copied().ok_or_else(|| {
-            shader_include_error(format!(
-                "failed to resolve embedded shader include `{path}`"
-            ))
-        })
-    }
-}
-
-impl ID3DInclude_Impl for ShaderIncludeHandler {
-    fn Open(
-        &self,
-        _includetype: D3D_INCLUDE_TYPE,
-        pfilename: &PCSTR,
-        pparentdata: *const c_void,
-        ppdata: *mut *mut c_void,
-        pbytes: *mut u32,
-    ) -> windows::core::Result<()> {
-        if ppdata.is_null() || pbytes.is_null() {
-            return Err(shader_include_error(
-                "shader include output pointers were unexpectedly null",
-            ));
-        }
-
-        let file_name = shader_include_file_name(pfilename)?;
-        let include_path = self.resolve_include_path(file_name, pparentdata);
-        let bytes = self
-            .load_embedded_source(&include_path)?
-            .as_bytes()
-            .to_vec();
-        let byte_len = u32::try_from(bytes.len()).map_err(|_conversion_error| {
-            shader_include_error(format!(
-                "shader include `{include_path}` exceeded the D3D compiler size limit"
-            ))
-        })?;
-        let bytes = bytes.into_boxed_slice();
-        let pointer = bytes.as_ptr() as *mut c_void;
-
-        self.sources
-            .lock()
-            .expect("shader include cache should not be poisoned")
-            .insert(
-                pointer as usize,
-                IncludedShaderSource {
-                    _bytes: bytes,
-                    path: include_path,
-                },
-            );
-
-        unsafe {
-            *ppdata = pointer;
-            *pbytes = byte_len;
-        }
-
-        Ok(())
-    }
-
-    fn Close(&self, pdata: *const c_void) -> windows::core::Result<()> {
-        if pdata.is_null() {
-            return Ok(());
-        }
-
-        self.sources
-            .lock()
-            .expect("shader include cache should not be poisoned")
-            .remove(&(pdata as usize));
-        Ok(())
-    }
-}
-
-fn shader_include_file_name(file_name: &PCSTR) -> windows::core::Result<&str> {
-    if file_name.0.is_null() {
-        return Err(shader_include_error(
-            "shader include file name pointer was unexpectedly null",
-        ));
-    }
-
-    unsafe { CStr::from_ptr(file_name.0 as *const i8) }
-        .to_str()
-        .map_err(|error| shader_include_error(format!("invalid shader include file name: {error}")))
-}
-
-fn shader_include_error(message: impl Into<String>) -> Error {
-    Error::new(E_FAIL, message.into())
-}
-
-fn shader_compile_flags() -> u32 {
-    if cfg!(debug_assertions) {
-        D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION
-    } else {
-        0
-    }
-}
-
-fn compile_embedded_shaders(flags: u32) -> eyre::Result<CompiledShaders> {
-    let vertex_shader = compile_shader(
-        WINDOWS_PANEL_SHADERS_PATH,
-        WINDOWS_PANEL_SHADERS_SOURCE,
-        s!("VSMain"),
-        s!("vs_5_0"),
-        flags,
-    )?;
-    let pixel_shader = compile_shader(
-        WINDOWS_PANEL_SHADERS_PATH,
-        WINDOWS_PANEL_SHADERS_SOURCE,
-        s!("PSMain"),
-        s!("ps_5_0"),
-        flags,
-    )?;
-
-    Ok(CompiledShaders {
-        vertex: shader_blob_bytes(&vertex_shader),
-        pixel: shader_blob_bytes(&pixel_shader),
-    })
-}
-
-fn compile_shader(
-    source_path: &'static str,
-    source_text: &'static str,
-    entry_point: PCSTR,
-    target: PCSTR,
-    flags: u32,
-) -> eyre::Result<ID3DBlob> {
-    let mut shader = None;
-    let mut error = None;
-    let include_handler = ShaderIncludeHandler::new(source_path);
-    let include = ID3DInclude::new(&include_handler);
-    let source_name =
-        CString::new(source_path).expect("embedded shader path should not contain NUL");
-    unsafe {
-        D3DCompile(
-            source_text.as_ptr() as *const c_void,
-            source_text.len(),
-            PCSTR(source_name.as_ptr() as *const u8),
-            None,
-            &*include,
-            entry_point,
-            target,
-            flags,
-            0,
-            &mut shader,
-            Some(&mut error),
-        )
-    }
-    .map_err(|err| shader_error(err, error))?;
-
-    Ok(shader.expect("shader blob should be initialized"))
 }
 
 fn shader_error(error: windows::core::Error, blob: Option<ID3DBlob>) -> eyre::Error {
@@ -6385,27 +6190,6 @@ fn shader_error(error: windows::core::Error, blob: Option<ID3DBlob>) -> eyre::Er
     } else {
         error.into()
     }
-}
-
-fn shader_blob_bytes(shader: &ID3DBlob) -> Vec<u8> {
-    unsafe {
-        std::slice::from_raw_parts(
-            shader.GetBufferPointer() as *const u8,
-            shader.GetBufferSize(),
-        )
-    }
-    .to_vec()
-}
-
-fn normalize_shader_virtual_path(path: impl AsRef<Path>) -> String {
-    path.as_ref().to_string_lossy().replace('\\', "/")
-}
-
-fn embedded_shader_sources() -> HashMap<&'static str, &'static str> {
-    HashMap::from([
-        (WINDOWS_PANEL_SHADERS_PATH, WINDOWS_PANEL_SHADERS_SOURCE),
-        (WINDOWS_CHROME_SHADERS_PATH, WINDOWS_CHROME_SHADERS_SOURCE),
-    ])
 }
 
 fn shader_bytecode_slice(shader: &[u8]) -> D3D12_SHADER_BYTECODE {
@@ -7795,14 +7579,13 @@ mod tests {
     use super::{
         CachedSceneVertices, FALLBACK_GLYPH, PanelEffect, RenderScene, Vertex,
         WindowChromeButtonsState, append_rect, append_slug_band_data, build_panel_scene,
-        build_shader_params, can_reuse_cached_scene_vertices, collect_scene_chars,
-        compile_embedded_shaders, composition_swap_chain_description, cpu_slug_coverage,
+        build_shader_params, cached_compiled_shaders, can_reuse_cached_scene_vertices,
+        collect_scene_chars, composition_swap_chain_description, cpu_slug_coverage,
         cpu_slug_coverage_all_curves, cursor_latency_view_state_from_sample, dirty_fragment_ranges,
         extract_glyph_curves, fragment_ranges_match, fragment_vertex_ranges, load_snapshot_glyph,
         load_terminal_font, preferred_garden_frame_color, preferred_title_bar_color,
-        push_centered_text, push_glyph,
-        push_overlay_panel, push_panel, push_text_block, push_title_text,
-        render_frame_model_offscreen_image, render_snapshot_glyph_into_image, shader_compile_flags,
+        push_centered_text, push_glyph, push_overlay_panel, push_panel, push_text_block,
+        push_title_text, render_frame_model_offscreen_image, render_snapshot_glyph_into_image,
         solve_inverse_homography, terminal_scrollbar_geometry, window_garden_shader_data,
     };
     use crate::app::render_verification::{
@@ -7888,7 +7671,7 @@ mod tests {
 
     #[test]
     fn embedded_hlsl_compiles_vertex_and_pixel_entry_points() -> eyre::Result<()> {
-        let shaders = compile_embedded_shaders(shader_compile_flags())?;
+        let shaders = cached_compiled_shaders()?;
 
         assert!(
             !shaders.vertex.is_empty(),
