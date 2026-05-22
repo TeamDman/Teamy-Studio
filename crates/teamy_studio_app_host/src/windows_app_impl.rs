@@ -4227,7 +4227,7 @@ fn configure_scene_window_chrome(hwnd: HWND) {
             u32::try_from(std::mem::size_of_val(&border_color)).unwrap_or(u32::MAX),
         )
     } {
-        tracing::warn!(error = %error, "scene window DWM border-color override unavailable");
+        log_scene_window_dwm_override_error("border-color", error);
     }
 
     let corner_preference = DWMWCP_DONOTROUND;
@@ -4239,8 +4239,16 @@ fn configure_scene_window_chrome(hwnd: HWND) {
             u32::try_from(std::mem::size_of_val(&corner_preference)).unwrap_or(u32::MAX),
         )
     } {
-        tracing::warn!(error = %error, "scene window DWM corner override unavailable");
+        log_scene_window_dwm_override_error("corner", error);
     }
+}
+
+fn log_scene_window_dwm_override_error(attribute: &str, error: windows::core::Error) {
+    tracing::warn!(
+        attribute,
+        error = %error,
+        "scene window DWM override unavailable"
+    );
 }
 
 fn scene_window_ex_style(

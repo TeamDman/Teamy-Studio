@@ -519,7 +519,7 @@ impl TimelineDataset {
     // timeline[impl display.dataset-checked-mutation]
     pub fn finish_span(&mut self, id: TimelineItemId, end: TimelineInstantNs) -> eyre::Result<()> {
         let span_start = {
-            let Some(item) = self.items.iter_mut().find(|item| item.id == id) else {
+            let Some(item) = self.item_mut(id) else {
                 eyre::bail!("timeline item {} does not exist", id.as_u64());
             };
 
@@ -608,6 +608,11 @@ impl TimelineDataset {
     fn item_index(&self, id: TimelineItemId) -> Option<usize> {
         let index = usize::try_from(id.as_u64().checked_sub(1)?).ok()?;
         self.items.get(index).and_then(|item| (item.id == id).then_some(index))
+    }
+
+    fn item_mut(&mut self, id: TimelineItemId) -> Option<&mut TimelineItem> {
+        let index = self.item_index(id)?;
+        self.items.get_mut(index)
     }
 
     fn build_item(

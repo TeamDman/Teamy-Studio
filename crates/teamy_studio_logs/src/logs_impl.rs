@@ -108,6 +108,8 @@ struct LogsState {
     records: Mutex<VecDeque<LogRecordSnapshot>>,
     span_records: Mutex<VecDeque<LogSpanSnapshot>>,
     active_spans: Mutex<HashMap<u64, LogActiveSpanSnapshot>>,
+    timeline_records: Mutex<Vec<LogRecordSnapshot>>,
+    timeline_span_records: Mutex<Vec<LogSpanSnapshot>>,
     timeline_cache: Mutex<LiveTracingTimelineCache>,
 }
 
@@ -120,6 +122,8 @@ impl Default for LogsState {
             records: Mutex::new(VecDeque::with_capacity(INITIAL_LOG_RECORD_CAPACITY)),
             span_records: Mutex::new(VecDeque::with_capacity(INITIAL_LOG_SPAN_RECORD_CAPACITY)),
             active_spans: Mutex::new(HashMap::new()),
+            timeline_records: Mutex::new(Vec::with_capacity(INITIAL_LOG_RECORD_CAPACITY)),
+            timeline_span_records: Mutex::new(Vec::with_capacity(INITIAL_LOG_SPAN_RECORD_CAPACITY)),
             timeline_cache: Mutex::new(LiveTracingTimelineCache::default()),
         }
     }
@@ -529,6 +533,16 @@ fn push_log_record(
         source_hwnd,
         is_tracy_frame_mark,
     });
+    let snapshot = records
+        .back()
+        .cloned()
+        .expect("newly pushed log record should exist");
+    drop(records);
+    state
+        .timeline_records
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(snapshot);
     id
 }
 
@@ -550,6 +564,16 @@ fn push_log_span_record(fields: LogSpanFields, end_timestamp: DateTime<Local>) -
         fields: fields.fields,
         source_hwnd: fields.source_hwnd,
     });
+    let snapshot = span_records
+        .back()
+        .cloned()
+        .expect("newly pushed span record should exist");
+    drop(span_records);
+    state
+        .timeline_span_records
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(snapshot);
     id
 }
 
@@ -641,15 +665,15 @@ pub fn active_span_snapshots() -> Vec<LogActiveSpanSnapshot> {
 #[must_use]
 pub fn live_tracing_snapshot_revision() -> LiveTracingSnapshotRevision {
     let records = logs_state()
-        .records
+        .timeline_records
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let latest_log_id = records.back().map_or(0, |record| record.id);
+    let latest_log_id = records.last().map_or(0, |record| record.id);
     let record_count = records.len();
     drop(records);
 
     let span_records = logs_state()
-        .span_records
+        .timeline_span_records
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let active_span_count = logs_state()
@@ -659,7 +683,7 @@ pub fn live_tracing_snapshot_revision() -> LiveTracingSnapshotRevision {
         .len();
     LiveTracingSnapshotRevision {
         latest_log_id,
-        latest_span_id: span_records.back().map_or(0, |record| record.id),
+        latest_span_id: span_records.last().map_or(0, |record| record.id),
         record_count,
         span_count: span_records.len(),
         active_span_count,
@@ -691,14 +715,11 @@ pub fn live_tracing_snapshot_delta_since(
     }
 
     let records = logs_state()
-        .records
+        .timeline_records
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut saw_frame_mark = false;
-    for record in records
-        .iter()
-        .filter(|record| record.id > previous.latest_log_id)
-    {
+    for record in records.iter().skip(previous.record_count) {
         if !record.is_tracy_frame_mark {
             return LiveTracingSnapshotDelta::Other;
         }
@@ -723,11 +744,11 @@ pub fn tracing_event_timeline_dataset() -> (Arc<TimelineDataset>, i64) {
     .entered();
     let state = logs_state();
     let records = state
-        .records
+        .timeline_records
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let span_records = state
-        .span_records
+        .timeline_span_records
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let active_spans = state
@@ -735,16 +756,16 @@ pub fn tracing_event_timeline_dataset() -> (Arc<TimelineDataset>, i64) {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let revision = LiveTracingSnapshotRevision {
-        latest_log_id: records.back().map_or(0, |record| record.id),
-        latest_span_id: span_records.back().map_or(0, |record| record.id),
+        latest_log_id: records.last().map_or(0, |record| record.id),
+        latest_span_id: span_records.last().map_or(0, |record| record.id),
         record_count: records.len(),
         span_count: span_records.len(),
         active_span_count: active_spans.len(),
         active_span_revision: state.active_span_revision.load(Ordering::Acquire),
     };
-    let first_log_id = records.front().map_or(0, |record| record.id);
+    let first_log_id = records.first().map_or(0, |record| record.id);
     let first_active_span_id = active_spans.values().map(|record| record.id).min();
-    let first_span_id = match (span_records.front(), first_active_span_id) {
+    let first_span_id = match (span_records.first(), first_active_span_id) {
         (Some(closed), Some(active)) => closed.id.min(active),
         (Some(closed), None) => closed.id,
         (None, Some(active)) => active,
@@ -1173,6 +1194,16 @@ pub fn clear_logs() {
         .clear();
     logs_state()
         .active_spans
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clear();
+    logs_state()
+        .timeline_records
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clear();
+    logs_state()
+        .timeline_span_records
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clear();
