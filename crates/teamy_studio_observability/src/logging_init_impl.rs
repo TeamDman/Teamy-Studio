@@ -23,10 +23,10 @@ fn exclude_tracy_frame_mark(meta: &Metadata<'_>) -> bool {
     meta.fields().field("tracy.frame_mark").is_none()
 }
 
-#[cfg(feature = "extended_observability")]
+#[cfg(all(feature = "tracing_subscriber_tracy", not(test)))]
 const TEAMY_STUDIO_ENABLE_TRACY_LAYER_ENV: &str = "TEAMY_STUDIO_ENABLE_TRACY_LAYER";
 
-#[cfg(feature = "extended_observability")]
+#[cfg(feature = "tracing_subscriber_tracy")]
 fn env_flag_enabled(value: Option<&str>) -> bool {
     let Some(value) = value else {
         return false;
@@ -38,7 +38,7 @@ fn env_flag_enabled(value: Option<&str>) -> bool {
     )
 }
 
-#[cfg(feature = "extended_observability")]
+#[cfg(all(feature = "tracing_subscriber_tracy", not(test)))]
 fn tracy_layer_requested() -> bool {
     env_flag_enabled(
         std::env::var(TEAMY_STUDIO_ENABLE_TRACY_LAYER_ENV)
@@ -178,9 +178,9 @@ pub fn init_logging(config: &LoggingConfig) -> eyre::Result<()> {
     // timeline[impl playground.live-tracing-unfiltered]
     let subscriber = subscriber.with(teamy_studio_logs::LogCollectorLayer);
 
-    #[cfg(all(feature = "extended_observability", not(test)))]
+    #[cfg(all(feature = "tracing_subscriber_tracy", not(test)))]
     let tracy_layer_requested = tracy_layer_requested();
-    #[cfg(all(feature = "extended_observability", not(test)))]
+    #[cfg(all(feature = "tracing_subscriber_tracy", not(test)))]
     let subscriber =
         subscriber.with(tracy_layer_requested.then(tracing_tracy::TracyLayer::default));
 
@@ -191,7 +191,7 @@ pub fn init_logging(config: &LoggingConfig) -> eyre::Result<()> {
         return Ok(());
     }
 
-    #[cfg(all(feature = "extended_observability", not(test)))]
+    #[cfg(all(feature = "tracing_subscriber_tracy", not(test)))]
     if tracy_layer_requested {
         tracing::info!(
             env_var = TEAMY_STUDIO_ENABLE_TRACY_LAYER_ENV,
@@ -205,7 +205,7 @@ pub fn init_logging(config: &LoggingConfig) -> eyre::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(feature = "extended_observability")]
+    #[cfg(feature = "tracing_subscriber_tracy")]
     use super::env_flag_enabled;
     use super::{LogFilterSelection, resolve_json_log_path, select_log_filter};
     use crate::LoggingConfig;
@@ -298,7 +298,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "extended_observability")]
+    #[cfg(feature = "tracing_subscriber_tracy")]
     #[test]
     fn tracy_layer_flag_defaults_to_disabled() {
         assert!(!env_flag_enabled(None));
@@ -306,7 +306,7 @@ mod tests {
         assert!(!env_flag_enabled(Some("false")));
     }
 
-    #[cfg(feature = "extended_observability")]
+    #[cfg(feature = "tracing_subscriber_tracy")]
     #[test]
     fn tracy_layer_flag_accepts_truthy_values() {
         assert!(env_flag_enabled(Some("1")));

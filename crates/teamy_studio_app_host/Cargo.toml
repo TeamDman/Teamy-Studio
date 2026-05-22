@@ -46,7 +46,11 @@ windows = { workspace = true, features = [
 
 [features]
 default = []
-extended_observability = []
+extended_observability = [
+    "teamy_studio_logs/extended_observability",
+    "teamy_studio_shell/extended_observability",
+    "teamy_studio_timeline_core/extended_observability",
+]
 
 [dev-dependencies]
 tracing-subscriber.workspace = true

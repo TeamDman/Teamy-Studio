@@ -9,7 +9,12 @@ arbitrary.workspace = true
 eyre.workspace = true
 facet.workspace = true
 sguaba.workspace = true
+tracing.workspace = true
 uom.workspace = true
+
+[features]
+default = []
+extended_observability = []
 
 [dev-dependencies]
 facet-pretty.workspace = true

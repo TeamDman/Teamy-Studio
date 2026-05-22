@@ -17,4 +17,5 @@ tempfile.workspace = true
 
 [features]
 default = []
-extended_observability = ["dep:tracing-tracy"]
+extended_observability = []
+tracing_subscriber_tracy = ["dep:tracing-tracy"]

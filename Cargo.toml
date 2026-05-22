@@ -239,6 +239,7 @@ default = ["extended_observability"]
 font-snapshot-tests = []
 ghostty = ["dep:libghostty-vt", "teamy_studio_cli/ghostty", "teamy_studio_terminal_core/ghostty", "teamy_studio_vt_types/ghostty", "teamy_studio_windows_terminal_engine/ghostty", "teamy_studio_windows_terminal_replay/ghostty"]
 extended_observability = ["teamy_studio_app_host/extended_observability", "teamy_studio_audio_input/extended_observability", "teamy_studio_audio_transcription/extended_observability", "teamy_studio_cli/extended_observability", "teamy_studio_frontend/extended_observability", "teamy_studio_observability/extended_observability", "teamy_studio_shell/extended_observability", "teamy_studio_teamy_terminal_engine/extended_observability", "teamy_studio_terminal_core/extended_observability", "teamy_studio_whisper_stack/extended_observability"]
+tracing_subscriber_tracy = ["teamy_studio_observability/tracing_subscriber_tracy"]
 
 [build-dependencies]
 embed-resource = "3.0.6"

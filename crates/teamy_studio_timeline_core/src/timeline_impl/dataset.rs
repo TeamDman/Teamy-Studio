@@ -321,6 +321,12 @@ pub enum TimelineWriteLogEntry {
     SpanFinished(TimelineItemId),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TimelineIndexedInsertTarget {
+    Span,
+    Event,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct TimelineDatasetIndex {
     spans_by_start: Vec<TimelineItemId>,
@@ -335,6 +341,7 @@ pub struct TimelineDataset {
     next_item_id: u64,
     next_sequence: u64,
     revision: TimelineDatasetRevision,
+    closed_data_bounds: Option<(TimelineInstantNs, TimelineInstantNs)>,
     strings: Vec<String>,
     string_ids: HashMap<String, TimelineInternedStringId>,
     items: Vec<TimelineItem>,
@@ -384,6 +391,11 @@ impl TimelineDataset {
     }
 
     #[must_use]
+    pub fn closed_data_bounds(&self) -> Option<(TimelineInstantNs, TimelineInstantNs)> {
+        self.closed_data_bounds
+    }
+
+    #[must_use]
     pub fn resolve_string(&self, id: TimelineInternedStringId) -> Option<&str> {
         self.strings.get(id.as_u32() as usize).map(String::as_str)
     }
@@ -427,6 +439,9 @@ impl TimelineDataset {
             input,
             TimelineItemKind::Span(TimelineSpanItem { start, end }),
         );
+        if let Some(end) = end {
+            self.update_closed_data_bounds(start, end);
+        }
         self.items.push(item);
         self.record_write(TimelineWriteLogEntry::ItemInserted(id));
         Ok(id)
@@ -439,8 +454,61 @@ impl TimelineDataset {
     ) -> TimelineItemId {
         let id = self.allocate_item_id();
         let item = self.build_item(id, input, TimelineItemKind::Event(TimelineEventItem { at }));
+        self.update_closed_data_bounds(at, at);
         self.items.push(item);
         self.record_write(TimelineWriteLogEntry::ItemInserted(id));
+        id
+    }
+
+    /// # Errors
+    ///
+    /// Returns an error if a closed span has an end before its start.
+    pub fn push_span_indexed(
+        &mut self,
+        input: TimelineItemInput,
+        start: TimelineInstantNs,
+        end: Option<TimelineInstantNs>,
+    ) -> eyre::Result<TimelineItemId> {
+        if self.pending_write_count() > 0 {
+            let _ = self.compact();
+        }
+
+        if let Some(end) = end {
+            TimelineRangeNs::try_new(start, end)?;
+        }
+
+        let id = self.allocate_item_id();
+        let item = self.build_item(
+            id,
+            input,
+            TimelineItemKind::Span(TimelineSpanItem { start, end }),
+        );
+        if let Some(end) = end {
+            self.update_closed_data_bounds(start, end);
+        }
+        let sequence = item.sequence();
+        let insert_at = self.span_insert_position(start, sequence);
+        self.items.push(item);
+        self.record_indexed_insert(id, insert_at, TimelineIndexedInsertTarget::Span);
+        Ok(id)
+    }
+
+    pub fn push_event_indexed(
+        &mut self,
+        input: TimelineItemInput,
+        at: TimelineInstantNs,
+    ) -> TimelineItemId {
+        if self.pending_write_count() > 0 {
+            let _ = self.compact();
+        }
+
+        let id = self.allocate_item_id();
+        let item = self.build_item(id, input, TimelineItemKind::Event(TimelineEventItem { at }));
+        self.update_closed_data_bounds(at, at);
+        let sequence = item.sequence();
+        let insert_at = self.event_insert_position(at, sequence);
+        self.items.push(item);
+        self.record_indexed_insert(id, insert_at, TimelineIndexedInsertTarget::Event);
         id
     }
 
@@ -450,27 +518,63 @@ impl TimelineDataset {
     /// or `end` is earlier than the span start.
     // timeline[impl display.dataset-checked-mutation]
     pub fn finish_span(&mut self, id: TimelineItemId, end: TimelineInstantNs) -> eyre::Result<()> {
-        let Some(item) = self.items.iter_mut().find(|item| item.id == id) else {
-            eyre::bail!("timeline item {} does not exist", id.as_u64());
+        let span_start = {
+            let Some(item) = self.items.iter_mut().find(|item| item.id == id) else {
+                eyre::bail!("timeline item {} does not exist", id.as_u64());
+            };
+
+            let TimelineItemKind::Span(span) = &mut item.kind else {
+                eyre::bail!("timeline item {} is not a span", id.as_u64());
+            };
+
+            if span.end.is_some() {
+                eyre::bail!("timeline span {} is already finished", id.as_u64());
+            }
+
+            TimelineRangeNs::try_new(span.start, end)?;
+            span.end = Some(end);
+            span.start
         };
-
-        let TimelineItemKind::Span(span) = &mut item.kind else {
-            eyre::bail!("timeline item {} is not a span", id.as_u64());
-        };
-
-        if span.end.is_some() {
-            eyre::bail!("timeline span {} is already finished", id.as_u64());
-        }
-
-        TimelineRangeNs::try_new(span.start, end)?;
-        span.end = Some(end);
+        self.update_closed_data_bounds(span_start, end);
         self.record_write(TimelineWriteLogEntry::SpanFinished(id));
+        Ok(())
+    }
+
+    /// # Errors
+    ///
+    /// Returns an error when the item does not exist, is not a span, is already closed,
+    /// or `end` is earlier than the span start.
+    pub fn finish_span_indexed(
+        &mut self,
+        id: TimelineItemId,
+        end: TimelineInstantNs,
+    ) -> eyre::Result<()> {
+        let span_start = {
+            let Some(item) = self.items.iter_mut().find(|item| item.id == id) else {
+                eyre::bail!("timeline item {} does not exist", id.as_u64());
+            };
+
+            let TimelineItemKind::Span(span) = &mut item.kind else {
+                eyre::bail!("timeline item {} is not a span", id.as_u64());
+            };
+
+            if span.end.is_some() {
+                eyre::bail!("timeline span {} is already finished", id.as_u64());
+            }
+
+            TimelineRangeNs::try_new(span.start, end)?;
+            span.end = Some(end);
+            span.start
+        };
+        self.update_closed_data_bounds(span_start, end);
+        self.revision = TimelineDatasetRevision(self.revision.as_u64().saturating_add(1));
+        self.index.revision = self.revision;
         Ok(())
     }
 
     #[must_use]
     pub fn item(&self, id: TimelineItemId) -> Option<&TimelineItem> {
-        self.items.iter().find(|item| item.id == id)
+        self.item_index(id).and_then(|index| self.items.get(index))
     }
 
     // timeline[impl display.dataset-index-compaction]
@@ -499,6 +603,11 @@ impl TimelineDataset {
     fn allocate_sequence(&mut self) -> TimelineItemSequence {
         self.next_sequence = self.next_sequence.saturating_add(1);
         TimelineItemSequence(self.next_sequence)
+    }
+
+    fn item_index(&self, id: TimelineItemId) -> Option<usize> {
+        let index = usize::try_from(id.as_u64().checked_sub(1)?).ok()?;
+        self.items.get(index).and_then(|item| (item.id == id).then_some(index))
     }
 
     fn build_item(
@@ -555,13 +664,84 @@ impl TimelineDataset {
         self.write_log.push(entry);
     }
 
+    fn record_indexed_insert(
+        &mut self,
+        id: TimelineItemId,
+        insert_at: usize,
+        target: TimelineIndexedInsertTarget,
+    ) {
+        self.revision = TimelineDatasetRevision(self.revision.as_u64().saturating_add(1));
+        match target {
+            TimelineIndexedInsertTarget::Span => self.index.spans_by_start.insert(insert_at, id),
+            TimelineIndexedInsertTarget::Event => self.index.events_by_time.insert(insert_at, id),
+        }
+        self.index.revision = self.revision;
+    }
+
+    fn span_insert_position(
+        &self,
+        start: TimelineInstantNs,
+        sequence: TimelineItemSequence,
+    ) -> usize {
+        self.index
+            .spans_by_start
+            .binary_search_by(|candidate_id| {
+                let candidate = self
+                    .item(*candidate_id)
+                    .expect("span index item must exist during indexed insert");
+                let TimelineItemKind::Span(span) = candidate.kind() else {
+                    unreachable!("span index contains only span items");
+                };
+                (span.start(), candidate.sequence()).cmp(&(start, sequence))
+            })
+            .unwrap_or_else(|insert_at| insert_at)
+    }
+
+    fn event_insert_position(
+        &self,
+        at: TimelineInstantNs,
+        sequence: TimelineItemSequence,
+    ) -> usize {
+        self.index
+            .events_by_time
+            .binary_search_by(|candidate_id| {
+                let candidate = self
+                    .item(*candidate_id)
+                    .expect("event index item must exist during indexed insert");
+                let TimelineItemKind::Event(event) = candidate.kind() else {
+                    unreachable!("event index contains only event items");
+                };
+                (event.at(), candidate.sequence()).cmp(&(at, sequence))
+            })
+            .unwrap_or_else(|insert_at| insert_at)
+    }
+
     fn rebuild_index_inner(&mut self) {
         let mut spans_by_start = Vec::new();
         let mut events_by_time = Vec::new();
+        let mut closed_data_bounds: Option<(TimelineInstantNs, TimelineInstantNs)> = None;
         for item in &self.items {
             match item.kind {
-                TimelineItemKind::Span(_) => spans_by_start.push(item.id),
-                TimelineItemKind::Event(_) => events_by_time.push(item.id),
+                TimelineItemKind::Span(span) => {
+                    spans_by_start.push(item.id);
+                    if let Some(end) = span.end {
+                        closed_data_bounds = Some(match closed_data_bounds {
+                            Some((current_start, current_end)) => {
+                                (current_start.min(span.start), current_end.max(end))
+                            }
+                            None => (span.start, end),
+                        });
+                    }
+                }
+                TimelineItemKind::Event(event) => {
+                    events_by_time.push(item.id);
+                    closed_data_bounds = Some(match closed_data_bounds {
+                        Some((current_start, current_end)) => {
+                            (current_start.min(event.at), current_end.max(event.at))
+                        }
+                        None => (event.at, event.at),
+                    });
+                }
             }
         }
         spans_by_start.sort_by_key(|id| {
@@ -583,6 +763,14 @@ impl TimelineDataset {
             events_by_time,
             revision: self.revision,
         };
+        self.closed_data_bounds = closed_data_bounds;
+    }
+
+    fn update_closed_data_bounds(&mut self, start: TimelineInstantNs, end: TimelineInstantNs) {
+        self.closed_data_bounds = Some(match self.closed_data_bounds {
+            Some((current_start, current_end)) => (current_start.min(start), current_end.max(end)),
+            None => (start, end),
+        });
     }
 
     fn compaction_report(&self, pending_writes_before: usize) -> TimelineCompactionReport {
@@ -820,6 +1008,108 @@ mod tests {
         assert_eq!(dataset.event_index(), &[event_id]);
         assert_eq!(dataset.pending_write_count(), 0);
         assert_eq!(dataset.index_revision(), dataset.revision());
+    }
+
+    #[test]
+    fn indexed_inserts_keep_indexes_current_without_compaction() {
+        let mut dataset = TimelineDataset::new();
+        let late_span_id = dataset
+            .push_span_indexed(
+                TimelineItemInput::new("late"),
+                TimelineInstantNs::new(50),
+                Some(TimelineInstantNs::new(60)),
+            )
+            .expect("late span");
+        let event_id = dataset.push_event_indexed(
+            TimelineItemInput::new("event"),
+            TimelineInstantNs::new(40),
+        );
+        let early_span_id = dataset
+            .push_span_indexed(
+                TimelineItemInput::new("early"),
+                TimelineInstantNs::new(10),
+                None,
+            )
+            .expect("early span");
+
+        assert_eq!(dataset.items().len(), 3);
+        assert_eq!(dataset.span_index(), &[early_span_id, late_span_id]);
+        assert_eq!(dataset.event_index(), &[event_id]);
+        assert_eq!(dataset.pending_write_count(), 0);
+        assert_eq!(dataset.index_revision(), dataset.revision());
+    }
+
+    #[test]
+    fn indexed_insert_compacts_pending_writes_before_updating_index() {
+        let mut dataset = TimelineDataset::new();
+        let early_event_id =
+            dataset.push_event(TimelineItemInput::new("early"), TimelineInstantNs::new(10));
+        let later_event_id = dataset.push_event_indexed(
+            TimelineItemInput::new("later"),
+            TimelineInstantNs::new(20),
+        );
+
+        assert_eq!(dataset.event_index(), &[early_event_id, later_event_id]);
+        assert_eq!(dataset.pending_write_count(), 0);
+        assert_eq!(dataset.index_revision(), dataset.revision());
+    }
+
+    #[test]
+    fn indexed_finish_keeps_indexes_current_without_compaction() {
+        let mut dataset = TimelineDataset::new();
+        let span_id = dataset
+            .push_span_indexed(TimelineItemInput::new("open"), TimelineInstantNs::new(10), None)
+            .expect("open span");
+
+        dataset
+            .finish_span_indexed(span_id, TimelineInstantNs::new(25))
+            .expect("finish indexed span");
+
+        let TimelineItemKind::Span(span) = dataset.item(span_id).expect("span").kind() else {
+            panic!("expected span");
+        };
+        assert_eq!(span.end(), Some(TimelineInstantNs::new(25)));
+        assert_eq!(dataset.span_index(), &[span_id]);
+        assert_eq!(dataset.pending_write_count(), 0);
+        assert_eq!(dataset.index_revision(), dataset.revision());
+    }
+
+    #[test]
+    fn closed_data_bounds_track_closed_items_without_full_scan() {
+        let mut dataset = TimelineDataset::new();
+        let open_span_id = dataset
+            .push_span(
+                TimelineItemInput::new("open"),
+                TimelineInstantNs::new(20),
+                None,
+            )
+            .expect("open span");
+
+        assert_eq!(dataset.closed_data_bounds(), None);
+
+        dataset.push_event(TimelineItemInput::new("event"), TimelineInstantNs::new(10));
+        dataset
+            .push_span(
+                TimelineItemInput::new("closed"),
+                TimelineInstantNs::new(30),
+                Some(TimelineInstantNs::new(40)),
+            )
+            .expect("closed span");
+        dataset
+            .finish_span(open_span_id, TimelineInstantNs::new(45))
+            .expect("finish open span");
+
+        assert_eq!(
+            dataset.closed_data_bounds(),
+            Some((TimelineInstantNs::new(10), TimelineInstantNs::new(45)))
+        );
+
+        dataset.compact();
+
+        assert_eq!(
+            dataset.closed_data_bounds(),
+            Some((TimelineInstantNs::new(10), TimelineInstantNs::new(45)))
+        );
     }
 
     #[test]

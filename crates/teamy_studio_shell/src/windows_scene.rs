@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::ops::Range;
 use std::time::{Duration, Instant};
@@ -20,7 +22,7 @@ use crate::model::{
     KNOWN_WHISPER_MODELS, WhisperModelPreparationState, WhisperModelPreparationStatus,
 };
 use crate::timeline::{
-    TimelineDataset, TimelineDocument, TimelineGroupingMode, TimelineInstantNs, TimelineItemKind,
+    TimelineDataset, TimelineDocument, TimelineGroupingMode, TimelineInstantNs,
     TimelinePlaygroundDetail, TimelineRenderItem, TimelineRenderPlan, TimelineRenderRowKey,
     TimelineRulerTick, TimelineTimeNs, TimelineTimeRangeNs, TimelineTrack, TimelineTrackId,
     TimelineTrackKind, TimelineViewport, TimelineViewportPoint,
@@ -1628,6 +1630,15 @@ pub fn build_timeline_playground_render_scene(
         SceneWindowKind::TimelinePlayground,
         window_chrome_buttons_state,
     );
+    let row_visual_metadata = {
+        #[cfg(feature = "extended_observability")]
+        let _span = tracing::debug_span!(
+            target: "timeline_playground_profiling",
+            "timeline_playground_build_row_visual_metadata"
+        )
+        .entered();
+        timeline_playground_row_visual_metadata(render_plan, row_visual_positions)
+    };
     let playground_layout = timeline_playground_layout(
         layout.terminal_panel_rect().inset(24),
         view_state.vertical_scroll_offset,
@@ -1640,12 +1651,20 @@ pub fn build_timeline_playground_render_scene(
     );
     push_timeline_playground_header(&mut scene, playground_layout, view_state);
     push_timeline_playground_controls(&mut scene, playground_layout, button_states);
-    push_timeline_playground_rows(
-        &mut scene,
-        playground_layout,
-        render_plan,
-        row_visual_positions,
-    );
+    {
+        #[cfg(feature = "extended_observability")]
+        let _span = tracing::debug_span!(
+            target: "timeline_playground_profiling",
+            "timeline_playground_push_rows"
+        )
+        .entered();
+        push_timeline_playground_rows(
+            &mut scene,
+            playground_layout,
+            render_plan,
+            &row_visual_metadata,
+        );
+    }
     push_timeline_playground_ruler_ticks(&mut scene, playground_layout, view_state);
     push_timeline_playground_data_bounds_dimming(
         &mut scene,
@@ -1654,15 +1673,29 @@ pub fn build_timeline_playground_render_scene(
         view_state,
     );
     push_timeline_playground_cursor_guide(&mut scene, playground_layout, view_state);
-    push_timeline_playground_items(
-        &mut scene,
-        playground_layout,
-        dataset,
-        render_plan,
-        view_state,
-        row_visual_positions,
-    );
+    {
+        #[cfg(feature = "extended_observability")]
+        let _span = tracing::debug_span!(
+            target: "timeline_playground_profiling",
+            "timeline_playground_push_items"
+        )
+        .entered();
+        push_timeline_playground_items(
+            &mut scene,
+            playground_layout,
+            dataset,
+            render_plan,
+            view_state,
+            &row_visual_metadata,
+        );
+    }
     scene
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct TimelinePlaygroundRowVisualMetadata {
+    world_top: i32,
+    color: [f32; 4],
 }
 
 // timeline[impl playground.data-bounds-dimming]
@@ -1912,15 +1945,24 @@ pub fn timeline_playground_hit_target_at_point(
     layout: TerminalLayout,
     render_plan: &TimelineRenderPlan,
     view_state: TimelinePlaygroundViewState,
+    row_visual_positions: &[(TimelineRenderRowKey, i32)],
     point: ClientPoint,
 ) -> Option<TimelinePlaygroundHitTarget> {
     let playground_layout = timeline_playground_layout(
         layout.terminal_panel_rect().inset(24),
         view_state.vertical_scroll_offset,
     );
-    timeline_playground_item_hit_rects(playground_layout, render_plan, view_state, &[])
-        .into_iter()
-        .find_map(|(rect, target)| rect.contains(point).then_some(target))
+    let row_visual_metadata =
+        timeline_playground_row_visual_metadata(render_plan, row_visual_positions);
+    render_plan.items().iter().copied().find_map(|render_item| {
+        timeline_playground_item_rect(
+            playground_layout,
+            render_item,
+            view_state,
+            &row_visual_metadata,
+        )
+        .and_then(|rect| rect.contains(point).then_some(TimelinePlaygroundHitTarget { render_item }))
+    })
 }
 
 #[must_use]
@@ -1930,18 +1972,13 @@ pub fn timeline_playground_item_hit_rects(
     view_state: TimelinePlaygroundViewState,
     row_visual_positions: &[(TimelineRenderRowKey, i32)],
 ) -> Vec<(ClientRect, TimelinePlaygroundHitTarget)> {
+    let row_visual_metadata = timeline_playground_row_visual_metadata(render_plan, row_visual_positions);
     render_plan
         .items()
         .iter()
         .copied()
         .filter_map(|render_item| {
-            timeline_playground_item_rect(
-                layout,
-                render_plan,
-                render_item,
-                view_state,
-                row_visual_positions,
-            )
+            timeline_playground_item_rect(layout, render_item, view_state, &row_visual_metadata)
             .map(|rect| (rect, TimelinePlaygroundHitTarget { render_item }))
         })
         .collect()
@@ -2010,8 +2047,15 @@ fn push_timeline_playground_rows(
     scene: &mut RenderScene,
     layout: TimelinePlaygroundLayout,
     render_plan: &TimelineRenderPlan,
-    row_visual_positions: &[(TimelineRenderRowKey, i32)],
+    row_visual_metadata: &[TimelinePlaygroundRowVisualMetadata],
 ) {
+    #[cfg(feature = "extended_observability")]
+    let mut clipped_row_count = 0_usize;
+    #[cfg(feature = "extended_observability")]
+    let mut trailing_rows_skipped = 0_usize;
+    #[cfg(feature = "extended_observability")]
+    let mut visible_row_count = 0_usize;
+
     push_panel(
         scene,
         layout.ruler_rect.to_win32_rect(),
@@ -2030,24 +2074,37 @@ fn push_timeline_playground_rows(
         [0.08, 0.09, 0.11, 1.0],
         PanelEffect::TerminalFill,
     );
-    for row in render_plan.rows() {
+    for (row_index, row) in render_plan.rows().iter().enumerate() {
+        let row_id = usize::try_from(row.id().as_u32()).unwrap_or(usize::MAX);
+        let Some(row_metadata) = row_visual_metadata.get(row_id) else {
+            continue;
+        };
         let raw_row_rect = timeline_playground_row_unclipped_rect_for_top(
             layout,
-            timeline_playground_visual_row_world_top(
-                row.key(),
-                row.id().as_u32(),
-                row_visual_positions,
-            ),
+            row_metadata.world_top,
         );
         let Some(row_rect) = client_rect_intersection(raw_row_rect, layout.content_rect) else {
+            #[cfg(feature = "extended_observability")]
+            {
+                clipped_row_count = clipped_row_count.saturating_add(1);
+            }
             if timeline_playground_row_world_top(row.id().as_u32())
                 .saturating_sub(layout.vertical_scroll_offset)
                 > layout.content_rect.height()
             {
+                #[cfg(feature = "extended_observability")]
+                {
+                    trailing_rows_skipped =
+                        render_plan.rows().len().saturating_sub(row_index);
+                }
                 break;
             }
             continue;
         };
+        #[cfg(feature = "extended_observability")]
+        {
+            visible_row_count = visible_row_count.saturating_add(1);
+        }
         push_panel(
             scene,
             row_rect.to_win32_rect(),
@@ -2075,6 +2132,16 @@ fn push_timeline_playground_rows(
             [0.80, 0.86, 0.92, 1.0],
         );
     }
+
+    #[cfg(feature = "extended_observability")]
+    tracing::trace!(
+        target: "timeline_playground_profiling",
+        total_rows = render_plan.rows().len(),
+        visible_rows = visible_row_count,
+        clipped_rows = clipped_row_count,
+        trailing_rows_skipped,
+        "timeline playground row visibility"
+    );
 }
 
 // timeline[impl playground.ruler-ticks]
@@ -2179,11 +2246,47 @@ fn push_timeline_playground_items(
     dataset: &TimelineDataset,
     render_plan: &TimelineRenderPlan,
     view_state: TimelinePlaygroundViewState,
-    row_visual_positions: &[(TimelineRenderRowKey, i32)],
+    row_visual_metadata: &[TimelinePlaygroundRowVisualMetadata],
 ) {
-    for (rect, target) in
-        timeline_playground_item_hit_rects(layout, render_plan, view_state, row_visual_positions)
-    {
+    #[cfg(feature = "extended_observability")]
+    let mut clipped_item_count = 0_usize;
+    #[cfg(feature = "extended_observability")]
+    let mut visible_event_count = 0_usize;
+    #[cfg(feature = "extended_observability")]
+    let mut visible_folded_event_cluster_count = 0_usize;
+    #[cfg(feature = "extended_observability")]
+    let mut visible_folded_span_cluster_count = 0_usize;
+    #[cfg(feature = "extended_observability")]
+    let mut visible_span_count = 0_usize;
+
+    for render_item in render_plan.items().iter().copied() {
+        let Some(rect) =
+            timeline_playground_item_rect(layout, render_item, view_state, row_visual_metadata)
+        else {
+            #[cfg(feature = "extended_observability")]
+            {
+                clipped_item_count = clipped_item_count.saturating_add(1);
+            }
+            continue;
+        };
+        #[cfg(feature = "extended_observability")]
+        match render_item {
+            TimelineRenderItem::Span(_) => {
+                visible_span_count = visible_span_count.saturating_add(1);
+            }
+            TimelineRenderItem::Event(_) => {
+                visible_event_count = visible_event_count.saturating_add(1);
+            }
+            TimelineRenderItem::FoldedSpanCluster(_) => {
+                visible_folded_span_cluster_count =
+                    visible_folded_span_cluster_count.saturating_add(1);
+            }
+            TimelineRenderItem::FoldedEventCluster(_) => {
+                visible_folded_event_cluster_count =
+                    visible_folded_event_cluster_count.saturating_add(1);
+            }
+        }
+        let target = TimelinePlaygroundHitTarget { render_item };
         let hovered = view_state.hovered_item == Some(target);
         if matches!(
             target.render_item,
@@ -2192,25 +2295,19 @@ fn push_timeline_playground_items(
             push_timeline_playground_event_marker(
                 scene,
                 rect,
-                timeline_playground_render_item_color(render_plan, target.render_item),
+                timeline_playground_render_item_color(target.render_item, row_visual_metadata),
                 hovered,
             );
             continue;
         }
-        let (color, label) = match target.render_item {
-            TimelineRenderItem::Span(span) => (
-                if span.is_open() {
-                    [0.28, 0.48, 0.42, 1.0]
-                } else {
-                    timeline_playground_render_item_color(render_plan, target.render_item)
-                },
-                timeline_playground_render_item_label(dataset, target.render_item),
-            ),
+        let color = match target.render_item {
+            TimelineRenderItem::Span(span) => if span.is_open() {
+                [0.28, 0.48, 0.42, 1.0]
+            } else {
+                timeline_playground_render_item_color(target.render_item, row_visual_metadata)
+            },
             TimelineRenderItem::Event(_) => unreachable!("events are rendered as markers"),
-            TimelineRenderItem::FoldedSpanCluster(cluster) => (
-                [0.62, 0.42, 0.84, 1.0],
-                Some(format!("x{}", cluster.count())),
-            ),
+            TimelineRenderItem::FoldedSpanCluster(_) => [0.62, 0.42, 0.84, 1.0],
             TimelineRenderItem::FoldedEventCluster(_) => {
                 unreachable!("event clusters are rendered as markers")
             }
@@ -2234,16 +2331,31 @@ fn push_timeline_playground_items(
             .shader_data(),
         );
         push_timeline_playground_span_bevel(scene, rect);
-        if let Some(label) = label {
+        if rect.height() < 16 || rect.width() < 28 {
+            continue;
+        }
+        if let Some(label) = timeline_playground_render_item_label(dataset, target.render_item) {
             let label_anchor_x = timeline_playground_item_label_anchor_x(
                 layout,
                 target.render_item,
                 view_state,
                 rect,
             );
-            push_timeline_playground_item_label(scene, rect, label_anchor_x, &label);
+            push_timeline_playground_item_label(scene, rect, label_anchor_x, label.as_ref());
         }
     }
+
+    #[cfg(feature = "extended_observability")]
+    tracing::trace!(
+        target: "timeline_playground_profiling",
+        total_items = render_plan.items().len(),
+        clipped_items = clipped_item_count,
+        visible_events = visible_event_count,
+        visible_folded_event_clusters = visible_folded_event_cluster_count,
+        visible_folded_span_clusters = visible_folded_span_cluster_count,
+        visible_spans = visible_span_count,
+        "timeline playground visible render items"
+    );
 }
 
 // timeline[impl playground.span-labels]
@@ -2344,13 +2456,17 @@ fn timeline_playground_item_label_anchor_x(
 fn timeline_playground_render_item_label(
     dataset: &TimelineDataset,
     render_item: TimelineRenderItem,
-) -> Option<String> {
+) -> Option<Cow<'_, str>> {
     match render_item {
         TimelineRenderItem::Span(span) => dataset
             .item(span.item_id())
             .and_then(|item| dataset.resolve_string(item.label()))
-            .map(str::to_owned),
-        TimelineRenderItem::FoldedSpanCluster(cluster) => Some(format!("x{}", cluster.count())),
+            .map(Cow::Borrowed),
+        TimelineRenderItem::FoldedSpanCluster(cluster) => Some(Cow::Owned(
+            cluster
+                .label_preview_text(dataset)
+                .unwrap_or_else(|| format!("x{}", cluster.count())),
+        )),
         TimelineRenderItem::Event(_) | TimelineRenderItem::FoldedEventCluster(_) => None,
     }
 }
@@ -2399,19 +2515,15 @@ fn push_timeline_playground_event_marker(
 }
 
 fn timeline_playground_render_item_color(
-    render_plan: &TimelineRenderPlan,
     render_item: TimelineRenderItem,
+    row_visual_metadata: &[TimelinePlaygroundRowVisualMetadata],
 ) -> [f32; 4] {
     // timeline[impl playground.row-stable-colors]
     let row_id = timeline_render_item_row_id(render_item);
-    let Some(row_key) = render_plan
-        .rows()
-        .iter()
-        .find_map(|row| (row.id().as_u32() == row_id).then_some(row.key()))
-    else {
-        return timeline_playground_row_color(row_id);
-    };
-    timeline_playground_row_key_color(row_key)
+    usize::try_from(row_id)
+        .ok()
+        .and_then(|row_id| row_visual_metadata.get(row_id))
+        .map_or_else(|| timeline_playground_row_color(row_id), |metadata| metadata.color)
 }
 
 fn timeline_playground_row_key_color(row_key: &TimelineRenderRowKey) -> [f32; 4] {
@@ -2460,10 +2572,9 @@ fn timeline_playground_row_label(key: &TimelineRenderRowKey) -> String {
 
 fn timeline_playground_item_rect(
     layout: TimelinePlaygroundLayout,
-    render_plan: &TimelineRenderPlan,
     render_item: TimelineRenderItem,
     view_state: TimelinePlaygroundViewState,
-    row_visual_positions: &[(TimelineRenderRowKey, i32)],
+    row_visual_metadata: &[TimelinePlaygroundRowVisualMetadata],
 ) -> Option<ClientRect> {
     let row_id = match render_item {
         TimelineRenderItem::Span(span) => span.row_id().as_u32(),
@@ -2471,13 +2582,12 @@ fn timeline_playground_item_rect(
         TimelineRenderItem::FoldedSpanCluster(cluster)
         | TimelineRenderItem::FoldedEventCluster(cluster) => cluster.row_id().as_u32(),
     };
-    let row_key = render_plan
-        .rows()
-        .iter()
-        .find_map(|row| (row.id().as_u32() == row_id).then_some(row.key()))?;
+    let row_metadata = usize::try_from(row_id)
+        .ok()
+        .and_then(|row_id| row_visual_metadata.get(row_id))?;
     let raw_row_rect = timeline_playground_row_unclipped_rect_for_top(
         layout,
-        timeline_playground_visual_row_world_top(row_key, row_id, row_visual_positions),
+        row_metadata.world_top,
     );
     client_rect_intersection(raw_row_rect, layout.content_rect)?;
     let row_rect = raw_row_rect.inset(8);
@@ -2586,15 +2696,32 @@ fn timeline_playground_row_unclipped_rect_for_top(
     )
 }
 
-fn timeline_playground_visual_row_world_top(
-    row_key: &TimelineRenderRowKey,
-    row_id: u32,
+fn timeline_playground_row_visual_metadata(
+    render_plan: &TimelineRenderPlan,
     row_visual_positions: &[(TimelineRenderRowKey, i32)],
-) -> i32 {
-    row_visual_positions
+) -> Vec<TimelinePlaygroundRowVisualMetadata> {
+    let position_overrides = row_visual_positions
         .iter()
-        .find_map(|(key, top)| (key == row_key).then_some(*top))
-        .unwrap_or_else(|| timeline_playground_row_world_top(row_id))
+        .cloned()
+        .collect::<BTreeMap<_, _>>();
+    let mut metadata = vec![
+        TimelinePlaygroundRowVisualMetadata::default();
+        render_plan.rows().len()
+    ];
+    for row in render_plan.rows() {
+        let row_id = usize::try_from(row.id().as_u32()).unwrap_or(usize::MAX);
+        if row_id >= metadata.len() {
+            continue;
+        }
+        metadata[row_id] = TimelinePlaygroundRowVisualMetadata {
+            world_top: position_overrides
+                .get(row.key())
+                .copied()
+                .unwrap_or_else(|| timeline_playground_row_world_top(row.id().as_u32())),
+            color: timeline_playground_row_key_color(row.key()),
+        };
+    }
+    metadata
 }
 
 pub fn timeline_playground_row_world_top(row_id: u32) -> i32 {
@@ -2645,21 +2772,9 @@ fn timeline_playground_span_lane_rect(row_rect: ClientRect, lane_index: u32) -> 
 fn timeline_playground_closed_data_bounds(
     dataset: &TimelineDataset,
 ) -> Option<(TimelineInstantNs, TimelineInstantNs)> {
-    let mut bounds: Option<(TimelineInstantNs, TimelineInstantNs)> = None;
-    for item in dataset.items() {
-        let item_bounds = match item.kind() {
-            TimelineItemKind::Event(event) => Some((event.at(), event.at())),
-            TimelineItemKind::Span(span) => span.end().map(|end| (span.start(), end)),
-        };
-        let Some((start, end)) = item_bounds else {
-            continue;
-        };
-        bounds = Some(match bounds {
-            Some((current_start, current_end)) => (current_start.min(start), current_end.max(end)),
-            None => (start, end),
-        });
-    }
-    bounds.map(|(start, end)| (start.min(TimelineInstantNs::new(0)), end))
+    dataset
+        .closed_data_bounds()
+        .map(|(start, end)| (start.min(TimelineInstantNs::new(0)), end))
 }
 
 fn timeline_playground_time_to_x(
@@ -10788,7 +10903,13 @@ mod tests {
         assert!(!scene.panels.is_empty());
         assert!(scene.glyphs.iter().any(|glyph| glyph.character == '0'));
         assert_eq!(
-            timeline_playground_hit_target_at_point(layout, &render_plan, view_state, hit_point),
+            timeline_playground_hit_target_at_point(
+                layout,
+                &render_plan,
+                view_state,
+                &[],
+                hit_point,
+            ),
             Some(first_target)
         );
     }
@@ -11081,8 +11202,14 @@ mod tests {
             .copied()
             .find(|item| matches!(item, crate::timeline::TimelineRenderItem::Span(span) if span.item_id() == span_id))
             .expect("span render item");
+        let row_visual_metadata = timeline_playground_row_visual_metadata(&plan, &[]);
 
-        let rect = timeline_playground_item_rect(layout, &plan, render_item, view_state, &[])
+        let rect = timeline_playground_item_rect(
+            layout,
+            render_item,
+            view_state,
+            &row_visual_metadata,
+        )
             .expect("visible span rect");
 
         assert!(

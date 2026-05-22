@@ -143,7 +143,10 @@ pub fn timeline_playground_detail_for_render_item(
                 .item(cluster.representative_item_id())
                 .map(|item| item_detail(dataset, item));
             Some(TimelinePlaygroundDetail {
-                title: format!("Folded cluster ({} items)", cluster.count()),
+                title: cluster.label_preview_text(dataset).map_or_else(
+                    || format!("Folded cluster ({} items)", cluster.count()),
+                    |summary| format!("Folded cluster ({summary})"),
+                ),
                 render_item: render_item_detail,
                 item: None,
                 representative_item,

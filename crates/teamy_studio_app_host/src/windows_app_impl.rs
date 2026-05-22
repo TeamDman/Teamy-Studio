@@ -1,6 +1,6 @@
 use std::cell::RefCell;
 use std::cmp::Ordering;
-use std::collections::{HashSet, VecDeque};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::ffi::c_void;
 use std::fmt::Write as _;
 use std::marker::PhantomData;
@@ -25,7 +25,7 @@ use widestring::{U16CStr, U16CString};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
 use windows::Win32::Graphics::Dwm::{
     DWMWA_BORDER_COLOR, DWMWA_COLOR_NONE, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND,
-    DwmSetWindowAttribute,
+    DwmFlush, DwmSetWindowAttribute,
 };
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, CLEARTYPE_QUALITY, CreateFontIndirectW, DEVMODEW, DeleteObject,
@@ -153,7 +153,6 @@ const HIGH_RESOLUTION_TIMER_PERIOD_MS: u32 = 1;
 const TOAST_RENDER_TIMER_ID: usize = 3;
 const FOCUSED_RENDER_TIMER_ID: usize = 4;
 const TOAST_RENDER_INTERVAL_MS: u32 = 16;
-const TIMELINE_PLAYGROUND_FOCUSED_RENDER_TICK_INTERVAL_MS: u32 = 16;
 const USER_DEFAULT_SCREEN_DPI: u32 = 96;
 const TERMINAL_THROUGHPUT_BENCHMARK_START_MARKER: &str = "__TEAMY_TERMINAL_THROUGHPUT_START__";
 const TERMINAL_THROUGHPUT_BENCHMARK_DONE_MARKER: &str = "__TEAMY_TERMINAL_THROUGHPUT_DONE__";
@@ -164,6 +163,7 @@ const TERMINAL_THROUGHPUT_BENCHMARK_POLL_INTERVAL: Duration = Duration::from_mil
 const TIMELINE_ZOOM_ANIMATION_DURATION: Duration = Duration::from_millis(220);
 const TIMELINE_PLAYGROUND_ROW_ANIMATION_DURATION: Duration = Duration::from_millis(180);
 const TIMELINE_PLAYGROUND_FRAME_MARK_SYNC_INTERVAL: Duration = Duration::from_millis(100);
+const TIMELINE_PLAYGROUND_LIVE_SYNC_MIN_INTERVAL: Duration = Duration::from_millis(16);
 const TIMELINE_PLAYGROUND_LIVE_INITIAL_DURATION_NS: i64 = 30_000_000_000;
 const MODEL_WARNING_PREPARE_HOLD_DURATION: Duration = Duration::from_millis(1400);
 const LOG_TOAST_DURATION: Duration = Duration::from_secs(5);
@@ -179,6 +179,7 @@ const TIMELINE_DOCUMENT_COMMAND_MESSAGE: u32 = WM_APP + 0x404;
 const TIMELINE_TRANSCRIPTION_WORKER_COMPLETED_MESSAGE: u32 = WM_APP + 0x405;
 const TIMELINE_PLAYGROUND_DETAIL_CHANGED_MESSAGE: u32 = WM_APP + 0x406;
 const TEXT_RENDERING_PLAYGROUND_CHANGED_MESSAGE: u32 = WM_APP + 0x407;
+const SCENE_FOCUSED_RENDER_WAKE_MESSAGE: u32 = WM_APP + 0x408;
 const TEXT_RENDERING_TOOLTIP_COOLDOWN: Duration = Duration::from_millis(850);
 const TEXT_RENDERING_DOUBLE_RIGHT_CLICK_WINDOW: Duration = Duration::from_millis(350);
 const TEXT_RENDERING_DOUBLE_RIGHT_CLICK_MAX_MOVEMENT_PX: u32 = 1;
@@ -539,10 +540,18 @@ enum TimelinePlaygroundSourceMode {
     LiveTracingEvents,
 }
 
+#[derive(Clone, Debug)]
+struct TimelinePlaygroundRenderPlanCache {
+    dataset: Arc<TimelineDataset>,
+    query: TimelineViewportQuery,
+    render_plan: Arc<TimelineRenderPlan>,
+}
+
 #[derive(Debug)]
 struct TimelinePlaygroundState {
     seed: u64,
     dataset: Arc<TimelineDataset>,
+    render_plan_cache: RefCell<Option<TimelinePlaygroundRenderPlanCache>>,
     grouping_mode: TimelineGroupingMode,
     minimum_visible_pixels: u32,
     visible_start_ns: i64,
@@ -858,6 +867,7 @@ impl TimelinePlaygroundState {
         Ok(Self {
             seed,
             dataset,
+            render_plan_cache: RefCell::new(None),
             grouping_mode: TimelineGroupingMode::GroupKey,
             minimum_visible_pixels: 4,
             visible_start_ns: 0,
@@ -884,6 +894,7 @@ impl TimelinePlaygroundState {
         self.dataset = Arc::new(generate_synthetic_timeline_dataset(
             &TimelineSyntheticConfig::default().with_seed(self.seed),
         )?);
+        self.invalidate_render_plan_cache();
         self.zoom_animation = None;
         self.row_position_animation = None;
         self.last_row_positions.clear();
@@ -941,19 +952,54 @@ impl TimelinePlaygroundState {
         if self.source_mode != TimelinePlaygroundSourceMode::LiveTracingEvents {
             return;
         }
-        let revision = logs::live_tracing_snapshot_revision();
+        let revision = {
+            #[cfg(feature = "extended_observability")]
+            let _span = debug_span!(
+                target: "timeline_playground_profiling",
+                "timeline_playground_sync_live_events_revision_check"
+            )
+            .entered();
+            logs::live_tracing_snapshot_revision()
+        };
         if self.live_tracing_snapshot_revision == Some(revision) {
             return;
         }
-        let (dataset, latest_at_ns) = logs::tracing_event_timeline_dataset();
-        self.live_tracing_snapshot_revision = Some(revision);
-        self.last_live_tracing_sync_at = Some(Instant::now());
-        self.dataset = dataset;
-        if self.live_tracing_follow_tail {
-            let duration = (self.visible_end_ns - self.visible_start_ns).max(1);
-            self.visible_end_ns = latest_at_ns.max(1);
-            self.visible_start_ns = self.visible_end_ns.saturating_sub(duration);
+        let now = Instant::now();
+        if self.should_throttle_live_tracing_sync(now) {
+            return;
         }
+        let (dataset, latest_at_ns) = {
+            #[cfg(feature = "extended_observability")]
+            let _span = debug_span!(
+                target: "timeline_playground_profiling",
+                "timeline_playground_sync_live_events_fetch_dataset"
+            )
+            .entered();
+            logs::tracing_event_timeline_dataset()
+        };
+        {
+            #[cfg(feature = "extended_observability")]
+            let _span = debug_span!(
+                target: "timeline_playground_profiling",
+                "timeline_playground_sync_live_events_apply_dataset"
+            )
+            .entered();
+            self.live_tracing_snapshot_revision = Some(revision);
+            self.last_live_tracing_sync_at = Some(now);
+            self.dataset = dataset;
+            self.invalidate_render_plan_cache();
+            if self.live_tracing_follow_tail {
+                let duration = (self.visible_end_ns - self.visible_start_ns).max(1);
+                self.visible_end_ns = latest_at_ns.max(1);
+                self.visible_start_ns = self.visible_end_ns.saturating_sub(duration);
+            }
+        }
+    }
+
+    fn should_throttle_live_tracing_sync(&self, now: Instant) -> bool {
+        self.last_live_tracing_sync_at.is_some_and(|last| {
+            now.saturating_duration_since(last) < TIMELINE_PLAYGROUND_LIVE_SYNC_MIN_INTERVAL
+        })
     }
 
     // timeline[impl playground.vertical-pan-clamp]
@@ -1024,15 +1070,16 @@ impl TimelinePlaygroundState {
             return animation.target_positions.clone();
         }
         let progress = ease_in_out(progress);
+        let start_positions = animation
+            .start_positions
+            .iter()
+            .map(|(key, top)| (key, *top))
+            .collect::<BTreeMap<_, _>>();
         animation
             .target_positions
             .iter()
             .map(|(key, target_top)| {
-                let start_top = animation
-                    .start_positions
-                    .iter()
-                    .find_map(|(start_key, top)| (start_key == key).then_some(*top))
-                    .unwrap_or(*target_top);
+                let start_top = start_positions.get(key).copied().unwrap_or(*target_top);
                 (
                     key.clone(),
                     interpolate_i32(start_top, *target_top, progress),
@@ -1050,6 +1097,30 @@ impl TimelinePlaygroundState {
         if progress >= 1.0 {
             self.row_position_animation = None;
         }
+    }
+
+    fn invalidate_render_plan_cache(&self) {
+        self.render_plan_cache.borrow_mut().take();
+    }
+
+    fn cached_render_plan(&self, query: &TimelineViewportQuery) -> Arc<TimelineRenderPlan> {
+        {
+            let cache = self.render_plan_cache.borrow();
+            if let Some(cache) = cache.as_ref()
+                && Arc::ptr_eq(&cache.dataset, &self.dataset)
+                && cache.query == *query
+            {
+                return Arc::clone(&cache.render_plan);
+            }
+        }
+
+        let render_plan = Arc::new(self.dataset.render_plan(query));
+        *self.render_plan_cache.borrow_mut() = Some(TimelinePlaygroundRenderPlanCache {
+            dataset: Arc::clone(&self.dataset),
+            query: query.clone(),
+            render_plan: Arc::clone(&render_plan),
+        });
+        render_plan
     }
 
     fn query(&self, viewport_width_pixels: u32) -> eyre::Result<TimelineViewportQuery> {
@@ -1582,6 +1653,7 @@ struct SceneAppState {
     diagnostic_selection_drag_point: Option<ClientPoint>,
     in_move_size_loop: bool,
     window_focused: bool,
+    focused_render_wake_pending: bool,
     focused_render_interval_ms: u32,
     terminal_cell_width: i32,
     terminal_cell_height: i32,
@@ -3107,6 +3179,7 @@ fn run_scene_window(
             diagnostic_selection_drag_point: None,
             in_move_size_loop: false,
             window_focused: false,
+            focused_render_wake_pending: false,
             focused_render_interval_ms,
             terminal_cell_width,
             terminal_cell_height,
@@ -3217,17 +3290,34 @@ fn timeline_playground_target_at_point(
     let Some(playground) = state.timeline_playground.as_ref() else {
         return Ok(None);
     };
-    let playground_layout = windows_scene::timeline_playground_layout(
-        layout.terminal_panel_rect().inset(24),
-        playground.vertical_scroll_offset,
-    );
-    let query = playground
-        .query(u32::try_from(playground_layout.content_rect.width().max(1)).unwrap_or(1))?;
-    let render_plan = playground.dataset.render_plan(&query);
+    let playground_layout = {
+        #[cfg(feature = "extended_observability")]
+        let _span = debug_span!("timeline_playground_hit_test_layout").entered();
+        windows_scene::timeline_playground_layout(
+            layout.terminal_panel_rect().inset(24),
+            playground.vertical_scroll_offset,
+        )
+    };
+    let query = {
+        #[cfg(feature = "extended_observability")]
+        let _span = debug_span!("timeline_playground_hit_test_query").entered();
+        playground.query(u32::try_from(playground_layout.content_rect.width().max(1)).unwrap_or(1))?
+    };
+    let render_plan = {
+        #[cfg(feature = "extended_observability")]
+        let _span = debug_span!("timeline_playground_hit_test_render_plan").entered();
+        playground.cached_render_plan(&query)
+    };
+    let row_visual_positions = {
+        #[cfg(feature = "extended_observability")]
+        let _span = debug_span!("timeline_playground_hit_test_row_positions").entered();
+        playground.row_visual_positions(&render_plan)
+    };
     Ok(windows_scene::timeline_playground_hit_target_at_point(
         layout,
         &render_plan,
         playground.view_state(None),
+        &row_visual_positions,
         point,
     ))
 }
@@ -4478,6 +4568,7 @@ extern "system" fn scene_window_proc(
         WM_MOVE => handle_scene_move(hwnd),
         WM_SIZE => handle_scene_size(hwnd),
         WM_TIMER if wparam.0 == FOCUSED_RENDER_TIMER_ID => handle_scene_focused_render_timer(hwnd),
+        SCENE_FOCUSED_RENDER_WAKE_MESSAGE => handle_scene_focused_render_wake(hwnd),
         DEMO_MODE_STATE_CHANGED_MESSAGE => handle_scene_demo_mode_state_changed(hwnd),
         TIMELINE_DOCUMENT_CHANGED_MESSAGE => handle_scene_timeline_document_changed(hwnd),
         TIMELINE_DOCUMENT_COMMAND_MESSAGE => handle_scene_timeline_document_command(hwnd),
@@ -4626,8 +4717,31 @@ fn handle_scene_move(hwnd: WindowHandle) -> LRESULT {
 }
 
 fn handle_scene_focused_render_timer(hwnd: WindowHandle) -> LRESULT {
+    handle_scene_focused_render_tick(hwnd, false)
+}
+
+fn handle_scene_focused_render_wake(hwnd: WindowHandle) -> LRESULT {
+    handle_scene_focused_render_tick(hwnd, true)
+}
+
+fn scene_should_force_redraw_on_focused_tick(
+    state: &SceneAppState,
+    from_wake: bool,
+) -> bool {
+    from_wake && scene_prefers_immediate_focused_render_loop(state)
+}
+
+fn scene_should_block_on_force_redraw(state: &SceneAppState, force_redraw: bool) -> bool {
+    force_redraw && scene_prefers_immediate_focused_render_loop(state)
+}
+
+fn handle_scene_focused_render_tick(hwnd: WindowHandle, from_wake: bool) -> LRESULT {
     match with_scene_app_state(|state| {
-        if !state.window_focused {
+        if from_wake {
+            state.focused_render_wake_pending = false;
+        }
+
+        if !state.window_focused && !scene_prefers_immediate_focused_render_loop(state) {
             return Ok(());
         }
 
@@ -4637,12 +4751,72 @@ fn handle_scene_focused_render_timer(hwnd: WindowHandle) -> LRESULT {
             return Ok(());
         }
 
-        render_scene_window_frame(state, hwnd, None, true)?;
+        let keep_live_tracing_burst_awake = scene_should_request_live_tracing_follow_up_render(state);
+        if from_wake && scene_prefers_immediate_focused_render_loop(state) {
+            // Reserve the single outstanding wake slot while we render so nested render paths
+            // cannot flood the queue with more immediate wakes.
+            state.focused_render_wake_pending = true;
+        }
+        render_scene_window_frame(
+            state,
+            hwnd,
+            None,
+            scene_should_force_redraw_on_focused_tick(state, from_wake),
+        )?;
+        if from_wake && scene_prefers_immediate_focused_render_loop(state) {
+            pace_scene_immediate_focused_render_loop();
+            state.focused_render_wake_pending = false;
+            if scene_needs_focused_timer_render(state) {
+                post_scene_focused_render_wake(state, hwnd);
+            }
+        }
+        if keep_live_tracing_burst_awake
+            && state.window_focused
+            && !scene_prefers_immediate_focused_render_loop(state)
+        {
+            post_scene_focused_render_wake(state, hwnd);
+        }
         Ok(())
     }) {
         Ok(()) => LRESULT(0),
         Err(error) => fail_and_close(hwnd, &error),
     }
+}
+
+fn scene_prefers_immediate_focused_render_loop(state: &SceneAppState) -> bool {
+    if state.timeline_zoom_animation.is_some() {
+        return true;
+    }
+
+    if state.scene_kind == SceneWindowKind::CursorLatencyPlayground {
+        return true;
+    }
+
+    state.scene_kind == SceneWindowKind::TimelinePlayground
+        && state.timeline_playground.as_ref().is_some_and(|playground| {
+            playground.zoom_animation.is_some() || playground.row_position_animation.is_some()
+        })
+}
+
+fn scene_should_request_live_tracing_follow_up_render(state: &SceneAppState) -> bool {
+    if state.latency_overlay.is_visible() {
+        return false;
+    }
+
+    state.scene_kind == SceneWindowKind::TimelinePlayground
+        && state.timeline_playground.as_ref().is_some_and(|playground| {
+            playground.live_tracing_follow_tail
+                && playground.last_live_tracing_sync_at.is_none_or(|last| {
+                    last.elapsed()
+                        >= Duration::from_millis(u64::from(
+                            scene_focused_render_tick_interval_ms(state).max(1),
+                        ))
+                })
+                && matches!(
+                    logs::live_tracing_snapshot_delta_since(playground.live_tracing_snapshot_revision),
+                    logs::LiveTracingSnapshotDelta::Other
+                )
+        })
 }
 
 fn handle_scene_text_rendering_playground_changed(hwnd: WindowHandle) -> LRESULT {
@@ -4662,11 +4836,7 @@ fn scene_needs_focused_timer_render(state: &SceneAppState) -> bool {
         return true;
     }
 
-    if state.timeline_zoom_animation.is_some() {
-        return true;
-    }
-
-    if state.scene_kind == SceneWindowKind::CursorLatencyPlayground {
+    if scene_prefers_immediate_focused_render_loop(state) {
         return true;
     }
 
@@ -4695,10 +4865,10 @@ fn scene_needs_focused_timer_render(state: &SceneAppState) -> bool {
 }
 
 fn scene_focused_render_tick_interval_ms(state: &SceneAppState) -> u32 {
-    if state.scene_kind == SceneWindowKind::CursorLatencyPlayground {
+    if state.latency_overlay.is_visible()
+        || state.scene_kind == SceneWindowKind::CursorLatencyPlayground
+    {
         CURSOR_LATENCY_FOCUSED_RENDER_TICK_INTERVAL_MS
-    } else if state.scene_kind == SceneWindowKind::TimelinePlayground {
-        TIMELINE_PLAYGROUND_FOCUSED_RENDER_TICK_INTERVAL_MS
     } else {
         state.focused_render_interval_ms
     }
@@ -4750,10 +4920,10 @@ fn handle_scene_focus_changed(hwnd: WindowHandle, focused: bool) -> LRESULT {
             if let Some(renderer) = state.renderer.as_ref() {
                 renderer.reactivate_low_latency_mode()?;
             }
-            hwnd.set_focused_render_timer(scene_focused_render_tick_interval_ms(state))?;
             render_scene_window_frame(state, hwnd, None, true)?;
         } else {
             hwnd.clear_focused_render_timer();
+            state.focused_render_wake_pending = false;
             state.chrome_tooltip.hide(hwnd);
             render_scene_window_frame(state, hwnd, None, true)?;
         }
@@ -7375,6 +7545,8 @@ fn handle_scene_mouse_wheel(
                 let anchor_x_pixels = point
                     .to_win32_point()
                     .map_or(0, |point| point.x - playground_layout.content_rect.left());
+                let previous_visible_start_ns = playground.visible_start_ns;
+                let previous_visible_end_ns = playground.visible_end_ns;
                 // timeline[impl playground.viewport-controls]
                 // timeline[impl playground.mouse-zoom-anchor]
                 if wheel_delta > 0 {
@@ -7392,6 +7564,18 @@ fn handle_scene_mouse_wheel(
                         1,
                     );
                 }
+                #[cfg(feature = "extended_observability")]
+                trace!(
+                    target: "timeline_playground_profiling",
+                    wheel_delta,
+                    anchor_x_pixels,
+                    content_width = playground_layout.content_rect.width(),
+                    previous_visible_end_ns,
+                    previous_visible_start_ns,
+                    visible_end_ns = playground.visible_end_ns,
+                    visible_start_ns = playground.visible_start_ns,
+                    "timeline playground mouse wheel received"
+                );
             }
             render_scene_window_frame(state, hwnd, None, false)?;
             return Ok(true);
@@ -7983,7 +8167,7 @@ fn render_current_frame_with_options(
     };
     let terminal_visual_state = terminal_scrollbar_visual_state(state);
 
-    let Some(renderer) = state.renderer.as_mut() else {
+    let Some(renderer) = state.renderer.as_ref() else {
         return Ok(());
     };
     let () = {
@@ -8519,33 +8703,58 @@ fn render_scene_window_frame(
             .timeline_playground
             .as_mut()
             .expect("timeline playground scene has playground state");
-        playground.sync_live_tracing_events();
-        let playground_layout = windows_scene::timeline_playground_layout(
-            layout.terminal_panel_rect().inset(24),
-            playground.vertical_scroll_offset,
-        );
-        let query = playground
-            .query(u32::try_from(playground_layout.content_rect.width().max(1)).unwrap_or(1))
-            .expect("timeline playground query must be valid");
-        let render_plan = playground.dataset.render_plan(&query);
-        playground.clamp_vertical_scroll_offset(playground_layout, render_plan.rows().len());
-        playground.update_row_position_animation(&render_plan);
-        let row_visual_positions = playground.row_visual_positions(&render_plan);
-        playground.apply_row_position_animation();
+        let () = {
+            #[cfg(feature = "extended_observability")]
+            let _span = debug_span!("timeline_playground_sync_live_events").entered();
+            playground.sync_live_tracing_events();
+        };
+        let playground_layout = {
+            #[cfg(feature = "extended_observability")]
+            let _span = debug_span!("timeline_playground_layout").entered();
+            windows_scene::timeline_playground_layout(
+                layout.terminal_panel_rect().inset(24),
+                playground.vertical_scroll_offset,
+            )
+        };
+        let query = {
+            #[cfg(feature = "extended_observability")]
+            let _span = debug_span!("timeline_playground_query").entered();
+            playground
+                .query(u32::try_from(playground_layout.content_rect.width().max(1)).unwrap_or(1))
+                .expect("timeline playground query must be valid")
+        };
+        let render_plan = {
+            #[cfg(feature = "extended_observability")]
+            let _span = debug_span!("timeline_playground_render_plan").entered();
+            playground.cached_render_plan(&query)
+        };
+        let row_visual_positions = {
+            #[cfg(feature = "extended_observability")]
+            let _span = debug_span!("timeline_playground_prepare_rows").entered();
+            playground.clamp_vertical_scroll_offset(playground_layout, render_plan.rows().len());
+            playground.update_row_position_animation(&render_plan);
+            let row_visual_positions = playground.row_visual_positions(&render_plan);
+            playground.apply_row_position_animation();
+            row_visual_positions
+        };
         late_latched_pointer_visual =
             Some(LateLatchedPointerVisual::TimelinePlaygroundCursorGuide {
                 ruler_rect: playground_layout.ruler_rect,
                 content_rect: playground_layout.content_rect,
             });
-        windows_scene::build_timeline_playground_render_scene(
-            layout,
-            window_chrome_buttons_state,
-            &playground.dataset,
-            &render_plan,
-            playground.view_state(None),
-            &row_visual_positions,
-            &button_visual_states,
-        )
+        {
+            #[cfg(feature = "extended_observability")]
+            let _span = debug_span!("timeline_playground_build_render_scene").entered();
+            windows_scene::build_timeline_playground_render_scene(
+                layout,
+                window_chrome_buttons_state,
+                &playground.dataset,
+                &render_plan,
+                playground.view_state(None),
+                &row_visual_positions,
+                &button_visual_states,
+            )
+        }
     } else if state.scene_kind == SceneWindowKind::TimelinePlaygroundDetail {
         let detail_state = timeline_playground_detail_window_state(state);
         let pretty_text = timeline_playground_detail_pretty_text(&detail_state);
@@ -8586,7 +8795,7 @@ fn render_scene_window_frame(
         windows_scene::push_latency_overlay(&mut scene, layout, &overlay_view);
     }
 
-    let Some(renderer) = state.renderer.as_mut() else {
+    let Some(renderer) = state.renderer.as_ref() else {
         return Ok(());
     };
 
@@ -8607,10 +8816,19 @@ fn render_scene_window_frame(
         terminal_visual_state: RendererTerminalVisualState::default(),
     };
 
-    if force_redraw {
+    if scene_should_block_on_force_redraw(state, force_redraw) {
+        renderer.render_frame_model_force_redraw_blocking(frame)?;
+    } else if force_redraw {
         renderer.render_frame_model_force_redraw(frame)?;
     } else {
         renderer.render_frame_model(frame)?;
+    }
+
+    refresh_scene_focused_render_driver(state, hwnd)?;
+    if scene_prefers_immediate_focused_render_loop(state)
+        && scene_needs_focused_timer_render(state)
+    {
+        post_scene_focused_render_wake(state, hwnd);
     }
 
     Ok(())
@@ -12691,10 +12909,44 @@ fn refresh_scene_focused_render_interval(
     hwnd: WindowHandle,
 ) -> eyre::Result<()> {
     state.focused_render_interval_ms = measure_focused_render_interval_ms(Some(hwnd.raw()));
-    if state.window_focused {
-        hwnd.set_focused_render_timer(scene_focused_render_tick_interval_ms(state))?;
+    refresh_scene_focused_render_driver(state, hwnd)
+}
+
+fn refresh_scene_focused_render_driver(
+    state: &SceneAppState,
+    hwnd: WindowHandle,
+) -> eyre::Result<()> {
+    if scene_prefers_immediate_focused_render_loop(state) {
+        hwnd.clear_focused_render_timer();
+        return Ok(());
     }
-    Ok(())
+
+    if !state.window_focused {
+        return Ok(());
+    }
+
+    hwnd.set_focused_render_timer(scene_focused_render_tick_interval_ms(state))
+}
+
+fn post_scene_focused_render_wake(state: &mut SceneAppState, hwnd: WindowHandle) {
+    if state.focused_render_wake_pending {
+        return;
+    }
+    state.focused_render_wake_pending = true;
+    // Safety: posting a private wake message to our live scene HWND is fire-and-forget.
+    let _ = unsafe {
+        PostMessageW(
+            Some(hwnd.raw()),
+            SCENE_FOCUSED_RENDER_WAKE_MESSAGE,
+            WPARAM(0),
+            LPARAM(0),
+        )
+    };
+}
+
+fn pace_scene_immediate_focused_render_loop() {
+    // Safety: DwmFlush is a read-only compositor pacing hint for the current UI thread.
+    let _ = unsafe { DwmFlush() };
 }
 
 fn focused_render_interval_ms_for_refresh_hz(refresh_hz: u32) -> u32 {
@@ -14771,7 +15023,7 @@ fn timeline_playground_context_text(state: &SceneAppState) -> eyre::Result<Strin
     };
 
     let query = playground.query(1_000)?;
-    let render_plan = playground.dataset.render_plan(&query);
+    let render_plan = playground.cached_render_plan(&query);
     let mut text = String::new();
     writeln!(text, "Teamy Studio Timeline Playground context")?;
     writeln!(text)?;
@@ -15536,21 +15788,32 @@ fn timeline_playground_item_tooltip(
     let Some(playground) = state.timeline_playground.as_ref() else {
         return Ok(None);
     };
-    let playground_layout = windows_scene::timeline_playground_layout(
-        layout.terminal_panel_rect().inset(24),
-        playground.vertical_scroll_offset,
-    );
-    let query = playground
-        .query(u32::try_from(playground_layout.content_rect.width().max(1)).unwrap_or(1))?;
-    let render_plan = playground.dataset.render_plan(&query);
-    let Some((_rect, target)) = windows_scene::timeline_playground_item_hit_rects(
-        playground_layout,
+    let playground_layout = {
+        #[cfg(feature = "extended_observability")]
+        let _span = debug_span!("timeline_playground_tooltip_layout").entered();
+        windows_scene::timeline_playground_layout(
+            layout.terminal_panel_rect().inset(24),
+            playground.vertical_scroll_offset,
+        )
+    };
+    let query = {
+        #[cfg(feature = "extended_observability")]
+        let _span = debug_span!("timeline_playground_tooltip_query").entered();
+        playground.query(u32::try_from(playground_layout.content_rect.width().max(1)).unwrap_or(1))?
+    };
+    let render_plan = {
+        #[cfg(feature = "extended_observability")]
+        let _span = debug_span!("timeline_playground_tooltip_render_plan").entered();
+        playground.cached_render_plan(&query)
+    };
+    let row_visual_positions = playground.row_visual_positions(&render_plan);
+    let Some(target) = windows_scene::timeline_playground_hit_target_at_point(
+        layout,
         &render_plan,
         playground.view_state(None),
-        &[],
-    )
-    .into_iter()
-    .find(|(rect, _)| rect.contains(point)) else {
+        &row_visual_positions,
+        point,
+    ) else {
         return Ok(None);
     };
     let Some(detail) =
@@ -16431,6 +16694,7 @@ mod tests {
             diagnostic_selection_drag_point: None,
             in_move_size_loop: false,
             window_focused: false,
+            focused_render_wake_pending: false,
             focused_render_interval_ms: 16,
             terminal_cell_width: 8,
             terminal_cell_height: 16,
@@ -16482,6 +16746,42 @@ mod tests {
     }
 
     #[test]
+    fn focused_wake_forces_redraw_for_active_playground_animation() {
+        let mut state = timeline_test_state(TimelineDocument::blank());
+        state.scene_kind = SceneWindowKind::TimelinePlayground;
+        let mut playground = TimelinePlaygroundState::new().expect("playground");
+        playground.zoom_animation = Some(TimelinePlaygroundZoomAnimation {
+            start_visible_start_ns: 0,
+            start_visible_end_ns: 1_000,
+            target_visible_start_ns: 250,
+            target_visible_end_ns: 750,
+            started_at: Instant::now(),
+        });
+        state.timeline_playground = Some(playground);
+
+        assert!(scene_should_force_redraw_on_focused_tick(&state, true));
+        assert!(!scene_should_force_redraw_on_focused_tick(&state, false));
+    }
+
+    #[test]
+    fn immediate_playground_force_redraw_blocks_until_render_completion() {
+        let mut state = timeline_test_state(TimelineDocument::blank());
+        state.scene_kind = SceneWindowKind::TimelinePlayground;
+        let mut playground = TimelinePlaygroundState::new().expect("playground");
+        playground.zoom_animation = Some(TimelinePlaygroundZoomAnimation {
+            start_visible_start_ns: 0,
+            start_visible_end_ns: 1_000,
+            target_visible_start_ns: 250,
+            target_visible_end_ns: 750,
+            started_at: Instant::now(),
+        });
+        state.timeline_playground = Some(playground);
+
+        assert!(scene_should_block_on_force_redraw(&state, true));
+        assert!(!scene_should_block_on_force_redraw(&state, false));
+    }
+
+    #[test]
     fn focused_timer_keeps_cursor_latency_playground_live() {
         let mut state = timeline_test_state(TimelineDocument::blank());
         state.scene_kind = SceneWindowKind::CursorLatencyPlayground;
@@ -16527,6 +16827,28 @@ mod tests {
         state.latency_overlay.visible = true;
 
         assert!(scene_needs_focused_timer_render(&state));
+    }
+
+    #[test]
+    fn focused_timer_uses_high_rate_interval_for_latency_overlay() {
+        let mut state = timeline_test_state(TimelineDocument::blank());
+        state.scene_kind = SceneWindowKind::Launcher;
+        state.focused_render_interval_ms = 7;
+        state.latency_overlay.visible = true;
+
+        assert_eq!(
+            scene_focused_render_tick_interval_ms(&state),
+            CURSOR_LATENCY_FOCUSED_RENDER_TICK_INTERVAL_MS
+        );
+    }
+
+    #[test]
+    fn focused_timer_does_not_use_immediate_wake_loop_for_latency_overlay() {
+        let mut state = timeline_test_state(TimelineDocument::blank());
+        state.scene_kind = SceneWindowKind::Launcher;
+        state.latency_overlay.visible = true;
+
+        assert!(!scene_prefers_immediate_focused_render_loop(&state));
     }
 
     #[test]
@@ -16633,6 +16955,78 @@ mod tests {
         });
 
         assert!(scene_needs_focused_timer_render(&state));
+    }
+
+    #[test]
+    fn live_follow_up_wake_skips_recent_live_log_updates() {
+        let _guard = TIMELINE_LOGS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        logs::clear_logs();
+        let mut state = timeline_test_state(TimelineDocument::blank());
+        state.scene_kind = SceneWindowKind::TimelinePlayground;
+        state.window_focused = true;
+        state.focused_render_interval_ms = 16;
+        let mut playground = TimelinePlaygroundState::new().expect("playground");
+        playground.source_mode = TimelinePlaygroundSourceMode::LiveTracingEvents;
+        playground.live_tracing_follow_tail = true;
+        playground.live_tracing_snapshot_revision = Some(logs::live_tracing_snapshot_revision());
+        playground.last_live_tracing_sync_at = Some(Instant::now());
+        state.timeline_playground = Some(playground);
+
+        let subscriber = tracing_subscriber::Registry::default().with(logs::LogCollectorLayer);
+        tracing::subscriber::with_default(subscriber, || tracing::info!("new live record"));
+
+        assert!(!scene_should_request_live_tracing_follow_up_render(&state));
+    }
+
+    #[test]
+    fn live_follow_up_wake_allows_stale_live_log_updates() {
+        let _guard = TIMELINE_LOGS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        logs::clear_logs();
+        let mut state = timeline_test_state(TimelineDocument::blank());
+        state.scene_kind = SceneWindowKind::TimelinePlayground;
+        state.window_focused = true;
+        state.focused_render_interval_ms = 16;
+        let mut playground = TimelinePlaygroundState::new().expect("playground");
+        playground.source_mode = TimelinePlaygroundSourceMode::LiveTracingEvents;
+        playground.live_tracing_follow_tail = true;
+        playground.live_tracing_snapshot_revision = Some(logs::live_tracing_snapshot_revision());
+        playground.last_live_tracing_sync_at = Instant::now()
+            .checked_sub(Duration::from_millis(17));
+        state.timeline_playground = Some(playground);
+
+        let subscriber = tracing_subscriber::Registry::default().with(logs::LogCollectorLayer);
+        tracing::subscriber::with_default(subscriber, || tracing::info!("new live record"));
+
+        assert!(scene_should_request_live_tracing_follow_up_render(&state));
+    }
+
+    #[test]
+    fn focused_timer_skips_live_follow_up_wake_when_latency_overlay_is_visible() {
+        let _guard = TIMELINE_LOGS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        logs::clear_logs();
+        let mut state = timeline_test_state(TimelineDocument::blank());
+        state.scene_kind = SceneWindowKind::TimelinePlayground;
+        state.window_focused = true;
+        state.focused_render_interval_ms = 16;
+        state.latency_overlay.visible = true;
+        let mut playground = TimelinePlaygroundState::new().expect("playground");
+        playground.source_mode = TimelinePlaygroundSourceMode::LiveTracingEvents;
+        playground.live_tracing_follow_tail = true;
+        playground.live_tracing_snapshot_revision = Some(logs::live_tracing_snapshot_revision());
+        playground.last_live_tracing_sync_at = Instant::now()
+            .checked_sub(Duration::from_millis(17));
+        state.timeline_playground = Some(playground);
+
+        let subscriber = tracing_subscriber::Registry::default().with(logs::LogCollectorLayer);
+        tracing::subscriber::with_default(subscriber, || tracing::info!("new live record"));
+
+        assert!(!scene_should_request_live_tracing_follow_up_render(&state));
     }
 
     #[test]
@@ -16884,6 +17278,34 @@ mod tests {
     }
 
     #[test]
+    // timeline[verify playground.render-plan-cache]
+    fn timeline_playground_cached_render_plan_reuses_same_query() {
+        let playground = TimelinePlaygroundState::new().expect("playground");
+        let query = playground.query(1_000).expect("query");
+
+        let first = playground.cached_render_plan(&query);
+        let cached_again = playground.cached_render_plan(&query);
+
+        assert!(Arc::ptr_eq(&first, &cached_again));
+    }
+
+    #[test]
+    // timeline[verify playground.render-plan-cache]
+    fn timeline_playground_cached_render_plan_invalidates_when_dataset_changes() {
+        let mut playground = TimelinePlaygroundState::new().expect("playground");
+        let query = playground.query(1_000).expect("query");
+        let first = playground.cached_render_plan(&query);
+
+        let mut dataset = TimelineDataset::new();
+        dataset.push_event(TimelineItemInput::new("next"), TimelineInstantNs::new(500));
+        playground.dataset = Arc::new(dataset);
+
+        let refreshed = playground.cached_render_plan(&query);
+
+        assert!(!Arc::ptr_eq(&first, &refreshed));
+    }
+
+    #[test]
     // timeline[verify playground.row-transition-animation]
     fn timeline_playground_row_positions_animate_when_prior_rows_disappear() {
         let mut dataset = TimelineDataset::new();
@@ -16989,6 +17411,76 @@ mod tests {
 
         assert!(playground.visible_start_ns < 0);
         assert!(playground.visible_end_ns > 0);
+    }
+
+    #[test]
+    fn timeline_playground_target_hit_testing_tracks_visual_row_animation() {
+        let mut dataset = TimelineDataset::new();
+        dataset.push_event(
+            TimelineItemInput::new("first").with_group_key("row-a"),
+            TimelineInstantNs::new(0),
+        );
+        dataset.push_event(
+            TimelineItemInput::new("second").with_group_key("row-b"),
+            TimelineInstantNs::new(1_000),
+        );
+        dataset.compact();
+
+        let mut playground = TimelinePlaygroundState::new().expect("playground");
+        playground.dataset = Arc::new(dataset);
+        playground.visible_start_ns = 900;
+        playground.visible_end_ns = 1_100;
+
+        let layout = test_scene_layout();
+        let playground_layout = windows_scene::timeline_playground_layout(
+            layout.terminal_panel_rect().inset(24),
+            playground.vertical_scroll_offset,
+        );
+        let query = playground
+            .query(u32::try_from(playground_layout.content_rect.width().max(1)).unwrap_or(1))
+            .expect("query");
+        let render_plan = playground.cached_render_plan(&query);
+        let row_b_key = render_plan.rows()[0].key().clone();
+        playground.last_row_positions = vec![(
+            row_b_key.clone(),
+            windows_scene::timeline_playground_row_world_top(1),
+        )];
+        playground.update_row_position_animation(&render_plan);
+        let row_visual_positions = playground.row_visual_positions(&render_plan);
+        let hit_rects = windows_scene::timeline_playground_item_hit_rects(
+            playground_layout,
+            &render_plan,
+            playground.view_state(None),
+            &row_visual_positions,
+        );
+        let (hit_rect, hit_target) = hit_rects.first().copied().expect("animated hit rect");
+
+        let mut state = timeline_test_state(TimelineDocument::blank());
+        state.scene_kind = SceneWindowKind::TimelinePlayground;
+        state.timeline_playground = Some(playground);
+
+        assert_eq!(
+            timeline_playground_target_at_point(&state, layout, rect_center(hit_rect))
+                .expect("hit test should succeed"),
+            Some(hit_target)
+        );
+    }
+
+    #[test]
+    fn timeline_playground_live_sync_throttle_skips_recent_syncs() {
+        let mut playground = TimelinePlaygroundState::new().expect("playground");
+        let now = Instant::now();
+
+        assert!(!playground.should_throttle_live_tracing_sync(now));
+
+        playground.last_live_tracing_sync_at = Some(now);
+
+        assert!(playground.should_throttle_live_tracing_sync(
+            now + TIMELINE_PLAYGROUND_LIVE_SYNC_MIN_INTERVAL - Duration::from_millis(1)
+        ));
+        assert!(!playground.should_throttle_live_tracing_sync(
+            now + TIMELINE_PLAYGROUND_LIVE_SYNC_MIN_INTERVAL
+        ));
     }
 
     #[test]
@@ -17168,16 +17660,13 @@ mod tests {
     }
 
     #[test]
-    fn timeline_playground_uses_fixed_focused_render_tick_interval() {
+    fn timeline_playground_uses_measured_focused_render_tick_interval() {
         let mut state = timeline_test_state(TimelineDocument::blank());
         state.scene_kind = SceneWindowKind::TimelinePlayground;
         state.focused_render_interval_ms = 40;
         state.timeline_playground = Some(TimelinePlaygroundState::new().expect("playground"));
 
-        assert_eq!(
-            scene_focused_render_tick_interval_ms(&state),
-            TIMELINE_PLAYGROUND_FOCUSED_RENDER_TICK_INTERVAL_MS
-        );
+        assert_eq!(scene_focused_render_tick_interval_ms(&state), 40);
     }
 
     #[test]
@@ -17343,6 +17832,7 @@ mod tests {
             diagnostic_selection_drag_point: None,
             in_move_size_loop: false,
             window_focused: false,
+            focused_render_wake_pending: false,
             focused_render_interval_ms: 16,
             terminal_cell_width: 8,
             terminal_cell_height: 16,
@@ -17434,6 +17924,7 @@ mod tests {
             diagnostic_selection_drag_point: None,
             in_move_size_loop: false,
             window_focused: false,
+            focused_render_wake_pending: false,
             focused_render_interval_ms: 16,
             terminal_cell_width: 8,
             terminal_cell_height: 16,
@@ -17527,6 +18018,7 @@ mod tests {
             diagnostic_selection_drag_point: None,
             in_move_size_loop: false,
             window_focused: false,
+            focused_render_wake_pending: false,
             focused_render_interval_ms: 16,
             terminal_cell_width: 8,
             terminal_cell_height: 16,
@@ -17611,6 +18103,7 @@ mod tests {
             diagnostic_selection_drag_point: None,
             in_move_size_loop: false,
             window_focused: false,
+            focused_render_wake_pending: false,
             focused_render_interval_ms: 16,
             terminal_cell_width: 8,
             terminal_cell_height: 16,

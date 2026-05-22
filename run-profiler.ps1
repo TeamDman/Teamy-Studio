@@ -5,6 +5,7 @@ param(
 )
 
 $tracyLayerEnvVar = 'TEAMY_STUDIO_ENABLE_TRACY_LAYER'
+$profilerFeatures = 'extended_observability,tracing_subscriber_tracy'
 
 function Format-Elapsed {
 	param(
@@ -172,7 +173,7 @@ Start-Sleep -Seconds 1
 try {
 	$previousTracyLayerSetting = [Environment]::GetEnvironmentVariable($tracyLayerEnvVar)
 	Set-Item -Path "Env:$tracyLayerEnvVar" -Value '1'
-	$cargoArgs = @("run")
+	$cargoArgs = @("run", "--features", $profilerFeatures)
 	if ($Release) {
 		$cargoArgs += @("--profile", "profiling")
 	}
@@ -181,7 +182,7 @@ try {
 	$cargoArgs += "--log-filter"
 	$cargoArgs += "trace"
 	$profileLabel = if ($Release) { "profiling release" } else { "debug" }
-	Write-Host "Running $profileLabel with ${tracyLayerEnvVar}=1: cargo $($cargoArgs -join ' ')"
+	Write-Host "Running $profileLabel with ${tracyLayerEnvVar}=1 and features ${profilerFeatures}: cargo $($cargoArgs -join ' ')"
 	$commandStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
 	& cargo @cargoArgs
 	$commandStopwatch.Stop()

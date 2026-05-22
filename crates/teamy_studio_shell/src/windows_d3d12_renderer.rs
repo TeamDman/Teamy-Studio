@@ -722,6 +722,33 @@ impl RenderThreadProxy {
         Ok(())
     }
 
+    pub fn render_frame_model_force_redraw_blocking(
+        &self,
+        frame: RenderFrameModel,
+    ) -> eyre::Result<()> {
+        let submission_id = self.submit_render_frame_model(frame, true)?;
+        let (state_lock, wake) = &*self.shared;
+        let mut state = state_lock
+            .lock()
+            .map_err(|error| eyre::eyre!("failed to lock renderer thread state: {error}"))?;
+
+        while state.completed_submission_id < submission_id {
+            if let Some(error) = state.error.as_ref() {
+                eyre::bail!(error.clone());
+            }
+
+            state = wake.wait(state).map_err(|error| {
+                eyre::eyre!("failed to wait for renderer thread completion: {error}")
+            })?;
+        }
+
+        if let Some(error) = state.error.as_ref() {
+            eyre::bail!(error.clone());
+        }
+
+        Ok(())
+    }
+
     pub fn render_frame_model_blocking(&self, frame: RenderFrameModel) -> eyre::Result<()> {
         let submission_id = self.submit_render_frame_model(frame, false)?;
         let (state_lock, wake) = &*self.shared;
