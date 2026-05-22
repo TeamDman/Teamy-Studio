@@ -22,7 +22,7 @@ use tracing::{debug, error, info, info_span, instrument};
 use uom::si::f64::Time;
 use uom::si::time::{nanosecond, second};
 use widestring::{U16CStr, U16CString};
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
+use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
 use windows::Win32::Graphics::Dwm::{
     DWMWA_BORDER_COLOR, DWMWA_COLOR_NONE, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND,
     DwmSetWindowAttribute,
@@ -35,6 +35,10 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
+};
+use windows::Win32::System::Threading::{
+    CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, CreateWaitableTimerExW, SetWaitableTimer,
+    TIMER_ALL_ACCESS,
 };
 use windows::Win32::UI::Controls::{
     TOOLTIPS_CLASSW, TTF_ABSOLUTE, TTF_TRACK, TTM_ADDTOOLW, TTM_SETMAXTIPWIDTH, TTM_TRACKACTIVATE,
@@ -55,7 +59,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, HTCAPTION, HTCLIENT,
     HTTRANSPARENT, HWND_NOTOPMOST, HWND_TOPMOST, IDC_ARROW, IDC_CROSS, IDC_HAND, IDC_HELP,
     IDC_IBEAM, IDC_SIZEALL, IDC_SIZEWE, IDC_WAIT, IsWindowVisible, IsZoomed, KillTimer,
-    LoadCursorW, MSG, MWMO_INPUTAVAILABLE, MoveWindow, MsgWaitForMultipleObjectsEx, PM_REMOVE,
+    LoadCursorW, MSG, MoveWindow, MsgWaitForMultipleObjectsEx, PM_REMOVE,
     PeekMessageW, PostMessageW, PostQuitMessage, QS_ALLINPUT, RegisterClassExW,
     SM_CXPADDEDBORDER, SM_CXSCREEN, SM_CXSIZEFRAME, SM_CXVIRTUALSCREEN, SM_CYSCREEN,
     SM_CYSIZEFRAME, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SW_HIDE, SW_MAXIMIZE,
@@ -518,6 +522,10 @@ impl TimelinePlaygroundDetailWindowHandle {
                 )
             };
         }
+    }
+
+    fn is_pinned(&self) -> bool {
+        self.shared.lock().map(|state| state.pinned).unwrap_or(false)
     }
 }
 
@@ -2353,6 +2361,23 @@ impl WindowHandle {
         .wrap_err("failed to position window")
     }
 
+    fn set_position(self, rect: ScreenRect) -> eyre::Result<()> {
+        self.window_thread.assert_window_thread();
+        // Safety: SetWindowPos moves and sizes this live top-level window while preserving z-order.
+        unsafe {
+            SetWindowPos(
+                self.hwnd,
+                None,
+                rect.left(),
+                rect.top(),
+                rect.width(),
+                rect.height(),
+                SWP_NOZORDER,
+            )
+        }
+        .wrap_err("failed to position window")
+    }
+
     fn set_topmost_position_no_activate(self, rect: ScreenRect) -> eyre::Result<()> {
         self.window_thread.assert_window_thread();
         // Safety: SetWindowPos moves and sizes this live top-level window without activating it.
@@ -2899,32 +2924,102 @@ fn dispatch_pending_thread_messages() -> eyre::Result<bool> {
     }
 }
 
-fn scene_immediate_focused_render_wait_ms() -> Option<u32> {
+#[derive(Debug)]
+struct SceneWaitTimer(HANDLE);
+
+impl SceneWaitTimer {
+    fn create() -> Option<Self> {
+        unsafe {
+            CreateWaitableTimerExW(
+                None,
+                PCWSTR::null(),
+                CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                TIMER_ALL_ACCESS.0,
+            )
+            .or_else(|_| CreateWaitableTimerExW(None, PCWSTR::null(), 0, TIMER_ALL_ACCESS.0))
+            .ok()
+            .map(Self)
+        }
+    }
+
+    fn raw(&self) -> HANDLE {
+        self.0
+    }
+
+    fn set_relative(&self, timeout: Duration) -> eyre::Result<()> {
+        let due_time_100ns = ((timeout.as_nanos().saturating_add(99)) / 100).max(1);
+        let due_time = -i64::try_from(due_time_100ns).unwrap_or(i64::MAX);
+        // Safety: this timer handle is owned by `SceneWaitTimer`; due time is a valid relative interval.
+        unsafe { SetWaitableTimer(self.0, &due_time, 0, None, None, false) }
+            .wrap_err("failed to arm scene wait timer")
+    }
+}
+
+impl Drop for SceneWaitTimer {
+    fn drop(&mut self) {
+        // Safety: this handle is owned by `SceneWaitTimer` and closed exactly once here.
+        let _ = unsafe { CloseHandle(self.0) };
+    }
+}
+
+fn scene_should_poll_for_focused_render_work(state: &SceneAppState) -> bool {
+    if !state.window_focused && !scene_allows_unfocused_focused_render_tick(state) {
+        return false;
+    }
+
+    if scene_needs_focused_timer_render(state) {
+        return true;
+    }
+
+    state.scene_kind == SceneWindowKind::TimelinePlayground
+        && state.timeline_playground.as_ref().is_some_and(|playground| {
+            matches!(
+                playground.source_mode,
+                TimelinePlaygroundSourceMode::LiveTracingEvents
+            ) && playground.live_tracing_follow_tail
+        })
+}
+
+fn scene_focused_render_wait_ms() -> Option<u32> {
     SCENE_APP_STATE.with(|state| {
         state.borrow().as_ref().and_then(|state| {
-            scene_should_use_immediate_focused_render_driver(state)
+            scene_should_poll_for_focused_render_work(state)
                 .then_some(scene_focused_render_tick_interval_ms(state).max(1))
         })
     })
 }
 
 fn scene_message_loop(hwnd: WindowHandle) -> eyre::Result<()> {
+    let wait_timer = SceneWaitTimer::create();
+
     loop {
-        if let Some(wait_ms) = scene_immediate_focused_render_wait_ms() {
+        if let Some(wait_ms) = scene_focused_render_wait_ms() {
+            let using_wait_timer = wait_timer.is_some();
+            if let Some(wait_timer) = wait_timer.as_ref() {
+                wait_timer.set_relative(Duration::from_millis(u64::from(wait_ms)))?;
+            }
+            let wait_handles = wait_timer.as_ref().map(|wait_timer| [wait_timer.raw()]);
             let status = {
                 #[cfg(feature = "extended_observability")]
                 let _span = debug_span!("wait_for_window_message").entered();
-                // Safety: waiting on this UI thread's message queue is valid.
-                unsafe { MsgWaitForMultipleObjectsEx(None, wait_ms, QS_ALLINPUT, MWMO_INPUTAVAILABLE) }
+                // Safety: waiting on this UI thread's message queue and optional timer handle is valid.
+                unsafe {
+                    MsgWaitForMultipleObjectsEx(
+                        wait_handles.as_ref().map(|handles| handles.as_slice()),
+                        if using_wait_timer { u32::MAX } else { wait_ms },
+                        QS_ALLINPUT,
+                        Default::default(),
+                    )
+                }
             };
             if status.0 == 0xFFFF_FFFF {
                 eyre::bail!("failed to wait for next scene message")
             }
-            if status.0 == 258 {
+            if (!using_wait_timer && status.0 == 258) || (using_wait_timer && status.0 == 0) {
                 handle_scene_focused_render_tick(hwnd, false);
                 continue;
             }
-            if status.0 != 0 {
+            if status.0 != if using_wait_timer { 1 } else { 0 } {
                 eyre::bail!("unexpected scene wait status: {}", status.0)
             }
             if dispatch_pending_thread_messages()? {
@@ -3201,6 +3296,11 @@ fn run_scene_window(
     let cursor_latency_playground = (scene_kind == SceneWindowKind::CursorLatencyPlayground)
         .then(CursorLatencyPlaygroundState::new);
     let text_rendering_playground = initialization.text_rendering_playground.take();
+    let starts_without_activation = scene_kind == SceneWindowKind::TimelinePlaygroundDetail
+        && initialization
+            .timeline_playground_detail
+            .as_ref()
+            .is_none_or(|detail| !detail.is_pinned());
 
     SCENE_APP_STATE.with(|state| {
         *state.borrow_mut() = Some(SceneAppState {
@@ -3272,7 +3372,7 @@ fn run_scene_window(
         });
     });
 
-    let hwnd = create_scene_window(window_thread, scene_kind)?;
+    let hwnd = create_scene_window(window_thread, scene_kind, starts_without_activation)?;
     register_scene_window(hwnd, scene_kind);
     let renderer = RenderThreadProxy::new(hwnd.raw())?;
     let chrome_tooltip = ChromeTooltipController::create(hwnd)?;
@@ -3298,8 +3398,14 @@ fn run_scene_window(
     })?;
 
     if let Some(position) = initialization.initial_position {
-        hwnd.set_position_no_activate(position)?;
-        hwnd.show_no_activate();
+        if starts_without_activation {
+            hwnd.set_position_no_activate(position)?;
+            hwnd.show_no_activate();
+        } else {
+            hwnd.set_position(position)?;
+            hwnd.show();
+            hwnd.bring_to_front();
+        }
     } else {
         hwnd.show();
         if scene_kind == SceneWindowKind::Launcher {
@@ -4054,6 +4160,7 @@ fn base_custom_window_style() -> WINDOW_STYLE {
 fn create_scene_window(
     window_thread: WindowThread,
     scene_kind: SceneWindowKind,
+    starts_without_activation: bool,
 ) -> eyre::Result<WindowHandle> {
     let instance = get_current_module().wrap_err("failed to get module handle")?;
 
@@ -4083,7 +4190,7 @@ fn create_scene_window(
     // Safety: all pointers and handles passed to CreateWindowExW are valid for the duration of the call.
     let hwnd = unsafe {
         CreateWindowExW(
-            scene_window_ex_style(scene_kind),
+            scene_window_ex_style(scene_kind, starts_without_activation),
             SCENE_WINDOW_CLASS_NAME,
             title.as_ref(),
             visible_custom_window_style(),
@@ -4130,10 +4237,17 @@ fn configure_scene_window_chrome(hwnd: HWND) {
     }
 }
 
-fn scene_window_ex_style(scene_kind: SceneWindowKind) -> WINDOW_EX_STYLE {
+fn scene_window_ex_style(
+    scene_kind: SceneWindowKind,
+    starts_without_activation: bool,
+) -> WINDOW_EX_STYLE {
     if scene_kind == SceneWindowKind::TimelinePlaygroundDetail {
-        // timeline[impl playground.hover-detail-no-activate]
-        WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_NOREDIRECTIONBITMAP
+        let mut style = WS_EX_TOOLWINDOW | WS_EX_NOREDIRECTIONBITMAP;
+        if starts_without_activation {
+            // timeline[impl playground.hover-detail-no-activate]
+            style |= WS_EX_NOACTIVATE;
+        }
+        style
     } else {
         custom_window_ex_style()
     }
@@ -4857,20 +4971,12 @@ fn handle_scene_focused_render_tick(hwnd: WindowHandle, from_wake: bool) -> LRES
             return Ok(());
         }
 
-        let keep_live_tracing_burst_awake =
-            scene_should_request_live_tracing_follow_up_render(state);
         render_scene_window_frame(
             state,
             hwnd,
             None,
             scene_should_force_redraw_on_focused_tick(state),
         )?;
-        if keep_live_tracing_burst_awake
-            && state.window_focused
-            && !scene_should_use_immediate_focused_render_driver(state)
-        {
-            post_scene_focused_render_wake(state, hwnd);
-        }
         Ok(())
     }) {
         Ok(()) => LRESULT(0),
@@ -4896,27 +5002,6 @@ fn scene_prefers_immediate_focused_render_loop(state: &SceneAppState) -> bool {
 
 fn scene_should_use_immediate_focused_render_driver(state: &SceneAppState) -> bool {
     scene_prefers_immediate_focused_render_loop(state) && scene_needs_focused_timer_render(state)
-}
-
-fn scene_should_request_live_tracing_follow_up_render(state: &SceneAppState) -> bool {
-    if state.latency_overlay.is_visible() {
-        return false;
-    }
-
-    state.scene_kind == SceneWindowKind::TimelinePlayground
-        && state.timeline_playground.as_ref().is_some_and(|playground| {
-            playground.live_tracing_follow_tail
-                && playground.last_live_tracing_sync_at.is_none_or(|last| {
-                    last.elapsed()
-                        >= Duration::from_millis(u64::from(
-                            scene_focused_render_tick_interval_ms(state).max(1),
-                        ))
-                })
-                && matches!(
-                    logs::live_tracing_snapshot_delta_since(playground.live_tracing_snapshot_revision),
-                    logs::LiveTracingSnapshotDelta::Other
-                )
-        })
 }
 
 fn handle_scene_text_rendering_playground_changed(hwnd: WindowHandle) -> LRESULT {
@@ -13012,34 +13097,9 @@ fn refresh_scene_focused_render_driver(
     state: &mut SceneAppState,
     hwnd: WindowHandle,
 ) -> eyre::Result<()> {
-    if scene_should_use_immediate_focused_render_driver(state) {
-        state.focused_render_wake_pending = false;
-        hwnd.clear_focused_render_timer();
-        return Ok(());
-    }
-
-    if !state.window_focused && !scene_uses_refresh_timer_for_playground_animation(state) {
-        return Ok(());
-    }
-
     state.focused_render_wake_pending = false;
-    hwnd.set_focused_render_timer(scene_focused_render_tick_interval_ms(state))
-}
-
-fn post_scene_focused_render_wake(state: &mut SceneAppState, hwnd: WindowHandle) {
-    if state.focused_render_wake_pending {
-        return;
-    }
-    state.focused_render_wake_pending = true;
-    // Safety: posting a private wake message to our live scene HWND is fire-and-forget.
-    let _ = unsafe {
-        PostMessageW(
-            Some(hwnd.raw()),
-            SCENE_FOCUSED_RENDER_WAKE_MESSAGE,
-            WPARAM(0),
-            LPARAM(0),
-        )
-    };
+    hwnd.clear_focused_render_timer();
+    Ok(())
 }
 
 fn focused_render_interval_ms_for_refresh_hz(refresh_hz: u32) -> u32 {
@@ -16818,6 +16878,17 @@ mod tests {
         state.window_focused = true;
 
         assert!(!scene_needs_focused_timer_render(&state));
+        assert!(!scene_should_poll_for_focused_render_work(&state));
+    }
+
+    #[test]
+    fn focused_timer_skips_static_launcher_windows() {
+        let mut state = timeline_test_state(TimelineDocument::blank());
+        state.scene_kind = SceneWindowKind::Launcher;
+        state.window_focused = true;
+
+        assert!(!scene_needs_focused_timer_render(&state));
+        assert!(!scene_should_poll_for_focused_render_work(&state));
     }
 
     #[test]
@@ -16976,6 +17047,7 @@ mod tests {
         state.scene_kind = SceneWindowKind::Launcher;
         state.latency_overlay.visible = true;
 
+        assert!(scene_should_poll_for_focused_render_work(&state));
         assert!(scene_prefers_immediate_focused_render_loop(&state));
         assert!(scene_should_use_immediate_focused_render_driver(&state));
         assert!(!scene_should_force_redraw_on_focused_tick(&state));
@@ -17032,6 +17104,7 @@ mod tests {
         playground.live_tracing_snapshot_revision = Some(logs::live_tracing_snapshot_revision());
         state.timeline_playground = Some(playground);
 
+        assert!(scene_should_poll_for_focused_render_work(&state));
         assert!(scene_live_playground_prefers_immediate_focused_render_loop(&state));
         assert!(!scene_should_use_immediate_focused_render_driver(&state));
     }
@@ -17136,7 +17209,7 @@ mod tests {
     }
 
     #[test]
-    fn live_follow_up_wake_skips_recent_live_log_updates() {
+    fn live_follow_tail_polling_stays_active_for_recent_live_log_updates() {
         let _guard = TIMELINE_LOGS_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -17155,7 +17228,8 @@ mod tests {
         let subscriber = tracing_subscriber::Registry::default().with(logs::LogCollectorLayer);
         tracing::subscriber::with_default(subscriber, || tracing::info!("new live record"));
 
-        assert!(!scene_should_request_live_tracing_follow_up_render(&state));
+        assert!(scene_should_poll_for_focused_render_work(&state));
+        assert!(scene_should_use_immediate_focused_render_driver(&state));
     }
 
     #[test]
@@ -17189,7 +17263,7 @@ mod tests {
     }
 
     #[test]
-    fn live_follow_up_wake_allows_stale_live_log_updates() {
+    fn live_follow_tail_polling_stays_active_for_stale_live_log_updates() {
         let _guard = TIMELINE_LOGS_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -17209,11 +17283,12 @@ mod tests {
         let subscriber = tracing_subscriber::Registry::default().with(logs::LogCollectorLayer);
         tracing::subscriber::with_default(subscriber, || tracing::info!("new live record"));
 
-        assert!(scene_should_request_live_tracing_follow_up_render(&state));
+        assert!(scene_should_poll_for_focused_render_work(&state));
+        assert!(scene_should_use_immediate_focused_render_driver(&state));
     }
 
     #[test]
-    fn focused_timer_skips_live_follow_up_wake_when_latency_overlay_is_visible() {
+    fn focused_timer_keeps_live_follow_tail_polling_when_latency_overlay_is_visible() {
         let _guard = TIMELINE_LOGS_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -17234,7 +17309,8 @@ mod tests {
         let subscriber = tracing_subscriber::Registry::default().with(logs::LogCollectorLayer);
         tracing::subscriber::with_default(subscriber, || tracing::info!("new live record"));
 
-        assert!(!scene_should_request_live_tracing_follow_up_render(&state));
+        assert!(scene_should_poll_for_focused_render_work(&state));
+        assert!(scene_should_use_immediate_focused_render_driver(&state));
     }
 
     #[test]
@@ -17694,9 +17770,18 @@ mod tests {
     #[test]
     // timeline[verify playground.hover-detail-no-activate]
     fn timeline_playground_detail_window_style_does_not_activate() {
-        let style = scene_window_ex_style(SceneWindowKind::TimelinePlaygroundDetail);
+        let style = scene_window_ex_style(SceneWindowKind::TimelinePlaygroundDetail, true);
 
         assert_eq!(style & WS_EX_NOACTIVATE, WS_EX_NOACTIVATE);
+        assert_eq!(style & WS_EX_TOOLWINDOW, WS_EX_TOOLWINDOW);
+        assert_eq!(style & WS_EX_APPWINDOW, WINDOW_EX_STYLE(0));
+    }
+
+    #[test]
+    fn pinned_timeline_playground_detail_window_style_can_activate() {
+        let style = scene_window_ex_style(SceneWindowKind::TimelinePlaygroundDetail, false);
+
+        assert_eq!(style & WS_EX_NOACTIVATE, WINDOW_EX_STYLE(0));
         assert_eq!(style & WS_EX_TOOLWINDOW, WS_EX_TOOLWINDOW);
         assert_eq!(style & WS_EX_APPWINDOW, WINDOW_EX_STYLE(0));
     }

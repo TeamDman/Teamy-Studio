@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use arbitrary::Arbitrary;
 use facet::Facet;
@@ -432,7 +432,7 @@ fn build_rows(
     candidates: &[TimelineRenderCandidate],
 ) -> (
     Vec<TimelineRenderRow>,
-    BTreeMap<TimelineCandidateRowKey, TimelineRenderRowId>,
+    HashMap<TimelineCandidateRowKey, TimelineRenderRowId>,
 ) {
     let mut row_keys = candidates
         .iter()
@@ -441,7 +441,7 @@ fn build_rows(
     row_keys.sort_unstable_by(|left, right| row_key_sort_key(dataset, *left).cmp(&row_key_sort_key(dataset, *right)));
     row_keys.dedup();
 
-    let mut row_ids = BTreeMap::new();
+    let mut row_ids = HashMap::with_capacity(row_keys.len());
     let rows = row_keys
         .into_iter()
         .enumerate()
@@ -462,7 +462,7 @@ fn build_render_items(
     dataset: &TimelineDataset,
     query: &TimelineViewportQuery,
     candidates: Vec<TimelineRenderCandidate>,
-    row_ids: &BTreeMap<TimelineCandidateRowKey, TimelineRenderRowId>,
+    row_ids: &HashMap<TimelineCandidateRowKey, TimelineRenderRowId>,
 ) -> Vec<TimelineRenderItem> {
     let candidates = {
         #[cfg(feature = "extended_observability")]

@@ -715,38 +715,32 @@ pub fn live_tracing_snapshot_delta_since(
 #[must_use]
 // timeline[impl playground.live-tracing-events]
 pub fn tracing_event_timeline_dataset() -> (Arc<TimelineDataset>, i64) {
-    let (records, span_records, active_spans) = {
-        #[cfg(feature = "extended_observability")]
-        let _span = tracing::debug_span!(
-            target: "timeline_playground_profiling",
-            "timeline_playground_live_tracing_snapshot_state"
-        )
-        .entered();
-        (
-            logs_state()
-                .records
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone(),
-            logs_state()
-                .span_records
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone(),
-            logs_state()
-                .active_spans
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone(),
-        )
-    };
+    #[cfg(feature = "extended_observability")]
+    let _span = tracing::debug_span!(
+        target: "timeline_playground_profiling",
+        "timeline_playground_live_tracing_snapshot_state"
+    )
+    .entered();
+    let state = logs_state();
+    let records = state
+        .records
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let span_records = state
+        .span_records
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let active_spans = state
+        .active_spans
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let revision = LiveTracingSnapshotRevision {
         latest_log_id: records.back().map_or(0, |record| record.id),
         latest_span_id: span_records.back().map_or(0, |record| record.id),
         record_count: records.len(),
         span_count: span_records.len(),
         active_span_count: active_spans.len(),
-        active_span_revision: logs_state().active_span_revision.load(Ordering::Acquire),
+        active_span_revision: state.active_span_revision.load(Ordering::Acquire),
     };
     let first_log_id = records.front().map_or(0, |record| record.id);
     let first_active_span_id = active_spans.values().map(|record| record.id).min();
@@ -761,7 +755,7 @@ pub fn tracing_event_timeline_dataset() -> (Arc<TimelineDataset>, i64) {
         span_records.iter(),
         active_spans.values(),
     );
-    let mut cache = logs_state()
+    let mut cache = state
         .timeline_cache
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -892,7 +886,7 @@ pub fn tracing_event_timeline_dataset() -> (Arc<TimelineDataset>, i64) {
             dataset.clone(),
             latest_at_ns,
             active_span_item_ids,
-            active_spans,
+            active_spans.clone(),
         );
         let (dataset, latest_at_ns) = (dataset, latest_at_ns);
         return (dataset, latest_at_ns);
@@ -994,7 +988,7 @@ pub fn tracing_event_timeline_dataset() -> (Arc<TimelineDataset>, i64) {
         dataset.clone(),
         latest_at_ns,
         active_span_item_ids,
-        active_spans,
+        active_spans.clone(),
     );
     (dataset, latest_at_ns)
 }
