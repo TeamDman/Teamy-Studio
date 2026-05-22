@@ -25,7 +25,7 @@ use widestring::{U16CStr, U16CString};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
 use windows::Win32::Graphics::Dwm::{
     DWMWA_BORDER_COLOR, DWMWA_COLOR_NONE, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND,
-    DwmFlush, DwmSetWindowAttribute,
+    DwmSetWindowAttribute,
 };
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, CLEARTYPE_QUALITY, CreateFontIndirectW, DEVMODEW, DeleteObject,
@@ -55,7 +55,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, HTCAPTION, HTCLIENT,
     HTTRANSPARENT, HWND_NOTOPMOST, HWND_TOPMOST, IDC_ARROW, IDC_CROSS, IDC_HAND, IDC_HELP,
     IDC_IBEAM, IDC_SIZEALL, IDC_SIZEWE, IDC_WAIT, IsWindowVisible, IsZoomed, KillTimer,
-    LoadCursorW, MSG, MoveWindow, PostMessageW, PostQuitMessage, RegisterClassExW,
+    LoadCursorW, MSG, MWMO_INPUTAVAILABLE, MoveWindow, MsgWaitForMultipleObjectsEx, PM_REMOVE,
+    PeekMessageW, PostMessageW, PostQuitMessage, QS_ALLINPUT, RegisterClassExW,
     SM_CXPADDEDBORDER, SM_CXSCREEN, SM_CXSIZEFRAME, SM_CXVIRTUALSCREEN, SM_CYSCREEN,
     SM_CYSIZEFRAME, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SW_HIDE, SW_MAXIMIZE,
     SW_MINIMIZE, SW_RESTORE, SW_SHOW, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
@@ -64,10 +65,11 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WINDOW_STYLE, WM_APP, WM_CHAR, WM_CLOSE, WM_DESTROY, WM_DPICHANGED, WM_ENTERSIZEMOVE,
     WM_ERASEBKGND, WM_EXITSIZEMOVE, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS, WM_LBUTTONDBLCLK,
     WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
-    WM_MOVE, WM_NCCALCSIZE, WM_NCHITTEST, WM_NCLBUTTONDOWN, WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP,
-    WM_SETCURSOR, WM_SETFOCUS, WM_SIZE, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WNDCLASSEXW,
-    WS_EX_APPWINDOW, WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
-    WS_EX_TRANSPARENT, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP, WS_THICKFRAME, WS_VISIBLE,
+    WM_MOVE, WM_NCCALCSIZE, WM_NCHITTEST, WM_NCLBUTTONDOWN, WM_PAINT, WM_QUIT, WM_RBUTTONDOWN,
+    WM_RBUTTONUP, WM_SETCURSOR, WM_SETFOCUS, WM_SIZE, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER,
+    WNDCLASSEXW, WS_EX_APPWINDOW, WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW,
+    WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP, WS_THICKFRAME,
+    WS_VISIBLE,
 };
 use windows::core::{BOOL, PCWSTR, w};
 
@@ -2873,6 +2875,82 @@ fn dispatch_message(message: &MSG) {
     unsafe { DispatchMessageW(&raw const *message) };
 }
 
+fn dispatch_thread_message(message: &MSG) {
+    translate_message(message);
+    dispatch_message(message);
+}
+
+fn dispatch_pending_thread_messages() -> eyre::Result<bool> {
+    loop {
+        let mut message = MSG::default();
+        let has_message = {
+            // Safety: `message` is a valid out-pointer for PeekMessageW on this UI thread.
+            unsafe { PeekMessageW(&raw mut message, None, 0, 0, PM_REMOVE) }
+        }
+        .as_bool();
+        if !has_message {
+            return Ok(false);
+        }
+        if message.message == WM_QUIT {
+            return Ok(true);
+        }
+
+        dispatch_thread_message(&message);
+    }
+}
+
+fn scene_immediate_focused_render_wait_ms() -> Option<u32> {
+    SCENE_APP_STATE.with(|state| {
+        state.borrow().as_ref().and_then(|state| {
+            scene_should_use_immediate_focused_render_driver(state)
+                .then_some(scene_focused_render_tick_interval_ms(state).max(1))
+        })
+    })
+}
+
+fn scene_message_loop(hwnd: WindowHandle) -> eyre::Result<()> {
+    loop {
+        if let Some(wait_ms) = scene_immediate_focused_render_wait_ms() {
+            let status = {
+                #[cfg(feature = "extended_observability")]
+                let _span = debug_span!("wait_for_window_message").entered();
+                // Safety: waiting on this UI thread's message queue is valid.
+                unsafe { MsgWaitForMultipleObjectsEx(None, wait_ms, QS_ALLINPUT, MWMO_INPUTAVAILABLE) }
+            };
+            if status.0 == 0xFFFF_FFFF {
+                eyre::bail!("failed to wait for next scene message")
+            }
+            if status.0 == 258 {
+                handle_scene_focused_render_tick(hwnd, false);
+                continue;
+            }
+            if status.0 != 0 {
+                eyre::bail!("unexpected scene wait status: {}", status.0)
+            }
+            if dispatch_pending_thread_messages()? {
+                return Ok(());
+            }
+            continue;
+        }
+
+        let mut message = MSG::default();
+        let status = {
+            #[cfg(feature = "extended_observability")]
+            let _span = debug_span!("wait_for_window_message").entered();
+            // Safety: `message` is a valid out-pointer for GetMessageW on this UI thread.
+            unsafe { GetMessageW(&raw mut message, None, 0, 0) }
+        };
+        if status.0 == -1 {
+            eyre::bail!("failed to get next scene window message")
+        }
+        if status.0 == 0 {
+            return Ok(());
+        }
+
+        dispatch_thread_message(&message);
+    }
+}
+
 /// Launch the Teamy Studio terminal window and block until it closes.
 /// behavior[impl window.startup.centered]
 /// behavior[impl window.startup.size]
@@ -3236,7 +3314,7 @@ fn run_scene_window(
         scene_kind = scene_kind.title(),
     )
     .entered();
-    message_loop()
+    scene_message_loop(hwnd)
 }
 
 fn timeline_document_handle(state: &SceneAppState) -> Option<&TimelineDocument> {
@@ -4477,8 +4555,7 @@ fn message_loop() -> eyre::Result<()> {
             return Ok(());
         }
 
-        translate_message(&message);
-        dispatch_message(&message);
+        dispatch_thread_message(&message);
     }
 }
 
@@ -4725,17 +4802,15 @@ fn handle_scene_focused_render_wake(hwnd: WindowHandle) -> LRESULT {
     handle_scene_focused_render_tick(hwnd, true)
 }
 
-fn scene_should_force_redraw_on_focused_tick(
-    state: &SceneAppState,
-    from_wake: bool,
-) -> bool {
-    (from_wake && scene_prefers_immediate_focused_render_loop(state))
-        || scene_uses_refresh_timer_for_playground_animation(state)
+fn scene_should_force_redraw_on_focused_tick(state: &SceneAppState) -> bool {
+    scene_uses_refresh_timer_for_playground_animation(state)
+        || (scene_requires_force_redraw_for_immediate_focused_render_loop(state)
+            && scene_should_use_immediate_focused_render_driver(state))
 }
 
 fn scene_should_block_on_force_redraw(state: &SceneAppState, force_redraw: bool) -> bool {
     force_redraw
-        && (scene_prefers_immediate_focused_render_loop(state)
+        && (scene_requires_force_redraw_for_immediate_focused_render_loop(state)
             || scene_uses_refresh_timer_for_playground_animation(state))
 }
 
@@ -4749,6 +4824,21 @@ fn scene_uses_refresh_timer_for_playground_animation(state: &SceneAppState) -> b
 fn scene_allows_unfocused_focused_render_tick(state: &SceneAppState) -> bool {
     scene_prefers_immediate_focused_render_loop(state)
         || scene_uses_refresh_timer_for_playground_animation(state)
+}
+
+fn scene_requires_force_redraw_for_immediate_focused_render_loop(state: &SceneAppState) -> bool {
+    state.timeline_zoom_animation.is_some()
+        || state.scene_kind == SceneWindowKind::CursorLatencyPlayground
+}
+
+fn scene_live_playground_prefers_immediate_focused_render_loop(state: &SceneAppState) -> bool {
+    state.scene_kind == SceneWindowKind::TimelinePlayground
+        && state.timeline_playground.as_ref().is_some_and(|playground| {
+            matches!(
+                playground.source_mode,
+                TimelinePlaygroundSourceMode::LiveTracingEvents
+            ) && playground.live_tracing_follow_tail
+        })
 }
 
 fn handle_scene_focused_render_tick(hwnd: WindowHandle, from_wake: bool) -> LRESULT {
@@ -4767,28 +4857,17 @@ fn handle_scene_focused_render_tick(hwnd: WindowHandle, from_wake: bool) -> LRES
             return Ok(());
         }
 
-        let keep_live_tracing_burst_awake = scene_should_request_live_tracing_follow_up_render(state);
-        if from_wake && scene_prefers_immediate_focused_render_loop(state) {
-            // Reserve the single outstanding wake slot while we render so nested render paths
-            // cannot flood the queue with more immediate wakes.
-            state.focused_render_wake_pending = true;
-        }
+        let keep_live_tracing_burst_awake =
+            scene_should_request_live_tracing_follow_up_render(state);
         render_scene_window_frame(
             state,
             hwnd,
             None,
-            scene_should_force_redraw_on_focused_tick(state, from_wake),
+            scene_should_force_redraw_on_focused_tick(state),
         )?;
-        if from_wake && scene_prefers_immediate_focused_render_loop(state) {
-            pace_scene_immediate_focused_render_loop();
-            state.focused_render_wake_pending = false;
-            if scene_needs_focused_timer_render(state) {
-                post_scene_focused_render_wake(state, hwnd);
-            }
-        }
         if keep_live_tracing_burst_awake
             && state.window_focused
-            && !scene_prefers_immediate_focused_render_loop(state)
+            && !scene_should_use_immediate_focused_render_driver(state)
         {
             post_scene_focused_render_wake(state, hwnd);
         }
@@ -4804,15 +4883,19 @@ fn scene_prefers_immediate_focused_render_loop(state: &SceneAppState) -> bool {
         return false;
     }
 
-    if state.timeline_zoom_animation.is_some() {
+    if state.latency_overlay.is_visible() {
         return true;
     }
 
-    if state.scene_kind == SceneWindowKind::CursorLatencyPlayground {
+    if scene_requires_force_redraw_for_immediate_focused_render_loop(state) {
         return true;
     }
 
-    false
+    scene_live_playground_prefers_immediate_focused_render_loop(state)
+}
+
+fn scene_should_use_immediate_focused_render_driver(state: &SceneAppState) -> bool {
+    scene_prefers_immediate_focused_render_loop(state) && scene_needs_focused_timer_render(state)
 }
 
 fn scene_should_request_live_tracing_follow_up_render(state: &SceneAppState) -> bool {
@@ -4853,7 +4936,7 @@ fn scene_needs_focused_timer_render(state: &SceneAppState) -> bool {
         return true;
     }
 
-    if scene_prefers_immediate_focused_render_loop(state) {
+    if scene_requires_force_redraw_for_immediate_focused_render_loop(state) {
         return true;
     }
 
@@ -4976,7 +5059,6 @@ fn handle_scene_key_down_message(
         }
 
         if alt_key_is_down() && virtual_key == u32::from(b'X') {
-            // audio[impl gui.diagnostics-toggle]
             scene_toggle_diagnostics_panel(state);
             render_scene_window_frame(state, hwnd, None, false)?;
             return Ok(SceneKeyAction::Handled);
@@ -8847,11 +8929,6 @@ fn render_scene_window_frame(
     }
 
     refresh_scene_focused_render_driver(state, hwnd)?;
-    if scene_prefers_immediate_focused_render_loop(state)
-        && scene_needs_focused_timer_render(state)
-    {
-        post_scene_focused_render_wake(state, hwnd);
-    }
 
     Ok(())
 }
@@ -10800,10 +10877,7 @@ fn open_timeline_transcription_settings_window_from_scene(track_index: usize) ->
                     ..Default::default()
                 },
             ) {
-                error!(
-                    ?error,
-                    "failed to open timeline transcription settings window"
-                );
+                error!(?error, "failed to open timeline transcription settings window");
             }
         })
         .wrap_err("failed to spawn Teamy Studio timeline transcription settings window thread")?;
@@ -12938,7 +13012,7 @@ fn refresh_scene_focused_render_driver(
     state: &mut SceneAppState,
     hwnd: WindowHandle,
 ) -> eyre::Result<()> {
-    if scene_prefers_immediate_focused_render_loop(state) {
+    if scene_should_use_immediate_focused_render_driver(state) {
         state.focused_render_wake_pending = false;
         hwnd.clear_focused_render_timer();
         return Ok(());
@@ -12966,11 +13040,6 @@ fn post_scene_focused_render_wake(state: &mut SceneAppState, hwnd: WindowHandle)
             LPARAM(0),
         )
     };
-}
-
-fn pace_scene_immediate_focused_render_loop() {
-    // Safety: DwmFlush is a read-only compositor pacing hint for the current UI thread.
-    let _ = unsafe { DwmFlush() };
 }
 
 fn focused_render_interval_ms_for_refresh_hz(refresh_hz: u32) -> u32 {
@@ -16806,7 +16875,7 @@ mod tests {
     }
 
     #[test]
-    fn focused_wake_forces_redraw_for_active_playground_animation() {
+    fn active_playground_animation_forces_redraw_on_focused_tick() {
         let mut state = timeline_test_state(TimelineDocument::blank());
         state.scene_kind = SceneWindowKind::TimelinePlayground;
         let mut playground = TimelinePlaygroundState::new().expect("playground");
@@ -16819,8 +16888,7 @@ mod tests {
         });
         state.timeline_playground = Some(playground);
 
-        assert!(scene_should_force_redraw_on_focused_tick(&state, true));
-        assert!(!scene_should_force_redraw_on_focused_tick(&state, false));
+        assert!(scene_should_force_redraw_on_focused_tick(&state));
     }
 
     #[test]
@@ -16903,12 +16971,14 @@ mod tests {
     }
 
     #[test]
-    fn focused_timer_does_not_use_immediate_wake_loop_for_latency_overlay() {
+    fn focused_render_driver_uses_immediate_loop_for_latency_overlay() {
         let mut state = timeline_test_state(TimelineDocument::blank());
         state.scene_kind = SceneWindowKind::Launcher;
         state.latency_overlay.visible = true;
 
-        assert!(!scene_prefers_immediate_focused_render_loop(&state));
+        assert!(scene_prefers_immediate_focused_render_loop(&state));
+        assert!(scene_should_use_immediate_focused_render_driver(&state));
+        assert!(!scene_should_force_redraw_on_focused_tick(&state));
     }
 
     #[test]
@@ -16948,6 +17018,25 @@ mod tests {
     }
 
     #[test]
+    fn idle_live_playground_keeps_timer_polling_until_work_arrives() {
+        let _guard = TIMELINE_LOGS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        logs::clear_logs();
+        let mut state = timeline_test_state(TimelineDocument::blank());
+        state.scene_kind = SceneWindowKind::TimelinePlayground;
+        state.window_focused = true;
+        let mut playground = TimelinePlaygroundState::new().expect("playground");
+        playground.source_mode = TimelinePlaygroundSourceMode::LiveTracingEvents;
+        playground.live_tracing_follow_tail = true;
+        playground.live_tracing_snapshot_revision = Some(logs::live_tracing_snapshot_revision());
+        state.timeline_playground = Some(playground);
+
+        assert!(scene_live_playground_prefers_immediate_focused_render_loop(&state));
+        assert!(!scene_should_use_immediate_focused_render_driver(&state));
+    }
+
+    #[test]
     fn focused_timer_renders_live_playground_after_new_records_arrive() {
         let _guard = TIMELINE_LOGS_TEST_LOCK
             .lock()
@@ -16966,6 +17055,8 @@ mod tests {
         tracing::subscriber::with_default(subscriber, || tracing::info!("new live record"));
 
         assert!(scene_needs_focused_timer_render(&state));
+        assert!(scene_should_use_immediate_focused_render_driver(&state));
+        assert!(!scene_should_force_redraw_on_focused_tick(&state));
     }
 
     #[test]
@@ -16990,6 +17081,8 @@ mod tests {
             state.timeline_playground = Some(playground);
 
             assert!(scene_needs_focused_timer_render(&state));
+            assert!(scene_should_use_immediate_focused_render_driver(&state));
+            assert!(!scene_should_force_redraw_on_focused_tick(&state));
         });
     }
 
