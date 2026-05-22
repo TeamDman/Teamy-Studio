@@ -4728,11 +4728,26 @@ fn scene_should_force_redraw_on_focused_tick(
     state: &SceneAppState,
     from_wake: bool,
 ) -> bool {
-    from_wake && scene_prefers_immediate_focused_render_loop(state)
+    (from_wake && scene_prefers_immediate_focused_render_loop(state))
+        || scene_uses_refresh_timer_for_playground_animation(state)
 }
 
 fn scene_should_block_on_force_redraw(state: &SceneAppState, force_redraw: bool) -> bool {
-    force_redraw && scene_prefers_immediate_focused_render_loop(state)
+    force_redraw
+        && (scene_prefers_immediate_focused_render_loop(state)
+            || scene_uses_refresh_timer_for_playground_animation(state))
+}
+
+fn scene_uses_refresh_timer_for_playground_animation(state: &SceneAppState) -> bool {
+    state.scene_kind == SceneWindowKind::TimelinePlayground
+        && state.timeline_playground.as_ref().is_some_and(|playground| {
+            playground.zoom_animation.is_some() || playground.row_position_animation.is_some()
+        })
+}
+
+fn scene_allows_unfocused_focused_render_tick(state: &SceneAppState) -> bool {
+    scene_prefers_immediate_focused_render_loop(state)
+        || scene_uses_refresh_timer_for_playground_animation(state)
 }
 
 fn handle_scene_focused_render_tick(hwnd: WindowHandle, from_wake: bool) -> LRESULT {
@@ -4741,7 +4756,7 @@ fn handle_scene_focused_render_tick(hwnd: WindowHandle, from_wake: bool) -> LRES
             state.focused_render_wake_pending = false;
         }
 
-        if !state.window_focused && !scene_prefers_immediate_focused_render_loop(state) {
+        if !state.window_focused && !scene_allows_unfocused_focused_render_tick(state) {
             return Ok(());
         }
 
@@ -4784,6 +4799,10 @@ fn handle_scene_focused_render_tick(hwnd: WindowHandle, from_wake: bool) -> LRES
 }
 
 fn scene_prefers_immediate_focused_render_loop(state: &SceneAppState) -> bool {
+    if scene_uses_refresh_timer_for_playground_animation(state) {
+        return false;
+    }
+
     if state.timeline_zoom_animation.is_some() {
         return true;
     }
@@ -4792,10 +4811,7 @@ fn scene_prefers_immediate_focused_render_loop(state: &SceneAppState) -> bool {
         return true;
     }
 
-    state.scene_kind == SceneWindowKind::TimelinePlayground
-        && state.timeline_playground.as_ref().is_some_and(|playground| {
-            playground.zoom_animation.is_some() || playground.row_position_animation.is_some()
-        })
+    false
 }
 
 fn scene_should_request_live_tracing_follow_up_render(state: &SceneAppState) -> bool {
@@ -12913,18 +12929,20 @@ fn refresh_scene_focused_render_interval(
 }
 
 fn refresh_scene_focused_render_driver(
-    state: &SceneAppState,
+    state: &mut SceneAppState,
     hwnd: WindowHandle,
 ) -> eyre::Result<()> {
     if scene_prefers_immediate_focused_render_loop(state) {
+        state.focused_render_wake_pending = false;
         hwnd.clear_focused_render_timer();
         return Ok(());
     }
 
-    if !state.window_focused {
+    if !state.window_focused && !scene_uses_refresh_timer_for_playground_animation(state) {
         return Ok(());
     }
 
+    state.focused_render_wake_pending = false;
     hwnd.set_focused_render_timer(scene_focused_render_tick_interval_ms(state))
 }
 
@@ -16743,6 +16761,42 @@ mod tests {
         state.timeline_playground = Some(playground);
 
         assert!(scene_needs_focused_timer_render(&state));
+    }
+
+    #[test]
+    fn playground_animation_uses_refresh_timer_driver_instead_of_immediate_wake_loop() {
+        let mut state = timeline_test_state(TimelineDocument::blank());
+        state.scene_kind = SceneWindowKind::TimelinePlayground;
+        let mut playground = TimelinePlaygroundState::new().expect("playground");
+        playground.zoom_animation = Some(TimelinePlaygroundZoomAnimation {
+            start_visible_start_ns: 0,
+            start_visible_end_ns: 1_000,
+            target_visible_start_ns: 250,
+            target_visible_end_ns: 750,
+            started_at: Instant::now(),
+        });
+        state.timeline_playground = Some(playground);
+
+        assert!(scene_uses_refresh_timer_for_playground_animation(&state));
+        assert!(!scene_prefers_immediate_focused_render_loop(&state));
+    }
+
+    #[test]
+    fn unfocused_playground_animation_still_allows_render_ticks() {
+        let mut state = timeline_test_state(TimelineDocument::blank());
+        state.scene_kind = SceneWindowKind::TimelinePlayground;
+        state.window_focused = false;
+        let mut playground = TimelinePlaygroundState::new().expect("playground");
+        playground.zoom_animation = Some(TimelinePlaygroundZoomAnimation {
+            start_visible_start_ns: 0,
+            start_visible_end_ns: 1_000,
+            target_visible_start_ns: 250,
+            target_visible_end_ns: 750,
+            started_at: Instant::now(),
+        });
+        state.timeline_playground = Some(playground);
+
+        assert!(scene_allows_unfocused_focused_render_tick(&state));
     }
 
     #[test]
