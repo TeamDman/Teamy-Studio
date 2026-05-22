@@ -961,7 +961,8 @@ impl TimelinePlaygroundState {
             .entered();
             logs::live_tracing_snapshot_revision()
         };
-        if self.live_tracing_snapshot_revision == Some(revision) {
+        let keep_follow_tail_active = self.live_tracing_follow_tail && revision.has_active_spans();
+        if self.live_tracing_snapshot_revision == Some(revision) && !keep_follow_tail_active {
             return;
         }
         let now = Instant::now();
@@ -4861,8 +4862,13 @@ fn scene_needs_focused_timer_render(state: &SceneAppState) -> bool {
     {
         let live_delta =
             logs::live_tracing_snapshot_delta_since(playground.live_tracing_snapshot_revision);
+        let live_active_spans_need_refresh = playground.live_tracing_follow_tail
+            && playground
+                .live_tracing_snapshot_revision
+                .is_some_and(|revision| revision.has_active_spans());
         return playground.zoom_animation.is_some()
             || playground.row_position_animation.is_some()
+            || live_active_spans_need_refresh
             || (playground.live_tracing_follow_tail
                 && match live_delta {
                     logs::LiveTracingSnapshotDelta::None => false,
@@ -16963,6 +16969,31 @@ mod tests {
     }
 
     #[test]
+    fn focused_timer_renders_live_playground_for_unchanged_active_spans() {
+        let _guard = TIMELINE_LOGS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        logs::clear_logs();
+        let subscriber = tracing_subscriber::Registry::default().with(logs::LogCollectorLayer);
+
+        tracing::subscriber::with_default(subscriber, || {
+            let span = tracing::info_span!("active live span");
+            let _entered = span.enter();
+
+            let mut state = timeline_test_state(TimelineDocument::blank());
+            state.scene_kind = SceneWindowKind::TimelinePlayground;
+            state.window_focused = true;
+            let mut playground = TimelinePlaygroundState::new().expect("playground");
+            playground.source_mode = TimelinePlaygroundSourceMode::LiveTracingEvents;
+            playground.live_tracing_follow_tail = true;
+            playground.live_tracing_snapshot_revision = Some(logs::live_tracing_snapshot_revision());
+            state.timeline_playground = Some(playground);
+
+            assert!(scene_needs_focused_timer_render(&state));
+        });
+    }
+
+    #[test]
     fn focused_timer_skips_live_playground_for_recent_frame_mark_only_updates() {
         let _guard = TIMELINE_LOGS_TEST_LOCK
             .lock()
@@ -17032,6 +17063,36 @@ mod tests {
         tracing::subscriber::with_default(subscriber, || tracing::info!("new live record"));
 
         assert!(!scene_should_request_live_tracing_follow_up_render(&state));
+    }
+
+    #[test]
+    fn live_sync_refreshes_unchanged_active_spans_while_following_tail() {
+        let _guard = TIMELINE_LOGS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        logs::clear_logs();
+        let subscriber = tracing_subscriber::Registry::default().with(logs::LogCollectorLayer);
+
+        tracing::subscriber::with_default(subscriber, || {
+            let span = tracing::info_span!("active live span");
+            let _entered = span.enter();
+
+            let mut playground = TimelinePlaygroundState::new().expect("playground");
+            playground.source_mode = TimelinePlaygroundSourceMode::LiveTracingEvents;
+            playground.live_tracing_follow_tail = true;
+            playground.sync_live_tracing_events();
+
+            let revision = playground.live_tracing_snapshot_revision;
+            let previous_sync = Instant::now() - TIMELINE_PLAYGROUND_LIVE_SYNC_MIN_INTERVAL;
+            playground.last_live_tracing_sync_at = Some(previous_sync);
+
+            playground.sync_live_tracing_events();
+
+            assert_eq!(playground.live_tracing_snapshot_revision, revision);
+            assert!(playground
+                .last_live_tracing_sync_at
+                .is_some_and(|last| last > previous_sync));
+        });
     }
 
     #[test]

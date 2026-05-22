@@ -461,18 +461,30 @@ fn build_rows(
 fn build_render_items(
     dataset: &TimelineDataset,
     query: &TimelineViewportQuery,
-    mut candidates: Vec<TimelineRenderCandidate>,
+    candidates: Vec<TimelineRenderCandidate>,
     row_ids: &BTreeMap<TimelineCandidateRowKey, TimelineRenderRowId>,
 ) -> Vec<TimelineRenderItem> {
-    {
+    let candidates = {
         #[cfg(feature = "extended_observability")]
         let _span = debug_span!(
             target: "timeline_playground_profiling",
             "timeline_playground_render_plan_sort_candidates"
         )
         .entered();
-        candidates.sort_by_key(|candidate| candidate_sort_key(candidate, row_ids));
-    }
+        let mut candidates = candidates
+            .into_iter()
+            .map(|candidate| {
+                let row_id = row_ids[&candidate.row_key];
+                let at = match candidate.kind {
+                    TimelineCandidateKind::Span { range, .. } => range.start(),
+                    TimelineCandidateKind::Event { at } => at,
+                };
+                (row_id, at, candidate.item_id, candidate)
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_unstable_by_key(|(row_id, at, item_id, _)| (*row_id, *at, *item_id));
+        candidates
+    };
     let mut render_items = Vec::new();
     let mut folded_spans: Vec<(TimelineItemId, TimelineRenderRowId, TimelineRangeNs)> = Vec::new();
     let mut folded_events = Vec::new();
@@ -485,8 +497,7 @@ fn build_render_items(
             "timeline_playground_render_plan_fold_items"
         )
         .entered();
-        for candidate in candidates {
-            let row_id = row_ids[&candidate.row_key];
+        for (row_id, _, _, candidate) in candidates {
             match candidate.kind {
                 TimelineCandidateKind::Span { range, is_open } => {
                     if projected_width_pixels(range, query)
@@ -712,17 +723,6 @@ fn event_cluster_max_width_pixels(query: &TimelineViewportQuery) -> f64 {
     // Keep folded event markers local so one dense chain does not collapse into a single
     // indicator across a broad visible band.
     f64::from(query.minimum_visible_pixels().max(4).saturating_mul(4))
-}
-
-fn candidate_sort_key(
-    candidate: &TimelineRenderCandidate,
-    row_ids: &BTreeMap<TimelineCandidateRowKey, TimelineRenderRowId>,
-) -> (TimelineRenderRowId, TimelineInstantNs, TimelineItemId) {
-    let at = match candidate.kind {
-        TimelineCandidateKind::Span { range, .. } => range.start(),
-        TimelineCandidateKind::Event { at } => at,
-    };
-    (row_ids[&candidate.row_key], at, candidate.item_id)
 }
 
 fn span_lane_index(

@@ -203,6 +203,13 @@ pub struct LiveTracingSnapshotRevision {
     active_span_revision: u64,
 }
 
+impl LiveTracingSnapshotRevision {
+    #[must_use]
+    pub const fn has_active_spans(self) -> bool {
+        self.active_span_count > 0
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LiveTracingSnapshotDelta {
     None,
