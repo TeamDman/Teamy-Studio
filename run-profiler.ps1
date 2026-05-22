@@ -60,6 +60,30 @@ function Wait-ForTracyCaptureReady {
 	throw "Timed out waiting $(Format-Elapsed $Timeout) for tracy-capture to start for $CapturePath"
 }
 
+function Wait-ForTracyCaptureExit {
+	param(
+		[Parameter(Mandatory = $true)]
+		[string]$CapturePath,
+		[Parameter(Mandatory = $true)]
+		[TimeSpan]$Timeout
+	)
+
+	$waitStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+	$deadline = (Get-Date).Add($Timeout)
+	do {
+		$processes = @(Get-TracyCaptureProcesses -CapturePath $CapturePath)
+		if ($processes.Count -eq 0) {
+			$waitStopwatch.Stop()
+			return $waitStopwatch.Elapsed
+		}
+
+		Start-Sleep -Milliseconds 250
+	} while ((Get-Date) -lt $deadline)
+
+	$waitStopwatch.Stop()
+	return $null
+}
+
 function Stop-TracyCaptureGracefully {
 	param(
 		[Parameter(Mandatory = $true)]
@@ -128,6 +152,7 @@ $profilerElapsed = $null
 $captureShutdownElapsed = [TimeSpan]::Zero
 $captureFlushDelay = [TimeSpan]::FromSeconds(1)
 $captureStartupTimeout = [TimeSpan]::FromSeconds(10)
+$captureExitTimeout = [TimeSpan]::FromMinutes(2)
 
 $captureDir = Join-Path $PSScriptRoot "tracy"
 if (-not (Test-Path $captureDir)) {
@@ -199,9 +224,16 @@ finally {
 		Set-Item -Path "Env:$tracyLayerEnvVar" -Value $previousTracyLayerSetting
 	}
 	$cleanupStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
-	Write-Host "Waiting $(Format-Elapsed $captureFlushDelay) before closing tracy-capture"
+	Write-Host "Waiting $(Format-Elapsed $captureFlushDelay) before watching tracy-capture shutdown"
 	Start-Sleep -Milliseconds ([int]$captureFlushDelay.TotalMilliseconds)
-	$captureShutdownElapsed = Stop-TracyCaptureGracefully -CapturePath $capturePath
+	$naturalCaptureShutdownElapsed = Wait-ForTracyCaptureExit -CapturePath $capturePath -Timeout $captureExitTimeout
+	if ($null -ne $naturalCaptureShutdownElapsed) {
+		$captureShutdownElapsed = $naturalCaptureShutdownElapsed
+		Write-Host "tracy-capture exited after the client disconnected"
+	} else {
+		Write-Warning "Timed out waiting $(Format-Elapsed $captureExitTimeout) for tracy-capture to finish saving; forcing shutdown"
+		$captureShutdownElapsed = Stop-TracyCaptureGracefully -CapturePath $capturePath
+	}
 	$cleanupStopwatch.Stop()
 	$cleanupElapsed = $cleanupStopwatch.Elapsed
 	Write-Host "Capture cleanup time: $(Format-Elapsed $cleanupElapsed)"

@@ -25,9 +25,6 @@ Because of that:
 - If a seam is ugly, move it intact first.
 - If a change is not required for the active extraction, leave it alone.
 
-## Extraction Strategy
-
-- When preparing a release profiling workflow or handing off to [run-profiler.ps1](run-profiler.ps1) with `-Release`, warm the same artifacts with `cargo build --profile profiling` so the profiler wrapper does not pay a fresh build after test-only validation. The wrapper defaults to debug profiling when `-Release` is not passed.
 
 ## First-Class Priorities
 

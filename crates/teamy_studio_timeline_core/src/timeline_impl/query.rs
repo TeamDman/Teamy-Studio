@@ -318,6 +318,12 @@ struct TimelineRenderCandidate {
     kind: TimelineCandidateKind,
 }
 
+#[derive(Clone, Debug, Default)]
+struct TimelineRowCandidateBuckets {
+    spans: Vec<TimelineRenderCandidate>,
+    events: Vec<TimelineRenderCandidate>,
+}
+
 impl TimelineDataset {
     #[must_use]
     // timeline[impl display.query-explicit-now]
@@ -325,11 +331,28 @@ impl TimelineDataset {
     // timeline[impl display.query-render-items]
     // timeline[impl display.query-folding]
     pub fn render_plan(&self, query: &TimelineViewportQuery) -> TimelineRenderPlan {
-        let mut candidates = Vec::new();
-        self.collect_visible_spans(query, &mut candidates);
-        self.collect_visible_events(query, &mut candidates);
+        let candidates = {
+            #[cfg(feature = "extended_observability")]
+            let _span = debug_span!(
+                target: "timeline_playground_profiling",
+                "timeline_playground_render_plan_collect_candidates"
+            )
+            .entered();
+            let mut candidates = Vec::new();
+            self.collect_visible_spans(query, &mut candidates);
+            self.collect_visible_events(query, &mut candidates);
+            candidates
+        };
 
-        let (rows, row_ids) = build_rows(self, &candidates);
+        let (rows, row_ids) = {
+            #[cfg(feature = "extended_observability")]
+            let _span = debug_span!(
+                target: "timeline_playground_profiling",
+                "timeline_playground_render_plan_build_rows"
+            )
+            .entered();
+            build_rows(self, &candidates)
+        };
         let items = build_render_items(self, query, candidates, &row_ids);
 
         TimelineRenderPlan {
@@ -471,19 +494,27 @@ fn build_render_items(
             "timeline_playground_render_plan_sort_candidates"
         )
         .entered();
-        let mut row_candidates = vec![Vec::new(); row_ids.len()];
-        for candidate in candidates {
-            let row_id = row_ids[&candidate.row_key];
-            let at = match candidate.kind {
-                TimelineCandidateKind::Span { range, .. } => range.start(),
-                TimelineCandidateKind::Event { at } => at,
-            };
-            let row_index =
-                usize::try_from(row_id.0).expect("render row ids always fit in usize indices");
-            row_candidates[row_index].push((at, candidate.item_id, candidate));
-        }
-        for candidates in &mut row_candidates {
-            candidates.sort_unstable_by_key(|(at, item_id, _)| (*at, *item_id));
+        let mut row_candidates = vec![TimelineRowCandidateBuckets::default(); row_ids.len()];
+        {
+            #[cfg(feature = "extended_observability")]
+            let _span = debug_span!(
+                target: "timeline_playground_profiling",
+                "timeline_playground_render_plan_bucket_candidates"
+            )
+            .entered();
+            for candidate in candidates {
+                let row_id = row_ids[&candidate.row_key];
+                let row_index = usize::try_from(row_id.0)
+                    .expect("render row ids always fit in usize indices");
+                match candidate.kind {
+                    TimelineCandidateKind::Span { .. } => {
+                        row_candidates[row_index].spans.push(candidate);
+                    }
+                    TimelineCandidateKind::Event { .. } => {
+                        row_candidates[row_index].events.push(candidate);
+                    }
+                }
+            }
         }
         row_candidates
     };
@@ -501,7 +532,20 @@ fn build_render_items(
         .entered();
         for (row_index, candidates) in row_candidates.into_iter().enumerate() {
             let row_id = TimelineRenderRowId(u32::try_from(row_index).unwrap_or(u32::MAX));
-            for (_, _, candidate) in candidates {
+            let mut spans = candidates.spans.into_iter().peekable();
+            let mut events = candidates.events.into_iter().peekable();
+            while spans.peek().is_some() || events.peek().is_some() {
+                let take_span = match (spans.peek(), events.peek()) {
+                    (Some(span), Some(event)) => candidate_sort_key(span) <= candidate_sort_key(event),
+                    (Some(_), None) => true,
+                    (None, Some(_)) => false,
+                    (None, None) => break,
+                };
+                let candidate = if take_span {
+                    spans.next().expect("peeked span candidate must be present")
+                } else {
+                    events.next().expect("peeked event candidate must be present")
+                };
                 match candidate.kind {
                     TimelineCandidateKind::Span { range, is_open } => {
                         if projected_width_pixels(range, query)
@@ -548,11 +592,25 @@ fn build_render_items(
     render_items
 }
 
+fn candidate_sort_key(candidate: &TimelineRenderCandidate) -> (TimelineInstantNs, TimelineItemId) {
+    let at = match candidate.kind {
+        TimelineCandidateKind::Span { range, .. } => range.start(),
+        TimelineCandidateKind::Event { at } => at,
+    };
+    (at, candidate.item_id)
+}
+
 fn flush_span_cluster(
     dataset: &TimelineDataset,
     folded_spans: &mut Vec<(TimelineItemId, TimelineRenderRowId, TimelineRangeNs)>,
     render_items: &mut Vec<TimelineRenderItem>,
 ) {
+    #[cfg(feature = "extended_observability")]
+    let _span = debug_span!(
+        target: "timeline_playground_profiling",
+        "timeline_playground_render_plan_flush_span_cluster"
+    )
+    .entered();
     if folded_spans.is_empty() {
         return;
     }
@@ -602,6 +660,12 @@ fn flush_event_cluster(
     folded_events: &mut Vec<(TimelineItemId, TimelineRenderRowId, TimelineInstantNs)>,
     render_items: &mut Vec<TimelineRenderItem>,
 ) {
+    #[cfg(feature = "extended_observability")]
+    let _span = debug_span!(
+        target: "timeline_playground_profiling",
+        "timeline_playground_render_plan_flush_event_cluster"
+    )
+    .entered();
     if folded_events.is_empty() {
         return;
     }
