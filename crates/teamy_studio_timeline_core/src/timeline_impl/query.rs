@@ -314,7 +314,6 @@ enum TimelineCandidateRowKey {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct TimelineRenderCandidate {
     item_id: TimelineItemId,
-    row_key: TimelineCandidateRowKey,
     kind: TimelineCandidateKind,
 }
 
@@ -331,29 +330,37 @@ impl TimelineDataset {
     // timeline[impl display.query-render-items]
     // timeline[impl display.query-folding]
     pub fn render_plan(&self, query: &TimelineViewportQuery) -> TimelineRenderPlan {
-        let candidates = {
+        let row_candidates = {
             #[cfg(feature = "extended_observability")]
             let _span = debug_span!(
                 target: "timeline_playground_profiling",
                 "timeline_playground_render_plan_collect_candidates"
             )
             .entered();
-            let mut candidates = Vec::new();
-            self.collect_visible_spans(query, &mut candidates);
-            self.collect_visible_events(query, &mut candidates);
-            candidates
+            let mut row_candidates = HashMap::new();
+            {
+                #[cfg(feature = "extended_observability")]
+                let _span = debug_span!(
+                    target: "timeline_playground_profiling",
+                    "timeline_playground_render_plan_bucket_candidates"
+                )
+                .entered();
+                self.collect_visible_spans(query, &mut row_candidates);
+                self.collect_visible_events(query, &mut row_candidates);
+            }
+            row_candidates
         };
 
-        let (rows, row_ids) = {
+        let (rows, row_candidates) = {
             #[cfg(feature = "extended_observability")]
             let _span = debug_span!(
                 target: "timeline_playground_profiling",
                 "timeline_playground_render_plan_build_rows"
             )
             .entered();
-            build_rows(self, &candidates)
+            build_rows(self, row_candidates)
         };
-        let items = build_render_items(self, query, candidates, &row_ids);
+        let items = build_render_items(self, query, row_candidates);
 
         TimelineRenderPlan {
             dataset_revision: self.revision(),
@@ -367,7 +374,7 @@ impl TimelineDataset {
     fn collect_visible_spans(
         &self,
         query: &TimelineViewportQuery,
-        candidates: &mut Vec<TimelineRenderCandidate>,
+        row_candidates: &mut HashMap<TimelineCandidateRowKey, TimelineRowCandidateBuckets>,
     ) {
         let visible_start = query.visible_range().start();
         let visible_end = query.visible_range().end();
@@ -396,9 +403,12 @@ impl TimelineDataset {
             let Ok(range) = TimelineRangeNs::try_new(span.start(), end) else {
                 continue;
             };
-            candidates.push(TimelineRenderCandidate {
+            row_candidates
+                .entry(row_key_for_item(item, query.grouping_mode()))
+                .or_default()
+                .spans
+                .push(TimelineRenderCandidate {
                 item_id: *item_id,
-                row_key: row_key_for_item(item, query.grouping_mode()),
                 kind: TimelineCandidateKind::Span {
                     range,
                     is_open: span.is_open(),
@@ -410,7 +420,7 @@ impl TimelineDataset {
     fn collect_visible_events(
         &self,
         query: &TimelineViewportQuery,
-        candidates: &mut Vec<TimelineRenderCandidate>,
+        row_candidates: &mut HashMap<TimelineCandidateRowKey, TimelineRowCandidateBuckets>,
     ) {
         let visible_start = query.visible_range().start();
         let visible_end = query.visible_range().end();
@@ -441,9 +451,12 @@ impl TimelineDataset {
             let TimelineItemKind::Event(event) = item.kind() else {
                 continue;
             };
-            candidates.push(TimelineRenderCandidate {
+            row_candidates
+                .entry(row_key_for_item(item, query.grouping_mode()))
+                .or_default()
+                .events
+                .push(TimelineRenderCandidate {
                 item_id: *item_id,
-                row_key: row_key_for_item(item, query.grouping_mode()),
                 kind: TimelineCandidateKind::Event { at: event.at() },
             });
         }
@@ -452,25 +465,23 @@ impl TimelineDataset {
 
 fn build_rows(
     dataset: &TimelineDataset,
-    candidates: &[TimelineRenderCandidate],
-) -> (
-    Vec<TimelineRenderRow>,
-    HashMap<TimelineCandidateRowKey, TimelineRenderRowId>,
-) {
-    let mut row_keys = candidates
-        .iter()
-        .map(|candidate| candidate.row_key)
-        .collect::<Vec<_>>();
+    row_candidates: HashMap<TimelineCandidateRowKey, TimelineRowCandidateBuckets>,
+) -> (Vec<TimelineRenderRow>, Vec<TimelineRowCandidateBuckets>) {
+    let mut row_keys = row_candidates.keys().copied().collect::<Vec<_>>();
     row_keys.sort_unstable_by(|left, right| row_key_sort_key(dataset, *left).cmp(&row_key_sort_key(dataset, *right)));
-    row_keys.dedup();
 
-    let mut row_ids = HashMap::with_capacity(row_keys.len());
+    let mut row_candidates = row_candidates;
+    let mut ordered_row_candidates = Vec::with_capacity(row_keys.len());
     let rows = row_keys
         .into_iter()
         .enumerate()
         .map(|(index, key)| {
             let id = TimelineRenderRowId(u32::try_from(index).unwrap_or(u32::MAX));
-            row_ids.insert(key, id);
+            ordered_row_candidates.push(
+                row_candidates
+                    .remove(&key)
+                    .expect("row candidate buckets must exist for every render row"),
+            );
             TimelineRenderRow {
                 id,
                 key: render_row_key(dataset, key),
@@ -478,46 +489,14 @@ fn build_rows(
         })
         .collect();
 
-    (rows, row_ids)
+    (rows, ordered_row_candidates)
 }
 
 fn build_render_items(
     dataset: &TimelineDataset,
     query: &TimelineViewportQuery,
-    candidates: Vec<TimelineRenderCandidate>,
-    row_ids: &HashMap<TimelineCandidateRowKey, TimelineRenderRowId>,
+    row_candidates: Vec<TimelineRowCandidateBuckets>,
 ) -> Vec<TimelineRenderItem> {
-    let row_candidates = {
-        #[cfg(feature = "extended_observability")]
-        let _span = debug_span!(
-            target: "timeline_playground_profiling",
-            "timeline_playground_render_plan_sort_candidates"
-        )
-        .entered();
-        let mut row_candidates = vec![TimelineRowCandidateBuckets::default(); row_ids.len()];
-        {
-            #[cfg(feature = "extended_observability")]
-            let _span = debug_span!(
-                target: "timeline_playground_profiling",
-                "timeline_playground_render_plan_bucket_candidates"
-            )
-            .entered();
-            for candidate in candidates {
-                let row_id = row_ids[&candidate.row_key];
-                let row_index = usize::try_from(row_id.0)
-                    .expect("render row ids always fit in usize indices");
-                match candidate.kind {
-                    TimelineCandidateKind::Span { .. } => {
-                        row_candidates[row_index].spans.push(candidate);
-                    }
-                    TimelineCandidateKind::Event { .. } => {
-                        row_candidates[row_index].events.push(candidate);
-                    }
-                }
-            }
-        }
-        row_candidates
-    };
     let mut render_items = Vec::new();
     let mut folded_spans: Vec<(TimelineItemId, TimelineRenderRowId, TimelineRangeNs)> = Vec::new();
     let mut folded_events = Vec::new();
