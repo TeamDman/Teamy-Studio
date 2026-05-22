@@ -800,11 +800,11 @@ pub fn tracing_event_timeline_dataset() -> (Arc<TimelineDataset>, i64) {
         .entered();
         let cached_record_count = cache.record_count;
         let cached_span_count = cache.span_count;
-        let mut dataset = cache.dataset.as_ref().clone();
         let mut latest_at_ns = cache.latest_at_ns.max(1);
         let mut active_span_item_ids = cache.active_span_item_ids.clone();
         let first_timestamp =
             first_timestamp.expect("append-only live tracing cache retains its first timestamp");
+        let dataset = Arc::make_mut(&mut cache.dataset);
 
         {
             #[cfg(feature = "extended_observability")]
@@ -816,7 +816,7 @@ pub fn tracing_event_timeline_dataset() -> (Arc<TimelineDataset>, i64) {
             for record in span_records.iter().skip(cached_span_count) {
                 if let Some(item_id) = active_span_item_ids.remove(&record.id) {
                     latest_at_ns = latest_at_ns.max(finish_live_tracing_active_span_timeline_item(
-                        &mut dataset,
+                        dataset,
                         item_id,
                         record,
                         first_timestamp,
@@ -824,7 +824,7 @@ pub fn tracing_event_timeline_dataset() -> (Arc<TimelineDataset>, i64) {
                     ));
                 } else {
                     latest_at_ns = latest_at_ns.max(push_live_tracing_span_timeline_item(
-                        &mut dataset,
+                        dataset,
                         record,
                         first_timestamp,
                         latest_at_ns,
@@ -842,7 +842,7 @@ pub fn tracing_event_timeline_dataset() -> (Arc<TimelineDataset>, i64) {
             .entered();
             for record in records.iter().skip(cached_record_count) {
                 latest_at_ns = latest_at_ns.max(push_live_tracing_event_timeline_item(
-                    &mut dataset,
+                    dataset,
                     record,
                     first_timestamp,
                     latest_at_ns,
@@ -864,7 +864,7 @@ pub fn tracing_event_timeline_dataset() -> (Arc<TimelineDataset>, i64) {
                     continue;
                 }
                 let (item_id, start_ns) = push_live_tracing_active_span_timeline_item(
-                    &mut dataset,
+                    dataset,
                     record,
                     first_timestamp,
                     latest_at_ns,
@@ -877,7 +877,7 @@ pub fn tracing_event_timeline_dataset() -> (Arc<TimelineDataset>, i64) {
             }
         }
         let latest_at_ns = latest_at_ns.max(1);
-        let dataset = Arc::new(dataset);
+        let dataset = cache.dataset.clone();
         cache.store(
             revision,
             first_log_id,

@@ -464,26 +464,28 @@ fn build_render_items(
     candidates: Vec<TimelineRenderCandidate>,
     row_ids: &HashMap<TimelineCandidateRowKey, TimelineRenderRowId>,
 ) -> Vec<TimelineRenderItem> {
-    let candidates = {
+    let row_candidates = {
         #[cfg(feature = "extended_observability")]
         let _span = debug_span!(
             target: "timeline_playground_profiling",
             "timeline_playground_render_plan_sort_candidates"
         )
         .entered();
-        let mut candidates = candidates
-            .into_iter()
-            .map(|candidate| {
-                let row_id = row_ids[&candidate.row_key];
-                let at = match candidate.kind {
-                    TimelineCandidateKind::Span { range, .. } => range.start(),
-                    TimelineCandidateKind::Event { at } => at,
-                };
-                (row_id, at, candidate.item_id, candidate)
-            })
-            .collect::<Vec<_>>();
-        candidates.sort_unstable_by_key(|(row_id, at, item_id, _)| (*row_id, *at, *item_id));
-        candidates
+        let mut row_candidates = vec![Vec::new(); row_ids.len()];
+        for candidate in candidates {
+            let row_id = row_ids[&candidate.row_key];
+            let at = match candidate.kind {
+                TimelineCandidateKind::Span { range, .. } => range.start(),
+                TimelineCandidateKind::Event { at } => at,
+            };
+            let row_index =
+                usize::try_from(row_id.0).expect("render row ids always fit in usize indices");
+            row_candidates[row_index].push((at, candidate.item_id, candidate));
+        }
+        for candidates in &mut row_candidates {
+            candidates.sort_unstable_by_key(|(at, item_id, _)| (*at, *item_id));
+        }
+        row_candidates
     };
     let mut render_items = Vec::new();
     let mut folded_spans: Vec<(TimelineItemId, TimelineRenderRowId, TimelineRangeNs)> = Vec::new();
@@ -497,49 +499,51 @@ fn build_render_items(
             "timeline_playground_render_plan_fold_items"
         )
         .entered();
-        for (row_id, _, _, candidate) in candidates {
-            match candidate.kind {
-                TimelineCandidateKind::Span { range, is_open } => {
-                    if projected_width_pixels(range, query)
-                        < f64::from(query.minimum_visible_pixels())
-                    {
-                        // timeline[impl playground.minimum-span-marker]
-                        // timeline[impl playground.span-cluster-decomposition]
-                        if folded_spans.last().is_some_and(|(_, row, previous_range)| {
-                            *row != row_id
-                                || projected_instant_distance_pixels(
-                                    previous_range.end(),
-                                    range.start(),
-                                    query,
-                                ) >= f64::from(query.minimum_visible_pixels())
-                        }) {
+        for (row_index, candidates) in row_candidates.into_iter().enumerate() {
+            let row_id = TimelineRenderRowId(u32::try_from(row_index).unwrap_or(u32::MAX));
+            for (_, _, candidate) in candidates {
+                match candidate.kind {
+                    TimelineCandidateKind::Span { range, is_open } => {
+                        if projected_width_pixels(range, query)
+                            < f64::from(query.minimum_visible_pixels())
+                        {
+                            // timeline[impl playground.minimum-span-marker]
+                            // timeline[impl playground.span-cluster-decomposition]
+                            if folded_spans.last().is_some_and(|(_, row, previous_range)| {
+                                *row != row_id
+                                    || projected_instant_distance_pixels(
+                                        previous_range.end(),
+                                        range.start(),
+                                        query,
+                                    ) >= f64::from(query.minimum_visible_pixels())
+                            }) {
+                                flush_span_cluster(dataset, &mut folded_spans, &mut render_items);
+                            }
+                            folded_spans.push((candidate.item_id, row_id, range));
+                        } else {
                             flush_span_cluster(dataset, &mut folded_spans, &mut render_items);
+                            flush_event_cluster(dataset, &mut folded_events, &mut render_items);
+                            let lane_index = span_lane_index(row_id, range, &mut span_lanes);
+                            render_items.push(TimelineRenderItem::Span(TimelineRenderSpan {
+                                item_id: candidate.item_id,
+                                row_id,
+                                lane_index,
+                                range,
+                                is_open,
+                            }));
                         }
-                        folded_spans.push((candidate.item_id, row_id, range));
-                    } else {
-                        flush_span_cluster(dataset, &mut folded_spans, &mut render_items);
-                        flush_event_cluster(dataset, &mut folded_events, &mut render_items);
-                        let lane_index = span_lane_index(row_id, range, &mut span_lanes);
-                        render_items.push(TimelineRenderItem::Span(TimelineRenderSpan {
-                            item_id: candidate.item_id,
-                            row_id,
-                            lane_index,
-                            range,
-                            is_open,
-                        }));
                     }
-                }
-                TimelineCandidateKind::Event { at } => {
-                    if should_flush_event_cluster(&folded_events, row_id, at, query) {
-                        flush_event_cluster(dataset, &mut folded_events, &mut render_items);
+                    TimelineCandidateKind::Event { at } => {
+                        if should_flush_event_cluster(&folded_events, row_id, at, query) {
+                            flush_event_cluster(dataset, &mut folded_events, &mut render_items);
+                        }
+                        folded_events.push((candidate.item_id, row_id, at));
                     }
-                    folded_events.push((candidate.item_id, row_id, at));
                 }
             }
+            flush_span_cluster(dataset, &mut folded_spans, &mut render_items);
+            flush_event_cluster(dataset, &mut folded_events, &mut render_items);
         }
-
-        flush_span_cluster(dataset, &mut folded_spans, &mut render_items);
-        flush_event_cluster(dataset, &mut folded_events, &mut render_items);
     }
     render_items
 }

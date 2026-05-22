@@ -979,6 +979,11 @@ impl TimelinePlaygroundState {
         if self.should_throttle_live_tracing_sync(now) {
             return;
         }
+        // Drop the UI's old live dataset refs before asking logs to append so the
+        // shared cache can stay uniquely owned and avoid deep-cloning the timeline.
+        self.invalidate_render_plan_cache();
+        let previous_dataset = std::mem::take(&mut self.dataset);
+        drop(previous_dataset);
         let (dataset, latest_at_ns) = {
             #[cfg(feature = "extended_observability")]
             let _span = debug_span!(
@@ -998,7 +1003,6 @@ impl TimelinePlaygroundState {
             self.live_tracing_snapshot_revision = Some(revision);
             self.last_live_tracing_sync_at = Some(now);
             self.dataset = dataset;
-            self.invalidate_render_plan_cache();
             if self.live_tracing_follow_tail {
                 let duration = (self.visible_end_ns - self.visible_start_ns).max(1);
                 self.visible_end_ns = latest_at_ns.max(1);
@@ -3296,11 +3300,13 @@ fn run_scene_window(
     let cursor_latency_playground = (scene_kind == SceneWindowKind::CursorLatencyPlayground)
         .then(CursorLatencyPlaygroundState::new);
     let text_rendering_playground = initialization.text_rendering_playground.take();
-    let starts_without_activation = scene_kind == SceneWindowKind::TimelinePlaygroundDetail
-        && initialization
+    let starts_without_activation = scene_window_starts_without_activation(
+        scene_kind,
+        initialization
             .timeline_playground_detail
             .as_ref()
-            .is_none_or(|detail| !detail.is_pinned());
+            .is_some_and(|detail| detail.is_pinned()),
+    );
 
     SCENE_APP_STATE.with(|state| {
         *state.borrow_mut() = Some(SceneAppState {
@@ -4242,15 +4248,19 @@ fn scene_window_ex_style(
     starts_without_activation: bool,
 ) -> WINDOW_EX_STYLE {
     if scene_kind == SceneWindowKind::TimelinePlaygroundDetail {
-        let mut style = WS_EX_TOOLWINDOW | WS_EX_NOREDIRECTIONBITMAP;
-        if starts_without_activation {
-            // timeline[impl playground.hover-detail-no-activate]
-            style |= WS_EX_NOACTIVATE;
-        }
-        style
+        let _ = starts_without_activation;
+        WS_EX_TOOLWINDOW | WS_EX_NOREDIRECTIONBITMAP
     } else {
         custom_window_ex_style()
     }
+}
+
+fn scene_window_starts_without_activation(
+    scene_kind: SceneWindowKind,
+    timeline_playground_detail_is_pinned: bool,
+) -> bool {
+    scene_kind == SceneWindowKind::TimelinePlaygroundDetail
+        && !timeline_playground_detail_is_pinned
 }
 
 fn ensure_toast_host_started() {
@@ -17769,10 +17779,14 @@ mod tests {
 
     #[test]
     // timeline[verify playground.hover-detail-no-activate]
-    fn timeline_playground_detail_window_style_does_not_activate() {
+    fn hover_timeline_playground_detail_window_starts_without_activation() {
         let style = scene_window_ex_style(SceneWindowKind::TimelinePlaygroundDetail, true);
 
-        assert_eq!(style & WS_EX_NOACTIVATE, WS_EX_NOACTIVATE);
+        assert!(scene_window_starts_without_activation(
+            SceneWindowKind::TimelinePlaygroundDetail,
+            false,
+        ));
+        assert_eq!(style & WS_EX_NOACTIVATE, WINDOW_EX_STYLE(0));
         assert_eq!(style & WS_EX_TOOLWINDOW, WS_EX_TOOLWINDOW);
         assert_eq!(style & WS_EX_APPWINDOW, WINDOW_EX_STYLE(0));
     }
@@ -17781,6 +17795,10 @@ mod tests {
     fn pinned_timeline_playground_detail_window_style_can_activate() {
         let style = scene_window_ex_style(SceneWindowKind::TimelinePlaygroundDetail, false);
 
+        assert!(!scene_window_starts_without_activation(
+            SceneWindowKind::TimelinePlaygroundDetail,
+            true,
+        ));
         assert_eq!(style & WS_EX_NOACTIVATE, WINDOW_EX_STYLE(0));
         assert_eq!(style & WS_EX_TOOLWINDOW, WS_EX_TOOLWINDOW);
         assert_eq!(style & WS_EX_APPWINDOW, WINDOW_EX_STYLE(0));
