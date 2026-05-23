@@ -1,5 +1,6 @@
 param(
 	[switch]$Release,
+	[switch]$NoOpenProfiler,
 	[Parameter(ValueFromRemainingArguments = $true)]
 	[string[]]$QueryArgs
 )
@@ -166,8 +167,16 @@ if (-not (Get-Command tracy-capture.exe -ErrorAction SilentlyContinue)) {
 	throw "tracy-capture.exe not found in PATH"
 }
 
-if (-not (Get-Command tracy-profiler.exe -ErrorAction SilentlyContinue)) {
+
+$profilerCommand = Get-Command tracy-profiler.exe -ErrorAction SilentlyContinue
+$csvExportCommand = Get-Command tracy-csvexport.exe -ErrorAction SilentlyContinue
+
+if (-not $NoOpenProfiler -and -not $profilerCommand) {
 	Write-Warning "tracy-profiler.exe not found in PATH; capture will still be produced at $capturePath"
+}
+
+if (-not $csvExportCommand) {
+	Write-Warning "tracy-csvexport.exe not found in PATH; CSV export will be skipped"
 }
 
 if (-not $QueryArgs -or $QueryArgs.Count -eq 0) {
@@ -240,7 +249,10 @@ finally {
 	Write-Host "Capture shutdown wait: $(Format-Elapsed $captureShutdownElapsed)"
 }
 
-if (Get-Command tracy-profiler.exe -ErrorAction SilentlyContinue) {
+
+if ($NoOpenProfiler) {
+	Write-Host "Skipping tracy-profiler launch (-NoOpenProfiler). Capture saved to $capturePath"
+} elseif ($profilerCommand) {
 	Write-Host "Displaying results from $capturePath"
 	$profilerStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
 	tracy-profiler.exe "$capturePath"
@@ -253,8 +265,10 @@ if (Get-Command tracy-profiler.exe -ErrorAction SilentlyContinue) {
 
 $overallStopwatch.Stop()
 
-Write-Host "CSV from tracy-csvexport.exe $capturePath"
-tracy-csvexport.exe $capturePath
+if ($csvExportCommand) {
+	Write-Host "CSV from tracy-csvexport.exe $capturePath"
+	tracy-csvexport.exe $capturePath
+}
 
 Write-Host "Timing summary:"
 Write-Host "  capture launch: $(Format-Elapsed $captureLaunchElapsed)"

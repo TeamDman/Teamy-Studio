@@ -43,7 +43,10 @@ pub use audio_transcription::{
 };
 pub use jobs::{JobSnapshot, JobStatus, has_job_snapshots, job_snapshots, running_job_count};
 pub use render_verification::{RenderOffscreenFixtureListReport, RenderOffscreenSelfTestReport};
-pub use teamy_studio_app_host::{TerminalThroughputBenchmarkMode, TerminalWindowSummary};
+pub use teamy_studio_app_host::{
+    TerminalThroughputBenchmarkMode, TerminalWindowSummary, TimelineLiveViewSelfTestOptions,
+    TimelineLiveViewSelfTestResultsReport, TimelineLiveViewSelfTestViewportMode,
+};
 pub use teamy_studio_terminal_core::VtEngineChoice;
 pub use windows_app::TerminalThroughputBenchmarkResultsReport;
 pub use windows_audio_input::{
@@ -170,6 +173,25 @@ pub fn run_terminal_throughput_self_test(
     samples: usize,
 ) -> eyre::Result<TerminalThroughputBenchmarkResultsReport> {
     windows_app::run_terminal_throughput_self_test(app_home, cache_home, mode, line_count, samples)
+}
+
+/// Run the live timeline view FPS self-test.
+// cli[impl command.surface.self-test-timeline-live-view]
+// cli[impl self-test.timeline-live-view.sample-ms-flag]
+// cli[impl self-test.timeline-live-view.warmup-ms-flag]
+// cli[impl self-test.timeline-live-view.samples-flag]
+/// tool[impl cli.surface.self-test-timeline-live-view]
+/// tool[impl tests.performance.timeline-live-view-self-test]
+///
+/// # Errors
+///
+/// This function will return an error if the Windows-only live timeline benchmark cannot be launched.
+pub fn run_timeline_live_view_self_test(
+    app_home: &AppHome,
+    cache_home: &CacheHome,
+    options: TimelineLiveViewSelfTestOptions,
+) -> eyre::Result<TimelineLiveViewSelfTestResultsReport> {
+    windows_app::run_timeline_live_view_self_test(app_home, cache_home, options)
 }
 
 /// Run a headless terminal replay self-test.

@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 
 use arbitrary::Arbitrary;
 use facet::Facet;
@@ -497,10 +497,15 @@ fn build_render_items(
     query: &TimelineViewportQuery,
     row_candidates: Vec<TimelineRowCandidateBuckets>,
 ) -> Vec<TimelineRenderItem> {
-    let mut render_items = Vec::new();
+    let mut render_items = Vec::with_capacity(
+        row_candidates
+            .iter()
+            .map(|candidates| candidates.spans.len() + candidates.events.len())
+            .sum(),
+    );
     let mut folded_spans: Vec<(TimelineItemId, TimelineRenderRowId, TimelineRangeNs)> = Vec::new();
     let mut folded_events = Vec::new();
-    let mut span_lanes = BTreeMap::new();
+    let projection = TimelineProjectionProducts::for_query(query);
 
     {
         #[cfg(feature = "extended_observability")]
@@ -511,6 +516,7 @@ fn build_render_items(
         .entered();
         for (row_index, candidates) in row_candidates.into_iter().enumerate() {
             let row_id = TimelineRenderRowId(u32::try_from(row_index).unwrap_or(u32::MAX));
+            let mut span_lanes = Vec::new();
             let mut spans = candidates.spans.into_iter().peekable();
             let mut events = candidates.events.into_iter().peekable();
             while spans.peek().is_some() || events.peek().is_some() {
@@ -527,18 +533,21 @@ fn build_render_items(
                 };
                 match candidate.kind {
                     TimelineCandidateKind::Span { range, is_open } => {
-                        if projected_width_pixels(range, query)
-                            < f64::from(query.minimum_visible_pixels())
-                        {
+                        if range_projects_narrower_than_minimum_visible_width(
+                            range,
+                            query,
+                            projection,
+                        ) {
                             // timeline[impl playground.minimum-span-marker]
                             // timeline[impl playground.span-cluster-decomposition]
                             if folded_spans.last().is_some_and(|(_, row, previous_range)| {
                                 *row != row_id
-                                    || projected_instant_distance_pixels(
+                                    || instant_distance_reaches_minimum_visible_width(
                                         previous_range.end(),
                                         range.start(),
                                         query,
-                                    ) >= f64::from(query.minimum_visible_pixels())
+                                        projection,
+                                    )
                             }) {
                                 flush_span_cluster(dataset, &mut folded_spans, &mut render_items);
                             }
@@ -546,7 +555,7 @@ fn build_render_items(
                         } else {
                             flush_span_cluster(dataset, &mut folded_spans, &mut render_items);
                             flush_event_cluster(dataset, &mut folded_events, &mut render_items);
-                            let lane_index = span_lane_index(row_id, range, &mut span_lanes);
+                            let lane_index = span_lane_index(range, &mut span_lanes);
                             render_items.push(TimelineRenderItem::Span(TimelineRenderSpan {
                                 item_id: candidate.item_id,
                                 row_id,
@@ -557,7 +566,8 @@ fn build_render_items(
                         }
                     }
                     TimelineCandidateKind::Event { at } => {
-                        if should_flush_event_cluster(&folded_events, row_id, at, query) {
+                        if should_flush_event_cluster(&folded_events, row_id, at, query, projection)
+                        {
                             flush_event_cluster(dataset, &mut folded_events, &mut render_items);
                         }
                         folded_events.push((candidate.item_id, row_id, at));
@@ -747,13 +757,13 @@ fn should_flush_event_cluster(
     row_id: TimelineRenderRowId,
     at: TimelineInstantNs,
     query: &TimelineViewportQuery,
+    projection: Option<TimelineProjectionProducts>,
 ) -> bool {
     let Some((_, previous_row, previous_at)) = folded_events.last() else {
         return false;
     };
     if *previous_row != row_id
-        || projected_instant_distance_pixels(*previous_at, at, query)
-            >= f64::from(query.minimum_visible_pixels())
+        || instant_distance_reaches_minimum_visible_width(*previous_at, at, query, projection)
     {
         return true;
     }
@@ -761,8 +771,7 @@ fn should_flush_event_cluster(
         return false;
     };
     *first_row != row_id
-        || projected_instant_distance_pixels(*first_at, at, query)
-            > event_cluster_max_width_pixels(query)
+        || instant_distance_exceeds_event_cluster_width(*first_at, at, query, projection)
 }
 
 fn event_cluster_max_width_pixels(query: &TimelineViewportQuery) -> f64 {
@@ -772,13 +781,8 @@ fn event_cluster_max_width_pixels(query: &TimelineViewportQuery) -> f64 {
     f64::from(query.minimum_visible_pixels().max(4).saturating_mul(4))
 }
 
-fn span_lane_index(
-    row_id: TimelineRenderRowId,
-    range: TimelineRangeNs,
-    span_lanes: &mut BTreeMap<TimelineRenderRowId, Vec<TimelineInstantNs>>,
-) -> u32 {
+fn span_lane_index(range: TimelineRangeNs, lanes: &mut Vec<TimelineInstantNs>) -> u32 {
     // timeline[impl playground.span-lanes]
-    let lanes = span_lanes.entry(row_id).or_default();
     for (index, lane_end) in lanes.iter_mut().enumerate() {
         if *lane_end <= range.start() {
             *lane_end = range.end();
@@ -796,6 +800,83 @@ fn render_row_key(dataset: &TimelineDataset, row_key: TimelineCandidateRowKey) -
         }
         TimelineCandidateRowKey::All => TimelineRenderRowKey::All,
     }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TimelineProjectionProducts {
+    viewport_width_pixels: u64,
+    minimum_visible_width_product: u128,
+    event_cluster_max_width_product: u128,
+}
+
+impl TimelineProjectionProducts {
+    fn for_query(query: &TimelineViewportQuery) -> Option<Self> {
+        let visible_duration_ns = query.visible_range().duration().as_u64();
+        if visible_duration_ns == 0 {
+            return None;
+        }
+
+        let visible_duration_product = u128::from(visible_duration_ns);
+        Some(Self {
+            viewport_width_pixels: u64::from(query.viewport_width_pixels()),
+            minimum_visible_width_product:
+                u128::from(query.minimum_visible_pixels()) * visible_duration_product,
+            event_cluster_max_width_product:
+                u128::from(query.minimum_visible_pixels().max(4).saturating_mul(4))
+                    * visible_duration_product,
+        })
+    }
+
+    fn projected_distance_product(self, duration_ns: u64) -> u128 {
+        u128::from(duration_ns) * u128::from(self.viewport_width_pixels)
+    }
+}
+
+fn range_projects_narrower_than_minimum_visible_width(
+    range: TimelineRangeNs,
+    query: &TimelineViewportQuery,
+    projection: Option<TimelineProjectionProducts>,
+) -> bool {
+    projection.map_or_else(
+        || projected_width_pixels(range, query) < f64::from(query.minimum_visible_pixels()),
+        |projection| {
+            projection.projected_distance_product(range.duration().as_u64())
+                < projection.minimum_visible_width_product
+        },
+    )
+}
+
+fn instant_distance_reaches_minimum_visible_width(
+    previous: TimelineInstantNs,
+    next: TimelineInstantNs,
+    query: &TimelineViewportQuery,
+    projection: Option<TimelineProjectionProducts>,
+) -> bool {
+    projection.map_or_else(
+        || {
+            projected_instant_distance_pixels(previous, next, query)
+                >= f64::from(query.minimum_visible_pixels())
+        },
+        |projection| {
+            projection.projected_distance_product(next.as_i64().abs_diff(previous.as_i64()))
+                >= projection.minimum_visible_width_product
+        },
+    )
+}
+
+fn instant_distance_exceeds_event_cluster_width(
+    previous: TimelineInstantNs,
+    next: TimelineInstantNs,
+    query: &TimelineViewportQuery,
+    projection: Option<TimelineProjectionProducts>,
+) -> bool {
+    projection.map_or_else(
+        || projected_instant_distance_pixels(previous, next, query) > event_cluster_max_width_pixels(query),
+        |projection| {
+            projection.projected_distance_product(next.as_i64().abs_diff(previous.as_i64()))
+                > projection.event_cluster_max_width_product
+        },
+    )
 }
 
 fn row_key_sort_key(

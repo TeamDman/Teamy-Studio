@@ -84,6 +84,26 @@ For Tracy profiling, run:
 ./run-profiler.ps1 window show
 ```
 
+For an unattended live Timeline Playground run that also writes an FPS report, use:
+
+```powershell
+./run-profiler.ps1 self-test timeline-live-view
+```
+
+Add `--overlay-message` if you want the self-test window to explain that it is non-interactive while automation is running:
+
+```powershell
+./run-profiler.ps1 self-test timeline-live-view --overlay-message "AI self-test running; window is non-interactive"
+```
+
+To reproduce the long-run zoomed-out regression without opening the Tracy UI, use fit-content mode together with interval buckets and the headless profiler switch:
+
+```powershell
+./run-profiler.ps1 -NoOpenProfiler self-test timeline-live-view --sample-ms 30000 --bucket-ms 5000 --viewport-mode fit-content --fit-content-interval-ms 5000 --minimum-visible-pixels 4 --overlay-message "AI self-test running; window is non-interactive" --fail-below-fps 15
+```
+
+The JSON report includes aggregate frame stats plus `summary.worst_frame_ms` and `samples[].slowest_frames[]` so unattended runs can point directly at the most expensive frame ranges.
+
 That wrapper defaults to the debug profile so captures can show the same lag you see from `cargo run`. Pass `-Release` to use the dedicated Cargo `profiling` profile:
 
 ```powershell

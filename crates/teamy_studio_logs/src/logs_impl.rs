@@ -209,6 +209,21 @@ pub struct LiveTracingSnapshotRevision {
 
 impl LiveTracingSnapshotRevision {
     #[must_use]
+    pub const fn record_count(self) -> usize {
+        self.record_count
+    }
+
+    #[must_use]
+    pub const fn span_count(self) -> usize {
+        self.span_count
+    }
+
+    #[must_use]
+    pub const fn active_span_count(self) -> usize {
+        self.active_span_count
+    }
+
+    #[must_use]
     pub const fn has_active_spans(self) -> bool {
         self.active_span_count > 0
     }
@@ -411,9 +426,26 @@ fn event_is_tracy_frame_mark(metadata: &Metadata<'_>) -> bool {
     metadata.fields().field("tracy.frame_mark").is_some()
 }
 
+fn live_timeline_is_internal_window_span(metadata: &Metadata<'_>) -> bool {
+    metadata.target() == "teamy_studio_app_host::windows_app_impl"
+        && matches!(
+            metadata.name(),
+            "scene_window"
+                | "scene_focused_render_tick"
+                | "wait_for_window_message"
+                | "dispatch_pending_thread_messages"
+                | "render_focused_animation_frame"
+                | "compute_client_layout"
+                | "build_diagnostic_panel_text"
+                | "build_terminal_display_state"
+                | "submit_render_frame_model"
+        )
+}
+
 fn live_timeline_should_collect_span(metadata: &Metadata<'_>) -> bool {
     if metadata.target() == "timeline_playground_profiling"
         || metadata.name().starts_with("timeline_playground_")
+        || live_timeline_is_internal_window_span(metadata)
     {
         return false;
     }
@@ -1748,6 +1780,34 @@ mod tests {
     }
 
     #[test]
+    fn collector_ignores_internal_scene_window_spans() {
+        let _guard = TEST_LOGS_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear_logs();
+        let subscriber = tracing_subscriber::Registry::default().with(LogCollectorLayer);
+
+        tracing::subscriber::with_default(subscriber, || {
+            let _scene_window = tracing::info_span!(
+                target: "teamy_studio_app_host::windows_app_impl",
+                "scene_window",
+                source_hwnd = 321_isize
+            )
+            .entered();
+            let _render_tick = tracing::debug_span!(
+                target: "teamy_studio_app_host::windows_app_impl",
+                "scene_focused_render_tick"
+            )
+            .entered();
+        });
+
+        assert!(log_span_snapshots().is_empty());
+
+        let (dataset, _) = tracing_event_timeline_dataset();
+        assert!(dataset.items().is_empty());
+    }
+
+    #[test]
     fn collector_captures_tracy_frame_mark_events() {
         let _guard = TEST_LOGS_LOCK
             .lock()
@@ -1828,7 +1888,7 @@ mod tests {
     }
 
     #[test]
-    fn collector_projects_live_scene_window_spans_as_open_timeline_spans() {
+    fn collector_projects_non_app_scene_window_spans_as_open_timeline_spans() {
         let _guard = TEST_LOGS_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);

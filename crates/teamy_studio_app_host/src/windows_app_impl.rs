@@ -167,10 +167,18 @@ const TERMINAL_THROUGHPUT_BENCHMARK_MEASURE_PREFIX: &str =
     "__TEAMY_TERMINAL_THROUGHPUT_MEASURE_MS=";
 const TERMINAL_THROUGHPUT_BENCHMARK_TIMEOUT: Duration = Duration::from_mins(1);
 const TERMINAL_THROUGHPUT_BENCHMARK_POLL_INTERVAL: Duration = Duration::from_millis(1);
+const DEFAULT_TIMELINE_LIVE_VIEW_SELF_TEST_OVERLAY_MESSAGE: &str =
+    "This window is non-interactive while the unattended live timeline self-test is running.";
+const TIMELINE_LIVE_VIEW_SELF_TEST_SLOW_FRAME_LIMIT: usize = 8;
 const TIMELINE_ZOOM_ANIMATION_DURATION: Duration = Duration::from_millis(220);
 const TIMELINE_PLAYGROUND_ROW_ANIMATION_DURATION: Duration = Duration::from_millis(180);
 const TIMELINE_PLAYGROUND_FRAME_MARK_SYNC_INTERVAL: Duration = Duration::from_millis(100);
-const TIMELINE_PLAYGROUND_LIVE_SYNC_MIN_INTERVAL: Duration = Duration::from_millis(16);
+const TIMELINE_PLAYGROUND_LIVE_FOLLOW_TAIL_SYNC_MIN_INTERVAL: Duration =
+    Duration::from_millis(16);
+const TIMELINE_PLAYGROUND_LIVE_OVERVIEW_SYNC_MIN_INTERVAL: Duration =
+    Duration::from_millis(100);
+const TIMELINE_PLAYGROUND_FIT_CONTENT_LEADING_PADDING_DIVISOR: i64 = 10;
+const TIMELINE_PLAYGROUND_FIT_CONTENT_TRAILING_PADDING_DIVISOR: i64 = 5;
 const TIMELINE_PLAYGROUND_LIVE_INITIAL_DURATION_NS: i64 = 30_000_000_000;
 const MODEL_WARNING_PREPARE_HOLD_DURATION: Duration = Duration::from_millis(1400);
 const LOG_TOAST_DURATION: Duration = Duration::from_secs(5);
@@ -180,6 +188,7 @@ const LOG_TOAST_HEIGHT: i32 = 60;
 const LOG_TOAST_GAP: i32 = 10;
 const LOG_TOAST_HOST_PADDING: i32 = 10;
 const TERMINAL_THROUGHPUT_RESULTS_DIR: &str = "self-test/terminal-throughput";
+const TIMELINE_LIVE_VIEW_SELF_TEST_RESULTS_DIR: &str = "self-test/timeline-live-view";
 const DEMO_MODE_STATE_CHANGED_MESSAGE: u32 = WM_APP + 0x402;
 const TIMELINE_DOCUMENT_CHANGED_MESSAGE: u32 = WM_APP + 0x403;
 const TIMELINE_DOCUMENT_COMMAND_MESSAGE: u32 = WM_APP + 0x404;
@@ -482,6 +491,7 @@ struct SceneWindowInitialization {
     timeline_transcription_settings: Option<windows_scene::TimelineTranscriptionSettingsViewState>,
     model_warning: Option<windows_scene::ModelWarningViewState>,
     timeline_playground_detail: Option<TimelinePlaygroundDetailWindowHandle>,
+    timeline_live_view_self_test: Option<TimelineLiveViewSelfTestHandle>,
     text_rendering_playground: Option<TextRenderingPlaygroundHandle>,
     initial_position: Option<ScreenRect>,
     timeline_document_command_sender: Option<mpsc::Sender<TimelineDocumentCommand>>,
@@ -643,6 +653,371 @@ struct TimelinePlaygroundState {
     hovered_item: Option<windows_scene::TimelinePlaygroundHitTarget>,
     detail_windows: Vec<TimelinePlaygroundDetailWindowHandle>,
     hover_detail_window: Option<TimelinePlaygroundDetailWindowHandle>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TimelineLiveViewSelfTestViewportMode {
+    FollowTail,
+    FitContent,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct TimelineLiveViewSelfTestOptions {
+    pub sample_duration_ms: u64,
+    pub warmup_duration_ms: u64,
+    pub bucket_duration_ms: u64,
+    pub samples: usize,
+    pub viewport_mode: TimelineLiveViewSelfTestViewportMode,
+    pub fit_content_interval_ms: Option<u64>,
+    pub minimum_visible_pixels: u32,
+    pub overlay_message: Option<String>,
+    pub fail_below_fps: Option<f64>,
+}
+
+impl Default for TimelineLiveViewSelfTestOptions {
+    fn default() -> Self {
+        Self {
+            sample_duration_ms: 5_000,
+            warmup_duration_ms: 1_000,
+            bucket_duration_ms: 1_000,
+            samples: 1,
+            viewport_mode: TimelineLiveViewSelfTestViewportMode::FitContent,
+            fit_content_interval_ms: Some(1_000),
+            minimum_visible_pixels: 4,
+            overlay_message: None,
+            fail_below_fps: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TimelineLiveViewSelfTestConfig {
+    warmup_duration: Duration,
+    sample_duration: Duration,
+    bucket_duration: Duration,
+    viewport_mode: TimelineLiveViewSelfTestViewportMode,
+    fit_content_interval: Option<Duration>,
+    minimum_visible_pixels: u32,
+    overlay_message: Option<String>,
+    block_user_input: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TimelineLiveViewSelfTestObservation {
+    visible_start_ns: i64,
+    visible_end_ns: i64,
+    minimum_visible_pixels: u32,
+    dataset_item_count: usize,
+    dataset_span_count: usize,
+    dataset_event_count: usize,
+    live_record_count: usize,
+    live_span_count: usize,
+    active_span_count: usize,
+}
+
+#[derive(Clone, Debug)]
+struct TimelineLiveViewSelfTestHandle {
+    config: TimelineLiveViewSelfTestConfig,
+    result: Arc<Mutex<Option<TimelineLiveViewSelfTestSampleMetrics>>>,
+}
+
+#[derive(Clone, Debug)]
+struct TimelineLiveViewSelfTestIntervalMetrics {
+    start_offset_ms: u64,
+    end_offset_ms: u64,
+    measured_duration_ms: f64,
+    frame_intervals_ms: Vec<f64>,
+    observation: TimelineLiveViewSelfTestObservation,
+}
+
+#[derive(Clone, Debug)]
+struct TimelineLiveViewSelfTestFrameMetrics {
+    start_offset_ms: u64,
+    end_offset_ms: u64,
+    frame_interval_ms: f64,
+    observation: TimelineLiveViewSelfTestObservation,
+}
+
+#[derive(Clone, Debug)]
+struct TimelineLiveViewSelfTestSampleMetrics {
+    warmup_duration_ms: u64,
+    target_sample_duration_ms: u64,
+    bucket_duration_ms: u64,
+    viewport_mode: TimelineLiveViewSelfTestViewportMode,
+    fit_content_interval_ms: Option<u64>,
+    minimum_visible_pixels: u32,
+    overlay_message: Option<String>,
+    block_user_input: bool,
+    measured_duration_ms: f64,
+    frame_intervals_ms: Vec<f64>,
+    intervals: Vec<TimelineLiveViewSelfTestIntervalMetrics>,
+    slowest_frames: Vec<TimelineLiveViewSelfTestFrameMetrics>,
+}
+
+#[derive(Debug)]
+struct TimelineLiveViewSelfTestState {
+    handle: TimelineLiveViewSelfTestHandle,
+    run_started_at: Option<Instant>,
+    measurement_started_at: Option<Instant>,
+    last_render_started_at: Option<Instant>,
+    frame_intervals_ms: Vec<f64>,
+    current_interval_started_at: Option<Instant>,
+    current_interval_frame_intervals_ms: Vec<f64>,
+    current_interval_observation: Option<TimelineLiveViewSelfTestObservation>,
+    last_fit_to_content_at: Option<Instant>,
+    intervals: Vec<TimelineLiveViewSelfTestIntervalMetrics>,
+    slowest_frames: Vec<TimelineLiveViewSelfTestFrameMetrics>,
+    completed: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TimelineLiveViewSelfTestAction {
+    Continue,
+    CloseWindow,
+}
+
+impl TimelineLiveViewSelfTestHandle {
+    fn new(config: TimelineLiveViewSelfTestConfig) -> Self {
+        Self {
+            config,
+            result: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    fn config(&self) -> &TimelineLiveViewSelfTestConfig {
+        &self.config
+    }
+
+    fn complete(&self, metrics: TimelineLiveViewSelfTestSampleMetrics) {
+        if let Ok(mut result) = self.result.lock() {
+            *result = Some(metrics);
+        }
+    }
+
+    fn result(&self) -> Option<TimelineLiveViewSelfTestSampleMetrics> {
+        self.result.lock().ok().and_then(|result| result.clone())
+    }
+}
+
+impl TimelineLiveViewSelfTestSampleMetrics {
+    fn from_observations(
+        config: &TimelineLiveViewSelfTestConfig,
+        frame_intervals_ms: Vec<f64>,
+        intervals: Vec<TimelineLiveViewSelfTestIntervalMetrics>,
+        slowest_frames: Vec<TimelineLiveViewSelfTestFrameMetrics>,
+    ) -> Self {
+        Self {
+            warmup_duration_ms: u64::try_from(config.warmup_duration.as_millis())
+                .unwrap_or(u64::MAX),
+            target_sample_duration_ms: u64::try_from(config.sample_duration.as_millis())
+                .unwrap_or(u64::MAX),
+            bucket_duration_ms: u64::try_from(config.bucket_duration.as_millis())
+                .unwrap_or(u64::MAX),
+            viewport_mode: config.viewport_mode,
+            fit_content_interval_ms: config
+                .fit_content_interval
+                .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)),
+            minimum_visible_pixels: config.minimum_visible_pixels,
+            overlay_message: config.overlay_message.clone(),
+            block_user_input: config.block_user_input,
+            measured_duration_ms: frame_intervals_ms.iter().sum(),
+            frame_intervals_ms,
+            intervals,
+            slowest_frames,
+        }
+    }
+}
+
+impl TimelineLiveViewSelfTestState {
+    fn new(handle: TimelineLiveViewSelfTestHandle) -> Self {
+        Self {
+            handle,
+            run_started_at: None,
+            measurement_started_at: None,
+            last_render_started_at: None,
+            frame_intervals_ms: Vec::new(),
+            current_interval_started_at: None,
+            current_interval_frame_intervals_ms: Vec::new(),
+            current_interval_observation: None,
+            last_fit_to_content_at: None,
+            intervals: Vec::new(),
+            slowest_frames: Vec::new(),
+            completed: false,
+        }
+    }
+
+    fn is_active(&self) -> bool {
+        !self.completed
+    }
+
+    fn overlay_message(&self) -> &str {
+        self.handle
+            .config()
+            .overlay_message
+            .as_deref()
+            .unwrap_or(DEFAULT_TIMELINE_LIVE_VIEW_SELF_TEST_OVERLAY_MESSAGE)
+    }
+
+    fn blocks_user_input(&self) -> bool {
+        self.handle.config().block_user_input
+    }
+
+    fn prepare_frame(&mut self, now: Instant, playground: &mut TimelinePlaygroundState) {
+        if self.completed {
+            return;
+        }
+
+        let _ = self.run_started_at.get_or_insert(now);
+        let config = self.handle.config();
+        playground.minimum_visible_pixels = config.minimum_visible_pixels.max(1);
+        match config.viewport_mode {
+            TimelineLiveViewSelfTestViewportMode::FollowTail => {
+                playground.live_tracing_follow_tail = true;
+            }
+            TimelineLiveViewSelfTestViewportMode::FitContent => {
+                let interval = config.fit_content_interval.unwrap_or(config.bucket_duration);
+                let should_fit = self.last_fit_to_content_at.is_none_or(|last| {
+                    now.saturating_duration_since(last) >= interval
+                });
+                if should_fit {
+                    playground.fit_to_content();
+                    self.last_fit_to_content_at = Some(now);
+                }
+            }
+        }
+    }
+
+    fn record_render_start(
+        &mut self,
+        now: Instant,
+        observation: TimelineLiveViewSelfTestObservation,
+    ) -> TimelineLiveViewSelfTestAction {
+        if self.completed {
+            return TimelineLiveViewSelfTestAction::Continue;
+        }
+
+        let run_started_at = *self.run_started_at.get_or_insert(now);
+
+        if self.measurement_started_at.is_none()
+            && now.duration_since(run_started_at) >= self.handle.config().warmup_duration
+        {
+            self.measurement_started_at = Some(now);
+            self.current_interval_started_at = Some(now);
+            self.current_interval_observation = Some(observation);
+        } else if self.measurement_started_at.is_some() {
+            if let Some(previous_started_at) = self.last_render_started_at {
+                let frame_interval_ms =
+                    now.duration_since(previous_started_at).as_secs_f64() * 1000.0;
+                if frame_interval_ms.is_finite() && frame_interval_ms > 0.0 {
+                    self.frame_intervals_ms.push(frame_interval_ms);
+                    self.current_interval_frame_intervals_ms.push(frame_interval_ms);
+                    self.record_slow_frame(previous_started_at, now, frame_interval_ms, observation);
+                }
+            }
+            self.current_interval_observation = Some(observation);
+            let measurement_started_at = self
+                .measurement_started_at
+                .expect("measurement start should exist when sampling");
+            if now.duration_since(measurement_started_at) >= self.handle.config().sample_duration {
+                self.finish_interval(now, false);
+                self.handle
+                    .complete(TimelineLiveViewSelfTestSampleMetrics::from_observations(
+                        self.handle.config(),
+                        self.frame_intervals_ms.clone(),
+                        self.intervals.clone(),
+                        self.slowest_frames.clone(),
+                    ));
+                self.completed = true;
+                self.last_render_started_at = Some(now);
+                return TimelineLiveViewSelfTestAction::CloseWindow;
+            }
+
+            if self.current_interval_started_at.is_some_and(|started_at| {
+                now.saturating_duration_since(started_at) >= self.handle.config().bucket_duration
+            }) {
+                self.finish_interval(now, true);
+            }
+        }
+
+        self.last_render_started_at = Some(now);
+
+        TimelineLiveViewSelfTestAction::Continue
+    }
+
+    fn record_slow_frame(
+        &mut self,
+        previous_started_at: Instant,
+        now: Instant,
+        frame_interval_ms: f64,
+        observation: TimelineLiveViewSelfTestObservation,
+    ) {
+        let Some(measurement_started_at) = self.measurement_started_at else {
+            return;
+        };
+
+        let start_offset_ms = u64::try_from(
+            previous_started_at
+                .saturating_duration_since(measurement_started_at)
+                .as_millis(),
+        )
+        .unwrap_or(u64::MAX);
+        let end_offset_ms = u64::try_from(
+            now.saturating_duration_since(measurement_started_at).as_millis(),
+        )
+        .unwrap_or(u64::MAX);
+        self.slowest_frames.push(TimelineLiveViewSelfTestFrameMetrics {
+            start_offset_ms,
+            end_offset_ms,
+            frame_interval_ms,
+            observation,
+        });
+        self.slowest_frames.sort_by(|left, right| {
+            right
+                .frame_interval_ms
+                .partial_cmp(&left.frame_interval_ms)
+                .unwrap_or(Ordering::Equal)
+        });
+        self.slowest_frames
+            .truncate(TIMELINE_LIVE_VIEW_SELF_TEST_SLOW_FRAME_LIMIT);
+    }
+
+    fn finish_interval(&mut self, now: Instant, restart: bool) {
+        let Some(measurement_started_at) = self.measurement_started_at else {
+            return;
+        };
+        let Some(interval_started_at) = self.current_interval_started_at else {
+            return;
+        };
+        let Some(observation) = self.current_interval_observation else {
+            return;
+        };
+        if self.current_interval_frame_intervals_ms.is_empty() {
+            if restart {
+                self.current_interval_started_at = Some(now);
+            }
+            return;
+        }
+
+        let start_offset_ms = u64::try_from(
+            interval_started_at
+                .saturating_duration_since(measurement_started_at)
+                .as_millis(),
+        )
+        .unwrap_or(u64::MAX);
+        let end_offset_ms = u64::try_from(
+            now.saturating_duration_since(measurement_started_at).as_millis(),
+        )
+        .unwrap_or(u64::MAX);
+        self.intervals.push(TimelineLiveViewSelfTestIntervalMetrics {
+            start_offset_ms,
+            end_offset_ms,
+            measured_duration_ms: self.current_interval_frame_intervals_ms.iter().sum(),
+            frame_intervals_ms: std::mem::take(&mut self.current_interval_frame_intervals_ms),
+            observation,
+        });
+        self.current_interval_observation = None;
+        self.current_interval_started_at = restart.then_some(now);
+    }
 }
 
 const CURSOR_LATENCY_FOCUSED_RENDER_TICK_INTERVAL_MS: u32 = 1;
@@ -1104,9 +1479,18 @@ impl TimelinePlaygroundState {
     }
 
     fn should_throttle_live_tracing_sync(&self, now: Instant) -> bool {
+        let sync_interval = self.live_tracing_sync_min_interval();
         self.last_live_tracing_sync_at.is_some_and(|last| {
-            now.saturating_duration_since(last) < TIMELINE_PLAYGROUND_LIVE_SYNC_MIN_INTERVAL
+            now.saturating_duration_since(last) < sync_interval
         })
+    }
+
+    fn live_tracing_sync_min_interval(&self) -> Duration {
+        if self.live_tracing_follow_tail {
+            TIMELINE_PLAYGROUND_LIVE_FOLLOW_TAIL_SYNC_MIN_INTERVAL
+        } else {
+            TIMELINE_PLAYGROUND_LIVE_OVERVIEW_SYNC_MIN_INTERVAL
+        }
     }
 
     // timeline[impl playground.vertical-pan-clamp]
@@ -1271,10 +1655,14 @@ impl TimelinePlaygroundState {
             return;
         };
         let content_duration = visible_duration_ns_i64(start, end);
-        let padding = (content_duration / 10).max(1);
-        self.visible_start_ns = start.saturating_sub(padding);
+        let leading_padding =
+            (content_duration / TIMELINE_PLAYGROUND_FIT_CONTENT_LEADING_PADDING_DIVISOR).max(1);
+        let trailing_padding =
+            (content_duration / TIMELINE_PLAYGROUND_FIT_CONTENT_TRAILING_PADDING_DIVISOR)
+                .max(leading_padding);
+        self.visible_start_ns = start.saturating_sub(leading_padding);
         self.visible_end_ns = end
-            .saturating_add(padding)
+            .saturating_add(trailing_padding)
             .max(self.visible_start_ns.saturating_add(1));
     }
 
@@ -1724,6 +2112,7 @@ struct SceneAppState {
     model_warning: Option<windows_scene::ModelWarningViewState>,
     model_warning_prepare_started_at: Option<Instant>,
     timeline_playground: Option<TimelinePlaygroundState>,
+    timeline_live_view_self_test: Option<TimelineLiveViewSelfTestState>,
     cursor_latency_playground: Option<CursorLatencyPlaygroundState>,
     text_rendering_playground: Option<TextRenderingPlaygroundHandle>,
     text_rendering_drag: Option<TextRenderingDragState>,
@@ -1786,6 +2175,14 @@ impl DemoModeInputDeviceIdentifierScramble {
     const fn is_enabled(self) -> bool {
         matches!(self, Self::On)
     }
+}
+
+fn initial_latency_overlay(self_test_active: bool) -> LatencyOverlayState {
+    let mut overlay = LatencyOverlayState::new();
+    if self_test_active {
+        overlay.visible = true;
+    }
+    overlay
 }
 
 fn sync_demo_mode_state(state: &mut SceneAppState) {
@@ -3437,14 +3834,28 @@ fn run_scene_window(
         .timeline_document_command_sender
         .take()
         .or_else(|| Some(local_timeline_command_sender.clone()));
-    let timeline_playground = if scene_kind == SceneWindowKind::TimelinePlayground {
+    let timeline_live_view_self_test = if scene_kind == SceneWindowKind::TimelinePlayground {
+        initialization
+            .timeline_live_view_self_test
+            .take()
+            .map(TimelineLiveViewSelfTestState::new)
+    } else {
+        None
+    };
+    let mut timeline_playground = if scene_kind == SceneWindowKind::TimelinePlayground {
         Some(TimelinePlaygroundState::new()?)
     } else {
         None
     };
+    if timeline_live_view_self_test.is_some()
+        && let Some(playground) = timeline_playground.as_mut()
+    {
+        playground.toggle_live_tracing_events();
+    }
     let cursor_latency_playground = (scene_kind == SceneWindowKind::CursorLatencyPlayground)
         .then(CursorLatencyPlaygroundState::new);
     let text_rendering_playground = initialization.text_rendering_playground.take();
+    let latency_overlay = initial_latency_overlay(timeline_live_view_self_test.is_some());
     let starts_without_activation = scene_window_starts_without_activation(
         scene_kind,
         initialization
@@ -3472,6 +3883,7 @@ fn run_scene_window(
             model_warning: initialization.model_warning,
             model_warning_prepare_started_at: None,
             timeline_playground,
+            timeline_live_view_self_test,
             cursor_latency_playground,
             text_rendering_playground,
             text_rendering_drag: None,
@@ -3479,7 +3891,7 @@ fn run_scene_window(
             text_rendering_last_right_button_down_at: None,
             text_rendering_last_right_button_down_point: None,
             text_rendering_glyph_cache: None,
-            latency_overlay: LatencyOverlayState::new(),
+            latency_overlay,
             timeline_playground_detail: initialization.timeline_playground_detail,
             timeline_tool: TimelineInteractionTool::default(),
             timeline_selection: None,
@@ -4264,6 +4676,573 @@ where
     }
 }
 
+#[derive(Debug, Facet)]
+pub struct TimelineLiveViewSelfTestResultsReport {
+    results_path: String,
+    generated_at_utc: String,
+    app_home: String,
+    sample_count: usize,
+    viewport_mode: String,
+    overlay_message: String,
+    block_user_input: bool,
+    warmup_duration_ms: u64,
+    target_sample_duration_ms: u64,
+    bucket_duration_ms: u64,
+    fit_content_interval_ms: Option<u64>,
+    minimum_visible_pixels: u32,
+    fail_below_fps: Option<f64>,
+    summary: TimelineLiveViewSelfTestSummaryReport,
+    samples: Vec<TimelineLiveViewSelfTestSampleReport>,
+}
+
+#[derive(Debug, Facet)]
+struct TimelineLiveViewSelfTestSummaryReport {
+    samples: usize,
+    median_average_fps: f64,
+    median_average_frame_ms: f64,
+    median_p50_frame_ms: f64,
+    median_p95_frame_ms: f64,
+    median_max_frame_ms: f64,
+    worst_frame_ms: f64,
+    median_frames_observed: u64,
+    median_lowest_interval_average_fps: f64,
+    worst_interval_average_fps: f64,
+    median_last_interval_average_fps: f64,
+    worst_interval_p95_frame_ms: f64,
+    max_dataset_item_count: u64,
+    max_live_record_count: u64,
+    max_live_span_count: u64,
+    max_active_span_count: u64,
+}
+
+#[derive(Debug, Facet)]
+struct TimelineLiveViewSelfTestSampleReport {
+    viewport_mode: String,
+    bucket_duration_ms: u64,
+    fit_content_interval_ms: Option<u64>,
+    minimum_visible_pixels: u32,
+    warmup_duration_ms: u64,
+    target_sample_duration_ms: u64,
+    measured_duration_ms: f64,
+    frames_observed: u64,
+    average_fps: f64,
+    average_frame_ms: f64,
+    p50_frame_ms: f64,
+    p95_frame_ms: f64,
+    min_frame_ms: f64,
+    max_frame_ms: f64,
+    lowest_interval_average_fps: f64,
+    last_interval_average_fps: f64,
+    max_dataset_item_count: u64,
+    max_live_record_count: u64,
+    max_live_span_count: u64,
+    max_active_span_count: u64,
+    intervals: Vec<TimelineLiveViewSelfTestIntervalReport>,
+    slowest_frames: Vec<TimelineLiveViewSelfTestFrameReport>,
+}
+
+#[derive(Debug, Facet)]
+struct TimelineLiveViewSelfTestIntervalReport {
+    start_offset_ms: u64,
+    end_offset_ms: u64,
+    measured_duration_ms: f64,
+    frames_observed: u64,
+    average_fps: f64,
+    average_frame_ms: f64,
+    p50_frame_ms: f64,
+    p95_frame_ms: f64,
+    min_frame_ms: f64,
+    max_frame_ms: f64,
+    visible_start_ns: i64,
+    visible_end_ns: i64,
+    visible_duration_ns: i64,
+    minimum_visible_pixels: u32,
+    dataset_item_count: u64,
+    dataset_span_count: u64,
+    dataset_event_count: u64,
+    live_record_count: u64,
+    live_span_count: u64,
+    active_span_count: u64,
+}
+
+#[derive(Debug, Facet)]
+struct TimelineLiveViewSelfTestFrameReport {
+    start_offset_ms: u64,
+    end_offset_ms: u64,
+    frame_ms: f64,
+    visible_start_ns: i64,
+    visible_end_ns: i64,
+    visible_duration_ns: i64,
+    minimum_visible_pixels: u32,
+    dataset_item_count: u64,
+    dataset_span_count: u64,
+    dataset_event_count: u64,
+    live_record_count: u64,
+    live_span_count: u64,
+    active_span_count: u64,
+}
+
+#[instrument(level = "info", skip_all)]
+pub fn run_timeline_live_view_self_test(
+    app_home: &AppHome,
+    cache_home: &CacheHome,
+    options: TimelineLiveViewSelfTestOptions,
+) -> eyre::Result<TimelineLiveViewSelfTestResultsReport> {
+    let sample_duration_ms = options.sample_duration_ms.max(1);
+    let bucket_duration_ms = options.bucket_duration_ms.max(1).min(sample_duration_ms);
+    let samples = options.samples.max(1);
+    let config = TimelineLiveViewSelfTestConfig {
+        warmup_duration: Duration::from_millis(options.warmup_duration_ms),
+        sample_duration: Duration::from_millis(sample_duration_ms),
+        bucket_duration: Duration::from_millis(bucket_duration_ms),
+        viewport_mode: options.viewport_mode,
+        fit_content_interval: options
+            .fit_content_interval_ms
+            .map(|duration_ms| Duration::from_millis(duration_ms.max(1))),
+        minimum_visible_pixels: options.minimum_visible_pixels.max(1),
+        overlay_message: options.overlay_message,
+        block_user_input: true,
+    };
+    let mut sample_results = Vec::with_capacity(samples);
+
+    for _ in 0..samples {
+        sample_results.push(run_timeline_live_view_self_test_sample(app_home, config.clone())?);
+    }
+
+    let report = write_timeline_live_view_self_test_results(
+        app_home,
+        cache_home,
+        &sample_results,
+        options.fail_below_fps,
+    )?;
+    validate_timeline_live_view_self_test_results(&report)?;
+    Ok(report)
+}
+
+fn run_timeline_live_view_self_test_sample(
+    app_home: &AppHome,
+    config: TimelineLiveViewSelfTestConfig,
+) -> eyre::Result<TimelineLiveViewSelfTestSampleMetrics> {
+    logs::clear_logs();
+    let handle = TimelineLiveViewSelfTestHandle::new(config);
+    run_scene_window(
+        app_home,
+        SceneWindowKind::TimelinePlayground,
+        VtEngineChoice::default(),
+        SceneWindowInitialization {
+            timeline_live_view_self_test: Some(handle.clone()),
+            ..SceneWindowInitialization::default()
+        },
+    )?;
+
+    let metrics = handle
+        .result()
+        .ok_or_else(|| eyre::eyre!("timeline live view self-test did not produce a sample"))?;
+    if metrics.frame_intervals_ms.is_empty() {
+        eyre::bail!("timeline live view self-test did not observe any frame intervals")
+    }
+    Ok(metrics)
+}
+
+fn write_timeline_live_view_self_test_results(
+    app_home: &AppHome,
+    cache_home: &CacheHome,
+    sample_results: &[TimelineLiveViewSelfTestSampleMetrics],
+    fail_below_fps: Option<f64>,
+) -> eyre::Result<TimelineLiveViewSelfTestResultsReport> {
+    let results_dir = cache_home.join(TIMELINE_LIVE_VIEW_SELF_TEST_RESULTS_DIR);
+    std::fs::create_dir_all(&results_dir).wrap_err_with(|| {
+        format!(
+            "failed to create timeline live-view self-test results directory {}",
+            results_dir.display()
+        )
+    })?;
+
+    let timestamp = Utc::now();
+    let results_path = results_dir.join(format!(
+        "timeline-live-view-{}.json",
+        timestamp.format("%Y%m%dT%H%M%SZ")
+    ));
+    let report = build_timeline_live_view_self_test_results_report(
+        app_home,
+        &results_path,
+        timestamp,
+        sample_results,
+        fail_below_fps,
+    );
+    let json = facet_json::to_string_pretty(&report)
+        .wrap_err("failed to serialize timeline live-view self-test results")?;
+    std::fs::write(&results_path, json)
+        .wrap_err_with(|| format!("failed to write {}", results_path.display()))?;
+    Ok(report)
+}
+
+fn build_timeline_live_view_self_test_results_report(
+    app_home: &AppHome,
+    results_path: &Path,
+    generated_at: chrono::DateTime<Utc>,
+    sample_results: &[TimelineLiveViewSelfTestSampleMetrics],
+    fail_below_fps: Option<f64>,
+) -> TimelineLiveViewSelfTestResultsReport {
+    let sample_reports = sample_results
+        .iter()
+        .map(timeline_live_view_self_test_sample_report)
+        .collect::<Vec<_>>();
+    let viewport_mode = sample_results
+        .first()
+        .map(|sample| timeline_live_view_self_test_viewport_mode_name(sample.viewport_mode))
+        .unwrap_or("fit-content")
+        .to_owned();
+    let overlay_message = sample_results
+        .first()
+        .and_then(|sample| sample.overlay_message.clone())
+        .unwrap_or_else(|| DEFAULT_TIMELINE_LIVE_VIEW_SELF_TEST_OVERLAY_MESSAGE.to_owned());
+    let block_user_input = sample_results
+        .first()
+        .map(|sample| sample.block_user_input)
+        .unwrap_or(true);
+    let warmup_duration_ms = sample_results
+        .first()
+        .map(|sample| sample.warmup_duration_ms)
+        .unwrap_or_default();
+    let target_sample_duration_ms = sample_results
+        .first()
+        .map(|sample| sample.target_sample_duration_ms)
+        .unwrap_or_default();
+    let bucket_duration_ms = sample_results
+        .first()
+        .map(|sample| sample.bucket_duration_ms)
+        .unwrap_or_default();
+    let fit_content_interval_ms = sample_results
+        .first()
+        .and_then(|sample| sample.fit_content_interval_ms);
+    let minimum_visible_pixels = sample_results
+        .first()
+        .map(|sample| sample.minimum_visible_pixels)
+        .unwrap_or(1);
+
+    TimelineLiveViewSelfTestResultsReport {
+        results_path: results_path.display().to_string(),
+        generated_at_utc: generated_at.to_rfc3339(),
+        app_home: app_home.display().to_string(),
+        sample_count: sample_reports.len(),
+        viewport_mode,
+        overlay_message,
+        block_user_input,
+        warmup_duration_ms,
+        target_sample_duration_ms,
+        bucket_duration_ms,
+        fit_content_interval_ms,
+        minimum_visible_pixels,
+        fail_below_fps,
+        summary: timeline_live_view_self_test_summary_report(&sample_reports),
+        samples: sample_reports,
+    }
+}
+
+fn timeline_live_view_self_test_summary_report(
+    sample_reports: &[TimelineLiveViewSelfTestSampleReport],
+) -> TimelineLiveViewSelfTestSummaryReport {
+    TimelineLiveViewSelfTestSummaryReport {
+        samples: sample_reports.len(),
+        median_average_fps: median_timeline_live_view_metric(sample_reports, |report| {
+            report.average_fps
+        }),
+        median_average_frame_ms: median_timeline_live_view_metric(sample_reports, |report| {
+            report.average_frame_ms
+        }),
+        median_p50_frame_ms: median_timeline_live_view_metric(sample_reports, |report| {
+            report.p50_frame_ms
+        }),
+        median_p95_frame_ms: median_timeline_live_view_metric(sample_reports, |report| {
+            report.p95_frame_ms
+        }),
+        median_max_frame_ms: median_timeline_live_view_metric(sample_reports, |report| {
+            report.max_frame_ms
+        }),
+        worst_frame_ms: sample_reports
+            .iter()
+            .flat_map(|report| report.slowest_frames.iter().map(|frame| frame.frame_ms))
+            .reduce(f64::max)
+            .unwrap_or(0.0),
+        median_frames_observed: median_timeline_live_view_u64_metric(sample_reports, |report| {
+            report.frames_observed
+        }),
+        median_lowest_interval_average_fps: median_timeline_live_view_metric(
+            sample_reports,
+            |report| report.lowest_interval_average_fps,
+        ),
+        worst_interval_average_fps: sample_reports
+            .iter()
+            .map(|report| report.lowest_interval_average_fps)
+            .reduce(f64::min)
+            .unwrap_or(0.0),
+        median_last_interval_average_fps: median_timeline_live_view_metric(
+            sample_reports,
+            |report| report.last_interval_average_fps,
+        ),
+        worst_interval_p95_frame_ms: sample_reports
+            .iter()
+            .flat_map(|report| report.intervals.iter().map(|interval| interval.p95_frame_ms))
+            .reduce(f64::max)
+            .unwrap_or(0.0),
+        max_dataset_item_count: sample_reports
+            .iter()
+            .map(|report| report.max_dataset_item_count)
+            .max()
+            .unwrap_or(0),
+        max_live_record_count: sample_reports
+            .iter()
+            .map(|report| report.max_live_record_count)
+            .max()
+            .unwrap_or(0),
+        max_live_span_count: sample_reports
+            .iter()
+            .map(|report| report.max_live_span_count)
+            .max()
+            .unwrap_or(0),
+        max_active_span_count: sample_reports
+            .iter()
+            .map(|report| report.max_active_span_count)
+            .max()
+            .unwrap_or(0),
+    }
+}
+
+fn timeline_live_view_self_test_sample_report(
+    sample_result: &TimelineLiveViewSelfTestSampleMetrics,
+) -> TimelineLiveViewSelfTestSampleReport {
+    let mut frame_intervals_ms = sample_result.frame_intervals_ms.clone();
+    frame_intervals_ms.sort_by(|left, right| left.partial_cmp(right).unwrap_or(Ordering::Equal));
+    let interval_reports = sample_result
+        .intervals
+        .iter()
+        .map(timeline_live_view_self_test_interval_report)
+        .collect::<Vec<_>>();
+    let slowest_frames = sample_result
+        .slowest_frames
+        .iter()
+        .map(timeline_live_view_self_test_frame_report)
+        .collect::<Vec<_>>();
+
+    let frames_observed = u64::try_from(frame_intervals_ms.len()).unwrap_or(u64::MAX);
+    let average_frame_ms = if frame_intervals_ms.is_empty() {
+        0.0
+    } else {
+        sample_result.measured_duration_ms / frame_intervals_ms.len() as f64
+    };
+    let average_fps = if average_frame_ms > 0.0 {
+        1000.0 / average_frame_ms
+    } else {
+        0.0
+    };
+
+    TimelineLiveViewSelfTestSampleReport {
+        viewport_mode: timeline_live_view_self_test_viewport_mode_name(sample_result.viewport_mode)
+            .to_owned(),
+        bucket_duration_ms: sample_result.bucket_duration_ms,
+        fit_content_interval_ms: sample_result.fit_content_interval_ms,
+        minimum_visible_pixels: sample_result.minimum_visible_pixels,
+        warmup_duration_ms: sample_result.warmup_duration_ms,
+        target_sample_duration_ms: sample_result.target_sample_duration_ms,
+        measured_duration_ms: sample_result.measured_duration_ms,
+        frames_observed,
+        average_fps,
+        average_frame_ms,
+        p50_frame_ms: percentile_timeline_live_view_metric(&frame_intervals_ms, 0.50),
+        p95_frame_ms: percentile_timeline_live_view_metric(&frame_intervals_ms, 0.95),
+        min_frame_ms: frame_intervals_ms.first().copied().unwrap_or_default(),
+        max_frame_ms: frame_intervals_ms.last().copied().unwrap_or_default(),
+        lowest_interval_average_fps: interval_reports
+            .iter()
+            .map(|interval| interval.average_fps)
+            .reduce(f64::min)
+            .unwrap_or(average_fps),
+        last_interval_average_fps: interval_reports
+            .last()
+            .map(|interval| interval.average_fps)
+            .unwrap_or(average_fps),
+        max_dataset_item_count: interval_reports
+            .iter()
+            .map(|interval| interval.dataset_item_count)
+            .max()
+            .unwrap_or(0),
+        max_live_record_count: interval_reports
+            .iter()
+            .map(|interval| interval.live_record_count)
+            .max()
+            .unwrap_or(0),
+        max_live_span_count: interval_reports
+            .iter()
+            .map(|interval| interval.live_span_count)
+            .max()
+            .unwrap_or(0),
+        max_active_span_count: interval_reports
+            .iter()
+            .map(|interval| interval.active_span_count)
+            .max()
+            .unwrap_or(0),
+        intervals: interval_reports,
+        slowest_frames,
+    }
+}
+
+fn timeline_live_view_self_test_interval_report(
+    interval: &TimelineLiveViewSelfTestIntervalMetrics,
+) -> TimelineLiveViewSelfTestIntervalReport {
+    let mut frame_intervals_ms = interval.frame_intervals_ms.clone();
+    frame_intervals_ms.sort_by(|left, right| left.partial_cmp(right).unwrap_or(Ordering::Equal));
+    let frames_observed = u64::try_from(frame_intervals_ms.len()).unwrap_or(u64::MAX);
+    let average_frame_ms = if frame_intervals_ms.is_empty() {
+        0.0
+    } else {
+        interval.measured_duration_ms / frame_intervals_ms.len() as f64
+    };
+    let average_fps = if average_frame_ms > 0.0 {
+        1000.0 / average_frame_ms
+    } else {
+        0.0
+    };
+
+    TimelineLiveViewSelfTestIntervalReport {
+        start_offset_ms: interval.start_offset_ms,
+        end_offset_ms: interval.end_offset_ms,
+        measured_duration_ms: interval.measured_duration_ms,
+        frames_observed,
+        average_fps,
+        average_frame_ms,
+        p50_frame_ms: percentile_timeline_live_view_metric(&frame_intervals_ms, 0.50),
+        p95_frame_ms: percentile_timeline_live_view_metric(&frame_intervals_ms, 0.95),
+        min_frame_ms: frame_intervals_ms.first().copied().unwrap_or_default(),
+        max_frame_ms: frame_intervals_ms.last().copied().unwrap_or_default(),
+        visible_start_ns: interval.observation.visible_start_ns,
+        visible_end_ns: interval.observation.visible_end_ns,
+        visible_duration_ns: interval
+            .observation
+            .visible_end_ns
+            .saturating_sub(interval.observation.visible_start_ns),
+        minimum_visible_pixels: interval.observation.minimum_visible_pixels,
+        dataset_item_count: u64::try_from(interval.observation.dataset_item_count)
+            .unwrap_or(u64::MAX),
+        dataset_span_count: u64::try_from(interval.observation.dataset_span_count)
+            .unwrap_or(u64::MAX),
+        dataset_event_count: u64::try_from(interval.observation.dataset_event_count)
+            .unwrap_or(u64::MAX),
+        live_record_count: u64::try_from(interval.observation.live_record_count)
+            .unwrap_or(u64::MAX),
+        live_span_count: u64::try_from(interval.observation.live_span_count)
+            .unwrap_or(u64::MAX),
+        active_span_count: u64::try_from(interval.observation.active_span_count)
+            .unwrap_or(u64::MAX),
+    }
+}
+
+fn timeline_live_view_self_test_frame_report(
+    frame: &TimelineLiveViewSelfTestFrameMetrics,
+) -> TimelineLiveViewSelfTestFrameReport {
+    TimelineLiveViewSelfTestFrameReport {
+        start_offset_ms: frame.start_offset_ms,
+        end_offset_ms: frame.end_offset_ms,
+        frame_ms: frame.frame_interval_ms,
+        visible_start_ns: frame.observation.visible_start_ns,
+        visible_end_ns: frame.observation.visible_end_ns,
+        visible_duration_ns: frame
+            .observation
+            .visible_end_ns
+            .saturating_sub(frame.observation.visible_start_ns),
+        minimum_visible_pixels: frame.observation.minimum_visible_pixels,
+        dataset_item_count: u64::try_from(frame.observation.dataset_item_count)
+            .unwrap_or(u64::MAX),
+        dataset_span_count: u64::try_from(frame.observation.dataset_span_count)
+            .unwrap_or(u64::MAX),
+        dataset_event_count: u64::try_from(frame.observation.dataset_event_count)
+            .unwrap_or(u64::MAX),
+        live_record_count: u64::try_from(frame.observation.live_record_count)
+            .unwrap_or(u64::MAX),
+        live_span_count: u64::try_from(frame.observation.live_span_count)
+            .unwrap_or(u64::MAX),
+        active_span_count: u64::try_from(frame.observation.active_span_count)
+            .unwrap_or(u64::MAX),
+    }
+}
+
+fn timeline_live_view_self_test_viewport_mode_name(
+    mode: TimelineLiveViewSelfTestViewportMode,
+) -> &'static str {
+    match mode {
+        TimelineLiveViewSelfTestViewportMode::FollowTail => "follow-tail",
+        TimelineLiveViewSelfTestViewportMode::FitContent => "fit-content",
+    }
+}
+
+fn validate_timeline_live_view_self_test_results(
+    report: &TimelineLiveViewSelfTestResultsReport,
+) -> eyre::Result<()> {
+    let Some(minimum_fps) = report.fail_below_fps else {
+        return Ok(());
+    };
+    if report.summary.worst_interval_average_fps >= minimum_fps {
+        return Ok(());
+    }
+
+    eyre::bail!(
+        "timeline live-view self-test worst interval average fps {:.2} fell below requested {:.2}; report: {}",
+        report.summary.worst_interval_average_fps,
+        minimum_fps,
+        report.results_path,
+    )
+}
+
+fn percentile_timeline_live_view_metric(values: &[f64], percentile: f64) -> f64 {
+    let Some(last_index) = values.len().checked_sub(1) else {
+        return 0.0;
+    };
+    let rank = ((last_index as f64) * percentile.clamp(0.0, 1.0)).round() as usize;
+    values[rank.min(last_index)]
+}
+
+fn median_timeline_live_view_metric<T>(
+    sample_reports: &[TimelineLiveViewSelfTestSampleReport],
+    selector: T,
+) -> f64
+where
+    T: Fn(&TimelineLiveViewSelfTestSampleReport) -> f64,
+{
+    if sample_reports.is_empty() {
+        return 0.0;
+    }
+
+    let mut values = sample_reports.iter().map(selector).collect::<Vec<_>>();
+    values.sort_by(|left, right| left.partial_cmp(right).unwrap_or(Ordering::Equal));
+    let mid = values.len() / 2;
+    if values.len() % 2 == 0 {
+        f64::midpoint(values[mid - 1], values[mid])
+    } else {
+        values[mid]
+    }
+}
+
+fn median_timeline_live_view_u64_metric<T>(
+    sample_reports: &[TimelineLiveViewSelfTestSampleReport],
+    selector: T,
+) -> u64
+where
+    T: Fn(&TimelineLiveViewSelfTestSampleReport) -> u64,
+{
+    if sample_reports.is_empty() {
+        return 0;
+    }
+
+    let mut values = sample_reports.iter().map(selector).collect::<Vec<_>>();
+    values.sort_unstable();
+    let mid = values.len() / 2;
+    if values.len() % 2 == 0 {
+        u64::midpoint(values[mid - 1], values[mid])
+    } else {
+        values[mid]
+    }
+}
+
 /// os[impl window.appearance.os-chrome-none]
 #[instrument(level = "info", skip_all)]
 fn create_window(window_thread: WindowThread, window_title: &str) -> eyre::Result<WindowHandle> {
@@ -4945,6 +5924,9 @@ extern "system" fn scene_window_proc(
     lparam: LPARAM,
 ) -> LRESULT {
     let hwnd = WindowHandle::new(WindowThread::current(), hwnd);
+    if scene_window_should_block_user_input(message) {
+        return LRESULT(0);
+    }
     match message {
         WM_NCCALCSIZE => LRESULT(0),
         WM_SETFOCUS => handle_scene_focus_changed(hwnd, true),
@@ -5012,6 +5994,36 @@ extern "system" fn scene_window_proc(
         WM_DESTROY => handle_scene_destroy_message(hwnd),
         _ => def_window_proc(hwnd, message, wparam, lparam),
     }
+}
+
+fn scene_window_should_block_user_input(message: u32) -> bool {
+    if !matches!(
+        message,
+        WM_CHAR
+            | WM_KEYDOWN
+            | WM_SYSKEYDOWN
+            | WM_KEYUP
+            | WM_SYSKEYUP
+            | WM_LBUTTONDOWN
+            | WM_LBUTTONDBLCLK
+            | WM_MBUTTONDOWN
+            | WM_MOUSEMOVE
+            | WM_LBUTTONUP
+            | WM_RBUTTONDOWN
+            | WM_RBUTTONUP
+            | WM_MBUTTONUP
+            | WM_MOUSEWHEEL
+    ) {
+        return false;
+    }
+
+    with_scene_app_state(|state| {
+        Ok(state
+            .timeline_live_view_self_test
+            .as_ref()
+            .is_some_and(|self_test| self_test.is_active() && self_test.blocks_user_input()))
+    })
+    .unwrap_or(false)
 }
 
 fn handle_scene_close_message(hwnd: WindowHandle) -> LRESULT {
@@ -5253,6 +6265,13 @@ fn scene_needs_focused_timer_render(state: &SceneAppState) -> bool {
     if state.scene_kind == SceneWindowKind::TimelinePlayground
         && let Some(playground) = state.timeline_playground.as_ref()
     {
+        if state
+            .timeline_live_view_self_test
+            .as_ref()
+            .is_some_and(TimelineLiveViewSelfTestState::is_active)
+        {
+            return true;
+        }
         let live_delta =
             logs::live_tracing_snapshot_delta_since(playground.live_tracing_snapshot_revision);
         let live_active_spans_need_refresh = playground.live_tracing_follow_tail
@@ -7960,7 +8979,9 @@ fn handle_scene_mouse_wheel(
                 let anchor_x_pixels = point
                     .to_win32_point()
                     .map_or(0, |point| point.x - playground_layout.content_rect.left());
+                #[cfg(feature = "extended_observability")]
                 let previous_visible_start_ns = playground.visible_start_ns;
+                #[cfg(feature = "extended_observability")]
                 let previous_visible_end_ns = playground.visible_end_ns;
                 // timeline[impl playground.viewport-controls]
                 // timeline[impl playground.mouse-zoom-anchor]
@@ -9123,6 +10144,9 @@ fn render_scene_window_frame(
             let _span = debug_span!("timeline_playground_sync_live_events").entered();
             playground.sync_live_tracing_events();
         };
+        if let Some(self_test) = state.timeline_live_view_self_test.as_mut() {
+            self_test.prepare_frame(render_started_at, playground);
+        }
         let playground_layout = {
             #[cfg(feature = "extended_observability")]
             let _span = debug_span!("timeline_playground_layout").entered();
@@ -9223,6 +10247,19 @@ fn render_scene_window_frame(
         windows_scene::push_latency_overlay(&mut scene, layout, &overlay_view);
     }
 
+    if let Some(self_test) = state.timeline_live_view_self_test.as_ref()
+        && self_test.is_active()
+    {
+        windows_scene::push_scene_self_test_overlay(
+            &mut scene,
+            layout,
+            "SELF-TEST RUNNING",
+            self_test.overlay_message(),
+        );
+    }
+
+    let timeline_live_view_self_test_observation = timeline_live_view_self_test_observation(state);
+
     let Some(renderer) = state.renderer.as_ref() else {
         return Ok(());
     };
@@ -9254,7 +10291,34 @@ fn render_scene_window_frame(
 
     refresh_scene_focused_render_driver(state, hwnd)?;
 
+    if let Some(self_test) = state.timeline_live_view_self_test.as_mut()
+        && timeline_live_view_self_test_observation.is_some_and(|observation| {
+            self_test.record_render_start(render_started_at, observation)
+                == TimelineLiveViewSelfTestAction::CloseWindow
+        })
+    {
+        hwnd.post_close();
+    }
+
     Ok(())
+}
+
+fn timeline_live_view_self_test_observation(
+    state: &SceneAppState,
+) -> Option<TimelineLiveViewSelfTestObservation> {
+    let playground = state.timeline_playground.as_ref()?;
+    let revision = logs::live_tracing_snapshot_revision();
+    Some(TimelineLiveViewSelfTestObservation {
+        visible_start_ns: playground.visible_start_ns,
+        visible_end_ns: playground.visible_end_ns,
+        minimum_visible_pixels: playground.minimum_visible_pixels,
+        dataset_item_count: playground.dataset.items().len(),
+        dataset_span_count: playground.dataset.span_index().len(),
+        dataset_event_count: playground.dataset.event_index().len(),
+        live_record_count: revision.record_count(),
+        live_span_count: revision.span_count(),
+        active_span_count: revision.active_span_count(),
+    })
 }
 
 fn sync_timeline_audio_runtime_from_document(state: &mut SceneAppState) {
@@ -17225,6 +18289,22 @@ mod tests {
 
     static TIMELINE_LOGS_TEST_LOCK: Mutex<()> = Mutex::new(());
 
+    fn timeline_live_view_self_test_observation_for_tests(
+        active_span_count: usize,
+    ) -> TimelineLiveViewSelfTestObservation {
+        TimelineLiveViewSelfTestObservation {
+            visible_start_ns: 10,
+            visible_end_ns: 110,
+            minimum_visible_pixels: 4,
+            dataset_item_count: 12,
+            dataset_span_count: 8,
+            dataset_event_count: 4,
+            live_record_count: 16,
+            live_span_count: 9,
+            active_span_count,
+        }
+    }
+
     fn timeline_test_state(document: TimelineDocument) -> SceneAppState {
         SceneAppState {
             app_home: AppHome(std::path::PathBuf::from(".")),
@@ -17244,6 +18324,7 @@ mod tests {
             model_warning: None,
             model_warning_prepare_started_at: None,
             timeline_playground: None,
+            timeline_live_view_self_test: None,
             cursor_latency_playground: None,
             text_rendering_playground: None,
             text_rendering_drag: None,
@@ -17646,6 +18727,180 @@ mod tests {
     }
 
     #[test]
+    fn focused_timer_keeps_live_playground_running_for_timeline_self_test() {
+        let _guard = TIMELINE_LOGS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        logs::clear_logs();
+        let mut state = timeline_test_state(TimelineDocument::blank());
+        state.scene_kind = SceneWindowKind::TimelinePlayground;
+        state.window_focused = true;
+        let mut playground = TimelinePlaygroundState::new().expect("playground");
+        playground.source_mode = TimelinePlaygroundSourceMode::LiveTracingEvents;
+        playground.live_tracing_follow_tail = true;
+        playground.live_tracing_snapshot_revision = Some(logs::live_tracing_snapshot_revision());
+        state.timeline_playground = Some(playground);
+        state.timeline_live_view_self_test = Some(TimelineLiveViewSelfTestState::new(
+            TimelineLiveViewSelfTestHandle::new(TimelineLiveViewSelfTestConfig {
+                warmup_duration: Duration::from_millis(5),
+                sample_duration: Duration::from_millis(20),
+                bucket_duration: Duration::from_millis(10),
+                viewport_mode: TimelineLiveViewSelfTestViewportMode::FitContent,
+                fit_content_interval: Some(Duration::from_millis(10)),
+                minimum_visible_pixels: 4,
+                overlay_message: None,
+                block_user_input: true,
+            }),
+        ));
+
+        assert!(scene_needs_focused_timer_render(&state));
+        assert!(scene_should_use_immediate_focused_render_driver(&state));
+    }
+
+    #[test]
+    fn timeline_live_view_self_test_records_frame_intervals_after_warmup() {
+        let config = TimelineLiveViewSelfTestConfig {
+            warmup_duration: Duration::from_millis(5),
+            sample_duration: Duration::from_millis(20),
+            bucket_duration: Duration::from_millis(10),
+            viewport_mode: TimelineLiveViewSelfTestViewportMode::FitContent,
+            fit_content_interval: Some(Duration::from_millis(10)),
+            minimum_visible_pixels: 4,
+            overlay_message: None,
+            block_user_input: true,
+        };
+        let handle = TimelineLiveViewSelfTestHandle::new(config);
+        let mut self_test = TimelineLiveViewSelfTestState::new(handle.clone());
+        let started_at = Instant::now();
+        let observation = timeline_live_view_self_test_observation_for_tests(2);
+
+        assert_eq!(
+            self_test.record_render_start(started_at, observation),
+            TimelineLiveViewSelfTestAction::Continue
+        );
+        assert_eq!(
+            self_test.record_render_start(started_at + Duration::from_millis(3), observation),
+            TimelineLiveViewSelfTestAction::Continue
+        );
+        assert_eq!(
+            self_test.record_render_start(started_at + Duration::from_millis(6), observation),
+            TimelineLiveViewSelfTestAction::Continue
+        );
+        assert_eq!(
+            self_test.record_render_start(started_at + Duration::from_millis(16), observation),
+            TimelineLiveViewSelfTestAction::Continue
+        );
+        assert_eq!(
+            self_test.record_render_start(started_at + Duration::from_millis(26), observation),
+            TimelineLiveViewSelfTestAction::CloseWindow
+        );
+
+        let metrics = handle.result().expect("self-test should capture a sample");
+        assert_eq!(metrics.warmup_duration_ms, 5);
+        assert_eq!(metrics.target_sample_duration_ms, 20);
+        assert_eq!(metrics.bucket_duration_ms, 10);
+        assert_eq!(metrics.minimum_visible_pixels, 4);
+        assert_eq!(metrics.frame_intervals_ms.len(), 2);
+        assert_eq!(metrics.intervals.len(), 2);
+        assert!((metrics.measured_duration_ms - 20.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn timeline_live_view_self_test_prepare_frame_applies_fit_content_schedule() {
+        let handle = TimelineLiveViewSelfTestHandle::new(TimelineLiveViewSelfTestConfig {
+            warmup_duration: Duration::from_millis(0),
+            sample_duration: Duration::from_millis(20),
+            bucket_duration: Duration::from_millis(10),
+            viewport_mode: TimelineLiveViewSelfTestViewportMode::FitContent,
+            fit_content_interval: Some(Duration::from_millis(10)),
+            minimum_visible_pixels: 7,
+            overlay_message: None,
+            block_user_input: true,
+        });
+        let mut self_test = TimelineLiveViewSelfTestState::new(handle);
+        let mut playground = TimelinePlaygroundState::new().expect("playground");
+        let started_at = Instant::now();
+
+        self_test.prepare_frame(started_at, &mut playground);
+        let first_fit_at = self_test.last_fit_to_content_at;
+
+        self_test.prepare_frame(started_at + Duration::from_millis(5), &mut playground);
+
+        assert_eq!(playground.minimum_visible_pixels, 7);
+        assert_eq!(self_test.last_fit_to_content_at, first_fit_at);
+
+        self_test.prepare_frame(started_at + Duration::from_millis(15), &mut playground);
+
+        assert_eq!(self_test.last_fit_to_content_at, Some(started_at + Duration::from_millis(15)));
+    }
+
+    #[test]
+    fn timeline_live_view_self_test_windows_start_with_latency_overlay_visible() {
+        let default_overlay = initial_latency_overlay(false);
+        assert!(!default_overlay.is_visible());
+
+        assert!(initial_latency_overlay(true).is_visible());
+    }
+
+    #[test]
+    fn timeline_live_view_self_test_sample_report_computes_fps_metrics() {
+        let report = timeline_live_view_self_test_sample_report(
+            &TimelineLiveViewSelfTestSampleMetrics {
+                warmup_duration_ms: 100,
+                target_sample_duration_ms: 500,
+                bucket_duration_ms: 250,
+                viewport_mode: TimelineLiveViewSelfTestViewportMode::FitContent,
+                fit_content_interval_ms: Some(250),
+                minimum_visible_pixels: 4,
+                overlay_message: Some("test overlay".to_owned()),
+                block_user_input: true,
+                measured_duration_ms: 100.0,
+                frame_intervals_ms: vec![10.0, 20.0, 30.0, 40.0],
+                intervals: vec![TimelineLiveViewSelfTestIntervalMetrics {
+                    start_offset_ms: 0,
+                    end_offset_ms: 100,
+                    measured_duration_ms: 100.0,
+                    frame_intervals_ms: vec![10.0, 20.0, 30.0, 40.0],
+                    observation: timeline_live_view_self_test_observation_for_tests(3),
+                }],
+                slowest_frames: vec![TimelineLiveViewSelfTestFrameMetrics {
+                    start_offset_ms: 60,
+                    end_offset_ms: 100,
+                    frame_interval_ms: 40.0,
+                    observation: timeline_live_view_self_test_observation_for_tests(3),
+                }],
+            },
+        );
+
+        assert_eq!(report.frames_observed, 4);
+        assert!((report.average_frame_ms - 25.0).abs() < 0.001);
+        assert!((report.average_fps - 40.0).abs() < 0.001);
+        assert_eq!(report.p50_frame_ms, 30.0);
+        assert_eq!(report.p95_frame_ms, 40.0);
+        assert_eq!(report.min_frame_ms, 10.0);
+        assert_eq!(report.max_frame_ms, 40.0);
+        assert_eq!(report.lowest_interval_average_fps, 40.0);
+        assert_eq!(report.max_dataset_item_count, 12);
+        assert_eq!(report.max_active_span_count, 3);
+        assert_eq!(report.slowest_frames.len(), 1);
+        assert_eq!(report.slowest_frames[0].frame_ms, 40.0);
+    }
+
+    #[test]
+    fn timeline_playground_fit_content_biases_extra_room_to_the_right() {
+        let mut dataset = TimelineDataset::new();
+        dataset.push_event(TimelineItemInput::new("start"), TimelineInstantNs::new(100));
+        dataset.push_event(TimelineItemInput::new("end"), TimelineInstantNs::new(200));
+        let mut playground = TimelinePlaygroundState::new().expect("playground");
+        playground.dataset = Arc::new(dataset);
+
+        playground.fit_to_content();
+
+        assert_eq!(playground.visible_start_ns, 90);
+        assert_eq!(playground.visible_end_ns, 220);
+    }
+
+    #[test]
     fn focused_timer_skips_live_playground_for_recent_frame_mark_only_updates() {
         let _guard = TIMELINE_LOGS_TEST_LOCK
             .lock()
@@ -17736,7 +18991,8 @@ mod tests {
             playground.sync_live_tracing_events();
 
             let revision = playground.live_tracing_snapshot_revision;
-            let previous_sync = Instant::now() - TIMELINE_PLAYGROUND_LIVE_SYNC_MIN_INTERVAL;
+            let previous_sync =
+                Instant::now() - TIMELINE_PLAYGROUND_LIVE_FOLLOW_TAIL_SYNC_MIN_INTERVAL;
             playground.last_live_tracing_sync_at = Some(previous_sync);
 
             playground.sync_live_tracing_events();
@@ -18247,10 +19503,21 @@ mod tests {
         playground.last_live_tracing_sync_at = Some(now);
 
         assert!(playground.should_throttle_live_tracing_sync(
-            now + TIMELINE_PLAYGROUND_LIVE_SYNC_MIN_INTERVAL - Duration::from_millis(1)
+            now + TIMELINE_PLAYGROUND_LIVE_OVERVIEW_SYNC_MIN_INTERVAL - Duration::from_millis(1)
         ));
         assert!(!playground.should_throttle_live_tracing_sync(
-            now + TIMELINE_PLAYGROUND_LIVE_SYNC_MIN_INTERVAL
+            now + TIMELINE_PLAYGROUND_LIVE_OVERVIEW_SYNC_MIN_INTERVAL
+        ));
+
+        playground.live_tracing_follow_tail = true;
+        playground.last_live_tracing_sync_at = Some(now);
+
+        assert!(playground.should_throttle_live_tracing_sync(
+            now + TIMELINE_PLAYGROUND_LIVE_FOLLOW_TAIL_SYNC_MIN_INTERVAL
+                - Duration::from_millis(1)
+        ));
+        assert!(!playground.should_throttle_live_tracing_sync(
+            now + TIMELINE_PLAYGROUND_LIVE_FOLLOW_TAIL_SYNC_MIN_INTERVAL
         ));
     }
 
@@ -18597,6 +19864,7 @@ mod tests {
             model_warning: None,
             model_warning_prepare_started_at: None,
             timeline_playground: None,
+            timeline_live_view_self_test: None,
             cursor_latency_playground: None,
             text_rendering_playground: None,
             text_rendering_drag: None,
@@ -18689,6 +19957,7 @@ mod tests {
             model_warning: None,
             model_warning_prepare_started_at: None,
             timeline_playground: None,
+            timeline_live_view_self_test: None,
             cursor_latency_playground: None,
             text_rendering_playground: None,
             text_rendering_drag: None,
@@ -18783,6 +20052,7 @@ mod tests {
             model_warning: None,
             model_warning_prepare_started_at: None,
             timeline_playground: None,
+            timeline_live_view_self_test: None,
             cursor_latency_playground: None,
             text_rendering_playground: None,
             text_rendering_drag: None,
@@ -18868,6 +20138,7 @@ mod tests {
             model_warning: None,
             model_warning_prepare_started_at: None,
             timeline_playground: None,
+            timeline_live_view_self_test: None,
             cursor_latency_playground: None,
             text_rendering_playground: None,
             text_rendering_drag: None,

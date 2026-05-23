@@ -46,6 +46,9 @@ The `self-test` command group must expose a `keyboard-input` subcommand.
 cli[command.surface.self-test-terminal-throughput]
 The `self-test` command group must expose a `terminal-throughput` subcommand.
 
+cli[command.surface.self-test-timeline-live-view]
+The `self-test` command group must expose a `timeline-live-view` subcommand.
+
 cli[command.surface.self-test-terminal-replay]
 The `self-test` command group must expose a headless terminal replay subcommand for deterministic transcript-driven validation.
 
@@ -72,6 +75,33 @@ The `self-test terminal-throughput` command must support `--line-count` to contr
 
 cli[self-test.terminal-throughput.samples-flag]
 The `self-test terminal-throughput` command must support `--samples` to run multiple benchmark samples and report median results.
+
+cli[self-test.timeline-live-view.sample-ms-flag]
+The `self-test timeline-live-view` command must support `--sample-ms` to control the measured live-view sample duration.
+
+cli[self-test.timeline-live-view.warmup-ms-flag]
+The `self-test timeline-live-view` command must support `--warmup-ms` to skip startup frames before FPS sampling begins.
+
+cli[self-test.timeline-live-view.samples-flag]
+The `self-test timeline-live-view` command must support `--samples` to run multiple live-view samples and report median results.
+
+cli[self-test.timeline-live-view.bucket-ms-flag]
+The `self-test timeline-live-view` command must support `--bucket-ms` to emit per-interval FPS and dataset-growth metrics during a sample.
+
+cli[self-test.timeline-live-view.viewport-mode-flag]
+The `self-test timeline-live-view` command must support `--viewport-mode follow-tail|fit-content` so unattended runs can reproduce either tail-following or zoomed-out fit-to-content behavior.
+
+cli[self-test.timeline-live-view.fit-content-interval-ms-flag]
+The `self-test timeline-live-view` command must support `--fit-content-interval-ms` to control how often fit-content mode re-applies the zoomed-out viewport.
+
+cli[self-test.timeline-live-view.minimum-visible-pixels-flag]
+The `self-test timeline-live-view` command must support `--minimum-visible-pixels` to force a consistent folding width while collecting live-view performance data.
+
+cli[self-test.timeline-live-view.overlay-message-flag]
+The `self-test timeline-live-view` command must support `--overlay-message` to customize the non-interactive banner shown while the unattended self-test window is running.
+
+cli[self-test.timeline-live-view.fail-below-fps-flag]
+The `self-test timeline-live-view` command must support `--fail-below-fps` so unattended runs can fail fast when any measured interval bucket drops below a required FPS floor.
 
 cli[self-test.terminal-replay.artifact-output]
 The headless terminal replay self-test must support writing failure artifacts so broken states can be inspected after automated runs.

@@ -7817,6 +7817,60 @@ pub fn push_latency_overlay(
     push_latency_overlay_bars(scene, graph_rect, &view_state.frame_times_ms);
 }
 
+pub fn push_scene_self_test_overlay(
+    scene: &mut RenderScene,
+    layout: TerminalLayout,
+    title: &str,
+    message: &str,
+) {
+    let panel_rect = layout.terminal_panel_rect();
+    let margin = 18;
+    let width = (panel_rect.width() - margin * 2).clamp(360, 760);
+    let height = 72;
+    let left = panel_rect.left() + (panel_rect.width() - width) / 2;
+    let top = panel_rect.bottom() - height - margin;
+    let overlay_rect = ClientRect::new(left, top, left + width, top + height);
+    let accent_rect = ClientRect::new(
+        overlay_rect.left(),
+        overlay_rect.top(),
+        overlay_rect.right(),
+        overlay_rect.top() + 3,
+    );
+    let text_rect = ClientRect::new(
+        overlay_rect.left() + 16,
+        overlay_rect.top() + 12,
+        overlay_rect.right() - 16,
+        overlay_rect.bottom() - 12,
+    );
+
+    push_overlay_panel(
+        scene,
+        overlay_rect.to_win32_rect(),
+        [0.05, 0.06, 0.08, 0.94],
+        PanelEffect::SceneButtonCard,
+    );
+    push_overlay_panel(
+        scene,
+        overlay_rect.inset(1).to_win32_rect(),
+        [0.10, 0.11, 0.14, 0.97],
+        PanelEffect::SceneBody,
+    );
+    push_overlay_panel(
+        scene,
+        accent_rect.to_win32_rect(),
+        [0.99, 0.71, 0.18, 1.0],
+        PanelEffect::TerminalFill,
+    );
+    push_overlay_text_block(
+        scene,
+        text_rect.to_win32_rect(),
+        &format!("{title}\n{message}"),
+        12,
+        18,
+        [0.97, 0.98, 1.0, 1.0],
+    );
+}
+
 fn latency_overlay_rect(panel_rect: ClientRect, anchor: LatencyOverlayAnchor) -> ClientRect {
     let width = 254;
     let height = 128;

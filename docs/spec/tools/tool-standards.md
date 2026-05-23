@@ -40,6 +40,9 @@ The CLI must expose a `self-test keyboard-input` command surface.
 tool[cli.surface.self-test-terminal-throughput]
 The CLI must expose a `self-test terminal-throughput` command surface.
 
+tool[cli.surface.self-test-timeline-live-view]
+The CLI must expose a `self-test timeline-live-view` command surface.
+
 tool[cli.help.position-independent]
 The CLI must support requesting help from nested command positions.
 
@@ -88,6 +91,18 @@ Terminal-engine and terminal-rendering changes should prefer headless automated 
 
 tool[tests.performance.terminal-throughput-pwsh-noprofile]
 The repository should maintain a repeatable `pwsh.exe -NoProfile` terminal throughput benchmark for the `1..10000` scenario.
+
+tool[tests.performance.timeline-live-view-self-test]
+The repository should maintain a repeatable `self-test timeline-live-view` benchmark for unattended Timeline Playground FPS sampling.
+
+tool[tests.performance.timeline-live-view-fit-content-repro]
+The unattended Timeline Playground FPS benchmark should support a zoomed-out `fit-content` viewport mode with interval buckets so long-run regressions can be reproduced without manual interaction.
+
+tool[tests.performance.timeline-live-view-window-banner]
+The unattended Timeline Playground FPS benchmark should display a clear non-interactive overlay banner and ignore user input while the self-test window is active.
+
+tool[tests.performance.timeline-live-view-slowest-frames]
+The timeline live-view benchmark output should identify the slowest observed frames so automated analysis can narrow profiler captures to the most expensive time ranges.
 
 tool[tests.performance.terminal-throughput-replay]
 The repository should maintain a headless transcript replay benchmark so terminal-engine performance can be measured without PTY or window overhead.

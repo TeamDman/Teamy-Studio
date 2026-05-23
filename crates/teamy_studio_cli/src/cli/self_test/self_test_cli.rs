@@ -1,6 +1,7 @@
 use crate::cli::self_test::image_upscale_reference::SelfTestImageUpscaleReferenceArgs;
 use crate::cli::self_test::keyboard_input::SelfTestKeyboardInputArgs;
 use crate::cli::self_test::render_offscreen::SelfTestRenderOffscreenArgs;
+use crate::cli::self_test::timeline_live_view::SelfTestTimelineLiveViewArgs;
 use crate::cli::self_test::terminal_replay::SelfTestTerminalReplayArgs;
 use crate::cli::self_test::terminal_throughput::SelfTestTerminalThroughputArgs;
 use arbitrary::Arbitrary;
@@ -33,6 +34,9 @@ pub enum SelfTestCommand {
     // cli[impl command.surface.self-test-terminal-throughput]
     /// Run the terminal throughput benchmark.
     TerminalThroughput(SelfTestTerminalThroughputArgs),
+    // cli[impl command.surface.self-test-timeline-live-view]
+    /// Run the live timeline view FPS self-test.
+    TimelineLiveView(SelfTestTimelineLiveViewArgs),
     // cli[impl command.surface.self-test-terminal-replay]
     /// Run a headless terminal transcript replay.
     TerminalReplay(SelfTestTerminalReplayArgs),
@@ -54,6 +58,7 @@ impl SelfTestArgs {
             SelfTestCommand::ImageUpscaleReference(args) => args.invoke(app_home, cache_home),
             SelfTestCommand::KeyboardInput(args) => args.invoke(app_home, cache_home),
             SelfTestCommand::TerminalThroughput(args) => args.invoke(app_home, cache_home),
+            SelfTestCommand::TimelineLiveView(args) => args.invoke(app_home, cache_home),
             SelfTestCommand::TerminalReplay(args) => args.invoke(app_home, cache_home),
             SelfTestCommand::RenderOffscreen(args) => args.invoke(app_home, cache_home),
         }

@@ -4,6 +4,14 @@ Each subcommand implementation must live in a new `{}_{}_{}_cli.rs` file that `m
 Additional documentation that captures historical decision making is located [here](docs/notes).
 The active crate-refactor plan is located [here](plan.md).
 
+## Workspace Search Scope
+
+This VS Code workspace contains many unrelated workspace members and large external directories.
+
+- Restrict every file, text, semantic, and code search to the workspace member the target is expected to be in.
+- Prefer narrowing further to the relevant crate, directory, or file subtree when possible.
+- Do not run unscoped workspace-wide searches from this repository when a Teamy-Studio-scoped search will do.
+
 ## Current Refactor Mission
 
 We are breaking the current monolith into separate crates to reduce compile times **without losing any behavior or functionality**.
