@@ -82,9 +82,10 @@ use crate::model::KNOWN_WHISPER_MODELS;
 use crate::paths::{AppHome, CacheHome};
 use crate::timeline::{
     TimelineDataset, TimelineDocument, TimelineGroupingMode, TimelineInstantNs, TimelineItemKind,
-    TimelinePlaygroundDetail, TimelineRenderPlan, TimelineRenderRowKey, TimelineSyntheticConfig,
-    TimelineTimeNs, TimelineTimeRangeNs, TimelineTrackId, TimelineViewport, TimelineViewportQuery,
-    generate_synthetic_timeline_dataset, timeline_playground_detail_for_render_item,
+    TimelinePlaygroundDetail, TimelineRenderItem, TimelineRenderPlan, TimelineRenderRowKey,
+    TimelineSyntheticConfig, TimelineTimeNs, TimelineTimeRangeNs, TimelineTrackId,
+    TimelineViewport, TimelineViewportQuery, generate_synthetic_timeline_dataset,
+    timeline_playground_detail_for_render_item,
 };
 use crate::win32_support::clipboard::{read_clipboard, write_clipboard};
 use crate::win32_support::module::get_current_module;
@@ -169,7 +170,7 @@ const TERMINAL_THROUGHPUT_BENCHMARK_POLL_INTERVAL: Duration = Duration::from_mil
 const TIMELINE_ZOOM_ANIMATION_DURATION: Duration = Duration::from_millis(220);
 const TIMELINE_PLAYGROUND_ROW_ANIMATION_DURATION: Duration = Duration::from_millis(180);
 const TIMELINE_PLAYGROUND_FRAME_MARK_SYNC_INTERVAL: Duration = Duration::from_millis(100);
-const TIMELINE_PLAYGROUND_LIVE_SYNC_MIN_INTERVAL: Duration = Duration::from_micros(6_944);
+const TIMELINE_PLAYGROUND_LIVE_SYNC_MIN_INTERVAL: Duration = Duration::from_millis(16);
 const TIMELINE_PLAYGROUND_LIVE_INITIAL_DURATION_NS: i64 = 30_000_000_000;
 const MODEL_WARNING_PREPARE_HOLD_DURATION: Duration = Duration::from_millis(1400);
 const LOG_TOAST_DURATION: Duration = Duration::from_secs(5);
@@ -491,16 +492,20 @@ struct SceneWindowInitialization {
 struct TimelinePlaygroundDetailWindowHandle {
     shared: Arc<Mutex<TimelinePlaygroundDetailWindowState>>,
     hwnd: Arc<Mutex<Option<isize>>>,
+    owner_hwnd: Arc<Mutex<Option<isize>>>,
 }
 
 impl TimelinePlaygroundDetailWindowHandle {
     fn new(detail: TimelinePlaygroundDetail, pinned: bool) -> Self {
+        let context_text = format!("{}", detail.pretty());
         Self {
             shared: Arc::new(Mutex::new(TimelinePlaygroundDetailWindowState {
                 detail: Some(detail),
                 pinned,
+                context_text,
             })),
             hwnd: Arc::new(Mutex::new(None)),
+            owner_hwnd: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -508,6 +513,70 @@ impl TimelinePlaygroundDetailWindowHandle {
         if let Ok(mut state) = self.shared.lock() {
             state.detail = Some(detail);
         }
+        self.post_changed_message();
+    }
+
+    fn update_context_text(&self, context_text: String) {
+        let changed = if let Ok(mut state) = self.shared.lock() {
+            if state.context_text == context_text {
+                false
+            } else {
+                state.context_text = context_text;
+                true
+            }
+        } else {
+            false
+        };
+        if changed {
+            self.post_changed_message();
+        }
+    }
+
+    fn set_window_hwnd(&self, hwnd: Option<isize>) {
+        if let Ok(mut stored) = self.hwnd.lock() {
+            *stored = hwnd;
+        }
+    }
+
+    fn set_owner_hwnd(&self, hwnd: WindowHandle) {
+        if let Ok(mut stored) = self.owner_hwnd.lock() {
+            *stored = Some(hwnd.raw().0 as isize);
+        }
+    }
+
+    fn is_window_open(&self) -> bool {
+        self.hwnd.lock().map(|hwnd| hwnd.is_some()).unwrap_or(false)
+    }
+
+    fn request_close(&self) {
+        if let Ok(hwnd) = self.hwnd.lock()
+            && let Some(raw) = *hwnd
+        {
+            let hwnd = HWND(raw as *mut c_void);
+            // Safety: the stored HWND belongs to a Teamy scene window; stale handles are tolerated by PostMessageW.
+            let _ = unsafe { PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0)) };
+        }
+    }
+
+    fn request_owner_close(&self) {
+        if let Ok(hwnd) = self.owner_hwnd.lock()
+            && let Some(raw) = *hwnd
+        {
+            let hwnd = HWND(raw as *mut c_void);
+            // Safety: the stored owner HWND belongs to the owning timeline playground window; stale handles are tolerated by PostMessageW.
+            let _ = unsafe { PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0)) };
+        }
+    }
+
+    fn is_pinned(&self) -> bool {
+        self.shared.lock().map(|state| state.pinned).unwrap_or(false)
+    }
+
+    fn same_window(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.shared, &other.shared)
+    }
+
+    fn post_changed_message(&self) {
         if let Ok(hwnd) = self.hwnd.lock()
             && let Some(raw) = *hwnd
         {
@@ -523,16 +592,13 @@ impl TimelinePlaygroundDetailWindowHandle {
             };
         }
     }
-
-    fn is_pinned(&self) -> bool {
-        self.shared.lock().map(|state| state.pinned).unwrap_or(false)
-    }
 }
 
 #[derive(Clone, Debug)]
 struct TimelinePlaygroundDetailWindowState {
     detail: Option<TimelinePlaygroundDetail>,
     pinned: bool,
+    context_text: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -575,6 +641,7 @@ struct TimelinePlaygroundState {
     row_position_animation: Option<TimelinePlaygroundRowPositionAnimation>,
     last_row_positions: Vec<(TimelineRenderRowKey, i32)>,
     hovered_item: Option<windows_scene::TimelinePlaygroundHitTarget>,
+    detail_windows: Vec<TimelinePlaygroundDetailWindowHandle>,
     hover_detail_window: Option<TimelinePlaygroundDetailWindowHandle>,
 }
 
@@ -891,6 +958,7 @@ impl TimelinePlaygroundState {
             row_position_animation: None,
             last_row_positions: Vec::new(),
             hovered_item: None,
+            detail_windows: Vec::new(),
             hover_detail_window: None,
         })
     }
@@ -911,6 +979,30 @@ impl TimelinePlaygroundState {
         self.hovered_item = None;
         self.vertical_scroll_offset = 0;
         Ok(())
+    }
+
+    fn register_detail_window_handle(&mut self, handle: TimelinePlaygroundDetailWindowHandle) {
+        if self
+            .detail_windows
+            .iter()
+            .any(|existing| existing.same_window(&handle))
+        {
+            return;
+        }
+        self.detail_windows.push(handle);
+    }
+
+    fn sync_detail_window_context(&mut self, context_text: &str) {
+        let hover_detail_window = self.hover_detail_window.clone();
+        self.detail_windows.retain(|handle| {
+            handle.is_window_open()
+                || hover_detail_window
+                    .as_ref()
+                    .is_some_and(|hover| hover.same_window(handle))
+        });
+        for handle in &self.detail_windows {
+            handle.update_context_text(context_text.to_owned());
+        }
     }
 
     fn view_state(
@@ -3450,9 +3542,8 @@ fn run_scene_window(
             state.timeline_document_command_target = Some(hwnd.raw().0 as isize);
         }
         if let Some(detail) = &state.timeline_playground_detail
-            && let Ok(mut detail_hwnd) = detail.hwnd.lock()
         {
-            *detail_hwnd = Some(hwnd.raw().0 as isize);
+            detail.set_window_hwnd(Some(hwnd.raw().0 as isize));
         }
         if let Some(playground) = &state.text_rendering_playground {
             playground.register_window(hwnd);
@@ -3502,6 +3593,7 @@ fn timeline_playground_detail_window_state(
         .unwrap_or(TimelinePlaygroundDetailWindowState {
             detail: None,
             pinned: false,
+            context_text: "No timeline item selected".to_owned(),
         })
 }
 
@@ -3565,6 +3657,7 @@ fn timeline_playground_target_at_point(
     };
     Ok(windows_scene::timeline_playground_hit_target_at_point(
         layout,
+        &playground.dataset,
         &render_plan,
         playground.view_state(None),
         &row_visual_positions,
@@ -3584,9 +3677,18 @@ fn update_timeline_playground_hover_detail_from_target(
         .and_then(|playground| playground.hover_detail_window.clone())
     {
         handle.update(detail);
+        if let Ok(context_text) = timeline_playground_context_text(state) {
+            handle.update_context_text(context_text);
+        }
+        if !handle.is_window_open() {
+            open_timeline_playground_detail_window(state, hwnd, handle.clone())?;
+        }
         return Ok(());
     }
     let handle = TimelinePlaygroundDetailWindowHandle::new(detail, false);
+    if let Ok(context_text) = timeline_playground_context_text(state) {
+        handle.update_context_text(context_text);
+    }
     open_timeline_playground_detail_window(state, hwnd, handle.clone())?;
     if let Some(playground) = state.timeline_playground.as_mut() {
         playground.hover_detail_window = Some(handle);
@@ -3601,6 +3703,9 @@ fn pin_timeline_playground_detail_from_target(
 ) -> eyre::Result<()> {
     let detail = timeline_playground_detail_from_target(state, target)?;
     let handle = TimelinePlaygroundDetailWindowHandle::new(detail, true);
+    if let Ok(context_text) = timeline_playground_context_text(state) {
+        handle.update_context_text(context_text);
+    }
     open_timeline_playground_detail_window(state, hwnd, handle)
 }
 
@@ -3616,13 +3721,17 @@ fn timeline_playground_detail_from_target(
 }
 
 fn open_timeline_playground_detail_window(
-    state: &SceneAppState,
+    state: &mut SceneAppState,
     hwnd: WindowHandle,
     detail: TimelinePlaygroundDetailWindowHandle,
 ) -> eyre::Result<()> {
     let app_home = state.app_home.clone();
     let vt_engine = state.vt_engine;
     let position = timeline_playground_detail_window_position(hwnd).ok();
+    detail.set_owner_hwnd(hwnd);
+    if let Some(playground) = state.timeline_playground.as_mut() {
+        playground.register_detail_window_handle(detail.clone());
+    }
     thread::Builder::new()
         .name("teamy-studio-timeline-playground-detail".to_owned())
         .spawn_with_current_span(move || {
@@ -4910,20 +5019,44 @@ fn handle_scene_close_message(hwnd: WindowHandle) -> LRESULT {
         let warning = (state.scene_kind == SceneWindowKind::TimelineTranscriptionSettings)
             .then(|| transcription_model_warning_for_selected_settings(state))
             .flatten();
+        let timeline_playground_detail = (state.scene_kind == SceneWindowKind::TimelinePlaygroundDetail)
+            .then(|| state.timeline_playground_detail.clone())
+            .flatten();
+        let timeline_playground_detail_windows = state
+            .timeline_playground
+            .as_ref()
+            .map(|playground| playground.detail_windows.clone())
+            .unwrap_or_default();
         Ok((
             state.app_home.clone(),
             state.vt_engine,
             warning,
             state.text_rendering_playground.clone(),
+            timeline_playground_detail,
+            timeline_playground_detail_windows,
         ))
     });
     match close_action {
-        Ok((app_home, vt_engine, warning, text_rendering_playground)) => {
+        Ok((
+            app_home,
+            vt_engine,
+            warning,
+            text_rendering_playground,
+            timeline_playground_detail,
+            timeline_playground_detail_windows,
+        )) => {
             if let Some(warning) = warning {
                 open_model_warning_window(&app_home, vt_engine, warning);
             }
             if let Some(playground) = text_rendering_playground {
                 playground.request_group_close(hwnd);
+            }
+            if let Some(detail) = timeline_playground_detail {
+                detail.request_owner_close();
+            } else {
+                for detail in timeline_playground_detail_windows {
+                    detail.request_close();
+                }
             }
             hwnd.destroy();
             LRESULT(0)
@@ -5761,6 +5894,9 @@ fn handle_scene_destroy_message(hwnd: WindowHandle) -> LRESULT {
     unregister_scene_window(hwnd);
     SCENE_APP_STATE.with(|state| {
         if let Some(state) = state.borrow_mut().as_mut() {
+            if let Some(detail) = &state.timeline_playground_detail {
+                detail.set_window_hwnd(None);
+            }
             if let Some(playground) = &state.text_rendering_playground {
                 playground.unregister_window(hwnd);
             }
@@ -8740,6 +8876,7 @@ fn render_scene_window_frame(
     {
         let detail_state = timeline_playground_detail_window_state(state);
         let pretty_text = timeline_playground_detail_pretty_text(&detail_state);
+        let button_visual_states = scene_button_visual_states(state, layout);
         windows_scene::build_timeline_playground_detail_diagnostic_render_scene(
             layout,
             window_chrome_buttons_state,
@@ -8749,6 +8886,7 @@ fn render_scene_window_frame(
             state.diagnostic_selection,
             state.diagnostic_cell_width,
             state.diagnostic_cell_height,
+            &button_visual_states,
         )
     } else if state.diagnostics_visible
         && !matches!(
@@ -9019,6 +9157,17 @@ fn render_scene_window_frame(
                 ruler_rect: playground_layout.ruler_rect,
                 content_rect: playground_layout.content_rect,
             });
+        if !playground.detail_windows.is_empty()
+            && let Ok(context_text) = timeline_playground_context_text_from_render_state(
+                playground,
+                playground_layout,
+                &render_plan,
+                &row_visual_positions,
+                state.pointer_position,
+            )
+        {
+            playground.sync_detail_window_context(&context_text);
+        }
         {
             #[cfg(feature = "extended_observability")]
             let _span = debug_span!("timeline_playground_build_render_scene").entered();
@@ -9035,12 +9184,14 @@ fn render_scene_window_frame(
     } else if state.scene_kind == SceneWindowKind::TimelinePlaygroundDetail {
         let detail_state = timeline_playground_detail_window_state(state);
         let pretty_text = timeline_playground_detail_pretty_text(&detail_state);
+        let button_visual_states = scene_button_visual_states(state, layout);
         windows_scene::build_timeline_playground_detail_render_scene(
             layout,
             window_chrome_buttons_state,
             &pretty_text,
             detail_state.pinned,
             state.diagnostic_selection,
+            &button_visual_states,
         )
     } else if state.scene_kind == SceneWindowKind::TimelineTranscriptionSettings {
         windows_scene::build_timeline_transcription_settings_render_scene(
@@ -12430,6 +12581,10 @@ fn scene_action_button_layout(
                 .controls_rect,
             76,
         ),
+        SceneWindowKind::TimelinePlaygroundDetail => (
+            windows_scene::timeline_playground_detail_controls_rect(layout),
+            48,
+        ),
         SceneWindowKind::CursorLatencyPlayground => (
             windows_scene::cursor_latency_playground_controls_rect(layout.terminal_panel_rect()),
             windows_scene::DEFAULT_MAX_BUTTON_SIZE,
@@ -12939,7 +13094,12 @@ fn perform_scene_action(
         SceneAction::CopyTimelinePlaygroundContext => {
             // timeline[impl playground.copy-context]
             with_scene_app_state(|state| {
-                let context = timeline_playground_context_text(state)?;
+                let context = if state.scene_kind == SceneWindowKind::TimelinePlaygroundDetail {
+                    let detail_state = timeline_playground_detail_window_state(state);
+                    timeline_playground_detail_pretty_text(&detail_state)
+                } else {
+                    timeline_playground_context_text(state)?
+                };
                 write_clipboard(&context).wrap_err("failed to copy timeline playground context")?;
                 Ok(())
             })?;
@@ -15252,6 +15412,10 @@ fn scene_pretty_text_target(
 fn timeline_playground_detail_pretty_text(
     detail_state: &TimelinePlaygroundDetailWindowState,
 ) -> String {
+    if !detail_state.context_text.is_empty() {
+        return detail_state.context_text.clone();
+    }
+
     detail_state.detail.as_ref().map_or_else(
         || "No timeline item selected".to_owned(),
         |detail| format!("{}", detail.pretty()),
@@ -15263,8 +15427,33 @@ fn timeline_playground_context_text(state: &SceneAppState) -> eyre::Result<Strin
         eyre::bail!("timeline playground state is missing");
     };
 
-    let query = playground.query(1_000)?;
+    let hwnd = state
+        .hwnd
+        .ok_or_else(|| eyre::eyre!("timeline playground window handle is missing"))?;
+    let layout = scene_client_layout(hwnd, state)?;
+    let playground_layout = windows_scene::timeline_playground_layout(
+        layout.terminal_panel_rect().inset(24),
+        playground.vertical_scroll_offset,
+    );
+    let query = playground.query(u32::try_from(playground_layout.content_rect.width().max(1)).unwrap_or(1))?;
     let render_plan = playground.cached_render_plan(&query);
+    let row_visual_positions = playground.row_visual_positions(&render_plan);
+    timeline_playground_context_text_from_render_state(
+        playground,
+        playground_layout,
+        &render_plan,
+        &row_visual_positions,
+        state.pointer_position,
+    )
+}
+
+fn timeline_playground_context_text_from_render_state(
+    playground: &TimelinePlaygroundState,
+    playground_layout: windows_scene::TimelinePlaygroundLayout,
+    render_plan: &TimelineRenderPlan,
+    row_visual_positions: &[(TimelineRenderRowKey, i32)],
+    pointer_position: Option<ClientPoint>,
+) -> eyre::Result<String> {
     let mut text = String::new();
     writeln!(text, "Teamy Studio Timeline Playground context")?;
     writeln!(text)?;
@@ -15299,6 +15488,83 @@ fn timeline_playground_context_text(state: &SceneAppState) -> eyre::Result<Strin
     )?;
     writeln!(text, "render_rows: {}", render_plan.rows().len())?;
     writeln!(text, "render_items: {}", render_plan.items().len())?;
+    if let Some((start, end)) = playground.dataset.closed_data_bounds() {
+        writeln!(
+            text,
+            "observed_closed_bounds_ns: {}..{}",
+            start.as_i64(),
+            end.as_i64()
+        )?;
+    } else {
+        writeln!(text, "observed_closed_bounds_ns: <none>")?;
+    }
+    writeln!(
+        text,
+        "content_rect_px: {}",
+        timeline_playground_format_rect(playground_layout.content_rect)
+    )?;
+    writeln!(
+        text,
+        "ruler_rect_px: {}",
+        timeline_playground_format_rect(playground_layout.ruler_rect)
+    )?;
+    writeln!(
+        text,
+        "row_header_rect_px: {}",
+        timeline_playground_format_rect(playground_layout.row_header_rect)
+    )?;
+
+    let hit_rects = pointer_position.map(|_| {
+        windows_scene::timeline_playground_item_hit_rects(
+            playground_layout,
+            &playground.dataset,
+            render_plan,
+            playground.view_state(None),
+            row_visual_positions,
+        )
+    });
+    if let Some(point) = pointer_position {
+        let point = point.to_win32_point()?;
+        writeln!(text, "mouse_client_px: {},{}", point.x, point.y)?;
+        writeln!(
+            text,
+            "mouse_surface: {}",
+            timeline_playground_surface_label(playground_layout, ClientPoint::new(point.x, point.y))
+        )?;
+        let mouse_targets = hit_rects
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|(rect, _)| rect.contains(ClientPoint::new(point.x, point.y)))
+            .collect::<Vec<_>>();
+        writeln!(text, "mouse_targets: {}", mouse_targets.len())?;
+        for (index, (rect, target)) in mouse_targets.into_iter().enumerate() {
+            writeln!(text)?;
+            writeln!(text, "mouse_target[{index}]:")?;
+            writeln!(
+                text,
+                "  rect_px: {}",
+                timeline_playground_format_rect(rect)
+            )?;
+            writeln!(
+                text,
+                "  render_item: {}",
+                timeline_playground_render_item_summary(target.render_item)
+            )?;
+            if let Some(detail) =
+                timeline_playground_detail_for_render_item(&playground.dataset, target.render_item)
+            {
+                timeline_playground_write_indented_block(
+                    &mut text,
+                    &format!("{}", detail.pretty()),
+                    "  ",
+                )?;
+            }
+        }
+    } else {
+        writeln!(text, "mouse_client_px: <none>")?;
+        writeln!(text, "mouse_surface: <none>")?;
+        writeln!(text, "mouse_targets: 0")?;
+    }
 
     if let Some(target) = playground.hovered_item {
         let detail =
@@ -15307,14 +15573,91 @@ fn timeline_playground_context_text(state: &SceneAppState) -> eyre::Result<Strin
                     eyre::eyre!("timeline playground hover target no longer resolves")
                 })?;
         writeln!(text)?;
+        writeln!(
+            text,
+            "hover_render_item: {}",
+            timeline_playground_render_item_summary(target.render_item)
+        )?;
         writeln!(text, "hover_detail:")?;
-        write!(text, "{}", detail.pretty())?;
+        timeline_playground_write_indented_block(&mut text, &format!("{}", detail.pretty()), "  ")?;
     } else {
         writeln!(text)?;
         writeln!(text, "hover_detail: <none>")?;
     }
 
     Ok(text)
+}
+
+fn timeline_playground_surface_label(
+    layout: windows_scene::TimelinePlaygroundLayout,
+    point: ClientPoint,
+) -> &'static str {
+    if layout.controls_rect.contains(point) {
+        "controls"
+    } else if layout.ruler_rect.contains(point) {
+        "ruler"
+    } else if layout.row_header_rect.contains(point) {
+        "row_header"
+    } else if layout.content_rect.contains(point) {
+        "content"
+    } else if layout.body_rect.contains(point) {
+        "body"
+    } else {
+        "outside"
+    }
+}
+
+fn timeline_playground_render_item_summary(render_item: TimelineRenderItem) -> String {
+    match render_item {
+        TimelineRenderItem::Span(span) => format!(
+            "span row={} lane={} open={} range_ns={}..{}",
+            span.row_id().as_u32(),
+            span.lane_index(),
+            span.is_open(),
+            span.range().start().as_i64(),
+            span.range().end().as_i64(),
+        ),
+        TimelineRenderItem::Event(event) => format!(
+            "event row={} at_ns={}",
+            event.row_id().as_u32(),
+            event.at().as_i64(),
+        ),
+        TimelineRenderItem::FoldedSpanCluster(cluster) => format!(
+            "folded_span_cluster row={} count={} range_ns={}..{}",
+            cluster.row_id().as_u32(),
+            cluster.count(),
+            cluster.range().start().as_i64(),
+            cluster.range().end().as_i64(),
+        ),
+        TimelineRenderItem::FoldedEventCluster(cluster) => format!(
+            "folded_event_cluster row={} count={} range_ns={}..{}",
+            cluster.row_id().as_u32(),
+            cluster.count(),
+            cluster.range().start().as_i64(),
+            cluster.range().end().as_i64(),
+        ),
+    }
+}
+
+fn timeline_playground_format_rect(rect: ClientRect) -> String {
+    format!(
+        "left={} top={} right={} bottom={}",
+        rect.left(),
+        rect.top(),
+        rect.right(),
+        rect.bottom(),
+    )
+}
+
+fn timeline_playground_write_indented_block(
+    text: &mut String,
+    block: &str,
+    prefix: &str,
+) -> std::fmt::Result {
+    for line in block.lines() {
+        writeln!(text, "{prefix}{line}")?;
+    }
+    Ok(())
 }
 
 fn scene_window_caption(state: &SceneAppState) -> String {
@@ -16050,6 +16393,7 @@ fn timeline_playground_item_tooltip(
     let row_visual_positions = playground.row_visual_positions(&render_plan);
     let Some(target) = windows_scene::timeline_playground_hit_target_at_point(
         layout,
+        &playground.dataset,
         &render_plan,
         playground.view_state(None),
         &row_visual_positions,
@@ -17875,6 +18219,7 @@ mod tests {
         let row_visual_positions = playground.row_visual_positions(&render_plan);
         let hit_rects = windows_scene::timeline_playground_item_hit_rects(
             playground_layout,
+            &playground.dataset,
             &render_plan,
             playground.view_state(None),
             &row_visual_positions,

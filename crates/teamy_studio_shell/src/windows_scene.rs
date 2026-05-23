@@ -24,8 +24,8 @@ use crate::model::{
 use crate::timeline::{
     TimelineDataset, TimelineDocument, TimelineGroupingMode, TimelineInstantNs,
     TimelinePlaygroundDetail, TimelineRenderItem, TimelineRenderPlan, TimelineRenderRowKey,
-    TimelineRulerTick, TimelineTimeNs, TimelineTimeRangeNs, TimelineTrack, TimelineTrackId,
-    TimelineTrackKind, TimelineViewport, TimelineViewportPoint,
+    TimelineRenderSpan, TimelineRulerTick, TimelineTimeNs, TimelineTimeRangeNs, TimelineTrack,
+    TimelineTrackId, TimelineTrackKind, TimelineViewport, TimelineViewportPoint,
 };
 
 use super::AudioTranscriptionDaemonStatusReport;
@@ -73,6 +73,9 @@ const TIMELINE_SCROLLBAR_THUMB: [f32; 4] = [0.48, 0.56, 0.66, 0.94];
 const TIMELINE_TRANSCRIPTION_MAX_CHUNK_SECONDS: f64 = 30.0;
 const TIMELINE_PLAYGROUND_ROW_HEIGHT: i32 = 74;
 const TIMELINE_PLAYGROUND_ROW_GAP: i32 = 8;
+const TIMELINE_PLAYGROUND_OPEN_SPAN_FADE_WIDTH_PX: i32 = 36;
+const TIMELINE_PLAYGROUND_DETAIL_CONTROLS_HEIGHT: i32 = 84;
+const TIMELINE_PLAYGROUND_DETAIL_MAX_BUTTON_SIZE: i32 = 48;
 const TIMELINE_TRANSCRIPTION_INACTIVITY_SECONDS: f64 = 3.0;
 const TIMELINE_TRANSCRIPTION_SETTINGS_TARGET_COLUMN_WIDTH: i32 = 92;
 const TIMELINE_TRANSCRIPTION_SETTINGS_TARGET_SOCKET_SIZE: i32 = 40;
@@ -1796,13 +1799,14 @@ pub fn build_timeline_playground_detail_render_scene(
     pretty_text: &str,
     pinned: bool,
     selection: Option<TerminalSelection>,
+    button_states: &[(SceneAction, ButtonVisualState)],
 ) -> RenderScene {
     let mut scene = build_scene_shell(
         layout,
         SceneWindowKind::TimelinePlaygroundDetail,
         window_chrome_buttons_state,
     );
-    let body_rect = layout.terminal_panel_rect().inset(22);
+    let body_rect = timeline_playground_detail_body_rect(layout);
     push_panel(
         &mut scene,
         body_rect.to_win32_rect(),
@@ -1836,16 +1840,29 @@ pub fn build_timeline_playground_detail_render_scene(
         15,
         selection,
     );
+    push_timeline_playground_detail_controls(&mut scene, layout, button_states);
     scene
 }
 
 #[must_use]
 // timeline[impl playground.detail-selectable-text]
 pub fn timeline_playground_detail_selectable_text_rect(layout: TerminalLayout) -> ClientRect {
-    let body_rect = layout.terminal_panel_rect().inset(22);
+    let body_rect = timeline_playground_detail_body_rect(layout);
+    let controls_rect = timeline_playground_detail_controls_rect(layout);
     ClientRect::new(
         body_rect.left() + 12,
         body_rect.top() + 42,
+        body_rect.right() - 12,
+        controls_rect.top() - 12,
+    )
+}
+
+#[must_use]
+pub fn timeline_playground_detail_controls_rect(layout: TerminalLayout) -> ClientRect {
+    let body_rect = timeline_playground_detail_body_rect(layout);
+    ClientRect::new(
+        body_rect.left() + 12,
+        body_rect.bottom() - TIMELINE_PLAYGROUND_DETAIL_CONTROLS_HEIGHT,
         body_rect.right() - 12,
         body_rect.bottom() - 12,
     )
@@ -1872,15 +1889,22 @@ pub fn build_timeline_playground_detail_diagnostic_render_scene(
     selection: Option<TerminalSelection>,
     cell_width: i32,
     cell_height: i32,
+    button_states: &[(SceneAction, ButtonVisualState)],
 ) -> RenderScene {
     let mut scene = build_scene_shell(
         layout,
         SceneWindowKind::TimelinePlaygroundDetail,
         window_chrome_buttons_state,
     );
-    let body_rect = layout.terminal_panel_rect().inset(20);
+    let body_rect = timeline_playground_detail_body_rect(layout).inset(2);
+    let controls_rect = timeline_playground_detail_controls_rect(layout);
     let diagnostic_scene = build_timeline_playground_detail_diagnostic_body_scene(
-        body_rect,
+        ClientRect::new(
+            body_rect.left(),
+            body_rect.top(),
+            body_rect.right(),
+            controls_rect.top() - 12,
+        ),
         detail,
         pretty_text,
         pinned,
@@ -1896,7 +1920,12 @@ pub fn build_timeline_playground_detail_diagnostic_render_scene(
         .overlay_transformed_panels
         .extend(diagnostic_scene.overlay_transformed_panels);
     scene.overlay_glyphs.extend(diagnostic_scene.overlay_glyphs);
+    push_timeline_playground_detail_controls(&mut scene, layout, button_states);
     scene
+}
+
+fn timeline_playground_detail_body_rect(layout: TerminalLayout) -> ClientRect {
+    layout.terminal_panel_rect().inset(22)
 }
 
 #[must_use]
@@ -1942,6 +1971,7 @@ pub fn timeline_playground_layout(
 // timeline[impl playground.pin-detail]
 pub fn timeline_playground_hit_target_at_point(
     layout: TerminalLayout,
+    dataset: &TimelineDataset,
     render_plan: &TimelineRenderPlan,
     view_state: TimelinePlaygroundViewState,
     row_visual_positions: &[(TimelineRenderRowKey, i32)],
@@ -1953,12 +1983,14 @@ pub fn timeline_playground_hit_target_at_point(
     );
     let row_visual_metadata =
         timeline_playground_row_visual_metadata(render_plan, row_visual_positions);
+    let observed_end_ns = timeline_playground_observed_end_ns(dataset);
     render_plan.items().iter().copied().find_map(|render_item| {
         timeline_playground_item_rect(
             playground_layout,
             render_item,
             view_state,
             &row_visual_metadata,
+            observed_end_ns,
         )
         .and_then(|rect| rect.contains(point).then_some(TimelinePlaygroundHitTarget { render_item }))
     })
@@ -1967,17 +1999,25 @@ pub fn timeline_playground_hit_target_at_point(
 #[must_use]
 pub fn timeline_playground_item_hit_rects(
     layout: TimelinePlaygroundLayout,
+    dataset: &TimelineDataset,
     render_plan: &TimelineRenderPlan,
     view_state: TimelinePlaygroundViewState,
     row_visual_positions: &[(TimelineRenderRowKey, i32)],
 ) -> Vec<(ClientRect, TimelinePlaygroundHitTarget)> {
     let row_visual_metadata = timeline_playground_row_visual_metadata(render_plan, row_visual_positions);
+    let observed_end_ns = timeline_playground_observed_end_ns(dataset);
     render_plan
         .items()
         .iter()
         .copied()
         .filter_map(|render_item| {
-            timeline_playground_item_rect(layout, render_item, view_state, &row_visual_metadata)
+            timeline_playground_item_rect(
+                layout,
+                render_item,
+                view_state,
+                &row_visual_metadata,
+                observed_end_ns,
+            )
             .map(|rect| (rect, TimelinePlaygroundHitTarget { render_item }))
         })
         .collect()
@@ -2042,6 +2082,39 @@ fn push_timeline_playground_controls(
     }
 }
 
+fn push_timeline_playground_detail_controls(
+    scene: &mut RenderScene,
+    layout: TerminalLayout,
+    button_states: &[(SceneAction, ButtonVisualState)],
+) {
+    let specs = scene_button_specs(SceneWindowKind::TimelinePlaygroundDetail);
+    let button_layouts = layout_scene_buttons(
+        timeline_playground_detail_controls_rect(layout),
+        specs.len(),
+        TIMELINE_PLAYGROUND_DETAIL_MAX_BUTTON_SIZE,
+    );
+    for (index, spec) in specs.iter().enumerate() {
+        let button_layout = button_layouts[index];
+        let visual_state = button_states
+            .iter()
+            .find_map(|(action, state)| (*action == spec.action).then_some(*state))
+            .unwrap_or_default();
+        push_panel_with_data(
+            scene,
+            button_layout.card_rect.to_win32_rect(),
+            spec.color,
+            PanelEffect::SceneButtonCard,
+            visual_state.shader_data(),
+        );
+        push_centered_text(
+            scene,
+            button_layout.label_rect.to_win32_rect(),
+            spec.label,
+            [0.94, 0.96, 0.98, 1.0],
+        );
+    }
+}
+
 fn push_timeline_playground_rows(
     scene: &mut RenderScene,
     layout: TimelinePlaygroundLayout,
@@ -2073,7 +2146,7 @@ fn push_timeline_playground_rows(
         [0.08, 0.09, 0.11, 1.0],
         PanelEffect::TerminalFill,
     );
-    for (row_index, row) in render_plan.rows().iter().enumerate() {
+    for (_row_index, row) in render_plan.rows().iter().enumerate() {
         let row_id = usize::try_from(row.id().as_u32()).unwrap_or(usize::MAX);
         let Some(row_metadata) = row_visual_metadata.get(row_id) else {
             continue;
@@ -2094,7 +2167,7 @@ fn push_timeline_playground_rows(
                 #[cfg(feature = "extended_observability")]
                 {
                     trailing_rows_skipped =
-                        render_plan.rows().len().saturating_sub(row_index);
+                        render_plan.rows().len().saturating_sub(_row_index);
                 }
                 break;
             }
@@ -2257,10 +2330,16 @@ fn push_timeline_playground_items(
     let mut visible_folded_span_cluster_count = 0_usize;
     #[cfg(feature = "extended_observability")]
     let mut visible_span_count = 0_usize;
+    let observed_end_ns = timeline_playground_observed_end_ns(dataset);
 
     for render_item in render_plan.items().iter().copied() {
-        let Some(rect) =
-            timeline_playground_item_rect(layout, render_item, view_state, row_visual_metadata)
+        let Some(rect) = timeline_playground_item_rect(
+            layout,
+            render_item,
+            view_state,
+            row_visual_metadata,
+            observed_end_ns,
+        )
         else {
             #[cfg(feature = "extended_observability")]
             {
@@ -2311,25 +2390,59 @@ fn push_timeline_playground_items(
                 unreachable!("event clusters are rendered as markers")
             }
         };
-        push_panel_with_data(
-            scene,
-            rect.to_win32_rect(),
-            if hovered {
-                [color[0] + 0.12, color[1] + 0.12, color[2] + 0.12, 1.0]
-            } else {
-                color
-            },
-            PanelEffect::SceneButtonCard,
-            ButtonVisualState {
-                hover_near: if hovered { 1.0 } else { 0.0 },
-                hovered,
-                pressed: false,
-                click_decay: 0.0,
-                active: false,
+        let display_color = if hovered {
+            [
+                (color[0] + 0.12).min(1.0),
+                (color[1] + 0.12).min(1.0),
+                (color[2] + 0.12).min(1.0),
+                1.0,
+            ]
+        } else {
+            color
+        };
+        let visual_state = ButtonVisualState {
+            hover_near: if hovered { 1.0 } else { 0.0 },
+            hovered,
+            pressed: false,
+            click_decay: 0.0,
+            active: false,
+        };
+        if let TimelineRenderItem::Span(span) = target.render_item
+            && span.is_open()
+            && let Some(fade_start_x) = timeline_playground_open_span_fade_start_x(
+                layout,
+                view_state,
+                span,
+                rect,
+                observed_end_ns,
+            )
+        {
+            let solid_rect = ClientRect::new(rect.left(), rect.top(), fade_start_x, rect.bottom());
+            if solid_rect.width() > 0 {
+                push_panel_with_data(
+                    scene,
+                    solid_rect.to_win32_rect(),
+                    display_color,
+                    PanelEffect::SceneButtonCard,
+                    visual_state.shader_data(),
+                );
+                push_timeline_playground_span_bevel(scene, solid_rect);
             }
-            .shader_data(),
-        );
-        push_timeline_playground_span_bevel(scene, rect);
+            push_timeline_playground_open_span_fade(
+                scene,
+                ClientRect::new(fade_start_x, rect.top(), rect.right(), rect.bottom()),
+                display_color,
+            );
+        } else {
+            push_panel_with_data(
+                scene,
+                rect.to_win32_rect(),
+                display_color,
+                PanelEffect::SceneButtonCard,
+                visual_state.shader_data(),
+            );
+            push_timeline_playground_span_bevel(scene, rect);
+        }
         if rect.height() < 16 || rect.width() < 28 {
             continue;
         }
@@ -2428,6 +2541,40 @@ fn push_timeline_playground_span_bevel(scene: &mut RenderScene, rect: ClientRect
     }
 }
 
+fn push_timeline_playground_open_span_fade(
+    scene: &mut RenderScene,
+    rect: ClientRect,
+    color: [f32; 4],
+) {
+    if rect.width() <= 0 || rect.height() <= 0 {
+        return;
+    }
+
+    let stripes = 6;
+    for index in 0..stripes {
+        let stripe_left = rect.left() + (rect.width() * index / stripes);
+        let stripe_right = rect.left() + (rect.width() * (index + 1) / stripes);
+        if stripe_right <= stripe_left {
+            continue;
+        }
+        let gap = if index + 1 == stripes { 0 } else { 1 };
+        let inset = i32::try_from(index % 2).unwrap_or_default();
+        let alpha = 0.56_f32 * (1.0 - (index as f32 / stripes as f32));
+        push_panel(
+            scene,
+            ClientRect::new(
+                stripe_left,
+                rect.top() + inset,
+                (stripe_right - gap).max(stripe_left + 1),
+                rect.bottom() - inset,
+            )
+            .to_win32_rect(),
+            [color[0], color[1], color[2], alpha.max(0.08)],
+            PanelEffect::SceneButtonCard,
+        );
+    }
+}
+
 fn timeline_playground_item_label_anchor_x(
     layout: TimelinePlaygroundLayout,
     render_item: TimelineRenderItem,
@@ -2436,6 +2583,9 @@ fn timeline_playground_item_label_anchor_x(
 ) -> i32 {
     match render_item {
         TimelineRenderItem::Span(span) => {
+            if span.is_open() {
+                return i32::midpoint(visible_rect.left(), visible_rect.right());
+            }
             let start_x = timeline_playground_time_to_x(layout, view_state, span.range().start());
             let end_x = timeline_playground_time_to_x(layout, view_state, span.range().end());
             i32::midpoint(start_x, end_x)
@@ -2574,6 +2724,7 @@ fn timeline_playground_item_rect(
     render_item: TimelineRenderItem,
     view_state: TimelinePlaygroundViewState,
     row_visual_metadata: &[TimelinePlaygroundRowVisualMetadata],
+    observed_end_ns: Option<TimelineInstantNs>,
 ) -> Option<ClientRect> {
     let row_id = match render_item {
         TimelineRenderItem::Span(span) => span.row_id().as_u32(),
@@ -2624,11 +2775,48 @@ fn timeline_playground_item_rect(
         TimelineRenderItem::FoldedSpanCluster(_) => timeline_playground_span_lane_rect(row_rect, 0),
         TimelineRenderItem::Event(_) | TimelineRenderItem::FoldedEventCluster(_) => row_rect,
     };
-    let (item_left, item_right) =
+    let (mut item_left, mut item_right) =
         timeline_playground_item_horizontal_bounds(layout, left, right, min_width);
+    if let TimelineRenderItem::Span(span) = render_item
+        && span.is_open()
+        && let Some(fade_start_x) = timeline_playground_open_span_fade_start_x(
+            layout,
+            view_state,
+            span,
+            ClientRect::new(item_left, lane_rect.top(), item_right, lane_rect.bottom()),
+            observed_end_ns,
+        )
+    {
+        item_right = item_right.min(
+            fade_start_x
+                .saturating_add(TIMELINE_PLAYGROUND_OPEN_SPAN_FADE_WIDTH_PX)
+                .clamp(layout.content_rect.left(), layout.content_rect.right()),
+        );
+        let minimum_open_width = min_width.min(TIMELINE_PLAYGROUND_OPEN_SPAN_FADE_WIDTH_PX).max(1);
+        if item_right.saturating_sub(item_left) < minimum_open_width {
+            item_left = item_right
+                .saturating_sub(minimum_open_width)
+                .clamp(layout.content_rect.left(), layout.content_rect.right());
+        }
+    }
     client_rect_intersection(
         ClientRect::new(item_left, lane_rect.top(), item_right, lane_rect.bottom()),
         layout.content_rect,
+    )
+}
+
+fn timeline_playground_open_span_fade_start_x(
+    layout: TimelinePlaygroundLayout,
+    view_state: TimelinePlaygroundViewState,
+    span: TimelineRenderSpan,
+    visible_rect: ClientRect,
+    observed_end_ns: Option<TimelineInstantNs>,
+) -> Option<i32> {
+    let observed_end = observed_end_ns?;
+    let solid_end = observed_end.max(span.range().start());
+    Some(
+        timeline_playground_time_to_x(layout, view_state, solid_end)
+            .clamp(visible_rect.left(), visible_rect.right()),
     )
 }
 
@@ -2774,6 +2962,10 @@ fn timeline_playground_closed_data_bounds(
     dataset
         .closed_data_bounds()
         .map(|(start, end)| (start.min(TimelineInstantNs::new(0)), end))
+}
+
+fn timeline_playground_observed_end_ns(dataset: &TimelineDataset) -> Option<TimelineInstantNs> {
+    timeline_playground_closed_data_bounds(dataset).map(|(_, end)| end)
 }
 
 fn timeline_playground_time_to_x(
@@ -3116,14 +3308,6 @@ pub fn scene_button_specs(scene_kind: SceneWindowKind) -> &'static [SceneButtonS
                 color: [0.18, 0.28, 0.22, 1.0],
             },
             SceneButtonSpec {
-                // timeline[impl playground.copy-context]
-                action: SceneAction::CopyTimelinePlaygroundContext,
-                label: "Copy Context",
-                tooltip: "Copy playground viewport and hover context (Ctrl+Shift+C)",
-                sprite: SpriteId::Terminal,
-                color: [0.22, 0.24, 0.18, 1.0],
-            },
-            SceneButtonSpec {
                 // timeline[impl playground.query-controls]
                 action: SceneAction::TimelinePlaygroundGroupingGroupKey,
                 label: "Group",
@@ -3171,37 +3355,15 @@ pub fn scene_button_specs(scene_kind: SceneWindowKind) -> &'static [SceneButtonS
                 sprite: SpriteId::Terminal,
                 color: [0.26, 0.20, 0.22, 1.0],
             },
+        ],
+        SceneWindowKind::TimelinePlaygroundDetail => &[
             SceneButtonSpec {
-                // timeline[impl playground.viewport-controls]
-                action: SceneAction::PanTimelineLeft,
-                label: "Pan Left",
-                tooltip: "Move the playground viewport earlier",
+                // timeline[impl playground.copy-context]
+                action: SceneAction::CopyTimelinePlaygroundContext,
+                label: "Copy Text",
+                tooltip: "Copy playground diagnostics and current hover context (Ctrl+Shift+C)",
                 sprite: SpriteId::Terminal,
-                color: [0.17, 0.22, 0.27, 1.0],
-            },
-            SceneButtonSpec {
-                // timeline[impl playground.viewport-controls]
-                action: SceneAction::PanTimelineRight,
-                label: "Pan Right",
-                tooltip: "Move the playground viewport later",
-                sprite: SpriteId::Terminal,
-                color: [0.17, 0.22, 0.27, 1.0],
-            },
-            SceneButtonSpec {
-                // timeline[impl playground.viewport-controls]
-                action: SceneAction::ZoomTimelineIn,
-                label: "Zoom In",
-                tooltip: "Zoom into the playground viewport",
-                sprite: SpriteId::Terminal,
-                color: [0.16, 0.24, 0.30, 1.0],
-            },
-            SceneButtonSpec {
-                // timeline[impl playground.viewport-controls]
-                action: SceneAction::ZoomTimelineOut,
-                label: "Zoom Out",
-                tooltip: "Zoom the playground viewport out",
-                sprite: SpriteId::Terminal,
-                color: [0.17, 0.20, 0.29, 1.0],
+                color: [0.22, 0.24, 0.18, 1.0],
             },
         ],
         SceneWindowKind::CursorLatencyPlayground
@@ -3216,7 +3378,6 @@ pub fn scene_button_specs(scene_kind: SceneWindowKind) -> &'static [SceneButtonS
         | SceneWindowKind::TextRenderingPlaygroundPlane
         | SceneWindowKind::TextRenderingPlaygroundEditor
         | SceneWindowKind::TextRenderingPlaygroundSpriteSheet
-        | SceneWindowKind::TimelinePlaygroundDetail
         | SceneWindowKind::TimelineTranscriptionSettings
         | SceneWindowKind::ModelWarning => &[],
         SceneWindowKind::TextRenderingPlaygroundPresets => &TEXT_RENDERING_PRESET_BUTTON_SPECS,
@@ -10757,10 +10918,19 @@ mod tests {
         assert!(actions.contains(&SceneAction::TimelinePlaygroundGroupingAll));
         assert!(actions.contains(&SceneAction::DecreaseTimelinePlaygroundFolding));
         assert!(actions.contains(&SceneAction::IncreaseTimelinePlaygroundFolding));
-        assert!(actions.contains(&SceneAction::PanTimelineLeft));
-        assert!(actions.contains(&SceneAction::PanTimelineRight));
-        assert!(actions.contains(&SceneAction::ZoomTimelineIn));
-        assert!(actions.contains(&SceneAction::ZoomTimelineOut));
+        assert!(!actions.contains(&SceneAction::CopyTimelinePlaygroundContext));
+        assert!(!actions.contains(&SceneAction::PanTimelineLeft));
+        assert!(!actions.contains(&SceneAction::PanTimelineRight));
+        assert!(!actions.contains(&SceneAction::ZoomTimelineIn));
+        assert!(!actions.contains(&SceneAction::ZoomTimelineOut));
+    }
+
+    #[test]
+    fn timeline_playground_detail_scene_specs_expose_copy_button() {
+        let specs = scene_button_specs(SceneWindowKind::TimelinePlaygroundDetail);
+        let actions = specs.iter().map(|spec| spec.action).collect::<Vec<_>>();
+
+        assert_eq!(actions, vec![SceneAction::CopyTimelinePlaygroundContext]);
     }
 
     #[test]
@@ -10859,8 +11029,13 @@ mod tests {
             &[],
             &[],
         );
-        let hit_rects =
-            timeline_playground_item_hit_rects(playground_layout, &render_plan, view_state, &[]);
+        let hit_rects = timeline_playground_item_hit_rects(
+            playground_layout,
+            &dataset,
+            &render_plan,
+            view_state,
+            &[],
+        );
         let (first_rect, first_target) = hit_rects.first().copied().expect("hit target");
         let hit_point = rect_center_point(first_rect);
 
@@ -10870,6 +11045,7 @@ mod tests {
         assert_eq!(
             timeline_playground_hit_target_at_point(
                 layout,
+                &dataset,
                 &render_plan,
                 view_state,
                 &[],
@@ -11174,6 +11350,7 @@ mod tests {
             render_item,
             view_state,
             &row_visual_metadata,
+            timeline_playground_observed_end_ns(&dataset),
         )
             .expect("visible span rect");
 
@@ -11181,6 +11358,79 @@ mod tests {
             rect.width() > i32::try_from(view_state.minimum_visible_pixels).expect("minimum width")
         );
         assert_eq!(rect.width(), layout.content_rect.width() / 2);
+    }
+
+    #[test]
+    fn timeline_playground_open_span_hit_rect_stops_after_observed_end_fade() {
+        let mut dataset = crate::timeline::TimelineDataset::new();
+        dataset.push_event(
+            crate::timeline::TimelineItemInput::new("last-closed").with_group_key("thread-a"),
+            crate::timeline::TimelineInstantNs::new(40),
+        );
+        let open_span_id = dataset
+            .push_span(
+                crate::timeline::TimelineItemInput::new("running").with_group_key("thread-a"),
+                crate::timeline::TimelineInstantNs::new(10),
+                None,
+            )
+            .expect("span");
+        dataset.compact();
+        let layout = timeline_playground_layout(sample_layout().terminal_panel_rect().inset(24), 0);
+        let view_state = TimelinePlaygroundViewState {
+            source_label: "synthetic",
+            seed: 0,
+            grouping_mode: crate::timeline::TimelineGroupingMode::GroupKey,
+            minimum_visible_pixels: 6,
+            visible_start_ns: 0,
+            visible_end_ns: 100,
+            vertical_scroll_offset: 0,
+            hovered_item: None,
+            cursor_position: None,
+        };
+        let query = crate::timeline::TimelineViewportQuery::try_new(
+            crate::timeline::TimelineInstantNs::new(view_state.visible_start_ns),
+            crate::timeline::TimelineInstantNs::new(view_state.visible_end_ns),
+            crate::timeline::TimelineInstantNs::new(view_state.visible_end_ns),
+            u32::try_from(layout.content_rect.width()).expect("positive viewport"),
+        )
+        .expect("query")
+        .with_grouping_mode(view_state.grouping_mode)
+        .with_minimum_visible_pixels(view_state.minimum_visible_pixels);
+        let render_plan = dataset.render_plan(&query);
+        let render_item = render_plan
+            .items()
+            .iter()
+            .copied()
+            .find(|item| {
+                matches!(
+                    item,
+                    crate::timeline::TimelineRenderItem::Span(span) if span.item_id() == open_span_id
+                )
+            })
+            .expect("open span render item");
+        let row_visual_metadata = timeline_playground_row_visual_metadata(&render_plan, &[]);
+
+        let rect = timeline_playground_item_rect(
+            layout,
+            render_item,
+            view_state,
+            &row_visual_metadata,
+            timeline_playground_observed_end_ns(&dataset),
+        )
+        .expect("visible open span rect");
+        let observed_end_x = timeline_playground_time_to_x(
+            layout,
+            view_state,
+            crate::timeline::TimelineInstantNs::new(40),
+        );
+
+        assert!(rect.right() > observed_end_x);
+        assert!(rect.right() < layout.content_rect.right());
+        assert!(
+            rect.right()
+                <= observed_end_x
+                    .saturating_add(TIMELINE_PLAYGROUND_OPEN_SPAN_FADE_WIDTH_PX)
+        );
     }
 
     #[test]
@@ -11240,7 +11490,7 @@ mod tests {
         .with_minimum_visible_pixels(view_state.minimum_visible_pixels);
         let plan = dataset.render_plan(&query);
 
-        let hit_rects = timeline_playground_item_hit_rects(layout, &plan, view_state, &[]);
+        let hit_rects = timeline_playground_item_hit_rects(layout, &dataset, &plan, view_state, &[]);
 
         assert_eq!(hit_rects.len(), 1);
         assert!(hit_rects[0].0.top() >= layout.content_rect.top());
@@ -11285,7 +11535,7 @@ mod tests {
         .with_minimum_visible_pixels(view_state.minimum_visible_pixels);
         let plan = dataset.render_plan(&query);
 
-        let hit_rects = timeline_playground_item_hit_rects(layout, &plan, view_state, &[]);
+        let hit_rects = timeline_playground_item_hit_rects(layout, &dataset, &plan, view_state, &[]);
 
         assert!(hit_rects.is_empty());
         assert!(timeline_playground_row_rect(layout, 0).is_some());
@@ -11362,6 +11612,7 @@ mod tests {
             "plain \x1b[31mred\x1b[0m done",
             false,
             None,
+            &[],
         );
         assert!(scene.glyphs.iter().all(|glyph| glyph.character != '\u{1b}'));
         assert!(scene.glyphs.iter().any(|glyph| {
