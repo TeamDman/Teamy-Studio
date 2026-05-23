@@ -1,9 +1,9 @@
 use crate::cli::self_test::image_upscale_reference::SelfTestImageUpscaleReferenceArgs;
 use crate::cli::self_test::keyboard_input::SelfTestKeyboardInputArgs;
 use crate::cli::self_test::render_offscreen::SelfTestRenderOffscreenArgs;
-use crate::cli::self_test::timeline_live_view::SelfTestTimelineLiveViewArgs;
 use crate::cli::self_test::terminal_replay::SelfTestTerminalReplayArgs;
 use crate::cli::self_test::terminal_throughput::SelfTestTerminalThroughputArgs;
+use crate::cli::self_test::timeline_live_view::SelfTestTimelineLiveViewArgs;
 use arbitrary::Arbitrary;
 use facet::Facet;
 use figue as args;

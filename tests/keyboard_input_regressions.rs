@@ -5,6 +5,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 struct TempDirGuard {
@@ -33,7 +34,65 @@ impl Drop for TempDirGuard {
     }
 }
 
+fn keyboard_self_test_guard() -> MutexGuard<'static, ()> {
+    static KEYBOARD_SELF_TEST_LOCK: Mutex<()> = Mutex::new(());
+    KEYBOARD_SELF_TEST_LOCK
+        .lock()
+        .expect("keyboard self-test lock should not be poisoned")
+}
+
+fn ratatui_key_debug_repo() -> Option<PathBuf> {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .find_map(|ancestor| {
+            let repo_dir = ancestor.join("ratatui-key-debug");
+            repo_dir.join("Cargo.toml").is_file().then_some(repo_dir)
+        })
+}
+
+fn ensure_ratatui_key_debug_path() -> Option<PathBuf> {
+    static RATATUI_KEY_DEBUG_PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
+
+    RATATUI_KEY_DEBUG_PATH
+        .get_or_init(|| {
+            if let Ok(path) = std::env::var("TEAMY_KEYBOARD_SELF_TEST_RATATUI_PATH") {
+                let path = PathBuf::from(path);
+                assert!(
+                    path.is_file(),
+                    "TEAMY_KEYBOARD_SELF_TEST_RATATUI_PATH should point to an existing file: {}",
+                    path.display()
+                );
+                return Some(path);
+            }
+
+            let repo_dir = ratatui_key_debug_repo()?;
+            let exe_path = repo_dir
+                .join("target")
+                .join("debug")
+                .join("ratatui_key_debug.exe");
+            if exe_path.is_file() {
+                return Some(exe_path);
+            }
+
+            let status = Command::new("cargo")
+                .current_dir(&repo_dir)
+                .args(["build", "--bin", "ratatui_key_debug"])
+                .status()
+                .expect("ratatui_key_debug build should launch");
+            assert!(status.success(), "ratatui_key_debug build should succeed");
+            assert!(
+                exe_path.is_file(),
+                "ratatui_key_debug.exe should exist after building {}",
+                repo_dir.display()
+            );
+
+            Some(exe_path)
+        })
+        .clone()
+}
+
 fn run_keyboard_self_test(probe_path: &str) -> std::process::Output {
+    let _guard = keyboard_self_test_guard();
     let app_home = TempDirGuard::new("teamy-studio-keyboard-self-test-home");
     Command::new(env!("CARGO_BIN_EXE_teamy-studio"))
         .env("COMSPEC", probe_path)
@@ -47,6 +106,7 @@ fn run_keyboard_self_test(probe_path: &str) -> std::process::Output {
 }
 
 fn run_crossterm_keyboard_self_test() -> std::process::Output {
+    let _guard = keyboard_self_test_guard();
     let app_home = TempDirGuard::new("teamy-studio-crossterm-self-test-home");
     Command::new(env!("CARGO_BIN_EXE_teamy-studio"))
         .env("COMSPEC", env!("CARGO_BIN_EXE_crossterm_key_probe"))
@@ -60,6 +120,7 @@ fn run_crossterm_keyboard_self_test() -> std::process::Output {
 }
 
 fn run_default_cmd_keyboard_self_test() -> std::process::Output {
+    let _guard = keyboard_self_test_guard();
     let app_home = TempDirGuard::new("teamy-studio-default-cmd-self-test-home");
     Command::new(env!("CARGO_BIN_EXE_teamy-studio"))
         .env("COMSPEC", "cmd.exe")
@@ -71,7 +132,8 @@ fn run_default_cmd_keyboard_self_test() -> std::process::Output {
         .expect("default cmd keyboard self-test should launch")
 }
 
-fn run_default_cmd_ratatui_keyboard_self_test() -> std::process::Output {
+fn run_default_cmd_ratatui_keyboard_self_test(ratatui_path: &Path) -> std::process::Output {
+    let _guard = keyboard_self_test_guard();
     let app_home = TempDirGuard::new("teamy-studio-default-cmd-ratatui-self-test-home");
     Command::new(env!("CARGO_BIN_EXE_teamy-studio"))
         .env("COMSPEC", "cmd.exe")
@@ -80,16 +142,14 @@ fn run_default_cmd_ratatui_keyboard_self_test() -> std::process::Output {
             "TEAMY_KEYBOARD_SELF_TEST_CASE",
             "default-cmd-ratatui-key-debug",
         )
-        .env(
-            "TEAMY_KEYBOARD_SELF_TEST_RATATUI_PATH",
-            "g:\\Programming\\Repos\\ratatui-key-debug\\target\\debug\\ratatui_key_debug.exe",
-        )
+        .env("TEAMY_KEYBOARD_SELF_TEST_RATATUI_PATH", ratatui_path)
         .args(["self-test", "keyboard-input"])
         .output()
         .expect("default cmd ratatui keyboard self-test should launch")
 }
 
 fn run_named_pwsh_keyboard_self_test(scenario: &str, vt_engine: &str) -> std::process::Output {
+    let _guard = keyboard_self_test_guard();
     let app_home = TempDirGuard::new("teamy-studio-pwsh-keyboard-self-test-home");
     Command::new(env!("CARGO_BIN_EXE_teamy-studio"))
         .env("COMSPEC", "pwsh.exe")
@@ -151,7 +211,14 @@ fn test_issue_keyboard_input_default_cmd_enter_runs_command() {
 
 #[test]
 fn test_issue_keyboard_input_default_cmd_ratatui_key_debug_reproduction() {
-    let output = run_default_cmd_ratatui_keyboard_self_test();
+    let Some(ratatui_path) = ensure_ratatui_key_debug_path() else {
+        eprintln!(
+            "skipping ratatui key debug regression: sibling ratatui-key-debug repo not available"
+        );
+        return;
+    };
+
+    let output = run_default_cmd_ratatui_keyboard_self_test(&ratatui_path);
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
@@ -199,6 +266,7 @@ fn test_issue_keyboard_input_teamy_noprofile_resize_restores_prompt() {
     );
 }
 
+#[cfg(feature = "ghostty")]
 #[test]
 fn test_issue_keyboard_input_ghostty_noprofile_resize_restores_prompt() {
     let output =

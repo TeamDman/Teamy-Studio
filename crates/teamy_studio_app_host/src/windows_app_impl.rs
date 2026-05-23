@@ -22,7 +22,9 @@ use tracing::{debug, error, info, info_span, instrument};
 use uom::si::f64::Time;
 use uom::si::time::{nanosecond, second};
 use widestring::{U16CStr, U16CString};
-use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
+use windows::Win32::Foundation::{
+    CloseHandle, HANDLE, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM,
+};
 use windows::Win32::Graphics::Dwm::{
     DWMWA_BORDER_COLOR, DWMWA_COLOR_NONE, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND,
     DwmSetWindowAttribute,
@@ -59,21 +61,20 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, HTCAPTION, HTCLIENT,
     HTTRANSPARENT, HWND_NOTOPMOST, HWND_TOPMOST, IDC_ARROW, IDC_CROSS, IDC_HAND, IDC_HELP,
     IDC_IBEAM, IDC_SIZEALL, IDC_SIZEWE, IDC_WAIT, IsWindowVisible, IsZoomed, KillTimer,
-    LoadCursorW, MSG, MoveWindow, MsgWaitForMultipleObjectsEx, PM_REMOVE,
-    PeekMessageW, PostMessageW, PostQuitMessage, QS_ALLINPUT, RegisterClassExW,
-    SM_CXPADDEDBORDER, SM_CXSCREEN, SM_CXSIZEFRAME, SM_CXVIRTUALSCREEN, SM_CYSCREEN,
-    SM_CYSIZEFRAME, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SW_HIDE, SW_MAXIMIZE,
-    SW_MINIMIZE, SW_RESTORE, SW_SHOW, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
-    SWP_NOZORDER, SYSTEM_METRICS_INDEX, SendMessageW, SetCursor, SetCursorPos, SetForegroundWindow,
-    SetTimer, SetWindowPos, SetWindowTextW, ShowWindow, TranslateMessage, WINDOW_EX_STYLE,
-    WINDOW_STYLE, WM_APP, WM_CHAR, WM_CLOSE, WM_DESTROY, WM_DPICHANGED, WM_ENTERSIZEMOVE,
-    WM_ERASEBKGND, WM_EXITSIZEMOVE, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS, WM_LBUTTONDBLCLK,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
-    WM_MOVE, WM_NCCALCSIZE, WM_NCHITTEST, WM_NCLBUTTONDOWN, WM_PAINT, WM_QUIT, WM_RBUTTONDOWN,
-    WM_RBUTTONUP, WM_SETCURSOR, WM_SETFOCUS, WM_SIZE, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER,
-    WNDCLASSEXW, WS_EX_APPWINDOW, WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW,
-    WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP, WS_THICKFRAME,
-    WS_VISIBLE,
+    LoadCursorW, MSG, MoveWindow, MsgWaitForMultipleObjectsEx, PM_REMOVE, PeekMessageW,
+    PostMessageW, PostQuitMessage, QS_ALLINPUT, RegisterClassExW, SM_CXPADDEDBORDER, SM_CXSCREEN,
+    SM_CXSIZEFRAME, SM_CXVIRTUALSCREEN, SM_CYSCREEN, SM_CYSIZEFRAME, SM_CYVIRTUALSCREEN,
+    SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SW_HIDE, SW_MAXIMIZE, SW_MINIMIZE, SW_RESTORE, SW_SHOW,
+    SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SYSTEM_METRICS_INDEX,
+    SendMessageW, SetCursor, SetCursorPos, SetForegroundWindow, SetTimer, SetWindowPos,
+    SetWindowTextW, ShowWindow, TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CHAR,
+    WM_CLOSE, WM_DESTROY, WM_DPICHANGED, WM_ENTERSIZEMOVE, WM_ERASEBKGND, WM_EXITSIZEMOVE,
+    WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_MOVE, WM_NCCALCSIZE,
+    WM_NCHITTEST, WM_NCLBUTTONDOWN, WM_PAINT, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR,
+    WM_SETFOCUS, WM_SIZE, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WNDCLASSEXW, WS_EX_APPWINDOW,
+    WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+    WS_EX_TRANSPARENT, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP, WS_THICKFRAME, WS_VISIBLE,
 };
 use windows::core::{BOOL, PCWSTR, w};
 
@@ -173,10 +174,8 @@ const TIMELINE_LIVE_VIEW_SELF_TEST_SLOW_FRAME_LIMIT: usize = 8;
 const TIMELINE_ZOOM_ANIMATION_DURATION: Duration = Duration::from_millis(220);
 const TIMELINE_PLAYGROUND_ROW_ANIMATION_DURATION: Duration = Duration::from_millis(180);
 const TIMELINE_PLAYGROUND_FRAME_MARK_SYNC_INTERVAL: Duration = Duration::from_millis(100);
-const TIMELINE_PLAYGROUND_LIVE_FOLLOW_TAIL_SYNC_MIN_INTERVAL: Duration =
-    Duration::from_millis(16);
-const TIMELINE_PLAYGROUND_LIVE_OVERVIEW_SYNC_MIN_INTERVAL: Duration =
-    Duration::from_millis(100);
+const TIMELINE_PLAYGROUND_LIVE_FOLLOW_TAIL_SYNC_MIN_INTERVAL: Duration = Duration::from_millis(16);
+const TIMELINE_PLAYGROUND_LIVE_OVERVIEW_SYNC_MIN_INTERVAL: Duration = Duration::from_millis(100);
 const TIMELINE_PLAYGROUND_FIT_CONTENT_LEADING_PADDING_DIVISOR: i64 = 10;
 const TIMELINE_PLAYGROUND_FIT_CONTENT_TRAILING_PADDING_DIVISOR: i64 = 5;
 const TIMELINE_PLAYGROUND_LIVE_INITIAL_DURATION_NS: i64 = 30_000_000_000;
@@ -579,7 +578,10 @@ impl TimelinePlaygroundDetailWindowHandle {
     }
 
     fn is_pinned(&self) -> bool {
-        self.shared.lock().map(|state| state.pinned).unwrap_or(false)
+        self.shared
+            .lock()
+            .map(|state| state.pinned)
+            .unwrap_or(false)
     }
 
     fn same_window(&self, other: &Self) -> bool {
@@ -875,10 +877,12 @@ impl TimelineLiveViewSelfTestState {
                 playground.live_tracing_follow_tail = true;
             }
             TimelineLiveViewSelfTestViewportMode::FitContent => {
-                let interval = config.fit_content_interval.unwrap_or(config.bucket_duration);
-                let should_fit = self.last_fit_to_content_at.is_none_or(|last| {
-                    now.saturating_duration_since(last) >= interval
-                });
+                let interval = config
+                    .fit_content_interval
+                    .unwrap_or(config.bucket_duration);
+                let should_fit = self
+                    .last_fit_to_content_at
+                    .is_none_or(|last| now.saturating_duration_since(last) >= interval);
                 if should_fit {
                     playground.fit_to_content();
                     self.last_fit_to_content_at = Some(now);
@@ -910,8 +914,14 @@ impl TimelineLiveViewSelfTestState {
                     now.duration_since(previous_started_at).as_secs_f64() * 1000.0;
                 if frame_interval_ms.is_finite() && frame_interval_ms > 0.0 {
                     self.frame_intervals_ms.push(frame_interval_ms);
-                    self.current_interval_frame_intervals_ms.push(frame_interval_ms);
-                    self.record_slow_frame(previous_started_at, now, frame_interval_ms, observation);
+                    self.current_interval_frame_intervals_ms
+                        .push(frame_interval_ms);
+                    self.record_slow_frame(
+                        previous_started_at,
+                        now,
+                        frame_interval_ms,
+                        observation,
+                    );
                 }
             }
             self.current_interval_observation = Some(observation);
@@ -962,15 +972,17 @@ impl TimelineLiveViewSelfTestState {
         )
         .unwrap_or(u64::MAX);
         let end_offset_ms = u64::try_from(
-            now.saturating_duration_since(measurement_started_at).as_millis(),
+            now.saturating_duration_since(measurement_started_at)
+                .as_millis(),
         )
         .unwrap_or(u64::MAX);
-        self.slowest_frames.push(TimelineLiveViewSelfTestFrameMetrics {
-            start_offset_ms,
-            end_offset_ms,
-            frame_interval_ms,
-            observation,
-        });
+        self.slowest_frames
+            .push(TimelineLiveViewSelfTestFrameMetrics {
+                start_offset_ms,
+                end_offset_ms,
+                frame_interval_ms,
+                observation,
+            });
         self.slowest_frames.sort_by(|left, right| {
             right
                 .frame_interval_ms
@@ -1005,16 +1017,18 @@ impl TimelineLiveViewSelfTestState {
         )
         .unwrap_or(u64::MAX);
         let end_offset_ms = u64::try_from(
-            now.saturating_duration_since(measurement_started_at).as_millis(),
+            now.saturating_duration_since(measurement_started_at)
+                .as_millis(),
         )
         .unwrap_or(u64::MAX);
-        self.intervals.push(TimelineLiveViewSelfTestIntervalMetrics {
-            start_offset_ms,
-            end_offset_ms,
-            measured_duration_ms: self.current_interval_frame_intervals_ms.iter().sum(),
-            frame_intervals_ms: std::mem::take(&mut self.current_interval_frame_intervals_ms),
-            observation,
-        });
+        self.intervals
+            .push(TimelineLiveViewSelfTestIntervalMetrics {
+                start_offset_ms,
+                end_offset_ms,
+                measured_duration_ms: self.current_interval_frame_intervals_ms.iter().sum(),
+                frame_intervals_ms: std::mem::take(&mut self.current_interval_frame_intervals_ms),
+                observation,
+            });
         self.current_interval_observation = None;
         self.current_interval_started_at = restart.then_some(now);
     }
@@ -1480,9 +1494,8 @@ impl TimelinePlaygroundState {
 
     fn should_throttle_live_tracing_sync(&self, now: Instant) -> bool {
         let sync_interval = self.live_tracing_sync_min_interval();
-        self.last_live_tracing_sync_at.is_some_and(|last| {
-            now.saturating_duration_since(last) < sync_interval
-        })
+        self.last_live_tracing_sync_at
+            .is_some_and(|last| now.saturating_duration_since(last) < sync_interval)
     }
 
     fn live_tracing_sync_min_interval(&self) -> Duration {
@@ -1657,9 +1670,9 @@ impl TimelinePlaygroundState {
         let content_duration = visible_duration_ns_i64(start, end);
         let leading_padding =
             (content_duration / TIMELINE_PLAYGROUND_FIT_CONTENT_LEADING_PADDING_DIVISOR).max(1);
-        let trailing_padding =
-            (content_duration / TIMELINE_PLAYGROUND_FIT_CONTENT_TRAILING_PADDING_DIVISOR)
-                .max(leading_padding);
+        let trailing_padding = (content_duration
+            / TIMELINE_PLAYGROUND_FIT_CONTENT_TRAILING_PADDING_DIVISOR)
+            .max(leading_padding);
         self.visible_start_ns = start.saturating_sub(leading_padding);
         self.visible_end_ns = end
             .saturating_add(trailing_padding)
@@ -3463,12 +3476,15 @@ fn scene_should_poll_for_focused_render_work(state: &SceneAppState) -> bool {
     }
 
     state.scene_kind == SceneWindowKind::TimelinePlayground
-        && state.timeline_playground.as_ref().is_some_and(|playground| {
-            matches!(
-                playground.source_mode,
-                TimelinePlaygroundSourceMode::LiveTracingEvents
-            ) && playground.live_tracing_follow_tail
-        })
+        && state
+            .timeline_playground
+            .as_ref()
+            .is_some_and(|playground| {
+                matches!(
+                    playground.source_mode,
+                    TimelinePlaygroundSourceMode::LiveTracingEvents
+                ) && playground.live_tracing_follow_tail
+            })
 }
 
 fn scene_focused_render_wait_ms() -> Option<u32> {
@@ -3491,8 +3507,7 @@ fn scene_focused_render_deadline(
     next_wait_ms: u32,
 ) -> Instant {
     if current_wait_ms == Some(next_wait_ms) {
-        current_deadline
-            .unwrap_or_else(|| now + scene_focused_render_wait_duration(next_wait_ms))
+        current_deadline.unwrap_or_else(|| now + scene_focused_render_wait_duration(next_wait_ms))
     } else {
         now + scene_focused_render_wait_duration(next_wait_ms)
     }
@@ -3953,8 +3968,7 @@ fn run_scene_window(
         {
             state.timeline_document_command_target = Some(hwnd.raw().0 as isize);
         }
-        if let Some(detail) = &state.timeline_playground_detail
-        {
+        if let Some(detail) = &state.timeline_playground_detail {
             detail.set_window_hwnd(Some(hwnd.raw().0 as isize));
         }
         if let Some(playground) = &state.text_rendering_playground {
@@ -4055,7 +4069,8 @@ fn timeline_playground_target_at_point(
     let query = {
         #[cfg(feature = "extended_observability")]
         let _span = debug_span!("timeline_playground_hit_test_query").entered();
-        playground.query(u32::try_from(playground_layout.content_rect.width().max(1)).unwrap_or(1))?
+        playground
+            .query(u32::try_from(playground_layout.content_rect.width().max(1)).unwrap_or(1))?
     };
     let render_plan = {
         #[cfg(feature = "extended_observability")]
@@ -4806,7 +4821,10 @@ pub fn run_timeline_live_view_self_test(
     let mut sample_results = Vec::with_capacity(samples);
 
     for _ in 0..samples {
-        sample_results.push(run_timeline_live_view_self_test_sample(app_home, config.clone())?);
+        sample_results.push(run_timeline_live_view_self_test_sample(
+            app_home,
+            config.clone(),
+        )?);
     }
 
     let report = write_timeline_live_view_self_test_results(
@@ -4983,7 +5001,12 @@ fn timeline_live_view_self_test_summary_report(
         ),
         worst_interval_p95_frame_ms: sample_reports
             .iter()
-            .flat_map(|report| report.intervals.iter().map(|interval| interval.p95_frame_ms))
+            .flat_map(|report| {
+                report
+                    .intervals
+                    .iter()
+                    .map(|interval| interval.p95_frame_ms)
+            })
             .reduce(f64::max)
             .unwrap_or(0.0),
         max_dataset_item_count: sample_reports
@@ -5130,8 +5153,7 @@ fn timeline_live_view_self_test_interval_report(
             .unwrap_or(u64::MAX),
         live_record_count: u64::try_from(interval.observation.live_record_count)
             .unwrap_or(u64::MAX),
-        live_span_count: u64::try_from(interval.observation.live_span_count)
-            .unwrap_or(u64::MAX),
+        live_span_count: u64::try_from(interval.observation.live_span_count).unwrap_or(u64::MAX),
         active_span_count: u64::try_from(interval.observation.active_span_count)
             .unwrap_or(u64::MAX),
     }
@@ -5151,18 +5173,13 @@ fn timeline_live_view_self_test_frame_report(
             .visible_end_ns
             .saturating_sub(frame.observation.visible_start_ns),
         minimum_visible_pixels: frame.observation.minimum_visible_pixels,
-        dataset_item_count: u64::try_from(frame.observation.dataset_item_count)
-            .unwrap_or(u64::MAX),
-        dataset_span_count: u64::try_from(frame.observation.dataset_span_count)
-            .unwrap_or(u64::MAX),
+        dataset_item_count: u64::try_from(frame.observation.dataset_item_count).unwrap_or(u64::MAX),
+        dataset_span_count: u64::try_from(frame.observation.dataset_span_count).unwrap_or(u64::MAX),
         dataset_event_count: u64::try_from(frame.observation.dataset_event_count)
             .unwrap_or(u64::MAX),
-        live_record_count: u64::try_from(frame.observation.live_record_count)
-            .unwrap_or(u64::MAX),
-        live_span_count: u64::try_from(frame.observation.live_span_count)
-            .unwrap_or(u64::MAX),
-        active_span_count: u64::try_from(frame.observation.active_span_count)
-            .unwrap_or(u64::MAX),
+        live_record_count: u64::try_from(frame.observation.live_record_count).unwrap_or(u64::MAX),
+        live_span_count: u64::try_from(frame.observation.live_span_count).unwrap_or(u64::MAX),
+        active_span_count: u64::try_from(frame.observation.active_span_count).unwrap_or(u64::MAX),
     }
 }
 
@@ -5414,8 +5431,7 @@ fn scene_window_starts_without_activation(
     scene_kind: SceneWindowKind,
     timeline_playground_detail_is_pinned: bool,
 ) -> bool {
-    scene_kind == SceneWindowKind::TimelinePlaygroundDetail
-        && !timeline_playground_detail_is_pinned
+    scene_kind == SceneWindowKind::TimelinePlaygroundDetail && !timeline_playground_detail_is_pinned
 }
 
 fn scene_renderer_presentation_mode(scene_kind: SceneWindowKind) -> RendererPresentationMode {
@@ -6031,7 +6047,8 @@ fn handle_scene_close_message(hwnd: WindowHandle) -> LRESULT {
         let warning = (state.scene_kind == SceneWindowKind::TimelineTranscriptionSettings)
             .then(|| transcription_model_warning_for_selected_settings(state))
             .flatten();
-        let timeline_playground_detail = (state.scene_kind == SceneWindowKind::TimelinePlaygroundDetail)
+        let timeline_playground_detail = (state.scene_kind
+            == SceneWindowKind::TimelinePlaygroundDetail)
             .then(|| state.timeline_playground_detail.clone())
             .flatten();
         let timeline_playground_detail_windows = state
@@ -6167,9 +6184,12 @@ fn scene_uses_always_redrawn_late_latched_frame_model(state: &SceneAppState) -> 
 
 fn scene_uses_refresh_timer_for_playground_animation(state: &SceneAppState) -> bool {
     state.scene_kind == SceneWindowKind::TimelinePlayground
-        && state.timeline_playground.as_ref().is_some_and(|playground| {
-            playground.zoom_animation.is_some() || playground.row_position_animation.is_some()
-        })
+        && state
+            .timeline_playground
+            .as_ref()
+            .is_some_and(|playground| {
+                playground.zoom_animation.is_some() || playground.row_position_animation.is_some()
+            })
 }
 
 fn scene_allows_unfocused_focused_render_tick(state: &SceneAppState) -> bool {
@@ -6184,12 +6204,15 @@ fn scene_requires_force_redraw_for_immediate_focused_render_loop(state: &SceneAp
 
 fn scene_live_playground_prefers_immediate_focused_render_loop(state: &SceneAppState) -> bool {
     state.scene_kind == SceneWindowKind::TimelinePlayground
-        && state.timeline_playground.as_ref().is_some_and(|playground| {
-            matches!(
-                playground.source_mode,
-                TimelinePlaygroundSourceMode::LiveTracingEvents
-            ) && playground.live_tracing_follow_tail
-        })
+        && state
+            .timeline_playground
+            .as_ref()
+            .is_some_and(|playground| {
+                matches!(
+                    playground.source_mode,
+                    TimelinePlaygroundSourceMode::LiveTracingEvents
+                ) && playground.live_tracing_follow_tail
+            })
 }
 
 fn handle_scene_focused_render_tick(hwnd: WindowHandle, from_wake: bool) -> LRESULT {
@@ -9997,8 +10020,9 @@ fn render_scene_window_frame(
         )
     } else if state.scene_kind == SceneWindowKind::CursorLatencyPlayground {
         let button_visual_states = scene_button_visual_states(state, layout);
-        let play_area_rect =
-            windows_scene::cursor_latency_playground_rendered_content_rect(layout.terminal_panel_rect());
+        let play_area_rect = windows_scene::cursor_latency_playground_rendered_content_rect(
+            layout.terminal_panel_rect(),
+        );
         let cursor_latency_state = state
             .cursor_latency_playground
             .as_mut()
@@ -12265,7 +12289,10 @@ fn open_timeline_transcription_settings_window_from_scene(track_index: usize) ->
                     ..Default::default()
                 },
             ) {
-                error!(?error, "failed to open timeline transcription settings window");
+                error!(
+                    ?error,
+                    "failed to open timeline transcription settings window"
+                );
             }
         })
         .wrap_err("failed to spawn Teamy Studio timeline transcription settings window thread")?;
@@ -16499,7 +16526,8 @@ fn timeline_playground_context_text(state: &SceneAppState) -> eyre::Result<Strin
         layout.terminal_panel_rect().inset(24),
         playground.vertical_scroll_offset,
     );
-    let query = playground.query(u32::try_from(playground_layout.content_rect.width().max(1)).unwrap_or(1))?;
+    let query = playground
+        .query(u32::try_from(playground_layout.content_rect.width().max(1)).unwrap_or(1))?;
     let render_plan = playground.cached_render_plan(&query);
     let row_visual_positions = playground.row_visual_positions(&render_plan);
     timeline_playground_context_text_from_render_state(
@@ -16593,7 +16621,10 @@ fn timeline_playground_context_text_from_render_state(
         writeln!(
             text,
             "mouse_surface: {}",
-            timeline_playground_surface_label(playground_layout, ClientPoint::new(point.x, point.y))
+            timeline_playground_surface_label(
+                playground_layout,
+                ClientPoint::new(point.x, point.y)
+            )
         )?;
         let mouse_targets = hit_rects
             .unwrap_or_default()
@@ -16604,11 +16635,7 @@ fn timeline_playground_context_text_from_render_state(
         for (index, (rect, target)) in mouse_targets.into_iter().enumerate() {
             writeln!(text)?;
             writeln!(text, "mouse_target[{index}]:")?;
-            writeln!(
-                text,
-                "  rect_px: {}",
-                timeline_playground_format_rect(rect)
-            )?;
+            writeln!(text, "  rect_px: {}", timeline_playground_format_rect(rect))?;
             writeln!(
                 text,
                 "  render_item: {}",
@@ -17447,7 +17474,8 @@ fn timeline_playground_item_tooltip(
     let query = {
         #[cfg(feature = "extended_observability")]
         let _span = debug_span!("timeline_playground_tooltip_query").entered();
-        playground.query(u32::try_from(playground_layout.content_rect.width().max(1)).unwrap_or(1))?
+        playground
+            .query(u32::try_from(playground_layout.content_rect.width().max(1)).unwrap_or(1))?
     };
     let render_plan = {
         #[cfg(feature = "extended_observability")]
@@ -18530,12 +18558,7 @@ mod tests {
         let deadline = scene_focused_render_deadline(start, None, None, 4);
         let message_wake = start + Duration::from_millis(1);
 
-        let preserved = scene_focused_render_deadline(
-            message_wake,
-            Some(deadline),
-            Some(4),
-            4,
-        );
+        let preserved = scene_focused_render_deadline(message_wake, Some(deadline), Some(4), 4);
 
         assert_eq!(preserved, deadline);
     }
@@ -18546,12 +18569,7 @@ mod tests {
         let deadline = scene_focused_render_deadline(start, None, None, 4);
         let message_wake = start + Duration::from_millis(1);
 
-        let reset = scene_focused_render_deadline(
-            message_wake,
-            Some(deadline),
-            Some(4),
-            8,
-        );
+        let reset = scene_focused_render_deadline(message_wake, Some(deadline), Some(4), 8);
 
         assert_eq!(reset, message_wake + Duration::from_millis(8));
     }
@@ -18672,7 +18690,9 @@ mod tests {
         state.timeline_playground = Some(playground);
 
         assert!(scene_should_poll_for_focused_render_work(&state));
-        assert!(scene_live_playground_prefers_immediate_focused_render_loop(&state));
+        assert!(scene_live_playground_prefers_immediate_focused_render_loop(
+            &state
+        ));
         assert!(!scene_should_use_immediate_focused_render_driver(&state));
     }
 
@@ -18717,7 +18737,8 @@ mod tests {
             let mut playground = TimelinePlaygroundState::new().expect("playground");
             playground.source_mode = TimelinePlaygroundSourceMode::LiveTracingEvents;
             playground.live_tracing_follow_tail = true;
-            playground.live_tracing_snapshot_revision = Some(logs::live_tracing_snapshot_revision());
+            playground.live_tracing_snapshot_revision =
+                Some(logs::live_tracing_snapshot_revision());
             state.timeline_playground = Some(playground);
 
             assert!(scene_needs_focused_timer_render(&state));
@@ -18831,7 +18852,10 @@ mod tests {
 
         self_test.prepare_frame(started_at + Duration::from_millis(15), &mut playground);
 
-        assert_eq!(self_test.last_fit_to_content_at, Some(started_at + Duration::from_millis(15)));
+        assert_eq!(
+            self_test.last_fit_to_content_at,
+            Some(started_at + Duration::from_millis(15))
+        );
     }
 
     #[test]
@@ -18844,8 +18868,8 @@ mod tests {
 
     #[test]
     fn timeline_live_view_self_test_sample_report_computes_fps_metrics() {
-        let report = timeline_live_view_self_test_sample_report(
-            &TimelineLiveViewSelfTestSampleMetrics {
+        let report =
+            timeline_live_view_self_test_sample_report(&TimelineLiveViewSelfTestSampleMetrics {
                 warmup_duration_ms: 100,
                 target_sample_duration_ms: 500,
                 bucket_duration_ms: 250,
@@ -18869,8 +18893,7 @@ mod tests {
                     frame_interval_ms: 40.0,
                     observation: timeline_live_view_self_test_observation_for_tests(3),
                 }],
-            },
-        );
+            });
 
         assert_eq!(report.frames_observed, 4);
         assert!((report.average_frame_ms - 25.0).abs() < 0.001);
@@ -18998,9 +19021,11 @@ mod tests {
             playground.sync_live_tracing_events();
 
             assert_eq!(playground.live_tracing_snapshot_revision, revision);
-            assert!(playground
-                .last_live_tracing_sync_at
-                .is_some_and(|last| last > previous_sync));
+            assert!(
+                playground
+                    .last_live_tracing_sync_at
+                    .is_some_and(|last| last > previous_sync)
+            );
         });
     }
 
@@ -19018,8 +19043,8 @@ mod tests {
         playground.source_mode = TimelinePlaygroundSourceMode::LiveTracingEvents;
         playground.live_tracing_follow_tail = true;
         playground.live_tracing_snapshot_revision = Some(logs::live_tracing_snapshot_revision());
-        playground.last_live_tracing_sync_at = Instant::now()
-            .checked_sub(Duration::from_millis(17));
+        playground.last_live_tracing_sync_at =
+            Instant::now().checked_sub(Duration::from_millis(17));
         state.timeline_playground = Some(playground);
 
         let subscriber = tracing_subscriber::Registry::default().with(logs::LogCollectorLayer);
@@ -19044,8 +19069,8 @@ mod tests {
         playground.source_mode = TimelinePlaygroundSourceMode::LiveTracingEvents;
         playground.live_tracing_follow_tail = true;
         playground.live_tracing_snapshot_revision = Some(logs::live_tracing_snapshot_revision());
-        playground.last_live_tracing_sync_at = Instant::now()
-            .checked_sub(Duration::from_millis(17));
+        playground.last_live_tracing_sync_at =
+            Instant::now().checked_sub(Duration::from_millis(17));
         state.timeline_playground = Some(playground);
 
         let subscriber = tracing_subscriber::Registry::default().with(logs::LogCollectorLayer);
@@ -19513,8 +19538,7 @@ mod tests {
         playground.last_live_tracing_sync_at = Some(now);
 
         assert!(playground.should_throttle_live_tracing_sync(
-            now + TIMELINE_PLAYGROUND_LIVE_FOLLOW_TAIL_SYNC_MIN_INTERVAL
-                - Duration::from_millis(1)
+            now + TIMELINE_PLAYGROUND_LIVE_FOLLOW_TAIL_SYNC_MIN_INTERVAL - Duration::from_millis(1)
         ));
         assert!(!playground.should_throttle_live_tracing_sync(
             now + TIMELINE_PLAYGROUND_LIVE_FOLLOW_TAIL_SYNC_MIN_INTERVAL

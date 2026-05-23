@@ -13,7 +13,9 @@ pub enum SelfTestTimelineLiveViewViewportMode {
     FitContent,
 }
 
-impl From<SelfTestTimelineLiveViewViewportMode> for crate::app::TimelineLiveViewSelfTestViewportMode {
+impl From<SelfTestTimelineLiveViewViewportMode>
+    for crate::app::TimelineLiveViewSelfTestViewportMode
+{
     fn from(value: SelfTestTimelineLiveViewViewportMode) -> Self {
         match value {
             SelfTestTimelineLiveViewViewportMode::FollowTail => Self::FollowTail,
@@ -84,29 +86,31 @@ impl SelfTestTimelineLiveViewArgs {
     ) -> eyre::Result<CliOutput> {
         let sample_ms = self.sample_ms.unwrap_or(5_000).max(1);
         let bucket_ms = self.bucket_ms.unwrap_or(1_000).max(1).min(sample_ms);
-        Ok(CliOutput::facet(crate::app::run_timeline_live_view_self_test(
-            app_home,
-            cache_home,
-            crate::app::TimelineLiveViewSelfTestOptions {
-                sample_duration_ms: sample_ms,
-                warmup_duration_ms: self.warmup_ms.unwrap_or(1_000),
-                bucket_duration_ms: bucket_ms,
-                samples: self.samples.unwrap_or(1).max(1),
-                viewport_mode: self
-                    .viewport_mode
-                    .unwrap_or(SelfTestTimelineLiveViewViewportMode::FitContent)
-                    .into(),
-                fit_content_interval_ms: self.fit_content_interval_ms.or_else(|| {
-                    Some(bucket_ms).filter(|_| {
-                        self.viewport_mode
-                            .unwrap_or(SelfTestTimelineLiveViewViewportMode::FitContent)
-                            == SelfTestTimelineLiveViewViewportMode::FitContent
-                    })
-                }),
-                minimum_visible_pixels: self.minimum_visible_pixels.unwrap_or(4).max(1),
-                overlay_message: self.overlay_message,
-                fail_below_fps: self.fail_below_fps,
-            },
-        )?))
+        Ok(CliOutput::facet(
+            crate::app::run_timeline_live_view_self_test(
+                app_home,
+                cache_home,
+                crate::app::TimelineLiveViewSelfTestOptions {
+                    sample_duration_ms: sample_ms,
+                    warmup_duration_ms: self.warmup_ms.unwrap_or(1_000),
+                    bucket_duration_ms: bucket_ms,
+                    samples: self.samples.unwrap_or(1).max(1),
+                    viewport_mode: self
+                        .viewport_mode
+                        .unwrap_or(SelfTestTimelineLiveViewViewportMode::FitContent)
+                        .into(),
+                    fit_content_interval_ms: self.fit_content_interval_ms.or_else(|| {
+                        Some(bucket_ms).filter(|_| {
+                            self.viewport_mode
+                                .unwrap_or(SelfTestTimelineLiveViewViewportMode::FitContent)
+                                == SelfTestTimelineLiveViewViewportMode::FitContent
+                        })
+                    }),
+                    minimum_visible_pixels: self.minimum_visible_pixels.unwrap_or(4).max(1),
+                    overlay_message: self.overlay_message,
+                    fail_below_fps: self.fail_below_fps,
+                },
+            )?,
+        ))
     }
 }

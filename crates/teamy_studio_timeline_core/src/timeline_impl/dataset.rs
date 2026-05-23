@@ -607,7 +607,9 @@ impl TimelineDataset {
 
     fn item_index(&self, id: TimelineItemId) -> Option<usize> {
         let index = usize::try_from(id.as_u64().checked_sub(1)?).ok()?;
-        self.items.get(index).and_then(|item| (item.id == id).then_some(index))
+        self.items
+            .get(index)
+            .and_then(|item| (item.id == id).then_some(index))
     }
 
     fn item_mut(&mut self, id: TimelineItemId) -> Option<&mut TimelineItem> {
@@ -1025,10 +1027,8 @@ mod tests {
                 Some(TimelineInstantNs::new(60)),
             )
             .expect("late span");
-        let event_id = dataset.push_event_indexed(
-            TimelineItemInput::new("event"),
-            TimelineInstantNs::new(40),
-        );
+        let event_id =
+            dataset.push_event_indexed(TimelineItemInput::new("event"), TimelineInstantNs::new(40));
         let early_span_id = dataset
             .push_span_indexed(
                 TimelineItemInput::new("early"),
@@ -1049,10 +1049,8 @@ mod tests {
         let mut dataset = TimelineDataset::new();
         let early_event_id =
             dataset.push_event(TimelineItemInput::new("early"), TimelineInstantNs::new(10));
-        let later_event_id = dataset.push_event_indexed(
-            TimelineItemInput::new("later"),
-            TimelineInstantNs::new(20),
-        );
+        let later_event_id =
+            dataset.push_event_indexed(TimelineItemInput::new("later"), TimelineInstantNs::new(20));
 
         assert_eq!(dataset.event_index(), &[early_event_id, later_event_id]);
         assert_eq!(dataset.pending_write_count(), 0);
@@ -1063,7 +1061,11 @@ mod tests {
     fn indexed_finish_keeps_indexes_current_without_compaction() {
         let mut dataset = TimelineDataset::new();
         let span_id = dataset
-            .push_span_indexed(TimelineItemInput::new("open"), TimelineInstantNs::new(10), None)
+            .push_span_indexed(
+                TimelineItemInput::new("open"),
+                TimelineInstantNs::new(10),
+                None,
+            )
             .expect("open span");
 
         dataset

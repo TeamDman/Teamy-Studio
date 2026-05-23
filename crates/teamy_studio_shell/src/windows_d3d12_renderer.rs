@@ -55,15 +55,17 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::System::LibraryLoader::LoadLibraryW;
 use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObjectEx};
 use windows::Win32::UI::WindowsAndMessaging::{
-    DI_NORMAL, DestroyIcon, DrawIconEx, GetClientRect, GetCursorPos, HICON,
-    IDC_ARROW, IDC_CROSS, IDC_HAND, IDC_HELP, IDC_IBEAM, IDC_SIZEALL, IDC_WAIT, IMAGE_FLAGS,
-    IMAGE_ICON, LoadCursorW, LoadImageW,
+    DI_NORMAL, DestroyIcon, DrawIconEx, GetClientRect, GetCursorPos, HICON, IDC_ARROW, IDC_CROSS,
+    IDC_HAND, IDC_HELP, IDC_IBEAM, IDC_SIZEALL, IDC_WAIT, IMAGE_FLAGS, IMAGE_ICON, LoadCursorW,
+    LoadImageW,
 };
 use windows::core::BOOL;
 use windows::core::{Error, Interface, Owned, PCWSTR, s};
 
 use super::cell_grid;
-use super::spatial::{ClientPoint, ClientRect, ScreenPoint, ScreenToClientTransform, TerminalCellPoint};
+use super::spatial::{
+    ClientPoint, ClientRect, ScreenPoint, ScreenToClientTransform, TerminalCellPoint,
+};
 use super::windows_scene::{self, CursorLatencyPlaygroundViewState, SceneAction};
 use super::windows_terminal;
 use super::windows_terminal::{
@@ -1594,7 +1596,10 @@ impl D3d12PanelRenderer {
         {
             #[cfg(feature = "extended_observability")]
             let _span = debug_span!("upload_transformed_glyph_inverse_data").entered();
-            upload_transformed_glyph_inverse_data(&self.transformed_glyph_inverse_buffer, &[&scene])?;
+            upload_transformed_glyph_inverse_data(
+                &self.transformed_glyph_inverse_buffer,
+                &[&scene],
+            )?;
         }
 
         self.execute_prepared_frame_for_slot(vertex_count, frame_index)
@@ -1695,8 +1700,9 @@ impl D3d12PanelRenderer {
         cursor_latency: &CursorLatencyFrameModel,
     ) -> eyre::Result<CursorLatencyPlaygroundViewState> {
         let sampled_cursor = self.sample_client_pointer_position()?;
-        let play_area_rect =
-            windows_scene::cursor_latency_playground_rendered_content_rect(layout.terminal_panel_rect());
+        let play_area_rect = windows_scene::cursor_latency_playground_rendered_content_rect(
+            layout.terminal_panel_rect(),
+        );
         let brick_center =
             cursor_latency
                 .brick
@@ -7714,12 +7720,12 @@ mod tests {
         append_slug_band_data, build_panel_scene, build_shader_params, cached_compiled_shaders,
         can_reuse_cached_scene_vertices, collect_scene_chars, composition_swap_chain_description,
         cpu_slug_coverage, cpu_slug_coverage_all_curves, cursor_latency_view_state_from_sample,
-        dirty_fragment_ranges, extract_glyph_curves, fragment_ranges_match,
-        fragment_vertex_ranges, load_snapshot_glyph, load_terminal_font,
-        preferred_garden_frame_color, preferred_title_bar_color, push_centered_text, push_glyph,
-        push_overlay_panel, push_panel, push_text_block, push_title_text,
-        render_frame_model_offscreen_image, render_snapshot_glyph_into_image,
-        solve_inverse_homography, terminal_scrollbar_geometry, window_garden_shader_data,
+        dirty_fragment_ranges, extract_glyph_curves, fragment_ranges_match, fragment_vertex_ranges,
+        load_snapshot_glyph, load_terminal_font, preferred_garden_frame_color,
+        preferred_title_bar_color, push_centered_text, push_glyph, push_overlay_panel, push_panel,
+        push_text_block, push_title_text, render_frame_model_offscreen_image,
+        render_snapshot_glyph_into_image, solve_inverse_homography, terminal_scrollbar_geometry,
+        window_garden_shader_data,
     };
     use crate::app::render_verification::{
         build_driver_crash_repro_transformed_text_frame, build_reference_transformed_text_frame,
@@ -7777,10 +7783,7 @@ mod tests {
             false,
         );
 
-        assert_eq!(
-            view_state.cursor_position,
-            Some(ClientPoint::new(120, 212))
-        );
+        assert_eq!(view_state.cursor_position, Some(ClientPoint::new(120, 212)));
         assert_eq!(view_state.brick_center, ClientPoint::new(96, 144));
         assert!(view_state.brick_hovered);
         assert!(!view_state.brick_dragging);
@@ -7788,10 +7791,12 @@ mod tests {
 
     #[test]
     fn cursor_latency_rejects_composed_presentation_mode() {
-        assert!(D3d12PanelRenderer::ensure_cursor_latency_presentation_mode(
-            RendererPresentationMode::LowLatencyHwnd,
-        )
-        .is_ok());
+        assert!(
+            D3d12PanelRenderer::ensure_cursor_latency_presentation_mode(
+                RendererPresentationMode::LowLatencyHwnd,
+            )
+            .is_ok()
+        );
 
         let error = D3d12PanelRenderer::ensure_cursor_latency_presentation_mode(
             RendererPresentationMode::Composed,

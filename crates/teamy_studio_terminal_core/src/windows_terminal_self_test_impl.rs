@@ -2,7 +2,7 @@ use eyre::Context;
 use facet::Facet;
 use std::fs;
 use std::io::{self, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
 use windows::Win32::System::Console::{
@@ -23,8 +23,6 @@ const CROSSTERM_KEY_PROBE_READY: &str = "CROSSTERM_KEY_PROBE_READY";
 const RATATUI_KEY_DEBUG_TITLE: &str = "Key Events (Hit Esc 3 times to exit)";
 const WINDOWS_KEY_PROBE_READY: &str = "WINDOWS_KEY_PROBE_READY";
 const WIN32_INPUT_MODE_UNSUPPORTED: &str = "WIN32_INPUT_MODE_UNSUPPORTED";
-const DEFAULT_RATATUI_KEY_DEBUG_PATH: &str =
-    "g:\\Programming\\Repos\\ratatui-key-debug\\target\\debug\\ratatui_key_debug.exe";
 const CTRL_D_EXIT_COMMAND: &[u8] = b"exit\r";
 const PWSH_CTRL_D_AT_PROMPT_CASE: &str = "pwsh-ctrl-d-at-prompt";
 const PWSH_NESTED_CTRL_D_CASE: &str = "pwsh-nested-ctrl-d";
@@ -40,6 +38,49 @@ const PROBE_DETECTION_TIMEOUT: Duration = Duration::from_millis(250);
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
 const MAX_CTRL_L_RESPONSE_LATENCY_MS: f64 = 1000.0;
 const MAX_CTRL_L_PRESENT_LATENCY_MS: f64 = 1000.0;
+
+fn default_ratatui_key_debug_path() -> Option<PathBuf> {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .find_map(|ancestor| {
+            let repo_dir = ancestor.join("ratatui-key-debug");
+            repo_dir.join("Cargo.toml").is_file().then(|| {
+                repo_dir
+                    .join("target")
+                    .join("debug")
+                    .join("ratatui_key_debug.exe")
+            })
+        })
+}
+
+fn resolve_ratatui_key_debug_path() -> eyre::Result<PathBuf> {
+    if let Ok(path) = std::env::var("TEAMY_KEYBOARD_SELF_TEST_RATATUI_PATH") {
+        let path = PathBuf::from(path);
+        if path.is_file() {
+            return Ok(path);
+        }
+
+        eyre::bail!(
+            "TEAMY_KEYBOARD_SELF_TEST_RATATUI_PATH does not point to an existing file: {}",
+            path.display()
+        );
+    }
+
+    let Some(path) = default_ratatui_key_debug_path() else {
+        eyre::bail!(
+            "could not locate ratatui_key_debug.exe; set TEAMY_KEYBOARD_SELF_TEST_RATATUI_PATH or build the sibling ratatui-key-debug repo"
+        );
+    };
+
+    if path.is_file() {
+        return Ok(path);
+    }
+
+    eyre::bail!(
+        "ratatui_key_debug.exe not found at {}; build the sibling ratatui-key-debug repo or set TEAMY_KEYBOARD_SELF_TEST_RATATUI_PATH",
+        path.display()
+    )
+}
 
 #[derive(Debug, Facet)]
 pub struct KeyboardInputSelfTestReport {
@@ -260,12 +301,12 @@ fn run_default_cmd_ratatui_key_debug_reproduction(
     terminal: &mut TerminalSession,
     artifact_output: Option<&Path>,
 ) -> eyre::Result<KeyboardInputSelfTestReport> {
-    let ratatui_path = std::env::var("TEAMY_KEYBOARD_SELF_TEST_RATATUI_PATH")
-        .unwrap_or_else(|_| DEFAULT_RATATUI_KEY_DEBUG_PATH.to_owned());
+    let ratatui_path = resolve_ratatui_key_debug_path()?;
+    let ratatui_command = format!("\"{}\"", ratatui_path.display());
 
     let _ = wait_for_quiet_screen(terminal, Duration::from_millis(150), WAIT_TIMEOUT)?;
 
-    type_text(terminal, &ratatui_path)?;
+    type_text(terminal, &ratatui_command)?;
     press_enter(terminal)?;
     let launched_screen = wait_for_screen(terminal, RATATUI_KEY_DEBUG_TITLE, WAIT_TIMEOUT)?;
     if !launched_screen.contains(RATATUI_KEY_DEBUG_TITLE) {
@@ -291,7 +332,8 @@ fn run_default_cmd_ratatui_key_debug_reproduction(
     let final_screen = wait_for_child_exit(terminal, WAIT_TIMEOUT)?;
 
     let transcript = format!(
-        "launched: {ratatui_path}\nkitty_flags: {initial_flags:?}\n\n=== after_a_release ===\n{after_a_release}\n\n=== after_ctrl_backspace_press ===\n{after_ctrl_backspace_press}\n\n=== after_ratatui_exit ===\n{after_ratatui_exit}\n\n=== final_screen ===\n{final_screen}"
+        "launched: {}\nkitty_flags: {initial_flags:?}\n\n=== after_a_release ===\n{after_a_release}\n\n=== after_ctrl_backspace_press ===\n{after_ctrl_backspace_press}\n\n=== after_ratatui_exit ===\n{after_ratatui_exit}\n\n=== final_screen ===\n{final_screen}",
+        ratatui_path.display()
     );
 
     emit_transcript(
