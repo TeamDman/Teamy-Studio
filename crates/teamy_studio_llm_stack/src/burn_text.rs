@@ -6,7 +6,7 @@ use eyre::{WrapErr, bail, ensure};
 use half::{bf16, f16, slice::{HalfBitsSliceExt, HalfFloatSliceExt}};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap, VecDeque},
     fs::File,
     io::{Read, Seek, SeekFrom},
     marker::PhantomData,
@@ -102,6 +102,39 @@ struct Qwen35TextRuntime<B: Backend> {
     backend_marker: PhantomData<B>,
     packed_tensor_path: Option<PathBuf>,
     packed_tensor_file: Option<Mutex<File>>,
+    loaded_tensor_cache: Mutex<HashMap<String, LoadedTensor>>,
+    #[allow(dead_code)]
+    tensor_1d_cache: Mutex<HashMap<String, Tensor<B, 1>>>,
+    tensor_2d_cache: Mutex<HashMap<String, Tensor<B, 2>>>,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug, PartialEq)]
+struct Qwen35DecodeState {
+    processed_token_count: usize,
+    layer_states: Vec<DecoderLayerDecodeState>,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug, PartialEq)]
+enum DecoderLayerDecodeState {
+    Full(FullAttentionDecodeState),
+    Linear(LinearAttentionDecodeState),
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug, Default, PartialEq)]
+struct FullAttentionDecodeState {
+    token_count: usize,
+    repeated_key_cache: Vec<f32>,
+    repeated_value_cache: Vec<f32>,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug, PartialEq)]
+struct LinearAttentionDecodeState {
+    state: Vec<f32>,
+    conv_history: VecDeque<Vec<f32>>,
 }
 
 impl<B: Backend> Qwen35TextRuntime<B> {
@@ -141,9 +174,13 @@ impl<B: Backend> Qwen35TextRuntime<B> {
             backend_marker: PhantomData,
             packed_tensor_path,
             packed_tensor_file,
+            loaded_tensor_cache: Mutex::new(HashMap::new()),
+            tensor_1d_cache: Mutex::new(HashMap::new()),
+            tensor_2d_cache: Mutex::new(HashMap::new()),
         })
     }
 
+    #[allow(dead_code)]
     fn embedding_hidden_states(&self, token_ids: &[u32]) -> eyre::Result<Tensor<B, 3>> {
         let embedding = self.read_rows_f32("model.embed_tokens.weight", token_ids)?;
         Ok(tensor_3d(
@@ -355,6 +392,15 @@ impl<B: Backend> Qwen35TextRuntime<B> {
         llm_tracy_zone!("llm_burn_load_tensor");
         #[cfg(feature = "extended_observability")]
         let _span = tracing::debug_span!("llm_burn_load_tensor", tensor_name).entered();
+        if let Some(cached) = self
+            .loaded_tensor_cache
+            .lock()
+            .map_err(|_| eyre::eyre!("Loaded tensor cache mutex was poisoned"))?
+            .get(tensor_name)
+            .cloned()
+        {
+            return Ok(cached);
+        }
         let spec = self.tensor_spec(tensor_name)?;
         let element_count = spec
             .shape
@@ -365,28 +411,107 @@ impl<B: Backend> Qwen35TextRuntime<B> {
         let mut values = Vec::with_capacity(element_count);
         let bytes = self.read_tensor_bytes(spec, tensor_name)?;
         decode_bytes_into_f32(&bytes, &spec.dtype, &mut values)?;
-        Ok(LoadedTensor {
+        let loaded = LoadedTensor {
             shape: spec.shape.clone(),
             values,
-        })
+        };
+        self.loaded_tensor_cache
+            .lock()
+            .map_err(|_| eyre::eyre!("Loaded tensor cache mutex was poisoned"))?
+            .insert(tensor_name.to_owned(), loaded.clone());
+        Ok(loaded)
     }
 
+    #[allow(dead_code)]
     fn load_tensor_1d(&self, tensor_name: &str) -> eyre::Result<Tensor<B, 1>> {
+        if let Some(cached) = self
+            .tensor_1d_cache
+            .lock()
+            .map_err(|_| eyre::eyre!("1D tensor cache mutex was poisoned"))?
+            .get(tensor_name)
+            .cloned()
+        {
+            return Ok(cached);
+        }
         let loaded = self.load_tensor(tensor_name)?;
         let [dim] = shape_array::<1>(&loaded.shape, tensor_name)?;
-        Ok(Tensor::from_data(
+        let tensor = Tensor::from_data(
             TensorData::new(loaded.values, [dim]),
             &self.device,
-        ))
+        );
+        self.tensor_1d_cache
+            .lock()
+            .map_err(|_| eyre::eyre!("1D tensor cache mutex was poisoned"))?
+            .insert(tensor_name.to_owned(), tensor.clone());
+        Ok(tensor)
     }
 
     fn load_tensor_2d(&self, tensor_name: &str) -> eyre::Result<Tensor<B, 2>> {
+        if let Some(cached) = self
+            .tensor_2d_cache
+            .lock()
+            .map_err(|_| eyre::eyre!("2D tensor cache mutex was poisoned"))?
+            .get(tensor_name)
+            .cloned()
+        {
+            return Ok(cached);
+        }
         let loaded = self.load_tensor(tensor_name)?;
         let [dim0, dim1] = shape_array::<2>(&loaded.shape, tensor_name)?;
-        Ok(Tensor::from_data(
+        let tensor = Tensor::from_data(
             TensorData::new(loaded.values, [dim0, dim1]),
             &self.device,
-        ))
+        );
+        self.tensor_2d_cache
+            .lock()
+            .map_err(|_| eyre::eyre!("2D tensor cache mutex was poisoned"))?
+            .insert(tensor_name.to_owned(), tensor.clone());
+        Ok(tensor)
+    }
+
+    #[allow(dead_code)]
+    fn load_tensor_1d_values(&self, tensor_name: &str) -> eyre::Result<Vec<f32>> {
+        let loaded = self.load_tensor(tensor_name)?;
+        let [dim] = shape_array::<1>(&loaded.shape, tensor_name)?;
+        ensure!(
+            loaded.values.len() == dim,
+            "Tensor `{tensor_name}` expected {} values but found {}",
+            dim,
+            loaded.values.len()
+        );
+        Ok(loaded.values)
+    }
+
+    #[allow(dead_code)]
+    fn new_decode_state(&self) -> eyre::Result<Qwen35DecodeState> {
+        let mut layer_states = Vec::with_capacity(self.manifest.num_hidden_layers);
+        for layer_index in 0..self.manifest.num_hidden_layers {
+            layer_states.push(match self.layer_token_mixer_kind(layer_index)? {
+                TokenMixerKind::FullAttention => {
+                    DecoderLayerDecodeState::Full(FullAttentionDecodeState::default())
+                }
+                TokenMixerKind::LinearAttention => {
+                    let state_len = self
+                        .manifest
+                        .linear_num_value_heads
+                        .checked_mul(self.manifest.linear_key_head_dim)
+                        .and_then(|value| value.checked_mul(self.manifest.linear_value_head_dim))
+                        .ok_or_else(|| {
+                            eyre::eyre!("linear-attention decode-state size overflow")
+                        })?;
+                    DecoderLayerDecodeState::Linear(LinearAttentionDecodeState {
+                        state: vec![0.0; state_len],
+                        conv_history: VecDeque::with_capacity(
+                            self.manifest.linear_conv_kernel_dim.saturating_sub(1),
+                        ),
+                    })
+                }
+            });
+        }
+        Ok(Qwen35DecodeState {
+            processed_token_count: 0,
+            layer_states,
+        })
     }
 
     fn layer_token_mixer_kind(&self, layer_index: usize) -> eyre::Result<TokenMixerKind> {
@@ -402,6 +527,7 @@ impl<B: Backend> Qwen35TextRuntime<B> {
         }
     }
 
+    #[allow(dead_code)]
     fn forward_hidden_states(
         &self,
         mut hidden_states: Tensor<B, 3>,
@@ -461,6 +587,375 @@ impl<B: Backend> Qwen35TextRuntime<B> {
         ))
     }
 
+    #[allow(dead_code)]
+    fn forward_token_hidden(
+        &self,
+        decode_state: &mut Qwen35DecodeState,
+        token_id: u32,
+    ) -> eyre::Result<Vec<f32>> {
+        let mut hidden = self.read_rows_f32("model.embed_tokens.weight", &[token_id])?;
+        for layer_index in 0..self.manifest.num_hidden_layers {
+            hidden = self.forward_decoder_layer_single(
+                layer_index,
+                &hidden,
+                decode_state.processed_token_count,
+                &mut decode_state.layer_states[layer_index],
+            )?;
+        }
+        let norm_weight = self.load_tensor_1d_values("model.norm.weight")?;
+        let hidden = qwen_rms_norm(
+            &hidden,
+            1,
+            1,
+            self.manifest.hidden_size,
+            &norm_weight,
+            self.manifest.rms_norm_eps as f32,
+        )?;
+        decode_state.processed_token_count += 1;
+        Ok(hidden)
+    }
+
+    #[allow(dead_code)]
+    fn forward_decoder_layer_single(
+        &self,
+        layer_index: usize,
+        hidden: &[f32],
+        position: usize,
+        layer_state: &mut DecoderLayerDecodeState,
+    ) -> eyre::Result<Vec<f32>> {
+        let hidden_size = self.manifest.hidden_size;
+        ensure!(
+            hidden.len() == hidden_size,
+            "Qwen3.5 decode step expected hidden size {}, but found {}",
+            hidden_size,
+            hidden.len()
+        );
+        let prefix = format!("model.layers.{layer_index}");
+        let input_layernorm_weight =
+            self.load_tensor_1d_values(&format!("{prefix}.input_layernorm.weight"))?;
+        let normalized = qwen_rms_norm(
+            hidden,
+            1,
+            1,
+            hidden_size,
+            &input_layernorm_weight,
+            self.manifest.rms_norm_eps as f32,
+        )?;
+        let mixed_delta = match layer_state {
+            DecoderLayerDecodeState::Full(full_state) => {
+                self.forward_full_attention_single(&prefix, &normalized, position, full_state)?
+            }
+            DecoderLayerDecodeState::Linear(linear_state) => {
+                self.forward_linear_attention_single(&prefix, &normalized, linear_state)?
+            }
+        };
+        let mixed = add_vectors(hidden, &mixed_delta)?;
+        let post_attention_layernorm_weight =
+            self.load_tensor_1d_values(&format!("{prefix}.post_attention_layernorm.weight"))?;
+        let post_norm = qwen_rms_norm(
+            &mixed,
+            1,
+            1,
+            hidden_size,
+            &post_attention_layernorm_weight,
+            self.manifest.rms_norm_eps as f32,
+        )?;
+        let mlp = self.forward_mlp_single(&format!("{prefix}.mlp"), &post_norm)?;
+        add_vectors(&mixed, &mlp)
+    }
+
+    #[allow(dead_code)]
+    fn forward_mlp_single(&self, prefix: &str, hidden: &[f32]) -> eyre::Result<Vec<f32>> {
+        let hidden_states = tensor_3d([1, 1, self.manifest.hidden_size], hidden.to_vec(), &self.device);
+        let gate_proj = linear_forward_3d(
+            &hidden_states,
+            self.load_tensor_2d(&format!("{prefix}.gate_proj.weight"))?,
+            None,
+        );
+        let up_proj = linear_forward_3d(
+            &hidden_states,
+            self.load_tensor_2d(&format!("{prefix}.up_proj.weight"))?,
+            None,
+        );
+        let gate = tensor_to_vec_f32(&gate_proj)?
+            .into_iter()
+            .map(silu_scalar)
+            .collect::<Vec<_>>();
+        let up = tensor_to_vec_f32(&up_proj)?;
+        ensure!(gate.len() == up.len(), "Qwen3.5 MLP gate/up projection size mismatch");
+        let fused = gate
+            .into_iter()
+            .zip(up)
+            .map(|(gate, up)| gate * up)
+            .collect::<Vec<_>>();
+        let fused = tensor_3d([1, 1, self.manifest.intermediate_size], fused, &self.device);
+        tensor_to_vec_f32(&linear_forward_3d(
+            &fused,
+            self.load_tensor_2d(&format!("{prefix}.down_proj.weight"))?,
+            None,
+        ))
+    }
+
+    #[allow(dead_code)]
+    fn forward_full_attention_single(
+        &self,
+        prefix: &str,
+        hidden: &[f32],
+        position: usize,
+        decode_state: &mut FullAttentionDecodeState,
+    ) -> eyre::Result<Vec<f32>> {
+        let hidden_states = tensor_3d([1, 1, self.manifest.hidden_size], hidden.to_vec(), &self.device);
+        let head_dim = self.manifest.head_dim;
+        let query_projection = linear_forward_3d(
+            &hidden_states,
+            self.load_tensor_2d(&format!("{prefix}.self_attn.q_proj.weight"))?,
+            None,
+        );
+        let query_projection_values = tensor_to_vec_f32(&query_projection)?;
+        let gate_offset = self
+            .manifest
+            .num_attention_heads
+            .checked_mul(head_dim)
+            .ok_or_else(|| eyre::eyre!("gate offset overflow"))?;
+        let query_and_gate_dim = gate_offset
+            .checked_mul(2)
+            .ok_or_else(|| eyre::eyre!("q_proj output size overflow"))?;
+        ensure!(
+            query_projection_values.len() == query_and_gate_dim,
+            "Unexpected q_proj output size for Qwen3.5 full attention single-step decode"
+        );
+        let mut query_values = query_projection_values[..gate_offset].to_vec();
+        let gate_values = query_projection_values[gate_offset..]
+            .iter()
+            .copied()
+            .map(sigmoid_scalar)
+            .collect::<Vec<_>>();
+
+        let query_norm_weight =
+            self.load_tensor_1d_values(&format!("{prefix}.self_attn.q_norm.weight"))?;
+        let key_norm_weight =
+            self.load_tensor_1d_values(&format!("{prefix}.self_attn.k_norm.weight"))?;
+        query_values = qwen_rms_norm_no_center(
+            &query_values,
+            1,
+            self.manifest.num_attention_heads,
+            head_dim,
+            &query_norm_weight,
+            self.manifest.rms_norm_eps as f32,
+        )?;
+
+        let key_proj = linear_forward_3d(
+            &hidden_states,
+            self.load_tensor_2d(&format!("{prefix}.self_attn.k_proj.weight"))?,
+            None,
+        );
+        let mut key_values = qwen_rms_norm_no_center(
+            &tensor_to_vec_f32(&key_proj)?,
+            1,
+            self.manifest.num_key_value_heads,
+            head_dim,
+            &key_norm_weight,
+            self.manifest.rms_norm_eps as f32,
+        )?;
+        let value_proj = linear_forward_3d(
+            &hidden_states,
+            self.load_tensor_2d(&format!("{prefix}.self_attn.v_proj.weight"))?,
+            None,
+        );
+        let value_values = tensor_to_vec_f32(&value_proj)?;
+
+        apply_rotary_embedding_single_position(&mut query_values, position, &self.manifest, self.manifest.num_attention_heads)?;
+        apply_rotary_embedding_single_position(&mut key_values, position, &self.manifest, self.manifest.num_key_value_heads)?;
+
+        let repeated_key = repeat_key_value_heads(
+            &key_values,
+            1,
+            self.manifest.num_key_value_heads,
+            self.manifest.num_attention_heads / self.manifest.num_key_value_heads,
+            head_dim,
+        );
+        let repeated_value = repeat_key_value_heads(
+            &value_values,
+            1,
+            self.manifest.num_key_value_heads,
+            self.manifest.num_attention_heads / self.manifest.num_key_value_heads,
+            head_dim,
+        );
+        decode_state.repeated_key_cache.extend_from_slice(&repeated_key);
+        decode_state.repeated_value_cache.extend_from_slice(&repeated_value);
+        decode_state.token_count += 1;
+
+        let scale = (head_dim as f32).powf(-0.5);
+        let mut attention_output = vec![0.0_f32; self.manifest.hidden_size];
+        for head in 0..self.manifest.num_attention_heads {
+            let query_base = head * head_dim;
+            let query_slice = &query_values[query_base..query_base + head_dim];
+            let mut scores = Vec::with_capacity(decode_state.token_count);
+            for token_index in 0..decode_state.token_count {
+                let key_base = (token_index * self.manifest.num_attention_heads + head) * head_dim;
+                let key_slice =
+                    &decode_state.repeated_key_cache[key_base..key_base + head_dim];
+                scores.push(dot_product(query_slice, key_slice) * scale);
+            }
+            let weights = softmax_scalars(&scores);
+            let output_base = head * head_dim;
+            for (token_index, weight) in weights.into_iter().enumerate() {
+                let value_base =
+                    (token_index * self.manifest.num_attention_heads + head) * head_dim;
+                let value_slice =
+                    &decode_state.repeated_value_cache[value_base..value_base + head_dim];
+                for dim in 0..head_dim {
+                    attention_output[output_base + dim] += value_slice[dim] * weight;
+                }
+            }
+        }
+        let gated = attention_output
+            .into_iter()
+            .zip(gate_values)
+            .map(|(output, gate)| output * gate)
+            .collect::<Vec<_>>();
+        tensor_to_vec_f32(&linear_forward_3d(
+            &tensor_3d([1, 1, self.manifest.hidden_size], gated, &self.device),
+            self.load_tensor_2d(&format!("{prefix}.self_attn.o_proj.weight"))?,
+            None,
+        ))
+    }
+
+    #[allow(dead_code)]
+    fn forward_linear_attention_single(
+        &self,
+        prefix: &str,
+        hidden: &[f32],
+        decode_state: &mut LinearAttentionDecodeState,
+    ) -> eyre::Result<Vec<f32>> {
+        let hidden_states = tensor_3d([1, 1, self.manifest.hidden_size], hidden.to_vec(), &self.device);
+        let mixed_qkv = linear_forward_3d(
+            &hidden_states,
+            self.load_tensor_2d(&format!("{prefix}.linear_attn.in_proj_qkv.weight"))?,
+            None,
+        );
+        let mixed_qkv_values = tensor_to_vec_f32(&mixed_qkv)?;
+        let conv_weight = self.load_tensor(&format!("{prefix}.linear_attn.conv1d.weight"))?;
+        let conv_mixed_qkv = depthwise_causal_conv1d_silu_step(
+            &mixed_qkv_values,
+            &decode_state.conv_history,
+            self.manifest.linear_num_key_heads * self.manifest.linear_key_head_dim * 2
+                + self.manifest.linear_num_value_heads * self.manifest.linear_value_head_dim,
+            self.manifest.linear_conv_kernel_dim,
+            &conv_weight.values,
+            &conv_weight.shape,
+        )?;
+        decode_state.conv_history.push_back(mixed_qkv_values);
+        while decode_state.conv_history.len() >= self.manifest.linear_conv_kernel_dim {
+            decode_state.conv_history.pop_front();
+        }
+
+        let key_dim = self
+            .manifest
+            .linear_num_key_heads
+            .checked_mul(self.manifest.linear_key_head_dim)
+            .ok_or_else(|| eyre::eyre!("linear-attention key-dim overflow"))?;
+        let value_dim = self
+            .manifest
+            .linear_num_value_heads
+            .checked_mul(self.manifest.linear_value_head_dim)
+            .ok_or_else(|| eyre::eyre!("linear-attention value-dim overflow"))?;
+        let conv_dim = key_dim
+            .checked_mul(2)
+            .and_then(|value| value.checked_add(value_dim))
+            .ok_or_else(|| eyre::eyre!("linear-attention conv-dim overflow"))?;
+        ensure!(
+            conv_mixed_qkv.len() == conv_dim,
+            "Unexpected linear-attention conv output size for single-step decode"
+        );
+        let mut query = conv_mixed_qkv[..key_dim].to_vec();
+        let mut key = conv_mixed_qkv[key_dim..key_dim * 2].to_vec();
+        let value = conv_mixed_qkv[key_dim * 2..].to_vec();
+
+        let z = tensor_to_vec_f32(&linear_forward_3d(
+            &hidden_states,
+            self.load_tensor_2d(&format!("{prefix}.linear_attn.in_proj_z.weight"))?,
+            None,
+        ))?;
+        let beta = tensor_to_vec_f32(&linear_forward_3d(
+            &hidden_states,
+            self.load_tensor_2d(&format!("{prefix}.linear_attn.in_proj_b.weight"))?,
+            None,
+        ))?
+        .into_iter()
+        .map(sigmoid_scalar)
+        .collect::<Vec<_>>();
+        let a = tensor_to_vec_f32(&linear_forward_3d(
+            &hidden_states,
+            self.load_tensor_2d(&format!("{prefix}.linear_attn.in_proj_a.weight"))?,
+            None,
+        ))?;
+        let dt_bias = self.load_tensor_1d_values(&format!("{prefix}.linear_attn.dt_bias"))?;
+        let a_log = self.load_tensor_1d_values(&format!("{prefix}.linear_attn.A_log"))?;
+        let mut g = Vec::with_capacity(a.len());
+        for (index, value) in a.iter().copied().enumerate() {
+            let head_index = index % self.manifest.linear_num_value_heads;
+            let a_scale = -a_log[head_index].exp();
+            g.push(a_scale * softplus_scalar(value + dt_bias[head_index]));
+        }
+
+        let repeat_factor = self.manifest.linear_num_value_heads / self.manifest.linear_num_key_heads;
+        query = repeat_linear_attention_heads(
+            &query,
+            1,
+            self.manifest.linear_num_key_heads,
+            repeat_factor,
+            self.manifest.linear_key_head_dim,
+        );
+        key = repeat_linear_attention_heads(
+            &key,
+            1,
+            self.manifest.linear_num_key_heads,
+            repeat_factor,
+            self.manifest.linear_key_head_dim,
+        );
+        let query = l2_norm_heads(
+            &query,
+            1,
+            self.manifest.linear_num_value_heads,
+            self.manifest.linear_key_head_dim,
+        )?;
+        let key = l2_norm_heads(
+            &key,
+            1,
+            self.manifest.linear_num_value_heads,
+            self.manifest.linear_key_head_dim,
+        )?;
+        let core_attn_out = recurrent_gated_delta_step(
+            &query,
+            &key,
+            &value,
+            &g,
+            &beta,
+            &mut decode_state.state,
+            self.manifest.linear_num_value_heads,
+            self.manifest.linear_key_head_dim,
+            self.manifest.linear_value_head_dim,
+        )?;
+        let norm_weight =
+            self.load_tensor_1d_values(&format!("{prefix}.linear_attn.norm.weight"))?;
+        let normalized = qwen_rms_norm_gated(
+            &core_attn_out,
+            1,
+            self.manifest.linear_num_value_heads,
+            self.manifest.linear_value_head_dim,
+            &norm_weight,
+            self.manifest.rms_norm_eps as f32,
+            &z,
+        )?;
+        tensor_to_vec_f32(&linear_forward_3d(
+            &tensor_3d([1, 1, value_dim], normalized, &self.device),
+            self.load_tensor_2d(&format!("{prefix}.linear_attn.out_proj.weight"))?,
+            None,
+        ))
+    }
+
+    #[allow(dead_code)]
     fn forward_decoder_layer(
         &self,
         layer_index: usize,
@@ -529,6 +1024,7 @@ impl<B: Backend> Qwen35TextRuntime<B> {
         Ok(mixed + mlp)
     }
 
+    #[allow(dead_code)]
     fn forward_mlp(
         &self,
         prefix: &str,
@@ -574,6 +1070,7 @@ impl<B: Backend> Qwen35TextRuntime<B> {
         ))
     }
 
+    #[allow(dead_code)]
     fn forward_full_attention(
         &self,
         prefix: &str,
@@ -721,6 +1218,7 @@ impl<B: Backend> Qwen35TextRuntime<B> {
         ))
     }
 
+    #[allow(dead_code)]
     fn forward_linear_attention(
         &self,
         prefix: &str,
@@ -858,6 +1356,7 @@ impl<B: Backend> Qwen35TextRuntime<B> {
         ))
     }
 
+    #[allow(dead_code)]
     fn greedy_next_token(&self, hidden_states: Tensor<B, 3>) -> eyre::Result<usize> {
         llm_tracy_zone!("llm_burn_greedy_next_token");
         #[cfg(feature = "extended_observability")]
@@ -1196,12 +1695,13 @@ fn generate_with_burn_text_runtime_on_device<B: Backend>(
                     .wrap_err_with(|| format!("Token id {token_id} exceeded u32 range"))
             })
             .collect::<eyre::Result<Vec<_>>>()?;
-        let hidden_states = runtime.forward_hidden_states(runtime.embedding_hidden_states(&input_token_ids)?)?;
+        let hidden_states =
+            runtime.forward_hidden_states(runtime.embedding_hidden_states(&input_token_ids)?)?;
         trace_burn_text_runtime("decoder stack complete; scanning lm_head");
         let next_token_id = runtime.greedy_next_token(hidden_states)?;
         trace_burn_text_runtime(&format!("selected token id {next_token_id}"));
-        all_token_ids.push(next_token_id);
         generated_token_ids.push(next_token_id);
+        all_token_ids.push(next_token_id);
         if eos_token_id.is_some_and(|eos_token_id| eos_token_id == next_token_id) {
             break;
         }
@@ -1240,6 +1740,7 @@ fn tensor_3d<B: Backend>(shape: [usize; 3], values: Vec<f32>, device: &B::Device
     Tensor::from_data(TensorData::new(values, shape), device)
 }
 
+#[allow(dead_code)]
 fn tensor_4d<B: Backend>(shape: [usize; 4], values: Vec<f32>, device: &B::Device) -> Tensor<B, 4> {
     Tensor::from_data(TensorData::new(values, shape), device)
 }
@@ -1425,6 +1926,46 @@ fn dot_product(left: &[f32], right: &[f32]) -> f32 {
         .sum()
 }
 
+#[allow(dead_code)]
+fn add_vectors(left: &[f32], right: &[f32]) -> eyre::Result<Vec<f32>> {
+    ensure!(
+        left.len() == right.len(),
+        "Vector add length mismatch: {} vs {}",
+        left.len(),
+        right.len()
+    );
+    Ok(left
+        .iter()
+        .copied()
+        .zip(right.iter().copied())
+        .map(|(left, right)| left + right)
+        .collect())
+}
+
+#[allow(dead_code)]
+fn softmax_scalars(values: &[f32]) -> Vec<f32> {
+    if values.is_empty() {
+        return Vec::new();
+    }
+    let max_value = values
+        .iter()
+        .copied()
+        .fold(f32::NEG_INFINITY, f32::max);
+    let mut exp_values = values
+        .iter()
+        .copied()
+        .map(|value| (value - max_value).exp())
+        .collect::<Vec<_>>();
+    let sum = exp_values.iter().copied().sum::<f32>();
+    if sum <= 0.0 {
+        return vec![0.0; values.len()];
+    }
+    for value in &mut exp_values {
+        *value /= sum;
+    }
+    exp_values
+}
+
 fn qwen_rms_norm(
     values: &[f32],
     batch_size: usize,
@@ -1570,12 +2111,14 @@ fn qwen_rms_norm_gated(
 }
 
 #[derive(Clone, Debug, PartialEq)]
+#[allow(dead_code)]
 struct RotaryEmbeddings {
     cos: Vec<f32>,
     sin: Vec<f32>,
     rotary_dim: usize,
 }
 
+#[allow(dead_code)]
 fn rotary_embeddings(seq_len: usize, manifest: &BurnTextManifest) -> eyre::Result<RotaryEmbeddings> {
     let rotary_dim = (manifest.head_dim as f64 * manifest.partial_rotary_factor).round() as usize;
     ensure!(
@@ -1619,6 +2162,7 @@ fn rotary_embeddings(seq_len: usize, manifest: &BurnTextManifest) -> eyre::Resul
     })
 }
 
+#[allow(dead_code)]
 fn apply_rotary_embeddings(
     query: &[f32],
     key: &[f32],
@@ -1673,6 +2217,57 @@ fn apply_rotary_embeddings(
         }
     }
     Ok((query_out, key_out))
+}
+
+#[allow(dead_code)]
+fn apply_rotary_embedding_single_position(
+    values: &mut [f32],
+    position: usize,
+    manifest: &BurnTextManifest,
+    head_count: usize,
+) -> eyre::Result<()> {
+    let rotary_dim = (manifest.head_dim as f64 * manifest.partial_rotary_factor).round() as usize;
+    ensure!(
+        rotary_dim > 0 && rotary_dim <= manifest.head_dim && rotary_dim.is_multiple_of(2),
+        "Qwen3.5 rotary dim {} was invalid for head dim {} and partial rotary factor {}",
+        rotary_dim,
+        manifest.head_dim,
+        manifest.partial_rotary_factor
+    );
+    ensure!(
+        values.len() == head_count * manifest.head_dim,
+        "Single-position rotary values length {} did not match {}x{}",
+        values.len(),
+        head_count,
+        manifest.head_dim
+    );
+    let half_dim = rotary_dim / 2;
+    let rope_theta = 1_000_000.0_f64;
+    let mut cos = Vec::with_capacity(rotary_dim);
+    let mut sin = Vec::with_capacity(rotary_dim);
+    for index in 0..half_dim {
+        let numerator = (index * 2) as f64;
+        let inv_freq = 1.0 / rope_theta.powf(numerator / rotary_dim as f64);
+        let angle = position as f32 * inv_freq as f32;
+        cos.push(angle.cos());
+    }
+    for index in 0..half_dim {
+        cos.push(cos[index]);
+    }
+    for index in 0..half_dim {
+        let numerator = (index * 2) as f64;
+        let inv_freq = 1.0 / rope_theta.powf(numerator / rotary_dim as f64);
+        let angle = position as f32 * inv_freq as f32;
+        sin.push(angle.sin());
+    }
+    for index in 0..half_dim {
+        sin.push(sin[index]);
+    }
+    for head in 0..head_count {
+        let base = head * manifest.head_dim;
+        apply_rotary_slice(&mut values[base..base + manifest.head_dim], &cos, &sin, half_dim);
+    }
+    Ok(())
 }
 
 fn apply_rotary_slice(values: &mut [f32], cos: &[f32], sin: &[f32], half_dim: usize) {
@@ -1748,6 +2343,7 @@ fn l2_norm_heads(
     clippy::too_many_arguments,
     reason = "the recurrent gated-delta rule keeps the tensor contract explicit to mirror the upstream Qwen3.5 recurrence"
 )]
+#[allow(dead_code)]
 fn recurrent_gated_delta_rule(
     query: &[f32],
     key: &[f32],
@@ -1854,6 +2450,106 @@ fn recurrent_gated_delta_rule(
     Ok(output)
 }
 
+#[allow(dead_code)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the incremental gated-delta step keeps the tensor contract explicit to mirror the upstream recurrence"
+)]
+fn recurrent_gated_delta_step(
+    query: &[f32],
+    key: &[f32],
+    value: &[f32],
+    g: &[f32],
+    beta: &[f32],
+    state: &mut [f32],
+    num_heads: usize,
+    key_dim: usize,
+    value_dim: usize,
+) -> eyre::Result<Vec<f32>> {
+    ensure!(
+        query.len() == num_heads * key_dim,
+        "Gated-delta step query length {} did not match {}x{}",
+        query.len(),
+        num_heads,
+        key_dim
+    );
+    ensure!(
+        key.len() == query.len(),
+        "Gated-delta step key length {} did not match query length {}",
+        key.len(),
+        query.len()
+    );
+    ensure!(
+        value.len() == num_heads * value_dim,
+        "Gated-delta step value length {} did not match {}x{}",
+        value.len(),
+        num_heads,
+        value_dim
+    );
+    ensure!(
+        g.len() == num_heads,
+        "Gated-delta step g length {} did not match {} heads",
+        g.len(),
+        num_heads
+    );
+    ensure!(
+        beta.len() == num_heads,
+        "Gated-delta step beta length {} did not match {} heads",
+        beta.len(),
+        num_heads
+    );
+    ensure!(
+        state.len() == num_heads * key_dim * value_dim,
+        "Gated-delta step state length {} did not match {}x{}x{}",
+        state.len(),
+        num_heads,
+        key_dim,
+        value_dim
+    );
+    let scale = (key_dim as f32).sqrt().recip();
+    let mut output = vec![0.0_f32; num_heads * value_dim];
+    for head in 0..num_heads {
+        let state_base = head * key_dim * value_dim;
+        let q_base = head * key_dim;
+        let v_base = head * value_dim;
+        let decay = g[head].exp();
+        let beta_t = beta[head];
+        for state_index in 0..key_dim * value_dim {
+            state[state_base + state_index] *= decay;
+        }
+        let mut kv_mem = vec![0.0_f32; value_dim];
+        for key_index in 0..key_dim {
+            let key_value = key[q_base + key_index];
+            let state_row_base = state_base + key_index * value_dim;
+            for value_index in 0..value_dim {
+                kv_mem[value_index] += state[state_row_base + value_index] * key_value;
+            }
+        }
+        let mut delta = vec![0.0_f32; value_dim];
+        for value_index in 0..value_dim {
+            delta[value_index] = (value[v_base + value_index] - kv_mem[value_index]) * beta_t;
+        }
+        for key_index in 0..key_dim {
+            let key_value = key[q_base + key_index];
+            let state_row_base = state_base + key_index * value_dim;
+            for value_index in 0..value_dim {
+                state[state_row_base + value_index] += key_value * delta[value_index];
+            }
+        }
+        for value_index in 0..value_dim {
+            let mut sum = 0.0_f32;
+            for key_index in 0..key_dim {
+                sum +=
+                    state[state_base + key_index * value_dim + value_index]
+                        * (query[q_base + key_index] * scale);
+            }
+            output[v_base + value_index] = sum;
+        }
+    }
+    Ok(output)
+}
+
+#[allow(dead_code)]
 fn depthwise_causal_conv1d_silu(
     values: &[f32],
     batch_size: usize,
@@ -1910,6 +2606,52 @@ fn depthwise_causal_conv1d_silu(
     Ok(output)
 }
 
+#[allow(dead_code)]
+fn depthwise_causal_conv1d_silu_step(
+    current: &[f32],
+    history: &VecDeque<Vec<f32>>,
+    channels: usize,
+    kernel_size: usize,
+    weight_values: &[f32],
+    weight_shape: &[usize],
+) -> eyre::Result<Vec<f32>> {
+    ensure!(
+        current.len() == channels,
+        "Depthwise causal conv step input length {} did not match channel count {}",
+        current.len(),
+        channels
+    );
+    ensure!(
+        weight_shape == [channels, 1, kernel_size],
+        "Depthwise conv expected weight shape [{channels}, 1, {kernel_size}], found {:?}",
+        weight_shape
+    );
+    ensure!(
+        weight_values.len() == channels * kernel_size,
+        "Depthwise conv expected {} weight values but found {}",
+        channels * kernel_size,
+        weight_values.len()
+    );
+    let mut output = vec![0.0_f32; channels];
+    for channel in 0..channels {
+        let mut sum = 0.0_f32;
+        for kernel_index in 0..kernel_size {
+            let input_value = if kernel_index == 0 {
+                current[channel]
+            } else if history.len() >= kernel_index {
+                history[history.len() - kernel_index][channel]
+            } else {
+                continue;
+            };
+            let weight_index = (channel * kernel_size) + (kernel_size - 1 - kernel_index);
+            sum += input_value * weight_values[weight_index];
+        }
+        output[channel] = silu_scalar(sum);
+    }
+    Ok(output)
+}
+
+#[allow(dead_code)]
 fn causal_mask<B: Backend>(seq_len: usize, device: &B::Device) -> Tensor<B, 4> {
     let mut values = vec![0_f32; seq_len * seq_len];
     for row in 0..seq_len {
