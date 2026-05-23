@@ -1582,9 +1582,7 @@ enum ScenePressedTarget {
 }
 
 fn cursor_latency_play_area_rect(layout: TerminalLayout) -> ClientRect {
-    windows_scene::cursor_latency_half_content_rect(
-        windows_scene::cursor_latency_playground_canvas_rect(layout.terminal_panel_rect()),
-    )
+    windows_scene::cursor_latency_playground_rendered_content_rect(layout.terminal_panel_rect())
 }
 
 fn cursor_latency_brick_rect_for_state(
@@ -2993,14 +2991,55 @@ fn scene_focused_render_wait_ms() -> Option<u32> {
     })
 }
 
+fn scene_focused_render_wait_duration(wait_ms: u32) -> Duration {
+    Duration::from_millis(u64::from(wait_ms))
+}
+
+fn scene_focused_render_deadline(
+    now: Instant,
+    current_deadline: Option<Instant>,
+    current_wait_ms: Option<u32>,
+    next_wait_ms: u32,
+) -> Instant {
+    if current_wait_ms == Some(next_wait_ms) {
+        current_deadline
+            .unwrap_or_else(|| now + scene_focused_render_wait_duration(next_wait_ms))
+    } else {
+        now + scene_focused_render_wait_duration(next_wait_ms)
+    }
+}
+
 fn scene_message_loop(hwnd: WindowHandle) -> eyre::Result<()> {
     let wait_timer = SceneWaitTimer::create();
+    let mut focused_render_deadline = None;
+    let mut focused_render_wait_ms = None;
 
     loop {
         if let Some(wait_ms) = scene_focused_render_wait_ms() {
+            let now = Instant::now();
+            let deadline = scene_focused_render_deadline(
+                now,
+                focused_render_deadline,
+                focused_render_wait_ms,
+                wait_ms,
+            );
+            focused_render_deadline = Some(deadline);
+            focused_render_wait_ms = Some(wait_ms);
+
+            if deadline <= now {
+                let () = {
+                    #[cfg(feature = "extended_observability")]
+                    let _span = debug_span!("scene_focused_render_tick").entered();
+                    handle_scene_focused_render_tick(hwnd, false);
+                };
+                focused_render_deadline =
+                    Some(Instant::now() + scene_focused_render_wait_duration(wait_ms));
+                continue;
+            }
+
             let using_wait_timer = wait_timer.is_some();
             if let Some(wait_timer) = wait_timer.as_ref() {
-                wait_timer.set_relative(Duration::from_millis(u64::from(wait_ms)))?;
+                wait_timer.set_relative(deadline.saturating_duration_since(now))?;
             }
             let wait_handles = wait_timer.as_ref().map(|wait_timer| [wait_timer.raw()]);
             let status = {
@@ -3020,17 +3059,31 @@ fn scene_message_loop(hwnd: WindowHandle) -> eyre::Result<()> {
                 eyre::bail!("failed to wait for next scene message")
             }
             if (!using_wait_timer && status.0 == 258) || (using_wait_timer && status.0 == 0) {
-                handle_scene_focused_render_tick(hwnd, false);
+                let () = {
+                    #[cfg(feature = "extended_observability")]
+                    let _span = debug_span!("scene_focused_render_tick").entered();
+                    handle_scene_focused_render_tick(hwnd, false);
+                };
+                focused_render_deadline =
+                    Some(Instant::now() + scene_focused_render_wait_duration(wait_ms));
                 continue;
             }
             if status.0 != if using_wait_timer { 1 } else { 0 } {
                 eyre::bail!("unexpected scene wait status: {}", status.0)
             }
-            if dispatch_pending_thread_messages()? {
+            let should_quit = {
+                #[cfg(feature = "extended_observability")]
+                let _span = debug_span!("dispatch_pending_thread_messages").entered();
+                dispatch_pending_thread_messages()?
+            };
+            if should_quit {
                 return Ok(());
             }
             continue;
         }
+
+        focused_render_deadline = None;
+        focused_render_wait_ms = None;
 
         let mut message = MSG::default();
         let status = {
@@ -4936,14 +4989,20 @@ fn handle_scene_focused_render_wake(hwnd: WindowHandle) -> LRESULT {
 
 fn scene_should_force_redraw_on_focused_tick(state: &SceneAppState) -> bool {
     scene_uses_refresh_timer_for_playground_animation(state)
-        || (scene_requires_force_redraw_for_immediate_focused_render_loop(state)
+        || (!scene_uses_always_redrawn_late_latched_frame_model(state)
+            && scene_requires_force_redraw_for_immediate_focused_render_loop(state)
             && scene_should_use_immediate_focused_render_driver(state))
 }
 
 fn scene_should_block_on_force_redraw(state: &SceneAppState, force_redraw: bool) -> bool {
     force_redraw
+        && !scene_uses_always_redrawn_late_latched_frame_model(state)
         && (scene_requires_force_redraw_for_immediate_focused_render_loop(state)
             || scene_uses_refresh_timer_for_playground_animation(state))
+}
+
+fn scene_uses_always_redrawn_late_latched_frame_model(state: &SceneAppState) -> bool {
+    state.scene_kind == SceneWindowKind::CursorLatencyPlayground
 }
 
 fn scene_uses_refresh_timer_for_playground_animation(state: &SceneAppState) -> bool {
@@ -5073,9 +5132,7 @@ fn scene_needs_focused_timer_render(state: &SceneAppState) -> bool {
 }
 
 fn scene_focused_render_tick_interval_ms(state: &SceneAppState) -> u32 {
-    if state.latency_overlay.is_visible()
-        || state.scene_kind == SceneWindowKind::CursorLatencyPlayground
-    {
+    if state.latency_overlay.is_visible() {
         CURSOR_LATENCY_FOCUSED_RENDER_TICK_INTERVAL_MS
     } else {
         state.focused_render_interval_ms
@@ -8766,9 +8823,8 @@ fn render_scene_window_frame(
         )
     } else if state.scene_kind == SceneWindowKind::CursorLatencyPlayground {
         let button_visual_states = scene_button_visual_states(state, layout);
-        let play_area_rect = windows_scene::cursor_latency_half_content_rect(
-            windows_scene::cursor_latency_playground_canvas_rect(layout.terminal_panel_rect()),
-        );
+        let play_area_rect =
+            windows_scene::cursor_latency_playground_rendered_content_rect(layout.terminal_panel_rect());
         let cursor_latency_state = state
             .cursor_latency_playground
             .as_mut()
@@ -8801,8 +8857,7 @@ fn render_scene_window_frame(
             },
         });
         let view_state = windows_scene::CursorLatencyPlaygroundViewState {
-            os_cursor_position: None,
-            rendered_cursor_position: None,
+            cursor_position: state.pointer_position,
             brick_center: cursor_latency_state.brick_center,
             brick_hovered,
             brick_dragging: cursor_latency_state.brick_drag.is_some(),
@@ -15335,7 +15390,7 @@ fn screen_to_client_point_from_screen(
     hwnd: WindowHandle,
     screen_point: ScreenPoint,
 ) -> eyre::Result<ClientPoint> {
-    let transform = ScreenToClientTransform::for_window(hwnd.window_rect()?);
+    let transform = ScreenToClientTransform::for_hwnd(hwnd.raw())?;
     Ok(transform.screen_to_client(screen_point))
 }
 
@@ -15343,7 +15398,7 @@ fn client_to_screen_point(
     hwnd: WindowHandle,
     client_point: ClientPoint,
 ) -> eyre::Result<ScreenPoint> {
-    let transform = ScreenToClientTransform::for_window(hwnd.window_rect()?);
+    let transform = ScreenToClientTransform::for_hwnd(hwnd.raw())?;
     Ok(transform.client_to_screen(client_point))
 }
 
@@ -17005,6 +17060,60 @@ mod tests {
         state.window_focused = true;
 
         assert!(scene_needs_focused_timer_render(&state));
+    }
+
+    #[test]
+    fn cursor_latency_playground_focused_ticks_stay_async() {
+        let mut state = timeline_test_state(TimelineDocument::blank());
+        state.scene_kind = SceneWindowKind::CursorLatencyPlayground;
+        state.window_focused = true;
+
+        assert!(scene_should_poll_for_focused_render_work(&state));
+        assert!(scene_prefers_immediate_focused_render_loop(&state));
+        assert!(scene_should_use_immediate_focused_render_driver(&state));
+        assert!(!scene_should_force_redraw_on_focused_tick(&state));
+        assert!(!scene_should_block_on_force_redraw(&state, true));
+    }
+
+    #[test]
+    fn focused_timer_uses_display_interval_for_cursor_latency_playground() {
+        let mut state = timeline_test_state(TimelineDocument::blank());
+        state.scene_kind = SceneWindowKind::CursorLatencyPlayground;
+        state.focused_render_interval_ms = 7;
+
+        assert_eq!(scene_focused_render_tick_interval_ms(&state), 7);
+    }
+
+    #[test]
+    fn focused_render_deadline_preserves_schedule_across_message_wakes() {
+        let start = Instant::now();
+        let deadline = scene_focused_render_deadline(start, None, None, 4);
+        let message_wake = start + Duration::from_millis(1);
+
+        let preserved = scene_focused_render_deadline(
+            message_wake,
+            Some(deadline),
+            Some(4),
+            4,
+        );
+
+        assert_eq!(preserved, deadline);
+    }
+
+    #[test]
+    fn focused_render_deadline_resets_when_interval_changes() {
+        let start = Instant::now();
+        let deadline = scene_focused_render_deadline(start, None, None, 4);
+        let message_wake = start + Duration::from_millis(1);
+
+        let reset = scene_focused_render_deadline(
+            message_wake,
+            Some(deadline),
+            Some(4),
+            8,
+        );
+
+        assert_eq!(reset, message_wake + Duration::from_millis(8));
     }
 
     #[test]

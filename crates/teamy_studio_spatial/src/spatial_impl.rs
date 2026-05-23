@@ -4,7 +4,8 @@ use eyre::Context;
 use sguaba::{Coordinate, CoordinateSystem, math::RigidBodyTransform, systems::RightHandedXyzLike};
 use uom::si::f64::Length;
 use uom::si::length::meter;
-use windows::Win32::Foundation::{LPARAM, POINT, RECT};
+use windows::Win32::Foundation::{HWND, LPARAM, POINT, RECT};
+use windows::Win32::Graphics::Gdi::ClientToScreen;
 use windows::Win32::UI::WindowsAndMessaging::{
     HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTLEFT, HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT,
 };
@@ -240,12 +241,21 @@ pub struct ScreenToClientTransform {
 
 impl ScreenToClientTransform {
     #[must_use]
-    pub fn for_window(window_rect: ScreenRect) -> Self {
-        let window_origin = ScreenPoint::new(window_rect.left(), window_rect.top());
+    pub fn for_client_origin(client_origin: ScreenPoint) -> Self {
         Self {
-            // SAFETY: the window's top-left screen-space point defines the client-space origin.
-            inner: unsafe { window_origin.coordinate().map_as_zero_in::<ClientSpace>() },
+            // SAFETY: the client-space origin in screen coordinates defines the transform.
+            inner: unsafe { client_origin.coordinate().map_as_zero_in::<ClientSpace>() },
         }
+    }
+
+    pub fn for_hwnd(hwnd: HWND) -> eyre::Result<Self> {
+        let mut client_origin = POINT::default();
+        if !unsafe { ClientToScreen(hwnd, &mut client_origin) }.as_bool() {
+            eyre::bail!("failed to query client origin in screen coordinates")
+        }
+        Ok(Self::for_client_origin(ScreenPoint::from_win32_point(
+            client_origin,
+        )))
     }
 
     #[must_use]
@@ -347,7 +357,7 @@ mod tests {
 
     #[test]
     fn screen_client_transform_roundtrips_points() {
-        let transform = ScreenToClientTransform::for_window(ScreenRect::new(300, 400, 800, 900));
+        let transform = ScreenToClientTransform::for_client_origin(ScreenPoint::new(300, 400));
 
         let client = transform.screen_to_client(ScreenPoint::new(325, 442));
         assert_eq!(client.to_win32_point().unwrap(), POINT { x: 25, y: 42 });

@@ -275,8 +275,7 @@ pub const fn text_rendering_preset_for_action(action: SceneAction) -> Option<Tex
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct CursorLatencyPlaygroundViewState {
-    pub os_cursor_position: Option<ClientPoint>,
-    pub rendered_cursor_position: Option<ClientPoint>,
+    pub cursor_position: Option<ClientPoint>,
     pub brick_center: ClientPoint,
     pub brick_hovered: bool,
     pub brick_dragging: bool,
@@ -7277,22 +7276,12 @@ pub fn build_cursor_latency_playground_render_scene(
         PanelEffect::SceneBody,
     );
 
-    let accent = hue_rotate_180(preferred_title_bar_color(
-        window_chrome_buttons_state.focused,
-    ));
-    push_cursor_latency_half(
-        &mut scene,
-        cursor_latency_half_content_rect(canvas_rect),
-        cursor_latency_half_content_rect(canvas_rect),
-        canvas_rect,
-        "",
-        accent,
-        view_state.rendered_cursor_position,
-        0,
-    );
+    let accent = hue_rotate_180(preferred_title_bar_color(window_chrome_buttons_state.focused));
+    let content_rect = cursor_latency_playground_content_rect(canvas_rect);
+    push_cursor_latency_panel(&mut scene, content_rect, accent, view_state.cursor_position);
     push_cursor_latency_brick(
         &mut scene,
-        cursor_latency_half_content_rect(canvas_rect),
+        content_rect,
         view_state.brick_center,
         accent,
         view_state.brick_hovered,
@@ -7337,6 +7326,15 @@ pub fn cursor_latency_playground_layout(panel_rect: ClientRect) -> CursorLatency
 #[must_use]
 pub fn cursor_latency_playground_canvas_rect(panel_rect: ClientRect) -> ClientRect {
     cursor_latency_playground_layout(panel_rect).canvas_rect
+}
+
+#[must_use]
+pub fn cursor_latency_playground_rendered_content_rect(panel_rect: ClientRect) -> ClientRect {
+    cursor_latency_playground_content_rect(cursor_latency_playground_canvas_rect(panel_rect))
+}
+
+fn cursor_latency_playground_content_rect(canvas_rect: ClientRect) -> ClientRect {
+    canvas_rect
 }
 
 #[must_use]
@@ -7420,45 +7418,29 @@ fn push_cursor_gallery_glow(
     }
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "the split-screen cursor latency cards are described by explicit source and destination rectangles"
-)]
-fn push_cursor_latency_half(
+fn push_cursor_latency_panel(
     scene: &mut RenderScene,
-    source_fastest_rect: ClientRect,
-    source_match_os_rect: ClientRect,
-    half_rect: ClientRect,
-    _label: &str,
+    content_rect: ClientRect,
     accent: [f32; 4],
     source_point: Option<ClientPoint>,
-    _lead_pixels: i32,
 ) {
-    // cursorlatency[impl playground.split-halves]
     // cursorlatency[impl playground.ripple-sdf]
     let background = mix_rgba([0.05, 0.06, 0.08, 1.0], accent, 0.22);
     push_panel(
         scene,
-        half_rect.to_win32_rect(),
+        content_rect.to_win32_rect(),
         background,
         PanelEffect::TerminalFill,
     );
     push_panel(
         scene,
-        half_rect.to_win32_rect(),
+        content_rect.to_win32_rect(),
         mix_rgba(background, accent, 0.08),
         PanelEffect::SceneBody,
     );
 
     if let Some(point) = source_point {
-        push_cursor_latency_ripple_panel(
-            scene,
-            source_fastest_rect,
-            source_match_os_rect,
-            cursor_latency_half_content_rect(half_rect),
-            point,
-            accent,
-        );
+        push_cursor_latency_ripple_panel(scene, content_rect, point, accent);
     }
 }
 
@@ -7468,25 +7450,22 @@ fn push_cursor_latency_half(
 )]
 fn push_cursor_latency_ripple_panel(
     scene: &mut RenderScene,
-    source_fastest_rect: ClientRect,
-    source_match_os_rect: ClientRect,
-    half_content_rect: ClientRect,
+    content_rect: ClientRect,
     source_point: ClientPoint,
     accent: [f32; 4],
 ) {
-    let origin_uv =
-        map_cursor_latency_point(source_fastest_rect, source_match_os_rect, source_point);
+    let origin_uv = map_cursor_latency_point(content_rect, source_point);
     let base = mix_rgba([0.05, 0.06, 0.08, 1.0], accent, 0.16);
     push_panel_with_data(
         scene,
-        half_content_rect.to_win32_rect(),
+        content_rect.to_win32_rect(),
         base,
         PanelEffect::CursorLatencyRipple,
         [
             origin_uv.0,
             origin_uv.1,
-            half_content_rect.width().max(1) as f32,
-            half_content_rect.height().max(1) as f32,
+            content_rect.width().max(1) as f32,
+            content_rect.height().max(1) as f32,
         ],
     );
 }
@@ -7541,26 +7520,12 @@ fn push_cursor_latency_brick(
     );
 }
 
-pub fn cursor_latency_half_content_rect(half_rect: ClientRect) -> ClientRect {
-    half_rect
-}
-
 #[expect(
     clippy::cast_precision_loss,
     reason = "cursor latency UV mapping converts integral client pixels into normalized floats"
 )]
-fn map_cursor_latency_point(
-    fastest_rect: ClientRect,
-    match_os_rect: ClientRect,
-    point: ClientPoint,
-) -> (f32, f32) {
-    let source_rect = point.to_win32_point().map_or(fastest_rect, |pixel| {
-        if pixel.x >= match_os_rect.left() {
-            match_os_rect
-        } else {
-            fastest_rect
-        }
-    });
+fn map_cursor_latency_point(content_rect: ClientRect, point: ClientPoint) -> (f32, f32) {
+    let source_rect = content_rect;
     let (point_x, point_y) = clamp_client_point_pixels(point, source_rect);
     let width = source_rect.width().max(1) as f32;
     let height = source_rect.height().max(1) as f32;

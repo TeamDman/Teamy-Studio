@@ -55,7 +55,7 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::System::LibraryLoader::LoadLibraryW;
 use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObjectEx};
 use windows::Win32::UI::WindowsAndMessaging::{
-    DI_NORMAL, DestroyIcon, DrawIconEx, GetClientRect, GetCursorPos, GetWindowRect, HICON,
+    DI_NORMAL, DestroyIcon, DrawIconEx, GetClientRect, GetCursorPos, HICON,
     IDC_ARROW, IDC_CROSS, IDC_HAND, IDC_HELP, IDC_IBEAM, IDC_SIZEALL, IDC_WAIT, IMAGE_FLAGS,
     IMAGE_ICON, LoadCursorW, LoadImageW,
 };
@@ -63,7 +63,7 @@ use windows::core::BOOL;
 use windows::core::{Error, Interface, Owned, PCWSTR, s};
 
 use super::cell_grid;
-use super::spatial::{ClientPoint, ClientRect, TerminalCellPoint};
+use super::spatial::{ClientPoint, ClientRect, ScreenPoint, ScreenToClientTransform, TerminalCellPoint};
 use super::windows_scene::{self, CursorLatencyPlaygroundViewState, SceneAction};
 use super::windows_terminal;
 use super::windows_terminal::{
@@ -857,7 +857,12 @@ fn render_thread_main_loop(
                 && state.pending_frame.is_none()
                 && state.error.is_none()
             {
-                state = match wake.wait(state) {
+                let wait_result = {
+                    #[cfg(feature = "extended_observability")]
+                    let _span = debug_span!("render_thread_wait_for_work").entered();
+                    wake.wait(state)
+                };
+                state = match wait_result {
                     Ok(state) => state,
                     Err(_) => return,
                 };
@@ -1363,7 +1368,11 @@ impl D3d12PanelRenderer {
     ) -> eyre::Result<()> {
         // Frame-model rendering updates shared upload buffers before command recording, so keep
         // the previous submission drained before producing the next frame.
-        self.wait_for_last_submitted_frame()?;
+        {
+            #[cfg(feature = "extended_observability")]
+            let _span = debug_span!("wait_for_last_submitted_frame").entered();
+            self.wait_for_last_submitted_frame()?;
+        }
         if let Some(cursor_latency) = frame.cursor_latency.as_ref() {
             scene_cache.last_frame = Some(frame.clone());
             return self.render_cursor_latency_frame_model(frame, cursor_latency);
@@ -1516,19 +1525,33 @@ impl D3d12PanelRenderer {
         frame: &RenderFrameModel,
         cursor_latency: &CursorLatencyFrameModel,
     ) -> eyre::Result<()> {
-        self.wait_for_frame_latency()?;
+        {
+            #[cfg(feature = "extended_observability")]
+            let _span = debug_span!("wait_for_frame_sync").entered();
+            self.wait_for_frame_latency()?;
+        }
         let frame_index = unsafe { self.swap_chain.GetCurrentBackBufferIndex() as usize };
-        self.wait_for_frame(frame_index)?;
+        {
+            #[cfg(feature = "extended_observability")]
+            let _span = debug_span!("wait_for_frame_fence").entered();
+            self.wait_for_frame(frame_index)?;
+        }
 
-        let view_state =
-            self.late_latched_cursor_latency_view_state(frame.layout, cursor_latency)?;
-        let mut scene = windows_scene::build_cursor_latency_playground_render_scene(
-            frame.layout,
-            frame.window_chrome_buttons_state,
-            view_state,
-            &cursor_latency.button_states,
-        );
+        let mut scene = {
+            #[cfg(feature = "extended_observability")]
+            let _span = debug_span!("build_cursor_latency_scene").entered();
+            let view_state =
+                self.late_latched_cursor_latency_view_state(frame.layout, cursor_latency)?;
+            windows_scene::build_cursor_latency_playground_render_scene(
+                frame.layout,
+                frame.window_chrome_buttons_state,
+                view_state,
+                &cursor_latency.button_states,
+            )
+        };
         if let Some(base_scene) = frame.scene.as_ref() {
+            #[cfg(feature = "extended_observability")]
+            let _span = debug_span!("copy_cursor_latency_overlays").entered();
             scene.overlay_panels.clone_from(&base_scene.overlay_panels);
             scene
                 .overlay_transformed_panels
@@ -1542,10 +1565,30 @@ impl D3d12PanelRenderer {
         self.transformed_text_projection = [[0.0; 4]; 2];
         self.transformed_text_inverse_homography = [[0.0; 4]; 2];
 
-        let _ = self.update_slug_curves_for_fragments(&[&scene])?;
-        let scene_vertices = self.build_scene_vertices(&scene);
-        let vertex_count = self.upload_cached_fragment_vertices(&[scene_vertices.as_slice()])?;
-        upload_transformed_glyph_inverse_data(&self.transformed_glyph_inverse_buffer, &[&scene])?;
+        let _ = {
+            #[cfg(feature = "extended_observability")]
+            let _span = debug_span!("update_slug_curves").entered();
+            self.update_slug_curves_for_fragments(&[&scene])?
+        };
+        let vertex_count = {
+            #[cfg(feature = "extended_observability")]
+            let _span = debug_span!("update_scene_vertices").entered();
+            let scene_vertices = {
+                #[cfg(feature = "extended_observability")]
+                let _span = debug_span!("build_scene_vertices").entered();
+                self.build_scene_vertices(&scene)
+            };
+            {
+                #[cfg(feature = "extended_observability")]
+                let _span = debug_span!("upload_scene_vertices").entered();
+                self.upload_cached_fragment_vertices(&[scene_vertices.as_slice()])?
+            }
+        };
+        {
+            #[cfg(feature = "extended_observability")]
+            let _span = debug_span!("upload_transformed_glyph_inverse_data").entered();
+            upload_transformed_glyph_inverse_data(&self.transformed_glyph_inverse_buffer, &[&scene])?;
+        }
 
         self.execute_prepared_frame_for_slot(vertex_count, frame_index)
     }
@@ -1559,17 +1602,30 @@ impl D3d12PanelRenderer {
             return Ok(());
         };
 
-        self.wait_for_frame_latency()?;
+        {
+            #[cfg(feature = "extended_observability")]
+            let _span = debug_span!("wait_for_frame_sync").entered();
+            self.wait_for_frame_latency()?;
+        }
         let frame_index = unsafe { self.swap_chain.GetCurrentBackBufferIndex() as usize };
-        self.wait_for_frame(frame_index)?;
+        {
+            #[cfg(feature = "extended_observability")]
+            let _span = debug_span!("wait_for_frame_fence").entered();
+            self.wait_for_frame(frame_index)?;
+        }
 
-        let sampled_pointer = self.sample_client_pointer_position()?;
-        let mut late_latched_scene = scene.clone();
-        apply_late_latched_pointer_visual(
-            &mut late_latched_scene,
-            late_latched_pointer_visual,
-            sampled_pointer,
-        );
+        let late_latched_scene = {
+            #[cfg(feature = "extended_observability")]
+            let _span = debug_span!("late_latch_pointer_visual").entered();
+            let sampled_pointer = self.sample_client_pointer_position()?;
+            let mut late_latched_scene = scene.clone();
+            apply_late_latched_pointer_visual(
+                &mut late_latched_scene,
+                late_latched_pointer_visual,
+                sampled_pointer,
+            );
+            late_latched_scene
+        };
 
         self.transformed_glyph_clip_rect = late_latched_scene.transformed_glyph_clip_rect;
         self.transformed_glyph_debug_enabled =
@@ -1585,13 +1641,33 @@ impl D3d12PanelRenderer {
             transformed_text_inverse_homography_for_scene(&late_latched_scene)
                 .unwrap_or([[0.0; 4]; 2]);
 
-        let _ = self.update_slug_curves_for_fragments(&[&late_latched_scene])?;
-        let scene_vertices = self.build_scene_vertices(&late_latched_scene);
-        let vertex_count = self.upload_cached_fragment_vertices(&[scene_vertices.as_slice()])?;
-        upload_transformed_glyph_inverse_data(
-            &self.transformed_glyph_inverse_buffer,
-            &[&late_latched_scene],
-        )?;
+        let _ = {
+            #[cfg(feature = "extended_observability")]
+            let _span = debug_span!("update_slug_curves").entered();
+            self.update_slug_curves_for_fragments(&[&late_latched_scene])?
+        };
+        let vertex_count = {
+            #[cfg(feature = "extended_observability")]
+            let _span = debug_span!("update_scene_vertices").entered();
+            let scene_vertices = {
+                #[cfg(feature = "extended_observability")]
+                let _span = debug_span!("build_scene_vertices").entered();
+                self.build_scene_vertices(&late_latched_scene)
+            };
+            {
+                #[cfg(feature = "extended_observability")]
+                let _span = debug_span!("upload_scene_vertices").entered();
+                self.upload_cached_fragment_vertices(&[scene_vertices.as_slice()])?
+            }
+        };
+        {
+            #[cfg(feature = "extended_observability")]
+            let _span = debug_span!("upload_transformed_glyph_inverse_data").entered();
+            upload_transformed_glyph_inverse_data(
+                &self.transformed_glyph_inverse_buffer,
+                &[&late_latched_scene],
+            )?;
+        }
 
         self.execute_prepared_frame_for_slot(vertex_count, frame_index)
     }
@@ -1602,9 +1678,8 @@ impl D3d12PanelRenderer {
         cursor_latency: &CursorLatencyFrameModel,
     ) -> eyre::Result<CursorLatencyPlaygroundViewState> {
         let sampled_cursor = self.sample_client_pointer_position()?;
-        let play_area_rect = windows_scene::cursor_latency_half_content_rect(
-            windows_scene::cursor_latency_playground_canvas_rect(layout.terminal_panel_rect()),
-        );
+        let play_area_rect =
+            windows_scene::cursor_latency_playground_rendered_content_rect(layout.terminal_panel_rect());
         let brick_center =
             cursor_latency
                 .brick
@@ -1634,19 +1709,25 @@ impl D3d12PanelRenderer {
 
     fn sample_client_pointer_position(&self) -> eyre::Result<Option<ClientPoint>> {
         let mut point = POINT::default();
-        unsafe { GetCursorPos(&mut point) }.wrap_err("failed to query cursor position")?;
-
-        let mut window_rect = RECT::default();
-        unsafe { GetWindowRect(self.hwnd, &mut window_rect) }
-            .wrap_err("failed to query renderer window rectangle")?;
-
-        let x = point.x - window_rect.left;
-        let y = point.y - window_rect.top;
+        {
+            #[cfg(feature = "extended_observability")]
+            let _span = debug_span!("query_cursor_screen_position").entered();
+            unsafe { GetCursorPos(&mut point) }.wrap_err("failed to query cursor position")?;
+        }
+        let client_point = {
+            #[cfg(feature = "extended_observability")]
+            let _span = debug_span!("convert_cursor_to_client_position").entered();
+            let transform = ScreenToClientTransform::for_hwnd(self.hwnd)?;
+            transform.screen_to_client(ScreenPoint::from_win32_point(point))
+        };
+        let client_point_pixels = client_point.to_win32_point()?;
+        let x = client_point_pixels.x;
+        let y = client_point_pixels.y;
         if x < 0 || y < 0 || x >= self.width as i32 || y >= self.height as i32 {
             return Ok(None);
         }
 
-        Ok(Some(ClientPoint::new(x, y)))
+        Ok(Some(client_point))
     }
 
     fn update_scene_vertices_for_fragments(&self, scenes: &[&RenderScene]) -> eyre::Result<usize> {
@@ -2256,14 +2337,13 @@ fn apply_late_latched_pointer_visual(
 }
 
 fn cursor_latency_view_state_from_sample(
-    sampled_cursor: Option<ClientPoint>,
+    cursor_position: Option<ClientPoint>,
     brick_center: ClientPoint,
     brick_hovered: bool,
     brick_dragging: bool,
 ) -> CursorLatencyPlaygroundViewState {
     CursorLatencyPlaygroundViewState {
-        os_cursor_position: sampled_cursor,
-        rendered_cursor_position: sampled_cursor,
+        cursor_position,
         brick_center,
         brick_hovered,
         brick_dragging,
@@ -4382,16 +4462,24 @@ fn upload_transformed_glyph_inverse_data(
     transformed_glyph_inverse_buffer: &ID3D12Resource,
     scenes: &[&RenderScene],
 ) -> eyre::Result<()> {
-    let inverse_data = build_transformed_glyph_inverse_data(scenes);
-    unsafe {
-        let mut mapped = std::ptr::null_mut();
-        transformed_glyph_inverse_buffer.Map(0, None, Some(&mut mapped))?;
-        std::ptr::copy_nonoverlapping(
-            inverse_data.as_ptr(),
-            mapped as *mut [f32; 4],
-            inverse_data.len(),
-        );
-        transformed_glyph_inverse_buffer.Unmap(0, None);
+    let inverse_data = {
+        #[cfg(feature = "extended_observability")]
+        let _span = debug_span!("build_transformed_glyph_inverse_data").entered();
+        build_transformed_glyph_inverse_data(scenes)
+    };
+    {
+        #[cfg(feature = "extended_observability")]
+        let _span = debug_span!("upload_transformed_glyph_inverse_buffer").entered();
+        unsafe {
+            let mut mapped = std::ptr::null_mut();
+            transformed_glyph_inverse_buffer.Map(0, None, Some(&mut mapped))?;
+            std::ptr::copy_nonoverlapping(
+                inverse_data.as_ptr(),
+                mapped as *mut [f32; 4],
+                inverse_data.len(),
+            );
+            transformed_glyph_inverse_buffer.Unmap(0, None);
+        }
     }
     Ok(())
 }
@@ -7672,11 +7760,7 @@ mod tests {
         );
 
         assert_eq!(
-            view_state.os_cursor_position,
-            Some(ClientPoint::new(120, 212))
-        );
-        assert_eq!(
-            view_state.rendered_cursor_position,
+            view_state.cursor_position,
             Some(ClientPoint::new(120, 212))
         );
         assert_eq!(view_state.brick_center, ClientPoint::new(96, 144));
