@@ -3435,6 +3435,9 @@ fn run_scene_window(
     register_scene_window(hwnd, scene_kind);
     let renderer = RenderThreadProxy::new_with_mode(
         hwnd.raw(),
+        // The cursor-latency playground exists specifically to minimize end-to-end pointer
+        // latency. Routing it through the composed swap-chain path silently reintroduces
+        // compositor latency and makes the playground lag behind the OS cursor again.
         scene_renderer_presentation_mode(scene_kind),
     )?;
     let chrome_tooltip = ChromeTooltipController::create(hwnd)?;
@@ -4329,6 +4332,8 @@ fn scene_window_starts_without_activation(
 
 fn scene_renderer_presentation_mode(scene_kind: SceneWindowKind) -> RendererPresentationMode {
     match scene_kind {
+        // This scene must bypass the composed presentation path. The low-latency HWND swap chain
+        // is part of the playground's correctness contract, not a performance optimization.
         SceneWindowKind::CursorLatencyPlayground => RendererPresentationMode::LowLatencyHwnd,
         _ => RendererPresentationMode::Composed,
     }

@@ -1153,6 +1153,9 @@ impl D3d12PanelRenderer {
     }
 
     fn reactivate_low_latency_mode(&mut self) -> eyre::Result<()> {
+        // Focus changes can broadcast this request to every scene renderer. Keep the composed
+        // path as a no-op, but treat the cursor-latency scene itself as a stricter contract in
+        // render_cursor_latency_frame_model.
         if self.presentation_mode != RendererPresentationMode::LowLatencyHwnd
             || self.width == 0
             || self.height == 0
@@ -1525,6 +1528,7 @@ impl D3d12PanelRenderer {
         frame: &RenderFrameModel,
         cursor_latency: &CursorLatencyFrameModel,
     ) -> eyre::Result<()> {
+        Self::ensure_cursor_latency_presentation_mode(self.presentation_mode)?;
         {
             #[cfg(feature = "extended_observability")]
             let _span = debug_span!("wait_for_frame_sync").entered();
@@ -1540,6 +1544,9 @@ impl D3d12PanelRenderer {
         let mut scene = {
             #[cfg(feature = "extended_observability")]
             let _span = debug_span!("build_cursor_latency_scene").entered();
+            // Sample after the frame-latency and fence waits so the observed cursor position is
+            // tied to the frame that is about to be submitted. Sampling earlier measurably moves
+            // the playground behind the OS cursor even when the rest of the frame is fast enough.
             let view_state =
                 self.late_latched_cursor_latency_view_state(frame.layout, cursor_latency)?;
             windows_scene::build_cursor_latency_playground_render_scene(
@@ -1591,6 +1598,16 @@ impl D3d12PanelRenderer {
         }
 
         self.execute_prepared_frame_for_slot(vertex_count, frame_index)
+    }
+
+    fn ensure_cursor_latency_presentation_mode(
+        presentation_mode: RendererPresentationMode,
+    ) -> eyre::Result<()> {
+        eyre::ensure!(
+            presentation_mode == RendererPresentationMode::LowLatencyHwnd,
+            "cursor latency playground requires LowLatencyHwnd presentation mode; the composed path adds compositor latency and invalidates the playground"
+        );
+        Ok(())
     }
 
     fn render_scene_with_late_latched_pointer_visual(
@@ -7692,15 +7709,16 @@ fn issue_transition_barrier(
 )]
 mod tests {
     use super::{
-        CachedSceneVertices, FALLBACK_GLYPH, PanelEffect, RenderScene, Vertex,
-        WindowChromeButtonsState, append_rect, append_slug_band_data, build_panel_scene,
-        build_shader_params, cached_compiled_shaders, can_reuse_cached_scene_vertices,
-        collect_scene_chars, composition_swap_chain_description, cpu_slug_coverage,
-        cpu_slug_coverage_all_curves, cursor_latency_view_state_from_sample, dirty_fragment_ranges,
-        extract_glyph_curves, fragment_ranges_match, fragment_vertex_ranges, load_snapshot_glyph,
-        load_terminal_font, preferred_garden_frame_color, preferred_title_bar_color,
-        push_centered_text, push_glyph, push_overlay_panel, push_panel, push_text_block,
-        push_title_text, render_frame_model_offscreen_image, render_snapshot_glyph_into_image,
+        CachedSceneVertices, D3d12PanelRenderer, FALLBACK_GLYPH, PanelEffect, RenderScene,
+        RendererPresentationMode, Vertex, WindowChromeButtonsState, append_rect,
+        append_slug_band_data, build_panel_scene, build_shader_params, cached_compiled_shaders,
+        can_reuse_cached_scene_vertices, collect_scene_chars, composition_swap_chain_description,
+        cpu_slug_coverage, cpu_slug_coverage_all_curves, cursor_latency_view_state_from_sample,
+        dirty_fragment_ranges, extract_glyph_curves, fragment_ranges_match,
+        fragment_vertex_ranges, load_snapshot_glyph, load_terminal_font,
+        preferred_garden_frame_color, preferred_title_bar_color, push_centered_text, push_glyph,
+        push_overlay_panel, push_panel, push_text_block, push_title_text,
+        render_frame_model_offscreen_image, render_snapshot_glyph_into_image,
         solve_inverse_homography, terminal_scrollbar_geometry, window_garden_shader_data,
     };
     use crate::app::render_verification::{
@@ -7766,6 +7784,26 @@ mod tests {
         assert_eq!(view_state.brick_center, ClientPoint::new(96, 144));
         assert!(view_state.brick_hovered);
         assert!(!view_state.brick_dragging);
+    }
+
+    #[test]
+    fn cursor_latency_rejects_composed_presentation_mode() {
+        assert!(D3d12PanelRenderer::ensure_cursor_latency_presentation_mode(
+            RendererPresentationMode::LowLatencyHwnd,
+        )
+        .is_ok());
+
+        let error = D3d12PanelRenderer::ensure_cursor_latency_presentation_mode(
+            RendererPresentationMode::Composed,
+        )
+        .expect_err("cursor latency playground must not accept composed presentation");
+
+        assert!(
+            error
+                .to_string()
+                .contains("LowLatencyHwnd presentation mode"),
+            "unexpected error: {error:#}"
+        );
     }
 
     #[test]
