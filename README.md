@@ -84,6 +84,10 @@ For Tracy profiling, run:
 ./run-profiler.ps1 window show
 ```
 
+`run-profiler.ps1` builds first, then starts Tracy capture immediately before launching the already-built `teamy-studio.exe`, so the capture excludes Cargo build time while still covering app startup.
+
+The wrapper now waits up to 5 minutes for `tracy-capture.exe` to finish saving after Teamy Studio exits, and it skips profiler or CSV post-processing if Tracy never produces a saved capture file.
+
 For an unattended live Timeline Playground run that also writes an FPS report, use:
 
 ```powershell

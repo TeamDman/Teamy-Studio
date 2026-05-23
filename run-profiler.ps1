@@ -1,9 +1,10 @@
+[CmdletBinding(PositionalBinding = $false)]
 param(
 	[switch]$Release,
 	[switch]$NoOpenProfiler,
 	[int]$SlowFramePaddingMs = 250,
 	[int]$SlowFrameExportLimit = 5,
-	[Parameter(ValueFromRemainingArguments = $true)]
+	[Parameter(Position = 0, ValueFromRemainingArguments = $true)]
 	[string[]]$QueryArgs
 )
 
@@ -378,6 +379,7 @@ function Export-TimelineLiveViewSlowFrameZoneCsvs {
 }
 
 $overallStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+$buildElapsed = $null
 $captureLaunchElapsed = $null
 $commandElapsed = $null
 $cleanupElapsed = $null
@@ -385,7 +387,7 @@ $profilerElapsed = $null
 $captureShutdownElapsed = [TimeSpan]::Zero
 $captureFlushDelay = [TimeSpan]::FromSeconds(1)
 $captureStartupTimeout = [TimeSpan]::FromSeconds(10)
-$captureExitTimeout = [TimeSpan]::FromMinutes(2)
+$captureExitTimeout = [TimeSpan]::FromMinutes(5)
 
 $captureDir = Join-Path $PSScriptRoot "tracy"
 if (-not (Test-Path $captureDir)) {
@@ -426,6 +428,40 @@ $timelineLiveViewSlowFrameSummaryPath = $null
 $previousTimelineLiveViewCacheDir = $null
 $commandExitCode = 0
 $commandFailureMessage = $null
+$captureReadyForPostProcessing = $false
+$capturePostProcessingSkipReason = $null
+$profileOutputDirectory = if ($Release) { 'profiling' } else { 'debug' }
+$profileLabel = if ($Release) { 'profiling release' } else { 'debug' }
+$buildArgs = @('build', '--bin', 'teamy-studio', '--features', $profilerFeatures)
+if ($Release) {
+	$buildArgs += @('--profile', 'profiling')
+}
+$teamyStudioPath = Join-Path $PSScriptRoot "target\$profileOutputDirectory\teamy-studio.exe"
+$appArgs = @($QueryArgs)
+$appArgs += '--log-filter'
+$appArgs += 'trace'
+
+$buildStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+Write-Host "Building $profileLabel with features ${profilerFeatures}: cargo $($buildArgs -join ' ')"
+& cargo @buildArgs
+$buildStopwatch.Stop()
+$buildElapsed = $buildStopwatch.Elapsed
+Write-Host "Build time: $(Format-Elapsed $buildElapsed)"
+if ($LASTEXITCODE -ne 0) {
+	throw "cargo build failed with exit code $LASTEXITCODE"
+}
+
+if (-not (Test-Path $teamyStudioPath)) {
+	throw "built Teamy Studio executable not found at $teamyStudioPath"
+}
+
+$captureDir = Join-Path $PSScriptRoot "tracy"
+if (-not (Test-Path $captureDir)) {
+	$null = New-Item -ItemType Directory -Path $captureDir
+}
+
+$slug = "$((Get-Date).ToString("yyyy-MM-dd_HH-mm-ss")).tracy"
+$capturePath = Join-Path $captureDir $slug
 
 if ($timelineLiveViewSelfTest) {
 	$captureStem = [System.IO.Path]::GetFileNameWithoutExtension($capturePath)
@@ -436,7 +472,7 @@ if ($timelineLiveViewSelfTest) {
 }
 
 Write-Host "Capture: $capturePath"
-Write-Host "Logging performance information to $capturePath"
+Write-Host "Logging Teamy Studio runtime performance information to $capturePath"
 $capture = $null
 $wt = Get-Command wt.exe -ErrorAction SilentlyContinue
 $captureLaunchStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
@@ -463,24 +499,15 @@ try {
 	if ($timelineLiveViewSelfTest) {
 		Set-Item -Path 'Env:TEAMY_STUDIO_CACHE_DIR' -Value $timelineLiveViewCacheDir
 	}
-	$cargoArgs = @("run", "--features", $profilerFeatures)
-	if ($Release) {
-		$cargoArgs += @("--profile", "profiling")
-	}
-	$cargoArgs += "--"
-	$cargoArgs += $QueryArgs
-	$cargoArgs += "--log-filter"
-	$cargoArgs += "trace"
-	$profileLabel = if ($Release) { "profiling release" } else { "debug" }
-	Write-Host "Running $profileLabel with ${tracyLayerEnvVar}=1 and features ${profilerFeatures}: cargo $($cargoArgs -join ' ')"
+	Write-Host "Running built $profileLabel Teamy Studio with ${tracyLayerEnvVar}=1: $teamyStudioPath $($appArgs -join ' ')"
 	$commandStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
-	& cargo @cargoArgs
+	& $teamyStudioPath @appArgs
 	$commandStopwatch.Stop()
 	$commandElapsed = $commandStopwatch.Elapsed
 	$commandExitCode = $LASTEXITCODE
-	Write-Host "Traced command time: $(Format-Elapsed $commandElapsed)"
+	Write-Host "Traced app time: $(Format-Elapsed $commandElapsed)"
 	if ($commandExitCode -ne 0) {
-		$commandFailureMessage = "cargo run failed with exit code $commandExitCode"
+		$commandFailureMessage = "teamy-studio.exe failed with exit code $commandExitCode"
 		Write-Warning $commandFailureMessage
 	}
 }
@@ -501,8 +528,10 @@ finally {
 	$naturalCaptureShutdownElapsed = Wait-ForTracyCaptureExit -CapturePath $capturePath -Timeout $captureExitTimeout
 	if ($null -ne $naturalCaptureShutdownElapsed) {
 		$captureShutdownElapsed = $naturalCaptureShutdownElapsed
+		$captureReadyForPostProcessing = $true
 		Write-Host "tracy-capture exited after the client disconnected"
 	} else {
+		$capturePostProcessingSkipReason = "tracy-capture did not finish saving within $(Format-Elapsed $captureExitTimeout)"
 		Write-Warning "Timed out waiting $(Format-Elapsed $captureExitTimeout) for tracy-capture to finish saving; forcing shutdown"
 		$captureShutdownElapsed = Stop-TracyCaptureGracefully -CapturePath $capturePath
 	}
@@ -510,6 +539,11 @@ finally {
 	$cleanupElapsed = $cleanupStopwatch.Elapsed
 	Write-Host "Capture cleanup time: $(Format-Elapsed $cleanupElapsed)"
 	Write-Host "Capture shutdown wait: $(Format-Elapsed $captureShutdownElapsed)"
+}
+
+if ($captureReadyForPostProcessing -and -not (Test-Path $capturePath)) {
+	$captureReadyForPostProcessing = $false
+	$capturePostProcessingSkipReason = "tracy-capture exited but no capture file was written to $capturePath"
 }
 
 if ($timelineLiveViewSelfTest) {
@@ -523,8 +557,12 @@ if ($timelineLiveViewSelfTest) {
 
 
 if ($NoOpenProfiler) {
-	Write-Host "Skipping tracy-profiler launch (-NoOpenProfiler). Capture saved to $capturePath"
-} elseif ($profilerCommand) {
+	if ($captureReadyForPostProcessing) {
+		Write-Host "Skipping tracy-profiler launch (-NoOpenProfiler). Capture saved to $capturePath"
+	} else {
+		Write-Warning "Skipping tracy-profiler launch (-NoOpenProfiler). $capturePostProcessingSkipReason"
+	}
+} elseif ($profilerCommand -and $captureReadyForPostProcessing) {
 	Write-Host "Displaying results from $capturePath"
 	$profilerStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
 	tracy-profiler.exe "$capturePath"
@@ -532,12 +570,16 @@ if ($NoOpenProfiler) {
 	$profilerElapsed = $profilerStopwatch.Elapsed
 	Write-Host "Profiler time: $(Format-Elapsed $profilerElapsed)"
 } else {
-	Write-Host "Capture saved to $capturePath"
+	if ($captureReadyForPostProcessing) {
+		Write-Host "Capture saved to $capturePath"
+	} else {
+		Write-Warning "Skipping tracy-profiler launch because $capturePostProcessingSkipReason"
+	}
 }
 
 $overallStopwatch.Stop()
 
-if ($csvExportCommand) {
+if ($csvExportCommand -and $captureReadyForPostProcessing) {
 	Write-Host "CSV from tracy-csvexport.exe $capturePath"
 	tracy-csvexport.exe $capturePath
 
@@ -573,12 +615,18 @@ if ($csvExportCommand) {
 			Write-Host "Timeline slow-frame export summary: $timelineLiveViewSlowFrameSummaryPath"
 		}
 	}
+
+} elseif ($csvExportCommand) {
+	Write-Warning "Skipping tracy-csvexport because $capturePostProcessingSkipReason"
 }
 
 Write-Host "Timing summary:"
+if ($buildElapsed) {
+	Write-Host "  build:          $(Format-Elapsed $buildElapsed)"
+}
 Write-Host "  capture launch: $(Format-Elapsed $captureLaunchElapsed)"
 if ($commandElapsed) {
-	Write-Host "  traced command: $(Format-Elapsed $commandElapsed)"
+	Write-Host "  traced app:     $(Format-Elapsed $commandElapsed)"
 }
 Write-Host "  cleanup:        $(Format-Elapsed $cleanupElapsed)"
 Write-Host "  capture stop:   $(Format-Elapsed $captureShutdownElapsed)"
