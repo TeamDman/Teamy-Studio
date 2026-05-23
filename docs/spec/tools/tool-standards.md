@@ -104,5 +104,8 @@ The unattended Timeline Playground FPS benchmark should display a clear non-inte
 tool[tests.performance.timeline-live-view-slowest-frames]
 The timeline live-view benchmark output should identify the slowest observed frames so automated analysis can narrow profiler captures to the most expensive time ranges.
 
+tool[tests.performance.timeline-live-view-trace-narrowing]
+The profiling wrapper should export narrowed Tracy event CSV windows around the slowest `self-test timeline-live-view` frames so unattended runs can inspect the relevant trace slice without manually hunting through the full capture.
+
 tool[tests.performance.terminal-throughput-replay]
 The repository should maintain a headless transcript replay benchmark so terminal-engine performance can be measured without PTY or window overhead.

@@ -104,6 +104,8 @@ To reproduce the long-run zoomed-out regression without opening the Tracy UI, us
 
 The JSON report includes aggregate frame stats plus `summary.worst_frame_ms` and `samples[].slowest_frames[]` so unattended runs can point directly at the most expensive frame ranges.
 
+When `run-profiler.ps1` wraps `self-test timeline-live-view`, it now also writes a `messages.csv`, a `slow-frame-windows.json`, and per-window `slow-frame-sampleXX-rankYY.csv` Tracy event exports under a sibling artifact directory next to the capture so unattended runs can jump straight to the hottest trace slices.
+
 That wrapper defaults to the debug profile so captures can show the same lag you see from `cargo run`. Pass `-Release` to use the dedicated Cargo `profiling` profile:
 
 ```powershell
