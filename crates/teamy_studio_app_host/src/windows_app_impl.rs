@@ -109,8 +109,8 @@ use super::windows_cursor_info::{CursorInfoConfig, CursorInfoVirtualSession};
 use super::windows_d3d12_renderer::{
     ButtonVisualState, CursorLatencyBrickFrameModel, CursorLatencyFrameModel,
     LateLatchedPointerVisual, RenderFrameModel, RenderScene, RenderThreadProxy,
-    RendererTerminalVisualState, WindowChromeButtonsState, terminal_font_layout_snapshot,
-    terminal_font_unicode_chars,
+    RendererPresentationMode, RendererTerminalVisualState, WindowChromeButtonsState,
+    terminal_font_layout_snapshot, terminal_font_unicode_chars,
 };
 use super::windows_demo_mode::{
     current_demo_mode_state, initialize_demo_mode_state, set_scramble_input_device_identifiers,
@@ -3433,7 +3433,10 @@ fn run_scene_window(
 
     let hwnd = create_scene_window(window_thread, scene_kind, starts_without_activation)?;
     register_scene_window(hwnd, scene_kind);
-    let renderer = RenderThreadProxy::new(hwnd.raw())?;
+    let renderer = RenderThreadProxy::new_with_mode(
+        hwnd.raw(),
+        scene_renderer_presentation_mode(scene_kind),
+    )?;
     let chrome_tooltip = ChromeTooltipController::create(hwnd)?;
     with_scene_app_state(|state| {
         state.hwnd = Some(hwnd);
@@ -4322,6 +4325,13 @@ fn scene_window_starts_without_activation(
 ) -> bool {
     scene_kind == SceneWindowKind::TimelinePlaygroundDetail
         && !timeline_playground_detail_is_pinned
+}
+
+fn scene_renderer_presentation_mode(scene_kind: SceneWindowKind) -> RendererPresentationMode {
+    match scene_kind {
+        SceneWindowKind::CursorLatencyPlayground => RendererPresentationMode::LowLatencyHwnd,
+        _ => RendererPresentationMode::Composed,
+    }
 }
 
 fn ensure_toast_host_started() {
@@ -17919,6 +17929,18 @@ mod tests {
         assert_eq!(style & WS_EX_NOACTIVATE, WINDOW_EX_STYLE(0));
         assert_eq!(style & WS_EX_TOOLWINDOW, WS_EX_TOOLWINDOW);
         assert_eq!(style & WS_EX_APPWINDOW, WINDOW_EX_STYLE(0));
+    }
+
+    #[test]
+    fn cursor_latency_playground_uses_low_latency_hwnd_renderer() {
+        assert_eq!(
+            scene_renderer_presentation_mode(SceneWindowKind::CursorLatencyPlayground),
+            RendererPresentationMode::LowLatencyHwnd,
+        );
+        assert_eq!(
+            scene_renderer_presentation_mode(SceneWindowKind::TimelinePlayground),
+            RendererPresentationMode::Composed,
+        );
     }
 
     #[test]
