@@ -10,6 +10,7 @@ members = [
     "crates/teamy_studio_demo_mode",
     "crates/teamy_studio_frontend",
     "crates/teamy_studio_image_models",
+    "crates/teamy_studio_llm_stack",
     "crates/teamy_studio_jobs",
     "crates/teamy_studio_logs",
 	"crates/teamy_studio_observability",
@@ -40,6 +41,7 @@ teamy_studio_cursor_info = { path = "crates/teamy_studio_cursor_info" }
 teamy_studio_demo_mode = { path = "crates/teamy_studio_demo_mode" }
 teamy_studio_frontend = { path = "crates/teamy_studio_frontend" }
 teamy_studio_image_models = { path = "crates/teamy_studio_image_models" }
+teamy_studio_llm_stack = { path = "crates/teamy_studio_llm_stack" }
 teamy_studio_jobs = { path = "crates/teamy_studio_jobs" }
 teamy_studio_logs = { path = "crates/teamy_studio_logs" }
 teamy_studio_observability = { path = "crates/teamy_studio_observability" }
@@ -76,6 +78,7 @@ figue = { package = "teamy-figue", version = "2.0.1", features = ["arbitrary"] }
 fontdb = "0.23"
 fontdue = "0.9.3"
 hound = "3.5.1"
+half = "2.7.1"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 libghostty-vt = { git = "https://github.com/TeamDman/libghostty-rs.git", rev = "5e5351c9dc4b800202721ce15017c929958f685d" }
 npy = "0.4.0"
@@ -94,6 +97,7 @@ tokenizers = { version = "0.22.0", default-features = false, features = ["onig"]
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter", "json"] }
 tracing-tracy = "0.11"
+tracy-client = "0.18.4"
 ttf-parser = "0.25"
 uom = { version = "0.38.0", default-features = false, features = ["autoconvert", "f64", "si", "std"] }
 widestring = "1.2"
@@ -147,6 +151,7 @@ teamy_studio_cursor_info.workspace = true
 teamy_studio_demo_mode.workspace = true
 teamy_studio_frontend.workspace = true
 teamy_studio_image_models.workspace = true
+teamy_studio_llm_stack.workspace = true
 teamy_studio_jobs.workspace = true
 teamy_studio_logs.workspace = true
 teamy_studio_observability.workspace = true
@@ -169,7 +174,7 @@ dunce.workspace = true
 eyre.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
-tracy-client = { version = "0.18.4", optional = true }
+tracy-client = { workspace = true, optional = true }
 image.workspace = true
 directories-next.workspace = true
 hound.workspace = true
@@ -240,7 +245,7 @@ default = ["extended_observability"]
 font-snapshot-tests = []
 ghostty = ["dep:libghostty-vt", "teamy_studio_cli/ghostty", "teamy_studio_terminal_core/ghostty", "teamy_studio_vt_types/ghostty", "teamy_studio_windows_terminal_engine/ghostty", "teamy_studio_windows_terminal_replay/ghostty"]
 extended_observability = ["teamy_studio_app_host/extended_observability", "teamy_studio_audio_input/extended_observability", "teamy_studio_audio_transcription/extended_observability", "teamy_studio_cli/extended_observability", "teamy_studio_frontend/extended_observability", "teamy_studio_observability/extended_observability", "teamy_studio_shell/extended_observability", "teamy_studio_teamy_terminal_engine/extended_observability", "teamy_studio_terminal_core/extended_observability", "teamy_studio_whisper_stack/extended_observability"]
-tracing_subscriber_tracy = ["teamy_studio_observability/tracing_subscriber_tracy", "dep:tracy-client"]
+tracing_subscriber_tracy = ["teamy_studio_llm_stack/tracing_subscriber_tracy", "teamy_studio_observability/tracing_subscriber_tracy", "dep:tracy-client"]
 
 [build-dependencies]
 embed-resource = "3.0.6"

@@ -170,6 +170,10 @@ impl LiveTracingTimelineCache {
             && self.first_timestamp.as_ref() == first_timestamp
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The cache snapshot stores a fixed revision bundle without introducing a churny intermediary struct during the refactor."
+    )]
     fn store(
         &mut self,
         revision: LiveTracingSnapshotRevision,

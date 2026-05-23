@@ -1,5 +1,6 @@
 use crate::cli::self_test::image_upscale_reference::SelfTestImageUpscaleReferenceArgs;
 use crate::cli::self_test::keyboard_input::SelfTestKeyboardInputArgs;
+use crate::cli::self_test::llm_reference::SelfTestLlmReferenceArgs;
 use crate::cli::self_test::render_offscreen::SelfTestRenderOffscreenArgs;
 use crate::cli::self_test::terminal_replay::SelfTestTerminalReplayArgs;
 use crate::cli::self_test::terminal_throughput::SelfTestTerminalThroughputArgs;
@@ -27,6 +28,8 @@ pub enum SelfTestCommand {
     // image[impl self-test.reference-command]
     /// Compare image upscaling against the Python/nunif reference harness.
     ImageUpscaleReference(SelfTestImageUpscaleReferenceArgs),
+    /// Compare Teamy's local LLM prompt lane against the Python Transformers reference harness.
+    LlmReference(SelfTestLlmReferenceArgs),
     // cli[impl command.surface.self-test-keyboard-input]
     /// Run the keyboard input self-test harness.
     KeyboardInput(SelfTestKeyboardInputArgs),
@@ -52,6 +55,7 @@ impl SelfTestArgs {
     ) -> eyre::Result<CliOutput> {
         match self.command {
             SelfTestCommand::ImageUpscaleReference(args) => args.invoke(app_home, cache_home),
+            SelfTestCommand::LlmReference(args) => args.invoke(app_home, cache_home),
             SelfTestCommand::KeyboardInput(args) => args.invoke(app_home, cache_home),
             SelfTestCommand::TerminalThroughput(args) => args.invoke(app_home, cache_home),
             SelfTestCommand::TerminalReplay(args) => args.invoke(app_home, cache_home),

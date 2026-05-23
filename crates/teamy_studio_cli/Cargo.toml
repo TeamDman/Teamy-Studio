@@ -25,6 +25,7 @@ teamy_studio_cursor_info.workspace = true
 teamy_studio_demo_mode.workspace = true
 teamy_studio_frontend.workspace = true
 teamy_studio_image_models.workspace = true
+teamy_studio_llm_stack.workspace = true
 teamy_studio_jobs.workspace = true
 teamy_studio_paths.workspace = true
 teamy_studio_shell.workspace = true

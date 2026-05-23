@@ -5775,6 +5775,7 @@ dependencies = [
  "teamy_studio_frontend",
  "teamy_studio_image_models",
  "teamy_studio_jobs",
+ "teamy_studio_llm_stack",
  "teamy_studio_logs",
  "teamy_studio_observability",
  "teamy_studio_paths",
@@ -5909,6 +5910,7 @@ dependencies = [
  "teamy_studio_frontend",
  "teamy_studio_image_models",
  "teamy_studio_jobs",
+ "teamy_studio_llm_stack",
  "teamy_studio_paths",
  "teamy_studio_shell",
  "teamy_studio_shell_default",
@@ -5978,6 +5980,24 @@ dependencies = [
 [[package]]
 name = "teamy_studio_jobs"
 version = "0.1.0"
+
+[[package]]
+name = "teamy_studio_llm_stack"
+version = "0.1.0"
+dependencies = [
+ "burn",
+ "burn-store",
+ "eyre",
+ "half",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "teamy_studio_paths",
+ "tempfile",
+ "tokenizers",
+ "tracing",
+ "tracy-client",
+]
 
 [[package]]
 name = "teamy_studio_logs"
