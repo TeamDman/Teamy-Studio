@@ -1,4 +1,5 @@
-use serde::Deserialize;
+use facet::Facet;
+use facet_json::RawJson;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -15,7 +16,9 @@ pub struct LlmSourceConfigSummary {
     pub text_num_attention_heads: Option<usize>,
     pub text_num_key_value_heads: Option<usize>,
     pub text_head_dim: Option<usize>,
+    pub text_hidden_act: Option<String>,
     pub text_partial_rotary_factor: Option<String>,
+    pub text_rope_theta: Option<String>,
     pub text_full_attention_interval: Option<usize>,
     pub text_linear_num_key_heads: Option<usize>,
     pub text_linear_num_value_heads: Option<usize>,
@@ -26,67 +29,61 @@ pub struct LlmSourceConfigSummary {
     pub text_layer_types_preview: Vec<String>,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Facet, PartialEq)]
 struct LlmSourceConfigFile {
-    #[serde(default)]
+    #[facet(default)]
     architectures: Vec<String>,
-    #[serde(default)]
+    #[facet(default)]
     model_name: Option<String>,
-    #[serde(default)]
+    #[facet(default)]
     model_type: Option<String>,
-    #[serde(default)]
+    #[facet(default)]
     text_config: Option<LlmSourceTextConfigFile>,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Facet, PartialEq)]
 struct LlmSourceTextConfigFile {
-    #[serde(default)]
+    #[facet(default)]
     model_type: Option<String>,
-    #[serde(default)]
+    #[facet(default)]
     num_hidden_layers: Option<usize>,
-    #[serde(default)]
+    #[facet(default)]
     hidden_size: Option<usize>,
-    #[serde(default)]
+    #[facet(default)]
     intermediate_size: Option<usize>,
-    #[serde(default)]
+    #[facet(default)]
     num_attention_heads: Option<usize>,
-    #[serde(default)]
+    #[facet(default)]
     num_key_value_heads: Option<usize>,
-    #[serde(default)]
+    #[facet(default)]
     head_dim: Option<usize>,
-    #[serde(default)]
-    partial_rotary_factor: Option<serde_json::Value>,
-    #[serde(default)]
+    #[facet(default)]
+    hidden_act: Option<String>,
+    #[facet(default)]
+    partial_rotary_factor: Option<RawJson<'static>>,
+    #[facet(default)]
+    rope_theta: Option<RawJson<'static>>,
+    #[facet(default)]
     full_attention_interval: Option<usize>,
-    #[serde(default)]
+    #[facet(default)]
     linear_num_key_heads: Option<usize>,
-    #[serde(default)]
+    #[facet(default)]
     linear_num_value_heads: Option<usize>,
-    #[serde(default)]
+    #[facet(default)]
     linear_key_head_dim: Option<usize>,
-    #[serde(default)]
+    #[facet(default)]
     linear_value_head_dim: Option<usize>,
-    #[serde(default)]
+    #[facet(default)]
     linear_conv_kernel_dim: Option<usize>,
-    #[serde(default)]
+    #[facet(default)]
     layer_types: Vec<String>,
-}
-
-fn render_json_value(value: serde_json::Value) -> String {
-    match value {
-        serde_json::Value::Null => "null".to_owned(),
-        serde_json::Value::Bool(value) => value.to_string(),
-        serde_json::Value::Number(value) => value.to_string(),
-        serde_json::Value::String(value) => value,
-        value => value.to_string(),
-    }
 }
 
 /// # Errors
 ///
 /// This function will return an error if the Hugging Face config file cannot be read or parsed.
 pub fn load_llm_source_config_summary(path: &Path) -> eyre::Result<LlmSourceConfigSummary> {
-    let parsed: LlmSourceConfigFile = serde_json::from_slice(&std::fs::read(path).map_err(
+    let parsed: LlmSourceConfigFile = facet_json::from_slice(&std::fs::read(path).map_err(
         |error| eyre::eyre!("Failed to read Hugging Face config {}: {}", path.display(), error),
     )?)
     .map_err(|error| eyre::eyre!("Failed to parse Hugging Face config {}: {}", path.display(), error))?;
@@ -133,11 +130,18 @@ pub fn load_llm_source_config_summary(path: &Path) -> eyre::Result<LlmSourceConf
             .text_config
             .as_ref()
             .and_then(|text_config| text_config.head_dim),
+        text_hidden_act: parsed
+            .text_config
+            .as_ref()
+            .and_then(|text_config| text_config.hidden_act.clone()),
         text_partial_rotary_factor: parsed.text_config.as_ref().and_then(|text_config| {
             text_config
                 .partial_rotary_factor
                 .clone()
                 .map(render_json_value)
+        }),
+        text_rope_theta: parsed.text_config.as_ref().and_then(|text_config| {
+            text_config.rope_theta.clone().map(render_json_value)
         }),
         text_full_attention_interval: parsed
             .text_config
@@ -168,6 +172,23 @@ pub fn load_llm_source_config_summary(path: &Path) -> eyre::Result<LlmSourceConf
     })
 }
 
+fn render_json_value(value: RawJson<'static>) -> String {
+    let raw = value.as_ref();
+    if raw == "null" {
+        return "null".to_owned();
+    }
+    if let Ok(parsed) = facet_json::from_str::<bool>(raw) {
+        return parsed.to_string();
+    }
+    if let Ok(parsed) = facet_json::from_str::<f64>(raw) {
+        return parsed.to_string();
+    }
+    if let Ok(parsed) = facet_json::from_str::<String>(raw) {
+        return parsed;
+    }
+    raw.to_owned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::load_llm_source_config_summary;
@@ -190,7 +211,9 @@ mod tests {
     "num_attention_heads":16,
     "num_key_value_heads":4,
     "head_dim":256,
+    "hidden_act":"silu",
     "partial_rotary_factor":0.25,
+    "rope_theta":10000000.0,
     "full_attention_interval":4,
     "linear_num_key_heads":16,
     "linear_num_value_heads":32,
@@ -206,6 +229,8 @@ mod tests {
         assert_eq!(summary.model_type.as_deref(), Some("qwen3_5"));
         assert_eq!(summary.text_model_type.as_deref(), Some("qwen3_5_text"));
         assert_eq!(summary.text_num_hidden_layers, Some(32));
+        assert_eq!(summary.text_hidden_act.as_deref(), Some("silu"));
+        assert_eq!(summary.text_rope_theta.as_deref(), Some("10000000"));
         assert_eq!(summary.text_full_attention_interval, Some(4));
         assert_eq!(
             summary.text_layer_type_counts.get("linear_attention"),

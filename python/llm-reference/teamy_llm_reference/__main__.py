@@ -17,8 +17,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--check-imports", action="store_true")
     parser.add_argument("--config-report", action="store_true")
     parser.add_argument("--prompt-report", action="store_true")
+    parser.add_argument("--layer-report", action="store_true")
     parser.add_argument("--export-burn-text", action="store_true")
     parser.add_argument("--model-id", default=DEFAULT_MODEL_ID)
+    parser.add_argument("--tokenizer-path")
     parser.add_argument("--device", default="cpu", choices=("cpu", "cuda"))
     parser.add_argument("--system-prompt")
     parser.add_argument("--user-prompt")
@@ -41,6 +43,11 @@ def main(argv: list[str] | None = None) -> int:
             if not args.user_prompt:
                 raise ValueError("--prompt-report requires --user-prompt")
             print_json(prompt_report(args), args.indent)
+            return 0
+        if args.layer_report:
+            if not args.user_prompt:
+                raise ValueError("--layer-report requires --user-prompt")
+            print_json(layer_report(args), args.indent)
             return 0
         if args.export_burn_text:
             if not args.output_dir:
@@ -74,7 +81,12 @@ def prompt_report(args: argparse.Namespace) -> dict[str, Any]:
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
-    tokenizer = AutoTokenizer.from_pretrained(args.model_id, trust_remote_code=True)
+    tokenizer_source = args.tokenizer_path or args.model_id
+    tokenizer = AutoTokenizer.from_pretrained(
+        tokenizer_source,
+        trust_remote_code=True,
+        local_files_only=is_local_model_source(tokenizer_source),
+    )
     rendered_prompt = render_qwen_single_turn_prompt(
         system_prompt=args.system_prompt,
         user_prompt=args.user_prompt,
@@ -118,6 +130,7 @@ def prompt_report(args: argparse.Namespace) -> dict[str, Any]:
     return {
         "ok": True,
         "model_id": args.model_id,
+        "tokenizer_source": tokenizer_source,
         "device": str(device),
         "rendered_prompt": rendered_prompt,
         "input_token_count": len(input_ids),
@@ -126,6 +139,96 @@ def prompt_report(args: argparse.Namespace) -> dict[str, Any]:
         "top_token_text": top_token_text,
         "top_logits": top_logits,
         "generated_text": generated_text,
+    }
+
+
+def layer_report(args: argparse.Namespace) -> dict[str, Any]:
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    tokenizer_source = args.tokenizer_path or args.model_id
+    tokenizer = AutoTokenizer.from_pretrained(
+        tokenizer_source,
+        trust_remote_code=True,
+        local_files_only=is_local_model_source(tokenizer_source),
+    )
+    rendered_prompt = render_qwen_single_turn_prompt(
+        system_prompt=args.system_prompt,
+        user_prompt=args.user_prompt,
+    )
+    encoded = tokenizer(rendered_prompt, return_tensors="pt")
+
+    if args.device == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA was requested but torch.cuda.is_available() is false")
+        device = torch.device("cuda")
+    else:
+        device = torch.device("cpu")
+
+    model = AutoModelForCausalLM.from_pretrained(
+        args.model_id,
+        trust_remote_code=True,
+        torch_dtype="auto",
+        local_files_only=is_local_model_source(args.model_id),
+    ).to(device)
+    encoded = {name: value.to(device) for name, value in encoded.items()}
+
+    text_model = resolve_text_model(model)
+    layer_outputs: list[list[float] | None] = [None] * len(text_model.layers)
+    final_norm_last_hidden: list[float] | None = None
+    hooks = []
+
+    def capture_layer(index: int):
+        def hook(_module: Any, _inputs: tuple[Any, ...], output: Any) -> None:
+            tensor = output[0] if isinstance(output, tuple) else output
+            layer_outputs[index] = tensor[0, -1].detach().float().cpu().tolist()
+
+        return hook
+
+    def capture_norm(_module: Any, _inputs: tuple[Any, ...], output: Any) -> None:
+        nonlocal final_norm_last_hidden
+        tensor = output[0] if isinstance(output, tuple) else output
+        final_norm_last_hidden = tensor[0, -1].detach().float().cpu().tolist()
+
+    for index, layer in enumerate(text_model.layers):
+        hooks.append(layer.register_forward_hook(capture_layer(index)))
+    hooks.append(text_model.norm.register_forward_hook(capture_norm))
+
+    try:
+        with torch.no_grad():
+            outputs = model(**encoded)
+            logits = outputs.logits[0, -1]
+            top = torch.topk(logits, args.top_k)
+    finally:
+        for hook in hooks:
+            hook.remove()
+
+    if any(value is None for value in layer_outputs):
+        raise RuntimeError("One or more layer hooks did not capture a hidden state")
+    if final_norm_last_hidden is None:
+        raise RuntimeError("Final norm hook did not capture a hidden state")
+
+    input_ids = encoded["input_ids"][0].detach().cpu().tolist()
+    top_token_ids = top.indices.detach().cpu().tolist()
+    top_logits = [float(value) for value in top.values.detach().cpu().tolist()]
+    top_token_text = [
+        tokenizer.decode([int(token_id)], skip_special_tokens=False)
+        for token_id in top_token_ids
+    ]
+
+    return {
+        "ok": True,
+        "model_id": args.model_id,
+        "tokenizer_source": tokenizer_source,
+        "device": str(device),
+        "rendered_prompt": rendered_prompt,
+        "input_token_count": len(input_ids),
+        "input_token_ids": input_ids,
+        "top_token_ids": top_token_ids,
+        "top_token_text": top_token_text,
+        "top_logits": top_logits,
+        "layer_last_hidden_states": layer_outputs,
+        "final_norm_last_hidden": final_norm_last_hidden,
     }
 
 
@@ -153,7 +256,9 @@ def config_report(args: argparse.Namespace) -> dict[str, Any]:
         "text_num_attention_heads": getattr(text_config, "num_attention_heads", None) if text_config else None,
         "text_num_key_value_heads": getattr(text_config, "num_key_value_heads", None) if text_config else None,
         "text_head_dim": getattr(text_config, "head_dim", None) if text_config else None,
+        "text_hidden_act": getattr(text_config, "hidden_act", None) if text_config else None,
         "text_partial_rotary_factor": getattr(text_config, "partial_rotary_factor", None) if text_config else None,
+        "text_rope_theta": resolve_optional_rope_theta(text_config) if text_config else None,
         "text_full_attention_interval": getattr(text_config, "full_attention_interval", None) if text_config else None,
         "text_linear_num_key_heads": getattr(text_config, "linear_num_key_heads", None) if text_config else None,
         "text_linear_num_value_heads": getattr(text_config, "linear_num_value_heads", None) if text_config else None,
@@ -252,9 +357,9 @@ def export_burn_text(args: argparse.Namespace) -> dict[str, Any]:
 
     manifest = {
         "format_version": 1,
-        "architecture": "qwen3_5_text",
+        "architecture": require_string_config_value(config, "model_type"),
         "source_model_id": args.model_id,
-        "text_model_type": getattr(config, "model_type", "qwen3_5_text"),
+        "text_model_type": require_string_config_value(config, "model_type"),
         "vocab_size": int(config.vocab_size),
         "hidden_size": int(config.hidden_size),
         "intermediate_size": int(config.intermediate_size),
@@ -263,7 +368,9 @@ def export_burn_text(args: argparse.Namespace) -> dict[str, Any]:
         "num_key_value_heads": int(config.num_key_value_heads),
         "head_dim": int(config.head_dim),
         "rms_norm_eps": float(config.rms_norm_eps),
-        "partial_rotary_factor": float(getattr(config, "partial_rotary_factor", 1.0)),
+        "hidden_act": require_string_config_value(config, "hidden_act"),
+        "partial_rotary_factor": require_float_config_value(config, "partial_rotary_factor"),
+        "rope_theta": resolve_required_rope_theta(config),
         "linear_num_key_heads": int(config.linear_num_key_heads),
         "linear_num_value_heads": int(config.linear_num_value_heads),
         "linear_key_head_dim": int(config.linear_key_head_dim),
@@ -305,6 +412,50 @@ def export_burn_text(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
+def require_float_config_value(config: Any, name: str) -> float:
+    value = getattr(config, name, None)
+    if value is None:
+        raise RuntimeError(
+            f"model config did not define required numeric field {name!r} for Burn text export"
+        )
+    return float(value)
+
+
+def require_string_config_value(config: Any, name: str) -> str:
+    value = getattr(config, name, None)
+    if value is None:
+        raise RuntimeError(
+            f"model config did not define required string field {name!r} for Burn text export"
+        )
+    return str(value)
+
+
+def resolve_required_rope_theta(config: Any) -> float:
+    rope_parameters = getattr(config, "rope_parameters", None)
+    if rope_parameters is not None:
+        rope_theta = rope_parameters.get("rope_theta")
+        if rope_theta is not None:
+            return float(rope_theta)
+    rope_theta = getattr(config, "rope_theta", None)
+    if rope_theta is None:
+        raise RuntimeError(
+            "model config did not define rope_theta in text_config.rope_parameters or text_config.rope_theta"
+        )
+    return float(rope_theta)
+
+
+def resolve_optional_rope_theta(config: Any) -> float | None:
+    rope_parameters = getattr(config, "rope_parameters", None)
+    if rope_parameters is not None:
+        rope_theta = rope_parameters.get("rope_theta")
+        if rope_theta is not None:
+            return float(rope_theta)
+    rope_theta = getattr(config, "rope_theta", None)
+    if rope_theta is None:
+        return None
+    return float(rope_theta)
+
+
 def render_qwen_single_turn_prompt(
     system_prompt: str | None,
     user_prompt: str,
@@ -315,6 +466,20 @@ def render_qwen_single_turn_prompt(
     parts.append(f"<|im_start|>user\n{user_prompt.strip()}<|im_end|>\n")
     parts.append("<|im_start|>assistant\n")
     return "".join(parts)
+
+
+def is_local_model_source(value: str) -> bool:
+    return Path(value).exists()
+
+
+def resolve_text_model(model: Any) -> Any:
+    direct = getattr(model, "model", None)
+    if direct is not None and hasattr(direct, "layers") and hasattr(direct, "norm"):
+        return direct
+    nested = getattr(direct, "language_model", None) if direct is not None else None
+    if nested is not None and hasattr(nested, "layers") and hasattr(nested, "norm"):
+        return nested
+    raise RuntimeError("Could not resolve the Qwen3.5 text model for layer hooks")
 
 
 def print_json(value: Any, indent: int) -> None:

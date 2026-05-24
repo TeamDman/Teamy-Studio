@@ -1,7 +1,7 @@
 use eyre::{Context, bail};
-use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use facet::Facet;
 use std::process::Command;
 
 pub const LLM_REFERENCE_SOURCE_PARENT_DIR: &str = "python";
@@ -14,7 +14,7 @@ pub struct LlmReferenceCommandOutput {
     pub stderr: String,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Facet, PartialEq, Eq)]
 pub struct LlmReferenceImportReport {
     pub ok: bool,
     pub python: String,
@@ -24,10 +24,11 @@ pub struct LlmReferenceImportReport {
     pub cuda_available: bool,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Facet, PartialEq)]
 pub struct LlmReferencePromptReport {
     pub ok: bool,
     pub model_id: String,
+    pub tokenizer_source: String,
     pub device: String,
     pub rendered_prompt: String,
     pub input_token_count: usize,
@@ -38,7 +39,23 @@ pub struct LlmReferencePromptReport {
     pub generated_text: String,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Facet, PartialEq)]
+pub struct LlmReferenceLayerReport {
+    pub ok: bool,
+    pub model_id: String,
+    pub tokenizer_source: String,
+    pub device: String,
+    pub rendered_prompt: String,
+    pub input_token_count: usize,
+    pub input_token_ids: Vec<u32>,
+    pub top_token_ids: Vec<u32>,
+    pub top_token_text: Vec<String>,
+    pub top_logits: Vec<f32>,
+    pub layer_last_hidden_states: Vec<Vec<f32>>,
+    pub final_norm_last_hidden: Vec<f32>,
+}
+
+#[derive(Clone, Debug, Facet, PartialEq)]
 pub struct LlmReferenceConfigReport {
     pub ok: bool,
     pub model_id: String,
@@ -64,7 +81,7 @@ pub struct LlmReferenceConfigReport {
     pub text_layer_types_preview: Vec<String>,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Facet, PartialEq, Eq)]
 pub struct LlmReferenceBurnTextExportReport {
     pub ok: bool,
     pub model_id: String,
@@ -103,6 +120,7 @@ pub fn read_llm_reference_config_report(model_id: &str) -> eyre::Result<LlmRefer
 /// This function will return an error if the Python LLM prompt report cannot be produced.
 pub fn read_llm_reference_prompt_report(
     model_id: &str,
+    tokenizer_path: Option<&Path>,
     device: &str,
     system_prompt: Option<&str>,
     user_prompt: &str,
@@ -122,12 +140,50 @@ pub fn read_llm_reference_prompt_report(
         "--top-k".to_owned(),
         top_k.to_string(),
     ];
+    if let Some(tokenizer_path) = tokenizer_path {
+        args.push("--tokenizer-path".to_owned());
+        args.push(tokenizer_path.display().to_string());
+    }
     if let Some(system_prompt) = system_prompt.filter(|value| !value.trim().is_empty()) {
         args.push("--system-prompt".to_owned());
         args.push(system_prompt.to_owned());
     }
     let output = run_llm_reference(args)?;
     parse_reference_json(&output.stdout, "LLM reference prompt report")
+}
+
+/// # Errors
+///
+/// This function will return an error if the Python LLM layer report cannot be produced.
+pub fn read_llm_reference_layer_report(
+    model_id: &str,
+    tokenizer_path: Option<&Path>,
+    device: &str,
+    system_prompt: Option<&str>,
+    user_prompt: &str,
+    top_k: usize,
+) -> eyre::Result<LlmReferenceLayerReport> {
+    let mut args = vec![
+        "--layer-report".to_owned(),
+        "--model-id".to_owned(),
+        model_id.to_owned(),
+        "--device".to_owned(),
+        device.to_owned(),
+        "--user-prompt".to_owned(),
+        user_prompt.to_owned(),
+        "--top-k".to_owned(),
+        top_k.to_string(),
+    ];
+    if let Some(tokenizer_path) = tokenizer_path {
+        args.push("--tokenizer-path".to_owned());
+        args.push(tokenizer_path.display().to_string());
+    }
+    if let Some(system_prompt) = system_prompt.filter(|value| !value.trim().is_empty()) {
+        args.push("--system-prompt".to_owned());
+        args.push(system_prompt.to_owned());
+    }
+    let output = run_llm_reference(args)?;
+    parse_reference_json(&output.stdout, "LLM reference layer report")
 }
 
 /// # Errors
@@ -200,9 +256,9 @@ fn ensure_reference_source_dir(path: &Path) -> eyre::Result<()> {
 
 fn parse_reference_json<T>(stdout: &str, label: &str) -> eyre::Result<T>
 where
-    T: for<'de> Deserialize<'de>,
+    T: Facet<'static>,
 {
-    serde_json::from_str(stdout).with_context(|| {
+    facet_json::from_str(stdout).with_context(|| {
         format!(
             "Failed to parse {label} from LLM reference harness stdout:\n{}",
             stdout

@@ -1,18 +1,19 @@
-use serde::Serialize;
 use std::collections::BTreeMap;
+use facet::Facet;
 
 use crate::burn_text::inspect_burn_text_runtime_status;
 use crate::model::LlmModelArtifacts;
 use crate::source_config::load_llm_source_config_summary;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Facet, PartialEq, Eq)]
 pub enum BurnLlmSupportState {
     InventoryOnly,
     TextArchitectureCaptured,
     Ready,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, Facet, PartialEq, Eq)]
 pub struct BurnLlmRuntimeSupportReport {
     pub backend: String,
     pub state: BurnLlmSupportState,

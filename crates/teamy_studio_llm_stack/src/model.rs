@@ -1,5 +1,6 @@
 use eyre::{Context, bail};
-use serde::{Deserialize, Serialize};
+use facet::Facet;
+use facet_json::RawJson;
 use std::path::{Path, PathBuf};
 
 use teamy_studio_paths::{AppHome, CacheHome};
@@ -84,7 +85,7 @@ impl LlmModelPreparationStatus {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Facet)]
 pub struct LlmManagedModelMetadata {
     pub model_name: String,
     pub family: String,
@@ -132,30 +133,14 @@ pub struct TokenizerConfigSummary {
     pub chat_template: Option<String>,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Facet, PartialEq, Eq)]
 struct TokenizerConfigFile {
-    #[serde(default)]
-    bos_token: Option<TokenizerConfigTokenValue>,
-    #[serde(default)]
-    eos_token: Option<TokenizerConfigTokenValue>,
-    #[serde(default)]
+    #[facet(default)]
+    bos_token: Option<RawJson<'static>>,
+    #[facet(default)]
+    eos_token: Option<RawJson<'static>>,
+    #[facet(default)]
     chat_template: Option<String>,
-}
-
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
-#[serde(untagged)]
-enum TokenizerConfigTokenValue {
-    String(String),
-    Object { content: String },
-}
-
-impl TokenizerConfigTokenValue {
-    fn into_content(self) -> String {
-        match self {
-            Self::String(value) => value,
-            Self::Object { content } => content,
-        }
-    }
 }
 
 #[must_use]
@@ -273,7 +258,7 @@ pub fn inspect_model_dir(root: &Path) -> eyre::Result<LlmModelArtifacts> {
         );
     }
     let metadata: LlmManagedModelMetadata =
-        serde_json::from_slice(&std::fs::read(&metadata_path).wrap_err_with(|| {
+        facet_json::from_slice(&std::fs::read(&metadata_path).wrap_err_with(|| {
             format!("Failed to read LLM metadata file {}", metadata_path.display())
         })?)
         .wrap_err_with(|| format!("Failed to parse {}", metadata_path.display()))?;
@@ -394,11 +379,17 @@ pub fn render_model_report(artifacts: &LlmModelArtifacts) -> String {
         if let Some(head_dim) = summary.text_head_dim {
             lines.push(format!("HF text head dim: {}", head_dim));
         }
+        if let Some(hidden_act) = summary.text_hidden_act {
+            lines.push(format!("HF text hidden act: {}", hidden_act));
+        }
         if let Some(partial_rotary_factor) = summary.text_partial_rotary_factor {
             lines.push(format!(
                 "HF text partial rotary factor: {}",
                 partial_rotary_factor
             ));
+        }
+        if let Some(rope_theta) = summary.text_rope_theta {
+            lines.push(format!("HF text rope theta: {}", rope_theta));
         }
         if let Some(full_attention_interval) = summary.text_full_attention_interval {
             lines.push(format!(
@@ -464,16 +455,40 @@ pub fn render_model_report(artifacts: &LlmModelArtifacts) -> String {
 ///
 /// This function will return an error if the tokenizer config cannot be read or parsed.
 pub fn load_tokenizer_config_summary(path: &Path) -> eyre::Result<TokenizerConfigSummary> {
-    let parsed: TokenizerConfigFile = serde_json::from_slice(&std::fs::read(path).wrap_err_with(
+    let parsed: TokenizerConfigFile = facet_json::from_slice(&std::fs::read(path).wrap_err_with(
         || format!("Failed to read tokenizer config {}", path.display()),
     )?)
     .wrap_err_with(|| format!("Failed to parse tokenizer config {}", path.display()))?;
     Ok(TokenizerConfigSummary {
         path: path.to_path_buf(),
-        bos_token: parsed.bos_token.map(TokenizerConfigTokenValue::into_content),
-        eos_token: parsed.eos_token.map(TokenizerConfigTokenValue::into_content),
+        bos_token: parsed
+            .bos_token
+            .map(parse_tokenizer_config_token_value)
+            .transpose()?,
+        eos_token: parsed
+            .eos_token
+            .map(parse_tokenizer_config_token_value)
+            .transpose()?,
         chat_template: parsed.chat_template,
     })
+}
+
+#[derive(Clone, Debug, Facet, PartialEq, Eq)]
+struct TokenizerConfigTokenObject {
+    content: String,
+}
+
+fn parse_tokenizer_config_token_value(value: RawJson<'static>) -> eyre::Result<String> {
+    if let Ok(token) = facet_json::from_str::<String>(value.as_ref()) {
+        return Ok(token);
+    }
+    if let Ok(token) = facet_json::from_str::<TokenizerConfigTokenObject>(value.as_ref()) {
+        return Ok(token.content);
+    }
+    bail!(
+        "Tokenizer token value must be a JSON string or an object with `content`, found {}",
+        value.as_ref()
+    )
 }
 
 /// Prepare a known Qwopus/Qwen-style model artifact bundle into Teamy's managed cache.
@@ -772,7 +787,7 @@ fn write_model_metadata(
     let metadata_path = root.join(MODEL_METADATA_FILE_NAME);
     std::fs::write(
         &metadata_path,
-        serde_json::to_vec_pretty(&metadata).context("Failed to encode LLM model metadata")?,
+        facet_json::to_vec_pretty(&metadata).context("Failed to encode LLM model metadata")?,
     )
     .wrap_err_with(|| format!("Failed to write {}", metadata_path.display()))
 }

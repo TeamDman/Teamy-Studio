@@ -3,15 +3,17 @@ use burn::{
     tensor::{Tensor, TensorData, activation::softmax, backend::Backend},
 };
 use eyre::{WrapErr, bail, ensure};
+use facet::Facet;
 use half::{bf16, f16, slice::{HalfBitsSliceExt, HalfFloatSliceExt}};
-use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
+    fmt,
     fs::File,
     io::{Read, Seek, SeekFrom},
     marker::PhantomData,
     path::{Path, PathBuf},
     sync::Mutex,
+    time::{Duration, Instant},
 };
 
 use crate::{
@@ -34,18 +36,18 @@ macro_rules! llm_tracy_zone {
     };
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Facet)]
 pub struct BurnTextTensorSpec {
     pub path: String,
     pub shape: Vec<usize>,
     pub dtype: String,
-    #[serde(default)]
+    #[facet(default)]
     pub offset_bytes: Option<u64>,
-    #[serde(default)]
+    #[facet(default)]
     pub byte_len: Option<usize>,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Facet)]
 pub struct BurnTextManifest {
     pub format_version: u32,
     pub architecture: String,
@@ -59,7 +61,9 @@ pub struct BurnTextManifest {
     pub num_key_value_heads: usize,
     pub head_dim: usize,
     pub rms_norm_eps: f64,
+    pub hidden_act: String,
     pub partial_rotary_factor: f64,
+    pub rope_theta: f64,
     pub linear_num_key_heads: usize,
     pub linear_num_value_heads: usize,
     pub linear_key_head_dim: usize,
@@ -69,17 +73,75 @@ pub struct BurnTextManifest {
     pub tensors: BTreeMap<String, BurnTextTensorSpec>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Facet)]
 pub struct BurnTextRuntimeStatus {
     pub directory: String,
     pub manifest_path: String,
     pub exists: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Facet)]
 pub struct BurnTextGenerationReport {
     pub generated_token_ids: Vec<usize>,
     pub generated_text: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BurnTextGenerationOptions {
+    pub max_new_tokens: usize,
+    pub generation_timeout: Option<Duration>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BurnTextGenerationMode {
+    Full,
+    Incremental,
+    Hybrid,
+}
+
+#[derive(Clone, Debug, PartialEq, Facet)]
+pub struct BurnTextHiddenDifferenceSummary {
+    pub max_abs_diff: f32,
+    pub mean_abs_diff: f32,
+}
+
+#[derive(Clone, Debug, PartialEq, Facet)]
+pub struct BurnTextIncrementalComparisonReport {
+    pub backend: String,
+    pub full_generated_token_ids: Vec<usize>,
+    pub full_generated_text: String,
+    pub incremental_generated_token_ids: Vec<usize>,
+    pub incremental_generated_text: String,
+    pub first_mismatch_index: Option<usize>,
+    pub token_match: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Facet)]
+pub struct BurnTextIncrementalHiddenDiagnosticsReport {
+    pub backend: String,
+    pub first_prompt_token_hidden_diff: BurnTextHiddenDifferenceSummary,
+    pub full_prompt_hidden_diff: BurnTextHiddenDifferenceSummary,
+}
+
+#[derive(Clone, Debug, PartialEq, Facet)]
+pub struct BurnTextLayerHiddenDifference {
+    pub layer_index: usize,
+    pub layer_type: String,
+    pub hidden_diff: BurnTextHiddenDifferenceSummary,
+}
+
+#[derive(Clone, Debug, PartialEq, Facet)]
+pub struct BurnTextIncrementalLayerDiagnosticsReport {
+    pub backend: String,
+    pub first_large_diff_layer_index: Option<usize>,
+    pub layer_differences: Vec<BurnTextLayerHiddenDifference>,
+}
+
+#[derive(Clone, Debug, PartialEq, Facet)]
+pub struct BurnTextLayerOutputsReport {
+    pub backend: String,
+    pub layer_last_hidden_states: Vec<Vec<f32>>,
+    pub final_norm_last_hidden: Vec<f32>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -94,6 +156,24 @@ enum TokenMixerKind {
     LinearAttention,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HiddenActivationKind {
+    Silu,
+}
+
+#[derive(Clone, Debug)]
+struct GenerationDeadline {
+    started_at: Instant,
+    timeout: Option<Duration>,
+}
+
+#[derive(Debug)]
+struct GenerationTimeoutError {
+    elapsed: Duration,
+    generated_token_count: usize,
+    max_new_tokens: usize,
+}
+
 #[derive(Debug)]
 struct Qwen35TextRuntime<B: Backend> {
     bundle_root: PathBuf,
@@ -105,6 +185,7 @@ struct Qwen35TextRuntime<B: Backend> {
     loaded_tensor_cache: Mutex<HashMap<String, LoadedTensor>>,
     #[allow(dead_code)]
     tensor_1d_cache: Mutex<HashMap<String, Tensor<B, 1>>>,
+    tensor_1d_values_cache: Mutex<HashMap<String, Vec<f32>>>,
     tensor_2d_cache: Mutex<HashMap<String, Tensor<B, 2>>>,
 }
 
@@ -143,10 +224,11 @@ impl<B: Backend> Qwen35TextRuntime<B> {
         let manifest_path = burn_text_manifest_path(&artifacts.root);
         let manifest = load_burn_text_manifest(&manifest_path)?;
         ensure!(
-            manifest.architecture == "qwen3_5_text",
-            "Burn text manifest {} used unsupported architecture `{}`",
+            manifest.architecture == manifest.text_model_type,
+            "Burn text manifest {} declared architecture `{}` but text model type `{}`",
             manifest_path.display(),
-            manifest.architecture
+            manifest.architecture,
+            manifest.text_model_type
         );
         ensure!(
             manifest.layer_types.len() == manifest.num_hidden_layers,
@@ -155,6 +237,7 @@ impl<B: Backend> Qwen35TextRuntime<B> {
             manifest.num_hidden_layers,
             manifest.layer_types.len()
         );
+        validate_manifest_contract(&manifest, &manifest_path)?;
         let packed_tensor_path = shared_packed_tensor_path(&bundle_root, &manifest);
         let packed_tensor_file = packed_tensor_path
             .as_ref()
@@ -176,8 +259,13 @@ impl<B: Backend> Qwen35TextRuntime<B> {
             packed_tensor_file,
             loaded_tensor_cache: Mutex::new(HashMap::new()),
             tensor_1d_cache: Mutex::new(HashMap::new()),
+            tensor_1d_values_cache: Mutex::new(HashMap::new()),
             tensor_2d_cache: Mutex::new(HashMap::new()),
         })
+    }
+
+    fn hidden_activation_kind(&self) -> eyre::Result<HiddenActivationKind> {
+        hidden_activation_kind(&self.manifest.hidden_act)
     }
 
     #[allow(dead_code)]
@@ -471,6 +559,15 @@ impl<B: Backend> Qwen35TextRuntime<B> {
 
     #[allow(dead_code)]
     fn load_tensor_1d_values(&self, tensor_name: &str) -> eyre::Result<Vec<f32>> {
+        if let Some(cached) = self
+            .tensor_1d_values_cache
+            .lock()
+            .map_err(|_| eyre::eyre!("1D tensor values cache mutex was poisoned"))?
+            .get(tensor_name)
+            .cloned()
+        {
+            return Ok(cached);
+        }
         let loaded = self.load_tensor(tensor_name)?;
         let [dim] = shape_array::<1>(&loaded.shape, tensor_name)?;
         ensure!(
@@ -479,6 +576,10 @@ impl<B: Backend> Qwen35TextRuntime<B> {
             dim,
             loaded.values.len()
         );
+        self.tensor_1d_values_cache
+            .lock()
+            .map_err(|_| eyre::eyre!("1D tensor values cache mutex was poisoned"))?
+            .insert(tensor_name.to_owned(), loaded.values.clone());
         Ok(loaded.values)
     }
 
@@ -588,6 +689,59 @@ impl<B: Backend> Qwen35TextRuntime<B> {
     }
 
     #[allow(dead_code)]
+    fn forward_hidden_states_with_decode_state(
+        &self,
+        mut hidden_states: Tensor<B, 3>,
+    ) -> eyre::Result<(Tensor<B, 3>, Qwen35DecodeState)> {
+        let [batch_size, seq_len, hidden_size] = hidden_states.dims();
+        ensure!(
+            batch_size == 1,
+            "Qwen3.5 Burn text runtime currently expects batch size 1, but received {batch_size}"
+        );
+        ensure!(
+            hidden_size == self.manifest.hidden_size,
+            "Qwen3.5 Burn text runtime expected hidden size {}, but received {}",
+            self.manifest.hidden_size,
+            hidden_size
+        );
+
+        let position_embeddings = rotary_embeddings(seq_len, &self.manifest)
+            .wrap_err("Failed to build rotary embeddings")?;
+        let causal_mask = causal_mask::<B>(seq_len, &self.device);
+        let mut decode_state = self.new_decode_state()?;
+
+        for layer_index in 0..self.manifest.num_hidden_layers {
+            hidden_states = self.forward_decoder_layer_with_decode_state(
+                layer_index,
+                hidden_states,
+                &position_embeddings,
+                &causal_mask,
+                &mut decode_state.layer_states[layer_index],
+            )?;
+        }
+
+        let norm_weight = tensor_to_vec_f32(&self.load_tensor_1d("model.norm.weight")?)?;
+        let hidden = tensor_to_vec_f32(&hidden_states)?;
+        let normalized = qwen_rms_norm(
+            &hidden,
+            batch_size,
+            seq_len,
+            self.manifest.hidden_size,
+            &norm_weight,
+            self.manifest.rms_norm_eps as f32,
+        )?;
+        decode_state.processed_token_count = seq_len;
+        Ok((
+            tensor_3d(
+                [batch_size, seq_len, self.manifest.hidden_size],
+                normalized,
+                &self.device,
+            ),
+            decode_state,
+        ))
+    }
+
+    #[allow(dead_code)]
     fn forward_token_hidden(
         &self,
         decode_state: &mut Qwen35DecodeState,
@@ -613,6 +767,27 @@ impl<B: Backend> Qwen35TextRuntime<B> {
         )?;
         decode_state.processed_token_count += 1;
         Ok(hidden)
+    }
+
+    #[allow(dead_code)]
+    fn forward_token_hidden_layer_outputs(
+        &self,
+        decode_state: &mut Qwen35DecodeState,
+        token_id: u32,
+    ) -> eyre::Result<Vec<Vec<f32>>> {
+        let mut hidden = self.read_rows_f32("model.embed_tokens.weight", &[token_id])?;
+        let mut layer_outputs = Vec::with_capacity(self.manifest.num_hidden_layers);
+        for layer_index in 0..self.manifest.num_hidden_layers {
+            hidden = self.forward_decoder_layer_single(
+                layer_index,
+                &hidden,
+                decode_state.processed_token_count,
+                &mut decode_state.layer_states[layer_index],
+            )?;
+            layer_outputs.push(hidden.clone());
+        }
+        decode_state.processed_token_count += 1;
+        Ok(layer_outputs)
     }
 
     #[allow(dead_code)]
@@ -666,6 +841,7 @@ impl<B: Backend> Qwen35TextRuntime<B> {
 
     #[allow(dead_code)]
     fn forward_mlp_single(&self, prefix: &str, hidden: &[f32]) -> eyre::Result<Vec<f32>> {
+        let activation = self.hidden_activation_kind()?;
         let hidden_states = tensor_3d([1, 1, self.manifest.hidden_size], hidden.to_vec(), &self.device);
         let gate_proj = linear_forward_3d(
             &hidden_states,
@@ -679,7 +855,7 @@ impl<B: Backend> Qwen35TextRuntime<B> {
         );
         let gate = tensor_to_vec_f32(&gate_proj)?
             .into_iter()
-            .map(silu_scalar)
+            .map(|value| apply_hidden_activation_scalar(activation, value))
             .collect::<Vec<_>>();
         let up = tensor_to_vec_f32(&up_proj)?;
         ensure!(gate.len() == up.len(), "Qwen3.5 MLP gate/up projection size mismatch");
@@ -724,10 +900,14 @@ impl<B: Backend> Qwen35TextRuntime<B> {
             query_projection_values.len() == query_and_gate_dim,
             "Unexpected q_proj output size for Qwen3.5 full attention single-step decode"
         );
-        let mut query_values = query_projection_values[..gate_offset].to_vec();
-        let gate_values = query_projection_values[gate_offset..]
-            .iter()
-            .copied()
+        let mut query_values = Vec::with_capacity(gate_offset);
+        let mut gate_values = Vec::with_capacity(gate_offset);
+        for head_chunk in query_projection_values.chunks_exact(head_dim * 2) {
+            query_values.extend_from_slice(&head_chunk[..head_dim]);
+            gate_values.extend_from_slice(&head_chunk[head_dim..]);
+        }
+        let gate_values = gate_values
+            .into_iter()
             .map(sigmoid_scalar)
             .collect::<Vec<_>>();
 
@@ -1025,6 +1205,71 @@ impl<B: Backend> Qwen35TextRuntime<B> {
     }
 
     #[allow(dead_code)]
+    fn forward_decoder_layer_with_decode_state(
+        &self,
+        layer_index: usize,
+        hidden_states: Tensor<B, 3>,
+        position_embeddings: &RotaryEmbeddings,
+        causal_mask: &Tensor<B, 4>,
+        layer_state: &mut DecoderLayerDecodeState,
+    ) -> eyre::Result<Tensor<B, 3>> {
+        let [batch_size, seq_len, hidden_size] = hidden_states.dims();
+        let prefix = format!("model.layers.{layer_index}");
+
+        let input_layernorm_weight = tensor_to_vec_f32(
+            &self.load_tensor_1d(&format!("{prefix}.input_layernorm.weight"))?,
+        )?;
+        let input_values = tensor_to_vec_f32(&hidden_states)?;
+        let normalized_values = qwen_rms_norm(
+            &input_values,
+            batch_size,
+            seq_len,
+            hidden_size,
+            &input_layernorm_weight,
+            self.manifest.rms_norm_eps as f32,
+        )?;
+        let normalized = tensor_3d(
+            [batch_size, seq_len, hidden_size],
+            normalized_values,
+            &self.device,
+        );
+
+        let mixed = match layer_state {
+            DecoderLayerDecodeState::Full(full_state) => self.forward_full_attention_with_state(
+                &prefix,
+                normalized,
+                position_embeddings,
+                causal_mask.clone(),
+                full_state,
+            )?,
+            DecoderLayerDecodeState::Linear(linear_state) => {
+                self.forward_linear_attention_with_state(&prefix, normalized, linear_state)?
+            }
+        };
+
+        let mixed = hidden_states + mixed;
+        let post_attention_layernorm_weight = tensor_to_vec_f32(
+            &self.load_tensor_1d(&format!("{prefix}.post_attention_layernorm.weight"))?,
+        )?;
+        let mixed_values = tensor_to_vec_f32(&mixed)?;
+        let post_norm_values = qwen_rms_norm(
+            &mixed_values,
+            batch_size,
+            seq_len,
+            hidden_size,
+            &post_attention_layernorm_weight,
+            self.manifest.rms_norm_eps as f32,
+        )?;
+        let post_norm = tensor_3d(
+            [batch_size, seq_len, hidden_size],
+            post_norm_values,
+            &self.device,
+        );
+        let mlp = self.forward_mlp(&format!("{prefix}.mlp"), post_norm)?;
+        Ok(mixed + mlp)
+    }
+
+    #[allow(dead_code)]
     fn forward_mlp(
         &self,
         prefix: &str,
@@ -1033,6 +1278,7 @@ impl<B: Backend> Qwen35TextRuntime<B> {
         llm_tracy_zone!("llm_burn_mlp");
         #[cfg(feature = "extended_observability")]
         let _span = tracing::debug_span!("llm_burn_mlp", prefix).entered();
+        let activation = self.hidden_activation_kind()?;
         let gate_proj = linear_forward_3d(
             &hidden_states,
             self.load_tensor_2d(&format!("{prefix}.gate_proj.weight"))?,
@@ -1045,7 +1291,7 @@ impl<B: Backend> Qwen35TextRuntime<B> {
         );
         let gate = tensor_to_vec_f32(&gate_proj)?
             .into_iter()
-            .map(silu_scalar)
+            .map(|value| apply_hidden_activation_scalar(activation, value))
             .collect::<Vec<_>>();
         let up = tensor_to_vec_f32(&up_proj)?;
         ensure!(
@@ -1099,16 +1345,18 @@ impl<B: Backend> Qwen35TextRuntime<B> {
             query_projection_values.len() == batch_size * seq_len * query_and_gate_dim,
             "Unexpected q_proj output size for Qwen3.5 full attention"
         );
-        let gate_offset = self
+        let query_width = self
             .manifest
             .num_attention_heads
             .checked_mul(head_dim)
-            .ok_or_else(|| eyre::eyre!("gate offset overflow"))?;
-        let mut query_values = Vec::with_capacity(batch_size * seq_len * gate_offset);
-        let mut gate_values = Vec::with_capacity(batch_size * seq_len * gate_offset);
-        for chunk in query_projection_values.chunks_exact(query_and_gate_dim) {
-            query_values.extend_from_slice(&chunk[..gate_offset]);
-            gate_values.extend_from_slice(&chunk[gate_offset..]);
+            .ok_or_else(|| eyre::eyre!("query width overflow"))?;
+        let mut query_values = Vec::with_capacity(batch_size * seq_len * query_width);
+        let mut gate_values = Vec::with_capacity(batch_size * seq_len * query_width);
+        for token_chunk in query_projection_values.chunks_exact(query_and_gate_dim) {
+            for head_chunk in token_chunk.chunks_exact(head_dim * 2) {
+                query_values.extend_from_slice(&head_chunk[..head_dim]);
+                gate_values.extend_from_slice(&head_chunk[head_dim..]);
+            }
         }
         let gate_values = gate_values
             .into_iter()
@@ -1155,6 +1403,178 @@ impl<B: Backend> Qwen35TextRuntime<B> {
             &self.manifest,
             seq_len,
         )?;
+        let query_values = transpose_seq_head_layout(
+            &query_values,
+            seq_len,
+            self.manifest.num_attention_heads,
+            head_dim,
+        )?;
+
+        let query = tensor_4d(
+            [
+                batch_size,
+                self.manifest.num_attention_heads,
+                seq_len,
+                head_dim,
+            ],
+            query_values,
+            &self.device,
+        ) * (self.manifest.head_dim as f32).powf(-0.5);
+        let key_repeated = repeat_key_value_heads(
+            &key_values,
+            seq_len,
+            self.manifest.num_key_value_heads,
+            self.manifest.num_attention_heads / self.manifest.num_key_value_heads,
+            head_dim,
+        );
+        let key_repeated = transpose_seq_head_layout(
+            &key_repeated,
+            seq_len,
+            self.manifest.num_attention_heads,
+            head_dim,
+        )?;
+        let value_repeated = repeat_key_value_heads(
+            &value_values,
+            seq_len,
+            self.manifest.num_key_value_heads,
+            self.manifest.num_attention_heads / self.manifest.num_key_value_heads,
+            head_dim,
+        );
+        let value_repeated = transpose_seq_head_layout(
+            &value_repeated,
+            seq_len,
+            self.manifest.num_attention_heads,
+            head_dim,
+        )?;
+        let key = tensor_4d(
+            [
+                batch_size,
+                self.manifest.num_attention_heads,
+                seq_len,
+                head_dim,
+            ],
+            key_repeated,
+            &self.device,
+        );
+        let value = tensor_4d(
+            [
+                batch_size,
+                self.manifest.num_attention_heads,
+                seq_len,
+                head_dim,
+            ],
+            value_repeated,
+            &self.device,
+        );
+
+        let attention = softmax(query.matmul(key.swap_dims(2, 3)) + causal_mask, 3);
+        let output = attention
+            .matmul(value)
+            .swap_dims(1, 2)
+            .reshape([batch_size, seq_len, hidden_size]);
+        let gated = tensor_to_vec_f32(&output)?
+            .into_iter()
+            .zip(gate_values)
+            .map(|(output, gate)| output * gate)
+            .collect::<Vec<_>>();
+        Ok(linear_forward_3d(
+            &tensor_3d([batch_size, seq_len, hidden_size], gated, &self.device),
+            self.load_tensor_2d(&format!("{prefix}.self_attn.o_proj.weight"))?,
+            None,
+        ))
+    }
+
+    #[allow(dead_code)]
+    fn forward_full_attention_with_state(
+        &self,
+        prefix: &str,
+        hidden_states: Tensor<B, 3>,
+        position_embeddings: &RotaryEmbeddings,
+        causal_mask: Tensor<B, 4>,
+        decode_state: &mut FullAttentionDecodeState,
+    ) -> eyre::Result<Tensor<B, 3>> {
+        let [batch_size, seq_len, hidden_size] = hidden_states.dims();
+        let head_dim = self.manifest.head_dim;
+        let query_projection = linear_forward_3d(
+            &hidden_states,
+            self.load_tensor_2d(&format!("{prefix}.self_attn.q_proj.weight"))?,
+            None,
+        );
+        let query_projection_values = tensor_to_vec_f32(&query_projection)?;
+        let query_and_gate_dim = self
+            .manifest
+            .num_attention_heads
+            .checked_mul(head_dim)
+            .and_then(|value| value.checked_mul(2))
+            .ok_or_else(|| eyre::eyre!("q_proj output size overflow"))?;
+        ensure!(
+            query_projection_values.len() == batch_size * seq_len * query_and_gate_dim,
+            "Unexpected q_proj output size for Qwen3.5 full attention"
+        );
+        let query_width = self
+            .manifest
+            .num_attention_heads
+            .checked_mul(head_dim)
+            .ok_or_else(|| eyre::eyre!("query width overflow"))?;
+        let mut query_values = Vec::with_capacity(batch_size * seq_len * query_width);
+        let mut gate_values = Vec::with_capacity(batch_size * seq_len * query_width);
+        for token_chunk in query_projection_values.chunks_exact(query_and_gate_dim) {
+            for head_chunk in token_chunk.chunks_exact(head_dim * 2) {
+                query_values.extend_from_slice(&head_chunk[..head_dim]);
+                gate_values.extend_from_slice(&head_chunk[head_dim..]);
+            }
+        }
+        let gate_values = gate_values
+            .into_iter()
+            .map(sigmoid_scalar)
+            .collect::<Vec<_>>();
+
+        let query_norm_weight =
+            tensor_to_vec_f32(&self.load_tensor_1d(&format!("{prefix}.self_attn.q_norm.weight"))?)?;
+        let key_norm_weight =
+            tensor_to_vec_f32(&self.load_tensor_1d(&format!("{prefix}.self_attn.k_norm.weight"))?)?;
+        let query_values = qwen_rms_norm_no_center(
+            &query_values,
+            batch_size * seq_len,
+            self.manifest.num_attention_heads,
+            head_dim,
+            &query_norm_weight,
+            self.manifest.rms_norm_eps as f32,
+        )?;
+
+        let key_proj = linear_forward_3d(
+            &hidden_states,
+            self.load_tensor_2d(&format!("{prefix}.self_attn.k_proj.weight"))?,
+            None,
+        );
+        let key_values = qwen_rms_norm_no_center(
+            &tensor_to_vec_f32(&key_proj)?,
+            batch_size * seq_len,
+            self.manifest.num_key_value_heads,
+            head_dim,
+            &key_norm_weight,
+            self.manifest.rms_norm_eps as f32,
+        )?;
+        let value_proj = linear_forward_3d(
+            &hidden_states,
+            self.load_tensor_2d(&format!("{prefix}.self_attn.v_proj.weight"))?,
+            None,
+        );
+        let value_values = tensor_to_vec_f32(&value_proj)?;
+
+        let (query_values, key_values) = apply_rotary_embeddings(
+            &query_values,
+            &key_values,
+            position_embeddings,
+            &self.manifest,
+            seq_len,
+        )?;
+        let query_values = transpose_seq_head_layout(
+            &query_values,
+            seq_len,
+            self.manifest.num_attention_heads,
+            head_dim,
+        )?;
 
         let query = tensor_4d(
             [
@@ -1180,6 +1600,21 @@ impl<B: Backend> Qwen35TextRuntime<B> {
             self.manifest.num_attention_heads / self.manifest.num_key_value_heads,
             head_dim,
         );
+        decode_state.token_count = seq_len;
+        decode_state.repeated_key_cache = key_repeated.clone();
+        decode_state.repeated_value_cache = value_repeated.clone();
+        let key_repeated = transpose_seq_head_layout(
+            &key_repeated,
+            seq_len,
+            self.manifest.num_attention_heads,
+            head_dim,
+        )?;
+        let value_repeated = transpose_seq_head_layout(
+            &value_repeated,
+            seq_len,
+            self.manifest.num_attention_heads,
+            head_dim,
+        )?;
         let key = tensor_4d(
             [
                 batch_size,
@@ -1357,6 +1792,159 @@ impl<B: Backend> Qwen35TextRuntime<B> {
     }
 
     #[allow(dead_code)]
+    fn forward_linear_attention_with_state(
+        &self,
+        prefix: &str,
+        hidden_states: Tensor<B, 3>,
+        decode_state: &mut LinearAttentionDecodeState,
+    ) -> eyre::Result<Tensor<B, 3>> {
+        let [batch_size, seq_len, _hidden_size] = hidden_states.dims();
+        ensure!(batch_size == 1, "Qwen3.5 linear attention currently expects batch size 1");
+        let mixed_qkv = linear_forward_3d(
+            &hidden_states,
+            self.load_tensor_2d(&format!("{prefix}.linear_attn.in_proj_qkv.weight"))?,
+            None,
+        );
+        let mixed_qkv_values = tensor_to_vec_f32(&mixed_qkv)?;
+        let conv_weight = self.load_tensor(&format!("{prefix}.linear_attn.conv1d.weight"))?;
+        let conv_mixed_qkv = depthwise_causal_conv1d_silu(
+            &mixed_qkv_values,
+            batch_size,
+            seq_len,
+            self.manifest.linear_num_key_heads * self.manifest.linear_key_head_dim * 2
+                + self.manifest.linear_num_value_heads * self.manifest.linear_value_head_dim,
+            self.manifest.linear_conv_kernel_dim,
+            &conv_weight.values,
+            &conv_weight.shape,
+        )?;
+
+        let key_dim = self
+            .manifest
+            .linear_num_key_heads
+            .checked_mul(self.manifest.linear_key_head_dim)
+            .ok_or_else(|| eyre::eyre!("linear-attention key-dim overflow"))?;
+        let value_dim = self
+            .manifest
+            .linear_num_value_heads
+            .checked_mul(self.manifest.linear_value_head_dim)
+            .ok_or_else(|| eyre::eyre!("linear-attention value-dim overflow"))?;
+        let conv_dim = key_dim
+            .checked_mul(2)
+            .and_then(|value| value.checked_add(value_dim))
+            .ok_or_else(|| eyre::eyre!("linear-attention conv-dim overflow"))?;
+        let mut query = Vec::with_capacity(seq_len * key_dim);
+        let mut key = Vec::with_capacity(seq_len * key_dim);
+        let mut value = Vec::with_capacity(seq_len * value_dim);
+        for chunk in conv_mixed_qkv.chunks_exact(conv_dim) {
+            query.extend_from_slice(&chunk[..key_dim]);
+            key.extend_from_slice(&chunk[key_dim..key_dim * 2]);
+            value.extend_from_slice(&chunk[key_dim * 2..]);
+        }
+
+        let z = tensor_to_vec_f32(&linear_forward_3d(
+            &hidden_states,
+            self.load_tensor_2d(&format!("{prefix}.linear_attn.in_proj_z.weight"))?,
+            None,
+        ))?;
+        let beta = tensor_to_vec_f32(&linear_forward_3d(
+            &hidden_states,
+            self.load_tensor_2d(&format!("{prefix}.linear_attn.in_proj_b.weight"))?,
+            None,
+        ))?
+        .into_iter()
+        .map(sigmoid_scalar)
+        .collect::<Vec<_>>();
+        let a = tensor_to_vec_f32(&linear_forward_3d(
+            &hidden_states,
+            self.load_tensor_2d(&format!("{prefix}.linear_attn.in_proj_a.weight"))?,
+            None,
+        ))?;
+        let dt_bias =
+            tensor_to_vec_f32(&self.load_tensor_1d(&format!("{prefix}.linear_attn.dt_bias"))?)?;
+        let a_log =
+            tensor_to_vec_f32(&self.load_tensor_1d(&format!("{prefix}.linear_attn.A_log"))?)?;
+        let mut g = Vec::with_capacity(a.len());
+        for (index, value) in a.iter().copied().enumerate() {
+            let head_index = index % self.manifest.linear_num_value_heads;
+            let a_scale = -a_log[head_index].exp();
+            g.push(a_scale * softplus_scalar(value + dt_bias[head_index]));
+        }
+
+        let repeat_factor = self.manifest.linear_num_value_heads / self.manifest.linear_num_key_heads;
+        let query = repeat_linear_attention_heads(
+            &query,
+            seq_len,
+            self.manifest.linear_num_key_heads,
+            repeat_factor,
+            self.manifest.linear_key_head_dim,
+        );
+        let key = repeat_linear_attention_heads(
+            &key,
+            seq_len,
+            self.manifest.linear_num_key_heads,
+            repeat_factor,
+            self.manifest.linear_key_head_dim,
+        );
+        let query = l2_norm_heads(
+            &query,
+            seq_len,
+            self.manifest.linear_num_value_heads,
+            self.manifest.linear_key_head_dim,
+        )?;
+        let key = l2_norm_heads(
+            &key,
+            seq_len,
+            self.manifest.linear_num_value_heads,
+            self.manifest.linear_key_head_dim,
+        )?;
+        let (core_attn_out, final_state) = recurrent_gated_delta_rule_with_final_state(
+            &query,
+            &key,
+            &value,
+            &g,
+            &beta,
+            seq_len,
+            self.manifest.linear_num_value_heads,
+            self.manifest.linear_key_head_dim,
+            self.manifest.linear_value_head_dim,
+        )?;
+        decode_state.state = final_state;
+        let raw_mixed_dim = key_dim
+            .checked_mul(2)
+            .and_then(|value| value.checked_add(value_dim))
+            .ok_or_else(|| eyre::eyre!("linear-attention raw mixed dim overflow"))?;
+        decode_state.conv_history.clear();
+        let keep_history = self.manifest.linear_conv_kernel_dim.saturating_sub(1);
+        let total_tokens = mixed_qkv_values.len() / raw_mixed_dim;
+        let history_start = total_tokens.saturating_sub(keep_history);
+        for token_index in history_start..total_tokens {
+            let start = token_index * raw_mixed_dim;
+            let end = start + raw_mixed_dim;
+            decode_state
+                .conv_history
+                .push_back(mixed_qkv_values[start..end].to_vec());
+        }
+
+        let norm_weight =
+            tensor_to_vec_f32(&self.load_tensor_1d(&format!("{prefix}.linear_attn.norm.weight"))?)?;
+        let normalized = qwen_rms_norm_gated(
+            &core_attn_out,
+            seq_len,
+            self.manifest.linear_num_value_heads,
+            self.manifest.linear_value_head_dim,
+            &norm_weight,
+            self.manifest.rms_norm_eps as f32,
+            &z,
+        )?;
+        let normalized = tensor_3d([batch_size, seq_len, value_dim], normalized, &self.device);
+        Ok(linear_forward_3d(
+            &normalized,
+            self.load_tensor_2d(&format!("{prefix}.linear_attn.out_proj.weight"))?,
+            None,
+        ))
+    }
+
+    #[allow(dead_code)]
     fn greedy_next_token(&self, hidden_states: Tensor<B, 3>) -> eyre::Result<usize> {
         llm_tracy_zone!("llm_burn_greedy_next_token");
         #[cfg(feature = "extended_observability")]
@@ -1504,6 +2092,263 @@ impl<B: Backend> Qwen35TextRuntime<B> {
     }
 }
 
+fn hidden_activation_kind(hidden_act: &str) -> eyre::Result<HiddenActivationKind> {
+    match hidden_act.trim() {
+        "silu" | "swish" => Ok(HiddenActivationKind::Silu),
+        other => bail!(
+            "Burn text runtime does not support hidden_act `{other}` yet; manifest/export must derive a supported activation from model config"
+        ),
+    }
+}
+
+fn apply_hidden_activation_scalar(activation: HiddenActivationKind, value: f32) -> f32 {
+    match activation {
+        HiddenActivationKind::Silu => silu_scalar(value),
+    }
+}
+
+impl fmt::Display for GenerationTimeoutError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "Burn text generation timed out after {} while producing {} of {} requested tokens",
+            humantime::format_duration(self.elapsed),
+            self.generated_token_count,
+            self.max_new_tokens
+        )
+    }
+}
+
+impl std::error::Error for GenerationTimeoutError {}
+
+impl GenerationDeadline {
+    fn new(timeout: Option<Duration>) -> Self {
+        Self {
+            started_at: Instant::now(),
+            timeout,
+        }
+    }
+
+    fn check(&self, generated_token_count: usize, max_new_tokens: usize) -> eyre::Result<()> {
+        let Some(timeout) = self.timeout else {
+            return Ok(());
+        };
+        let elapsed = self.started_at.elapsed();
+        if elapsed <= timeout {
+            return Ok(());
+        }
+        Err(eyre::Report::new(GenerationTimeoutError {
+            elapsed,
+            generated_token_count,
+            max_new_tokens,
+        }))
+    }
+}
+
+fn is_generation_timeout_error(error: &eyre::Report) -> bool {
+    error.downcast_ref::<GenerationTimeoutError>().is_some()
+}
+
+fn validate_manifest_contract(manifest: &BurnTextManifest, manifest_path: &Path) -> eyre::Result<()> {
+    ensure!(
+        manifest.format_version == 1,
+        "Burn text manifest {} used unsupported format_version {}",
+        manifest_path.display(),
+        manifest.format_version
+    );
+    ensure!(
+        manifest.text_model_type == "qwen3_5_text",
+        "Burn text manifest {} used unsupported text model type `{}`",
+        manifest_path.display(),
+        manifest.text_model_type
+    );
+    let _ = hidden_activation_kind(&manifest.hidden_act)?;
+    ensure!(
+        manifest.hidden_size > 0
+            && manifest.intermediate_size > 0
+            && manifest.num_hidden_layers > 0
+            && manifest.num_attention_heads > 0
+            && manifest.num_key_value_heads > 0
+            && manifest.head_dim > 0
+            && manifest.vocab_size > 0,
+        "Burn text manifest {} contained zero-valued core dimensions",
+        manifest_path.display()
+    );
+    ensure!(
+        manifest.hidden_size == manifest.num_attention_heads * manifest.head_dim,
+        "Burn text manifest {} declared hidden_size {} but num_attention_heads {} x head_dim {} = {}",
+        manifest_path.display(),
+        manifest.hidden_size,
+        manifest.num_attention_heads,
+        manifest.head_dim,
+        manifest.num_attention_heads * manifest.head_dim
+    );
+    ensure!(
+        manifest.num_attention_heads.is_multiple_of(manifest.num_key_value_heads),
+        "Burn text manifest {} declared {} attention heads and {} key/value heads, which is not an integer repeat factor",
+        manifest_path.display(),
+        manifest.num_attention_heads,
+        manifest.num_key_value_heads
+    );
+    ensure!(
+        manifest.linear_num_value_heads.is_multiple_of(manifest.linear_num_key_heads),
+        "Burn text manifest {} declared {} linear value heads and {} linear key heads, which is not an integer repeat factor",
+        manifest_path.display(),
+        manifest.linear_num_value_heads,
+        manifest.linear_num_key_heads
+    );
+    validate_manifest_tensor_shape(
+        manifest,
+        "model.embed_tokens.weight",
+        &[manifest.vocab_size, manifest.hidden_size],
+    )?;
+    validate_manifest_tensor_shape(manifest, "model.norm.weight", &[manifest.hidden_size])?;
+    if manifest.tensors.contains_key("lm_head.weight") {
+        validate_manifest_tensor_shape(
+            manifest,
+            "lm_head.weight",
+            &[manifest.vocab_size, manifest.hidden_size],
+        )?;
+    }
+    for layer_index in 0..manifest.num_hidden_layers {
+        let prefix = format!("model.layers.{layer_index}");
+        validate_manifest_tensor_shape(
+            manifest,
+            &format!("{prefix}.input_layernorm.weight"),
+            &[manifest.hidden_size],
+        )?;
+        validate_manifest_tensor_shape(
+            manifest,
+            &format!("{prefix}.post_attention_layernorm.weight"),
+            &[manifest.hidden_size],
+        )?;
+        validate_manifest_tensor_shape(
+            manifest,
+            &format!("{prefix}.mlp.gate_proj.weight"),
+            &[manifest.intermediate_size, manifest.hidden_size],
+        )?;
+        validate_manifest_tensor_shape(
+            manifest,
+            &format!("{prefix}.mlp.up_proj.weight"),
+            &[manifest.intermediate_size, manifest.hidden_size],
+        )?;
+        validate_manifest_tensor_shape(
+            manifest,
+            &format!("{prefix}.mlp.down_proj.weight"),
+            &[manifest.hidden_size, manifest.intermediate_size],
+        )?;
+        match manifest.layer_types[layer_index].as_str() {
+            "full_attention" => {
+                validate_manifest_tensor_shape(
+                    manifest,
+                    &format!("{prefix}.self_attn.q_proj.weight"),
+                    &[manifest.num_attention_heads * manifest.head_dim * 2, manifest.hidden_size],
+                )?;
+                validate_manifest_tensor_shape(
+                    manifest,
+                    &format!("{prefix}.self_attn.k_proj.weight"),
+                    &[manifest.num_key_value_heads * manifest.head_dim, manifest.hidden_size],
+                )?;
+                validate_manifest_tensor_shape(
+                    manifest,
+                    &format!("{prefix}.self_attn.v_proj.weight"),
+                    &[manifest.num_key_value_heads * manifest.head_dim, manifest.hidden_size],
+                )?;
+                validate_manifest_tensor_shape(
+                    manifest,
+                    &format!("{prefix}.self_attn.o_proj.weight"),
+                    &[manifest.hidden_size, manifest.hidden_size],
+                )?;
+                validate_manifest_tensor_shape(
+                    manifest,
+                    &format!("{prefix}.self_attn.q_norm.weight"),
+                    &[manifest.head_dim],
+                )?;
+                validate_manifest_tensor_shape(
+                    manifest,
+                    &format!("{prefix}.self_attn.k_norm.weight"),
+                    &[manifest.head_dim],
+                )?;
+            }
+            "linear_attention" => {
+                let linear_key_width = manifest.linear_num_key_heads * manifest.linear_key_head_dim;
+                let linear_value_width =
+                    manifest.linear_num_value_heads * manifest.linear_value_head_dim;
+                let linear_qkv_width = linear_key_width * 2 + linear_value_width;
+                validate_manifest_tensor_shape(
+                    manifest,
+                    &format!("{prefix}.linear_attn.conv1d.weight"),
+                    &[linear_qkv_width, 1, manifest.linear_conv_kernel_dim],
+                )?;
+                validate_manifest_tensor_shape(
+                    manifest,
+                    &format!("{prefix}.linear_attn.dt_bias"),
+                    &[manifest.linear_num_value_heads],
+                )?;
+                validate_manifest_tensor_shape(
+                    manifest,
+                    &format!("{prefix}.linear_attn.A_log"),
+                    &[manifest.linear_num_value_heads],
+                )?;
+                validate_manifest_tensor_shape(
+                    manifest,
+                    &format!("{prefix}.linear_attn.norm.weight"),
+                    &[manifest.linear_value_head_dim],
+                )?;
+                validate_manifest_tensor_shape(
+                    manifest,
+                    &format!("{prefix}.linear_attn.out_proj.weight"),
+                    &[manifest.hidden_size, linear_value_width],
+                )?;
+                validate_manifest_tensor_shape(
+                    manifest,
+                    &format!("{prefix}.linear_attn.in_proj_qkv.weight"),
+                    &[linear_qkv_width, manifest.hidden_size],
+                )?;
+                validate_manifest_tensor_shape(
+                    manifest,
+                    &format!("{prefix}.linear_attn.in_proj_z.weight"),
+                    &[linear_value_width, manifest.hidden_size],
+                )?;
+                validate_manifest_tensor_shape(
+                    manifest,
+                    &format!("{prefix}.linear_attn.in_proj_b.weight"),
+                    &[manifest.linear_num_value_heads, manifest.hidden_size],
+                )?;
+                validate_manifest_tensor_shape(
+                    manifest,
+                    &format!("{prefix}.linear_attn.in_proj_a.weight"),
+                    &[manifest.linear_num_value_heads, manifest.hidden_size],
+                )?;
+            }
+            other => bail!(
+                "Burn text manifest {} used unsupported layer type `{other}` at layer {}",
+                manifest_path.display(),
+                layer_index
+            ),
+        }
+    }
+    Ok(())
+}
+
+fn validate_manifest_tensor_shape(
+    manifest: &BurnTextManifest,
+    tensor_name: &str,
+    expected_shape: &[usize],
+) -> eyre::Result<()> {
+    let spec = manifest
+        .tensors
+        .get(tensor_name)
+        .ok_or_else(|| eyre::eyre!("Burn text manifest is missing tensor `{tensor_name}`"))?;
+    ensure!(
+        spec.shape == expected_shape,
+        "Burn text tensor `{tensor_name}` expected shape {:?} but manifest declared {:?}",
+        expected_shape,
+        spec.shape
+    );
+    Ok(())
+}
+
 #[must_use]
 pub fn burn_text_dir(root: &Path) -> PathBuf {
     root.join(BURN_TEXT_DIR_NAME)
@@ -1571,7 +2416,7 @@ pub fn export_burn_text_weights(
 pub fn load_burn_text_manifest(path: &Path) -> eyre::Result<BurnTextManifest> {
     let bytes = std::fs::read(path)
         .wrap_err_with(|| format!("Failed to read Burn text manifest {}", path.display()))?;
-    serde_json::from_slice(&bytes)
+    facet_json::from_slice(&bytes)
         .wrap_err_with(|| format!("Failed to parse Burn text manifest {}", path.display()))
 }
 
@@ -1582,18 +2427,112 @@ pub fn load_burn_text_manifest(path: &Path) -> eyre::Result<BurnTextManifest> {
 pub fn generate_with_burn_text_runtime(
     artifacts: &LlmModelArtifacts,
     prompt_token_ids: &[u32],
-    max_new_tokens: usize,
+    options: &BurnTextGenerationOptions,
 ) -> eyre::Result<BurnTextGenerationReport> {
+    let generation_mode = burn_text_generation_mode();
     if burn_text_prefers_cuda_by_default()
         && let Some(report) =
-            try_generate_with_cuda_backend(artifacts, prompt_token_ids, max_new_tokens)?
+            try_generate_with_cuda_backend(artifacts, prompt_token_ids, options, generation_mode)?
     {
         return Ok(report);
     }
-    generate_with_burn_text_runtime_on_device::<LlmCpuBackend>(
+    generate_with_selected_burn_text_runtime_on_device::<LlmCpuBackend>(
         artifacts,
         prompt_token_ids,
-        max_new_tokens,
+        options,
+        generation_mode,
+        NdArrayDevice::default(),
+        "cpu-ndarray",
+    )
+}
+
+/// # Errors
+///
+/// This function will return an error if either the stable or experimental incremental Burn path
+/// cannot run for the provided prompt.
+pub fn compare_with_incremental_burn_text_runtime(
+    artifacts: &LlmModelArtifacts,
+    prompt_token_ids: &[u32],
+    options: &BurnTextGenerationOptions,
+) -> eyre::Result<BurnTextIncrementalComparisonReport> {
+    if burn_text_prefers_cuda_by_default()
+        && let Some(report) = try_compare_with_incremental_cuda_backend(
+            artifacts,
+            prompt_token_ids,
+            options,
+        )?
+    {
+        return Ok(report);
+    }
+    compare_with_incremental_burn_text_runtime_on_device::<LlmCpuBackend>(
+        artifacts,
+        prompt_token_ids,
+        options,
+        NdArrayDevice::default(),
+        "cpu-ndarray",
+    )
+}
+
+/// # Errors
+///
+/// This function will return an error if either the stable or experimental incremental Burn path
+/// cannot reproduce the final prompt hidden state for the provided prompt.
+pub fn diagnose_incremental_hidden_burn_text_runtime(
+    artifacts: &LlmModelArtifacts,
+    prompt_token_ids: &[u32],
+) -> eyre::Result<BurnTextIncrementalHiddenDiagnosticsReport> {
+    if burn_text_prefers_cuda_by_default()
+        && let Some(report) =
+            try_diagnose_incremental_hidden_cuda_backend(artifacts, prompt_token_ids)?
+    {
+        return Ok(report);
+    }
+    diagnose_incremental_hidden_burn_text_runtime_on_device::<LlmCpuBackend>(
+        artifacts,
+        prompt_token_ids,
+        NdArrayDevice::default(),
+        "cpu-ndarray",
+    )
+}
+
+/// # Errors
+///
+/// This function will return an error if either the stable or experimental incremental Burn path
+/// cannot produce per-layer hidden diagnostics for the provided prompt.
+pub fn diagnose_incremental_layers_burn_text_runtime(
+    artifacts: &LlmModelArtifacts,
+    prompt_token_ids: &[u32],
+) -> eyre::Result<BurnTextIncrementalLayerDiagnosticsReport> {
+    if burn_text_prefers_cuda_by_default()
+        && let Some(report) =
+            try_diagnose_incremental_layers_cuda_backend(artifacts, prompt_token_ids)?
+    {
+        return Ok(report);
+    }
+    diagnose_incremental_layers_burn_text_runtime_on_device::<LlmCpuBackend>(
+        artifacts,
+        prompt_token_ids,
+        NdArrayDevice::default(),
+        "cpu-ndarray",
+    )
+}
+
+/// # Errors
+///
+/// This function will return an error if the Burn text runtime cannot collect final-token layer
+/// outputs for the provided prompt.
+pub fn collect_full_layer_outputs_burn_text_runtime(
+    artifacts: &LlmModelArtifacts,
+    prompt_token_ids: &[u32],
+) -> eyre::Result<BurnTextLayerOutputsReport> {
+    if burn_text_prefers_cuda_by_default()
+        && let Some(report) = try_collect_full_layer_outputs_cuda_backend(artifacts, prompt_token_ids)?
+    {
+        return Ok(report);
+    }
+    collect_full_layer_outputs_burn_text_runtime_on_device::<LlmCpuBackend>(
+        artifacts,
+        prompt_token_ids,
         NdArrayDevice::default(),
         "cpu-ndarray",
     )
@@ -1611,16 +2550,63 @@ fn burn_text_prefers_cuda_by_default() -> bool {
     )
 }
 
+fn burn_text_generation_mode() -> BurnTextGenerationMode {
+    match std::env::var("TEAMY_STUDIO_LLM_BURN_GENERATION_MODE") {
+        Ok(value) if value.trim().eq_ignore_ascii_case("full") => BurnTextGenerationMode::Full,
+        Ok(value) if value.trim().eq_ignore_ascii_case("incremental") => {
+            BurnTextGenerationMode::Incremental
+        }
+        _ => BurnTextGenerationMode::Hybrid,
+    }
+}
+
+fn generate_with_selected_burn_text_runtime_on_device<B: Backend>(
+    artifacts: &LlmModelArtifacts,
+    prompt_token_ids: &[u32],
+    options: &BurnTextGenerationOptions,
+    generation_mode: BurnTextGenerationMode,
+    device: B::Device,
+    backend_label: &str,
+) -> eyre::Result<BurnTextGenerationReport> {
+    match generation_mode {
+        BurnTextGenerationMode::Full => generate_with_burn_text_runtime_on_device::<B>(
+            artifacts,
+            prompt_token_ids,
+            options,
+            device,
+            backend_label,
+        ),
+        BurnTextGenerationMode::Incremental => {
+            generate_with_incremental_burn_text_runtime_on_device::<B>(
+                artifacts,
+                prompt_token_ids,
+                options,
+                device,
+                backend_label,
+            )
+        }
+        BurnTextGenerationMode::Hybrid => generate_with_hybrid_burn_text_runtime_on_device::<B>(
+            artifacts,
+            prompt_token_ids,
+            options,
+            device,
+            backend_label,
+        ),
+    }
+}
+
 fn try_generate_with_cuda_backend(
     artifacts: &LlmModelArtifacts,
     prompt_token_ids: &[u32],
-    max_new_tokens: usize,
+    options: &BurnTextGenerationOptions,
+    generation_mode: BurnTextGenerationMode,
 ) -> eyre::Result<Option<BurnTextGenerationReport>> {
     let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        generate_with_burn_text_runtime_on_device::<LlmCudaBackend>(
+        generate_with_selected_burn_text_runtime_on_device::<LlmCudaBackend>(
             artifacts,
             prompt_token_ids,
-            max_new_tokens,
+            options,
+            generation_mode,
             llm_inference_cuda_device(),
             "cuda",
         )
@@ -1628,6 +2614,9 @@ fn try_generate_with_cuda_backend(
     match attempt {
         Ok(Ok(report)) => Ok(Some(report)),
         Ok(Err(error)) => {
+            if is_generation_timeout_error(&error) {
+                return Err(error);
+            }
             trace_burn_text_runtime(&format!(
                 "CUDA backend unavailable for Burn text runtime; falling back to CPU: {error}"
             ));
@@ -1642,10 +2631,288 @@ fn try_generate_with_cuda_backend(
     }
 }
 
+fn try_compare_with_incremental_cuda_backend(
+    artifacts: &LlmModelArtifacts,
+    prompt_token_ids: &[u32],
+    options: &BurnTextGenerationOptions,
+) -> eyre::Result<Option<BurnTextIncrementalComparisonReport>> {
+    let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        compare_with_incremental_burn_text_runtime_on_device::<LlmCudaBackend>(
+            artifacts,
+            prompt_token_ids,
+            options,
+            llm_inference_cuda_device(),
+            "cuda",
+        )
+    }));
+    match attempt {
+        Ok(Ok(report)) => Ok(Some(report)),
+        Ok(Err(error)) => {
+            if is_generation_timeout_error(&error) {
+                return Err(error);
+            }
+            trace_burn_text_runtime(&format!(
+                "CUDA backend unavailable for Burn incremental comparison; falling back to CPU: {error}"
+            ));
+            Ok(None)
+        }
+        Err(_) => {
+            trace_burn_text_runtime(
+                "CUDA backend panicked during Burn incremental comparison initialization; falling back to CPU",
+            );
+            Ok(None)
+        }
+    }
+}
+
+fn try_diagnose_incremental_hidden_cuda_backend(
+    artifacts: &LlmModelArtifacts,
+    prompt_token_ids: &[u32],
+) -> eyre::Result<Option<BurnTextIncrementalHiddenDiagnosticsReport>> {
+    let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        diagnose_incremental_hidden_burn_text_runtime_on_device::<LlmCudaBackend>(
+            artifacts,
+            prompt_token_ids,
+            llm_inference_cuda_device(),
+            "cuda",
+        )
+    }));
+    match attempt {
+        Ok(Ok(report)) => Ok(Some(report)),
+        Ok(Err(error)) => {
+            trace_burn_text_runtime(&format!(
+                "CUDA backend unavailable for Burn incremental hidden diagnostics; falling back to CPU: {error}"
+            ));
+            Ok(None)
+        }
+        Err(_) => {
+            trace_burn_text_runtime(
+                "CUDA backend panicked during Burn incremental hidden diagnostics; falling back to CPU",
+            );
+            Ok(None)
+        }
+    }
+}
+
+fn try_diagnose_incremental_layers_cuda_backend(
+    artifacts: &LlmModelArtifacts,
+    prompt_token_ids: &[u32],
+) -> eyre::Result<Option<BurnTextIncrementalLayerDiagnosticsReport>> {
+    let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        diagnose_incremental_layers_burn_text_runtime_on_device::<LlmCudaBackend>(
+            artifacts,
+            prompt_token_ids,
+            llm_inference_cuda_device(),
+            "cuda",
+        )
+    }));
+    match attempt {
+        Ok(Ok(report)) => Ok(Some(report)),
+        Ok(Err(error)) => {
+            trace_burn_text_runtime(&format!(
+                "CUDA backend unavailable for Burn incremental layer diagnostics; falling back to CPU: {error}"
+            ));
+            Ok(None)
+        }
+        Err(_) => {
+            trace_burn_text_runtime(
+                "CUDA backend panicked during Burn incremental layer diagnostics; falling back to CPU",
+            );
+            Ok(None)
+        }
+    }
+}
+
+fn try_collect_full_layer_outputs_cuda_backend(
+    artifacts: &LlmModelArtifacts,
+    prompt_token_ids: &[u32],
+) -> eyre::Result<Option<BurnTextLayerOutputsReport>> {
+    let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        collect_full_layer_outputs_burn_text_runtime_on_device::<LlmCudaBackend>(
+            artifacts,
+            prompt_token_ids,
+            llm_inference_cuda_device(),
+            "cuda",
+        )
+    }));
+    match attempt {
+        Ok(Ok(report)) => Ok(Some(report)),
+        Ok(Err(error)) => {
+            trace_burn_text_runtime(&format!(
+                "CUDA backend unavailable for Burn full-layer outputs; falling back to CPU: {error}"
+            ));
+            Ok(None)
+        }
+        Err(_) => {
+            trace_burn_text_runtime(
+                "CUDA backend panicked during Burn full-layer outputs; falling back to CPU",
+            );
+            Ok(None)
+        }
+    }
+}
+
+fn compare_with_incremental_burn_text_runtime_on_device<B: Backend>(
+    artifacts: &LlmModelArtifacts,
+    prompt_token_ids: &[u32],
+    options: &BurnTextGenerationOptions,
+    device: B::Device,
+    backend_label: &str,
+) -> eyre::Result<BurnTextIncrementalComparisonReport> {
+    llm_tracy_zone!("llm_burn_compare_incremental");
+    #[cfg(feature = "extended_observability")]
+    let _span = tracing::info_span!(
+        "llm_burn_compare_incremental",
+        backend = backend_label,
+        prompt_token_count = prompt_token_ids.len(),
+        max_new_tokens = options.max_new_tokens
+    )
+    .entered();
+    ensure!(
+        !prompt_token_ids.is_empty(),
+        "Burn incremental comparison expected at least one prompt token"
+    );
+    let full = generate_with_burn_text_runtime_on_device::<B>(
+        artifacts,
+        prompt_token_ids,
+        options,
+        device.clone(),
+        backend_label,
+    )?;
+    let incremental = generate_with_incremental_burn_text_runtime_on_device::<B>(
+        artifacts,
+        prompt_token_ids,
+        options,
+        device,
+        backend_label,
+    )?;
+    let first_mismatch_index =
+        first_mismatch_index(&full.generated_token_ids, &incremental.generated_token_ids);
+    Ok(BurnTextIncrementalComparisonReport {
+        backend: backend_label.to_owned(),
+        token_match: first_mismatch_index.is_none(),
+        first_mismatch_index,
+        full_generated_token_ids: full.generated_token_ids,
+        full_generated_text: full.generated_text,
+        incremental_generated_token_ids: incremental.generated_token_ids,
+        incremental_generated_text: incremental.generated_text,
+    })
+}
+
+fn diagnose_incremental_hidden_burn_text_runtime_on_device<B: Backend>(
+    artifacts: &LlmModelArtifacts,
+    prompt_token_ids: &[u32],
+    device: B::Device,
+    backend_label: &str,
+) -> eyre::Result<BurnTextIncrementalHiddenDiagnosticsReport> {
+    llm_tracy_zone!("llm_burn_diagnose_incremental_hidden");
+    #[cfg(feature = "extended_observability")]
+    let _span = tracing::info_span!(
+        "llm_burn_diagnose_incremental_hidden",
+        backend = backend_label,
+        prompt_token_count = prompt_token_ids.len()
+    )
+    .entered();
+    ensure!(
+        !prompt_token_ids.is_empty(),
+        "Burn incremental hidden diagnostics expected at least one prompt token"
+    );
+    let runtime = Qwen35TextRuntime::<B>::load(artifacts, device)?;
+    let first_prompt_token_hidden_diff = compare_hidden_slices(
+        &full_last_hidden_for_prompt(&runtime, &prompt_token_ids[..1])?,
+        &incremental_last_hidden_for_prompt(&runtime, &prompt_token_ids[..1])?,
+    )?;
+    let full_prompt_hidden_diff = compare_hidden_slices(
+        &full_last_hidden_for_prompt(&runtime, prompt_token_ids)?,
+        &incremental_last_hidden_for_prompt(&runtime, prompt_token_ids)?,
+    )?;
+    Ok(BurnTextIncrementalHiddenDiagnosticsReport {
+        backend: backend_label.to_owned(),
+        first_prompt_token_hidden_diff,
+        full_prompt_hidden_diff,
+    })
+}
+
+fn diagnose_incremental_layers_burn_text_runtime_on_device<B: Backend>(
+    artifacts: &LlmModelArtifacts,
+    prompt_token_ids: &[u32],
+    device: B::Device,
+    backend_label: &str,
+) -> eyre::Result<BurnTextIncrementalLayerDiagnosticsReport> {
+    llm_tracy_zone!("llm_burn_diagnose_incremental_layers");
+    #[cfg(feature = "extended_observability")]
+    let _span = tracing::info_span!(
+        "llm_burn_diagnose_incremental_layers",
+        backend = backend_label,
+        prompt_token_count = prompt_token_ids.len()
+    )
+    .entered();
+    ensure!(
+        !prompt_token_ids.is_empty(),
+        "Burn incremental layer diagnostics expected at least one prompt token"
+    );
+    let runtime = Qwen35TextRuntime::<B>::load(artifacts, device)?;
+    let full_outputs = full_layer_outputs_for_prompt(&runtime, prompt_token_ids)?;
+    let incremental_outputs = incremental_layer_outputs_for_prompt(&runtime, prompt_token_ids)?;
+    ensure!(
+        full_outputs.len() == incremental_outputs.len(),
+        "Per-layer diagnostic output count mismatch: {} vs {}",
+        full_outputs.len(),
+        incremental_outputs.len()
+    );
+    let mut layer_differences = Vec::with_capacity(full_outputs.len());
+    for (layer_index, (full_hidden, incremental_hidden)) in
+        full_outputs.iter().zip(incremental_outputs.iter()).enumerate()
+    {
+        layer_differences.push(BurnTextLayerHiddenDifference {
+            layer_index,
+            layer_type: runtime.manifest.layer_types[layer_index].clone(),
+            hidden_diff: compare_hidden_slices(full_hidden, incremental_hidden)?,
+        });
+    }
+    let first_large_diff_layer_index = layer_differences
+        .iter()
+        .find(|layer| layer.hidden_diff.max_abs_diff > 0.1)
+        .map(|layer| layer.layer_index);
+    Ok(BurnTextIncrementalLayerDiagnosticsReport {
+        backend: backend_label.to_owned(),
+        first_large_diff_layer_index,
+        layer_differences,
+    })
+}
+
+fn collect_full_layer_outputs_burn_text_runtime_on_device<B: Backend>(
+    artifacts: &LlmModelArtifacts,
+    prompt_token_ids: &[u32],
+    device: B::Device,
+    backend_label: &str,
+) -> eyre::Result<BurnTextLayerOutputsReport> {
+    llm_tracy_zone!("llm_burn_collect_full_layer_outputs");
+    #[cfg(feature = "extended_observability")]
+    let _span = tracing::info_span!(
+        "llm_burn_collect_full_layer_outputs",
+        backend = backend_label,
+        prompt_token_count = prompt_token_ids.len()
+    )
+    .entered();
+    ensure!(
+        !prompt_token_ids.is_empty(),
+        "Burn full-layer output collection expected at least one prompt token"
+    );
+    let runtime = Qwen35TextRuntime::<B>::load(artifacts, device)?;
+    let layer_last_hidden_states = full_layer_outputs_for_prompt(&runtime, prompt_token_ids)?;
+    let final_norm_last_hidden = full_last_hidden_for_prompt(&runtime, prompt_token_ids)?;
+    Ok(BurnTextLayerOutputsReport {
+        backend: backend_label.to_owned(),
+        layer_last_hidden_states,
+        final_norm_last_hidden,
+    })
+}
+
 fn generate_with_burn_text_runtime_on_device<B: Backend>(
     artifacts: &LlmModelArtifacts,
     prompt_token_ids: &[u32],
-    max_new_tokens: usize,
+    options: &BurnTextGenerationOptions,
     device: B::Device,
     backend_label: &str,
 ) -> eyre::Result<BurnTextGenerationReport> {
@@ -1655,7 +2922,7 @@ fn generate_with_burn_text_runtime_on_device<B: Backend>(
         "llm_burn_generate",
         backend = backend_label,
         prompt_token_count = prompt_token_ids.len(),
-        max_new_tokens
+        max_new_tokens = options.max_new_tokens
     )
     .entered();
     trace_burn_text_runtime(&format!(
@@ -1680,8 +2947,10 @@ fn generate_with_burn_text_runtime_on_device<B: Backend>(
         .map(|token_id| usize::try_from(token_id).unwrap_or(usize::MAX))
         .collect::<Vec<_>>();
     let mut generated_token_ids = Vec::new();
+    let deadline = GenerationDeadline::new(options.generation_timeout);
 
-    for token_index in 0..max_new_tokens {
+    for token_index in 0..options.max_new_tokens {
+        deadline.check(generated_token_ids.len(), options.max_new_tokens)?;
         trace_burn_text_runtime(&format!(
             "generating token {} with prompt length {}",
             token_index + 1,
@@ -1702,9 +2971,202 @@ fn generate_with_burn_text_runtime_on_device<B: Backend>(
         trace_burn_text_runtime(&format!("selected token id {next_token_id}"));
         generated_token_ids.push(next_token_id);
         all_token_ids.push(next_token_id);
+        deadline.check(generated_token_ids.len(), options.max_new_tokens)?;
         if eos_token_id.is_some_and(|eos_token_id| eos_token_id == next_token_id) {
             break;
         }
+    }
+
+    let generated_text = decode_token_ids_with_tokenizer(&tokenizer, &generated_token_ids, false)?;
+    Ok(BurnTextGenerationReport {
+        generated_token_ids,
+        generated_text,
+    })
+}
+
+fn generate_with_incremental_burn_text_runtime_on_device<B: Backend>(
+    artifacts: &LlmModelArtifacts,
+    prompt_token_ids: &[u32],
+    options: &BurnTextGenerationOptions,
+    device: B::Device,
+    backend_label: &str,
+) -> eyre::Result<BurnTextGenerationReport> {
+    llm_tracy_zone!("llm_burn_generate_incremental");
+    #[cfg(feature = "extended_observability")]
+    let _span = tracing::info_span!(
+        "llm_burn_generate_incremental",
+        backend = backend_label,
+        prompt_token_count = prompt_token_ids.len(),
+        max_new_tokens = options.max_new_tokens
+    )
+    .entered();
+    trace_burn_text_runtime(&format!(
+        "using {backend_label} backend for Burn text incremental runtime"
+    ));
+    ensure!(
+        !prompt_token_ids.is_empty(),
+        "Burn text incremental runtime expected at least one prompt token"
+    );
+    let runtime = Qwen35TextRuntime::<B>::load(artifacts, device)?;
+    let tokenizer = tokenizers::Tokenizer::from_file(&artifacts.tokenizer_path).map_err(|error| {
+        eyre::eyre!(
+            "Failed to load tokenizer from {}: {}",
+            artifacts.tokenizer_path.display(),
+            error
+        )
+    })?;
+    let eos_token_id = load_tokenizer_config_summary(&artifacts.tokenizer_config_path)?
+        .eos_token
+        .as_deref()
+        .and_then(|token| tokenizer.token_to_id(token))
+        .and_then(|token_id| usize::try_from(token_id).ok());
+
+    let deadline = GenerationDeadline::new(options.generation_timeout);
+    let mut decode_state = runtime.new_decode_state()?;
+    let mut last_hidden = Vec::new();
+    for (prompt_index, token_id) in prompt_token_ids.iter().enumerate() {
+        deadline.check(0, options.max_new_tokens)?;
+        trace_burn_text_runtime(&format!(
+            "incremental processing prompt token {} of {}",
+            prompt_index + 1,
+            prompt_token_ids.len()
+        ));
+        last_hidden = runtime.forward_token_hidden(&mut decode_state, *token_id)?;
+    }
+
+    let mut generated_token_ids = Vec::new();
+    for token_index in 0..options.max_new_tokens {
+        deadline.check(generated_token_ids.len(), options.max_new_tokens)?;
+        trace_burn_text_runtime(&format!(
+            "incremental generating token {} after {} processed tokens",
+            token_index + 1,
+            decode_state.processed_token_count
+        ));
+        let next_token_id = runtime.greedy_next_token_from_hidden(&last_hidden)?;
+        trace_burn_text_runtime(&format!(
+            "incremental selected token id {next_token_id}"
+        ));
+        generated_token_ids.push(next_token_id);
+        deadline.check(generated_token_ids.len(), options.max_new_tokens)?;
+        if eos_token_id.is_some_and(|eos_token_id| eos_token_id == next_token_id) {
+            break;
+        }
+        last_hidden = runtime.forward_token_hidden(
+            &mut decode_state,
+            u32::try_from(next_token_id)
+                .wrap_err_with(|| format!("Token id {next_token_id} exceeded u32 range"))?,
+        )?;
+    }
+
+    let generated_text = decode_token_ids_with_tokenizer(&tokenizer, &generated_token_ids, false)?;
+    Ok(BurnTextGenerationReport {
+        generated_token_ids,
+        generated_text,
+    })
+}
+
+fn generate_with_hybrid_burn_text_runtime_on_device<B: Backend>(
+    artifacts: &LlmModelArtifacts,
+    prompt_token_ids: &[u32],
+    options: &BurnTextGenerationOptions,
+    device: B::Device,
+    backend_label: &str,
+) -> eyre::Result<BurnTextGenerationReport> {
+    llm_tracy_zone!("llm_burn_generate_hybrid");
+    #[cfg(feature = "extended_observability")]
+    let _span = tracing::info_span!(
+        "llm_burn_generate_hybrid",
+        backend = backend_label,
+        prompt_token_count = prompt_token_ids.len(),
+        max_new_tokens = options.max_new_tokens
+    )
+    .entered();
+    trace_burn_text_runtime(&format!(
+        "using {backend_label} backend for Burn text hybrid runtime"
+    ));
+    if options.max_new_tokens == 0 {
+        return Ok(BurnTextGenerationReport {
+            generated_token_ids: Vec::new(),
+            generated_text: String::new(),
+        });
+    }
+    if prompt_token_ids.is_empty() {
+        return generate_with_burn_text_runtime_on_device::<B>(
+            artifacts,
+            prompt_token_ids,
+            options,
+            device,
+            backend_label,
+        );
+    }
+
+    let runtime = Qwen35TextRuntime::<B>::load(artifacts, device)?;
+    let tokenizer = tokenizers::Tokenizer::from_file(&artifacts.tokenizer_path).map_err(|error| {
+        eyre::eyre!(
+            "Failed to load tokenizer from {}: {}",
+            artifacts.tokenizer_path.display(),
+            error
+        )
+    })?;
+    let eos_token_id = load_tokenizer_config_summary(&artifacts.tokenizer_config_path)?
+        .eos_token
+        .as_deref()
+        .and_then(|token| tokenizer.token_to_id(token))
+        .and_then(|token_id| usize::try_from(token_id).ok());
+    let deadline = GenerationDeadline::new(options.generation_timeout);
+
+    deadline.check(0, options.max_new_tokens)?;
+    trace_burn_text_runtime(&format!(
+        "hybrid generating token 1 with prompt length {}",
+        prompt_token_ids.len()
+    ));
+    let (hidden_states, mut decode_state) = runtime
+        .forward_hidden_states_with_decode_state(runtime.embedding_hidden_states(prompt_token_ids)?)?;
+    trace_burn_text_runtime("hybrid decoder stack complete; scanning lm_head");
+    let first_token_id = runtime.greedy_next_token(hidden_states)?;
+    trace_burn_text_runtime(&format!("hybrid selected token id {first_token_id}"));
+    let mut generated_token_ids = vec![first_token_id];
+    deadline.check(generated_token_ids.len(), options.max_new_tokens)?;
+    if eos_token_id.is_some_and(|eos_token_id| eos_token_id == first_token_id)
+        || options.max_new_tokens == 1
+    {
+        let generated_text =
+            decode_token_ids_with_tokenizer(&tokenizer, &generated_token_ids, false)?;
+        return Ok(BurnTextGenerationReport {
+            generated_token_ids,
+            generated_text,
+        });
+    }
+
+    deadline.check(generated_token_ids.len(), options.max_new_tokens)?;
+    trace_burn_text_runtime("hybrid handing off first generated token to cached decode state");
+    let mut last_hidden = runtime.forward_token_hidden(
+        &mut decode_state,
+        u32::try_from(first_token_id)
+            .wrap_err_with(|| format!("Token id {first_token_id} exceeded u32 range"))?,
+    )?;
+
+    for token_index in 1..options.max_new_tokens {
+        deadline.check(generated_token_ids.len(), options.max_new_tokens)?;
+        trace_burn_text_runtime(&format!(
+            "hybrid generating token {} after {} processed tokens",
+            token_index + 1,
+            decode_state.processed_token_count
+        ));
+        let next_token_id = runtime.greedy_next_token_from_hidden(&last_hidden)?;
+        trace_burn_text_runtime(&format!(
+            "hybrid selected token id {next_token_id}"
+        ));
+        generated_token_ids.push(next_token_id);
+        deadline.check(generated_token_ids.len(), options.max_new_tokens)?;
+        if eos_token_id.is_some_and(|eos_token_id| eos_token_id == next_token_id) {
+            break;
+        }
+        last_hidden = runtime.forward_token_hidden(
+            &mut decode_state,
+            u32::try_from(next_token_id)
+                .wrap_err_with(|| format!("Token id {next_token_id} exceeded u32 range"))?,
+        )?;
     }
 
     let generated_text = decode_token_ids_with_tokenizer(&tokenizer, &generated_token_ids, false)?;
@@ -1734,6 +3196,124 @@ fn trace_burn_text_runtime(message: &str) {
     if std::env::var_os("TEAMY_STUDIO_LLM_TRACE").is_some() {
         eprintln!("[teamy-llm-trace] {message}");
     }
+}
+
+fn full_last_hidden_for_prompt<B: Backend>(
+    runtime: &Qwen35TextRuntime<B>,
+    prompt_token_ids: &[u32],
+) -> eyre::Result<Vec<f32>> {
+    ensure!(
+        !prompt_token_ids.is_empty(),
+        "Burn text hidden comparison expected at least one prompt token"
+    );
+    let hidden_states =
+        runtime.forward_hidden_states(runtime.embedding_hidden_states(prompt_token_ids)?)?;
+    last_hidden_from_hidden_states(hidden_states)
+}
+
+fn full_layer_outputs_for_prompt<B: Backend>(
+    runtime: &Qwen35TextRuntime<B>,
+    prompt_token_ids: &[u32],
+) -> eyre::Result<Vec<Vec<f32>>> {
+    ensure!(
+        !prompt_token_ids.is_empty(),
+        "Burn text layer diagnostics expected at least one prompt token"
+    );
+    let seq_len = prompt_token_ids.len();
+    let mut hidden_states = runtime.embedding_hidden_states(prompt_token_ids)?;
+    let position_embeddings = rotary_embeddings(seq_len, &runtime.manifest)
+        .wrap_err("Failed to build rotary embeddings for layer diagnostics")?;
+    let causal_mask = causal_mask::<B>(seq_len, &runtime.device);
+    let mut outputs = Vec::with_capacity(runtime.manifest.num_hidden_layers);
+    for layer_index in 0..runtime.manifest.num_hidden_layers {
+        hidden_states = runtime.forward_decoder_layer(
+            layer_index,
+            hidden_states,
+            &position_embeddings,
+            &causal_mask,
+        )?;
+        outputs.push(last_hidden_from_hidden_states(hidden_states.clone())?);
+    }
+    Ok(outputs)
+}
+
+fn incremental_last_hidden_for_prompt<B: Backend>(
+    runtime: &Qwen35TextRuntime<B>,
+    prompt_token_ids: &[u32],
+) -> eyre::Result<Vec<f32>> {
+    ensure!(
+        !prompt_token_ids.is_empty(),
+        "Burn text incremental hidden comparison expected at least one prompt token"
+    );
+    let mut decode_state = runtime.new_decode_state()?;
+    let mut last_hidden = Vec::new();
+    for token_id in prompt_token_ids {
+        last_hidden = runtime.forward_token_hidden(&mut decode_state, *token_id)?;
+    }
+    Ok(last_hidden)
+}
+
+fn incremental_layer_outputs_for_prompt<B: Backend>(
+    runtime: &Qwen35TextRuntime<B>,
+    prompt_token_ids: &[u32],
+) -> eyre::Result<Vec<Vec<f32>>> {
+    ensure!(
+        !prompt_token_ids.is_empty(),
+        "Burn text incremental layer diagnostics expected at least one prompt token"
+    );
+    let mut decode_state = runtime.new_decode_state()?;
+    let mut last_outputs = Vec::new();
+    for token_id in prompt_token_ids {
+        last_outputs = runtime.forward_token_hidden_layer_outputs(&mut decode_state, *token_id)?;
+    }
+    Ok(last_outputs)
+}
+
+fn last_hidden_from_hidden_states<B: Backend>(hidden_states: Tensor<B, 3>) -> eyre::Result<Vec<f32>> {
+    let [batch_size, seq_len, hidden_size] = hidden_states.dims();
+    ensure!(batch_size == 1, "Qwen3.5 hidden comparison expected batch size 1");
+    ensure!(seq_len > 0, "Qwen3.5 hidden comparison expected at least one timestep");
+    tensor_to_vec_f32(&hidden_states)?
+        .chunks_exact(hidden_size)
+        .last()
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| eyre::eyre!("Missing final hidden state during hidden comparison"))
+}
+
+fn compare_hidden_slices(
+    left: &[f32],
+    right: &[f32],
+) -> eyre::Result<BurnTextHiddenDifferenceSummary> {
+    ensure!(
+        left.len() == right.len(),
+        "Hidden comparison length mismatch: {} vs {}",
+        left.len(),
+        right.len()
+    );
+    if left.is_empty() {
+        return Ok(BurnTextHiddenDifferenceSummary {
+            max_abs_diff: 0.0,
+            mean_abs_diff: 0.0,
+        });
+    }
+    let mut max_abs_diff = 0.0_f32;
+    let mut abs_diff_sum = 0.0_f64;
+    for (left_value, right_value) in left.iter().zip(right.iter()) {
+        let abs_diff = (left_value - right_value).abs();
+        max_abs_diff = max_abs_diff.max(abs_diff);
+        abs_diff_sum += f64::from(abs_diff);
+    }
+    Ok(BurnTextHiddenDifferenceSummary {
+        max_abs_diff,
+        mean_abs_diff: (abs_diff_sum / left.len() as f64) as f32,
+    })
+}
+
+fn first_mismatch_index<T: PartialEq>(left: &[T], right: &[T]) -> Option<usize> {
+    left.iter()
+        .zip(right.iter())
+        .position(|(left, right)| left != right)
+        .or_else(|| (left.len() != right.len()).then_some(left.len().min(right.len())))
 }
 
 fn tensor_3d<B: Backend>(shape: [usize; 3], values: Vec<f32>, device: &B::Device) -> Tensor<B, 3> {
@@ -2129,7 +3709,7 @@ fn rotary_embeddings(seq_len: usize, manifest: &BurnTextManifest) -> eyre::Resul
         manifest.partial_rotary_factor
     );
     let half_dim = rotary_dim / 2;
-    let rope_theta = 1_000_000.0_f64;
+    let rope_theta = manifest.rope_theta;
     let mut inv_freq = Vec::with_capacity(half_dim);
     for index in 0..half_dim {
         let numerator = (index * 2) as f64;
@@ -2242,7 +3822,7 @@ fn apply_rotary_embedding_single_position(
         manifest.head_dim
     );
     let half_dim = rotary_dim / 2;
-    let rope_theta = 1_000_000.0_f64;
+    let rope_theta = manifest.rope_theta;
     let mut cos = Vec::with_capacity(rotary_dim);
     let mut sin = Vec::with_capacity(rotary_dim);
     for index in 0..half_dim {
@@ -2279,6 +3859,30 @@ fn apply_rotary_slice(values: &mut [f32], cos: &[f32], sin: &[f32], half_dim: us
         values[index] = left * cos[index] + (-right) * sin[index];
         values[index + half_dim] = right * cos[index + half_dim] + left * sin[index + half_dim];
     }
+}
+
+fn transpose_seq_head_layout(
+    values: &[f32],
+    seq_len: usize,
+    num_heads: usize,
+    head_dim: usize,
+) -> eyre::Result<Vec<f32>> {
+    ensure!(
+        values.len() == seq_len * num_heads * head_dim,
+        "Seq/head transpose expected {} values but found {}",
+        seq_len * num_heads * head_dim,
+        values.len()
+    );
+    let mut output = vec![0.0_f32; values.len()];
+    for position in 0..seq_len {
+        for head in 0..num_heads {
+            let source_base = (position * num_heads + head) * head_dim;
+            let target_base = (head * seq_len + position) * head_dim;
+            output[target_base..target_base + head_dim]
+                .copy_from_slice(&values[source_base..source_base + head_dim]);
+        }
+    }
+    Ok(output)
 }
 
 fn repeat_key_value_heads(
@@ -2448,6 +4052,108 @@ fn recurrent_gated_delta_rule(
         }
     }
     Ok(output)
+}
+
+#[allow(dead_code)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the recurrent gated-delta prefill capture keeps the tensor contract explicit to mirror the upstream Qwen3.5 recurrence"
+)]
+fn recurrent_gated_delta_rule_with_final_state(
+    query: &[f32],
+    key: &[f32],
+    value: &[f32],
+    g: &[f32],
+    beta: &[f32],
+    seq_len: usize,
+    num_heads: usize,
+    key_dim: usize,
+    value_dim: usize,
+) -> eyre::Result<(Vec<f32>, Vec<f32>)> {
+    llm_tracy_zone!("llm_burn_recurrent_gated_delta_rule_with_final_state");
+    ensure!(
+        query.len() == seq_len * num_heads * key_dim,
+        "Gated-delta query length {} did not match {}x{}x{}",
+        query.len(),
+        seq_len,
+        num_heads,
+        key_dim
+    );
+    ensure!(
+        key.len() == query.len(),
+        "Gated-delta key length {} did not match query length {}",
+        key.len(),
+        query.len()
+    );
+    ensure!(
+        value.len() == seq_len * num_heads * value_dim,
+        "Gated-delta value length {} did not match {}x{}x{}",
+        value.len(),
+        seq_len,
+        num_heads,
+        value_dim
+    );
+    ensure!(
+        g.len() == seq_len * num_heads,
+        "Gated-delta g length {} did not match {}x{}",
+        g.len(),
+        seq_len,
+        num_heads
+    );
+    ensure!(
+        beta.len() == seq_len * num_heads,
+        "Gated-delta beta length {} did not match {}x{}",
+        beta.len(),
+        seq_len,
+        num_heads
+    );
+    let scale = (key_dim as f32).sqrt().recip();
+    let mut state = vec![0_f32; num_heads * key_dim * value_dim];
+    let mut output = vec![0_f32; seq_len * num_heads * value_dim];
+    for position in 0..seq_len {
+        for head in 0..num_heads {
+            let state_base = head * key_dim * value_dim;
+            let q_base = (position * num_heads + head) * key_dim;
+            let v_base = (position * num_heads + head) * value_dim;
+            let decay = g[position * num_heads + head].exp();
+            let beta_t = beta[position * num_heads + head];
+            for state_index in 0..key_dim * value_dim {
+                state[state_base + state_index] *= decay;
+            }
+
+            let mut kv_mem = vec![0_f32; value_dim];
+            for key_index in 0..key_dim {
+                let key_value = key[q_base + key_index];
+                let state_row_base = state_base + key_index * value_dim;
+                for value_index in 0..value_dim {
+                    kv_mem[value_index] += state[state_row_base + value_index] * key_value;
+                }
+            }
+
+            let mut delta = vec![0_f32; value_dim];
+            for value_index in 0..value_dim {
+                delta[value_index] = (value[v_base + value_index] - kv_mem[value_index]) * beta_t;
+            }
+            for key_index in 0..key_dim {
+                let key_value = key[q_base + key_index];
+                let state_row_base = state_base + key_index * value_dim;
+                for value_index in 0..value_dim {
+                    state[state_row_base + value_index] += key_value * delta[value_index];
+                }
+            }
+
+            let output_base = (position * num_heads + head) * value_dim;
+            for value_index in 0..value_dim {
+                let mut sum = 0_f32;
+                for key_index in 0..key_dim {
+                    sum += state[state_base + key_index * value_dim + value_index]
+                        * (query[q_base + key_index] * scale);
+                }
+                output[output_base + value_index] = sum;
+            }
+        }
+    }
+    Ok((output, state))
 }
 
 #[allow(dead_code)]
@@ -2682,9 +4388,9 @@ fn softplus_scalar(value: f32) -> f32 {
 mod tests {
     use super::{
         BURN_TEXT_DIR_NAME, BURN_TEXT_MANIFEST_FILE_NAME, BurnTextManifest, BurnTextTensorSpec,
-        LlmCpuBackend, apply_rotary_slice, bytes_per_element, causal_mask, decode_bytes_into_f32,
-        dot_product, f16_bits_to_f32, inspect_burn_text_runtime_status, rotary_embeddings,
-        sigmoid_scalar,
+        LlmCpuBackend, apply_rotary_slice, bytes_per_element, causal_mask,
+        decode_bytes_into_f32, dot_product, f16_bits_to_f32, first_mismatch_index,
+        inspect_burn_text_runtime_status, rotary_embeddings, sigmoid_scalar,
     };
     use std::collections::BTreeMap;
 
@@ -2755,7 +4461,9 @@ mod tests {
             num_key_value_heads: 1,
             head_dim: 4,
             rms_norm_eps: 1e-6,
+            hidden_act: "silu".to_owned(),
             partial_rotary_factor: 0.5,
+            rope_theta: 10_000_000.0,
             linear_num_key_heads: 1,
             linear_num_value_heads: 2,
             linear_key_head_dim: 2,
@@ -2774,5 +4482,14 @@ mod tests {
     fn helper_math_is_stable() {
         assert!((sigmoid_scalar(0.0) - 0.5).abs() < 1e-6);
         assert_eq!(dot_product(&[1.0, 2.0], &[3.0, 4.0]), 11.0);
+    }
+
+    #[test]
+    fn first_mismatch_index_reports_value_mismatches_and_length_mismatches() {
+        assert_eq!(first_mismatch_index::<usize>(&[], &[]), None);
+        assert_eq!(first_mismatch_index(&[1, 2, 3], &[1, 4, 3]), Some(1));
+        assert_eq!(first_mismatch_index(&[1, 2], &[1, 2, 3]), Some(2));
+        assert_eq!(first_mismatch_index(&[1, 2, 3], &[1, 2]), Some(2));
+        assert_eq!(first_mismatch_index(&[1, 2, 3], &[1, 2, 3]), None);
     }
 }

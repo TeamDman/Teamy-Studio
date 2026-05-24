@@ -64,6 +64,7 @@ impl SelfTestLlmReferenceArgs {
 
         let report = crate::llm::reference::read_llm_reference_prompt_report(
             &self.model_id,
+            None,
             &self.device,
             self.system_prompt.as_deref(),
             &self.prompt,

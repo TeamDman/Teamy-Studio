@@ -1,9 +1,10 @@
 use eyre::{WrapErr, bail};
-use serde::Serialize;
+use facet::Facet;
 use std::path::Path;
+use std::time::Duration;
 
 use crate::burn_backend::inspect_burn_runtime_support;
-use crate::burn_text::generate_with_burn_text_runtime;
+use crate::burn_text::{BurnTextGenerationOptions, generate_with_burn_text_runtime};
 use crate::model::{LlmModelArtifacts, load_tokenizer_config_summary};
 
 pub const DEFAULT_MAX_NEW_TOKENS: usize = 256;
@@ -13,9 +14,10 @@ pub struct LlmPromptRequest {
     pub system_prompt: Option<String>,
     pub user_prompt: String,
     pub max_new_tokens: usize,
+    pub generation_timeout: Option<Duration>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, Facet, PartialEq, Eq)]
 pub struct LlmPromptResult {
     pub rendered_prompt: String,
     pub output_text: String,
@@ -85,7 +87,14 @@ pub fn run_prompt(
     );
     let _token_ids = tokenize_rendered_prompt(&artifacts.tokenizer_path, &rendered.prompt)?;
 
-    let output_text = run_prompt_with_burn_backend(artifacts, &rendered.prompt, request.max_new_tokens)
+    let output_text = run_prompt_with_burn_backend(
+        artifacts,
+        &rendered.prompt,
+        &BurnTextGenerationOptions {
+            max_new_tokens: request.max_new_tokens,
+            generation_timeout: request.generation_timeout,
+        },
+    )
         .wrap_err("failed to execute the local Rust Burn LLM runtime")?;
 
     Ok(LlmPromptResult {
@@ -97,7 +106,7 @@ pub fn run_prompt(
 fn run_prompt_with_burn_backend(
     artifacts: &LlmModelArtifacts,
     rendered_prompt: &str,
-    max_new_tokens: usize,
+    options: &BurnTextGenerationOptions,
 ) -> eyre::Result<String> {
     let token_ids = tokenize_rendered_prompt(&artifacts.tokenizer_path, rendered_prompt)
         .wrap_err("failed to tokenize the rendered prompt for Burn execution")?;
@@ -110,7 +119,7 @@ fn run_prompt_with_burn_backend(
             report.reason
         );
     }
-    let generation = generate_with_burn_text_runtime(artifacts, &token_ids, max_new_tokens)
+    let generation = generate_with_burn_text_runtime(artifacts, &token_ids, options)
         .wrap_err("failed to execute the converted Burn text runtime")?;
     Ok(generation.generated_text)
 }
@@ -118,8 +127,11 @@ fn run_prompt_with_burn_backend(
 #[cfg(test)]
 mod tests {
     use super::{render_qwen_single_turn_prompt, tokenize_rendered_prompt};
-    use crate::{burn_text::generate_with_burn_text_runtime, model::inspect_model_dir};
-    use std::path::Path;
+    use crate::{
+        burn_text::{BurnTextGenerationOptions, generate_with_burn_text_runtime},
+        model::inspect_model_dir,
+    };
+    use std::{path::Path, time::Duration};
     use tokenizers::{Tokenizer, models::bpe::BPE};
 
     #[test]
@@ -153,9 +165,16 @@ mod tests {
         let rendered = render_qwen_single_turn_prompt(None, "Hello again");
         let token_ids = tokenize_rendered_prompt(&artifacts.tokenizer_path, &rendered.prompt)
             .expect("Jackrong prompt should tokenize");
-        let report = generate_with_burn_text_runtime(&artifacts, &token_ids, 1)
-            .expect("Jackrong Burn text runtime should generate one token");
-        assert_eq!(report.generated_token_ids, vec![318]);
-        assert_eq!(report.generated_text, " (");
+        let report = generate_with_burn_text_runtime(
+            &artifacts,
+            &token_ids,
+            &BurnTextGenerationOptions {
+                max_new_tokens: 1,
+                generation_timeout: Some(Duration::from_secs(30)),
+            },
+        )
+        .expect("Jackrong Burn text runtime should generate one token");
+        assert_eq!(report.generated_token_ids, vec![248068]);
+        assert_eq!(report.generated_text, "<think>");
     }
 }

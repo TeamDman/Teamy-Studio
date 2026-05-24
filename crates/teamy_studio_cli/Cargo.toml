@@ -14,6 +14,7 @@ facet-json.workspace = true
 facet-pretty.workspace = true
 figue.workspace = true
 image.workspace = true
+humantime.workspace = true
 open.workspace = true
 serde.workspace = true
 serde_json.workspace = true
