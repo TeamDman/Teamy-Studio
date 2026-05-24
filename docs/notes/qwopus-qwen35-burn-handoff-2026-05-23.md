@@ -631,3 +631,53 @@ That means the next serious optimization target is:
 
 - reducing or eliminating host synchronization inside `forward_token_hidden(...)` and its per-layer helpers,
 - especially the single-token full-attention and linear-attention branches.
+
+## 2026-05-24 Performance Breakthrough Addendum
+
+### Changes That Moved The Needle
+
+The following changes produced the first successful sub-minute 100-token benchmark:
+
+- CUDA Burn backend changed from `Cuda<f32, i32>` to `Cuda<f16, i32>`;
+- `tensor_to_vec_f32(...)` now explicitly converts Burn tensor data before extracting `Vec<f32>`, which keeps the half-precision CUDA path valid instead of tripping a type mismatch and falling back to CPU;
+- device-bound 1D/2D tensor loads now decode directly from `float16` / `bfloat16` / `float32` bytes into Burn `TensorData`, instead of first expanding everything to host `f32` and then converting again on device;
+- the MLP path was moved back onto device for both:
+  - `forward_mlp(...)`
+  - `forward_mlp_single(...)`
+- the runtime still uses the hybrid prefill/decode-state-capture path from the previous addendum.
+
+### Important Benchmark Result
+
+Clean release benchmark command:
+
+```powershell
+.\target\release\teamy-studio.exe llm prompt "Count from 1 to 200, comma separated." --model-dir python\llm-reference\bench-model --max-new-tokens 100 --generation-timeout 1m
+```
+
+Observed:
+
+- exit code: `0`
+- actual generated tokens: `100`
+- wall-clock: about `31.48s`
+
+Validation method:
+
+- a traced run with `TEAMY_STUDIO_LLM_TRACE=1` showed:
+  - `GENERATING_LINES=100`
+  - `SELECTED_LINES=100`
+- the clean wall-clock measurement used the same prompt without extra trace overhead.
+
+### Supporting Measurements
+
+- `Hello again` with `--max-new-tokens 10` completed in about `22.2s`
+- `Hello again` with `--max-new-tokens 1` had previously dropped to about `27.1s` during this same optimization wave
+
+### Caution About Benchmark Interpretation
+
+The earlier `Hello again` benchmark prompt can terminate early due to EOS before reaching 100 tokens, so it is not a reliable throughput benchmark by itself.
+
+The counting prompt above is the benchmark that confirmed the actual target:
+
+- 100 requested tokens
+- completed under 1 minute
+- on the current Burn-based Rust path

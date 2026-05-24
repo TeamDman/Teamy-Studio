@@ -1,6 +1,6 @@
 use burn::{
     backend::{Cuda, NdArray, cuda::CudaDevice, ndarray::NdArrayDevice},
-    tensor::{Tensor, TensorData, activation::softmax, backend::Backend},
+    tensor::{Tensor, TensorData, activation::{self, softmax}, backend::Backend},
 };
 use eyre::{WrapErr, bail, ensure};
 use facet::Facet;
@@ -12,7 +12,7 @@ use std::{
     io::{Read, Seek, SeekFrom},
     marker::PhantomData,
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::{Mutex, atomic::{AtomicBool, Ordering}},
     time::{Duration, Instant},
 };
 
@@ -27,7 +27,7 @@ pub const DEFAULT_BURN_TEXT_EXPORT_DTYPE: &str = "float16";
 const DEFAULT_LOGIT_CHUNK_ROWS: usize = 512;
 
 pub type LlmCpuBackend = NdArray<f32>;
-pub type LlmCudaBackend = Cuda<f32, i32>;
+pub type LlmCudaBackend = Cuda<f16, i32>;
 
 macro_rules! llm_tracy_zone {
     ($name:literal) => {
@@ -187,6 +187,7 @@ struct Qwen35TextRuntime<B: Backend> {
     tensor_1d_cache: Mutex<HashMap<String, Tensor<B, 1>>>,
     tensor_1d_values_cache: Mutex<HashMap<String, Vec<f32>>>,
     tensor_2d_cache: Mutex<HashMap<String, Tensor<B, 2>>>,
+    lm_head_tensor_disabled: AtomicBool,
 }
 
 #[allow(dead_code)]
@@ -261,6 +262,7 @@ impl<B: Backend> Qwen35TextRuntime<B> {
             tensor_1d_cache: Mutex::new(HashMap::new()),
             tensor_1d_values_cache: Mutex::new(HashMap::new()),
             tensor_2d_cache: Mutex::new(HashMap::new()),
+            lm_head_tensor_disabled: AtomicBool::new(false),
         })
     }
 
@@ -521,12 +523,10 @@ impl<B: Backend> Qwen35TextRuntime<B> {
         {
             return Ok(cached);
         }
-        let loaded = self.load_tensor(tensor_name)?;
-        let [dim] = shape_array::<1>(&loaded.shape, tensor_name)?;
-        let tensor = Tensor::from_data(
-            TensorData::new(loaded.values, [dim]),
-            &self.device,
-        );
+        let spec = self.tensor_spec(tensor_name)?;
+        let [dim] = shape_array::<1>(&spec.shape, tensor_name)?;
+        let bytes = self.read_tensor_bytes(spec, tensor_name)?;
+        let tensor = tensor_1d_from_bytes(&bytes, &spec.dtype, dim, &self.device)?;
         self.tensor_1d_cache
             .lock()
             .map_err(|_| eyre::eyre!("1D tensor cache mutex was poisoned"))?
@@ -544,12 +544,10 @@ impl<B: Backend> Qwen35TextRuntime<B> {
         {
             return Ok(cached);
         }
-        let loaded = self.load_tensor(tensor_name)?;
-        let [dim0, dim1] = shape_array::<2>(&loaded.shape, tensor_name)?;
-        let tensor = Tensor::from_data(
-            TensorData::new(loaded.values, [dim0, dim1]),
-            &self.device,
-        );
+        let spec = self.tensor_spec(tensor_name)?;
+        let [dim0, dim1] = shape_array::<2>(&spec.shape, tensor_name)?;
+        let bytes = self.read_tensor_bytes(spec, tensor_name)?;
+        let tensor = tensor_2d_from_bytes(&bytes, &spec.dtype, [dim0, dim1], &self.device)?;
         self.tensor_2d_cache
             .lock()
             .map_err(|_| eyre::eyre!("2D tensor cache mutex was poisoned"))?
@@ -841,7 +839,7 @@ impl<B: Backend> Qwen35TextRuntime<B> {
 
     #[allow(dead_code)]
     fn forward_mlp_single(&self, prefix: &str, hidden: &[f32]) -> eyre::Result<Vec<f32>> {
-        let activation = self.hidden_activation_kind()?;
+        let _activation = self.hidden_activation_kind()?;
         let hidden_states = tensor_3d([1, 1, self.manifest.hidden_size], hidden.to_vec(), &self.device);
         let gate_proj = linear_forward_3d(
             &hidden_states,
@@ -853,20 +851,8 @@ impl<B: Backend> Qwen35TextRuntime<B> {
             self.load_tensor_2d(&format!("{prefix}.up_proj.weight"))?,
             None,
         );
-        let gate = tensor_to_vec_f32(&gate_proj)?
-            .into_iter()
-            .map(|value| apply_hidden_activation_scalar(activation, value))
-            .collect::<Vec<_>>();
-        let up = tensor_to_vec_f32(&up_proj)?;
-        ensure!(gate.len() == up.len(), "Qwen3.5 MLP gate/up projection size mismatch");
-        let fused = gate
-            .into_iter()
-            .zip(up)
-            .map(|(gate, up)| gate * up)
-            .collect::<Vec<_>>();
-        let fused = tensor_3d([1, 1, self.manifest.intermediate_size], fused, &self.device);
         tensor_to_vec_f32(&linear_forward_3d(
-            &fused,
+            &activation::silu(gate_proj).mul(up_proj),
             self.load_tensor_2d(&format!("{prefix}.down_proj.weight"))?,
             None,
         ))
@@ -1278,7 +1264,7 @@ impl<B: Backend> Qwen35TextRuntime<B> {
         llm_tracy_zone!("llm_burn_mlp");
         #[cfg(feature = "extended_observability")]
         let _span = tracing::debug_span!("llm_burn_mlp", prefix).entered();
-        let activation = self.hidden_activation_kind()?;
+        let _activation = self.hidden_activation_kind()?;
         let gate_proj = linear_forward_3d(
             &hidden_states,
             self.load_tensor_2d(&format!("{prefix}.gate_proj.weight"))?,
@@ -1289,28 +1275,8 @@ impl<B: Backend> Qwen35TextRuntime<B> {
             self.load_tensor_2d(&format!("{prefix}.up_proj.weight"))?,
             None,
         );
-        let gate = tensor_to_vec_f32(&gate_proj)?
-            .into_iter()
-            .map(|value| apply_hidden_activation_scalar(activation, value))
-            .collect::<Vec<_>>();
-        let up = tensor_to_vec_f32(&up_proj)?;
-        ensure!(
-            gate.len() == up.len(),
-            "Qwen3.5 MLP gate/up projection size mismatch"
-        );
-        let fused = gate
-            .into_iter()
-            .zip(up)
-            .map(|(gate, up)| gate * up)
-            .collect::<Vec<_>>();
-        let [batch_size, seq_len, _intermediate] = gate_proj.dims();
-        let fused = tensor_3d(
-            [batch_size, seq_len, self.manifest.intermediate_size],
-            fused,
-            &self.device,
-        );
         Ok(linear_forward_3d(
-            &fused,
+            &activation::silu(gate_proj).mul(up_proj),
             self.load_tensor_2d(&format!("{prefix}.down_proj.weight"))?,
             None,
         ))
@@ -1964,6 +1930,17 @@ impl<B: Backend> Qwen35TextRuntime<B> {
         llm_tracy_zone!("llm_burn_lm_head_scan");
         #[cfg(feature = "extended_observability")]
         let _span = tracing::debug_span!("llm_burn_lm_head_scan", hidden_size = hidden.len()).entered();
+        if !self.lm_head_tensor_disabled.load(Ordering::Relaxed) {
+            match self.greedy_next_token_from_hidden_tensor(hidden) {
+                Ok(token_id) => return Ok(token_id),
+                Err(error) => {
+                    self.lm_head_tensor_disabled.store(true, Ordering::Relaxed);
+                    trace_burn_text_runtime(&format!(
+                        "device lm_head path unavailable; falling back to row scan: {error}"
+                    ));
+                }
+            }
+        }
         let lm_head_name = if self.manifest.tensors.contains_key("lm_head.weight") {
             "lm_head.weight"
         } else {
@@ -2090,6 +2067,28 @@ impl<B: Backend> Qwen35TextRuntime<B> {
         }
         Ok(best_index)
     }
+
+    fn greedy_next_token_from_hidden_tensor(&self, hidden: &[f32]) -> eyre::Result<usize> {
+        let lm_head_name = if self.manifest.tensors.contains_key("lm_head.weight") {
+            "lm_head.weight"
+        } else {
+            "model.embed_tokens.weight"
+        };
+        let logits = linear_forward_3d(
+            &tensor_3d([1, 1, hidden.len()], hidden.to_vec(), &self.device),
+            self.load_tensor_2d(lm_head_name)?,
+            None,
+        );
+        let logits = tensor_to_vec_f32(&logits)?;
+        let (best_token_id, _) = logits
+            .into_iter()
+            .enumerate()
+            .max_by(|(_, left), (_, right)| {
+                left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .ok_or_else(|| eyre::eyre!("lm_head logits were empty"))?;
+        Ok(best_token_id)
+    }
 }
 
 fn hidden_activation_kind(hidden_act: &str) -> eyre::Result<HiddenActivationKind> {
@@ -2098,12 +2097,6 @@ fn hidden_activation_kind(hidden_act: &str) -> eyre::Result<HiddenActivationKind
         other => bail!(
             "Burn text runtime does not support hidden_act `{other}` yet; manifest/export must derive a supported activation from model config"
         ),
-    }
-}
-
-fn apply_hidden_activation_scalar(activation: HiddenActivationKind, value: f32) -> f32 {
-    match activation {
-        HiddenActivationKind::Silu => silu_scalar(value),
     }
 }
 
@@ -3325,6 +3318,104 @@ fn tensor_4d<B: Backend>(shape: [usize; 4], values: Vec<f32>, device: &B::Device
     Tensor::from_data(TensorData::new(values, shape), device)
 }
 
+fn tensor_1d_from_bytes<B: Backend>(
+    bytes: &[u8],
+    dtype: &str,
+    dim: usize,
+    device: &B::Device,
+) -> eyre::Result<Tensor<B, 1>> {
+    match dtype.trim().to_ascii_lowercase().as_str() {
+        "float16" | "f16" => {
+            ensure!(
+                bytes.len().is_multiple_of(2),
+                "float16 tensor bytes length {} was not divisible by 2",
+                bytes.len()
+            );
+            let words = bytes
+                .chunks_exact(2)
+                .map(|chunk| u16::from_ne_bytes([chunk[0], chunk[1]]))
+                .collect::<Vec<_>>();
+            let values: &[f16] = words.reinterpret_cast();
+            Ok(Tensor::from_data(TensorData::new(values.to_vec(), [dim]), device))
+        }
+        "bfloat16" | "bf16" => {
+            ensure!(
+                bytes.len().is_multiple_of(2),
+                "bfloat16 tensor bytes length {} was not divisible by 2",
+                bytes.len()
+            );
+            let words = bytes
+                .chunks_exact(2)
+                .map(|chunk| u16::from_ne_bytes([chunk[0], chunk[1]]))
+                .collect::<Vec<_>>();
+            let values: &[bf16] = words.reinterpret_cast();
+            Ok(Tensor::from_data(TensorData::new(values.to_vec(), [dim]), device))
+        }
+        "float32" | "f32" => {
+            ensure!(
+                bytes.len().is_multiple_of(4),
+                "float32 tensor bytes length {} was not divisible by 4",
+                bytes.len()
+            );
+            let values = bytes
+                .chunks_exact(4)
+                .map(|chunk| f32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+                .collect::<Vec<_>>();
+            Ok(Tensor::from_data(TensorData::new(values.to_vec(), [dim]), device))
+        }
+        other => bail!("Unsupported Burn text tensor dtype `{other}`"),
+    }
+}
+
+fn tensor_2d_from_bytes<B: Backend>(
+    bytes: &[u8],
+    dtype: &str,
+    shape: [usize; 2],
+    device: &B::Device,
+) -> eyre::Result<Tensor<B, 2>> {
+    match dtype.trim().to_ascii_lowercase().as_str() {
+        "float16" | "f16" => {
+            ensure!(
+                bytes.len().is_multiple_of(2),
+                "float16 tensor bytes length {} was not divisible by 2",
+                bytes.len()
+            );
+            let words = bytes
+                .chunks_exact(2)
+                .map(|chunk| u16::from_ne_bytes([chunk[0], chunk[1]]))
+                .collect::<Vec<_>>();
+            let values: &[f16] = words.reinterpret_cast();
+            Ok(Tensor::from_data(TensorData::new(values.to_vec(), shape), device))
+        }
+        "bfloat16" | "bf16" => {
+            ensure!(
+                bytes.len().is_multiple_of(2),
+                "bfloat16 tensor bytes length {} was not divisible by 2",
+                bytes.len()
+            );
+            let words = bytes
+                .chunks_exact(2)
+                .map(|chunk| u16::from_ne_bytes([chunk[0], chunk[1]]))
+                .collect::<Vec<_>>();
+            let values: &[bf16] = words.reinterpret_cast();
+            Ok(Tensor::from_data(TensorData::new(values.to_vec(), shape), device))
+        }
+        "float32" | "f32" => {
+            ensure!(
+                bytes.len().is_multiple_of(4),
+                "float32 tensor bytes length {} was not divisible by 4",
+                bytes.len()
+            );
+            let values = bytes
+                .chunks_exact(4)
+                .map(|chunk| f32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+                .collect::<Vec<_>>();
+            Ok(Tensor::from_data(TensorData::new(values.to_vec(), shape), device))
+        }
+        other => bail!("Unsupported Burn text tensor dtype `{other}`"),
+    }
+}
+
 fn linear_forward_3d<B: Backend>(
     input: &Tensor<B, 3>,
     weight: Tensor<B, 2>,
@@ -3358,6 +3449,7 @@ fn tensor_to_vec_f32<B: Backend, const D: usize>(tensor: &Tensor<B, D>) -> eyre:
     let _span = tracing::debug_span!("llm_burn_tensor_to_vec_f32", rank = D).entered();
     tensor
         .to_data()
+        .convert::<f32>()
         .to_vec::<f32>()
         .map_err(|error| eyre::eyre!("Failed to extract Burn tensor values: {:?}", error))
 }
