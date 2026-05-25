@@ -3,3 +3,8 @@ ignore
 *.tracy
 __pycache__/
 *.py[cod]
+.teamy-cache/
+.teamy-home/
+python/llm-reference/bench-model/
+python/llm-reference/*.stdout.txt
+python/llm-reference/*.stderr.txt

@@ -1,0 +1,27 @@
+[package]
+name = "teamy_studio_llm_stack"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+burn.workspace = true
+burn-store.workspace = true
+eyre.workspace = true
+facet.workspace = true
+facet-json.workspace = true
+half.workspace = true
+humantime.workspace = true
+reqwest.workspace = true
+teamy_studio_paths.workspace = true
+tokenizers.workspace = true
+tracing.workspace = true
+tracy-client = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[features]
+default = []
+extended_observability = []
+tracing_subscriber_tracy = ["dep:tracy-client"]

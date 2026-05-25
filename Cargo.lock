@@ -3121,6 +3121,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6dbf3de79e51f3d586ab4cb9d5c3e2c14aa28ed23d180cf89b4df0454a69cc87"
 
 [[package]]
+name = "humantime"
+version = "2.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "135b12329e5e3ce057a9f972339ea52bc954fe1e9358ef27f95e89716fbc5424"
+
+[[package]]
 name = "hyper"
 version = "1.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5775,6 +5781,7 @@ dependencies = [
  "teamy_studio_frontend",
  "teamy_studio_image_models",
  "teamy_studio_jobs",
+ "teamy_studio_llm_stack",
  "teamy_studio_logs",
  "teamy_studio_observability",
  "teamy_studio_paths",
@@ -5895,6 +5902,7 @@ dependencies = [
  "facet-csv",
  "facet-json",
  "facet-pretty",
+ "humantime",
  "image",
  "open",
  "serde",
@@ -5909,6 +5917,7 @@ dependencies = [
  "teamy_studio_frontend",
  "teamy_studio_image_models",
  "teamy_studio_jobs",
+ "teamy_studio_llm_stack",
  "teamy_studio_paths",
  "teamy_studio_shell",
  "teamy_studio_shell_default",
@@ -5978,6 +5987,25 @@ dependencies = [
 [[package]]
 name = "teamy_studio_jobs"
 version = "0.1.0"
+
+[[package]]
+name = "teamy_studio_llm_stack"
+version = "0.1.0"
+dependencies = [
+ "burn",
+ "burn-store",
+ "eyre",
+ "facet",
+ "facet-json",
+ "half",
+ "humantime",
+ "reqwest",
+ "teamy_studio_paths",
+ "tempfile",
+ "tokenizers",
+ "tracing",
+ "tracy-client",
+]
 
 [[package]]
 name = "teamy_studio_logs"

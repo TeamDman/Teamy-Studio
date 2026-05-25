@@ -21,6 +21,10 @@ pub mod image_model {
     pub use teamy_studio_image_models::*;
 }
 
+pub mod llm {
+    pub use teamy_studio_llm_stack::*;
+}
+
 pub mod logging_init {
     use crate::cli::global_args::GlobalArgs;
     use teamy_studio_observability::LoggingConfig;
