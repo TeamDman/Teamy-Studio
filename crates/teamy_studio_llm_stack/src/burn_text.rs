@@ -6,6 +6,7 @@ use eyre::{WrapErr, bail, ensure};
 use facet::Facet;
 use half::{bf16, f16, slice::{HalfBitsSliceExt, HalfFloatSliceExt}};
 use std::{
+    cell::RefCell,
     collections::{BTreeMap, HashMap, VecDeque},
     fmt,
     fs::File,
@@ -327,6 +328,7 @@ impl<B: Backend> Qwen35TextRuntime<B> {
                 )
             })?;
             for row_id in row_ids {
+                GenerationDeadline::check_current()?;
                 let row_index = usize::try_from(*row_id)
                     .wrap_err_with(|| format!("Token id {row_id} exceeded usize range"))?;
                 ensure!(
@@ -359,6 +361,7 @@ impl<B: Backend> Qwen35TextRuntime<B> {
         let mut file = File::open(&path)
             .wrap_err_with(|| format!("Failed to open Burn text tensor {}", path.display()))?;
         for row_id in row_ids {
+            GenerationDeadline::check_current()?;
             let row_index = usize::try_from(*row_id)
                 .wrap_err_with(|| format!("Token id {row_id} exceeded usize range"))?;
             ensure!(
@@ -655,6 +658,7 @@ impl<B: Backend> Qwen35TextRuntime<B> {
         let causal_mask = causal_mask::<B>(seq_len, &self.device);
 
         for layer_index in 0..self.manifest.num_hidden_layers {
+            GenerationDeadline::check_current()?;
             trace_burn_text_runtime(&format!(
                 "decoder layer {}/{} ({})",
                 layer_index + 1,
@@ -709,6 +713,7 @@ impl<B: Backend> Qwen35TextRuntime<B> {
         let mut decode_state = self.new_decode_state()?;
 
         for layer_index in 0..self.manifest.num_hidden_layers {
+            GenerationDeadline::check_current()?;
             hidden_states = self.forward_decoder_layer_with_decode_state(
                 layer_index,
                 hidden_states,
@@ -747,6 +752,7 @@ impl<B: Backend> Qwen35TextRuntime<B> {
     ) -> eyre::Result<Vec<f32>> {
         let mut hidden = self.read_rows_f32("model.embed_tokens.weight", &[token_id])?;
         for layer_index in 0..self.manifest.num_hidden_layers {
+            GenerationDeadline::check_current()?;
             hidden = self.forward_decoder_layer_single(
                 layer_index,
                 &hidden,
@@ -776,6 +782,7 @@ impl<B: Backend> Qwen35TextRuntime<B> {
         let mut hidden = self.read_rows_f32("model.embed_tokens.weight", &[token_id])?;
         let mut layer_outputs = Vec::with_capacity(self.manifest.num_hidden_layers);
         for layer_index in 0..self.manifest.num_hidden_layers {
+            GenerationDeadline::check_current()?;
             hidden = self.forward_decoder_layer_single(
                 layer_index,
                 &hidden,
@@ -1127,6 +1134,7 @@ impl<B: Backend> Qwen35TextRuntime<B> {
         let [batch_size, seq_len, hidden_size] = hidden_states.dims();
         let prefix = format!("model.layers.{layer_index}");
 
+        GenerationDeadline::check_current()?;
         let input_layernorm_weight = tensor_to_vec_f32(
             &self.load_tensor_1d(&format!("{prefix}.input_layernorm.weight"))?,
         )?;
@@ -1145,6 +1153,7 @@ impl<B: Backend> Qwen35TextRuntime<B> {
             &self.device,
         );
 
+        GenerationDeadline::check_current()?;
         let mixed = match self.layer_token_mixer_kind(layer_index)? {
             TokenMixerKind::FullAttention => self.forward_full_attention(
                 &prefix,
@@ -1156,6 +1165,7 @@ impl<B: Backend> Qwen35TextRuntime<B> {
         };
 
         let mixed = hidden_states + mixed;
+        GenerationDeadline::check_current()?;
         let post_attention_layernorm_weight = tensor_to_vec_f32(
             &self.load_tensor_1d(&format!("{prefix}.post_attention_layernorm.weight"))?,
         )?;
@@ -1173,6 +1183,7 @@ impl<B: Backend> Qwen35TextRuntime<B> {
             post_norm_values,
             &self.device,
         );
+        GenerationDeadline::check_current()?;
         let mlp = self.forward_mlp(&format!("{prefix}.mlp"), post_norm)?;
         Ok(mixed + mlp)
     }
@@ -1189,6 +1200,7 @@ impl<B: Backend> Qwen35TextRuntime<B> {
         let [batch_size, seq_len, hidden_size] = hidden_states.dims();
         let prefix = format!("model.layers.{layer_index}");
 
+        GenerationDeadline::check_current()?;
         let input_layernorm_weight = tensor_to_vec_f32(
             &self.load_tensor_1d(&format!("{prefix}.input_layernorm.weight"))?,
         )?;
@@ -1207,6 +1219,7 @@ impl<B: Backend> Qwen35TextRuntime<B> {
             &self.device,
         );
 
+        GenerationDeadline::check_current()?;
         let mixed = match layer_state {
             DecoderLayerDecodeState::Full(full_state) => self.forward_full_attention_with_state(
                 &prefix,
@@ -1221,6 +1234,7 @@ impl<B: Backend> Qwen35TextRuntime<B> {
         };
 
         let mixed = hidden_states + mixed;
+        GenerationDeadline::check_current()?;
         let post_attention_layernorm_weight = tensor_to_vec_f32(
             &self.load_tensor_1d(&format!("{prefix}.post_attention_layernorm.weight"))?,
         )?;
@@ -1238,6 +1252,7 @@ impl<B: Backend> Qwen35TextRuntime<B> {
             post_norm_values,
             &self.device,
         );
+        GenerationDeadline::check_current()?;
         let mlp = self.forward_mlp(&format!("{prefix}.mlp"), post_norm)?;
         Ok(mixed + mlp)
     }
@@ -1976,6 +1991,7 @@ impl<B: Backend> Qwen35TextRuntime<B> {
                 )
             })?;
             while row_start < vocab_size {
+                GenerationDeadline::check_current()?;
                 let rows = (vocab_size - row_start).min(max_chunk_rows);
                 let bytes = rows
                     .checked_mul(row_bytes)
@@ -2017,6 +2033,7 @@ impl<B: Backend> Qwen35TextRuntime<B> {
         let mut file = File::open(&path)
             .wrap_err_with(|| format!("Failed to open lm_head tensor {}", path.display()))?;
         while row_start < vocab_size {
+            GenerationDeadline::check_current()?;
             let rows = (vocab_size - row_start).min(max_chunk_rows);
             let bytes = rows
                 .checked_mul(row_bytes)
@@ -2101,12 +2118,66 @@ impl fmt::Display for GenerationTimeoutError {
 
 impl std::error::Error for GenerationTimeoutError {}
 
+#[derive(Clone, Debug)]
+struct GenerationDeadlineContext {
+    started_at: Instant,
+    timeout: Duration,
+    generated_token_count: usize,
+    max_new_tokens: usize,
+}
+
+thread_local! {
+    static GENERATION_DEADLINE_CONTEXT: RefCell<Option<GenerationDeadlineContext>> = const { RefCell::new(None) };
+}
+
+struct GenerationDeadlineScope {
+    previous: Option<GenerationDeadlineContext>,
+}
+
+impl Drop for GenerationDeadlineScope {
+    fn drop(&mut self) {
+        GENERATION_DEADLINE_CONTEXT.with(|context| {
+            *context.borrow_mut() = self.previous.take();
+        });
+    }
+}
+
 impl GenerationDeadline {
     fn new(timeout: Option<Duration>) -> Self {
         Self {
             started_at: Instant::now(),
             timeout,
         }
+    }
+
+    fn enter_scope(&self, max_new_tokens: usize) -> GenerationDeadlineScope {
+        let next = self.timeout.map(|timeout| GenerationDeadlineContext {
+            started_at: self.started_at,
+            timeout,
+            generated_token_count: 0,
+            max_new_tokens,
+        });
+        let previous = GENERATION_DEADLINE_CONTEXT.with(|context| {
+            let mut context = context.borrow_mut();
+            let previous = context.clone();
+            *context = next;
+            previous
+        });
+        GenerationDeadlineScope { previous }
+    }
+
+    fn update_progress(&self, generated_token_count: usize, max_new_tokens: usize) {
+        let Some(timeout) = self.timeout else {
+            return;
+        };
+        GENERATION_DEADLINE_CONTEXT.with(|context| {
+            *context.borrow_mut() = Some(GenerationDeadlineContext {
+                started_at: self.started_at,
+                timeout,
+                generated_token_count,
+                max_new_tokens,
+            });
+        });
     }
 
     fn check(&self, generated_token_count: usize, max_new_tokens: usize) -> eyre::Result<()> {
@@ -2121,6 +2192,22 @@ impl GenerationDeadline {
             elapsed,
             generated_token_count,
             max_new_tokens,
+        }))
+    }
+
+    fn check_current() -> eyre::Result<()> {
+        let context = GENERATION_DEADLINE_CONTEXT.with(|context| context.borrow().clone());
+        let Some(context) = context else {
+            return Ok(());
+        };
+        let elapsed = context.started_at.elapsed();
+        if elapsed <= context.timeout {
+            return Ok(());
+        }
+        Err(eyre::Report::new(GenerationTimeoutError {
+            elapsed,
+            generated_token_count: context.generated_token_count,
+            max_new_tokens: context.max_new_tokens,
         }))
     }
 }
@@ -2908,6 +2995,8 @@ fn generate_with_burn_text_runtime_on_device<B: Backend>(
     trace_burn_text_runtime(&format!(
         "using {backend_label} backend for Burn text runtime"
     ));
+    let deadline = GenerationDeadline::new(options.generation_timeout);
+    let _deadline_scope = deadline.enter_scope(options.max_new_tokens);
     let runtime = Qwen35TextRuntime::<B>::load(artifacts, device)?;
     let tokenizer = tokenizers::Tokenizer::from_file(&artifacts.tokenizer_path).map_err(|error| {
         eyre::eyre!(
@@ -2927,9 +3016,8 @@ fn generate_with_burn_text_runtime_on_device<B: Backend>(
         .map(|token_id| usize::try_from(token_id).unwrap_or(usize::MAX))
         .collect::<Vec<_>>();
     let mut generated_token_ids = Vec::new();
-    let deadline = GenerationDeadline::new(options.generation_timeout);
-
     for token_index in 0..options.max_new_tokens {
+        deadline.update_progress(generated_token_ids.len(), options.max_new_tokens);
         deadline.check(generated_token_ids.len(), options.max_new_tokens)?;
         trace_burn_text_runtime(&format!(
             "generating token {} with prompt length {}",
@@ -2950,6 +3038,7 @@ fn generate_with_burn_text_runtime_on_device<B: Backend>(
         let next_token_id = runtime.greedy_next_token(hidden_states)?;
         trace_burn_text_runtime(&format!("selected token id {next_token_id}"));
         generated_token_ids.push(next_token_id);
+        deadline.update_progress(generated_token_ids.len(), options.max_new_tokens);
         all_token_ids.push(next_token_id);
         deadline.check(generated_token_ids.len(), options.max_new_tokens)?;
         if eos_token_id.is_some_and(|eos_token_id| eos_token_id == next_token_id) {
@@ -2983,6 +3072,8 @@ fn generate_with_incremental_burn_text_runtime_on_device<B: Backend>(
     trace_burn_text_runtime(&format!(
         "using {backend_label} backend for Burn text incremental runtime"
     ));
+    let deadline = GenerationDeadline::new(options.generation_timeout);
+    let _deadline_scope = deadline.enter_scope(options.max_new_tokens);
     ensure!(
         !prompt_token_ids.is_empty(),
         "Burn text incremental runtime expected at least one prompt token"
@@ -3001,10 +3092,10 @@ fn generate_with_incremental_burn_text_runtime_on_device<B: Backend>(
         .and_then(|token| tokenizer.token_to_id(token))
         .and_then(|token_id| usize::try_from(token_id).ok());
 
-    let deadline = GenerationDeadline::new(options.generation_timeout);
     let mut decode_state = runtime.new_decode_state()?;
     let mut last_hidden = Vec::new();
     for (prompt_index, token_id) in prompt_token_ids.iter().enumerate() {
+        deadline.update_progress(0, options.max_new_tokens);
         deadline.check(0, options.max_new_tokens)?;
         trace_burn_text_runtime(&format!(
             "incremental processing prompt token {} of {}",
@@ -3016,6 +3107,7 @@ fn generate_with_incremental_burn_text_runtime_on_device<B: Backend>(
 
     let mut generated_token_ids = Vec::new();
     for token_index in 0..options.max_new_tokens {
+        deadline.update_progress(generated_token_ids.len(), options.max_new_tokens);
         deadline.check(generated_token_ids.len(), options.max_new_tokens)?;
         trace_burn_text_runtime(&format!(
             "incremental generating token {} after {} processed tokens",
@@ -3027,6 +3119,7 @@ fn generate_with_incremental_burn_text_runtime_on_device<B: Backend>(
             "incremental selected token id {next_token_id}"
         ));
         generated_token_ids.push(next_token_id);
+        deadline.update_progress(generated_token_ids.len(), options.max_new_tokens);
         deadline.check(generated_token_ids.len(), options.max_new_tokens)?;
         if eos_token_id.is_some_and(|eos_token_id| eos_token_id == next_token_id) {
             break;
@@ -3064,6 +3157,8 @@ fn generate_with_hybrid_burn_text_runtime_on_device<B: Backend>(
     trace_burn_text_runtime(&format!(
         "using {backend_label} backend for Burn text hybrid runtime"
     ));
+    let deadline = GenerationDeadline::new(options.generation_timeout);
+    let _deadline_scope = deadline.enter_scope(options.max_new_tokens);
     if options.max_new_tokens == 0 {
         return Ok(BurnTextGenerationReport {
             generated_token_ids: Vec::new(),
@@ -3093,8 +3188,7 @@ fn generate_with_hybrid_burn_text_runtime_on_device<B: Backend>(
         .as_deref()
         .and_then(|token| tokenizer.token_to_id(token))
         .and_then(|token_id| usize::try_from(token_id).ok());
-    let deadline = GenerationDeadline::new(options.generation_timeout);
-
+    deadline.update_progress(0, options.max_new_tokens);
     deadline.check(0, options.max_new_tokens)?;
     trace_burn_text_runtime(&format!(
         "hybrid generating token 1 with prompt length {}",
@@ -3106,6 +3200,7 @@ fn generate_with_hybrid_burn_text_runtime_on_device<B: Backend>(
     let first_token_id = runtime.greedy_next_token(hidden_states)?;
     trace_burn_text_runtime(&format!("hybrid selected token id {first_token_id}"));
     let mut generated_token_ids = vec![first_token_id];
+    deadline.update_progress(generated_token_ids.len(), options.max_new_tokens);
     deadline.check(generated_token_ids.len(), options.max_new_tokens)?;
     if eos_token_id.is_some_and(|eos_token_id| eos_token_id == first_token_id)
         || options.max_new_tokens == 1
@@ -3127,6 +3222,7 @@ fn generate_with_hybrid_burn_text_runtime_on_device<B: Backend>(
     )?;
 
     for token_index in 1..options.max_new_tokens {
+        deadline.update_progress(generated_token_ids.len(), options.max_new_tokens);
         deadline.check(generated_token_ids.len(), options.max_new_tokens)?;
         trace_burn_text_runtime(&format!(
             "hybrid generating token {} after {} processed tokens",
@@ -3138,6 +3234,7 @@ fn generate_with_hybrid_burn_text_runtime_on_device<B: Backend>(
             "hybrid selected token id {next_token_id}"
         ));
         generated_token_ids.push(next_token_id);
+        deadline.update_progress(generated_token_ids.len(), options.max_new_tokens);
         deadline.check(generated_token_ids.len(), options.max_new_tokens)?;
         if eos_token_id.is_some_and(|eos_token_id| eos_token_id == next_token_id) {
             break;
@@ -3174,7 +3271,7 @@ fn decode_token_ids_with_tokenizer(
 
 fn trace_burn_text_runtime(message: &str) {
     if std::env::var_os("TEAMY_STUDIO_LLM_TRACE").is_some() {
-        eprintln!("[teamy-llm-trace] {message}");
+        tracing::info!(target: "teamy_llm_trace", message = %message, "teamy_llm_trace");
     }
 }
 

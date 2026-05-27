@@ -31,6 +31,10 @@ pub struct LlmPromptArgs {
 
     /// Optional wall-clock timeout for token generation, for example `5m` or `90s`.
     #[facet(args::named)]
+    pub timeout: Option<String>,
+
+    /// Deprecated compatibility alias for `--timeout`.
+    #[facet(args::named)]
     pub generation_timeout: Option<String>,
 
     /// Print a Python Transformers reference report before running the Rust prompt.
@@ -89,11 +93,10 @@ impl LlmPromptArgs {
             .python_model_path
             .as_deref()
             .unwrap_or(artifacts.metadata.source_repo_id.as_str());
-        let generation_timeout = self
-            .generation_timeout
-            .as_deref()
-            .map(parse_generation_timeout)
-            .transpose()?;
+        let generation_timeout = resolve_timeout_arg(
+            self.timeout.as_deref(),
+            self.generation_timeout.as_deref(),
+        )?;
         let python_tokenizer_path = self
             .python_tokenizer_path
             .as_deref()
@@ -307,11 +310,26 @@ impl LlmPromptArgs {
 fn parse_generation_timeout(value: &str) -> eyre::Result<Duration> {
     humantime::parse_duration(value).map_err(|error| {
         eyre::eyre!(
-            "Failed to parse generation timeout {:?}: {}",
+            "Failed to parse timeout {:?}: {}",
             value,
             error
         )
     })
+}
+
+fn resolve_timeout_arg(
+    timeout: Option<&str>,
+    generation_timeout: Option<&str>,
+) -> eyre::Result<Option<Duration>> {
+    match (timeout, generation_timeout) {
+        (Some(_), Some(_)) => eyre::bail!(
+            "Specify only one of `--timeout` or `--generation-timeout`; `--timeout` is the preferred flag."
+        ),
+        (Some(timeout), None) | (None, Some(timeout)) => {
+            parse_generation_timeout(timeout).map(Some)
+        }
+        (None, None) => Ok(None),
+    }
 }
 
 fn hidden_diff_summary(left: &[f32], right: &[f32]) -> eyre::Result<(f32, f32)> {

@@ -6,7 +6,10 @@ use std::path::{Path, PathBuf};
 use teamy_studio_paths::{AppHome, CacheHome};
 
 use crate::burn_backend::{inspect_burn_runtime_support, render_burn_runtime_support_report};
-use crate::burn_text::{DEFAULT_BURN_TEXT_EXPORT_DTYPE, export_burn_text_weights, inspect_burn_text_runtime_status};
+use crate::burn_text::{
+    DEFAULT_BURN_TEXT_EXPORT_DTYPE, burn_text_manifest_path, export_burn_text_weights,
+    inspect_burn_text_runtime_status, load_burn_text_manifest,
+};
 use crate::source_config::load_llm_source_config_summary;
 
 pub const MODEL_DIRS_FILE_NAME: &str = "llm-model-dirs.txt";
@@ -601,6 +604,19 @@ pub fn prepare_burn_text_runtime_bundle(
     overwrite: bool,
     dtype: Option<&str>,
 ) -> eyre::Result<String> {
+    let manifest_path = burn_text_manifest_path(&artifacts.root);
+    if manifest_path.is_file() && !overwrite {
+        load_burn_text_manifest(&manifest_path).wrap_err_with(|| {
+            format!(
+                "Existing Burn text manifest at {} was not readable; rerun with --overwrite to replace it",
+                manifest_path.display()
+            )
+        })?;
+        return Ok(format!(
+            "Burn text runtime bundle already exists at {}; skipping export because --overwrite was not set",
+            manifest_path.display()
+        ));
+    }
     let report = export_burn_text_weights(
         artifacts,
         overwrite,
