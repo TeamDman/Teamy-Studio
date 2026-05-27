@@ -5,10 +5,10 @@ use figue as args;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::thread;
-use std::time::Instant;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const LLM_TIMEOUT_CHILD_ENV: &str = "TEAMY_STUDIO_LLM_TIMEOUT_CHILD";
+const LLM_TIMEOUT_DEADLINE_MS_ENV: &str = "TEAMY_STUDIO_LLM_TIMEOUT_DEADLINE_MS";
 const LLM_TIMEOUT_KILL_GRACE: Duration = Duration::from_secs(10);
 
 /// Run a single Teamy-managed prompt through the Rust Burn lane.
@@ -115,9 +115,8 @@ impl LlmPromptArgs {
             .as_deref()
             .map(PathBuf::from)
             .unwrap_or_else(|| artifacts.root.clone());
-        let effective_generation_timeout = generation_timeout.and_then(|timeout| {
-            timeout.checked_sub(command_started_at.elapsed())
-        });
+        let effective_generation_timeout =
+            resolve_effective_generation_timeout(generation_timeout, command_started_at)?;
 
         if self.compare_python {
             let reference = crate::llm::reference::read_llm_reference_prompt_report(
@@ -360,11 +359,46 @@ fn maybe_warn_about_dev_profile() {
     );
 }
 
+fn resolve_effective_generation_timeout(
+    generation_timeout: Option<Duration>,
+    command_started_at: Instant,
+) -> eyre::Result<Option<Duration>> {
+    let Some(timeout) = generation_timeout else {
+        return Ok(None);
+    };
+    if let Some(deadline_ms) = std::env::var_os(LLM_TIMEOUT_DEADLINE_MS_ENV) {
+        let deadline_ms = deadline_ms
+            .to_string_lossy()
+            .parse::<u128>()
+            .map_err(|error| {
+                eyre::eyre!(
+                    "Failed to parse {}={:?}: {}",
+                    LLM_TIMEOUT_DEADLINE_MS_ENV,
+                    deadline_ms,
+                    error
+                )
+            })?;
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|error| eyre::eyre!("System clock is before the Unix epoch: {}", error))?
+            .as_millis();
+        let remaining_ms = deadline_ms.saturating_sub(now_ms);
+        let remaining_ms = remaining_ms.min(u128::from(u64::MAX));
+        return Ok(Some(Duration::from_millis(remaining_ms as u64)));
+    }
+    Ok(timeout.checked_sub(command_started_at.elapsed()))
+}
+
 fn is_timeout_supervision_child() -> bool {
     std::env::var_os(LLM_TIMEOUT_CHILD_ENV).is_some()
 }
 
 fn supervise_llm_prompt_timeout(timeout: Duration) -> eyre::Result<CliOutput> {
+    let timeout_deadline_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| eyre::eyre!("System clock is before the Unix epoch: {}", error))?
+        .as_millis()
+        .saturating_add(timeout.as_millis());
     let exe = std::env::current_exe()
         .map_err(|error| eyre::eyre!("Failed to resolve current executable for LLM timeout supervision: {}", error))?;
     let current_dir = std::env::current_dir()
@@ -374,6 +408,7 @@ fn supervise_llm_prompt_timeout(timeout: Duration) -> eyre::Result<CliOutput> {
         .args(&args)
         .current_dir(current_dir)
         .env(LLM_TIMEOUT_CHILD_ENV, "1")
+        .env(LLM_TIMEOUT_DEADLINE_MS_ENV, timeout_deadline_ms.to_string())
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
@@ -402,7 +437,7 @@ fn supervise_llm_prompt_timeout(timeout: Duration) -> eyre::Result<CliOutput> {
                 humantime::format_duration(LLM_TIMEOUT_KILL_GRACE),
             ));
         }
-        thread::sleep(Duration::from_millis(200));
+        thread::sleep(Duration::from_millis(50));
     }
 }
 
