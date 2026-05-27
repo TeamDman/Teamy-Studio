@@ -5,6 +5,8 @@ use burn::{
 use eyre::{WrapErr, bail, ensure};
 use facet::Facet;
 use half::{bf16, f16, slice::{HalfBitsSliceExt, HalfFloatSliceExt}};
+use memmap2::Mmap;
+use safetensors::{Dtype as SafeTensorsDtype, SafeTensors};
 use std::{
     cell::RefCell,
     collections::{BTreeMap, HashMap, VecDeque},
@@ -19,13 +21,14 @@ use std::{
 
 use crate::{
     model::{LlmModelArtifacts, load_tokenizer_config_summary},
-    reference::{LlmReferenceBurnTextExportReport, export_llm_reference_burn_text_model},
+    reference::LlmReferenceBurnTextExportReport,
 };
 
 pub const BURN_TEXT_DIR_NAME: &str = "burn-text";
 pub const BURN_TEXT_MANIFEST_FILE_NAME: &str = "burn-text-manifest.json";
 pub const DEFAULT_BURN_TEXT_EXPORT_DTYPE: &str = "float16";
 const DEFAULT_LOGIT_CHUNK_ROWS: usize = 512;
+const SOURCE_SAFETENSORS_INDEX_FILE_NAME: &str = "model.safetensors.index.json";
 
 pub type LlmCpuBackend = NdArray<f32>;
 pub type LlmCudaBackend = Cuda<f16, i32>;
@@ -72,6 +75,60 @@ pub struct BurnTextManifest {
     pub linear_conv_kernel_dim: usize,
     pub layer_types: Vec<String>,
     pub tensors: BTreeMap<String, BurnTextTensorSpec>,
+}
+
+#[derive(Clone, Debug, PartialEq, Facet)]
+struct SourceSafetensorsIndexFile {
+    #[facet(default)]
+    weight_map: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Facet)]
+struct BurnExportConfigFile {
+    #[facet(default)]
+    model_type: Option<String>,
+    #[facet(default)]
+    text_config: Option<BurnExportTextConfigFile>,
+}
+
+#[derive(Clone, Debug, PartialEq, Facet)]
+struct BurnExportTextConfigFile {
+    #[facet(default)]
+    model_type: Option<String>,
+    #[facet(default)]
+    vocab_size: Option<usize>,
+    #[facet(default)]
+    hidden_size: Option<usize>,
+    #[facet(default)]
+    intermediate_size: Option<usize>,
+    #[facet(default)]
+    num_hidden_layers: Option<usize>,
+    #[facet(default)]
+    num_attention_heads: Option<usize>,
+    #[facet(default)]
+    num_key_value_heads: Option<usize>,
+    #[facet(default)]
+    head_dim: Option<usize>,
+    #[facet(default)]
+    rms_norm_eps: Option<f64>,
+    #[facet(default)]
+    hidden_act: Option<String>,
+    #[facet(default)]
+    partial_rotary_factor: Option<f64>,
+    #[facet(default)]
+    rope_theta: Option<f64>,
+    #[facet(default)]
+    linear_num_key_heads: Option<usize>,
+    #[facet(default)]
+    linear_num_value_heads: Option<usize>,
+    #[facet(default)]
+    linear_key_head_dim: Option<usize>,
+    #[facet(default)]
+    linear_value_head_dim: Option<usize>,
+    #[facet(default)]
+    linear_conv_kernel_dim: Option<usize>,
+    #[facet(default)]
+    layer_types: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Facet)]
@@ -2460,21 +2517,599 @@ pub fn export_burn_text_weights(
     dtype: &str,
 ) -> eyre::Result<LlmReferenceBurnTextExportReport> {
     let output_dir = burn_text_dir(&artifacts.root);
-    let report = export_llm_reference_burn_text_model(
-        &artifacts.metadata.source_repo_id,
-        &output_dir,
-        dtype,
-        overwrite,
-    )?;
+    if output_dir.exists() {
+        if overwrite {
+            std::fs::remove_dir_all(&output_dir).wrap_err_with(|| {
+                format!(
+                    "Failed to remove existing Burn text directory {}",
+                    output_dir.display()
+                )
+            })?;
+        } else {
+            bail!(
+                "Burn text manifest already exists at {}; rerun with --overwrite to replace it",
+                burn_text_manifest_path(&artifacts.root).display()
+            );
+        }
+    }
+    std::fs::create_dir_all(&output_dir).wrap_err_with(|| {
+        format!(
+            "Failed to create Burn text output directory {}",
+            output_dir.display()
+        )
+    })?;
+    let report = export_burn_text_weights_from_source_snapshot(artifacts, &output_dir, dtype)?;
     let manifest = load_burn_text_manifest(&burn_text_manifest_path(&artifacts.root))?;
     ensure!(
         report.tensor_count == manifest.tensors.len(),
-        "Python Burn text export reported {} tensors but manifest {} contained {}",
+        "Rust Burn text export reported {} tensors but manifest {} contained {}",
         report.tensor_count,
         burn_text_manifest_path(&artifacts.root).display(),
         manifest.tensors.len()
     );
     Ok(report)
+}
+
+fn export_burn_text_weights_from_source_snapshot(
+    artifacts: &LlmModelArtifacts,
+    output_dir: &Path,
+    dtype: &str,
+) -> eyre::Result<LlmReferenceBurnTextExportReport> {
+    let config = load_burn_export_config(&artifacts.hf_config_path)?;
+    let text_config = config.text_config.ok_or_else(|| {
+        eyre::eyre!(
+            "Hugging Face config {} did not define text_config for Burn export",
+            artifacts.hf_config_path.display()
+        )
+    })?;
+    let source_model_id = artifacts.metadata.source_repo_id.as_str();
+    if let Some(local_snapshot_dir) = resolve_local_hugging_face_snapshot_dir(source_model_id)? {
+        let index = load_source_safetensors_index(
+            &local_snapshot_dir.join(SOURCE_SAFETENSORS_INDEX_FILE_NAME),
+        )?;
+        let layer_types = text_config.layer_types.clone();
+        let source_prefix = resolve_source_tensor_prefix(&index.weight_map)?;
+        let required_tensors = build_required_source_tensor_map(&source_prefix, &layer_types)?;
+        let target_dtype = parse_burn_export_dtype(dtype)?;
+        let manifest = build_burn_export_manifest(source_model_id, &text_config)?;
+        return write_burn_export_bundle(
+            output_dir,
+            manifest,
+            target_dtype,
+            &local_snapshot_dir,
+            &index.weight_map,
+            &required_tensors,
+        );
+    }
+    let source_snapshot_dir = artifacts.root.join(".burn-text-source-staging");
+    if source_snapshot_dir.exists() {
+        std::fs::remove_dir_all(&source_snapshot_dir).wrap_err_with(|| {
+            format!(
+                "Failed to clear Burn source staging directory {}",
+                source_snapshot_dir.display()
+            )
+        })?;
+    }
+    std::fs::create_dir_all(&source_snapshot_dir).wrap_err_with(|| {
+        format!(
+            "Failed to create Burn source staging directory {}",
+            source_snapshot_dir.display()
+        )
+    })?;
+
+    let result = (|| {
+        let index_path = source_snapshot_dir.join(SOURCE_SAFETENSORS_INDEX_FILE_NAME);
+        download_hugging_face_repo_file(source_model_id, SOURCE_SAFETENSORS_INDEX_FILE_NAME, &index_path)?;
+        let index = load_source_safetensors_index(&index_path)?;
+        let layer_types = text_config.layer_types.clone();
+        let source_prefix = resolve_source_tensor_prefix(&index.weight_map)?;
+        let required_tensors = build_required_source_tensor_map(&source_prefix, &layer_types)?;
+        let shard_names = required_tensors
+            .values()
+            .map(|source_name| {
+                index.weight_map.get(source_name).cloned().ok_or_else(|| {
+                    eyre::eyre!(
+                        "Safetensors index {} was missing shard mapping for required tensor {}",
+                        index_path.display(),
+                        source_name
+                    )
+                })
+            })
+            .collect::<eyre::Result<std::collections::BTreeSet<_>>>()?;
+        for shard_name in &shard_names {
+            download_hugging_face_repo_file(
+                source_model_id,
+                shard_name,
+                &source_snapshot_dir.join(shard_name),
+            )?;
+        }
+
+        let target_dtype = parse_burn_export_dtype(dtype)?;
+        let manifest = build_burn_export_manifest(source_model_id, &text_config)?;
+        write_burn_export_bundle(
+            output_dir,
+            manifest,
+            target_dtype,
+            &source_snapshot_dir,
+            &index.weight_map,
+            &required_tensors,
+        )
+    })();
+
+    let _ = std::fs::remove_dir_all(&source_snapshot_dir);
+    result
+}
+
+fn resolve_local_hugging_face_snapshot_dir(repo_id: &str) -> eyre::Result<Option<PathBuf>> {
+    let mut roots = Vec::new();
+    if let Some(hf_home) = std::env::var_os("HF_HOME") {
+        roots.push(PathBuf::from(hf_home).join("hub"));
+    }
+    if let Some(hf_hub_cache) = std::env::var_os("HF_HUB_CACHE") {
+        roots.push(PathBuf::from(hf_hub_cache));
+    }
+    if let Some(huggingface_hub_cache) = std::env::var_os("HUGGINGFACE_HUB_CACHE") {
+        roots.push(PathBuf::from(huggingface_hub_cache));
+    }
+    if let Some(user_profile) = std::env::var_os("USERPROFILE") {
+        roots.push(
+            PathBuf::from(user_profile)
+                .join(".cache")
+                .join("huggingface")
+                .join("hub"),
+        );
+    }
+    let repo_cache_dir_name = format!("models--{}", repo_id.replace('/', "--"));
+    for root in roots {
+        let repo_dir = root.join(&repo_cache_dir_name);
+        let refs_main = repo_dir.join("refs").join("main");
+        let snapshots_dir = repo_dir.join("snapshots");
+        if refs_main.is_file() {
+            let revision = std::fs::read_to_string(&refs_main).wrap_err_with(|| {
+                format!("Failed to read Hugging Face ref {}", refs_main.display())
+            })?;
+            let snapshot_dir = snapshots_dir.join(revision.trim());
+            if snapshot_dir.is_dir() {
+                return Ok(Some(snapshot_dir));
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn load_burn_export_config(path: &Path) -> eyre::Result<BurnExportConfigFile> {
+    let bytes = std::fs::read(path)
+        .wrap_err_with(|| format!("Failed to read Hugging Face config {}", path.display()))?;
+    facet_json::from_slice(&bytes)
+        .wrap_err_with(|| format!("Failed to parse Hugging Face config {}", path.display()))
+}
+
+fn load_source_safetensors_index(path: &Path) -> eyre::Result<SourceSafetensorsIndexFile> {
+    let bytes = std::fs::read(path)
+        .wrap_err_with(|| format!("Failed to read safetensors index {}", path.display()))?;
+    facet_json::from_slice(&bytes)
+        .wrap_err_with(|| format!("Failed to parse safetensors index {}", path.display()))
+}
+
+fn resolve_source_tensor_prefix(weight_map: &BTreeMap<String, String>) -> eyre::Result<String> {
+    if weight_map.contains_key("model.embed_tokens.weight") {
+        return Ok("model".to_owned());
+    }
+    if weight_map.contains_key("model.language_model.embed_tokens.weight") {
+        return Ok("model.language_model".to_owned());
+    }
+    bail!(
+        "Safetensors weight map did not include either model.embed_tokens.weight or model.language_model.embed_tokens.weight"
+    )
+}
+
+fn build_required_source_tensor_map(
+    source_prefix: &str,
+    layer_types: &[String],
+) -> eyre::Result<BTreeMap<String, String>> {
+    let mut required_tensors = BTreeMap::from([
+        (
+            "model.embed_tokens.weight".to_owned(),
+            format!("{source_prefix}.embed_tokens.weight"),
+        ),
+        (
+            "model.norm.weight".to_owned(),
+            format!("{source_prefix}.norm.weight"),
+        ),
+        ("lm_head.weight".to_owned(), "lm_head.weight".to_owned()),
+    ]);
+    for (layer_index, layer_type) in layer_types.iter().enumerate() {
+        let canonical_prefix = format!("model.layers.{layer_index}");
+        let source_layer_prefix = format!("{source_prefix}.layers.{layer_index}");
+        required_tensors.extend([
+            (
+                format!("{canonical_prefix}.input_layernorm.weight"),
+                format!("{source_layer_prefix}.input_layernorm.weight"),
+            ),
+            (
+                format!("{canonical_prefix}.post_attention_layernorm.weight"),
+                format!("{source_layer_prefix}.post_attention_layernorm.weight"),
+            ),
+            (
+                format!("{canonical_prefix}.mlp.gate_proj.weight"),
+                format!("{source_layer_prefix}.mlp.gate_proj.weight"),
+            ),
+            (
+                format!("{canonical_prefix}.mlp.up_proj.weight"),
+                format!("{source_layer_prefix}.mlp.up_proj.weight"),
+            ),
+            (
+                format!("{canonical_prefix}.mlp.down_proj.weight"),
+                format!("{source_layer_prefix}.mlp.down_proj.weight"),
+            ),
+        ]);
+        match layer_type.as_str() {
+            "full_attention" => {
+                required_tensors.extend([
+                    (
+                        format!("{canonical_prefix}.self_attn.q_proj.weight"),
+                        format!("{source_layer_prefix}.self_attn.q_proj.weight"),
+                    ),
+                    (
+                        format!("{canonical_prefix}.self_attn.k_proj.weight"),
+                        format!("{source_layer_prefix}.self_attn.k_proj.weight"),
+                    ),
+                    (
+                        format!("{canonical_prefix}.self_attn.v_proj.weight"),
+                        format!("{source_layer_prefix}.self_attn.v_proj.weight"),
+                    ),
+                    (
+                        format!("{canonical_prefix}.self_attn.o_proj.weight"),
+                        format!("{source_layer_prefix}.self_attn.o_proj.weight"),
+                    ),
+                    (
+                        format!("{canonical_prefix}.self_attn.q_norm.weight"),
+                        format!("{source_layer_prefix}.self_attn.q_norm.weight"),
+                    ),
+                    (
+                        format!("{canonical_prefix}.self_attn.k_norm.weight"),
+                        format!("{source_layer_prefix}.self_attn.k_norm.weight"),
+                    ),
+                ]);
+            }
+            "linear_attention" => {
+                required_tensors.extend([
+                    (
+                        format!("{canonical_prefix}.linear_attn.conv1d.weight"),
+                        format!("{source_layer_prefix}.linear_attn.conv1d.weight"),
+                    ),
+                    (
+                        format!("{canonical_prefix}.linear_attn.dt_bias"),
+                        format!("{source_layer_prefix}.linear_attn.dt_bias"),
+                    ),
+                    (
+                        format!("{canonical_prefix}.linear_attn.A_log"),
+                        format!("{source_layer_prefix}.linear_attn.A_log"),
+                    ),
+                    (
+                        format!("{canonical_prefix}.linear_attn.norm.weight"),
+                        format!("{source_layer_prefix}.linear_attn.norm.weight"),
+                    ),
+                    (
+                        format!("{canonical_prefix}.linear_attn.out_proj.weight"),
+                        format!("{source_layer_prefix}.linear_attn.out_proj.weight"),
+                    ),
+                    (
+                        format!("{canonical_prefix}.linear_attn.in_proj_qkv.weight"),
+                        format!("{source_layer_prefix}.linear_attn.in_proj_qkv.weight"),
+                    ),
+                    (
+                        format!("{canonical_prefix}.linear_attn.in_proj_z.weight"),
+                        format!("{source_layer_prefix}.linear_attn.in_proj_z.weight"),
+                    ),
+                    (
+                        format!("{canonical_prefix}.linear_attn.in_proj_b.weight"),
+                        format!("{source_layer_prefix}.linear_attn.in_proj_b.weight"),
+                    ),
+                    (
+                        format!("{canonical_prefix}.linear_attn.in_proj_a.weight"),
+                        format!("{source_layer_prefix}.linear_attn.in_proj_a.weight"),
+                    ),
+                ]);
+            }
+            other => bail!("unsupported Qwen3.5 layer type {other:?}"),
+        }
+    }
+    Ok(required_tensors)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BurnExportTargetDtype {
+    Float16,
+    Bfloat16,
+    Float32,
+}
+
+fn parse_burn_export_dtype(value: &str) -> eyre::Result<BurnExportTargetDtype> {
+    match value {
+        "float16" => Ok(BurnExportTargetDtype::Float16),
+        "bfloat16" => Ok(BurnExportTargetDtype::Bfloat16),
+        "float32" => Ok(BurnExportTargetDtype::Float32),
+        other => bail!("Unsupported Burn export dtype `{other}`"),
+    }
+}
+
+fn build_burn_export_manifest(
+    source_model_id: &str,
+    config: &BurnExportTextConfigFile,
+) -> eyre::Result<BurnTextManifest> {
+    Ok(BurnTextManifest {
+        format_version: 1,
+        architecture: require_export_string(config.model_type.as_ref(), "text_config.model_type")?,
+        source_model_id: source_model_id.to_owned(),
+        text_model_type: require_export_string(config.model_type.as_ref(), "text_config.model_type")?,
+        vocab_size: require_export_usize(config.vocab_size, "text_config.vocab_size")?,
+        hidden_size: require_export_usize(config.hidden_size, "text_config.hidden_size")?,
+        intermediate_size: require_export_usize(
+            config.intermediate_size,
+            "text_config.intermediate_size",
+        )?,
+        num_hidden_layers: require_export_usize(
+            config.num_hidden_layers,
+            "text_config.num_hidden_layers",
+        )?,
+        num_attention_heads: require_export_usize(
+            config.num_attention_heads,
+            "text_config.num_attention_heads",
+        )?,
+        num_key_value_heads: require_export_usize(
+            config.num_key_value_heads,
+            "text_config.num_key_value_heads",
+        )?,
+        head_dim: require_export_usize(config.head_dim, "text_config.head_dim")?,
+        rms_norm_eps: require_export_f64(config.rms_norm_eps, "text_config.rms_norm_eps")?,
+        hidden_act: require_export_string(config.hidden_act.as_ref(), "text_config.hidden_act")?,
+        partial_rotary_factor: require_export_f64(
+            config.partial_rotary_factor,
+            "text_config.partial_rotary_factor",
+        )?,
+        rope_theta: require_export_f64(config.rope_theta, "text_config.rope_theta")?,
+        linear_num_key_heads: require_export_usize(
+            config.linear_num_key_heads,
+            "text_config.linear_num_key_heads",
+        )?,
+        linear_num_value_heads: require_export_usize(
+            config.linear_num_value_heads,
+            "text_config.linear_num_value_heads",
+        )?,
+        linear_key_head_dim: require_export_usize(
+            config.linear_key_head_dim,
+            "text_config.linear_key_head_dim",
+        )?,
+        linear_value_head_dim: require_export_usize(
+            config.linear_value_head_dim,
+            "text_config.linear_value_head_dim",
+        )?,
+        linear_conv_kernel_dim: require_export_usize(
+            config.linear_conv_kernel_dim,
+            "text_config.linear_conv_kernel_dim",
+        )?,
+        layer_types: config.layer_types.clone(),
+        tensors: BTreeMap::new(),
+    })
+}
+
+fn require_export_usize(value: Option<usize>, field_name: &str) -> eyre::Result<usize> {
+    value.ok_or_else(|| eyre::eyre!("Burn export requires config field {}", field_name))
+}
+
+fn require_export_f64(value: Option<f64>, field_name: &str) -> eyre::Result<f64> {
+    value.ok_or_else(|| eyre::eyre!("Burn export requires config field {}", field_name))
+}
+
+fn require_export_string(value: Option<&String>, field_name: &str) -> eyre::Result<String> {
+    value
+        .cloned()
+        .ok_or_else(|| eyre::eyre!("Burn export requires config field {}", field_name))
+}
+
+fn write_burn_export_bundle(
+    output_dir: &Path,
+    mut manifest: BurnTextManifest,
+    target_dtype: BurnExportTargetDtype,
+    source_snapshot_dir: &Path,
+    weight_map: &BTreeMap<String, String>,
+    required_tensors: &BTreeMap<String, String>,
+) -> eyre::Result<LlmReferenceBurnTextExportReport> {
+    let packed_tensor_path = output_dir.join("tensors.bin");
+    let mut packed_tensor_file = std::fs::File::create(&packed_tensor_path).wrap_err_with(|| {
+        format!(
+            "Failed to create packed Burn text tensor file {}",
+            packed_tensor_path.display()
+        )
+    })?;
+    let mut shard_cache = HashMap::<String, Mmap>::new();
+
+    for (canonical_name, source_name) in required_tensors {
+        let shard_name = weight_map.get(source_name).ok_or_else(|| {
+            eyre::eyre!("Missing shard mapping for required tensor {}", source_name)
+        })?;
+        let mmap = if let Some(existing) = shard_cache.get(shard_name) {
+            existing
+        } else {
+            let file = std::fs::File::open(source_snapshot_dir.join(shard_name)).wrap_err_with(|| {
+                format!(
+                    "Failed to open source safetensors shard {}",
+                    source_snapshot_dir.join(shard_name).display()
+                )
+            })?;
+            let mmap = unsafe { Mmap::map(&file) }.wrap_err_with(|| {
+                format!(
+                    "Failed to memory-map source safetensors shard {}",
+                    source_snapshot_dir.join(shard_name).display()
+                )
+            })?;
+            shard_cache.entry(shard_name.clone()).or_insert(mmap)
+        };
+        let tensors = SafeTensors::deserialize(&mmap[..]).map_err(|error| {
+            eyre::eyre!(
+                "Failed to parse safetensors shard {}: {}",
+                source_snapshot_dir.join(shard_name).display(),
+                error
+            )
+        })?;
+        let tensor = tensors.tensor(source_name).map_err(|error| {
+            eyre::eyre!(
+                "Failed to read tensor {} from shard {}: {}",
+                source_name,
+                source_snapshot_dir.join(shard_name).display(),
+                error
+            )
+        })?;
+        let tensor_bytes = convert_safetensors_bytes(tensor.dtype(), tensor.data(), target_dtype)?;
+        let offset_bytes = packed_tensor_file.stream_position().wrap_err_with(|| {
+            format!(
+                "Failed to query write position for {}",
+                packed_tensor_path.display()
+            )
+        })?;
+        std::io::Write::write_all(&mut packed_tensor_file, &tensor_bytes).wrap_err_with(|| {
+            format!(
+                "Failed to write tensor {} into {}",
+                canonical_name,
+                packed_tensor_path.display()
+            )
+        })?;
+        manifest.tensors.insert(
+            canonical_name.clone(),
+            BurnTextTensorSpec {
+                path: "tensors.bin".to_owned(),
+                shape: tensor.shape().to_vec(),
+                dtype: render_burn_export_dtype(target_dtype).to_owned(),
+                offset_bytes: Some(offset_bytes),
+                byte_len: Some(tensor_bytes.len()),
+            },
+        );
+    }
+
+    let manifest_path = output_dir.join(BURN_TEXT_MANIFEST_FILE_NAME);
+    std::fs::write(
+        &manifest_path,
+        facet_json::to_string_pretty(&manifest).map_err(|error| {
+            eyre::eyre!(
+                "Failed to serialize Burn text manifest {}: {}",
+                manifest_path.display(),
+                error
+            )
+        })?,
+    )
+    .wrap_err_with(|| format!("Failed to write Burn text manifest {}", manifest_path.display()))?;
+
+    Ok(LlmReferenceBurnTextExportReport {
+        ok: true,
+        model_id: manifest.source_model_id,
+        output_dir: output_dir.display().to_string(),
+        dtype: render_burn_export_dtype(target_dtype).to_owned(),
+        tensor_count: manifest.tensors.len(),
+    })
+}
+
+fn render_burn_export_dtype(dtype: BurnExportTargetDtype) -> &'static str {
+    match dtype {
+        BurnExportTargetDtype::Float16 => "float16",
+        BurnExportTargetDtype::Bfloat16 => "bfloat16",
+        BurnExportTargetDtype::Float32 => "float32",
+    }
+}
+
+fn convert_safetensors_bytes(
+    source_dtype: SafeTensorsDtype,
+    source_bytes: &[u8],
+    target_dtype: BurnExportTargetDtype,
+) -> eyre::Result<Vec<u8>> {
+    match (source_dtype, target_dtype) {
+        (SafeTensorsDtype::F16, BurnExportTargetDtype::Float16)
+        | (SafeTensorsDtype::BF16, BurnExportTargetDtype::Bfloat16)
+        | (SafeTensorsDtype::F32, BurnExportTargetDtype::Float32) => Ok(source_bytes.to_vec()),
+        (SafeTensorsDtype::F16, BurnExportTargetDtype::Bfloat16) => Ok(source_bytes
+            .chunks_exact(2)
+            .flat_map(|chunk| {
+                let value = f16::from_bits(u16::from_le_bytes([chunk[0], chunk[1]]));
+                bf16::from_f32(value.to_f32()).to_bits().to_le_bytes()
+            })
+            .collect()),
+        (SafeTensorsDtype::F16, BurnExportTargetDtype::Float32) => Ok(source_bytes
+            .chunks_exact(2)
+            .flat_map(|chunk| {
+                let value = f16::from_bits(u16::from_le_bytes([chunk[0], chunk[1]]));
+                value.to_f32().to_le_bytes()
+            })
+            .collect()),
+        (SafeTensorsDtype::BF16, BurnExportTargetDtype::Float16) => Ok(source_bytes
+            .chunks_exact(2)
+            .flat_map(|chunk| {
+                let value = bf16::from_bits(u16::from_le_bytes([chunk[0], chunk[1]]));
+                f16::from_f32(value.to_f32()).to_bits().to_le_bytes()
+            })
+            .collect()),
+        (SafeTensorsDtype::BF16, BurnExportTargetDtype::Float32) => Ok(source_bytes
+            .chunks_exact(2)
+            .flat_map(|chunk| {
+                let value = bf16::from_bits(u16::from_le_bytes([chunk[0], chunk[1]]));
+                value.to_f32().to_le_bytes()
+            })
+            .collect()),
+        (SafeTensorsDtype::F32, BurnExportTargetDtype::Float16) => Ok(source_bytes
+            .chunks_exact(4)
+            .flat_map(|chunk| {
+                let value = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                f16::from_f32(value).to_bits().to_le_bytes()
+            })
+            .collect()),
+        (SafeTensorsDtype::F32, BurnExportTargetDtype::Bfloat16) => Ok(source_bytes
+            .chunks_exact(4)
+            .flat_map(|chunk| {
+                let value = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                bf16::from_f32(value).to_bits().to_le_bytes()
+            })
+            .collect()),
+        (other, _) => bail!("Unsupported safetensors dtype {:?} for Burn export", other),
+    }
+}
+
+fn download_hugging_face_repo_file(
+    repo_id: &str,
+    file_name: &str,
+    destination: &Path,
+) -> eyre::Result<()> {
+    if destination.is_file() {
+        return Ok(());
+    }
+    if let Some(parent) = destination.parent() {
+        std::fs::create_dir_all(parent).wrap_err_with(|| {
+            format!("Failed to create download directory {}", parent.display())
+        })?;
+    }
+    let url = format!("https://huggingface.co/{repo_id}/resolve/main/{file_name}");
+    let client = reqwest::blocking::Client::builder()
+        .build()
+        .wrap_err("Failed to build HTTP client for Burn export source download")?;
+    let mut response = client
+        .get(&url)
+        .send()
+        .wrap_err_with(|| format!("Failed to start download from {}", url))?;
+    if !response.status().is_success() {
+        bail!(
+            "Download failed from {} with HTTP {}",
+            url,
+            response.status()
+        );
+    }
+    let mut output = std::fs::File::create(destination)
+        .wrap_err_with(|| format!("Failed to create {}", destination.display()))?;
+    std::io::copy(&mut response, &mut output).wrap_err_with(|| {
+        format!(
+            "Failed to stream download body from {} into {}",
+            url,
+            destination.display()
+        )
+    })?;
+    Ok(())
 }
 
 /// # Errors
@@ -4584,12 +5219,18 @@ fn softplus_scalar(value: f32) -> f32 {
 mod tests {
     use super::{
         BURN_TEXT_DIR_NAME, BURN_TEXT_MANIFEST_FILE_NAME, BurnTextManifest, BurnTextTensorSpec,
-        LlmCpuBackend, apply_rotary_slice, bytes_per_element, causal_mask,
+        LlmCpuBackend, SOURCE_SAFETENSORS_INDEX_FILE_NAME, apply_rotary_slice, bytes_per_element, causal_mask,
         decode_bytes_into_f32, dot_product, f16_bits_to_f32, first_mismatch_index,
-        inspect_burn_text_runtime_status, rotary_embeddings, sigmoid_scalar, softmax_scalars,
-        softmax_scalars_in_place,
+        export_burn_text_weights, inspect_burn_text_runtime_status, rotary_embeddings, sigmoid_scalar,
+        softmax_scalars, softmax_scalars_in_place,
     };
+    use crate::model::{
+        DEFAULT_LLM_MODEL_NAME, HF_CONFIG_FILE_NAME, MODEL_FILE_NAME, TOKENIZER_CONFIG_FILE_NAME,
+        TOKENIZER_FILE_NAME, inspect_model_dir,
+    };
+    use safetensors::{Dtype, tensor::TensorView, serialize_to_file};
     use std::collections::BTreeMap;
+    use tokenizers::{Tokenizer, models::bpe::BPE};
 
     #[test]
     fn burn_text_status_reports_manifest_presence() {
@@ -4695,5 +5336,192 @@ mod tests {
         assert_eq!(first_mismatch_index(&[1, 2], &[1, 2, 3]), Some(2));
         assert_eq!(first_mismatch_index(&[1, 2, 3], &[1, 2]), Some(2));
         assert_eq!(first_mismatch_index(&[1, 2, 3], &[1, 2, 3]), None);
+    }
+
+    #[test]
+    fn rust_export_writes_burn_bundle_from_local_hf_snapshot() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let hf_home = temp.path().join("hf-home");
+        let snapshot_dir = hf_home
+            .join("hub")
+            .join("models--Jackrong--Qwopus3.5-9B-Coder")
+            .join("snapshots")
+            .join("fixture-revision");
+        std::fs::create_dir_all(&snapshot_dir).expect("snapshot dir");
+        std::fs::create_dir_all(
+            hf_home
+                .join("hub")
+                .join("models--Jackrong--Qwopus3.5-9B-Coder")
+                .join("refs"),
+        )
+        .expect("refs dir");
+        std::fs::write(
+            hf_home
+                .join("hub")
+                .join("models--Jackrong--Qwopus3.5-9B-Coder")
+                .join("refs")
+                .join("main"),
+            "fixture-revision\n",
+        )
+        .expect("main ref");
+
+        let shard_path = snapshot_dir.join("model.safetensors-00001-of-00001.safetensors");
+        let tensors = build_fixture_export_tensors();
+        serialize_to_file(&tensors, None, &shard_path).expect("serialize safetensors shard");
+        std::fs::write(
+            snapshot_dir.join(SOURCE_SAFETENSORS_INDEX_FILE_NAME),
+            build_fixture_safetensors_index_json(tensors.keys().cloned().collect()),
+        )
+        .expect("index json");
+
+        let root = temp.path().join("model-root");
+        std::fs::create_dir_all(&root).expect("model root");
+        std::fs::write(root.join(MODEL_FILE_NAME), b"burn-text-only").expect("model placeholder");
+        Tokenizer::new(BPE::default())
+            .save(root.join(TOKENIZER_FILE_NAME), false)
+            .expect("tokenizer fixture");
+        std::fs::write(
+            root.join(TOKENIZER_CONFIG_FILE_NAME),
+            r#"{"eos_token":"<|im_end|>","chat_template":"template"}"#,
+        )
+        .expect("tokenizer config");
+        std::fs::write(
+            root.join(HF_CONFIG_FILE_NAME),
+            r#"{
+  "model_type":"qwen3_5",
+  "text_config":{
+    "model_type":"qwen3_5_text",
+    "vocab_size":8,
+    "hidden_size":4,
+    "intermediate_size":6,
+    "num_hidden_layers":2,
+    "num_attention_heads":1,
+    "num_key_value_heads":1,
+    "head_dim":4,
+    "rms_norm_eps":0.000001,
+    "hidden_act":"silu",
+    "partial_rotary_factor":0.5,
+    "rope_theta":10000.0,
+    "linear_num_key_heads":1,
+    "linear_num_value_heads":1,
+    "linear_key_head_dim":2,
+    "linear_value_head_dim":2,
+    "linear_conv_kernel_dim":2,
+    "layer_types":["linear_attention","full_attention"]
+  }
+}"#,
+        )
+        .expect("config");
+        std::fs::write(
+            root.join("model-metadata.json"),
+            format!(
+                r#"{{
+  "model_name":"{DEFAULT_LLM_MODEL_NAME}",
+  "family":"qwopus",
+  "display_name":"fixture",
+  "source_repo_id":"Jackrong/Qwopus3.5-9B-Coder",
+  "model_repo_id":"Jackrong/Qwopus3.5-9B-Coder-GGUF",
+  "tokenizer_repo_id":"Jackrong/Qwopus3.5-9B-Coder",
+  "architecture":"qwen35",
+  "quantization":"Q4_K_M",
+  "model_file_name":"model.gguf",
+  "hf_config_file_name":"config.json",
+  "tokenizer_file_name":"tokenizer.json",
+  "tokenizer_config_file_name":"tokenizer_config.json",
+  "parameter_count":"9B",
+  "size_estimate":"5.63 GiB",
+  "supports_vision":true,
+  "supports_tool_calling":true,
+  "mmproj_file_name":null
+}}"#
+            ),
+        )
+        .expect("metadata");
+
+        let previous_hf_home = std::env::var_os("HF_HOME");
+        unsafe {
+            std::env::set_var("HF_HOME", &hf_home);
+        }
+        let artifacts = inspect_model_dir(&root).expect("inspect model dir");
+        let report = export_burn_text_weights(&artifacts, true, "float16").expect("rust export");
+        if let Some(previous_hf_home) = previous_hf_home {
+            unsafe {
+                std::env::set_var("HF_HOME", previous_hf_home);
+            }
+        } else {
+            unsafe {
+                std::env::remove_var("HF_HOME");
+            }
+        }
+
+        assert!(root.join(BURN_TEXT_DIR_NAME).join(BURN_TEXT_MANIFEST_FILE_NAME).is_file());
+        assert!(root.join(BURN_TEXT_DIR_NAME).join("tensors.bin").is_file());
+        assert_eq!(report.tensor_count, 28);
+        let manifest = super::load_burn_text_manifest(
+            &root.join(BURN_TEXT_DIR_NAME).join(BURN_TEXT_MANIFEST_FILE_NAME),
+        )
+        .expect("load manifest");
+        assert_eq!(manifest.layer_types, vec!["linear_attention", "full_attention"]);
+        assert_eq!(manifest.hidden_size, 4);
+        assert_eq!(manifest.tensors.len(), 28);
+    }
+
+    fn build_fixture_export_tensors() -> BTreeMap<String, TensorView<'static>> {
+        let mut tensors = BTreeMap::new();
+        insert_fixture_tensor(&mut tensors, "model.language_model.embed_tokens.weight", &[8, 4], 0.0);
+        insert_fixture_tensor(&mut tensors, "model.language_model.norm.weight", &[4], 100.0);
+        insert_fixture_tensor(&mut tensors, "lm_head.weight", &[8, 4], 200.0);
+
+        insert_fixture_tensor(&mut tensors, "model.language_model.layers.0.input_layernorm.weight", &[4], 300.0);
+        insert_fixture_tensor(&mut tensors, "model.language_model.layers.0.post_attention_layernorm.weight", &[4], 310.0);
+        insert_fixture_tensor(&mut tensors, "model.language_model.layers.0.mlp.gate_proj.weight", &[6, 4], 320.0);
+        insert_fixture_tensor(&mut tensors, "model.language_model.layers.0.mlp.up_proj.weight", &[6, 4], 330.0);
+        insert_fixture_tensor(&mut tensors, "model.language_model.layers.0.mlp.down_proj.weight", &[4, 6], 340.0);
+        insert_fixture_tensor(&mut tensors, "model.language_model.layers.0.linear_attn.conv1d.weight", &[6, 1, 2], 350.0);
+        insert_fixture_tensor(&mut tensors, "model.language_model.layers.0.linear_attn.dt_bias", &[1], 360.0);
+        insert_fixture_tensor(&mut tensors, "model.language_model.layers.0.linear_attn.A_log", &[1], 370.0);
+        insert_fixture_tensor(&mut tensors, "model.language_model.layers.0.linear_attn.norm.weight", &[2], 380.0);
+        insert_fixture_tensor(&mut tensors, "model.language_model.layers.0.linear_attn.out_proj.weight", &[4, 2], 390.0);
+        insert_fixture_tensor(&mut tensors, "model.language_model.layers.0.linear_attn.in_proj_qkv.weight", &[6, 4], 400.0);
+        insert_fixture_tensor(&mut tensors, "model.language_model.layers.0.linear_attn.in_proj_z.weight", &[2, 4], 410.0);
+        insert_fixture_tensor(&mut tensors, "model.language_model.layers.0.linear_attn.in_proj_b.weight", &[1, 4], 420.0);
+        insert_fixture_tensor(&mut tensors, "model.language_model.layers.0.linear_attn.in_proj_a.weight", &[1, 4], 430.0);
+
+        insert_fixture_tensor(&mut tensors, "model.language_model.layers.1.input_layernorm.weight", &[4], 440.0);
+        insert_fixture_tensor(&mut tensors, "model.language_model.layers.1.post_attention_layernorm.weight", &[4], 450.0);
+        insert_fixture_tensor(&mut tensors, "model.language_model.layers.1.mlp.gate_proj.weight", &[6, 4], 460.0);
+        insert_fixture_tensor(&mut tensors, "model.language_model.layers.1.mlp.up_proj.weight", &[6, 4], 470.0);
+        insert_fixture_tensor(&mut tensors, "model.language_model.layers.1.mlp.down_proj.weight", &[4, 6], 480.0);
+        insert_fixture_tensor(&mut tensors, "model.language_model.layers.1.self_attn.q_proj.weight", &[8, 4], 490.0);
+        insert_fixture_tensor(&mut tensors, "model.language_model.layers.1.self_attn.k_proj.weight", &[4, 4], 500.0);
+        insert_fixture_tensor(&mut tensors, "model.language_model.layers.1.self_attn.v_proj.weight", &[4, 4], 510.0);
+        insert_fixture_tensor(&mut tensors, "model.language_model.layers.1.self_attn.o_proj.weight", &[4, 4], 520.0);
+        insert_fixture_tensor(&mut tensors, "model.language_model.layers.1.self_attn.q_norm.weight", &[4], 530.0);
+        insert_fixture_tensor(&mut tensors, "model.language_model.layers.1.self_attn.k_norm.weight", &[4], 540.0);
+        tensors
+    }
+
+    fn insert_fixture_tensor(
+        tensors: &mut BTreeMap<String, TensorView<'static>>,
+        name: &str,
+        shape: &[usize],
+        base: f32,
+    ) {
+        let element_count = shape.iter().copied().product::<usize>();
+        let data = (0..element_count)
+            .flat_map(|index| (base + index as f32).to_le_bytes())
+            .collect::<Vec<_>>();
+        let leaked = Box::leak(data.into_boxed_slice());
+        let view = TensorView::new(Dtype::F32, shape.to_vec(), leaked).expect("tensor view");
+        tensors.insert(name.to_owned(), view);
+    }
+
+    fn build_fixture_safetensors_index_json(weight_names: Vec<String>) -> String {
+        let weight_map = weight_names
+            .into_iter()
+            .map(|name| format!(r#""{}":"model.safetensors-00001-of-00001.safetensors""#, name))
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(r#"{{"weight_map":{{{weight_map}}}}}"#)
     }
 }

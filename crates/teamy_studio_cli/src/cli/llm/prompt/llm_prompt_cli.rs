@@ -3,7 +3,12 @@ use arbitrary::Arbitrary;
 use facet::Facet;
 use figue as args;
 use std::path::PathBuf;
+use std::process::{Command, Stdio};
+use std::thread;
 use std::time::Duration;
+
+const LLM_TIMEOUT_CHILD_ENV: &str = "TEAMY_STUDIO_LLM_TIMEOUT_CHILD";
+const LLM_TIMEOUT_KILL_GRACE: Duration = Duration::from_secs(10);
 
 /// Run a single Teamy-managed prompt through the Rust Burn lane.
 #[derive(Facet, Arbitrary, Debug, PartialEq)]
@@ -80,6 +85,16 @@ impl LlmPromptArgs {
         app_home: &crate::paths::AppHome,
         cache_home: &crate::paths::CacheHome,
     ) -> eyre::Result<CliOutput> {
+        let generation_timeout = resolve_timeout_arg(
+            self.timeout.as_deref(),
+            self.generation_timeout.as_deref(),
+        )?;
+        if let Some(timeout) = generation_timeout
+            && !is_timeout_supervision_child()
+        {
+            return supervise_llm_prompt_timeout(timeout);
+        }
+        maybe_warn_about_dev_profile();
         let explicit_model_dir = self.model_dir.as_deref().map(PathBuf::from);
         let resolved = crate::llm::model::resolve_llm_model_dir(
             app_home,
@@ -93,10 +108,6 @@ impl LlmPromptArgs {
             .python_model_path
             .as_deref()
             .unwrap_or(artifacts.metadata.source_repo_id.as_str());
-        let generation_timeout = resolve_timeout_arg(
-            self.timeout.as_deref(),
-            self.generation_timeout.as_deref(),
-        )?;
         let python_tokenizer_path = self
             .python_tokenizer_path
             .as_deref()
@@ -330,6 +341,86 @@ fn resolve_timeout_arg(
         }
         (None, None) => Ok(None),
     }
+}
+
+fn maybe_warn_about_dev_profile() {
+    if !cfg!(debug_assertions) {
+        return;
+    }
+    tracing::warn!(
+        "Running `llm prompt` in the dev profile is substantially slower than release for Burn LLM inference. Prefer `cargo run --release -- llm prompt ...` for meaningful timing or throughput checks."
+    );
+    eprintln!(
+        "warning: `llm prompt` is running in the dev profile; Burn LLM inference is much slower here. Prefer `cargo run --release -- llm prompt ...` for real performance measurements."
+    );
+}
+
+fn is_timeout_supervision_child() -> bool {
+    std::env::var_os(LLM_TIMEOUT_CHILD_ENV).is_some()
+}
+
+fn supervise_llm_prompt_timeout(timeout: Duration) -> eyre::Result<CliOutput> {
+    let exe = std::env::current_exe()
+        .map_err(|error| eyre::eyre!("Failed to resolve current executable for LLM timeout supervision: {}", error))?;
+    let current_dir = std::env::current_dir()
+        .map_err(|error| eyre::eyre!("Failed to resolve current directory for LLM timeout supervision: {}", error))?;
+    let args = std::env::args_os().skip(1).collect::<Vec<_>>();
+    let mut child = Command::new(&exe)
+        .args(&args)
+        .current_dir(current_dir)
+        .env(LLM_TIMEOUT_CHILD_ENV, "1")
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .map_err(|error| eyre::eyre!("Failed to launch supervised LLM child process {}: {}", exe.display(), error))?;
+
+    let deadline = std::time::Instant::now() + timeout + LLM_TIMEOUT_KILL_GRACE;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            if status.success() {
+                return Ok(CliOutput::none());
+            }
+            return Err(eyre::eyre!(
+                "supervised LLM child process exited with status {}",
+                status
+            ));
+        }
+        if std::time::Instant::now() >= deadline {
+            tracing::warn!(
+                pid = child.id(),
+                timeout_secs = timeout.as_secs_f64(),
+                grace_secs = LLM_TIMEOUT_KILL_GRACE.as_secs_f64(),
+                "LLM child process exceeded graceful timeout window; forcing termination"
+            );
+            force_terminate_child(&mut child)?;
+            return Err(eyre::eyre!(
+                "LLM prompt exceeded timeout {} plus {} grace; child process was terminated",
+                humantime::format_duration(timeout),
+                humantime::format_duration(LLM_TIMEOUT_KILL_GRACE),
+            ));
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
+}
+
+fn force_terminate_child(child: &mut std::process::Child) -> eyre::Result<()> {
+    if let Err(error) = child.kill() {
+        tracing::warn!(pid = child.id(), %error, "Child kill() failed during timeout termination");
+    }
+    #[cfg(windows)]
+    {
+        let _ = Command::new("taskkill")
+            .arg("/PID")
+            .arg(child.id().to_string())
+            .arg("/T")
+            .arg("/F")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    let _ = child.wait();
+    Ok(())
 }
 
 fn hidden_diff_summary(left: &[f32], right: &[f32]) -> eyre::Result<(f32, f32)> {

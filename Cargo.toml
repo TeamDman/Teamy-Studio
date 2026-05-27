@@ -89,9 +89,11 @@ ratatui = { version = "0.30.0", default-features = false, features = ["crossterm
 reqwest = { version = "0.12.23", default-features = false, features = ["blocking", "rustls-tls"] }
 rfd = "0.15"
 rustfft = "6.4.1"
+safetensors = "0.7.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sguaba = { version = "0.10.3", default-features = false, features = ["std"] }
+memmap2 = "0.9.9"
 tempfile = "3.20.0"
 tokio = { version = "1.49.0", features = ["full"] }
 tokenizers = { version = "0.22.0", default-features = false, features = ["onig"] }
@@ -124,6 +126,18 @@ documentation = "https://github.com/TeamDman/Teamy-Studio"
 
 [profile.dev]
 debug = "full"
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.dev.package.teamy-studio]
+opt-level = 1
+
+[profile.dev.package.teamy_studio_cli]
+opt-level = 1
+
+[profile.dev.package.teamy_studio_llm_stack]
+opt-level = 1
 
 [profile.profiling]
 inherits = "release"

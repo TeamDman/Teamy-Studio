@@ -838,6 +838,18 @@ fn download_to_file(url: &str, destination: &Path) -> eyre::Result<()> {
             format!("Failed to create download directory {}", parent.display())
         })?;
     }
+    if let Some((repo_id, file_name)) = parse_hugging_face_resolve_url(url)
+        && let Some(cached_source) = resolve_local_hugging_face_repo_file(repo_id, file_name)?
+    {
+        std::fs::copy(&cached_source, destination).wrap_err_with(|| {
+            format!(
+                "Failed to copy cached Hugging Face file {} into {}",
+                cached_source.display(),
+                destination.display()
+            )
+        })?;
+        return Ok(());
+    }
     let client = reqwest::blocking::Client::builder()
         .build()
         .wrap_err("Failed to build HTTP client for model download")?;
@@ -853,6 +865,67 @@ fn download_to_file(url: &str, destination: &Path) -> eyre::Result<()> {
     std::io::copy(&mut response, &mut output)
         .wrap_err_with(|| format!("Failed to stream download body from {url} into {}", destination.display()))?;
     Ok(())
+}
+
+fn parse_hugging_face_resolve_url(url: &str) -> Option<(&str, &str)> {
+    let prefix = "https://huggingface.co/";
+    let suffix = "/resolve/main/";
+    let remainder = url.strip_prefix(prefix)?;
+    let split_index = remainder.find(suffix)?;
+    let repo_id = &remainder[..split_index];
+    let file_name = &remainder[split_index + suffix.len()..];
+    Some((repo_id, file_name))
+}
+
+fn resolve_local_hugging_face_repo_file(
+    repo_id: &str,
+    file_name: &str,
+) -> eyre::Result<Option<PathBuf>> {
+    for snapshot_dir in local_hugging_face_snapshot_dirs(repo_id) {
+        let candidate = snapshot_dir.join(file_name);
+        if candidate.is_file() {
+            return Ok(Some(candidate));
+        }
+    }
+    Ok(None)
+}
+
+fn local_hugging_face_snapshot_dirs(repo_id: &str) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Some(hf_home) = std::env::var_os("HF_HOME") {
+        roots.push(PathBuf::from(hf_home).join("hub"));
+    }
+    if let Some(hf_hub_cache) = std::env::var_os("HF_HUB_CACHE") {
+        roots.push(PathBuf::from(hf_hub_cache));
+    }
+    if let Some(huggingface_hub_cache) = std::env::var_os("HUGGINGFACE_HUB_CACHE") {
+        roots.push(PathBuf::from(huggingface_hub_cache));
+    }
+    if let Some(user_profile) = std::env::var_os("USERPROFILE") {
+        roots.push(
+            PathBuf::from(user_profile)
+                .join(".cache")
+                .join("huggingface")
+                .join("hub"),
+        );
+    }
+
+    let repo_cache_dir_name = format!("models--{}", repo_id.replace('/', "--"));
+    let mut snapshots = Vec::new();
+    for root in roots {
+        let repo_dir = root.join(&repo_cache_dir_name);
+        let refs_main = repo_dir.join("refs").join("main");
+        let snapshots_dir = repo_dir.join("snapshots");
+        if refs_main.is_file()
+            && let Ok(revision) = std::fs::read_to_string(&refs_main)
+        {
+            let snapshot_dir = snapshots_dir.join(revision.trim());
+            if snapshot_dir.is_dir() {
+                snapshots.push(snapshot_dir);
+            }
+        }
+    }
+    snapshots
 }
 
 fn write_burn_text_only_model_placeholder(path: &Path) -> eyre::Result<()> {
