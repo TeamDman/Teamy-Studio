@@ -118,6 +118,8 @@ struct BurnExportTextConfigFile {
     #[facet(default)]
     rope_theta: Option<f64>,
     #[facet(default)]
+    rope_parameters: Option<BurnExportRopeParametersFile>,
+    #[facet(default)]
     linear_num_key_heads: Option<usize>,
     #[facet(default)]
     linear_num_value_heads: Option<usize>,
@@ -129,6 +131,12 @@ struct BurnExportTextConfigFile {
     linear_conv_kernel_dim: Option<usize>,
     #[facet(default)]
     layer_types: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Facet)]
+struct BurnExportRopeParametersFile {
+    #[facet(default)]
+    rope_theta: Option<f64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Facet)]
@@ -2868,7 +2876,7 @@ fn build_burn_export_manifest(
             config.partial_rotary_factor,
             "text_config.partial_rotary_factor",
         )?,
-        rope_theta: require_export_f64(config.rope_theta, "text_config.rope_theta")?,
+        rope_theta: resolve_export_rope_theta(config)?,
         linear_num_key_heads: require_export_usize(
             config.linear_num_key_heads,
             "text_config.linear_num_key_heads",
@@ -2906,6 +2914,17 @@ fn require_export_string(value: Option<&String>, field_name: &str) -> eyre::Resu
     value
         .cloned()
         .ok_or_else(|| eyre::eyre!("Burn export requires config field {}", field_name))
+}
+
+fn resolve_export_rope_theta(config: &BurnExportTextConfigFile) -> eyre::Result<f64> {
+    if let Some(rope_theta) = config
+        .rope_parameters
+        .as_ref()
+        .and_then(|parameters| parameters.rope_theta)
+    {
+        return Ok(rope_theta);
+    }
+    require_export_f64(config.rope_theta, "text_config.rope_theta or text_config.rope_parameters.rope_theta")
 }
 
 fn write_burn_export_bundle(

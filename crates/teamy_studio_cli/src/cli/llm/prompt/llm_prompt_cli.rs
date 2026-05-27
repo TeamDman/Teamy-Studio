@@ -5,6 +5,7 @@ use figue as args;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::thread;
+use std::time::Instant;
 use std::time::Duration;
 
 const LLM_TIMEOUT_CHILD_ENV: &str = "TEAMY_STUDIO_LLM_TIMEOUT_CHILD";
@@ -85,6 +86,7 @@ impl LlmPromptArgs {
         app_home: &crate::paths::AppHome,
         cache_home: &crate::paths::CacheHome,
     ) -> eyre::Result<CliOutput> {
+        let command_started_at = Instant::now();
         let generation_timeout = resolve_timeout_arg(
             self.timeout.as_deref(),
             self.generation_timeout.as_deref(),
@@ -113,6 +115,9 @@ impl LlmPromptArgs {
             .as_deref()
             .map(PathBuf::from)
             .unwrap_or_else(|| artifacts.root.clone());
+        let effective_generation_timeout = generation_timeout.and_then(|timeout| {
+            timeout.checked_sub(command_started_at.elapsed())
+        });
 
         if self.compare_python {
             let reference = crate::llm::reference::read_llm_reference_prompt_report(
@@ -223,7 +228,7 @@ impl LlmPromptArgs {
                     &prompt_token_ids,
                     &crate::llm::burn_text::BurnTextGenerationOptions {
                         max_new_tokens: self.max_new_tokens,
-                        generation_timeout,
+                        generation_timeout: effective_generation_timeout,
                     },
                 )?;
                 println!(
@@ -309,7 +314,7 @@ impl LlmPromptArgs {
                 system_prompt: self.system_prompt,
                 user_prompt: self.prompt,
                 max_new_tokens: self.max_new_tokens,
-                generation_timeout,
+                generation_timeout: effective_generation_timeout,
             },
         )?;
         println!("Rendered prompt:\n{}", result.rendered_prompt);
@@ -381,10 +386,7 @@ fn supervise_llm_prompt_timeout(timeout: Duration) -> eyre::Result<CliOutput> {
             if status.success() {
                 return Ok(CliOutput::none());
             }
-            return Err(eyre::eyre!(
-                "supervised LLM child process exited with status {}",
-                status
-            ));
+            std::process::exit(status.code().unwrap_or(1));
         }
         if std::time::Instant::now() >= deadline {
             tracing::warn!(
