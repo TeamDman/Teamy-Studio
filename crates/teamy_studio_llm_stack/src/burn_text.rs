@@ -208,8 +208,8 @@ enum DecoderLayerDecodeState {
 #[derive(Clone, Debug, Default, PartialEq)]
 struct FullAttentionDecodeState {
     token_count: usize,
-    repeated_key_cache: Vec<f32>,
-    repeated_value_cache: Vec<f32>,
+    key_cache: Vec<f32>,
+    value_cache: Vec<f32>,
 }
 
 #[allow(dead_code)]
@@ -933,43 +933,30 @@ impl<B: Backend> Qwen35TextRuntime<B> {
         apply_rotary_embedding_single_position(&mut query_values, position, &self.manifest, self.manifest.num_attention_heads)?;
         apply_rotary_embedding_single_position(&mut key_values, position, &self.manifest, self.manifest.num_key_value_heads)?;
 
-        let repeated_key = repeat_key_value_heads(
-            &key_values,
-            1,
-            self.manifest.num_key_value_heads,
-            self.manifest.num_attention_heads / self.manifest.num_key_value_heads,
-            head_dim,
-        );
-        let repeated_value = repeat_key_value_heads(
-            &value_values,
-            1,
-            self.manifest.num_key_value_heads,
-            self.manifest.num_attention_heads / self.manifest.num_key_value_heads,
-            head_dim,
-        );
-        decode_state.repeated_key_cache.extend_from_slice(&repeated_key);
-        decode_state.repeated_value_cache.extend_from_slice(&repeated_value);
+        decode_state.key_cache.extend_from_slice(&key_values);
+        decode_state.value_cache.extend_from_slice(&value_values);
         decode_state.token_count += 1;
 
         let scale = (head_dim as f32).powf(-0.5);
         let mut attention_output = vec![0.0_f32; self.manifest.hidden_size];
+        let repeat_factor = self.manifest.num_attention_heads / self.manifest.num_key_value_heads;
         for head in 0..self.manifest.num_attention_heads {
             let query_base = head * head_dim;
             let query_slice = &query_values[query_base..query_base + head_dim];
+            let key_value_head = head / repeat_factor;
             let mut scores = Vec::with_capacity(decode_state.token_count);
             for token_index in 0..decode_state.token_count {
-                let key_base = (token_index * self.manifest.num_attention_heads + head) * head_dim;
-                let key_slice =
-                    &decode_state.repeated_key_cache[key_base..key_base + head_dim];
+                let key_base =
+                    (token_index * self.manifest.num_key_value_heads + key_value_head) * head_dim;
+                let key_slice = &decode_state.key_cache[key_base..key_base + head_dim];
                 scores.push(dot_product(query_slice, key_slice) * scale);
             }
             softmax_scalars_in_place(&mut scores);
             let output_base = head * head_dim;
             for (token_index, weight) in scores.into_iter().enumerate() {
                 let value_base =
-                    (token_index * self.manifest.num_attention_heads + head) * head_dim;
-                let value_slice =
-                    &decode_state.repeated_value_cache[value_base..value_base + head_dim];
+                    (token_index * self.manifest.num_key_value_heads + key_value_head) * head_dim;
+                let value_slice = &decode_state.value_cache[value_base..value_base + head_dim];
                 for dim in 0..head_dim {
                     attention_output[output_base + dim] += value_slice[dim] * weight;
                 }
@@ -1567,8 +1554,8 @@ impl<B: Backend> Qwen35TextRuntime<B> {
             head_dim,
         );
         decode_state.token_count = seq_len;
-        decode_state.repeated_key_cache = key_repeated.clone();
-        decode_state.repeated_value_cache = value_repeated.clone();
+        decode_state.key_cache = key_values;
+        decode_state.value_cache = value_values;
         let key_repeated = transpose_seq_head_layout(
             &key_repeated,
             seq_len,
