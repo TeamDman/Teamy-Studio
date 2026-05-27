@@ -1,10 +1,17 @@
 use burn::{
     backend::{Cuda, NdArray, cuda::CudaDevice, ndarray::NdArrayDevice},
-    tensor::{Tensor, TensorData, activation::{self, softmax}, backend::Backend},
+    tensor::{
+        Tensor, TensorData,
+        activation::{self, softmax},
+        backend::Backend,
+    },
 };
 use eyre::{WrapErr, bail, ensure};
 use facet::Facet;
-use half::{bf16, f16, slice::{HalfBitsSliceExt, HalfFloatSliceExt}};
+use half::{
+    bf16, f16,
+    slice::{HalfBitsSliceExt, HalfFloatSliceExt},
+};
 use memmap2::Mmap;
 use safetensors::{Dtype as SafeTensorsDtype, SafeTensors};
 use std::{
@@ -12,10 +19,13 @@ use std::{
     collections::{BTreeMap, HashMap, VecDeque},
     fmt,
     fs::File,
-    io::{Read, Seek, SeekFrom},
+    io::{Read, Seek, SeekFrom, Write},
     marker::PhantomData,
     path::{Path, PathBuf},
-    sync::{Mutex, atomic::{AtomicBool, Ordering}},
+    sync::{
+        Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -389,7 +399,10 @@ impl<B: Backend> Qwen35TextRuntime<B> {
         );
         let mut buffer = vec![0_u8; row_bytes];
         if let Some(file) = &self.packed_tensor_file
-            && self.packed_tensor_path.as_ref().is_some_and(|packed| packed == &path)
+            && self
+                .packed_tensor_path
+                .as_ref()
+                .is_some_and(|packed| packed == &path)
         {
             let mut file = file.lock().map_err(|_| {
                 eyre::eyre!(
@@ -410,7 +423,9 @@ impl<B: Backend> Qwen35TextRuntime<B> {
                     .ok_or_else(|| eyre::eyre!("row offset overflow for tensor `{tensor_name}`"))?;
                 let byte_offset = offset_bytes
                     .checked_add(u64::try_from(row_offset).unwrap_or(u64::MAX))
-                    .ok_or_else(|| eyre::eyre!("byte offset overflow for tensor `{tensor_name}`"))?;
+                    .ok_or_else(|| {
+                        eyre::eyre!("byte offset overflow for tensor `{tensor_name}`")
+                    })?;
                 file.seek(SeekFrom::Start(byte_offset)).wrap_err_with(|| {
                     format!(
                         "Failed to seek to row {row_index} in packed Burn text tensor {}",
@@ -509,7 +524,10 @@ impl<B: Backend> Qwen35TextRuntime<B> {
         let path = self.tensor_file_path(spec);
         let mut bytes = vec![0_u8; byte_len];
         if let Some(file) = &self.packed_tensor_file
-            && self.packed_tensor_path.as_ref().is_some_and(|packed| packed == &path)
+            && self
+                .packed_tensor_path
+                .as_ref()
+                .is_some_and(|packed| packed == &path)
         {
             GenerationDeadline::check_current()?;
             let mut file = file.lock().map_err(|_| {
@@ -706,10 +724,7 @@ impl<B: Backend> Qwen35TextRuntime<B> {
     }
 
     #[allow(dead_code)]
-    fn forward_hidden_states(
-        &self,
-        mut hidden_states: Tensor<B, 3>,
-    ) -> eyre::Result<Tensor<B, 3>> {
+    fn forward_hidden_states(&self, mut hidden_states: Tensor<B, 3>) -> eyre::Result<Tensor<B, 3>> {
         llm_tracy_zone!("llm_burn_forward_hidden_states");
         #[cfg(feature = "extended_observability")]
         let _span = tracing::info_span!(
@@ -923,7 +938,11 @@ impl<B: Backend> Qwen35TextRuntime<B> {
     #[allow(dead_code)]
     fn forward_mlp_single(&self, prefix: &str, hidden: &[f32]) -> eyre::Result<Vec<f32>> {
         let _activation = self.hidden_activation_kind()?;
-        let hidden_states = tensor_3d([1, 1, self.manifest.hidden_size], hidden.to_vec(), &self.device);
+        let hidden_states = tensor_3d(
+            [1, 1, self.manifest.hidden_size],
+            hidden.to_vec(),
+            &self.device,
+        );
         let gate_proj = linear_forward_3d(
             &hidden_states,
             self.load_tensor_2d(&format!("{prefix}.gate_proj.weight"))?,
@@ -949,7 +968,11 @@ impl<B: Backend> Qwen35TextRuntime<B> {
         position: usize,
         decode_state: &mut FullAttentionDecodeState,
     ) -> eyre::Result<Vec<f32>> {
-        let hidden_states = tensor_3d([1, 1, self.manifest.hidden_size], hidden.to_vec(), &self.device);
+        let hidden_states = tensor_3d(
+            [1, 1, self.manifest.hidden_size],
+            hidden.to_vec(),
+            &self.device,
+        );
         let head_dim = self.manifest.head_dim;
         let query_projection = linear_forward_3d(
             &hidden_states,
@@ -1013,8 +1036,18 @@ impl<B: Backend> Qwen35TextRuntime<B> {
         );
         let value_values = tensor_to_vec_f32(&value_proj)?;
 
-        apply_rotary_embedding_single_position(&mut query_values, position, &self.manifest, self.manifest.num_attention_heads)?;
-        apply_rotary_embedding_single_position(&mut key_values, position, &self.manifest, self.manifest.num_key_value_heads)?;
+        apply_rotary_embedding_single_position(
+            &mut query_values,
+            position,
+            &self.manifest,
+            self.manifest.num_attention_heads,
+        )?;
+        apply_rotary_embedding_single_position(
+            &mut key_values,
+            position,
+            &self.manifest,
+            self.manifest.num_key_value_heads,
+        )?;
 
         decode_state.key_cache.extend_from_slice(&key_values);
         decode_state.value_cache.extend_from_slice(&value_values);
@@ -1064,7 +1097,11 @@ impl<B: Backend> Qwen35TextRuntime<B> {
         hidden: &[f32],
         decode_state: &mut LinearAttentionDecodeState,
     ) -> eyre::Result<Vec<f32>> {
-        let hidden_states = tensor_3d([1, 1, self.manifest.hidden_size], hidden.to_vec(), &self.device);
+        let hidden_states = tensor_3d(
+            [1, 1, self.manifest.hidden_size],
+            hidden.to_vec(),
+            &self.device,
+        );
         let mixed_qkv = linear_forward_3d(
             &hidden_states,
             self.load_tensor_2d(&format!("{prefix}.linear_attn.in_proj_qkv.weight"))?,
@@ -1135,7 +1172,8 @@ impl<B: Backend> Qwen35TextRuntime<B> {
             g.push(a_scale * softplus_scalar(value + dt_bias[head_index]));
         }
 
-        let repeat_factor = self.manifest.linear_num_value_heads / self.manifest.linear_num_key_heads;
+        let repeat_factor =
+            self.manifest.linear_num_value_heads / self.manifest.linear_num_key_heads;
         query = repeat_linear_attention_heads(
             &query,
             1,
@@ -1211,9 +1249,8 @@ impl<B: Backend> Qwen35TextRuntime<B> {
         let prefix = format!("model.layers.{layer_index}");
 
         GenerationDeadline::check_current()?;
-        let input_layernorm_weight = tensor_to_vec_f32(
-            &self.load_tensor_1d(&format!("{prefix}.input_layernorm.weight"))?,
-        )?;
+        let input_layernorm_weight =
+            tensor_to_vec_f32(&self.load_tensor_1d(&format!("{prefix}.input_layernorm.weight"))?)?;
         let input_values = tensor_to_vec_f32(&hidden_states)?;
         let normalized_values = qwen_rms_norm(
             &input_values,
@@ -1237,7 +1274,9 @@ impl<B: Backend> Qwen35TextRuntime<B> {
                 position_embeddings,
                 causal_mask.clone(),
             )?,
-            TokenMixerKind::LinearAttention => self.forward_linear_attention(&prefix, normalized)?,
+            TokenMixerKind::LinearAttention => {
+                self.forward_linear_attention(&prefix, normalized)?
+            }
         };
 
         let mixed = hidden_states + mixed;
@@ -1277,9 +1316,8 @@ impl<B: Backend> Qwen35TextRuntime<B> {
         let prefix = format!("model.layers.{layer_index}");
 
         GenerationDeadline::check_current()?;
-        let input_layernorm_weight = tensor_to_vec_f32(
-            &self.load_tensor_1d(&format!("{prefix}.input_layernorm.weight"))?,
-        )?;
+        let input_layernorm_weight =
+            tensor_to_vec_f32(&self.load_tensor_1d(&format!("{prefix}.input_layernorm.weight"))?)?;
         let input_values = tensor_to_vec_f32(&hidden_states)?;
         let normalized_values = qwen_rms_norm(
             &input_values,
@@ -1334,11 +1372,7 @@ impl<B: Backend> Qwen35TextRuntime<B> {
     }
 
     #[allow(dead_code)]
-    fn forward_mlp(
-        &self,
-        prefix: &str,
-        hidden_states: Tensor<B, 3>,
-    ) -> eyre::Result<Tensor<B, 3>> {
+    fn forward_mlp(&self, prefix: &str, hidden_states: Tensor<B, 3>) -> eyre::Result<Tensor<B, 3>> {
         llm_tracy_zone!("llm_burn_mlp");
         #[cfg(feature = "extended_observability")]
         let _span = tracing::debug_span!("llm_burn_mlp", prefix).entered();
@@ -1512,10 +1546,11 @@ impl<B: Backend> Qwen35TextRuntime<B> {
         );
 
         let attention = softmax(query.matmul(key.swap_dims(2, 3)) + causal_mask, 3);
-        let output = attention
-            .matmul(value)
-            .swap_dims(1, 2)
-            .reshape([batch_size, seq_len, hidden_size]);
+        let output =
+            attention
+                .matmul(value)
+                .swap_dims(1, 2)
+                .reshape([batch_size, seq_len, hidden_size]);
         let gated = tensor_to_vec_f32(&output)?
             .into_iter()
             .zip(gate_values)
@@ -1681,10 +1716,11 @@ impl<B: Backend> Qwen35TextRuntime<B> {
         );
 
         let attention = softmax(query.matmul(key.swap_dims(2, 3)) + causal_mask, 3);
-        let output = attention
-            .matmul(value)
-            .swap_dims(1, 2)
-            .reshape([batch_size, seq_len, hidden_size]);
+        let output =
+            attention
+                .matmul(value)
+                .swap_dims(1, 2)
+                .reshape([batch_size, seq_len, hidden_size]);
         let gated = tensor_to_vec_f32(&output)?
             .into_iter()
             .zip(gate_values)
@@ -1707,7 +1743,10 @@ impl<B: Backend> Qwen35TextRuntime<B> {
         #[cfg(feature = "extended_observability")]
         let _span = tracing::debug_span!("llm_burn_linear_attention", prefix).entered();
         let [batch_size, seq_len, _hidden_size] = hidden_states.dims();
-        ensure!(batch_size == 1, "Qwen3.5 linear attention currently expects batch size 1");
+        ensure!(
+            batch_size == 1,
+            "Qwen3.5 linear attention currently expects batch size 1"
+        );
         let mixed_qkv = linear_forward_3d(
             &hidden_states,
             self.load_tensor_2d(&format!("{prefix}.linear_attn.in_proj_qkv.weight"))?,
@@ -1778,7 +1817,8 @@ impl<B: Backend> Qwen35TextRuntime<B> {
             g.push(a_scale * softplus_scalar(value + dt_bias[head_index]));
         }
 
-        let repeat_factor = self.manifest.linear_num_value_heads / self.manifest.linear_num_key_heads;
+        let repeat_factor =
+            self.manifest.linear_num_value_heads / self.manifest.linear_num_key_heads;
         let query = repeat_linear_attention_heads(
             &query,
             seq_len,
@@ -1843,7 +1883,10 @@ impl<B: Backend> Qwen35TextRuntime<B> {
         decode_state: &mut LinearAttentionDecodeState,
     ) -> eyre::Result<Tensor<B, 3>> {
         let [batch_size, seq_len, _hidden_size] = hidden_states.dims();
-        ensure!(batch_size == 1, "Qwen3.5 linear attention currently expects batch size 1");
+        ensure!(
+            batch_size == 1,
+            "Qwen3.5 linear attention currently expects batch size 1"
+        );
         let mixed_qkv = linear_forward_3d(
             &hidden_states,
             self.load_tensor_2d(&format!("{prefix}.linear_attn.in_proj_qkv.weight"))?,
@@ -1914,7 +1957,8 @@ impl<B: Backend> Qwen35TextRuntime<B> {
             g.push(a_scale * softplus_scalar(value + dt_bias[head_index]));
         }
 
-        let repeat_factor = self.manifest.linear_num_value_heads / self.manifest.linear_num_key_heads;
+        let repeat_factor =
+            self.manifest.linear_num_value_heads / self.manifest.linear_num_key_heads;
         let query = repeat_linear_attention_heads(
             &query,
             seq_len,
@@ -1994,8 +2038,14 @@ impl<B: Backend> Qwen35TextRuntime<B> {
         #[cfg(feature = "extended_observability")]
         let _span = tracing::debug_span!("llm_burn_greedy_next_token").entered();
         let [batch_size, seq_len, hidden_size] = hidden_states.dims();
-        ensure!(batch_size == 1, "Qwen3.5 greedy decode expected batch size 1");
-        ensure!(seq_len > 0, "Qwen3.5 greedy decode expected at least one timestep");
+        ensure!(
+            batch_size == 1,
+            "Qwen3.5 greedy decode expected batch size 1"
+        );
+        ensure!(
+            seq_len > 0,
+            "Qwen3.5 greedy decode expected at least one timestep"
+        );
         let last_hidden = tensor_to_vec_f32(&hidden_states)?
             .chunks_exact(hidden_size)
             .last()
@@ -2007,7 +2057,8 @@ impl<B: Backend> Qwen35TextRuntime<B> {
     fn greedy_next_token_from_hidden(&self, hidden: &[f32]) -> eyre::Result<usize> {
         llm_tracy_zone!("llm_burn_lm_head_scan");
         #[cfg(feature = "extended_observability")]
-        let _span = tracing::debug_span!("llm_burn_lm_head_scan", hidden_size = hidden.len()).entered();
+        let _span =
+            tracing::debug_span!("llm_burn_lm_head_scan", hidden_size = hidden.len()).entered();
         if !self.lm_head_tensor_disabled.load(Ordering::Relaxed) {
             match self.greedy_next_token_from_hidden_tensor(hidden) {
                 Ok(token_id) => return Ok(token_id),
@@ -2058,7 +2109,10 @@ impl<B: Backend> Qwen35TextRuntime<B> {
         let mut row_start = 0_usize;
         let mut buffer = vec![0_u8; chunk_bytes];
         if let Some(file) = &self.packed_tensor_file
-            && self.packed_tensor_path.as_ref().is_some_and(|packed| packed == &path)
+            && self
+                .packed_tensor_path
+                .as_ref()
+                .is_some_and(|packed| packed == &path)
         {
             let mut file = file.lock().map_err(|_| {
                 eyre::eyre!(
@@ -2074,8 +2128,7 @@ impl<B: Backend> Qwen35TextRuntime<B> {
                     .ok_or_else(|| eyre::eyre!("lm_head chunk read overflow"))?;
                 let byte_offset = offset_bytes
                     .checked_add(
-                        u64::try_from(row_start.saturating_mul(row_bytes))
-                            .unwrap_or(u64::MAX),
+                        u64::try_from(row_start.saturating_mul(row_bytes)).unwrap_or(u64::MAX),
                     )
                     .ok_or_else(|| eyre::eyre!("lm_head chunk offset overflow"))?;
                 file.seek(SeekFrom::Start(byte_offset)).wrap_err_with(|| {
@@ -2115,10 +2168,7 @@ impl<B: Backend> Qwen35TextRuntime<B> {
                 .checked_mul(row_bytes)
                 .ok_or_else(|| eyre::eyre!("lm_head chunk read overflow"))?;
             let byte_offset = offset_bytes
-                .checked_add(
-                    u64::try_from(row_start.saturating_mul(row_bytes))
-                        .unwrap_or(u64::MAX),
-                )
+                .checked_add(u64::try_from(row_start.saturating_mul(row_bytes)).unwrap_or(u64::MAX))
                 .ok_or_else(|| eyre::eyre!("lm_head chunk offset overflow"))?;
             file.seek(SeekFrom::Start(byte_offset)).wrap_err_with(|| {
                 format!(
@@ -2294,7 +2344,10 @@ pub fn is_generation_timeout_error(error: &eyre::Report) -> bool {
         .any(|source| source.downcast_ref::<GenerationTimeoutError>().is_some())
 }
 
-fn validate_manifest_contract(manifest: &BurnTextManifest, manifest_path: &Path) -> eyre::Result<()> {
+fn validate_manifest_contract(
+    manifest: &BurnTextManifest,
+    manifest_path: &Path,
+) -> eyre::Result<()> {
     ensure!(
         manifest.format_version == 1,
         "Burn text manifest {} used unsupported format_version {}",
@@ -2329,14 +2382,18 @@ fn validate_manifest_contract(manifest: &BurnTextManifest, manifest_path: &Path)
         manifest.num_attention_heads * manifest.head_dim
     );
     ensure!(
-        manifest.num_attention_heads.is_multiple_of(manifest.num_key_value_heads),
+        manifest
+            .num_attention_heads
+            .is_multiple_of(manifest.num_key_value_heads),
         "Burn text manifest {} declared {} attention heads and {} key/value heads, which is not an integer repeat factor",
         manifest_path.display(),
         manifest.num_attention_heads,
         manifest.num_key_value_heads
     );
     ensure!(
-        manifest.linear_num_value_heads.is_multiple_of(manifest.linear_num_key_heads),
+        manifest
+            .linear_num_value_heads
+            .is_multiple_of(manifest.linear_num_key_heads),
         "Burn text manifest {} declared {} linear value heads and {} linear key heads, which is not an integer repeat factor",
         manifest_path.display(),
         manifest.linear_num_value_heads,
@@ -2387,17 +2444,26 @@ fn validate_manifest_contract(manifest: &BurnTextManifest, manifest_path: &Path)
                 validate_manifest_tensor_shape(
                     manifest,
                     &format!("{prefix}.self_attn.q_proj.weight"),
-                    &[manifest.num_attention_heads * manifest.head_dim * 2, manifest.hidden_size],
+                    &[
+                        manifest.num_attention_heads * manifest.head_dim * 2,
+                        manifest.hidden_size,
+                    ],
                 )?;
                 validate_manifest_tensor_shape(
                     manifest,
                     &format!("{prefix}.self_attn.k_proj.weight"),
-                    &[manifest.num_key_value_heads * manifest.head_dim, manifest.hidden_size],
+                    &[
+                        manifest.num_key_value_heads * manifest.head_dim,
+                        manifest.hidden_size,
+                    ],
                 )?;
                 validate_manifest_tensor_shape(
                     manifest,
                     &format!("{prefix}.self_attn.v_proj.weight"),
-                    &[manifest.num_key_value_heads * manifest.head_dim, manifest.hidden_size],
+                    &[
+                        manifest.num_key_value_heads * manifest.head_dim,
+                        manifest.hidden_size,
+                    ],
                 )?;
                 validate_manifest_tensor_shape(
                     manifest,
@@ -2620,7 +2686,11 @@ fn export_burn_text_weights_from_source_snapshot(
 
     let result = (|| {
         let index_path = source_snapshot_dir.join(SOURCE_SAFETENSORS_INDEX_FILE_NAME);
-        download_hugging_face_repo_file(source_model_id, SOURCE_SAFETENSORS_INDEX_FILE_NAME, &index_path)?;
+        download_hugging_face_repo_file(
+            source_model_id,
+            SOURCE_SAFETENSORS_INDEX_FILE_NAME,
+            &index_path,
+        )?;
         let index = load_source_safetensors_index(&index_path)?;
         let layer_types = text_config.layer_types.clone();
         let source_prefix = resolve_source_tensor_prefix(&index.weight_map)?;
@@ -2863,7 +2933,10 @@ fn build_burn_export_manifest(
         format_version: 1,
         architecture: require_export_string(config.model_type.as_ref(), "text_config.model_type")?,
         source_model_id: source_model_id.to_owned(),
-        text_model_type: require_export_string(config.model_type.as_ref(), "text_config.model_type")?,
+        text_model_type: require_export_string(
+            config.model_type.as_ref(),
+            "text_config.model_type",
+        )?,
         vocab_size: require_export_usize(config.vocab_size, "text_config.vocab_size")?,
         hidden_size: require_export_usize(config.hidden_size, "text_config.hidden_size")?,
         intermediate_size: require_export_usize(
@@ -2937,7 +3010,10 @@ fn resolve_export_rope_theta(config: &BurnExportTextConfigFile) -> eyre::Result<
     {
         return Ok(rope_theta);
     }
-    require_export_f64(config.rope_theta, "text_config.rope_theta or text_config.rope_parameters.rope_theta")
+    require_export_f64(
+        config.rope_theta,
+        "text_config.rope_theta or text_config.rope_parameters.rope_theta",
+    )
 }
 
 fn write_burn_export_bundle(
@@ -2949,12 +3025,13 @@ fn write_burn_export_bundle(
     required_tensors: &BTreeMap<String, String>,
 ) -> eyre::Result<LlmReferenceBurnTextExportReport> {
     let packed_tensor_path = output_dir.join("tensors.bin");
-    let mut packed_tensor_file = std::fs::File::create(&packed_tensor_path).wrap_err_with(|| {
-        format!(
-            "Failed to create packed Burn text tensor file {}",
-            packed_tensor_path.display()
-        )
-    })?;
+    let mut packed_tensor_file =
+        std::fs::File::create(&packed_tensor_path).wrap_err_with(|| {
+            format!(
+                "Failed to create packed Burn text tensor file {}",
+                packed_tensor_path.display()
+            )
+        })?;
     let mut shard_cache = HashMap::<String, Mmap>::new();
 
     for (canonical_name, source_name) in required_tensors {
@@ -2964,12 +3041,13 @@ fn write_burn_export_bundle(
         let mmap = if let Some(existing) = shard_cache.get(shard_name) {
             existing
         } else {
-            let file = std::fs::File::open(source_snapshot_dir.join(shard_name)).wrap_err_with(|| {
-                format!(
-                    "Failed to open source safetensors shard {}",
-                    source_snapshot_dir.join(shard_name).display()
-                )
-            })?;
+            let file =
+                std::fs::File::open(source_snapshot_dir.join(shard_name)).wrap_err_with(|| {
+                    format!(
+                        "Failed to open source safetensors shard {}",
+                        source_snapshot_dir.join(shard_name).display()
+                    )
+                })?;
             let mmap = unsafe { Mmap::map(&file) }.wrap_err_with(|| {
                 format!(
                     "Failed to memory-map source safetensors shard {}",
@@ -3030,7 +3108,12 @@ fn write_burn_export_bundle(
             )
         })?,
     )
-    .wrap_err_with(|| format!("Failed to write Burn text manifest {}", manifest_path.display()))?;
+    .wrap_err_with(|| {
+        format!(
+            "Failed to write Burn text manifest {}",
+            manifest_path.display()
+        )
+    })?;
 
     Ok(LlmReferenceBurnTextExportReport {
         ok: true,
@@ -3163,10 +3246,37 @@ pub fn generate_with_burn_text_runtime(
     prompt_token_ids: &[u32],
     options: &BurnTextGenerationOptions,
 ) -> eyre::Result<BurnTextGenerationReport> {
+    generate_with_burn_text_runtime_inner(artifacts, prompt_token_ids, options, None)
+}
+
+/// # Errors
+///
+/// This function will return an error if the Burn text runtime is missing, the prompt cannot be
+/// generated, or generated text cannot be written to `writer`.
+pub fn generate_with_burn_text_runtime_to_writer(
+    artifacts: &LlmModelArtifacts,
+    prompt_token_ids: &[u32],
+    options: &BurnTextGenerationOptions,
+    writer: &mut dyn Write,
+) -> eyre::Result<BurnTextGenerationReport> {
+    generate_with_burn_text_runtime_inner(artifacts, prompt_token_ids, options, Some(writer))
+}
+
+fn generate_with_burn_text_runtime_inner(
+    artifacts: &LlmModelArtifacts,
+    prompt_token_ids: &[u32],
+    options: &BurnTextGenerationOptions,
+    mut token_writer: Option<&mut dyn Write>,
+) -> eyre::Result<BurnTextGenerationReport> {
     let generation_mode = burn_text_generation_mode();
     if burn_text_prefers_cuda_by_default()
-        && let Some(report) =
-            try_generate_with_cuda_backend(artifacts, prompt_token_ids, options, generation_mode)?
+        && let Some(report) = try_generate_with_cuda_backend(
+            artifacts,
+            prompt_token_ids,
+            options,
+            generation_mode,
+            &mut token_writer,
+        )?
     {
         return Ok(report);
     }
@@ -3177,6 +3287,7 @@ pub fn generate_with_burn_text_runtime(
         generation_mode,
         NdArrayDevice::default(),
         "cpu-ndarray",
+        &mut token_writer,
     )
 }
 
@@ -3190,11 +3301,8 @@ pub fn compare_with_incremental_burn_text_runtime(
     options: &BurnTextGenerationOptions,
 ) -> eyre::Result<BurnTextIncrementalComparisonReport> {
     if burn_text_prefers_cuda_by_default()
-        && let Some(report) = try_compare_with_incremental_cuda_backend(
-            artifacts,
-            prompt_token_ids,
-            options,
-        )?
+        && let Some(report) =
+            try_compare_with_incremental_cuda_backend(artifacts, prompt_token_ids, options)?
     {
         return Ok(report);
     }
@@ -3260,7 +3368,8 @@ pub fn collect_full_layer_outputs_burn_text_runtime(
     prompt_token_ids: &[u32],
 ) -> eyre::Result<BurnTextLayerOutputsReport> {
     if burn_text_prefers_cuda_by_default()
-        && let Some(report) = try_collect_full_layer_outputs_cuda_backend(artifacts, prompt_token_ids)?
+        && let Some(report) =
+            try_collect_full_layer_outputs_cuda_backend(artifacts, prompt_token_ids)?
     {
         return Ok(report);
     }
@@ -3301,6 +3410,7 @@ fn generate_with_selected_burn_text_runtime_on_device<B: Backend>(
     generation_mode: BurnTextGenerationMode,
     device: B::Device,
     backend_label: &str,
+    token_writer: &mut Option<&mut dyn Write>,
 ) -> eyre::Result<BurnTextGenerationReport> {
     match generation_mode {
         BurnTextGenerationMode::Full => generate_with_burn_text_runtime_on_device::<B>(
@@ -3309,6 +3419,7 @@ fn generate_with_selected_burn_text_runtime_on_device<B: Backend>(
             options,
             device,
             backend_label,
+            token_writer,
         ),
         BurnTextGenerationMode::Incremental => {
             generate_with_incremental_burn_text_runtime_on_device::<B>(
@@ -3317,6 +3428,7 @@ fn generate_with_selected_burn_text_runtime_on_device<B: Backend>(
                 options,
                 device,
                 backend_label,
+                token_writer,
             )
         }
         BurnTextGenerationMode::Hybrid => generate_with_hybrid_burn_text_runtime_on_device::<B>(
@@ -3325,6 +3437,7 @@ fn generate_with_selected_burn_text_runtime_on_device<B: Backend>(
             options,
             device,
             backend_label,
+            token_writer,
         ),
     }
 }
@@ -3334,6 +3447,7 @@ fn try_generate_with_cuda_backend(
     prompt_token_ids: &[u32],
     options: &BurnTextGenerationOptions,
     generation_mode: BurnTextGenerationMode,
+    token_writer: &mut Option<&mut dyn Write>,
 ) -> eyre::Result<Option<BurnTextGenerationReport>> {
     let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         generate_with_selected_burn_text_runtime_on_device::<LlmCudaBackend>(
@@ -3343,6 +3457,7 @@ fn try_generate_with_cuda_backend(
             generation_mode,
             llm_inference_cuda_device(),
             "cuda",
+            token_writer,
         )
     }));
     match attempt {
@@ -3506,12 +3621,14 @@ fn compare_with_incremental_burn_text_runtime_on_device<B: Backend>(
         !prompt_token_ids.is_empty(),
         "Burn incremental comparison expected at least one prompt token"
     );
+    let mut token_writer = None;
     let full = generate_with_burn_text_runtime_on_device::<B>(
         artifacts,
         prompt_token_ids,
         options,
         device.clone(),
         backend_label,
+        &mut token_writer,
     )?;
     let incremental = generate_with_incremental_burn_text_runtime_on_device::<B>(
         artifacts,
@@ -3519,6 +3636,7 @@ fn compare_with_incremental_burn_text_runtime_on_device<B: Backend>(
         options,
         device,
         backend_label,
+        &mut token_writer,
     )?;
     let first_mismatch_index =
         first_mismatch_index(&full.generated_token_ids, &incremental.generated_token_ids);
@@ -3595,8 +3713,10 @@ fn diagnose_incremental_layers_burn_text_runtime_on_device<B: Backend>(
         incremental_outputs.len()
     );
     let mut layer_differences = Vec::with_capacity(full_outputs.len());
-    for (layer_index, (full_hidden, incremental_hidden)) in
-        full_outputs.iter().zip(incremental_outputs.iter()).enumerate()
+    for (layer_index, (full_hidden, incremental_hidden)) in full_outputs
+        .iter()
+        .zip(incremental_outputs.iter())
+        .enumerate()
     {
         layer_differences.push(BurnTextLayerHiddenDifference {
             layer_index,
@@ -3649,6 +3769,7 @@ fn generate_with_burn_text_runtime_on_device<B: Backend>(
     options: &BurnTextGenerationOptions,
     device: B::Device,
     backend_label: &str,
+    token_writer: &mut Option<&mut dyn Write>,
 ) -> eyre::Result<BurnTextGenerationReport> {
     llm_tracy_zone!("llm_burn_generate");
     #[cfg(feature = "extended_observability")]
@@ -3665,13 +3786,14 @@ fn generate_with_burn_text_runtime_on_device<B: Backend>(
     let deadline = GenerationDeadline::new(options.generation_timeout);
     let _deadline_scope = deadline.enter_scope(options.max_new_tokens);
     let runtime = Qwen35TextRuntime::<B>::load(artifacts, device)?;
-    let tokenizer = tokenizers::Tokenizer::from_file(&artifacts.tokenizer_path).map_err(|error| {
-        eyre::eyre!(
-            "Failed to load tokenizer from {}: {}",
-            artifacts.tokenizer_path.display(),
-            error
-        )
-    })?;
+    let tokenizer =
+        tokenizers::Tokenizer::from_file(&artifacts.tokenizer_path).map_err(|error| {
+            eyre::eyre!(
+                "Failed to load tokenizer from {}: {}",
+                artifacts.tokenizer_path.display(),
+                error
+            )
+        })?;
     let eos_token_id = load_tokenizer_config_summary(&artifacts.tokenizer_config_path)?
         .eos_token
         .as_deref()
@@ -3683,6 +3805,7 @@ fn generate_with_burn_text_runtime_on_device<B: Backend>(
         .map(|token_id| usize::try_from(token_id).unwrap_or(usize::MAX))
         .collect::<Vec<_>>();
     let mut generated_token_ids = Vec::new();
+    let mut emitted_text_len = 0_usize;
     for token_index in 0..options.max_new_tokens {
         deadline.update_progress(generated_token_ids.len(), options.max_new_tokens);
         deadline.check(generated_token_ids.len(), options.max_new_tokens)?;
@@ -3705,6 +3828,12 @@ fn generate_with_burn_text_runtime_on_device<B: Backend>(
         let next_token_id = runtime.greedy_next_token(hidden_states)?;
         trace_burn_text_runtime(&format!("selected token id {next_token_id}"));
         generated_token_ids.push(next_token_id);
+        emit_generated_token_text(
+            &tokenizer,
+            &generated_token_ids,
+            &mut emitted_text_len,
+            token_writer,
+        )?;
         deadline.update_progress(generated_token_ids.len(), options.max_new_tokens);
         all_token_ids.push(next_token_id);
         deadline.check(generated_token_ids.len(), options.max_new_tokens)?;
@@ -3726,6 +3855,7 @@ fn generate_with_incremental_burn_text_runtime_on_device<B: Backend>(
     options: &BurnTextGenerationOptions,
     device: B::Device,
     backend_label: &str,
+    token_writer: &mut Option<&mut dyn Write>,
 ) -> eyre::Result<BurnTextGenerationReport> {
     llm_tracy_zone!("llm_burn_generate_incremental");
     #[cfg(feature = "extended_observability")]
@@ -3746,13 +3876,14 @@ fn generate_with_incremental_burn_text_runtime_on_device<B: Backend>(
         "Burn text incremental runtime expected at least one prompt token"
     );
     let runtime = Qwen35TextRuntime::<B>::load(artifacts, device)?;
-    let tokenizer = tokenizers::Tokenizer::from_file(&artifacts.tokenizer_path).map_err(|error| {
-        eyre::eyre!(
-            "Failed to load tokenizer from {}: {}",
-            artifacts.tokenizer_path.display(),
-            error
-        )
-    })?;
+    let tokenizer =
+        tokenizers::Tokenizer::from_file(&artifacts.tokenizer_path).map_err(|error| {
+            eyre::eyre!(
+                "Failed to load tokenizer from {}: {}",
+                artifacts.tokenizer_path.display(),
+                error
+            )
+        })?;
     let eos_token_id = load_tokenizer_config_summary(&artifacts.tokenizer_config_path)?
         .eos_token
         .as_deref()
@@ -3773,6 +3904,7 @@ fn generate_with_incremental_burn_text_runtime_on_device<B: Backend>(
     }
 
     let mut generated_token_ids = Vec::new();
+    let mut emitted_text_len = 0_usize;
     for token_index in 0..options.max_new_tokens {
         deadline.update_progress(generated_token_ids.len(), options.max_new_tokens);
         deadline.check(generated_token_ids.len(), options.max_new_tokens)?;
@@ -3782,10 +3914,14 @@ fn generate_with_incremental_burn_text_runtime_on_device<B: Backend>(
             decode_state.processed_token_count
         ));
         let next_token_id = runtime.greedy_next_token_from_hidden(&last_hidden)?;
-        trace_burn_text_runtime(&format!(
-            "incremental selected token id {next_token_id}"
-        ));
+        trace_burn_text_runtime(&format!("incremental selected token id {next_token_id}"));
         generated_token_ids.push(next_token_id);
+        emit_generated_token_text(
+            &tokenizer,
+            &generated_token_ids,
+            &mut emitted_text_len,
+            token_writer,
+        )?;
         deadline.update_progress(generated_token_ids.len(), options.max_new_tokens);
         deadline.check(generated_token_ids.len(), options.max_new_tokens)?;
         if eos_token_id.is_some_and(|eos_token_id| eos_token_id == next_token_id) {
@@ -3811,6 +3947,7 @@ fn generate_with_hybrid_burn_text_runtime_on_device<B: Backend>(
     options: &BurnTextGenerationOptions,
     device: B::Device,
     backend_label: &str,
+    token_writer: &mut Option<&mut dyn Write>,
 ) -> eyre::Result<BurnTextGenerationReport> {
     llm_tracy_zone!("llm_burn_generate_hybrid");
     #[cfg(feature = "extended_observability")]
@@ -3839,17 +3976,19 @@ fn generate_with_hybrid_burn_text_runtime_on_device<B: Backend>(
             options,
             device,
             backend_label,
+            token_writer,
         );
     }
 
     let runtime = Qwen35TextRuntime::<B>::load(artifacts, device)?;
-    let tokenizer = tokenizers::Tokenizer::from_file(&artifacts.tokenizer_path).map_err(|error| {
-        eyre::eyre!(
-            "Failed to load tokenizer from {}: {}",
-            artifacts.tokenizer_path.display(),
-            error
-        )
-    })?;
+    let tokenizer =
+        tokenizers::Tokenizer::from_file(&artifacts.tokenizer_path).map_err(|error| {
+            eyre::eyre!(
+                "Failed to load tokenizer from {}: {}",
+                artifacts.tokenizer_path.display(),
+                error
+            )
+        })?;
     let eos_token_id = load_tokenizer_config_summary(&artifacts.tokenizer_config_path)?
         .eos_token
         .as_deref()
@@ -3861,12 +4000,20 @@ fn generate_with_hybrid_burn_text_runtime_on_device<B: Backend>(
         "hybrid generating token 1 with prompt length {}",
         prompt_token_ids.len()
     ));
-    let (hidden_states, mut decode_state) = runtime
-        .forward_hidden_states_with_decode_state(runtime.embedding_hidden_states(prompt_token_ids)?)?;
+    let (hidden_states, mut decode_state) = runtime.forward_hidden_states_with_decode_state(
+        runtime.embedding_hidden_states(prompt_token_ids)?,
+    )?;
     trace_burn_text_runtime("hybrid decoder stack complete; scanning lm_head");
     let first_token_id = runtime.greedy_next_token(hidden_states)?;
     trace_burn_text_runtime(&format!("hybrid selected token id {first_token_id}"));
     let mut generated_token_ids = vec![first_token_id];
+    let mut emitted_text_len = 0_usize;
+    emit_generated_token_text(
+        &tokenizer,
+        &generated_token_ids,
+        &mut emitted_text_len,
+        token_writer,
+    )?;
     deadline.update_progress(generated_token_ids.len(), options.max_new_tokens);
     deadline.check(generated_token_ids.len(), options.max_new_tokens)?;
     if eos_token_id.is_some_and(|eos_token_id| eos_token_id == first_token_id)
@@ -3897,10 +4044,14 @@ fn generate_with_hybrid_burn_text_runtime_on_device<B: Backend>(
             decode_state.processed_token_count
         ));
         let next_token_id = runtime.greedy_next_token_from_hidden(&last_hidden)?;
-        trace_burn_text_runtime(&format!(
-            "hybrid selected token id {next_token_id}"
-        ));
+        trace_burn_text_runtime(&format!("hybrid selected token id {next_token_id}"));
         generated_token_ids.push(next_token_id);
+        emit_generated_token_text(
+            &tokenizer,
+            &generated_token_ids,
+            &mut emitted_text_len,
+            token_writer,
+        )?;
         deadline.update_progress(generated_token_ids.len(), options.max_new_tokens);
         deadline.check(generated_token_ids.len(), options.max_new_tokens)?;
         if eos_token_id.is_some_and(|eos_token_id| eos_token_id == next_token_id) {
@@ -3934,6 +4085,31 @@ fn decode_token_ids_with_tokenizer(
     tokenizer
         .decode(&token_ids, skip_special_tokens)
         .map_err(|error| eyre::eyre!("Failed to decode generated token ids: {}", error))
+}
+
+fn emit_generated_token_text(
+    tokenizer: &tokenizers::Tokenizer,
+    generated_token_ids: &[usize],
+    emitted_text_len: &mut usize,
+    writer: &mut Option<&mut dyn Write>,
+) -> eyre::Result<()> {
+    let Some(writer) = writer.as_mut() else {
+        return Ok(());
+    };
+    let decoded = decode_token_ids_with_tokenizer(tokenizer, generated_token_ids, false)?;
+    if *emitted_text_len > decoded.len() {
+        *emitted_text_len = 0;
+    }
+    if let Some(new_text) = decoded.get(*emitted_text_len..) {
+        (*writer)
+            .write_all(new_text.as_bytes())
+            .wrap_err("Failed to stream generated LLM token text")?;
+        (*writer)
+            .flush()
+            .wrap_err("Failed to flush generated LLM token text")?;
+        *emitted_text_len = decoded.len();
+    }
+    Ok(())
 }
 
 fn trace_burn_text_runtime(message: &str) {
@@ -4013,10 +4189,18 @@ fn incremental_layer_outputs_for_prompt<B: Backend>(
     Ok(last_outputs)
 }
 
-fn last_hidden_from_hidden_states<B: Backend>(hidden_states: Tensor<B, 3>) -> eyre::Result<Vec<f32>> {
+fn last_hidden_from_hidden_states<B: Backend>(
+    hidden_states: Tensor<B, 3>,
+) -> eyre::Result<Vec<f32>> {
     let [batch_size, seq_len, hidden_size] = hidden_states.dims();
-    ensure!(batch_size == 1, "Qwen3.5 hidden comparison expected batch size 1");
-    ensure!(seq_len > 0, "Qwen3.5 hidden comparison expected at least one timestep");
+    ensure!(
+        batch_size == 1,
+        "Qwen3.5 hidden comparison expected batch size 1"
+    );
+    ensure!(
+        seq_len > 0,
+        "Qwen3.5 hidden comparison expected at least one timestep"
+    );
     tensor_to_vec_f32(&hidden_states)?
         .chunks_exact(hidden_size)
         .last()
@@ -4087,7 +4271,10 @@ fn tensor_1d_from_bytes<B: Backend>(
                 .map(|chunk| u16::from_ne_bytes([chunk[0], chunk[1]]))
                 .collect::<Vec<_>>();
             let values: &[f16] = words.reinterpret_cast();
-            Ok(Tensor::from_data(TensorData::new(values.to_vec(), [dim]), device))
+            Ok(Tensor::from_data(
+                TensorData::new(values.to_vec(), [dim]),
+                device,
+            ))
         }
         "bfloat16" | "bf16" => {
             ensure!(
@@ -4100,7 +4287,10 @@ fn tensor_1d_from_bytes<B: Backend>(
                 .map(|chunk| u16::from_ne_bytes([chunk[0], chunk[1]]))
                 .collect::<Vec<_>>();
             let values: &[bf16] = words.reinterpret_cast();
-            Ok(Tensor::from_data(TensorData::new(values.to_vec(), [dim]), device))
+            Ok(Tensor::from_data(
+                TensorData::new(values.to_vec(), [dim]),
+                device,
+            ))
         }
         "float32" | "f32" => {
             ensure!(
@@ -4112,7 +4302,10 @@ fn tensor_1d_from_bytes<B: Backend>(
                 .chunks_exact(4)
                 .map(|chunk| f32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
                 .collect::<Vec<_>>();
-            Ok(Tensor::from_data(TensorData::new(values.to_vec(), [dim]), device))
+            Ok(Tensor::from_data(
+                TensorData::new(values.to_vec(), [dim]),
+                device,
+            ))
         }
         other => bail!("Unsupported Burn text tensor dtype `{other}`"),
     }
@@ -4136,7 +4329,10 @@ fn tensor_2d_from_bytes<B: Backend>(
                 .map(|chunk| u16::from_ne_bytes([chunk[0], chunk[1]]))
                 .collect::<Vec<_>>();
             let values: &[f16] = words.reinterpret_cast();
-            Ok(Tensor::from_data(TensorData::new(values.to_vec(), shape), device))
+            Ok(Tensor::from_data(
+                TensorData::new(values.to_vec(), shape),
+                device,
+            ))
         }
         "bfloat16" | "bf16" => {
             ensure!(
@@ -4149,7 +4345,10 @@ fn tensor_2d_from_bytes<B: Backend>(
                 .map(|chunk| u16::from_ne_bytes([chunk[0], chunk[1]]))
                 .collect::<Vec<_>>();
             let values: &[bf16] = words.reinterpret_cast();
-            Ok(Tensor::from_data(TensorData::new(values.to_vec(), shape), device))
+            Ok(Tensor::from_data(
+                TensorData::new(values.to_vec(), shape),
+                device,
+            ))
         }
         "float32" | "f32" => {
             ensure!(
@@ -4161,7 +4360,10 @@ fn tensor_2d_from_bytes<B: Backend>(
                 .chunks_exact(4)
                 .map(|chunk| f32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
                 .collect::<Vec<_>>();
-            Ok(Tensor::from_data(TensorData::new(values.to_vec(), shape), device))
+            Ok(Tensor::from_data(
+                TensorData::new(values.to_vec(), shape),
+                device,
+            ))
         }
         other => bail!("Unsupported Burn text tensor dtype `{other}`"),
     }
@@ -4370,10 +4572,7 @@ fn softmax_scalars(values: &[f32]) -> Vec<f32> {
     if values.is_empty() {
         return Vec::new();
     }
-    let max_value = values
-        .iter()
-        .copied()
-        .fold(f32::NEG_INFINITY, f32::max);
+    let max_value = values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     let mut exp_values = values
         .iter()
         .copied()
@@ -4420,13 +4619,8 @@ fn qwen_rms_norm(
 ) -> eyre::Result<Vec<f32>> {
     llm_tracy_zone!("llm_burn_qwen_rms_norm");
     #[cfg(feature = "extended_observability")]
-    let _span = tracing::debug_span!(
-        "llm_burn_qwen_rms_norm",
-        batch_size,
-        seq_len,
-        hidden_size
-    )
-    .entered();
+    let _span =
+        tracing::debug_span!("llm_burn_qwen_rms_norm", batch_size, seq_len, hidden_size).entered();
     ensure!(
         weight.len() == hidden_size,
         "Qwen RMSNorm expected {} weights but found {}",
@@ -4444,7 +4638,11 @@ fn qwen_rms_norm(
     );
     let mut output = Vec::with_capacity(values.len());
     for chunk in values.chunks_exact(chunk_len) {
-        let variance = chunk.iter().copied().map(|value| value * value).sum::<f32>()
+        let variance = chunk
+            .iter()
+            .copied()
+            .map(|value| value * value)
+            .sum::<f32>()
             / chunk_len as f32;
         let scale = (variance + eps).sqrt().recip();
         for (index, value) in chunk.iter().copied().enumerate() {
@@ -4487,7 +4685,11 @@ fn qwen_rms_norm_no_center(
     );
     let mut output = Vec::with_capacity(values.len());
     for chunk in values.chunks_exact(head_dim) {
-        let variance = chunk.iter().copied().map(|value| value * value).sum::<f32>()
+        let variance = chunk
+            .iter()
+            .copied()
+            .map(|value| value * value)
+            .sum::<f32>()
             / head_dim as f32;
         let scale = (variance + eps).sqrt().recip();
         for (index, value) in chunk.iter().copied().enumerate() {
@@ -4548,7 +4750,8 @@ fn qwen_rms_norm_gated(
             / head_dim as f32;
         let scale = (variance + eps).sqrt().recip();
         for index in 0..head_dim {
-            output.push(value_chunk[index] * scale * weight[index] * silu_scalar(gate_chunk[index]));
+            output
+                .push(value_chunk[index] * scale * weight[index] * silu_scalar(gate_chunk[index]));
         }
     }
     Ok(output)
@@ -4563,7 +4766,10 @@ struct RotaryEmbeddings {
 }
 
 #[allow(dead_code)]
-fn rotary_embeddings(seq_len: usize, manifest: &BurnTextManifest) -> eyre::Result<RotaryEmbeddings> {
+fn rotary_embeddings(
+    seq_len: usize,
+    manifest: &BurnTextManifest,
+) -> eyre::Result<RotaryEmbeddings> {
     let rotary_dim = (manifest.head_dim as f64 * manifest.partial_rotary_factor).round() as usize;
     ensure!(
         rotary_dim > 0 && rotary_dim <= manifest.head_dim && rotary_dim.is_multiple_of(2),
@@ -4653,11 +4859,21 @@ fn apply_rotary_embeddings(
         let sin = &embeddings.sin[position * rotary_dim..(position + 1) * rotary_dim];
         for head in 0..manifest.num_attention_heads {
             let base = (position * manifest.num_attention_heads + head) * manifest.head_dim;
-            apply_rotary_slice(&mut query_out[base..base + manifest.head_dim], cos, sin, half_dim);
+            apply_rotary_slice(
+                &mut query_out[base..base + manifest.head_dim],
+                cos,
+                sin,
+                half_dim,
+            );
         }
         for head in 0..manifest.num_key_value_heads {
             let base = (position * manifest.num_key_value_heads + head) * manifest.head_dim;
-            apply_rotary_slice(&mut key_out[base..base + manifest.head_dim], cos, sin, half_dim);
+            apply_rotary_slice(
+                &mut key_out[base..base + manifest.head_dim],
+                cos,
+                sin,
+                half_dim,
+            );
         }
     }
     Ok((query_out, key_out))
@@ -4709,7 +4925,12 @@ fn apply_rotary_embedding_single_position(
     }
     for head in 0..head_count {
         let base = head * manifest.head_dim;
-        apply_rotary_slice(&mut values[base..base + manifest.head_dim], &cos, &sin, half_dim);
+        apply_rotary_slice(
+            &mut values[base..base + manifest.head_dim],
+            &cos,
+            &sin,
+            half_dim,
+        );
     }
     Ok(())
 }
@@ -4787,7 +5008,8 @@ fn l2_norm_heads(
 ) -> eyre::Result<Vec<f32>> {
     llm_tracy_zone!("llm_burn_l2_norm_heads");
     #[cfg(feature = "extended_observability")]
-    let _span = tracing::debug_span!("llm_burn_l2_norm_heads", seq_len, num_heads, head_dim).entered();
+    let _span =
+        tracing::debug_span!("llm_burn_l2_norm_heads", seq_len, num_heads, head_dim).entered();
     ensure!(
         values.len() == seq_len * num_heads * head_dim,
         "L2 head norm input length {} did not match {}x{}x{}",
@@ -4798,7 +5020,12 @@ fn l2_norm_heads(
     );
     let mut output = Vec::with_capacity(values.len());
     for chunk in values.chunks_exact(head_dim) {
-        let norm = chunk.iter().copied().map(|value| value * value).sum::<f32>() + 1e-6;
+        let norm = chunk
+            .iter()
+            .copied()
+            .map(|value| value * value)
+            .sum::<f32>()
+            + 1e-6;
         let inv_norm = norm.sqrt().recip();
         for value in chunk {
             output.push(*value * inv_norm);
@@ -5108,9 +5335,8 @@ fn recurrent_gated_delta_step(
         for value_index in 0..value_dim {
             let mut sum = 0.0_f32;
             for key_index in 0..key_dim {
-                sum +=
-                    state[state_base + key_index * value_dim + value_index]
-                        * (query[q_base + key_index] * scale);
+                sum += state[state_base + key_index * value_dim + value_index]
+                    * (query[q_base + key_index] * scale);
             }
             output[v_base + value_index] = sum;
         }
@@ -5142,7 +5368,8 @@ fn depthwise_causal_conv1d_silu(
         batch_size == 1,
         "Depthwise causal conv currently expects batch size 1, but found {batch_size}"
     );
-    let [weight_channels, grouped_channels, kernel] = shape_array::<3>(weight_shape, "conv1d.weight")?;
+    let [weight_channels, grouped_channels, kernel] =
+        shape_array::<3>(weight_shape, "conv1d.weight")?;
     ensure!(
         weight_channels == channels && grouped_channels == 1 && kernel == kernel_size,
         "Depthwise causal conv expected weight shape [{channels}, 1, {kernel_size}] but found {:?}",
@@ -5251,16 +5478,16 @@ fn softplus_scalar(value: f32) -> f32 {
 mod tests {
     use super::{
         BURN_TEXT_DIR_NAME, BURN_TEXT_MANIFEST_FILE_NAME, BurnTextManifest, BurnTextTensorSpec,
-        LlmCpuBackend, SOURCE_SAFETENSORS_INDEX_FILE_NAME, apply_rotary_slice, bytes_per_element, causal_mask,
-        decode_bytes_into_f32, dot_product, f16_bits_to_f32, first_mismatch_index,
-        export_burn_text_weights, inspect_burn_text_runtime_status, rotary_embeddings, sigmoid_scalar,
+        LlmCpuBackend, SOURCE_SAFETENSORS_INDEX_FILE_NAME, apply_rotary_slice, bytes_per_element,
+        causal_mask, decode_bytes_into_f32, dot_product, export_burn_text_weights, f16_bits_to_f32,
+        first_mismatch_index, inspect_burn_text_runtime_status, rotary_embeddings, sigmoid_scalar,
         softmax_scalars, softmax_scalars_in_place,
     };
     use crate::model::{
         DEFAULT_LLM_MODEL_NAME, HF_CONFIG_FILE_NAME, MODEL_FILE_NAME, TOKENIZER_CONFIG_FILE_NAME,
         TOKENIZER_FILE_NAME, inspect_model_dir,
     };
-    use safetensors::{Dtype, tensor::TensorView, serialize_to_file};
+    use safetensors::{Dtype, serialize_to_file, tensor::TensorView};
     use std::collections::BTreeMap;
     use tokenizers::{Tokenizer, models::bpe::BPE};
 
@@ -5486,50 +5713,194 @@ mod tests {
             }
         }
 
-        assert!(root.join(BURN_TEXT_DIR_NAME).join(BURN_TEXT_MANIFEST_FILE_NAME).is_file());
+        assert!(
+            root.join(BURN_TEXT_DIR_NAME)
+                .join(BURN_TEXT_MANIFEST_FILE_NAME)
+                .is_file()
+        );
         assert!(root.join(BURN_TEXT_DIR_NAME).join("tensors.bin").is_file());
         assert_eq!(report.tensor_count, 28);
         let manifest = super::load_burn_text_manifest(
-            &root.join(BURN_TEXT_DIR_NAME).join(BURN_TEXT_MANIFEST_FILE_NAME),
+            &root
+                .join(BURN_TEXT_DIR_NAME)
+                .join(BURN_TEXT_MANIFEST_FILE_NAME),
         )
         .expect("load manifest");
-        assert_eq!(manifest.layer_types, vec!["linear_attention", "full_attention"]);
+        assert_eq!(
+            manifest.layer_types,
+            vec!["linear_attention", "full_attention"]
+        );
         assert_eq!(manifest.hidden_size, 4);
         assert_eq!(manifest.tensors.len(), 28);
     }
 
     fn build_fixture_export_tensors() -> BTreeMap<String, TensorView<'static>> {
         let mut tensors = BTreeMap::new();
-        insert_fixture_tensor(&mut tensors, "model.language_model.embed_tokens.weight", &[8, 4], 0.0);
-        insert_fixture_tensor(&mut tensors, "model.language_model.norm.weight", &[4], 100.0);
+        insert_fixture_tensor(
+            &mut tensors,
+            "model.language_model.embed_tokens.weight",
+            &[8, 4],
+            0.0,
+        );
+        insert_fixture_tensor(
+            &mut tensors,
+            "model.language_model.norm.weight",
+            &[4],
+            100.0,
+        );
         insert_fixture_tensor(&mut tensors, "lm_head.weight", &[8, 4], 200.0);
 
-        insert_fixture_tensor(&mut tensors, "model.language_model.layers.0.input_layernorm.weight", &[4], 300.0);
-        insert_fixture_tensor(&mut tensors, "model.language_model.layers.0.post_attention_layernorm.weight", &[4], 310.0);
-        insert_fixture_tensor(&mut tensors, "model.language_model.layers.0.mlp.gate_proj.weight", &[6, 4], 320.0);
-        insert_fixture_tensor(&mut tensors, "model.language_model.layers.0.mlp.up_proj.weight", &[6, 4], 330.0);
-        insert_fixture_tensor(&mut tensors, "model.language_model.layers.0.mlp.down_proj.weight", &[4, 6], 340.0);
-        insert_fixture_tensor(&mut tensors, "model.language_model.layers.0.linear_attn.conv1d.weight", &[6, 1, 2], 350.0);
-        insert_fixture_tensor(&mut tensors, "model.language_model.layers.0.linear_attn.dt_bias", &[1], 360.0);
-        insert_fixture_tensor(&mut tensors, "model.language_model.layers.0.linear_attn.A_log", &[1], 370.0);
-        insert_fixture_tensor(&mut tensors, "model.language_model.layers.0.linear_attn.norm.weight", &[2], 380.0);
-        insert_fixture_tensor(&mut tensors, "model.language_model.layers.0.linear_attn.out_proj.weight", &[4, 2], 390.0);
-        insert_fixture_tensor(&mut tensors, "model.language_model.layers.0.linear_attn.in_proj_qkv.weight", &[6, 4], 400.0);
-        insert_fixture_tensor(&mut tensors, "model.language_model.layers.0.linear_attn.in_proj_z.weight", &[2, 4], 410.0);
-        insert_fixture_tensor(&mut tensors, "model.language_model.layers.0.linear_attn.in_proj_b.weight", &[1, 4], 420.0);
-        insert_fixture_tensor(&mut tensors, "model.language_model.layers.0.linear_attn.in_proj_a.weight", &[1, 4], 430.0);
+        insert_fixture_tensor(
+            &mut tensors,
+            "model.language_model.layers.0.input_layernorm.weight",
+            &[4],
+            300.0,
+        );
+        insert_fixture_tensor(
+            &mut tensors,
+            "model.language_model.layers.0.post_attention_layernorm.weight",
+            &[4],
+            310.0,
+        );
+        insert_fixture_tensor(
+            &mut tensors,
+            "model.language_model.layers.0.mlp.gate_proj.weight",
+            &[6, 4],
+            320.0,
+        );
+        insert_fixture_tensor(
+            &mut tensors,
+            "model.language_model.layers.0.mlp.up_proj.weight",
+            &[6, 4],
+            330.0,
+        );
+        insert_fixture_tensor(
+            &mut tensors,
+            "model.language_model.layers.0.mlp.down_proj.weight",
+            &[4, 6],
+            340.0,
+        );
+        insert_fixture_tensor(
+            &mut tensors,
+            "model.language_model.layers.0.linear_attn.conv1d.weight",
+            &[6, 1, 2],
+            350.0,
+        );
+        insert_fixture_tensor(
+            &mut tensors,
+            "model.language_model.layers.0.linear_attn.dt_bias",
+            &[1],
+            360.0,
+        );
+        insert_fixture_tensor(
+            &mut tensors,
+            "model.language_model.layers.0.linear_attn.A_log",
+            &[1],
+            370.0,
+        );
+        insert_fixture_tensor(
+            &mut tensors,
+            "model.language_model.layers.0.linear_attn.norm.weight",
+            &[2],
+            380.0,
+        );
+        insert_fixture_tensor(
+            &mut tensors,
+            "model.language_model.layers.0.linear_attn.out_proj.weight",
+            &[4, 2],
+            390.0,
+        );
+        insert_fixture_tensor(
+            &mut tensors,
+            "model.language_model.layers.0.linear_attn.in_proj_qkv.weight",
+            &[6, 4],
+            400.0,
+        );
+        insert_fixture_tensor(
+            &mut tensors,
+            "model.language_model.layers.0.linear_attn.in_proj_z.weight",
+            &[2, 4],
+            410.0,
+        );
+        insert_fixture_tensor(
+            &mut tensors,
+            "model.language_model.layers.0.linear_attn.in_proj_b.weight",
+            &[1, 4],
+            420.0,
+        );
+        insert_fixture_tensor(
+            &mut tensors,
+            "model.language_model.layers.0.linear_attn.in_proj_a.weight",
+            &[1, 4],
+            430.0,
+        );
 
-        insert_fixture_tensor(&mut tensors, "model.language_model.layers.1.input_layernorm.weight", &[4], 440.0);
-        insert_fixture_tensor(&mut tensors, "model.language_model.layers.1.post_attention_layernorm.weight", &[4], 450.0);
-        insert_fixture_tensor(&mut tensors, "model.language_model.layers.1.mlp.gate_proj.weight", &[6, 4], 460.0);
-        insert_fixture_tensor(&mut tensors, "model.language_model.layers.1.mlp.up_proj.weight", &[6, 4], 470.0);
-        insert_fixture_tensor(&mut tensors, "model.language_model.layers.1.mlp.down_proj.weight", &[4, 6], 480.0);
-        insert_fixture_tensor(&mut tensors, "model.language_model.layers.1.self_attn.q_proj.weight", &[8, 4], 490.0);
-        insert_fixture_tensor(&mut tensors, "model.language_model.layers.1.self_attn.k_proj.weight", &[4, 4], 500.0);
-        insert_fixture_tensor(&mut tensors, "model.language_model.layers.1.self_attn.v_proj.weight", &[4, 4], 510.0);
-        insert_fixture_tensor(&mut tensors, "model.language_model.layers.1.self_attn.o_proj.weight", &[4, 4], 520.0);
-        insert_fixture_tensor(&mut tensors, "model.language_model.layers.1.self_attn.q_norm.weight", &[4], 530.0);
-        insert_fixture_tensor(&mut tensors, "model.language_model.layers.1.self_attn.k_norm.weight", &[4], 540.0);
+        insert_fixture_tensor(
+            &mut tensors,
+            "model.language_model.layers.1.input_layernorm.weight",
+            &[4],
+            440.0,
+        );
+        insert_fixture_tensor(
+            &mut tensors,
+            "model.language_model.layers.1.post_attention_layernorm.weight",
+            &[4],
+            450.0,
+        );
+        insert_fixture_tensor(
+            &mut tensors,
+            "model.language_model.layers.1.mlp.gate_proj.weight",
+            &[6, 4],
+            460.0,
+        );
+        insert_fixture_tensor(
+            &mut tensors,
+            "model.language_model.layers.1.mlp.up_proj.weight",
+            &[6, 4],
+            470.0,
+        );
+        insert_fixture_tensor(
+            &mut tensors,
+            "model.language_model.layers.1.mlp.down_proj.weight",
+            &[4, 6],
+            480.0,
+        );
+        insert_fixture_tensor(
+            &mut tensors,
+            "model.language_model.layers.1.self_attn.q_proj.weight",
+            &[8, 4],
+            490.0,
+        );
+        insert_fixture_tensor(
+            &mut tensors,
+            "model.language_model.layers.1.self_attn.k_proj.weight",
+            &[4, 4],
+            500.0,
+        );
+        insert_fixture_tensor(
+            &mut tensors,
+            "model.language_model.layers.1.self_attn.v_proj.weight",
+            &[4, 4],
+            510.0,
+        );
+        insert_fixture_tensor(
+            &mut tensors,
+            "model.language_model.layers.1.self_attn.o_proj.weight",
+            &[4, 4],
+            520.0,
+        );
+        insert_fixture_tensor(
+            &mut tensors,
+            "model.language_model.layers.1.self_attn.q_norm.weight",
+            &[4],
+            530.0,
+        );
+        insert_fixture_tensor(
+            &mut tensors,
+            "model.language_model.layers.1.self_attn.k_norm.weight",
+            &[4],
+            540.0,
+        );
         tensors
     }
 
@@ -5551,7 +5922,12 @@ mod tests {
     fn build_fixture_safetensors_index_json(weight_names: Vec<String>) -> String {
         let weight_map = weight_names
             .into_iter()
-            .map(|name| format!(r#""{}":"model.safetensors-00001-of-00001.safetensors""#, name))
+            .map(|name| {
+                format!(
+                    r#""{}":"model.safetensors-00001-of-00001.safetensors""#,
+                    name
+                )
+            })
             .collect::<Vec<_>>()
             .join(",");
         format!(r#"{{"weight_map":{{{weight_map}}}}}"#)

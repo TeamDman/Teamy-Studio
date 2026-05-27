@@ -23,8 +23,7 @@ pub const TOKENIZER_CONFIG_FILE_NAME: &str = "tokenizer_config.json";
 pub const HF_CONFIG_FILE_NAME: &str = "config.json";
 pub const MODEL_METADATA_FILE_NAME: &str = "model-metadata.json";
 pub const DEFAULT_LLM_MODEL_NAME: &str = "qwopus-3.5-9b-coder-q4-k-m";
-const BURN_TEXT_ONLY_MODEL_PLACEHOLDER: &str =
-    "This placeholder marks a Teamy Burn-text-only model directory. The Rust runtime uses the converted burn-text bundle rather than this GGUF file.\n";
+const BURN_TEXT_ONLY_MODEL_PLACEHOLDER: &str = "This placeholder marks a Teamy Burn-text-only model directory. The Rust runtime uses the converted burn-text bundle rather than this GGUF file.\n";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct KnownLlmModel {
@@ -263,7 +262,10 @@ pub fn inspect_model_dir(root: &Path) -> eyre::Result<LlmModelArtifacts> {
     }
     let metadata: LlmManagedModelMetadata =
         facet_json::from_slice(&std::fs::read(&metadata_path).wrap_err_with(|| {
-            format!("Failed to read LLM metadata file {}", metadata_path.display())
+            format!(
+                "Failed to read LLM metadata file {}",
+                metadata_path.display()
+            )
         })?)
         .wrap_err_with(|| format!("Failed to parse {}", metadata_path.display()))?;
 
@@ -303,11 +305,17 @@ pub fn render_model_report(artifacts: &LlmModelArtifacts) -> String {
             "Tokenizer config file: {}",
             artifacts.tokenizer_config_path.display()
         ),
-        format!("Hugging Face config file: {}", artifacts.hf_config_path.display()),
+        format!(
+            "Hugging Face config file: {}",
+            artifacts.hf_config_path.display()
+        ),
         format!("Metadata file: {}", artifacts.metadata_path.display()),
         format!("Parameter count: {}", artifacts.metadata.parameter_count),
         format!("Size estimate: {}", artifacts.metadata.size_estimate),
-        format!("Supports tool calling: {}", artifacts.metadata.supports_tool_calling),
+        format!(
+            "Supports tool calling: {}",
+            artifacts.metadata.supports_tool_calling
+        ),
         format!("Supports vision: {}", artifacts.metadata.supports_vision),
     ];
     if let Some(mmproj_path) = &artifacts.mmproj_path {
@@ -372,10 +380,7 @@ pub fn render_model_report(artifacts: &LlmModelArtifacts) -> String {
             lines.push(format!("HF text intermediate size: {}", intermediate_size));
         }
         if let Some(num_attention_heads) = summary.text_num_attention_heads {
-            lines.push(format!(
-                "HF text attention heads: {}",
-                num_attention_heads
-            ));
+            lines.push(format!("HF text attention heads: {}", num_attention_heads));
         }
         if let Some(num_key_value_heads) = summary.text_num_key_value_heads {
             lines.push(format!("HF text kv heads: {}", num_key_value_heads));
@@ -459,9 +464,10 @@ pub fn render_model_report(artifacts: &LlmModelArtifacts) -> String {
 ///
 /// This function will return an error if the tokenizer config cannot be read or parsed.
 pub fn load_tokenizer_config_summary(path: &Path) -> eyre::Result<TokenizerConfigSummary> {
-    let parsed: TokenizerConfigFile = facet_json::from_slice(&std::fs::read(path).wrap_err_with(
-        || format!("Failed to read tokenizer config {}", path.display()),
-    )?)
+    let parsed: TokenizerConfigFile = facet_json::from_slice(
+        &std::fs::read(path)
+            .wrap_err_with(|| format!("Failed to read tokenizer config {}", path.display()))?,
+    )
     .wrap_err_with(|| format!("Failed to parse tokenizer config {}", path.display()))?;
     Ok(TokenizerConfigSummary {
         path: path.to_path_buf(),
@@ -542,7 +548,10 @@ pub fn prepare_known_llm_model(
     remove_existing_path(&staging_dir)
         .wrap_err_with(|| format!("Failed to clear staging path {}", staging_dir.display()))?;
     std::fs::create_dir_all(&staging_dir).wrap_err_with(|| {
-        format!("Failed to create staging directory {}", staging_dir.display())
+        format!(
+            "Failed to create staging directory {}",
+            staging_dir.display()
+        )
     })?;
 
     if download_main_model_file {
@@ -577,7 +586,10 @@ pub fn prepare_known_llm_model(
         })?;
     } else if let Some(parent) = managed_dir.parent() {
         std::fs::create_dir_all(parent).wrap_err_with(|| {
-            format!("Failed to create LLM model parent directory {}", parent.display())
+            format!(
+                "Failed to create LLM model parent directory {}",
+                parent.display()
+            )
         })?;
     }
     std::fs::rename(&staging_dir, &managed_dir).wrap_err_with(|| {
@@ -758,8 +770,12 @@ pub fn list_registered_model_dirs(app_home: &AppHome) -> eyre::Result<Vec<PathBu
     if !registry_path.is_file() {
         return Ok(Vec::new());
     }
-    let registry = std::fs::read_to_string(&registry_path)
-        .wrap_err_with(|| format!("Failed to read LLM model registry {}", registry_path.display()))?;
+    let registry = std::fs::read_to_string(&registry_path).wrap_err_with(|| {
+        format!(
+            "Failed to read LLM model registry {}",
+            registry_path.display()
+        )
+    })?;
     let mut model_dirs = Vec::new();
     for line in registry.lines() {
         let trimmed = line.trim();
@@ -881,8 +897,12 @@ fn download_to_file(url: &str, destination: &Path) -> eyre::Result<()> {
     }
     let mut output = std::fs::File::create(destination)
         .wrap_err_with(|| format!("Failed to create {}", destination.display()))?;
-    std::io::copy(&mut response, &mut output)
-        .wrap_err_with(|| format!("Failed to stream download body from {url} into {}", destination.display()))?;
+    std::io::copy(&mut response, &mut output).wrap_err_with(|| {
+        format!(
+            "Failed to stream download body from {url} into {}",
+            destination.display()
+        )
+    })?;
     Ok(())
 }
 
@@ -948,8 +968,12 @@ fn local_hugging_face_snapshot_dirs(repo_id: &str) -> Vec<PathBuf> {
 }
 
 fn write_burn_text_only_model_placeholder(path: &Path) -> eyre::Result<()> {
-    std::fs::write(path, BURN_TEXT_ONLY_MODEL_PLACEHOLDER)
-        .wrap_err_with(|| format!("Failed to write Burn-text-only model placeholder {}", path.display()))
+    std::fs::write(path, BURN_TEXT_ONLY_MODEL_PLACEHOLDER).wrap_err_with(|| {
+        format!(
+            "Failed to write Burn-text-only model placeholder {}",
+            path.display()
+        )
+    })
 }
 
 #[cfg(test)]
@@ -957,8 +981,7 @@ mod tests {
     use super::{
         HF_CONFIG_FILE_NAME, KNOWN_LLM_MODELS, MODEL_FILE_NAME, MODEL_METADATA_FILE_NAME,
         TOKENIZER_CONFIG_FILE_NAME, TOKENIZER_FILE_NAME, inspect_model_dir,
-        load_tokenizer_config_summary, remove_existing_path,
-        write_model_metadata,
+        load_tokenizer_config_summary, remove_existing_path, write_model_metadata,
     };
     use tokenizers::{Tokenizer, models::bpe::BPE};
 
@@ -1000,7 +1023,10 @@ mod tests {
         let artifacts = inspect_model_dir(root).expect("artifacts should load");
         assert_eq!(artifacts.metadata.model_name, KNOWN_LLM_MODELS[0].name);
         assert_eq!(
-            artifacts.model_path.file_name().and_then(|value| value.to_str()),
+            artifacts
+                .model_path
+                .file_name()
+                .and_then(|value| value.to_str()),
             Some(MODEL_FILE_NAME)
         );
         assert!(root.join(MODEL_METADATA_FILE_NAME).is_file());

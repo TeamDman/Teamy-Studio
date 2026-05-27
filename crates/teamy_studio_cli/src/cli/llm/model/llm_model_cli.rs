@@ -145,7 +145,10 @@ impl LlmModelPrepareArgs {
             "Prepared managed LLM model directory: {}",
             prepared.managed_dir.display()
         );
-        println!("{}", crate::llm::model::render_model_report(&prepared.artifacts));
+        println!(
+            "{}",
+            crate::llm::model::render_model_report(&prepared.artifacts)
+        );
         if self.with_burn_text {
             println!(
                 "{}",

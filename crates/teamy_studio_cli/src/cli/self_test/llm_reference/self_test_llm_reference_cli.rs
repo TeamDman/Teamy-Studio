@@ -73,7 +73,10 @@ impl SelfTestLlmReferenceArgs {
         )?;
         ensure!(report.ok, "LLM reference prompt report reported failure");
         println!("LLM reference rendered prompt:\n{}", report.rendered_prompt);
-        println!("LLM reference input token count: {}", report.input_token_count);
+        println!(
+            "LLM reference input token count: {}",
+            report.input_token_count
+        );
         println!("LLM reference top token ids: {:?}", report.top_token_ids);
         println!("LLM reference top token text: {:?}", report.top_token_text);
         println!("LLM reference top logits: {:?}", report.top_logits);

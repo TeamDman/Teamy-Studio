@@ -83,16 +83,29 @@ struct LlmSourceTextConfigFile {
 ///
 /// This function will return an error if the Hugging Face config file cannot be read or parsed.
 pub fn load_llm_source_config_summary(path: &Path) -> eyre::Result<LlmSourceConfigSummary> {
-    let parsed: LlmSourceConfigFile = facet_json::from_slice(&std::fs::read(path).map_err(
-        |error| eyre::eyre!("Failed to read Hugging Face config {}: {}", path.display(), error),
-    )?)
-    .map_err(|error| eyre::eyre!("Failed to parse Hugging Face config {}: {}", path.display(), error))?;
+    let parsed: LlmSourceConfigFile =
+        facet_json::from_slice(&std::fs::read(path).map_err(|error| {
+            eyre::eyre!(
+                "Failed to read Hugging Face config {}: {}",
+                path.display(),
+                error
+            )
+        })?)
+        .map_err(|error| {
+            eyre::eyre!(
+                "Failed to parse Hugging Face config {}: {}",
+                path.display(),
+                error
+            )
+        })?;
 
     let mut text_layer_type_counts = BTreeMap::new();
     let mut text_layer_types_preview = Vec::new();
     if let Some(text_config) = &parsed.text_config {
         for layer_type in &text_config.layer_types {
-            *text_layer_type_counts.entry(layer_type.clone()).or_insert(0) += 1;
+            *text_layer_type_counts
+                .entry(layer_type.clone())
+                .or_insert(0) += 1;
         }
         text_layer_types_preview = text_config.layer_types.iter().take(8).cloned().collect();
     }
@@ -140,9 +153,10 @@ pub fn load_llm_source_config_summary(path: &Path) -> eyre::Result<LlmSourceConf
                 .clone()
                 .map(render_json_value)
         }),
-        text_rope_theta: parsed.text_config.as_ref().and_then(|text_config| {
-            text_config.rope_theta.clone().map(render_json_value)
-        }),
+        text_rope_theta: parsed
+            .text_config
+            .as_ref()
+            .and_then(|text_config| text_config.rope_theta.clone().map(render_json_value)),
         text_full_attention_interval: parsed
             .text_config
             .as_ref()
@@ -236,6 +250,9 @@ mod tests {
             summary.text_layer_type_counts.get("linear_attention"),
             Some(&3)
         );
-        assert_eq!(summary.text_layer_type_counts.get("full_attention"), Some(&1));
+        assert_eq!(
+            summary.text_layer_type_counts.get("full_attention"),
+            Some(&1)
+        );
     }
 }

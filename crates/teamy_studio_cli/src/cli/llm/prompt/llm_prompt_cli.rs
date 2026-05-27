@@ -2,6 +2,7 @@ use crate::cli::output::CliOutput;
 use arbitrary::Arbitrary;
 use facet::Facet;
 use figue as args;
+use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::thread;
@@ -108,10 +109,8 @@ impl LlmPromptArgs {
         cache_home: &crate::paths::CacheHome,
     ) -> eyre::Result<CliOutput> {
         let command_started_at = Instant::now();
-        let generation_timeout = resolve_timeout_arg(
-            self.timeout.as_deref(),
-            self.generation_timeout.as_deref(),
-        )?;
+        let generation_timeout =
+            resolve_timeout_arg(self.timeout.as_deref(), self.generation_timeout.as_deref())?;
         if let Some(timeout) = generation_timeout
             && !is_timeout_supervision_child()
         {
@@ -149,7 +148,10 @@ impl LlmPromptArgs {
                 1,
                 10,
             )?;
-            println!("Python reference rendered prompt:\n{}", reference.rendered_prompt);
+            println!(
+                "Python reference rendered prompt:\n{}",
+                reference.rendered_prompt
+            );
             println!(
                 "Python reference input token count: {}",
                 reference.input_token_count
@@ -209,22 +211,23 @@ impl LlmPromptArgs {
                     "Python reference top token text: {:?}",
                     python_report.top_token_text
                 );
-                println!("Python reference top logits: {:?}", python_report.top_logits);
+                println!(
+                    "Python reference top logits: {:?}",
+                    python_report.top_logits
+                );
                 println!("Rust Burn backend: {}", rust_report.backend);
                 println!(
                     "Python layer count: {} / Rust layer count: {}",
                     python_report.layer_last_hidden_states.len(),
                     rust_report.layer_last_hidden_states.len()
                 );
-                let (final_norm_max_abs_diff, final_norm_mean_abs_diff) =
-                    hidden_diff_summary(
-                        &python_report.final_norm_last_hidden,
-                        &rust_report.final_norm_last_hidden,
-                    )?;
+                let (final_norm_max_abs_diff, final_norm_mean_abs_diff) = hidden_diff_summary(
+                    &python_report.final_norm_last_hidden,
+                    &rust_report.final_norm_last_hidden,
+                )?;
                 println!(
                     "Rust vs Python final norm hidden diff: max_abs={} mean_abs={}",
-                    final_norm_max_abs_diff,
-                    final_norm_mean_abs_diff
+                    final_norm_max_abs_diff, final_norm_mean_abs_diff
                 );
                 for (layer_index, (python_hidden, rust_hidden)) in python_report
                     .layer_last_hidden_states
@@ -236,9 +239,7 @@ impl LlmPromptArgs {
                         hidden_diff_summary(python_hidden, rust_hidden)?;
                     println!(
                         "Rust vs Python layer {} hidden diff: max_abs={} mean_abs={}",
-                        layer_index,
-                        max_abs_diff,
-                        mean_abs_diff
+                        layer_index, max_abs_diff, mean_abs_diff
                     );
                 }
             }
@@ -255,10 +256,7 @@ impl LlmPromptArgs {
                     "Burn incremental comparison backend: {}",
                     comparison.backend
                 );
-                println!(
-                    "Burn incremental token match: {}",
-                    comparison.token_match
-                );
+                println!("Burn incremental token match: {}", comparison.token_match);
                 println!(
                     "Burn incremental first mismatch index: {:?}",
                     comparison.first_mismatch_index
@@ -328,7 +326,8 @@ impl LlmPromptArgs {
             return Ok(CliOutput::none());
         }
 
-        let result = crate::llm::runtime::run_prompt(
+        let mut stdout = std::io::stdout().lock();
+        let _result = crate::llm::runtime::run_prompt_to_writer(
             &artifacts,
             &crate::llm::runtime::LlmPromptRequest {
                 system_prompt: self.system_prompt,
@@ -336,21 +335,18 @@ impl LlmPromptArgs {
                 max_new_tokens: self.max_new_tokens,
                 generation_timeout: effective_generation_timeout,
             },
+            &mut stdout,
         )?;
-        println!("Rendered prompt:\n{}", result.rendered_prompt);
-        println!("\nRust Burn output:\n{}", result.output_text);
+        stdout
+            .flush()
+            .map_err(|error| eyre::eyre!("Failed to flush generated LLM output: {}", error))?;
         Ok(CliOutput::none())
     }
 }
 
 fn parse_generation_timeout(value: &str) -> eyre::Result<Duration> {
-    humantime::parse_duration(value).map_err(|error| {
-        eyre::eyre!(
-            "Failed to parse timeout {:?}: {}",
-            value,
-            error
-        )
-    })
+    humantime::parse_duration(value)
+        .map_err(|error| eyre::eyre!("Failed to parse timeout {:?}: {}", value, error))
 }
 
 fn resolve_timeout_arg(
@@ -420,10 +416,18 @@ fn supervise_llm_prompt_timeout(timeout: Duration) -> eyre::Result<CliOutput> {
         .map_err(|error| eyre::eyre!("System clock is before the Unix epoch: {}", error))?
         .as_millis()
         .saturating_add(timeout.as_millis());
-    let exe = std::env::current_exe()
-        .map_err(|error| eyre::eyre!("Failed to resolve current executable for LLM timeout supervision: {}", error))?;
-    let current_dir = std::env::current_dir()
-        .map_err(|error| eyre::eyre!("Failed to resolve current directory for LLM timeout supervision: {}", error))?;
+    let exe = std::env::current_exe().map_err(|error| {
+        eyre::eyre!(
+            "Failed to resolve current executable for LLM timeout supervision: {}",
+            error
+        )
+    })?;
+    let current_dir = std::env::current_dir().map_err(|error| {
+        eyre::eyre!(
+            "Failed to resolve current directory for LLM timeout supervision: {}",
+            error
+        )
+    })?;
     let args = std::env::args_os().skip(1).collect::<Vec<_>>();
     let mut child = Command::new(&exe)
         .args(&args)
@@ -434,7 +438,13 @@ fn supervise_llm_prompt_timeout(timeout: Duration) -> eyre::Result<CliOutput> {
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .spawn()
-        .map_err(|error| eyre::eyre!("Failed to launch supervised LLM child process {}: {}", exe.display(), error))?;
+        .map_err(|error| {
+            eyre::eyre!(
+                "Failed to launch supervised LLM child process {}: {}",
+                exe.display(),
+                error
+            )
+        })?;
 
     let deadline = std::time::Instant::now() + timeout + LLM_TIMEOUT_KILL_GRACE;
     loop {

@@ -1,10 +1,14 @@
 use eyre::{WrapErr, bail};
 use facet::Facet;
+use std::io::Write;
 use std::path::Path;
 use std::time::Duration;
 
 use crate::burn_backend::inspect_burn_runtime_support;
-use crate::burn_text::{BurnTextGenerationOptions, generate_with_burn_text_runtime};
+use crate::burn_text::{
+    BurnTextGenerationOptions, generate_with_burn_text_runtime,
+    generate_with_burn_text_runtime_to_writer,
+};
 use crate::model::{LlmModelArtifacts, load_tokenizer_config_summary};
 
 pub const DEFAULT_MAX_NEW_TOKENS: usize = 256;
@@ -80,11 +84,32 @@ pub fn run_prompt(
     artifacts: &LlmModelArtifacts,
     request: &LlmPromptRequest,
 ) -> eyre::Result<LlmPromptResult> {
+    run_prompt_inner(artifacts, request, None)
+}
+
+/// Run a Teamy-managed prompt with the local Rust Burn runtime, streaming generated text to a
+/// caller-provided writer as tokens are selected.
+///
+/// # Errors
+///
+/// This function will return an error if the local runtime cannot be loaded, the prompt fails, or
+/// generated text cannot be written to the provided writer.
+pub fn run_prompt_to_writer(
+    artifacts: &LlmModelArtifacts,
+    request: &LlmPromptRequest,
+    writer: &mut dyn Write,
+) -> eyre::Result<LlmPromptResult> {
+    run_prompt_inner(artifacts, request, Some(writer))
+}
+
+fn run_prompt_inner(
+    artifacts: &LlmModelArtifacts,
+    request: &LlmPromptRequest,
+    writer: Option<&mut dyn Write>,
+) -> eyre::Result<LlmPromptResult> {
     let _summary = load_tokenizer_config_summary(&artifacts.tokenizer_config_path)?;
-    let rendered = render_qwen_single_turn_prompt(
-        request.system_prompt.as_deref(),
-        &request.user_prompt,
-    );
+    let rendered =
+        render_qwen_single_turn_prompt(request.system_prompt.as_deref(), &request.user_prompt);
     let _token_ids = tokenize_rendered_prompt(&artifacts.tokenizer_path, &rendered.prompt)?;
 
     let output_text = run_prompt_with_burn_backend(
@@ -94,8 +119,9 @@ pub fn run_prompt(
             max_new_tokens: request.max_new_tokens,
             generation_timeout: request.generation_timeout,
         },
+        writer,
     )
-        .wrap_err("failed to execute the local Rust Burn LLM runtime")?;
+    .wrap_err("failed to execute the local Rust Burn LLM runtime")?;
 
     Ok(LlmPromptResult {
         rendered_prompt: rendered.prompt,
@@ -107,6 +133,7 @@ fn run_prompt_with_burn_backend(
     artifacts: &LlmModelArtifacts,
     rendered_prompt: &str,
     options: &BurnTextGenerationOptions,
+    writer: Option<&mut dyn Write>,
 ) -> eyre::Result<String> {
     let token_ids = tokenize_rendered_prompt(&artifacts.tokenizer_path, rendered_prompt)
         .wrap_err("failed to tokenize the rendered prompt for Burn execution")?;
@@ -119,8 +146,12 @@ fn run_prompt_with_burn_backend(
             report.reason
         );
     }
-    let generation = generate_with_burn_text_runtime(artifacts, &token_ids, options)
-        .wrap_err("failed to execute the converted Burn text runtime")?;
+    let generation = if let Some(writer) = writer {
+        generate_with_burn_text_runtime_to_writer(artifacts, &token_ids, options, writer)
+    } else {
+        generate_with_burn_text_runtime(artifacts, &token_ids, options)
+    }
+    .wrap_err("failed to execute the converted Burn text runtime")?;
     Ok(generation.generated_text)
 }
 
@@ -160,8 +191,8 @@ mod tests {
         let Some(model_dir) = std::env::var_os("TEAMY_STUDIO_LLM_SMOKE_MODEL_DIR") else {
             return;
         };
-        let artifacts =
-            inspect_model_dir(Path::new(&model_dir)).expect("managed Jackrong model should inspect");
+        let artifacts = inspect_model_dir(Path::new(&model_dir))
+            .expect("managed Jackrong model should inspect");
         let rendered = render_qwen_single_turn_prompt(None, "Hello again");
         let token_ids = tokenize_rendered_prompt(&artifacts.tokenizer_path, &rendered.prompt)
             .expect("Jackrong prompt should tokenize");

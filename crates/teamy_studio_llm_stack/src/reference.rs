@@ -1,7 +1,7 @@
 use eyre::{Context, bail};
+use facet::Facet;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use facet::Facet;
 use std::process::Command;
 
 pub const LLM_REFERENCE_SOURCE_PARENT_DIR: &str = "python";
@@ -249,7 +249,10 @@ where
 
 fn ensure_reference_source_dir(path: &Path) -> eyre::Result<()> {
     if !path.is_dir() {
-        bail!("LLM reference source directory does not exist: {}", path.display());
+        bail!(
+            "LLM reference source directory does not exist: {}",
+            path.display()
+        );
     }
     Ok(())
 }

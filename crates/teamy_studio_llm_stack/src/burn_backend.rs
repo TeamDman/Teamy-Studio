@@ -1,5 +1,5 @@
-use std::collections::BTreeMap;
 use facet::Facet;
+use std::collections::BTreeMap;
 
 use crate::burn_text::inspect_burn_text_runtime_status;
 use crate::model::LlmModelArtifacts;
@@ -91,10 +91,7 @@ pub fn render_burn_runtime_support_report(report: &BurnLlmRuntimeSupportReport) 
         "Burn backend: {}\nBurn support state: {:?}\nBurn text model type: {}\nBurn layer histogram: {}\nBurn support note: {}",
         report.backend,
         report.state,
-        report
-            .text_model_type
-            .as_deref()
-            .unwrap_or("<unknown>"),
+        report.text_model_type.as_deref().unwrap_or("<unknown>"),
         histogram,
         report.reason
     )
@@ -151,7 +148,10 @@ mod tests {
         let report = inspect_burn_runtime_support(&fixture_artifacts(temp.path()))
             .expect("burn support report should load");
         assert_eq!(report.state, BurnLlmSupportState::TextArchitectureCaptured);
-        assert_eq!(report.layer_type_histogram.get("linear_attention"), Some(&1));
+        assert_eq!(
+            report.layer_type_histogram.get("linear_attention"),
+            Some(&1)
+        );
         assert_eq!(report.layer_type_histogram.get("full_attention"), Some(&1));
     }
 }
