@@ -25,6 +25,8 @@ fn exclude_tracy_frame_mark(meta: &Metadata<'_>) -> bool {
 
 #[cfg(all(feature = "tracing_subscriber_tracy", not(test)))]
 const TEAMY_STUDIO_ENABLE_TRACY_LAYER_ENV: &str = "TEAMY_STUDIO_ENABLE_TRACY_LAYER";
+const DEFAULT_LOG_FILTER_DIRECTIVES: &str = "cubecl_cuda::compute::server=warn";
+const CUBECL_CUDA_SERVER_TARGET: &str = "cubecl_cuda::compute::server";
 
 #[cfg(feature = "tracing_subscriber_tracy")]
 fn env_flag_enabled(value: Option<&str>) -> bool {
@@ -75,14 +77,31 @@ fn select_log_filter(
 fn build_env_filter(config: &LoggingConfig, rust_log: Option<&str>) -> eyre::Result<EnvFilter> {
     let builder = EnvFilter::builder();
     match select_log_filter(config, rust_log)? {
-        LogFilterSelection::Explicit(filter) => Ok(builder
-            .with_default_directive(LevelFilter::from_str(&filter)?.into())
-            .parse("")?),
-        LogFilterSelection::FromEnv(filter) => Ok(builder.parse(filter)?),
-        LogFilterSelection::Default(level) => {
-            Ok(builder.with_default_directive(level.into()).parse("")?)
+        LogFilterSelection::Explicit(filter) => {
+            let _ = LevelFilter::from_str(&filter)?;
+            Ok(builder.parse(append_default_quiet_directives(&filter))?)
         }
+        LogFilterSelection::FromEnv(filter) => {
+            Ok(builder.parse(append_default_quiet_directives(&filter))?)
+        }
+        LogFilterSelection::Default(level) => Ok(builder.parse(
+            append_default_quiet_directives(&level.to_string().to_ascii_lowercase()),
+        )?),
     }
+}
+
+fn append_default_quiet_directives(filter: &str) -> String {
+    if filter
+        .split(',')
+        .map(str::trim)
+        .any(|directive| directive.starts_with(CUBECL_CUDA_SERVER_TARGET))
+    {
+        return filter.to_owned();
+    }
+    if filter.trim().is_empty() {
+        return DEFAULT_LOG_FILTER_DIRECTIVES.to_owned();
+    }
+    format!("{filter},{DEFAULT_LOG_FILTER_DIRECTIVES}")
 }
 
 fn resolve_json_log_path(log_file: Option<&str>, now: DateTime<Local>) -> Option<PathBuf> {
@@ -122,25 +141,14 @@ pub fn init_logging(config: &LoggingConfig) -> eyre::Result<()> {
     };
     let stderr_env_filter_layer = build_env_filter(config, rust_log.as_deref())?;
 
-    let stderr_layer = if config.debug {
-        tracing_subscriber::fmt::layer()
-            .with_file(cfg!(debug_assertions))
-            .with_line_number(cfg!(debug_assertions))
-            .with_target(true)
-            .with_writer(std::io::stderr)
-            .pretty()
-            .with_timer(tracing_subscriber::fmt::time::uptime())
-            .boxed()
-    } else {
-        tracing_subscriber::fmt::layer()
-            .with_file(cfg!(debug_assertions))
-            .with_line_number(cfg!(debug_assertions))
-            .with_target(true)
-            .with_writer(std::io::stderr)
-            .pretty()
-            .without_time()
-            .boxed()
-    };
+    let stderr_layer = tracing_subscriber::fmt::layer()
+        .with_file(cfg!(debug_assertions))
+        .with_line_number(cfg!(debug_assertions))
+        .with_target(true)
+        .with_writer(std::io::stderr)
+        .pretty()
+        .with_timer(tracing_subscriber::fmt::time::uptime())
+        .boxed();
     let stderr_layer = stderr_layer.with_filter(stderr_env_filter_layer);
     #[cfg(feature = "extended_observability")]
     let stderr_layer = stderr_layer.with_filter(FilterFn::new(exclude_tracy_frame_mark));
@@ -207,7 +215,10 @@ pub fn init_logging(config: &LoggingConfig) -> eyre::Result<()> {
 mod tests {
     #[cfg(feature = "tracing_subscriber_tracy")]
     use super::env_flag_enabled;
-    use super::{LogFilterSelection, resolve_json_log_path, select_log_filter};
+    use super::{
+        LogFilterSelection, append_default_quiet_directives, resolve_json_log_path,
+        select_log_filter,
+    };
     use crate::LoggingConfig;
 
     fn test_logging_config() -> LoggingConfig {
@@ -267,6 +278,22 @@ mod tests {
         assert_eq!(
             selection,
             LogFilterSelection::Default(tracing::level_filters::LevelFilter::INFO)
+        );
+    }
+
+    #[test]
+    fn default_quiet_directives_are_appended_to_broad_filters() {
+        assert_eq!(
+            append_default_quiet_directives("info"),
+            "info,cubecl_cuda::compute::server=warn"
+        );
+    }
+
+    #[test]
+    fn explicit_cubecl_directive_is_preserved() {
+        assert_eq!(
+            append_default_quiet_directives("info,cubecl_cuda::compute::server=trace"),
+            "info,cubecl_cuda::compute::server=trace"
         );
     }
 

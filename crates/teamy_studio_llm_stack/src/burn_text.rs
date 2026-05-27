@@ -3783,9 +3783,10 @@ fn generate_with_burn_text_runtime_on_device<B: Backend>(
     trace_burn_text_runtime(&format!(
         "using {backend_label} backend for Burn text runtime"
     ));
+    let generation_started_at = Instant::now();
     let deadline = GenerationDeadline::new(options.generation_timeout);
     let _deadline_scope = deadline.enter_scope(options.max_new_tokens);
-    let runtime = Qwen35TextRuntime::<B>::load(artifacts, device)?;
+    let runtime = load_qwen35_runtime_with_log::<B>(artifacts, device, backend_label)?;
     let tokenizer =
         tokenizers::Tokenizer::from_file(&artifacts.tokenizer_path).map_err(|error| {
             eyre::eyre!(
@@ -3843,6 +3844,11 @@ fn generate_with_burn_text_runtime_on_device<B: Backend>(
     }
 
     let generated_text = decode_token_ids_with_tokenizer(&tokenizer, &generated_token_ids, false)?;
+    log_generation_complete(
+        backend_label,
+        generated_token_ids.len(),
+        generation_started_at,
+    );
     Ok(BurnTextGenerationReport {
         generated_token_ids,
         generated_text,
@@ -3869,13 +3875,14 @@ fn generate_with_incremental_burn_text_runtime_on_device<B: Backend>(
     trace_burn_text_runtime(&format!(
         "using {backend_label} backend for Burn text incremental runtime"
     ));
+    let generation_started_at = Instant::now();
     let deadline = GenerationDeadline::new(options.generation_timeout);
     let _deadline_scope = deadline.enter_scope(options.max_new_tokens);
     ensure!(
         !prompt_token_ids.is_empty(),
         "Burn text incremental runtime expected at least one prompt token"
     );
-    let runtime = Qwen35TextRuntime::<B>::load(artifacts, device)?;
+    let runtime = load_qwen35_runtime_with_log::<B>(artifacts, device, backend_label)?;
     let tokenizer =
         tokenizers::Tokenizer::from_file(&artifacts.tokenizer_path).map_err(|error| {
             eyre::eyre!(
@@ -3935,6 +3942,11 @@ fn generate_with_incremental_burn_text_runtime_on_device<B: Backend>(
     }
 
     let generated_text = decode_token_ids_with_tokenizer(&tokenizer, &generated_token_ids, false)?;
+    log_generation_complete(
+        backend_label,
+        generated_token_ids.len(),
+        generation_started_at,
+    );
     Ok(BurnTextGenerationReport {
         generated_token_ids,
         generated_text,
@@ -3961,9 +3973,11 @@ fn generate_with_hybrid_burn_text_runtime_on_device<B: Backend>(
     trace_burn_text_runtime(&format!(
         "using {backend_label} backend for Burn text hybrid runtime"
     ));
+    let generation_started_at = Instant::now();
     let deadline = GenerationDeadline::new(options.generation_timeout);
     let _deadline_scope = deadline.enter_scope(options.max_new_tokens);
     if options.max_new_tokens == 0 {
+        log_generation_complete(backend_label, 0, generation_started_at);
         return Ok(BurnTextGenerationReport {
             generated_token_ids: Vec::new(),
             generated_text: String::new(),
@@ -3980,7 +3994,7 @@ fn generate_with_hybrid_burn_text_runtime_on_device<B: Backend>(
         );
     }
 
-    let runtime = Qwen35TextRuntime::<B>::load(artifacts, device)?;
+    let runtime = load_qwen35_runtime_with_log::<B>(artifacts, device, backend_label)?;
     let tokenizer =
         tokenizers::Tokenizer::from_file(&artifacts.tokenizer_path).map_err(|error| {
             eyre::eyre!(
@@ -4021,6 +4035,11 @@ fn generate_with_hybrid_burn_text_runtime_on_device<B: Backend>(
     {
         let generated_text =
             decode_token_ids_with_tokenizer(&tokenizer, &generated_token_ids, false)?;
+        log_generation_complete(
+            backend_label,
+            generated_token_ids.len(),
+            generation_started_at,
+        );
         return Ok(BurnTextGenerationReport {
             generated_token_ids,
             generated_text,
@@ -4065,10 +4084,51 @@ fn generate_with_hybrid_burn_text_runtime_on_device<B: Backend>(
     }
 
     let generated_text = decode_token_ids_with_tokenizer(&tokenizer, &generated_token_ids, false)?;
+    log_generation_complete(
+        backend_label,
+        generated_token_ids.len(),
+        generation_started_at,
+    );
     Ok(BurnTextGenerationReport {
         generated_token_ids,
         generated_text,
     })
+}
+
+fn load_qwen35_runtime_with_log<B: Backend>(
+    artifacts: &LlmModelArtifacts,
+    device: B::Device,
+    backend_label: &str,
+) -> eyre::Result<Qwen35TextRuntime<B>> {
+    let started_at = Instant::now();
+    let runtime = Qwen35TextRuntime::<B>::load(artifacts, device)?;
+    let elapsed = started_at.elapsed();
+    tracing::info!(
+        target: "teamy_llm",
+        backend = backend_label,
+        elapsed_ms = elapsed.as_secs_f64() * 1000.0,
+        model_dir = %artifacts.root.display(),
+        "LLM model weights loaded"
+    );
+    Ok(runtime)
+}
+
+fn log_generation_complete(backend_label: &str, generated_token_count: usize, started_at: Instant) {
+    let elapsed = started_at.elapsed();
+    let elapsed_secs = elapsed.as_secs_f64();
+    let tokens_per_second = if elapsed_secs > 0.0 {
+        generated_token_count as f64 / elapsed_secs
+    } else {
+        0.0
+    };
+    tracing::info!(
+        target: "teamy_llm",
+        backend = backend_label,
+        generated_token_count,
+        elapsed_ms = elapsed_secs * 1000.0,
+        tokens_per_second,
+        "LLM prompt generation complete"
+    );
 }
 
 fn decode_token_ids_with_tokenizer(
