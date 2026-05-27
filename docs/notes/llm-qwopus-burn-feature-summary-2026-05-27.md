@@ -38,7 +38,7 @@ Teamy Studio now has a local LLM stack that can:
 
 - manage a known Qwopus model entry;
 - prepare a Teamy-managed model directory;
-- export a Burn-native lazy-load text bundle from the upstream Python model;
+- export a Burn-native lazy-load text bundle in Rust from the upstream Hugging Face model files;
 - inspect and report model metadata, tokenizer config, and Burn support status;
 - run local prompt inference through a pure Rust Burn runtime;
 - compare Rust outputs against a Python reference path;
@@ -93,11 +93,16 @@ Those facts are no longer meant to be treated as hand-entered constants. The run
 
 This feature line is Burn-first. Earlier exploration around `candelabra` was abandoned. The current runtime and support reporting are Burn-oriented.
 
-### 2. Pure Rust runtime, Python only for preparation and reference
+### 2. Pure Rust acquire, prepare, and runtime path; Python only for reference tooling
 
-The end-user runtime path is Rust-only. Python is used for:
+The end-user-facing LLM path is Rust-only for:
 
-- exporting the Burn text bundle;
+- model acquisition;
+- Burn text bundle export;
+- prompt inference.
+
+Python is retained only for optional development/reference work:
+
 - generating reference prompt/layer reports during debugging;
 - inspecting upstream behavior while implementing parity.
 
@@ -152,7 +157,7 @@ The first pass landed the basic feature skeleton:
 
 - a managed model entry for the Jackrong Qwopus model;
 - Teamy model preparation and inspection flows;
-- a Burn text export lane from Python;
+- a Burn text export lane, later replaced with a Rust exporter;
 - a Rust runtime that could consume the exported bundle;
 - CLI support for prompt execution and self-test/reference work.
 
@@ -189,6 +194,12 @@ Relevant code:
 - [crates/teamy_studio_llm_stack/src/model.rs](../../crates/teamy_studio_llm_stack/src/model.rs)
 - [crates/teamy_studio_llm_stack/src/burn_text.rs](../../crates/teamy_studio_llm_stack/src/burn_text.rs)
 - [python/llm-reference/teamy_llm_reference/__main__.py](../../python/llm-reference/teamy_llm_reference/__main__.py)
+
+The Python reference harness is no longer part of normal model preparation or inference. The current production path uses:
+
+- Rust download/acquisition helpers in [crates/teamy_studio_llm_stack/src/model.rs](../../crates/teamy_studio_llm_stack/src/model.rs)
+- Rust Burn export in [crates/teamy_studio_llm_stack/src/burn_text.rs](../../crates/teamy_studio_llm_stack/src/burn_text.rs)
+- Rust Burn inference in [crates/teamy_studio_llm_stack/src/runtime.rs](../../crates/teamy_studio_llm_stack/src/runtime.rs)
 
 Operationally, this means:
 
@@ -257,6 +268,26 @@ Tensor loading was changed so that supported dtypes are decoded directly into Bu
 The MLP path was moved back onto the device instead of bouncing through CPU-side scalar/vector processing.
 
 ### Reduced scratch allocation
+
+## Timeout Behavior
+
+`llm prompt` now treats timeout as a two-stage contract:
+
+- graceful timeout first, enforced inside the Burn runtime with deadline checks in generation and runtime load paths;
+- guaranteed termination second, enforced by a supervising parent process that kills the child if it exceeds `timeout + 5s`.
+
+Relevant implementation:
+
+- [crates/teamy_studio_cli/src/cli/llm/prompt/llm_prompt_cli.rs](../../crates/teamy_studio_cli/src/cli/llm/prompt/llm_prompt_cli.rs)
+- [crates/teamy_studio_llm_stack/src/burn_text.rs](../../crates/teamy_studio_llm_stack/src/burn_text.rs)
+
+Operationally, this means:
+
+- `--timeout` is the preferred CLI flag;
+- `--generation-timeout` remains as a compatibility alias;
+- the runtime tries to stop cleanly first;
+- if clean shutdown does not happen fast enough, the parent process force-terminates the child after a short grace window;
+- very small timeout smoke tests in the dev profile still include non-trivial process startup/console overhead and should not be mistaken for production timing.
 
 Single-token full-attention and recurrent linear-attention paths were tightened to reuse buffers rather than allocating unnecessary temporaries.
 

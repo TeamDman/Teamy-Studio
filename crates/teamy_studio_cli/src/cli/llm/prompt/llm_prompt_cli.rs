@@ -9,7 +9,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const LLM_TIMEOUT_CHILD_ENV: &str = "TEAMY_STUDIO_LLM_TIMEOUT_CHILD";
 const LLM_TIMEOUT_DEADLINE_MS_ENV: &str = "TEAMY_STUDIO_LLM_TIMEOUT_DEADLINE_MS";
-const LLM_TIMEOUT_KILL_GRACE: Duration = Duration::from_secs(10);
+const LLM_TIMEOUT_KILL_GRACE: Duration = Duration::from_secs(5);
 
 /// Run a single Teamy-managed prompt through the Rust Burn lane.
 #[derive(Facet, Arbitrary, Debug, PartialEq)]
