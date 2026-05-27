@@ -126,6 +126,7 @@ pub struct PreparedLlmModel {
     pub managed_dir: PathBuf,
     pub artifacts: LlmModelArtifacts,
     pub registered_model_dirs: Vec<PathBuf>,
+    pub registration_warning: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -527,11 +528,13 @@ pub fn prepare_known_llm_model(
                 managed_dir.display()
             )
         })?;
-        let registered_model_dirs = add_registered_model_dir(app_home, &managed_dir)?;
+        let (registered_model_dirs, registration_warning) =
+            try_add_registered_model_dir(app_home, &managed_dir);
         return Ok(PreparedLlmModel {
             managed_dir,
             artifacts,
             registered_model_dirs,
+            registration_warning,
         });
     }
 
@@ -586,11 +589,13 @@ pub fn prepare_known_llm_model(
     })?;
 
     let artifacts = inspect_model_dir(&managed_dir)?;
-    let registered_model_dirs = add_registered_model_dir(app_home, &managed_dir)?;
+    let (registered_model_dirs, registration_warning) =
+        try_add_registered_model_dir(app_home, &managed_dir);
     Ok(PreparedLlmModel {
         managed_dir,
         artifacts,
         registered_model_dirs,
+        registration_warning,
     })
 }
 
@@ -727,6 +732,20 @@ pub fn add_registered_model_dir(app_home: &AppHome, root: &Path) -> eyre::Result
     model_dirs.insert(0, root);
     write_registered_model_dirs(app_home, &model_dirs)?;
     Ok(model_dirs)
+}
+
+fn try_add_registered_model_dir(app_home: &AppHome, root: &Path) -> (Vec<PathBuf>, Option<String>) {
+    match add_registered_model_dir(app_home, root) {
+        Ok(model_dirs) => (model_dirs, None),
+        Err(error) => (
+            vec![root.to_path_buf()],
+            Some(format!(
+                "Prepared the model successfully, but Teamy could not persist the registered model directory list: {}. You can still use this model via `--model-dir {}`.",
+                error,
+                root.display()
+            )),
+        ),
+    }
 }
 
 /// List all registered Teamy LLM model directories.

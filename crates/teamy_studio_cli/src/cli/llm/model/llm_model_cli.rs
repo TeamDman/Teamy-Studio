@@ -158,6 +158,9 @@ impl LlmModelPrepareArgs {
             let refreshed = crate::llm::model::inspect_model_dir(&prepared.managed_dir)?;
             println!("{}", crate::llm::model::render_model_report(&refreshed));
         }
+        if let Some(warning) = &prepared.registration_warning {
+            eprintln!("warning: {warning}");
+        }
         println!(
             "Registered model directory list:\n{}",
             crate::llm::model::render_registered_model_dirs(&prepared.registered_model_dirs)
