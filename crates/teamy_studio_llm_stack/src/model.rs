@@ -533,11 +533,8 @@ pub fn prepare_known_llm_model(
     }
 
     let staging_dir = managed_dir.with_extension("staging");
-    if staging_dir.exists() {
-        std::fs::remove_dir_all(&staging_dir).wrap_err_with(|| {
-            format!("Failed to clear staging directory {}", staging_dir.display())
-        })?;
-    }
+    remove_existing_path(&staging_dir)
+        .wrap_err_with(|| format!("Failed to clear staging path {}", staging_dir.display()))?;
     std::fs::create_dir_all(&staging_dir).wrap_err_with(|| {
         format!("Failed to create staging directory {}", staging_dir.display())
     })?;
@@ -566,9 +563,9 @@ pub fn prepare_known_llm_model(
 
     let _artifacts = inspect_model_dir(&staging_dir)?;
     if managed_dir.exists() {
-        std::fs::remove_dir_all(&managed_dir).wrap_err_with(|| {
+        remove_existing_path(&managed_dir).wrap_err_with(|| {
             format!(
-                "Failed to replace existing managed LLM model directory {}",
+                "Failed to replace existing managed LLM model path {}",
                 managed_dir.display()
             )
         })?;
@@ -793,10 +790,30 @@ fn write_model_metadata(
 }
 
 fn ensure_existing_dir(root: &Path) -> eyre::Result<()> {
+    if !root.exists() {
+        bail!(
+            "LLM model directory does not exist: {}. Prepare the model first with `teamy-studio llm model prepare --burn-text-only --with-burn-text`, or pass `--model-dir <prepared-model-dir>`.",
+            root.display()
+        );
+    }
     if !root.is_dir() {
-        bail!("Expected directory but found {}", root.display());
+        bail!(
+            "Expected LLM model directory but found a non-directory path: {}. If this is a stale placeholder, rerun model preparation with `teamy-studio llm model prepare --overwrite --burn-text-only --with-burn-text`.",
+            root.display()
+        );
     }
     Ok(())
+}
+
+fn remove_existing_path(path: &Path) -> eyre::Result<()> {
+    if path.is_dir() {
+        std::fs::remove_dir_all(path)
+    } else if path.exists() {
+        std::fs::remove_file(path)
+    } else {
+        Ok(())
+    }
+    .wrap_err_with(|| format!("Failed to remove existing path {}", path.display()))
 }
 
 fn download_to_file(url: &str, destination: &Path) -> eyre::Result<()> {
@@ -832,7 +849,7 @@ mod tests {
     use super::{
         HF_CONFIG_FILE_NAME, KNOWN_LLM_MODELS, MODEL_FILE_NAME, MODEL_METADATA_FILE_NAME,
         TOKENIZER_CONFIG_FILE_NAME, TOKENIZER_FILE_NAME, inspect_model_dir,
-        load_tokenizer_config_summary,
+        load_tokenizer_config_summary, remove_existing_path,
         write_model_metadata,
     };
     use tokenizers::{Tokenizer, models::bpe::BPE};
@@ -879,5 +896,30 @@ mod tests {
             Some(MODEL_FILE_NAME)
         );
         assert!(root.join(MODEL_METADATA_FILE_NAME).is_file());
+    }
+
+    #[test]
+    fn inspect_model_dir_reports_prepare_hint_for_missing_model_dir() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let missing = temp.path().join("missing-model");
+        let error = inspect_model_dir(&missing).expect_err("missing model dir should fail");
+        let message = error.to_string();
+        assert!(message.contains("LLM model directory does not exist"));
+        assert!(message.contains("llm model prepare"));
+    }
+
+    #[test]
+    fn remove_existing_path_removes_files_and_directories() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let file_path = temp.path().join("stale-file");
+        std::fs::write(&file_path, b"stale").expect("stale file");
+        remove_existing_path(&file_path).expect("remove stale file");
+        assert!(!file_path.exists());
+
+        let dir_path = temp.path().join("stale-dir");
+        std::fs::create_dir_all(&dir_path).expect("stale dir");
+        std::fs::write(dir_path.join("child"), b"stale").expect("stale child");
+        remove_existing_path(&dir_path).expect("remove stale dir");
+        assert!(!dir_path.exists());
     }
 }
