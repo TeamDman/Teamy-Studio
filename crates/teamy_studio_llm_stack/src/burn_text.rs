@@ -963,9 +963,9 @@ impl<B: Backend> Qwen35TextRuntime<B> {
                     &decode_state.repeated_key_cache[key_base..key_base + head_dim];
                 scores.push(dot_product(query_slice, key_slice) * scale);
             }
-            let weights = softmax_scalars(&scores);
+            softmax_scalars_in_place(&mut scores);
             let output_base = head * head_dim;
-            for (token_index, weight) in weights.into_iter().enumerate() {
+            for (token_index, weight) in scores.into_iter().enumerate() {
                 let value_base =
                     (token_index * self.manifest.num_attention_heads + head) * head_dim;
                 let value_slice =
@@ -3638,6 +3638,27 @@ fn softmax_scalars(values: &[f32]) -> Vec<f32> {
     exp_values
 }
 
+#[allow(dead_code)]
+fn softmax_scalars_in_place(values: &mut [f32]) {
+    if values.is_empty() {
+        return;
+    }
+    let max_value = values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let mut sum = 0.0_f32;
+    for value in values.iter_mut() {
+        *value = (*value - max_value).exp();
+        sum += *value;
+    }
+    if sum <= 0.0 {
+        values.fill(0.0);
+        return;
+    }
+    let inv_sum = sum.recip();
+    for value in values {
+        *value *= inv_sum;
+    }
+}
+
 fn qwen_rms_norm(
     values: &[f32],
     batch_size: usize,
@@ -4315,17 +4336,16 @@ fn recurrent_gated_delta_step(
         for state_index in 0..key_dim * value_dim {
             state[state_base + state_index] *= decay;
         }
-        let mut kv_mem = vec![0.0_f32; value_dim];
+        let mut delta = vec![0.0_f32; value_dim];
         for key_index in 0..key_dim {
             let key_value = key[q_base + key_index];
             let state_row_base = state_base + key_index * value_dim;
             for value_index in 0..value_dim {
-                kv_mem[value_index] += state[state_row_base + value_index] * key_value;
+                delta[value_index] += state[state_row_base + value_index] * key_value;
             }
         }
-        let mut delta = vec![0.0_f32; value_dim];
         for value_index in 0..value_dim {
-            delta[value_index] = (value[v_base + value_index] - kv_mem[value_index]) * beta_t;
+            delta[value_index] = (value[v_base + value_index] - delta[value_index]) * beta_t;
         }
         for key_index in 0..key_dim {
             let key_value = key[q_base + key_index];
@@ -4482,7 +4502,8 @@ mod tests {
         BURN_TEXT_DIR_NAME, BURN_TEXT_MANIFEST_FILE_NAME, BurnTextManifest, BurnTextTensorSpec,
         LlmCpuBackend, apply_rotary_slice, bytes_per_element, causal_mask,
         decode_bytes_into_f32, dot_product, f16_bits_to_f32, first_mismatch_index,
-        inspect_burn_text_runtime_status, rotary_embeddings, sigmoid_scalar,
+        inspect_burn_text_runtime_status, rotary_embeddings, sigmoid_scalar, softmax_scalars,
+        softmax_scalars_in_place,
     };
     use std::collections::BTreeMap;
 
@@ -4574,6 +4595,13 @@ mod tests {
     fn helper_math_is_stable() {
         assert!((sigmoid_scalar(0.0) - 0.5).abs() < 1e-6);
         assert_eq!(dot_product(&[1.0, 2.0], &[3.0, 4.0]), 11.0);
+        let values = [1.0, 2.0, 4.0, -1.0];
+        let expected = softmax_scalars(&values);
+        let mut actual = values;
+        softmax_scalars_in_place(&mut actual);
+        for (left, right) in expected.iter().zip(actual.iter()) {
+            assert!((left - right).abs() < 1e-6);
+        }
     }
 
     #[test]
