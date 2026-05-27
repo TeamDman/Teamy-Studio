@@ -86,6 +86,27 @@ impl LlmPromptArgs {
         app_home: &crate::paths::AppHome,
         cache_home: &crate::paths::CacheHome,
     ) -> eyre::Result<CliOutput> {
+        match self.invoke_inner(app_home, cache_home) {
+            Ok(output) => Ok(output),
+            Err(error)
+                if is_timeout_supervision_child()
+                    && crate::llm::burn_text::is_generation_timeout_error(&error) =>
+            {
+                tracing::warn!(
+                    "LLM prompt child hit the Burn generation timeout and will exit immediately to avoid slow runtime teardown"
+                );
+                eprintln!("Error:\n   0: {}", error);
+                std::process::exit(124);
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn invoke_inner(
+        self,
+        app_home: &crate::paths::AppHome,
+        cache_home: &crate::paths::CacheHome,
+    ) -> eyre::Result<CliOutput> {
         let command_started_at = Instant::now();
         let generation_timeout = resolve_timeout_arg(
             self.timeout.as_deref(),

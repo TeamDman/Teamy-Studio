@@ -287,6 +287,7 @@ struct LinearAttentionDecodeState {
 
 impl<B: Backend> Qwen35TextRuntime<B> {
     fn load(artifacts: &LlmModelArtifacts, device: B::Device) -> eyre::Result<Self> {
+        GenerationDeadline::check_current()?;
         let bundle_root = burn_text_dir(&artifacts.root);
         let manifest_path = burn_text_manifest_path(&artifacts.root);
         let manifest = load_burn_text_manifest(&manifest_path)?;
@@ -305,7 +306,11 @@ impl<B: Backend> Qwen35TextRuntime<B> {
             manifest.layer_types.len()
         );
         validate_manifest_contract(&manifest, &manifest_path)?;
+        GenerationDeadline::check_current()?;
         let packed_tensor_path = shared_packed_tensor_path(&bundle_root, &manifest);
+        if packed_tensor_path.is_some() {
+            GenerationDeadline::check_current()?;
+        }
         let packed_tensor_file = packed_tensor_path
             .as_ref()
             .map(File::open)
@@ -499,12 +504,14 @@ impl<B: Backend> Qwen35TextRuntime<B> {
         spec: &BurnTextTensorSpec,
         tensor_name: &str,
     ) -> eyre::Result<Vec<u8>> {
+        GenerationDeadline::check_current()?;
         let (offset_bytes, byte_len) = self.tensor_byte_range(spec, tensor_name)?;
         let path = self.tensor_file_path(spec);
         let mut bytes = vec![0_u8; byte_len];
         if let Some(file) = &self.packed_tensor_file
             && self.packed_tensor_path.as_ref().is_some_and(|packed| packed == &path)
         {
+            GenerationDeadline::check_current()?;
             let mut file = file.lock().map_err(|_| {
                 eyre::eyre!(
                     "Packed Burn text tensor file mutex was poisoned for {}",
@@ -527,6 +534,7 @@ impl<B: Backend> Qwen35TextRuntime<B> {
             })?;
             return Ok(bytes);
         }
+        GenerationDeadline::check_current()?;
         let mut file = File::open(&path)
             .wrap_err_with(|| format!("Failed to open Burn text tensor {}", path.display()))?;
         file.seek(SeekFrom::Start(offset_bytes)).wrap_err_with(|| {
@@ -567,6 +575,7 @@ impl<B: Backend> Qwen35TextRuntime<B> {
             .try_fold(1_usize, |acc, dim| acc.checked_mul(dim))
             .ok_or_else(|| eyre::eyre!("element-count overflow for tensor `{tensor_name}`"))?;
         let mut values = Vec::with_capacity(element_count);
+        GenerationDeadline::check_current()?;
         let bytes = self.read_tensor_bytes(spec, tensor_name)?;
         decode_bytes_into_f32(&bytes, &spec.dtype, &mut values)?;
         let loaded = LoadedTensor {
@@ -593,6 +602,7 @@ impl<B: Backend> Qwen35TextRuntime<B> {
         }
         let spec = self.tensor_spec(tensor_name)?;
         let [dim] = shape_array::<1>(&spec.shape, tensor_name)?;
+        GenerationDeadline::check_current()?;
         let bytes = self.read_tensor_bytes(spec, tensor_name)?;
         let tensor = tensor_1d_from_bytes(&bytes, &spec.dtype, dim, &self.device)?;
         self.tensor_1d_cache
@@ -614,6 +624,7 @@ impl<B: Backend> Qwen35TextRuntime<B> {
         }
         let spec = self.tensor_spec(tensor_name)?;
         let [dim0, dim1] = shape_array::<2>(&spec.shape, tensor_name)?;
+        GenerationDeadline::check_current()?;
         let bytes = self.read_tensor_bytes(spec, tensor_name)?;
         let tensor = tensor_2d_from_bytes(&bytes, &spec.dtype, [dim0, dim1], &self.device)?;
         self.tensor_2d_cache
@@ -2277,8 +2288,10 @@ impl GenerationDeadline {
     }
 }
 
-fn is_generation_timeout_error(error: &eyre::Report) -> bool {
-    error.downcast_ref::<GenerationTimeoutError>().is_some()
+pub fn is_generation_timeout_error(error: &eyre::Report) -> bool {
+    error
+        .chain()
+        .any(|source| source.downcast_ref::<GenerationTimeoutError>().is_some())
 }
 
 fn validate_manifest_contract(manifest: &BurnTextManifest, manifest_path: &Path) -> eyre::Result<()> {
