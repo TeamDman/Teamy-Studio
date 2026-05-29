@@ -4,31 +4,12 @@ use figue as args;
 
 use crate::cli::output::CliOutput;
 
-#[derive(Facet, Arbitrary, Clone, Copy, Debug, Default, PartialEq, Eq)]
-#[facet(rename_all = "kebab-case")]
-#[repr(u8)]
-pub enum TerminalOpenVtEngine {
-    Ghostty,
-    #[default]
-    Teamy,
-}
-
-impl From<TerminalOpenVtEngine> for crate::app::VtEngineChoice {
-    fn from(value: TerminalOpenVtEngine) -> Self {
-        match value {
-            TerminalOpenVtEngine::Ghostty => Self::Ghostty,
-            TerminalOpenVtEngine::Teamy => Self::Teamy,
-        }
-    }
-}
-
 /// Open a new terminal window.
 // cli[impl command.surface.terminal-open]
 // cli[impl terminal.open.default-shell-when-program-omitted]
 // cli[impl terminal.open.double-dash-trailing-args]
 // cli[impl terminal.open.stdin-flag]
 // cli[impl terminal.open.title-flag]
-// cli[impl terminal.open.vt-engine-flag]
 #[derive(Facet, Debug, PartialEq)]
 #[facet(rename_all = "kebab-case")]
 pub struct TerminalOpenArgs {
@@ -44,10 +25,6 @@ pub struct TerminalOpenArgs {
     #[facet(args::named)]
     pub title: Option<String>,
 
-    /// Select which VT engine backs the new window.
-    #[facet(args::named)]
-    pub vt_engine: Option<TerminalOpenVtEngine>,
-
     /// Use `--` before any terminal argument that starts with `-` so Teamy Studio
     /// treats it as a trailing program argument instead of a CLI flag.
     #[facet(args::positional, default)]
@@ -59,7 +36,6 @@ impl<'a> Arbitrary<'a> for TerminalOpenArgs {
         let program = Option::<String>::arbitrary(u)?;
         let stdin = Option::<String>::arbitrary(u)?;
         let title = Option::<String>::arbitrary(u)?;
-        let vt_engine = Option::<TerminalOpenVtEngine>::arbitrary(u)?;
         let mut args = Vec::<String>::arbitrary(u)?;
         if program.is_none() {
             args.clear();
@@ -68,7 +44,6 @@ impl<'a> Arbitrary<'a> for TerminalOpenArgs {
             program,
             stdin,
             title,
-            vt_engine,
             args,
         })
     }
@@ -95,7 +70,7 @@ impl TerminalOpenArgs {
             command_argv.as_deref(),
             self.stdin.as_deref(),
             self.title.as_deref(),
-            self.vt_engine.unwrap_or_default().into(),
+            crate::app::VtEngineChoice::Teamy,
         )?;
         Ok(CliOutput::none())
     }
@@ -107,7 +82,7 @@ impl TerminalOpenArgs {
     reason = "CLI parser tests use Default::default in expected-value literals for brevity"
 )]
 mod tests {
-    use crate::cli::terminal::open::{TerminalOpenArgs, TerminalOpenVtEngine};
+    use crate::cli::terminal::open::TerminalOpenArgs;
     use crate::cli::terminal::{TerminalArgs, TerminalCommand};
     use crate::cli::{Cli, Command};
 
@@ -135,7 +110,6 @@ mod tests {
                         program: None,
                         stdin: None,
                         title: Some("scratch".to_owned()),
-                        vt_engine: None,
                         args: Vec::new(),
                     }),
                 })),
@@ -155,8 +129,6 @@ mod tests {
                         "pwsh",
                         "--title",
                         "scratch",
-                        "--vt-engine",
-                        "teamy",
                         "--",
                         "-NoProfile",
                     ])
@@ -177,7 +149,6 @@ mod tests {
                         program: Some("pwsh".to_owned()),
                         stdin: None,
                         title: Some("scratch".to_owned()),
-                        vt_engine: Some(TerminalOpenVtEngine::Teamy),
                         args: vec!["-NoProfile".to_owned()],
                     }),
                 })),

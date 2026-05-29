@@ -3412,18 +3412,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "int-enum"
-version = "1.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e366a1634cccc76b4cfd3e7580de9b605e4d93f1edac48d786c1f867c0def495"
-dependencies = [
- "proc-macro2",
- "proc-macro2-diagnostics",
- "quote",
- "syn",
-]
-
-[[package]]
 name = "ipnet"
 version = "2.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3592,21 +3580,6 @@ name = "libc"
 version = "0.2.180"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bcc35a38544a891a5f7c865aca548a982ccb3b8650a5b06d0fd33a10283c56fc"
-
-[[package]]
-name = "libghostty-vt"
-version = "0.1.1"
-source = "git+https://github.com/TeamDman/libghostty-rs.git?rev=5e5351c9dc4b800202721ce15017c929958f685d#5e5351c9dc4b800202721ce15017c929958f685d"
-dependencies = [
- "bitflags 2.11.0",
- "int-enum",
- "libghostty-vt-sys",
-]
-
-[[package]]
-name = "libghostty-vt-sys"
-version = "0.1.1"
-source = "git+https://github.com/TeamDman/libghostty-rs.git?rev=5e5351c9dc4b800202721ce15017c929958f685d#5e5351c9dc4b800202721ce15017c929958f685d"
 
 [[package]]
 name = "libloading"
@@ -4597,18 +4570,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8fd00f0bb2e90d81d1044c2b32617f68fcb9fa3bb7640c23e9c748e53fb30934"
 dependencies = [
  "unicode-ident",
-]
-
-[[package]]
-name = "proc-macro2-diagnostics"
-version = "0.10.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "af066a9c399a26e020ada66a034357a868728e72cd426f3adcd35f80d88d88c8"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn",
- "version_check",
 ]
 
 [[package]]
@@ -5759,7 +5720,6 @@ dependencies = [
  "fontdue",
  "hound",
  "image",
- "libghostty-vt",
  "npy",
  "open",
  "portable-pty",
@@ -5797,7 +5757,6 @@ dependencies = [
  "teamy_studio_win32_support",
  "teamy_studio_windows_audio",
  "teamy_studio_windows_dialogs",
- "teamy_studio_windows_terminal_engine",
  "teamy_studio_windows_terminal_replay",
  "tempfile",
  "tokenizers",
@@ -5929,7 +5888,6 @@ dependencies = [
  "teamy_studio_whisper_stack",
  "teamy_studio_windows_audio",
  "teamy_studio_windows_dialogs",
- "teamy_studio_windows_terminal_engine",
  "teamy_studio_windows_terminal_replay",
  "tracing",
 ]
@@ -6101,7 +6059,6 @@ version = "0.1.0"
 dependencies = [
  "eyre",
  "facet",
- "libghostty-vt",
  "portable-pty",
  "teamy_studio_paths",
  "teamy_studio_shell_default",
@@ -6109,7 +6066,6 @@ dependencies = [
  "teamy_studio_teamy_terminal_engine",
  "teamy_studio_vt_types",
  "teamy_studio_windows_audio",
- "teamy_studio_windows_terminal_engine",
  "tracing",
  "windows 0.62.2",
 ]
@@ -6131,9 +6087,6 @@ dependencies = [
 [[package]]
 name = "teamy_studio_vt_types"
 version = "0.1.0"
-dependencies = [
- "libghostty-vt",
-]
 
 [[package]]
 name = "teamy_studio_waifu2x_reference"
@@ -6196,24 +6149,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "teamy_studio_windows_terminal_engine"
-version = "0.1.0"
-dependencies = [
- "eyre",
- "libghostty-vt",
- "teamy_studio_vt_types",
-]
-
-[[package]]
 name = "teamy_studio_windows_terminal_replay"
 version = "0.1.0"
 dependencies = [
  "eyre",
  "facet",
  "facet-json",
- "libghostty-vt",
  "teamy_studio_teamy_terminal_engine",
- "teamy_studio_windows_terminal_engine",
 ]
 
 [[package]]

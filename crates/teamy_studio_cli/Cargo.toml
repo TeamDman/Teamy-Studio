@@ -39,16 +39,9 @@ teamy_studio_waifu2x_reference.workspace = true
 teamy_studio_whisper_stack.workspace = true
 teamy_studio_windows_audio.workspace = true
 teamy_studio_windows_dialogs.workspace = true
-teamy_studio_windows_terminal_engine = { workspace = true, optional = true }
 teamy_studio_windows_terminal_replay.workspace = true
 tracing.workspace = true
 
 [features]
 default = []
-ghostty = [
-	"dep:teamy_studio_windows_terminal_engine",
-	"teamy_studio_terminal_core/ghostty",
-	"teamy_studio_windows_terminal_engine/ghostty",
-	"teamy_studio_windows_terminal_replay/ghostty",
-]
 extended_observability = []

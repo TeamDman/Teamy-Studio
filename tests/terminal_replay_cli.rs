@@ -44,7 +44,6 @@ impl Drop for TempDirGuard {
 
 // cli[verify command.surface.self-test-terminal-replay]
 // cli[verify self-test.terminal-replay.artifact-output]
-#[cfg(feature = "ghostty")]
 #[test]
 fn terminal_replay_command_runs_headlessly_and_writes_artifact() {
     let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -71,10 +70,6 @@ fn terminal_replay_command_runs_headlessly_and_writes_artifact() {
         "missing replay timing:\n{text}"
     );
     assert!(
-        text.contains("\"teamy_matches_ghostty\": true"),
-        "missing Teamy comparison result:\n{text}"
-    );
-    assert!(
         text.contains("hello"),
         "missing replay screen text:\n{text}"
     );
@@ -82,48 +77,10 @@ fn terminal_replay_command_runs_headlessly_and_writes_artifact() {
 
     let artifact_text = std::fs::read_to_string(&artifact).expect("artifact should be readable");
     assert!(artifact_text.contains("final_screen"));
-    assert!(artifact_text.contains("teamy_final_screen"));
-    assert!(artifact_text.contains("teamy_matches_ghostty"));
-    assert!(artifact_text.contains("teamy_display"));
-    assert!(artifact_text.contains("teamy_trace"));
+    assert!(artifact_text.contains("display"));
+    assert!(artifact_text.contains("trace"));
     assert!(artifact_text.contains("visible_rows"));
     assert!(artifact_text.contains("cursor"));
     assert!(artifact_text.contains("events"));
     assert!(artifact_text.contains("hello"));
-}
-
-// cli[verify command.surface.self-test-terminal-replay]
-#[cfg(not(feature = "ghostty"))]
-#[test]
-fn terminal_replay_command_reports_missing_ghostty_feature() {
-    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests")
-        .join("fixtures")
-        .join("terminal-replay")
-        .join("hello.json");
-    let output_dir = TempDirGuard::new("teamy-studio-terminal-replay");
-    let artifact = output_dir.path().join("replay-report.json");
-
-    let output = run_teamy_studio(&[
-        "self-test",
-        "terminal-replay",
-        "--fixture",
-        fixture.to_string_lossy().as_ref(),
-        "--artifact-output",
-        artifact.to_string_lossy().as_ref(),
-    ]);
-    let text = output_text(&output);
-
-    assert!(
-        !output.status.success(),
-        "terminal replay should fail clearly without the ghostty feature:\n{text}"
-    );
-    assert!(
-        text.contains("requires the `ghostty` feature"),
-        "missing ghostty feature error should stay explicit:\n{text}"
-    );
-    assert!(
-        !artifact.exists(),
-        "terminal replay should not write an artifact when the ghostty feature is unavailable"
-    );
 }

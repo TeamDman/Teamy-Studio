@@ -9,14 +9,6 @@ use tracing::debug_span;
 use tracing::trace;
 
 use eyre::Context;
-#[cfg(feature = "ghostty")]
-use libghostty_vt::TerminalOptions;
-#[cfg(feature = "ghostty")]
-use libghostty_vt::render::{CellIterator, CursorVisualStyle, Dirty, RowIterator};
-#[cfg(feature = "ghostty")]
-use libghostty_vt::screen::RowSemanticPrompt;
-#[cfg(feature = "ghostty")]
-use libghostty_vt::style::RgbColor;
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use tracing::{debug, error, info, info_span, instrument};
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
@@ -36,8 +28,6 @@ use super::teamy_terminal_engine::{
 };
 use super::vt_types::{ScrollViewport, key};
 use super::windows_audio::ring_terminal_bell;
-#[cfg(feature = "ghostty")]
-use super::windows_terminal_engine::GhosttyTerminalEngine;
 
 pub const DRAG_STRIP_HEIGHT: i32 = 52;
 pub const WINDOW_PADDING: i32 = 18;
@@ -402,26 +392,19 @@ pub struct TerminalSession {
 }
 
 enum RuntimeTerminalEngine {
-    #[cfg(feature = "ghostty")]
-    Ghostty(GhosttyTerminalEngine),
     Teamy(Box<TeamyTerminalEngine>),
 }
 
 impl RuntimeTerminalEngine {
     fn vt_write(&mut self, bytes: &[u8]) {
         match self {
-            #[cfg(feature = "ghostty")]
-            Self::Ghostty(engine) => engine.vt_write(bytes),
             Self::Teamy(engine) => engine.vt_write(bytes),
         }
     }
 
-    #[cfg_attr(
-        not(feature = "ghostty"),
-        expect(
-            clippy::unnecessary_wraps,
-            reason = "the Teamy branch is intentionally kept signature-compatible with the ghostty branch during terminal-engine preservation work"
-        )
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "preserve the terminal-session Result-based call shape while the Teamy VT path is the only backend"
     )]
     fn resize(
         &mut self,
@@ -431,8 +414,6 @@ impl RuntimeTerminalEngine {
         cell_height: u32,
     ) -> eyre::Result<()> {
         match self {
-            #[cfg(feature = "ghostty")]
-            Self::Ghostty(engine) => engine.resize(cols, rows, cell_width, cell_height),
             Self::Teamy(engine) => {
                 let _ = cell_width;
                 let _ = cell_height;
@@ -444,32 +425,16 @@ impl RuntimeTerminalEngine {
 
     fn scroll_viewport(&mut self, viewport: ScrollViewport) {
         match self {
-            #[cfg(feature = "ghostty")]
-            Self::Ghostty(engine) => engine.scroll_viewport(viewport),
             Self::Teamy(engine) => engine.scroll_viewport(viewport),
         }
     }
 
-    #[cfg_attr(
-        not(feature = "ghostty"),
-        expect(
-            clippy::unnecessary_wraps,
-            reason = "the Teamy branch is intentionally kept signature-compatible with the ghostty branch during terminal-engine preservation work"
-        )
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "preserve the terminal-session Result-based call shape while the Teamy VT path is the only backend"
     )]
     fn scroll_active_cursor_into_view(&mut self) -> eyre::Result<()> {
         match self {
-            #[cfg(feature = "ghostty")]
-            Self::Ghostty(engine) => {
-                let viewport = engine.viewport_metrics()?;
-                let max_offset = viewport.total.saturating_sub(viewport.visible);
-                if viewport.offset < max_offset {
-                    let delta = i128::from(max_offset) - i128::from(viewport.offset);
-                    let delta = delta.clamp(isize::MIN as i128, isize::MAX as i128) as isize;
-                    engine.scroll_viewport(ScrollViewport::Delta(delta));
-                }
-                Ok(())
-            }
             Self::Teamy(engine) => {
                 engine.scroll_active_cursor_into_view();
                 Ok(())
@@ -477,48 +442,28 @@ impl RuntimeTerminalEngine {
         }
     }
 
-    #[cfg_attr(
-        not(feature = "ghostty"),
-        expect(
-            clippy::unnecessary_wraps,
-            reason = "the Teamy branch is intentionally kept signature-compatible with the ghostty branch during terminal-engine preservation work"
-        )
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "preserve the terminal-session Result-based call shape while the Teamy VT path is the only backend"
     )]
     fn kitty_keyboard_flags(&self) -> eyre::Result<key::KittyKeyFlags> {
         match self {
-            #[cfg(feature = "ghostty")]
-            Self::Ghostty(engine) => engine.kitty_keyboard_flags(),
             Self::Teamy(_) => Ok(key::KittyKeyFlags::empty()),
         }
     }
 
     fn mouse_reporting_enabled(&self) -> bool {
         match self {
-            #[cfg(feature = "ghostty")]
-            Self::Ghostty(_) => false,
             Self::Teamy(engine) => engine.mouse_reporting_enabled(),
         }
     }
 
-    #[cfg_attr(
-        not(feature = "ghostty"),
-        expect(
-            clippy::unnecessary_wraps,
-            reason = "the Teamy branch is intentionally kept signature-compatible with the ghostty branch during terminal-engine preservation work"
-        )
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "preserve the terminal-session Result-based call shape while the Teamy VT path is the only backend"
     )]
     fn viewport_metrics(&self) -> eyre::Result<TerminalViewportMetrics> {
         match self {
-            #[cfg(feature = "ghostty")]
-            Self::Ghostty(engine) => {
-                let viewport = engine.viewport_metrics()?;
-                Ok(TerminalViewportMetrics {
-                    total: viewport.total,
-                    offset: viewport.offset,
-                    visible: viewport.visible,
-                    scrollback: u64::try_from(viewport.scrollback).unwrap_or(u64::MAX),
-                })
-            }
             Self::Teamy(engine) => {
                 let TeamyViewportMetrics {
                     total,
@@ -536,44 +481,30 @@ impl RuntimeTerminalEngine {
         }
     }
 
-    #[cfg_attr(
-        not(feature = "ghostty"),
-        expect(
-            clippy::unnecessary_wraps,
-            reason = "the Teamy branch is intentionally kept signature-compatible with the ghostty branch during terminal-engine preservation work"
-        )
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "preserve the terminal-session Result-based call shape while the Teamy VT path is the only backend"
     )]
     fn total_rows(&self) -> eyre::Result<usize> {
         match self {
-            #[cfg(feature = "ghostty")]
-            Self::Ghostty(engine) => engine.total_rows(),
             Self::Teamy(engine) => Ok(engine.total_rows()),
         }
     }
 
-    #[cfg_attr(
-        not(feature = "ghostty"),
-        expect(
-            clippy::unnecessary_wraps,
-            reason = "the Teamy branch is intentionally kept signature-compatible with the ghostty branch during terminal-engine preservation work"
-        )
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "preserve the terminal-session Result-based call shape while the Teamy VT path is the only backend"
     )]
     fn screen_row_cells(&self, row: u32, cols: u16) -> eyre::Result<Vec<String>> {
-        #[cfg(not(feature = "ghostty"))]
         let _ = cols;
         match self {
-            #[cfg(feature = "ghostty")]
-            Self::Ghostty(engine) => ghostty_screen_row_cells(engine, cols, row),
             Self::Teamy(engine) => Ok(engine.screen_row_cells(row)),
         }
     }
 
-    #[cfg_attr(
-        not(feature = "ghostty"),
-        expect(
-            clippy::unnecessary_wraps,
-            reason = "the Teamy branch is intentionally kept signature-compatible with the ghostty branch during terminal-engine preservation work"
-        )
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "preserve the terminal-session Result-based call shape while the Teamy VT path is the only backend"
     )]
     fn encode_key_event(
         &mut self,
@@ -584,7 +515,6 @@ impl RuntimeTerminalEngine {
         unshifted_codepoint: char,
         response: &mut Vec<u8>,
     ) -> eyre::Result<()> {
-        #[cfg(not(feature = "ghostty"))]
         let _ = (
             &action,
             &mapped_key,
@@ -594,15 +524,6 @@ impl RuntimeTerminalEngine {
             &mut *response,
         );
         match self {
-            #[cfg(feature = "ghostty")]
-            Self::Ghostty(engine) => engine.encode_key_event(
-                action,
-                mapped_key,
-                mods,
-                consumed_mods,
-                unshifted_codepoint,
-                response,
-            ),
             Self::Teamy(_) => Ok(()),
         }
     }
@@ -1793,12 +1714,12 @@ impl TerminalWorkerRunner {
 impl TerminalCore {
     #[expect(
         clippy::too_many_lines,
-        reason = "PTY setup, libghostty initialization, and reader-thread wiring are kept together for clarity"
+        reason = "PTY setup and reader-thread wiring are kept together for clarity"
     )]
     #[instrument(level = "info", skip_all)]
     pub fn new_with_command(
         shell: CommandBuilder,
-        vt_engine: VtEngineChoice,
+        _vt_engine: VtEngineChoice,
     ) -> eyre::Result<Self> {
         let pty_system = native_pty_system();
         let initial_size = PtySize {
@@ -1822,49 +1743,16 @@ impl TerminalCore {
             Arc::new(Mutex::new(pair.master.take_writer().map_err(|error| {
                 eyre::eyre!("failed to open PTY writer: {error}")
             })?));
-        let engine = match vt_engine {
-            VtEngineChoice::Ghostty => {
-                #[cfg(not(feature = "ghostty"))]
-                {
-                    eyre::bail!(
-                        "Ghostty VT engine is not available in this build; rebuild with `--features ghostty`"
-                    )
-                }
-
-                #[cfg(feature = "ghostty")]
-                {
-                    let writer_for_effect = Arc::clone(&writer);
-                    let mut engine = info_span!("create_libghostty_terminal").in_scope(|| {
-                        GhosttyTerminalEngine::new(TerminalOptions {
-                            cols: DEFAULT_COLS,
-                            rows: DEFAULT_ROWS,
-                            max_scrollback: MAX_SCROLLBACK,
-                        })
-                    })?;
-                    engine.on_pty_write(move |_terminal, data| {
-                        if let Ok(mut writer) = writer_for_effect.lock() {
-                            let _ = writer.write_all(data);
-                            let _ = writer.flush();
-                        }
-                    })?;
-                    engine.on_bell(ring_terminal_bell)?;
-                    RuntimeTerminalEngine::Ghostty(engine)
-                }
+        let writer_for_effect = Arc::clone(&writer);
+        let mut engine = TeamyTerminalEngine::new(DEFAULT_COLS, DEFAULT_ROWS, MAX_SCROLLBACK);
+        engine.on_pty_write(move |data| {
+            if let Ok(mut writer) = writer_for_effect.lock() {
+                let _ = writer.write_all(data);
+                let _ = writer.flush();
             }
-            VtEngineChoice::Teamy => {
-                let writer_for_effect = Arc::clone(&writer);
-                let mut engine =
-                    TeamyTerminalEngine::new(DEFAULT_COLS, DEFAULT_ROWS, MAX_SCROLLBACK);
-                engine.on_pty_write(move |data| {
-                    if let Ok(mut writer) = writer_for_effect.lock() {
-                        let _ = writer.write_all(data);
-                        let _ = writer.flush();
-                    }
-                });
-                engine.on_bell(ring_terminal_bell);
-                RuntimeTerminalEngine::Teamy(Box::new(engine))
-            }
-        };
+        });
+        engine.on_bell(ring_terminal_bell);
+        let engine = RuntimeTerminalEngine::Teamy(Box::new(engine));
 
         info!(
             program = shell.get_argv().first().map_or_else(
@@ -2677,21 +2565,7 @@ impl TerminalCore {
         selection: Option<TerminalSelection>,
     ) -> eyre::Result<TerminalDisplayState> {
         let viewport = self.viewport_metrics()?;
-        let selection_active = selection.is_some();
-        #[cfg(not(feature = "ghostty"))]
-        let _ = selection_active;
-        #[cfg(feature = "ghostty")]
-        let previous_display = (!selection_active).then(|| Arc::clone(&self.cached_display));
-
         match &mut self.engine {
-            #[cfg(feature = "ghostty")]
-            RuntimeTerminalEngine::Ghostty(engine) => build_ghostty_display_state(
-                engine,
-                selection,
-                selection_active,
-                previous_display.as_deref(),
-                viewport,
-            ),
             RuntimeTerminalEngine::Teamy(engine) => {
                 Ok(build_teamy_display_state(engine, selection, viewport))
             }
@@ -2833,17 +2707,12 @@ impl TerminalCore {
         Cow::Owned(output)
     }
 
-    #[cfg_attr(
-        not(feature = "ghostty"),
-        expect(
-            clippy::unnecessary_wraps,
-            reason = "the ghostty branch can fail and the shared preserved call path keeps one signature"
-        )
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "preserve the terminal-session Result-based call shape while semantic prompt tracking stays backend-agnostic"
     )]
     fn refresh_semantic_prompt_tracking(&mut self) -> eyre::Result<()> {
         let next = match &mut self.engine {
-            #[cfg(feature = "ghostty")]
-            RuntimeTerminalEngine::Ghostty(engine) => ghostty_semantic_prompt_tracking(engine)?,
             RuntimeTerminalEngine::Teamy(_) => teamy_semantic_prompt_tracking(self.semantic_prompt),
         };
         if !self.semantic_prompt.markers_observed && next.markers_observed {
@@ -2876,17 +2745,6 @@ impl TerminalCore {
         self.repaint.full_repaint_pending = true;
         self.invalidate_display_cache();
 
-        #[cfg(feature = "ghostty")]
-        let ghostty_prompt_is_blank = matches!(&self.engine, RuntimeTerminalEngine::Ghostty(_))
-            && self.visible_text()?.trim().is_empty();
-        #[cfg(not(feature = "ghostty"))]
-        let ghostty_prompt_is_blank = false;
-        if ghostty_prompt_is_blank {
-            self.pending_prompt_reanchor_after_resize = true;
-            self.mark_prompt_input_written();
-            self.write_input(&[CTRL_L_FORM_FEED])?;
-        }
-
         Ok(())
     }
 
@@ -2908,10 +2766,6 @@ impl TerminalCore {
     fn visible_cell_text_rows(&mut self) -> eyre::Result<Vec<TerminalTextRow>> {
         let viewport = self.viewport_metrics()?;
         match &mut self.engine {
-            #[cfg(feature = "ghostty")]
-            RuntimeTerminalEngine::Ghostty(engine) => {
-                visible_ghostty_cell_text_rows(engine, viewport)
-            }
             RuntimeTerminalEngine::Teamy(engine) => {
                 Ok(visible_teamy_cell_text_rows(engine, viewport))
             }
@@ -2946,160 +2800,6 @@ impl TerminalCore {
     fn screen_row_cells(&self, row: u32) -> eyre::Result<Vec<String>> {
         self.engine.screen_row_cells(row, self.cols)
     }
-}
-
-#[expect(
-    clippy::too_many_lines,
-    reason = "incremental row extraction keeps the Ghostty render-state walk and dirty-row policy together"
-)]
-#[cfg(feature = "ghostty")]
-fn build_ghostty_display_state(
-    engine: &mut GhosttyTerminalEngine,
-    selection: Option<TerminalSelection>,
-    selection_active: bool,
-    previous_display: Option<&TerminalDisplayState>,
-    viewport: TerminalViewportMetrics,
-) -> eyre::Result<TerminalDisplayState> {
-    engine.with_snapshot(|snapshot| {
-        #[cfg(feature = "extended_observability")]
-        let _span = debug_span!("update_terminal_render_state").entered();
-
-        let colors = snapshot
-            .colors()
-            .wrap_err("failed to fetch terminal colors")?;
-        let mut rows = RowIterator::new().wrap_err("failed to create row iterator")?;
-        let mut cells = CellIterator::new().wrap_err("failed to create cell iterator")?;
-        let cursor = build_terminal_cursor(snapshot, &colors)?;
-        let mut display = TerminalDisplayState {
-            rows: Vec::new(),
-            dirty_rows: Vec::new(),
-            cursor,
-            scrollbar: Some(TerminalDisplayScrollbar {
-                total: viewport.total,
-                offset: viewport.offset,
-                visible: viewport.visible,
-            }),
-        };
-
-        let snapshot_dirty = snapshot.dirty().unwrap_or_else(|error| {
-            debug!(
-                ?error,
-                "falling back to full redraw after dirty-state query failure"
-            );
-            Dirty::Full
-        });
-
-        #[cfg(feature = "extended_observability")]
-        let _span = debug_span!("collect_visible_terminal_cells").entered();
-        let mut row_index = 0_i32;
-        let mut row_iter = rows
-            .update(snapshot)
-            .wrap_err("failed to update row iterator")?;
-        while let Some(row) = row_iter.next() {
-            let row_position = usize::try_from(row_index).unwrap_or_default();
-            let row_dirty = if selection_active || matches!(snapshot_dirty, Dirty::Full) {
-                true
-            } else if let Some(previous_display) = previous_display {
-                row.dirty().unwrap_or_else(|error| {
-                    debug!(
-                        ?error,
-                        row_position,
-                        "falling back to dirty row after row dirty-state query failure"
-                    );
-                    true
-                }) || previous_display.rows.get(row_position).is_none()
-            } else {
-                true
-            };
-
-            if !row_dirty
-                && let Some(previous_row) = previous_display
-                    .and_then(|previous_display| previous_display.rows.get(row_position))
-            {
-                display.rows.push(previous_row.clone());
-                row_index += 1;
-                continue;
-            }
-
-            let mut column_index = 0_i32;
-            let mut display_row = TerminalDisplayRow {
-                row: row_index,
-                backgrounds: Vec::new(),
-                glyphs: Vec::new(),
-            };
-            let mut cell_iter = cells
-                .update(row)
-                .wrap_err("failed to update cell iterator")?;
-            while let Some(cell) = cell_iter.next() {
-                let style = cell.style().wrap_err("failed to read cell style")?;
-                let graphemes = cell.graphemes().wrap_err("failed to read cell text")?;
-                let foreground = cell.fg_color().wrap_err("failed to read cell foreground")?;
-                let background = cell.bg_color().wrap_err("failed to read cell background")?;
-                let viewport_cell = TerminalCellPoint::new(column_index, row_index);
-                let selection_cell = TerminalCellPoint::new(
-                    column_index,
-                    i32::try_from(viewport.offset).unwrap_or(i32::MAX) + row_index,
-                );
-                let selected =
-                    selection.is_some_and(|selection| selection.contains(selection_cell));
-                let (glyph_color, background_color) = resolve_terminal_cell_colors(
-                    &colors,
-                    foreground,
-                    background,
-                    style.inverse ^ selected,
-                );
-
-                if let Some(color) = background_color {
-                    display_row.backgrounds.push(TerminalDisplayBackground {
-                        cell: viewport_cell,
-                        color,
-                    });
-                }
-
-                if !graphemes.is_empty() {
-                    for character in graphemes {
-                        if !should_render_terminal_glyph(character) {
-                            continue;
-                        }
-                        display_row.glyphs.push(TerminalDisplayGlyph {
-                            cell: viewport_cell,
-                            character,
-                            color: glyph_color,
-                        });
-                    }
-                }
-                column_index += 1;
-            }
-            display.rows.push(display_row);
-
-            if row_dirty {
-                display.dirty_rows.push(row_position);
-            }
-
-            if !selection_active && let Err(error) = row.set_dirty(false) {
-                debug!(
-                    ?error,
-                    row_position, "failed to clear terminal row dirty flag"
-                );
-            }
-
-            row_index += 1;
-        }
-
-        if selection_active
-            || matches!(snapshot_dirty, Dirty::Full)
-            || previous_display
-                .is_some_and(|previous_display| previous_display.rows.len() != display.rows.len())
-        {
-            display.dirty_rows = (0..display.rows.len()).collect();
-        }
-
-        if !selection_active && let Err(error) = snapshot.set_dirty(Dirty::Clean) {
-            debug!(?error, "failed to clear terminal render-state dirty flag");
-        }
-
-        Ok(display)
-    })
 }
 
 fn should_render_terminal_glyph(character: char) -> bool {
@@ -3274,44 +2974,6 @@ fn xterm_palette_color(index: u8) -> [f32; 4] {
     ]
 }
 
-#[cfg(feature = "ghostty")]
-fn visible_ghostty_cell_text_rows(
-    engine: &mut GhosttyTerminalEngine,
-    viewport: TerminalViewportMetrics,
-) -> eyre::Result<Vec<TerminalTextRow>> {
-    engine.with_snapshot(|snapshot| {
-        let mut rows = RowIterator::new().wrap_err("failed to create row iterator")?;
-        let mut cells = CellIterator::new().wrap_err("failed to create cell iterator")?;
-        let mut text_rows = Vec::new();
-
-        let mut row_iter = rows
-            .update(snapshot)
-            .wrap_err("failed to update row iterator")?;
-        let mut row_index = 0_i32;
-        while let Some(row) = row_iter.next() {
-            let mut row_cells = Vec::new();
-            let mut cell_iter = cells
-                .update(row)
-                .wrap_err("failed to update cell iterator")?;
-            while let Some(cell) = cell_iter.next() {
-                let graphemes = cell.graphemes().wrap_err("failed to read cell text")?;
-                if graphemes.is_empty() {
-                    row_cells.push(" ".to_owned());
-                } else {
-                    row_cells.push(graphemes.iter().collect());
-                }
-            }
-            text_rows.push(TerminalTextRow {
-                row: i32::try_from(viewport.offset).unwrap_or(i32::MAX) + row_index,
-                cells: row_cells,
-            });
-            row_index += 1;
-        }
-
-        Ok(text_rows)
-    })
-}
-
 fn visible_teamy_cell_text_rows(
     engine: &TeamyTerminalEngine,
     viewport: TerminalViewportMetrics,
@@ -3330,21 +2992,6 @@ fn visible_teamy_cell_text_rows(
         .collect()
 }
 
-#[cfg(feature = "ghostty")]
-fn ghostty_screen_row_cells(
-    engine: &GhosttyTerminalEngine,
-    cols: u16,
-    row: u32,
-) -> eyre::Result<Vec<String>> {
-    let mut cells = Vec::with_capacity(usize::from(cols));
-    for column in 0..cols {
-        let grid_ref = engine.screen_grid_ref(column, row)?;
-        cells.push(read_grid_ref_text(&grid_ref)?);
-    }
-
-    Ok(cells)
-}
-
 fn ordered_linear_bounds(
     anchor: TerminalCellPoint,
     focus: TerminalCellPoint,
@@ -3354,50 +3001,6 @@ fn ordered_linear_bounds(
     } else {
         (focus, anchor)
     }
-}
-
-#[cfg(feature = "ghostty")]
-fn ghostty_semantic_prompt_tracking(
-    engine: &mut GhosttyTerminalEngine,
-) -> eyre::Result<SemanticPromptTracking> {
-    engine.with_snapshot(|snapshot| {
-        let cursor_row = snapshot
-            .cursor_viewport()
-            .wrap_err("failed to query terminal cursor viewport for semantic prompt tracking")?
-            .map(|cursor| cursor.y);
-
-        let mut rows = RowIterator::new().wrap_err("failed to create row iterator")?;
-        let mut row_iter = rows
-            .update(snapshot)
-            .wrap_err("failed to update row iterator")?;
-
-        let mut row_index = 0_u16;
-        let mut markers_observed = false;
-        let mut at_shell_prompt = false;
-
-        while let Some(row) = row_iter.next() {
-            let semantic_prompt = row
-                .raw_row()
-                .wrap_err("failed to query raw terminal row for semantic prompt tracking")?
-                .semantic_prompt()
-                .wrap_err("failed to query terminal row semantic prompt state")?;
-
-            if semantic_prompt != RowSemanticPrompt::None {
-                markers_observed = true;
-                if cursor_row == Some(row_index) {
-                    at_shell_prompt = true;
-                }
-            }
-
-            row_index = row_index.saturating_add(1);
-        }
-
-        Ok(SemanticPromptTracking {
-            markers_observed,
-            at_shell_prompt,
-            input_state: PromptInputState::Inactive,
-        })
-    })
 }
 
 fn teamy_semantic_prompt_tracking(current: SemanticPromptTracking) -> SemanticPromptTracking {
@@ -3687,105 +3290,6 @@ fn extract_selected_text(rows: &[TerminalTextRow], selection: TerminalSelection)
     }
 
     selected_rows.join("\n")
-}
-
-#[cfg(feature = "ghostty")]
-fn read_grid_ref_text(grid_ref: &libghostty_vt::screen::GridRef<'_>) -> eyre::Result<String> {
-    let mut small = ['\0'; 8];
-    match grid_ref.graphemes(&mut small) {
-        Ok(0) => Ok(" ".to_owned()),
-        Ok(length) => Ok(small[..length].iter().collect()),
-        Err(libghostty_vt::Error::OutOfSpace { required }) => {
-            let mut buffer = vec!['\0'; required];
-            let length = grid_ref
-                .graphemes(&mut buffer)
-                .wrap_err("failed to read terminal grapheme cluster into resized buffer")?;
-            if length == 0 {
-                Ok(" ".to_owned())
-            } else {
-                Ok(buffer[..length].iter().collect())
-            }
-        }
-        Err(error) => Err(error).wrap_err("failed to read terminal cell grapheme cluster"),
-    }
-}
-
-#[cfg(feature = "ghostty")]
-fn rgb_to_rgba(color: RgbColor) -> [f32; 4] {
-    [
-        f32::from(color.r) / 255.0,
-        f32::from(color.g) / 255.0,
-        f32::from(color.b) / 255.0,
-        1.0,
-    ]
-}
-
-/// behavior[impl window.appearance.terminal.selection.inverse]
-#[cfg(feature = "ghostty")]
-fn resolve_terminal_cell_colors(
-    colors: &libghostty_vt::render::Colors,
-    foreground: Option<RgbColor>,
-    background: Option<RgbColor>,
-    inverse: bool,
-) -> ([f32; 4], Option<[f32; 4]>) {
-    let mut foreground = foreground.unwrap_or(colors.foreground);
-    let mut background = background.unwrap_or(colors.background);
-    let mut draw_background = background != colors.background;
-
-    if inverse {
-        std::mem::swap(&mut foreground, &mut background);
-        draw_background = true;
-    }
-
-    (
-        rgb_to_rgba(foreground),
-        draw_background.then(|| rgb_to_rgba(background)),
-    )
-}
-
-/// behavior[impl window.appearance.terminal.cursor.visible]
-#[cfg(feature = "ghostty")]
-fn build_terminal_cursor(
-    snapshot: &libghostty_vt::render::Snapshot<'_, '_>,
-    colors: &libghostty_vt::render::Colors,
-) -> eyre::Result<Option<TerminalDisplayCursor>> {
-    if !snapshot
-        .cursor_visible()
-        .wrap_err("failed to query cursor visibility")?
-    {
-        return Ok(None);
-    }
-
-    let Some(viewport) = snapshot
-        .cursor_viewport()
-        .wrap_err("failed to query cursor viewport")?
-    else {
-        return Ok(None);
-    };
-    let style = snapshot
-        .cursor_visual_style()
-        .wrap_err("failed to query cursor visual style")?;
-    let cursor_color = snapshot
-        .cursor_color()
-        .wrap_err("failed to query cursor color")?
-        .or(colors.cursor)
-        .unwrap_or(colors.foreground);
-
-    Ok(Some(TerminalDisplayCursor {
-        cell: TerminalCellPoint::new(i32::from(viewport.x), i32::from(viewport.y)),
-        color: rgb_to_rgba(cursor_color),
-        style: map_cursor_style(style),
-    }))
-}
-
-#[cfg(feature = "ghostty")]
-fn map_cursor_style(style: CursorVisualStyle) -> TerminalDisplayCursorStyle {
-    match style {
-        CursorVisualStyle::Bar => TerminalDisplayCursorStyle::Bar,
-        CursorVisualStyle::Underline => TerminalDisplayCursorStyle::Underline,
-        CursorVisualStyle::BlockHollow => TerminalDisplayCursorStyle::BlockHollow,
-        _ => TerminalDisplayCursorStyle::Block,
-    }
 }
 
 fn map_teamy_cursor_style(style: TeamyCursorStyle) -> TerminalDisplayCursorStyle {
@@ -4194,38 +3698,10 @@ fn normalize_cursor_visibility_mode_sequence(data: &[u8]) -> Cow<'_, [u8]> {
     }
 }
 
-#[cfg_attr(
-    not(feature = "ghostty"),
-    expect(
-        clippy::needless_return,
-        reason = "the cfg-split early return keeps the non-ghostty branch visually aligned with the ghostty branch"
-    )
-)]
 fn legacy_special_key_bytes(mapped_key: key::Key, mods: key::Mods) -> Option<Vec<u8>> {
-    #[cfg(not(feature = "ghostty"))]
-    {
-        let _ = mapped_key;
-        let _ = mods;
-        return None;
-    }
-
-    #[cfg(feature = "ghostty")]
-    {
-        use libghostty_vt::key as ghostty_key;
-
-        let mut key_event = ghostty_key::Event::new().ok()?;
-        let mut encoder = ghostty_key::Encoder::new().ok()?;
-        let mut response = Vec::with_capacity(16);
-        key_event
-            .set_action(ghostty_key::Action::Press)
-            .set_key(mapped_key.into())
-            .set_mods(mods.into())
-            .set_consumed_mods(key::Mods::empty().into())
-            .set_unshifted_codepoint('\0')
-            .set_utf8::<String>(None);
-        encoder.encode_to_vec(&key_event, &mut response).ok()?;
-        Some(response)
-    }
+    let _ = mapped_key;
+    let _ = mods;
+    None
 }
 
 fn should_publish_terminal_display_state(
@@ -4359,28 +3835,15 @@ mod tests {
         should_translate_ctrl_d_key, should_translate_ctrl_d_to_exit, should_translate_ctrl_l_key,
         should_translate_ctrl_l_to_form_feed, strip_echoed_ctrl_d, viewport_is_bottom_anchored,
     };
-    #[cfg(feature = "ghostty")]
-    use super::{
-        TerminalDisplayCursorStyle, build_ghostty_display_state, map_cursor_style,
-        resolve_terminal_cell_colors,
-    };
-    use crate::app::VtEngineChoice;
-    use crate::app::spatial::TerminalCellPoint;
-    use crate::app::teamy_terminal_engine::{TeamyColor, TeamyTerminalEngine};
+    use crate::VtEngineChoice;
+    use crate::spatial::TerminalCellPoint;
+    use crate::teamy_terminal_engine::{TeamyColor, TeamyTerminalEngine};
     use portable_pty::CommandBuilder;
     use std::ffi::OsStr;
     use std::sync::Arc;
     use std::time::Duration;
 
-    #[cfg(feature = "ghostty")]
-    use super::GhosttyTerminalEngine;
     use super::key;
-    #[cfg(feature = "ghostty")]
-    use libghostty_vt::TerminalOptions;
-    #[cfg(feature = "ghostty")]
-    use libghostty_vt::render::Colors;
-    #[cfg(feature = "ghostty")]
-    use libghostty_vt::style::RgbColor;
 
     // behavior[verify window.appearance.code-panel.terminal-alignment]
     // windowing[verify garden-band.shared]
@@ -4484,16 +3947,6 @@ mod tests {
     // cli[verify terminal.open.current-vt-engine-env]
     #[test]
     fn terminal_spawn_environment_sets_current_vt_engine_env_var() {
-        let mut ghostty_command = CommandBuilder::new("cmd.exe");
-        TerminalSession::apply_terminal_spawn_environment(
-            &mut ghostty_command,
-            VtEngineChoice::Ghostty,
-        );
-        assert_eq!(
-            ghostty_command.get_env(VtEngineChoice::CURRENT_TERMINAL_VT_ENGINE_ENV_VAR),
-            Some(OsStr::new("ghostty"))
-        );
-
         let mut teamy_command = CommandBuilder::new("cmd.exe");
         TerminalSession::apply_terminal_spawn_environment(
             &mut teamy_command,
@@ -4532,35 +3985,6 @@ mod tests {
 
         assert_eq!(i32::from(grid_cols), visible_cols.max(1));
         assert_eq!(i32::from(grid_rows), visible_rows.max(1));
-    }
-
-    // behavior[verify window.appearance.terminal.selection.inverse]
-    #[cfg(feature = "ghostty")]
-    #[test]
-    fn inverse_cells_swap_colors_and_force_background() {
-        let colors = Colors {
-            background: RgbColor {
-                r: 10,
-                g: 20,
-                b: 30,
-            },
-            foreground: RgbColor {
-                r: 240,
-                g: 241,
-                b: 242,
-            },
-            cursor: None,
-            palette: [RgbColor { r: 0, g: 0, b: 0 }; 256],
-        };
-
-        let (foreground, background) =
-            resolve_terminal_cell_colors(&colors, Some(RgbColor { r: 1, g: 2, b: 3 }), None, true);
-
-        assert_eq!(foreground, [10.0 / 255.0, 20.0 / 255.0, 30.0 / 255.0, 1.0]);
-        assert_eq!(
-            background,
-            Some([1.0 / 255.0, 2.0 / 255.0, 3.0 / 255.0, 1.0])
-        );
     }
 
     #[test]
@@ -4610,42 +4034,6 @@ mod tests {
             glyph.cell == TerminalCellPoint::new(1, 0)
                 && glyph.color == [4.0 / 255.0, 5.0 / 255.0, 6.0 / 255.0, 1.0]
         }));
-    }
-
-    #[test]
-    #[cfg(feature = "ghostty")]
-    fn ghostty_display_state_skips_tab_glyphs_and_keeps_tab_stop_alignment() -> eyre::Result<()> {
-        let mut engine = GhosttyTerminalEngine::new(TerminalOptions {
-            cols: 12,
-            rows: 2,
-            max_scrollback: 64,
-        })?;
-        engine.vt_write(b"a\tb");
-
-        let display = build_ghostty_display_state(
-            &mut engine,
-            None,
-            false,
-            None,
-            TerminalViewportMetrics {
-                total: 2,
-                offset: 0,
-                visible: 2,
-                scrollback: 0,
-            },
-        )?;
-
-        assert_eq!(
-            display.rows[0]
-                .glyphs
-                .iter()
-                .map(|glyph| glyph.character)
-                .collect::<Vec<_>>(),
-            vec!['a', 'b']
-        );
-        assert_eq!(display.rows[0].glyphs[0].cell, TerminalCellPoint::new(0, 0));
-        assert_eq!(display.rows[0].glyphs[1].cell, TerminalCellPoint::new(8, 0));
-        Ok(())
     }
 
     #[test]
@@ -4713,27 +4101,6 @@ mod tests {
         };
 
         assert_eq!(dirty_terminal_row_indices(&previous, &next), vec![1]);
-    }
-
-    #[test]
-    #[cfg(feature = "ghostty")]
-    fn cursor_style_mapping_matches_ghostty_values() {
-        assert_eq!(
-            map_cursor_style(libghostty_vt::render::CursorVisualStyle::Bar),
-            TerminalDisplayCursorStyle::Bar
-        );
-        assert_eq!(
-            map_cursor_style(libghostty_vt::render::CursorVisualStyle::Block),
-            TerminalDisplayCursorStyle::Block
-        );
-        assert_eq!(
-            map_cursor_style(libghostty_vt::render::CursorVisualStyle::Underline),
-            TerminalDisplayCursorStyle::Underline
-        );
-        assert_eq!(
-            map_cursor_style(libghostty_vt::render::CursorVisualStyle::BlockHollow),
-            TerminalDisplayCursorStyle::BlockHollow
-        );
     }
 
     #[test]

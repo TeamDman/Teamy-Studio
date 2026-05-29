@@ -64,9 +64,6 @@ The `self-test keyboard-input` command must accept an optional scenario argument
 cli[self-test.keyboard-input.artifact-output]
 The `self-test keyboard-input` command must support optional artifact output so captured keyboard and redraw transcripts can be written to disk for reduction into regression fixtures.
 
-cli[self-test.keyboard-input.vt-engine-flag]
-The `self-test keyboard-input` command must support `--vt-engine ghostty|teamy` so live keyboard regressions can be replayed against either terminal backend.
-
 cli[self-test.terminal-throughput.mode-optional]
 The `self-test terminal-throughput` command must accept an optional benchmark mode argument.
 
@@ -146,11 +143,8 @@ The `terminal open` command must support `--stdin` so text can be written to the
 cli[terminal.open.title-flag]
 The `terminal open` command must support `--title` so callers can seed the terminal chrome title.
 
-cli[terminal.open.vt-engine-flag]
-The `terminal open` command must support `--vt-engine ghostty|teamy` so callers can choose the terminal backend for the new window.
-
 cli[terminal.open.current-vt-engine-env]
-The `terminal open` command must set `TEAMY_STUDIO_CURRENT_TERMINAL_VT_ENGINE` in the spawned terminal process to `ghostty` or `teamy` for the selected backend.
+The `terminal open` command must set `TEAMY_STUDIO_CURRENT_TERMINAL_VT_ENGINE` in the spawned terminal process to `teamy`.
 
 cli[terminal.list.enumerates-live-windows]
 The `terminal list` command must enumerate live Teamy Studio terminal windows from the operating system rather than from on-disk state.

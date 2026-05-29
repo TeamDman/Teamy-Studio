@@ -22,14 +22,8 @@ pub mod windows_audio {
     pub use teamy_studio_windows_audio::*;
 }
 
-#[cfg(feature = "ghostty")]
-pub mod windows_terminal_engine {
-    pub use teamy_studio_windows_terminal_engine::*;
-}
-
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum VtEngineChoice {
-    Ghostty,
     #[default]
     Teamy,
 }
@@ -40,7 +34,6 @@ impl VtEngineChoice {
     #[must_use]
     pub const fn current_terminal_vt_engine_env_value(self) -> &'static str {
         match self {
-            Self::Ghostty => "ghostty",
             Self::Teamy => "teamy",
         }
     }

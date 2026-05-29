@@ -8,10 +8,4 @@ publish = false
 eyre.workspace = true
 facet.workspace = true
 facet-json.workspace = true
-libghostty-vt = { workspace = true, optional = true }
 teamy_studio_teamy_terminal_engine.workspace = true
-teamy_studio_windows_terminal_engine = { workspace = true, optional = true }
-
-[features]
-default = []
-ghostty = ["dep:libghostty-vt", "dep:teamy_studio_windows_terminal_engine"]

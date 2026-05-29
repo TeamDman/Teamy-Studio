@@ -4,7 +4,7 @@
 
 Teamy Studio is a Windows-first desktop shell initialized from the shared Rust CLI scaffold and tuned for an application-first launch path.
 
-Running `teamy-studio.exe` with no command-line arguments opens a translucent terminal window centered on screen. The window hosts a shell inside a PTY, renders terminal content through `libghostty-vt`, and can be repositioned by dragging the top accent strip.
+Running `teamy-studio.exe` with no command-line arguments opens a translucent terminal window centered on screen. The window hosts a shell inside a PTY, renders terminal content through Teamy Studio's in-repo terminal engine, and can be repositioned by dragging the top accent strip.
 
 <!-- repo[impl readme.media-demo] -->
 ![Teamy Studio media placeholder](resources/main.png)

@@ -5,24 +5,6 @@ use std::path::Path;
 
 use crate::cli::output::CliOutput;
 
-#[derive(Facet, Arbitrary, Clone, Copy, Debug, Default, PartialEq, Eq)]
-#[facet(rename_all = "kebab-case")]
-#[repr(u8)]
-pub enum SelfTestKeyboardInputVtEngine {
-    #[default]
-    Teamy,
-    Ghostty,
-}
-
-impl From<SelfTestKeyboardInputVtEngine> for crate::app::VtEngineChoice {
-    fn from(value: SelfTestKeyboardInputVtEngine) -> Self {
-        match value {
-            SelfTestKeyboardInputVtEngine::Ghostty => Self::Ghostty,
-            SelfTestKeyboardInputVtEngine::Teamy => Self::Teamy,
-        }
-    }
-}
-
 /// Run the keyboard input self-test harness.
 // cli[impl command.surface.self-test-keyboard-input]
 #[derive(Facet, Arbitrary, Debug, PartialEq)]
@@ -42,11 +24,6 @@ pub struct SelfTestKeyboardInputArgs {
     /// Optional artifact output path for the captured transcript.
     #[facet(args::named)]
     pub artifact_output: Option<String>,
-
-    // cli[impl self-test.keyboard-input.vt-engine-flag]
-    /// Select which VT engine backs the keyboard-input self-test session.
-    #[facet(args::named)]
-    pub vt_engine: Option<SelfTestKeyboardInputVtEngine>,
 }
 
 impl SelfTestKeyboardInputArgs {
@@ -64,7 +41,7 @@ impl SelfTestKeyboardInputArgs {
             self.inside,
             self.scenario.as_deref(),
             self.artifact_output.as_deref().map(Path::new),
-            self.vt_engine.unwrap_or_default().into(),
+            crate::app::VtEngineChoice::Teamy,
         )?))
     }
 }

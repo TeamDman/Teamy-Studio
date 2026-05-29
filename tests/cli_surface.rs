@@ -661,7 +661,6 @@ fn test_terminal_help_is_available() {
 // cli[verify terminal.open.double-dash-trailing-args]
 // cli[verify terminal.open.stdin-flag]
 // cli[verify terminal.open.title-flag]
-// cli[verify terminal.open.vt-engine-flag]
 #[test]
 fn test_terminal_open_help_is_available() {
     let output = run_teamy_studio(&["terminal", "open", "--help"], &[]);
@@ -677,18 +676,6 @@ fn test_terminal_open_help_is_available() {
     );
     assert!(text.contains("--stdin"), "missing --stdin in help:\n{text}");
     assert!(text.contains("--title"), "missing --title in help:\n{text}");
-    assert!(
-        text.contains("--vt-engine"),
-        "missing --vt-engine in help:\n{text}"
-    );
-    assert!(
-        text.contains("ghostty"),
-        "missing ghostty choice in help:\n{text}"
-    );
-    assert!(
-        text.contains("teamy"),
-        "missing teamy choice in help:\n{text}"
-    );
 }
 
 // cli[verify terminal.list.enumerates-live-windows]

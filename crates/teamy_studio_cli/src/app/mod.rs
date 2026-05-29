@@ -91,7 +91,6 @@ pub fn run_with_vt_engine(app_home: &AppHome, vt_engine: VtEngineChoice) -> eyre
 // cli[impl command.surface.terminal-open]
 // cli[impl terminal.open.stdin-flag]
 // cli[impl terminal.open.title-flag]
-// cli[impl terminal.open.vt-engine-flag]
 // cli[impl terminal.open.current-vt-engine-env]
 ///
 /// # Errors

@@ -13,10 +13,10 @@ The launched terminal and scene windows must start at a fixed 1300x900 logical-p
 ## Window Appearance
 
 behavior[window.appearance.shell]
-The launched window must host a shell backed by a PTY and render terminal content through `libghostty-vt`.
+The launched window must host a shell backed by a PTY and render terminal content through a Teamy-Studio-owned Rust terminal engine.
 
 behavior[window.appearance.shell.teamy-terminal-engine]
-The launched window must eventually render terminal content through a Teamy-Studio-owned Rust terminal engine rather than depending on `libghostty-vt`.
+The launched window must render terminal content through a Teamy-Studio-owned Rust terminal engine rather than depending on an external terminal backend.
 
 behavior[window.appearance.shell-configured-default]
 The launched window must start the effective default shell command rather than a hard-coded shell executable.

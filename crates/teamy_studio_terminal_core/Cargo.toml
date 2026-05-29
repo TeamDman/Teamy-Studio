@@ -14,9 +14,7 @@ teamy_studio_spatial.workspace = true
 teamy_studio_teamy_terminal_engine.workspace = true
 teamy_studio_vt_types.workspace = true
 teamy_studio_windows_audio.workspace = true
-teamy_studio_windows_terminal_engine = { workspace = true, optional = true }
 tracing.workspace = true
-libghostty-vt = { workspace = true, optional = true }
 windows = { workspace = true, features = [
     "std",
     "Win32_Foundation",
@@ -27,10 +25,4 @@ windows = { workspace = true, features = [
 
 [features]
 default = []
-ghostty = [
-    "dep:libghostty-vt",
-    "dep:teamy_studio_windows_terminal_engine",
-    "teamy_studio_vt_types/ghostty",
-    "teamy_studio_windows_terminal_engine/ghostty",
-]
 extended_observability = []

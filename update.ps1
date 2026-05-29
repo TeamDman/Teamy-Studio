@@ -12,7 +12,7 @@ $cargoHome = if ($env:CARGO_HOME) {
 $cargoBin = Join-Path $cargoHome "bin"
 $releaseDir = Join-Path $PSScriptRoot "target\release"
 
-foreach ($fileName in @("teamy-studio.exe", "ghostty-vt.dll", "conpty.dll", "OpenConsole.exe")) {
+foreach ($fileName in @("teamy-studio.exe", "conpty.dll", "OpenConsole.exe")) {
 	$source = Join-Path $releaseDir $fileName
 	if (-not (Test-Path $source)) {
 		throw "Missing runtime artifact: $source"

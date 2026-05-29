@@ -6,9 +6,6 @@ use std::process::Command;
 fn main() {
     add_exe_resources();
     add_git_revision();
-    if env::var_os("CARGO_FEATURE_GHOSTTY").is_some() {
-        stage_ghostty_binaries();
-    }
     stage_openconsole_binaries();
 }
 
@@ -37,23 +34,6 @@ fn add_git_revision() {
         .map_or_else(|| "unknown".to_string(), |s| s.trim().to_string());
 
     println!("cargo:rustc-env=GIT_REVISION={rev}");
-}
-
-fn stage_ghostty_binaries() {
-    println!("cargo:rerun-if-env-changed=DEP_GHOSTTY_VT_INCLUDE");
-
-    let Some(output_dir) = cargo_profile_dir() else {
-        println!(
-            "cargo:warning=skipping Ghostty staging because Cargo output directory could not be determined"
-        );
-        return;
-    };
-
-    let Some(source_dir) = ghostty_build_dir(&output_dir) else {
-        return;
-    };
-
-    stage_binary(&source_dir, &output_dir, "ghostty-vt.dll", "Ghostty");
 }
 
 fn stage_openconsole_binaries() {
@@ -98,37 +78,6 @@ fn stage_binary(source_dir: &Path, output_dir: &Path, file_name: &str, label: &s
             error,
         );
     }
-}
-
-fn ghostty_build_dir(output_dir: &Path) -> Option<PathBuf> {
-    let env_dir = env::var_os("DEP_GHOSTTY_VT_INCLUDE")
-        .map(PathBuf::from)
-        .and_then(|include_dir| include_dir.parent().map(Path::to_path_buf))
-        .map(|prefix| prefix.join("bin"))
-        .filter(|path| path.join("ghostty-vt.dll").exists());
-    if env_dir.is_some() {
-        return env_dir;
-    }
-
-    let build_dir = output_dir.join("build");
-    let entries = fs::read_dir(build_dir).ok()?;
-
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
-            continue;
-        };
-        if !name.starts_with("libghostty-vt-sys-") {
-            continue;
-        }
-
-        let candidate = path.join("out").join("ghostty-install").join("bin");
-        if candidate.join("ghostty-vt.dll").exists() {
-            return Some(candidate);
-        }
-    }
-
-    None
 }
 
 fn openconsole_build_dir() -> Option<PathBuf> {

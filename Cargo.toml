@@ -27,7 +27,6 @@ members = [
     "crates/teamy_studio_windows_audio",
     "crates/teamy_studio_windows_dialogs",
     "crates/teamy_studio_windows_terminal_replay",
-    "crates/teamy_studio_windows_terminal_engine",
     "crates/teamy_studio_win32_support",
 ]
 
@@ -58,7 +57,6 @@ teamy_studio_whisper_stack = { path = "crates/teamy_studio_whisper_stack" }
 teamy_studio_windows_audio = { path = "crates/teamy_studio_windows_audio" }
 teamy_studio_windows_dialogs = { path = "crates/teamy_studio_windows_dialogs" }
 teamy_studio_windows_terminal_replay = { path = "crates/teamy_studio_windows_terminal_replay" }
-teamy_studio_windows_terminal_engine = { path = "crates/teamy_studio_windows_terminal_engine" }
 teamy_studio_win32_support = { path = "crates/teamy_studio_win32_support" }
 
 arbitrary = { version = "1.4.1", features = ["derive"] }
@@ -81,7 +79,6 @@ hound = "3.5.1"
 half = "2.7.1"
 humantime = "2.2.0"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
-libghostty-vt = { git = "https://github.com/TeamDman/libghostty-rs.git", rev = "5e5351c9dc4b800202721ce15017c929958f685d" }
 npy = "0.4.0"
 open = "5"
 portable-pty = "0.9"
@@ -183,7 +180,6 @@ teamy_studio_whisper_stack.workspace = true
 teamy_studio_windows_audio.workspace = true
 teamy_studio_windows_dialogs.workspace = true
 teamy_studio_windows_terminal_replay.workspace = true
-teamy_studio_windows_terminal_engine.workspace = true
 teamy_studio_win32_support.workspace = true
 dunce.workspace = true
 eyre.workspace = true
@@ -205,7 +201,6 @@ reqwest.workspace = true
 rfd.workspace = true
 crossterm.workspace = true
 fontdb.workspace = true
-libghostty-vt = { workspace = true, optional = true }
 portable-pty.workspace = true
 ratatui.workspace = true
 rustfft.workspace = true
@@ -258,7 +253,6 @@ tempfile.workspace = true
 [features]
 default = ["extended_observability"]
 font-snapshot-tests = []
-ghostty = ["dep:libghostty-vt", "teamy_studio_cli/ghostty", "teamy_studio_terminal_core/ghostty", "teamy_studio_vt_types/ghostty", "teamy_studio_windows_terminal_engine/ghostty", "teamy_studio_windows_terminal_replay/ghostty"]
 extended_observability = ["teamy_studio_app_host/extended_observability", "teamy_studio_audio_input/extended_observability", "teamy_studio_audio_transcription/extended_observability", "teamy_studio_cli/extended_observability", "teamy_studio_frontend/extended_observability", "teamy_studio_observability/extended_observability", "teamy_studio_shell/extended_observability", "teamy_studio_teamy_terminal_engine/extended_observability", "teamy_studio_terminal_core/extended_observability", "teamy_studio_whisper_stack/extended_observability"]
 tracing_subscriber_tracy = ["teamy_studio_llm_stack/tracing_subscriber_tracy", "teamy_studio_observability/tracing_subscriber_tracy", "dep:tracy-client"]
 

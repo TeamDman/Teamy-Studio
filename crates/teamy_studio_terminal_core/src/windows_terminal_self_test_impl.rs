@@ -357,7 +357,7 @@ fn run_pwsh_ctrl_d_at_prompt_reproduction(
 
     if final_screen.contains("warning(stream): invalid C0 character, ignoring: 0x4") {
         eyre::bail!(
-            "Ctrl+D at the prompt still leaked 0x04 into Ghostty\n\n=== initial_screen ===\n{initial_screen}\n\n=== input_trace ===\n{}\n\n=== final_screen ===\n{final_screen}",
+            "Ctrl+D at the prompt still leaked 0x04 into the terminal engine\n\n=== initial_screen ===\n{initial_screen}\n\n=== input_trace ===\n{}\n\n=== final_screen ===\n{final_screen}",
             format_chunks(&input_trace),
         );
     }
