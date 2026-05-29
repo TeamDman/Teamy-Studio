@@ -4267,7 +4267,7 @@ fn inspect_image_model_burn_load_probe(
         up2_proj_weight_shape,
         to_image_proj_weight_shape,
         applied: result.applied,
-        missing: result.missing,
+        missing: result.missing.into_iter().map(|(path, _)| path).collect(),
         unused: result.unused,
         errors: result
             .errors

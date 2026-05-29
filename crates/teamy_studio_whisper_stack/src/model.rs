@@ -1143,8 +1143,8 @@ fn import_whisper_model_from_checkpoint(
     let unexpected_missing = result
         .missing
         .iter()
-        .filter(|path| !allowed_missing.iter().any(|allowed| path == allowed))
-        .cloned()
+        .filter(|(path, _)| !allowed_missing.iter().any(|allowed| path == allowed))
+        .map(|(path, _)| path.clone())
         .collect::<Vec<_>>();
     if !unexpected_missing.is_empty() {
         bail!(

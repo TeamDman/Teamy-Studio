@@ -502,10 +502,6 @@ pub fn audio_transcription_run_python_debug_request_once_with_tensor(
 ///
 /// Returns an error if no audio samples are available, the shared-memory slot cannot be created,
 /// the managed Python daemon cannot be launched, or the transcription request times out.
-#[expect(
-    clippy::duration_suboptimal_units,
-    reason = "the first real transcription run may install dependencies and download a model"
-)]
 // audio[impl transcription.real-python-inference]
 pub fn audio_transcription_run_python_transcription_request_once_from_samples(
     request_id: u64,

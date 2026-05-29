@@ -95,10 +95,10 @@ impl WhisperAudioEncoderConfig {
 
     pub fn init<B: Backend>(&self, device: &B::Device) -> WhisperAudioEncoder<B> {
         let conv1 = Conv1dConfig::new(self.n_mels, self.n_audio_state, 3)
-            .with_padding(PaddingConfig1d::Explicit(1))
+            .with_padding(PaddingConfig1d::Explicit(1, 1))
             .init(device);
         let conv2 = Conv1dConfig::new(self.n_audio_state, self.n_audio_state, 3)
-            .with_padding(PaddingConfig1d::Explicit(1))
+            .with_padding(PaddingConfig1d::Explicit(1, 1))
             .with_stride(2)
             .init(device);
         let blocks = (0..self.n_audio_layer)
@@ -803,13 +803,13 @@ pub fn load_audio_encoder_from_artifacts(
     encoder.conv1 = load_conv1d::<WhisperCpuBackend>(
         &root.join("conv1"),
         Conv1dConfig::new(dims.audio.n_mels, dims.audio.n_audio_state, 3)
-            .with_padding(PaddingConfig1d::Explicit(1)),
+            .with_padding(PaddingConfig1d::Explicit(1, 1)),
         &device,
     )?;
     encoder.conv2 = load_conv1d::<WhisperCpuBackend>(
         &root.join("conv2"),
         Conv1dConfig::new(dims.audio.n_audio_state, dims.audio.n_audio_state, 3)
-            .with_padding(PaddingConfig1d::Explicit(1))
+            .with_padding(PaddingConfig1d::Explicit(1, 1))
             .with_stride(2),
         &device,
     )?;
@@ -1633,7 +1633,7 @@ fn load_layer_norm<B: Backend>(root: &Path, device: &B::Device) -> eyre::Result<
         .with_epsilon(read_packed_scalar_f64(&root.join("eps.npy"))?)
         .init(device);
     layer_norm.gamma = Param::from_tensor(gamma);
-    layer_norm.beta = Param::from_tensor(beta);
+    layer_norm.beta = Some(Param::from_tensor(beta));
     Ok(layer_norm)
 }
 
@@ -1655,7 +1655,7 @@ fn load_conv1d<B: Backend>(
         kernel_size: config.kernel_size,
         dilation: config.dilation,
         groups: config.groups,
-        padding: Ignored(config.padding),
+        padding: config.padding,
     })
 }
 

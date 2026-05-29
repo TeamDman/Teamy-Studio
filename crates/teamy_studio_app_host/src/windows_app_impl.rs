@@ -4577,7 +4577,7 @@ fn run_terminal_throughput_self_test_sample(
     .in_scope(|| measure_terminal_cell_size(diagnostic_font_height))?;
     let command = terminal_throughput_benchmark_command(plan.mode, plan.line_count)?;
     let mut terminal = info_span!("create_terminal_benchmark_session")
-        .in_scope(|| TerminalSession::new_with_command(command, VtEngineChoice::Ghostty))?;
+        .in_scope(|| TerminalSession::new_with_command(command, VtEngineChoice::Teamy))?;
     let hwnd = info_span!("create_terminal_benchmark_window")
         .in_scope(|| create_benchmark_window(window_thread))?;
     let renderer = info_span!("create_terminal_benchmark_renderer")

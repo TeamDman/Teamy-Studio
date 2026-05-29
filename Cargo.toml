@@ -60,19 +60,19 @@ teamy_studio_windows_terminal_replay = { path = "crates/teamy_studio_windows_ter
 teamy_studio_win32_support = { path = "crates/teamy_studio_win32_support" }
 
 arbitrary = { version = "1.4.1", features = ["derive"] }
-burn = { version = "0.19.0", default-features = false, features = ["cuda", "ndarray", "std", "store", "record-item-custom-serde"] }
-burn-store = "0.19.1"
+burn = { version = "0.21.0", default-features = false, features = ["cuda", "ndarray", "std", "store", "record-item-custom-serde"] }
+burn-store = "0.21.0"
 chrono = "0.4"
 color-eyre = "0.6.5"
 crossterm = "0.29"
 directories-next = "2"
 dunce = "1.0.5"
 eyre = "0.6.12"
-facet = "0.44.1"
-facet-csv = "0.44.1"
-facet-json = "0.44.1"
-facet-pretty = "0.44.1"
-figue = { package = "teamy-figue", version = "2.0.1", features = ["arbitrary"] }
+facet = "=0.46.5"
+facet-csv = "=0.46.1"
+facet-json = "=0.46.1"
+facet-pretty = "=0.46.5"
+figue = { package = "teamy-figue", version = "=4.0.3", features = ["arbitrary"] }
 fontdb = "0.23"
 fontdue = "0.9.3"
 hound = "3.5.1"
