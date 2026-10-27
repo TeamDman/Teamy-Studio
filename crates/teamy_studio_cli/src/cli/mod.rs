@@ -68,7 +68,8 @@ impl Cli {
             command.invoke(&app_home, &cache_home)
         } else {
             crate::app::run(&app_home)?;
-            Ok(CliOutput::none())
+            // The default GUI runs until the user closes it.
+            Ok(CliOutput::none(None))
         }
     }
 }
@@ -117,6 +118,21 @@ impl Command {
             Command::CursorInfo(args) => args.invoke(app_home, cache_home),
             Command::Terminal(args) => args.invoke(app_home, cache_home),
             Command::SelfTest(args) => args.invoke(app_home, cache_home),
+        }
+    }
+}
+
+impl Command {
+    /// Fixed diagnostic label; never includes user arguments.
+    #[must_use]
+    pub const fn name(&self) -> &'static str {
+        match self {
+            Self::Audio(_) => "audio",
+            Self::Image(_) => "image",
+            Self::Llm(_) => "llm",
+            Self::CursorInfo(_) => "cursor-info",
+            Self::Terminal(_) => "terminal",
+            Self::SelfTest(_) => "self-test",
         }
     }
 }

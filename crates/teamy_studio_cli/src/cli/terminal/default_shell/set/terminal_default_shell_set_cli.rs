@@ -41,11 +41,14 @@ impl TerminalDefaultShellSetArgs {
         argv.push(self.program.clone());
         argv.extend(self.args.clone());
         crate::shell_default::save_configured_argv(app_home, self.program, self.args)?;
-        Ok(CliOutput::facet(TerminalDefaultShellSetReport {
-            config_path: crate::shell_default::default_shell_path(app_home)
-                .display()
-                .to_string(),
-            argv,
-        }))
+        Ok(CliOutput::facet(
+            TerminalDefaultShellSetReport {
+                config_path: crate::shell_default::default_shell_path(app_home)
+                    .display()
+                    .to_string(),
+                argv,
+            },
+            Some(std::time::Duration::from_secs(3)),
+        ))
     }
 }

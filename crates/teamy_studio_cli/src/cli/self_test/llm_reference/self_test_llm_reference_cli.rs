@@ -81,6 +81,6 @@ impl SelfTestLlmReferenceArgs {
         println!("LLM reference top token text: {:?}", report.top_token_text);
         println!("LLM reference top logits: {:?}", report.top_logits);
         println!("LLM reference one-token decode: {}", report.generated_text);
-        Ok(CliOutput::none())
+        Ok(CliOutput::none(Some(std::time::Duration::from_mins(5))))
     }
 }

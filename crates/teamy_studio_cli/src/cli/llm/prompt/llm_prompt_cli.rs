@@ -108,6 +108,13 @@ impl LlmPromptArgs {
         app_home: &crate::paths::AppHome,
         cache_home: &crate::paths::CacheHome,
     ) -> eyre::Result<CliOutput> {
+        let threshold = Some(Duration::from_secs(
+            120_u64.saturating_add(
+                u64::try_from(self.max_new_tokens)
+                    .unwrap_or(u64::MAX)
+                    .saturating_mul(2),
+            ),
+        ));
         let command_started_at = Instant::now();
         let generation_timeout =
             resolve_timeout_arg(self.timeout.as_deref(), self.generation_timeout.as_deref())?;
@@ -323,7 +330,7 @@ impl LlmPromptArgs {
                     );
                 }
             }
-            return Ok(CliOutput::none());
+            return Ok(CliOutput::none(threshold));
         }
 
         let mut stdout = std::io::stdout().lock();
@@ -340,7 +347,7 @@ impl LlmPromptArgs {
         stdout
             .flush()
             .map_err(|error| eyre::eyre!("Failed to flush generated LLM output: {}", error))?;
-        Ok(CliOutput::none())
+        Ok(CliOutput::none(threshold))
     }
 }
 
@@ -450,7 +457,9 @@ fn supervise_llm_prompt_timeout(timeout: Duration) -> eyre::Result<CliOutput> {
     loop {
         if let Some(status) = child.try_wait()? {
             if status.success() {
-                return Ok(CliOutput::none());
+                return Ok(CliOutput::none(Some(
+                    timeout.saturating_add(Duration::from_secs(30)),
+                )));
             }
             std::process::exit(status.code().unwrap_or(1));
         }

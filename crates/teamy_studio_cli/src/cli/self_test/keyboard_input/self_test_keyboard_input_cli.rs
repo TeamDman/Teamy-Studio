@@ -36,12 +36,15 @@ impl SelfTestKeyboardInputArgs {
         cache_home: &crate::paths::CacheHome,
     ) -> eyre::Result<CliOutput> {
         let _ = cache_home;
-        Ok(CliOutput::facet(crate::app::run_keyboard_input_self_test(
-            app_home,
-            self.inside,
-            self.scenario.as_deref(),
-            self.artifact_output.as_deref().map(Path::new),
-            crate::app::VtEngineChoice::Teamy,
-        )?))
+        Ok(CliOutput::facet(
+            crate::app::run_keyboard_input_self_test(
+                app_home,
+                self.inside,
+                self.scenario.as_deref(),
+                self.artifact_output.as_deref().map(Path::new),
+                crate::app::VtEngineChoice::Teamy,
+            )?,
+            Some(std::time::Duration::from_secs(30)),
+        ))
     }
 }

@@ -89,7 +89,7 @@ impl LlmModelListArgs {
                 &crate::llm::model::list_registered_model_dirs(app_home)?
             )
         );
-        Ok(CliOutput::none())
+        Ok(CliOutput::none(Some(std::time::Duration::from_secs(1))))
     }
 }
 
@@ -168,7 +168,7 @@ impl LlmModelPrepareArgs {
             "Registered model directory list:\n{}",
             crate::llm::model::render_registered_model_dirs(&prepared.registered_model_dirs)
         );
-        Ok(CliOutput::none())
+        Ok(CliOutput::none(Some(std::time::Duration::from_mins(2))))
     }
 }
 
@@ -202,6 +202,6 @@ impl LlmModelShowArgs {
         )?;
         let artifacts = crate::llm::model::inspect_model_dir(&resolved)?;
         println!("{}", crate::llm::model::render_model_report(&artifacts));
-        Ok(CliOutput::none())
+        Ok(CliOutput::none(Some(std::time::Duration::from_secs(1))))
     }
 }

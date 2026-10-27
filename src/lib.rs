@@ -1,6 +1,7 @@
 #![deny(clippy::disallowed_methods)]
 #![deny(clippy::disallowed_macros)]
 
+pub mod elapsed_duration;
 pub mod app {
     pub use teamy_studio_cli::app::*;
 }
@@ -144,7 +145,25 @@ pub fn main() -> eyre::Result<()> {
 
     // Invoke whatever command was requested
     let output_format = cli.global_args.output_format;
-    let output: CliOutput = cli.invoke()?;
-    output.emit(output_format)?;
-    Ok(())
+    let command_name = cli
+        .command
+        .as_ref()
+        .map_or("interactive", crate::cli::Command::name);
+    tracing::debug!(command = command_name, "Dispatching command");
+    let _command_span = tracing::info_span!("command", command = command_name).entered();
+    let started = std::time::Instant::now();
+    let result = (|| -> eyre::Result<()> {
+        let output: CliOutput = cli.invoke()?;
+        let threshold = output.elapsed_duration_warn_threshold;
+        let emitted = output.emit(output_format);
+        elapsed_duration::warn_if_exceeded(command_name, started.elapsed(), threshold);
+        emitted?;
+        Ok(())
+    })();
+    tracing::debug!(
+        command = command_name,
+        success = result.is_ok(),
+        "Command finished"
+    );
+    result
 }

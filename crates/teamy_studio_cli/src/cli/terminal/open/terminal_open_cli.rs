@@ -72,7 +72,8 @@ impl TerminalOpenArgs {
             self.title.as_deref(),
             crate::app::VtEngineChoice::Teamy,
         )?;
-        Ok(CliOutput::none())
+        // The terminal window runs until the user closes it.
+        Ok(CliOutput::none(None))
     }
 }
 

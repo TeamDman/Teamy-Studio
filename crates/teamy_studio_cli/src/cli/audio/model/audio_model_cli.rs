@@ -120,7 +120,7 @@ impl AudioModelListArgs {
                 );
             }
         }
-        Ok(CliOutput::none())
+        Ok(CliOutput::none(Some(std::time::Duration::from_secs(1))))
     }
 }
 
@@ -231,7 +231,7 @@ impl AudioModelPrepareArgs {
             "Registered model directory list:\n{}",
             crate::model::render_registered_model_dirs(&prepared.registered_model_dirs)
         );
-        Ok(CliOutput::none())
+        Ok(CliOutput::none(Some(std::time::Duration::from_mins(2))))
     }
 }
 
@@ -269,6 +269,6 @@ impl AudioModelShowArgs {
             format!("failed to inspect model directory {}", model_dir.display())
         })?;
         println!("{}", crate::model::render_model_report(&artifacts));
-        Ok(CliOutput::none())
+        Ok(CliOutput::none(Some(std::time::Duration::from_secs(1))))
     }
 }

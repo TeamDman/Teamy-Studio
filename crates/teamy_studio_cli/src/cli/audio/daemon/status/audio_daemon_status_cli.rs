@@ -20,8 +20,9 @@ impl AudioDaemonStatusArgs {
         cache_home: &crate::paths::CacheHome,
     ) -> eyre::Result<CliOutput> {
         let _ = app_home;
-        Ok(CliOutput::facet(audio_transcription_daemon_status(
-            cache_home,
-        )))
+        Ok(CliOutput::facet(
+            audio_transcription_daemon_status(cache_home),
+            Some(std::time::Duration::from_secs(3)),
+        ))
     }
 }

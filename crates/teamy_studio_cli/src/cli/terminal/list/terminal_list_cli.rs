@@ -27,8 +27,11 @@ impl TerminalListArgs {
     ) -> eyre::Result<CliOutput> {
         let _ = app_home;
         let _ = cache_home;
-        Ok(CliOutput::facet(TerminalListReport {
-            windows: crate::app::list_terminal_windows()?,
-        }))
+        Ok(CliOutput::facet(
+            TerminalListReport {
+                windows: crate::app::list_terminal_windows()?,
+            },
+            Some(std::time::Duration::from_secs(3)),
+        ))
     }
 }

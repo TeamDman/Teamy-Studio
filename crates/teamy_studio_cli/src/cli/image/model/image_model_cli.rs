@@ -60,9 +60,10 @@ impl ImageModelListArgs {
         cache_home: &crate::paths::CacheHome,
     ) -> eyre::Result<CliOutput> {
         let _ = self;
-        Ok(CliOutput::facet(crate::image_model::list_image_models(
-            cache_home,
-        )))
+        Ok(CliOutput::facet(
+            crate::image_model::list_image_models(cache_home),
+            Some(std::time::Duration::from_secs(1)),
+        ))
     }
 }
 
@@ -89,11 +90,10 @@ impl ImageModelPrepareArgs {
         _app_home: &crate::paths::AppHome,
         cache_home: &crate::paths::CacheHome,
     ) -> eyre::Result<CliOutput> {
-        Ok(CliOutput::facet(crate::image_model::prepare_image_model(
-            cache_home,
-            &self.model,
-            self.overwrite,
-        )?))
+        Ok(CliOutput::facet(
+            crate::image_model::prepare_image_model(cache_home, &self.model, self.overwrite)?,
+            Some(std::time::Duration::from_mins(2)),
+        ))
     }
 }
 
@@ -121,10 +121,13 @@ impl ImageModelShowArgs {
         cache_home: &crate::paths::CacheHome,
     ) -> eyre::Result<CliOutput> {
         let explicit_model_dir = self.model_dir.as_deref().map(PathBuf::from);
-        Ok(CliOutput::facet(crate::image_model::image_model_details(
-            cache_home,
-            &self.model,
-            explicit_model_dir.as_deref(),
-        )?))
+        Ok(CliOutput::facet(
+            crate::image_model::image_model_details(
+                cache_home,
+                &self.model,
+                explicit_model_dir.as_deref(),
+            )?,
+            Some(std::time::Duration::from_secs(1)),
+        ))
     }
 }

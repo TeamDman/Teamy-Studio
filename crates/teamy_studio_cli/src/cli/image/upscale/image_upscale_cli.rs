@@ -383,33 +383,43 @@ impl ImageUpscaleArgs {
             alpha_preserved,
             "image upscale tiled Burn inference succeeded"
         );
-        Ok(CliOutput::facet(ImageUpscaleReport {
-            model_name: resolved_model.name.to_owned(),
-            input_path: self.image_path,
-            output_path: output.path.display().to_string(),
-            output_format: format!("{:?}", output.format),
-            tile_size: actual_tile_size,
-            batch_size: self.batch_size,
-            input_width: prepared_input.width,
-            input_height: prepared_input.height,
-            output_width,
-            output_height,
-            blank_alpha: prepared_input.blank_alpha,
-            alpha_preserved,
-            runtime_mode: if ran_alpha_runtime {
-                if tta_enabled {
-                    "tiled-rgba-tta".to_owned()
+        Ok(CliOutput::facet(
+            ImageUpscaleReport {
+                model_name: resolved_model.name.to_owned(),
+                input_path: self.image_path,
+                output_path: output.path.display().to_string(),
+                output_format: format!("{:?}", output.format),
+                tile_size: actual_tile_size,
+                batch_size: self.batch_size,
+                input_width: prepared_input.width,
+                input_height: prepared_input.height,
+                output_width,
+                output_height,
+                blank_alpha: prepared_input.blank_alpha,
+                alpha_preserved,
+                runtime_mode: if ran_alpha_runtime {
+                    if tta_enabled {
+                        "tiled-rgba-tta".to_owned()
+                    } else {
+                        "tiled-rgba".to_owned()
+                    }
                 } else {
-                    "tiled-rgba".to_owned()
-                }
-            } else {
-                if tta_enabled {
-                    "tiled-rgb-only-tta".to_owned()
-                } else {
-                    "tiled-rgb-only".to_owned()
-                }
+                    if tta_enabled {
+                        "tiled-rgb-only-tta".to_owned()
+                    } else {
+                        "tiled-rgb-only".to_owned()
+                    }
+                },
             },
-        }))
+            Some(std::time::Duration::from_secs(
+                30_u64.saturating_add(
+                    u64::from(output_width)
+                        .saturating_mul(u64::from(output_height))
+                        .div_ceil(1_048_576)
+                        .saturating_mul(if tta_enabled { 80 } else { 10 }),
+                ),
+            )),
+        ))
     }
 
     /// # Errors

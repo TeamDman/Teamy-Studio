@@ -158,7 +158,13 @@ impl AudioTranscribeArgs {
         if !result.streamed_stdout {
             println!("{}", result.text);
         }
-        Ok(CliOutput::none())
+        Ok(CliOutput::none(Some(std::time::Duration::from_secs(
+            120_u64.saturating_add(
+                u64::try_from(max_decode_tokens)
+                    .unwrap_or(u64::MAX)
+                    .saturating_mul(2),
+            ),
+        ))))
     }
 
     fn invoke_demo_batch(
@@ -259,7 +265,14 @@ impl AudioTranscribeArgs {
             "Finished audio transcribe demo batch"
         );
         self.write_timing_jsonl(&timing_records)?;
-        Ok(CliOutput::none())
+        Ok(CliOutput::none(Some(std::time::Duration::from_secs(
+            120_u64.saturating_add(
+                u64::try_from(max_decode_tokens)
+                    .unwrap_or(u64::MAX)
+                    .saturating_mul(u64::try_from(demo_count).unwrap_or(u64::MAX))
+                    .saturating_mul(2),
+            ),
+        ))))
     }
 
     fn write_timing_jsonl(&self, records: &[TranscriptionTimingRecord]) -> eyre::Result<()> {

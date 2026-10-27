@@ -34,10 +34,13 @@ impl SelfTestTerminalReplayArgs {
         _cache_home: &crate::paths::CacheHome,
     ) -> eyre::Result<CliOutput> {
         let _ = app_home;
-        Ok(CliOutput::facet(crate::app::run_terminal_replay_self_test(
-            Path::new(&self.fixture),
-            self.artifact_output.as_deref().map(Path::new),
-            self.samples.unwrap_or(1).max(1),
-        )?))
+        Ok(CliOutput::facet(
+            crate::app::run_terminal_replay_self_test(
+                Path::new(&self.fixture),
+                self.artifact_output.as_deref().map(Path::new),
+                self.samples.unwrap_or(1).max(1),
+            )?,
+            Some(std::time::Duration::from_secs(30)),
+        ))
     }
 }

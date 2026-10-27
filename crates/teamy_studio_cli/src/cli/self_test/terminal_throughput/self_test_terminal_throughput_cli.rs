@@ -68,6 +68,15 @@ impl SelfTestTerminalThroughputArgs {
                 self.line_count.unwrap_or(10_000),
                 self.samples.unwrap_or(1).max(1),
             )?,
+            Some(std::time::Duration::from_millis(
+                5000_u64.saturating_add(
+                    u64::try_from(self.line_count.unwrap_or(10_000))
+                        .unwrap_or(u64::MAX)
+                        .saturating_mul(
+                            u64::try_from(self.samples.unwrap_or(1).max(1)).unwrap_or(u64::MAX),
+                        ),
+                ),
+            )),
         ))
     }
 }

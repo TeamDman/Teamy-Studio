@@ -88,7 +88,8 @@ impl CursorInfoArgs {
                 pixel_size: self.pixel_size.unwrap_or_default().into(),
             },
         )?;
-        Ok(CliOutput::none())
+        // The desktop overlay has a user-controlled lifetime.
+        Ok(CliOutput::none(None))
     }
 }
 

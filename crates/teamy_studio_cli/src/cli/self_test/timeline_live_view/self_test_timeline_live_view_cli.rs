@@ -111,6 +111,15 @@ impl SelfTestTimelineLiveViewArgs {
                     fail_below_fps: self.fail_below_fps,
                 },
             )?,
+            Some(std::time::Duration::from_millis(
+                5000_u64.saturating_add(
+                    sample_ms
+                        .saturating_add(self.warmup_ms.unwrap_or(1_000))
+                        .saturating_mul(
+                            u64::try_from(self.samples.unwrap_or(1).max(1)).unwrap_or(u64::MAX),
+                        ),
+                ),
+            )),
         ))
     }
 }

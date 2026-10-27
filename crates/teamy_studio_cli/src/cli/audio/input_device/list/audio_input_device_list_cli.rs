@@ -20,8 +20,11 @@ impl AudioInputDeviceListArgs {
     ) -> eyre::Result<CliOutput> {
         let _ = app_home;
         let _ = cache_home;
-        Ok(CliOutput::facet(AudioInputDeviceListReport {
-            devices: list_active_audio_input_devices()?,
-        }))
+        Ok(CliOutput::facet(
+            AudioInputDeviceListReport {
+                devices: list_active_audio_input_devices()?,
+            },
+            Some(std::time::Duration::from_secs(3)),
+        ))
     }
 }

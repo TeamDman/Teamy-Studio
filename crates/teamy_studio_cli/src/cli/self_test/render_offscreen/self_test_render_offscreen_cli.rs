@@ -40,6 +40,7 @@ impl SelfTestRenderOffscreenArgs {
         if self.list_fixtures {
             return Ok(CliOutput::facet(
                 crate::app::list_render_offscreen_self_test_fixtures(),
+                Some(std::time::Duration::from_secs(1)),
             ));
         }
 
@@ -51,6 +52,7 @@ impl SelfTestRenderOffscreenArgs {
                 self.artifact_output.as_deref().map(Path::new),
                 self.update_expected,
             )?,
+            Some(std::time::Duration::from_secs(30)),
         ))
     }
 }

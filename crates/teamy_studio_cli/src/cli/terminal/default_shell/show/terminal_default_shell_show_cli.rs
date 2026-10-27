@@ -27,9 +27,9 @@ impl TerminalDefaultShellShowArgs {
         let _ = cache_home;
         let argv = crate::shell_default::load_effective_argv(app_home)?;
         let command_line = crate::shell_default::format_command_line(&argv);
-        Ok(CliOutput::facet(TerminalDefaultShellShowReport {
-            argv,
-            command_line,
-        }))
+        Ok(CliOutput::facet(
+            TerminalDefaultShellShowReport { argv, command_line },
+            Some(std::time::Duration::from_secs(3)),
+        ))
     }
 }

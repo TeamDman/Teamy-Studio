@@ -106,7 +106,7 @@ impl SelfTestImageUpscaleReferenceArgs {
             );
             compare_rust_preprocessing_against_reference(&reference_image_path, "real image")?;
         }
-        Ok(CliOutput::none())
+        Ok(CliOutput::none(Some(std::time::Duration::from_mins(5))))
     }
 }
 
